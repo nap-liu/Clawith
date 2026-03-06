@@ -1656,7 +1656,7 @@ export default function AgentDetail() {
                                 ))}
                             </div>
                             {/* Right: chat area */}
-                            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative' }}>
+                            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', position: 'relative', minWidth: 0, overflow: 'hidden' }}>
                                 {selectedConv === 'me' ? (
                                     /* Live websocket chat */
                                     <>
