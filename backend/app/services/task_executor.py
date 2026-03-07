@@ -77,7 +77,9 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
     if not base_url:
         await _log_error(task_id, f"未配置 {model.provider} 的 API 地址")
         return
-
+    # Normalize: strip /chat/completions if user accidentally included the full endpoint
+    if base_url.rstrip('/').endswith('/chat/completions'):
+        base_url = base_url.rstrip('/').rsplit('/chat/completions', 1)[0]
     url = f"{base_url.rstrip('/')}/chat/completions"
     api_key = model.api_key_encrypted
 
