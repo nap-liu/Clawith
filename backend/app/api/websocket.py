@@ -271,6 +271,7 @@ async def call_llm(
                             estimated_tokens = max(total_chars // 3, 1)
                             _agent.tokens_used_today = (_agent.tokens_used_today or 0) + estimated_tokens
                             _agent.tokens_used_month = (_agent.tokens_used_month or 0) + estimated_tokens
+                            _agent.tokens_used_total = (_agent.tokens_used_total or 0) + estimated_tokens
                             await _db.commit()
                 except Exception:
                     pass

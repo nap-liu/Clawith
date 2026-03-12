@@ -97,6 +97,7 @@ class AgentOut(BaseModel):
     autonomy_policy: dict
     tokens_used_today: int
     tokens_used_month: int
+    tokens_used_total: int = 0
     max_tokens_per_day: int | None = None
     max_tokens_per_month: int | None = None
     max_tool_rounds: int = 50
