@@ -13,6 +13,14 @@ import { useAuthStore } from '../stores';
 
 const TABS = ['status', 'aware', 'mind', 'tools', 'skills', 'relationships', 'workspace', 'chat', 'activityLog', 'settings'] as const;
 
+// Format large token numbers with K/M suffixes
+const formatTokens = (n: number) => {
+    if (!n) return '0';
+    if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+    if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+    return String(n);
+};
+
 const getCategoryLabels = (t: any): Record<string, string> => ({
     file: t('agent.toolCategories.file'),
     task: t('agent.toolCategories.task'),
@@ -1572,13 +1580,13 @@ function AgentDetailInner() {
                                 </div>
                                 <div className="card">
                                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '6px' }}>{t('agent.settings.today')} Token</div>
-                                    <div style={{ fontSize: '22px', fontWeight: 600 }}>{agent.tokens_used_today.toLocaleString()}</div>
-                                    {agent.max_tokens_per_day && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{t('agent.settings.noLimit')} {agent.max_tokens_per_day.toLocaleString()}</div>}
+                                    <div style={{ fontSize: '22px', fontWeight: 600 }}>{formatTokens(agent.tokens_used_today)}</div>
+                                    {agent.max_tokens_per_day && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{t('agent.settings.noLimit')} {formatTokens(agent.max_tokens_per_day)}</div>}
                                 </div>
                                 <div className="card">
                                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '6px' }}>{t('agent.settings.month')} Token</div>
-                                    <div style={{ fontSize: '22px', fontWeight: 600 }}>{agent.tokens_used_month.toLocaleString()}</div>
-                                    {agent.max_tokens_per_month && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{t('agent.settings.noLimit')} {agent.max_tokens_per_month.toLocaleString()}</div>}
+                                    <div style={{ fontSize: '22px', fontWeight: 600 }}>{formatTokens(agent.tokens_used_month)}</div>
+                                    {agent.max_tokens_per_month && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{t('agent.settings.noLimit')} {formatTokens(agent.max_tokens_per_month)}</div>}
                                 </div>
                                 <div className="card">
                                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '6px' }}>LLM Calls Today</div>
@@ -3172,7 +3180,7 @@ function AgentDetailInner() {
                                                 placeholder={t("agent.settings.noLimit")}
                                             />
                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                                                {t('agent.settings.today')}: {(agent?.tokens_used_today || 0).toLocaleString()}
+                                                {t('agent.settings.today')}: {formatTokens(agent?.tokens_used_today || 0)}
                                             </div>
                                         </div>
                                         <div>
@@ -3185,7 +3193,7 @@ function AgentDetailInner() {
                                                 placeholder={t("agent.settings.noLimit")}
                                             />
                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                                                {t('agent.settings.month')}: {(agent?.tokens_used_month || 0).toLocaleString()}
+                                                {t('agent.settings.month')}: {formatTokens(agent?.tokens_used_month || 0)}
                                             </div>
                                         </div>
                                     </div>

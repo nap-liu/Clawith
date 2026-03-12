@@ -384,3 +384,42 @@ async def get_agent_tools_with_config(
             "source": at.source if at else "system",
         })
     return result
+
+
+# ─── Email Connection Testing ──────────────────────────────
+
+class EmailTestRequest(BaseModel):
+    config: dict
+
+
+@router.post("/test-email")
+async def test_email_connection(
+    data: EmailTestRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Test IMAP and SMTP email connections with provided config."""
+    from app.services.email_service import test_connection
+
+    try:
+        result = await test_connection(data.config)
+        return result
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300]}
+
+
+@router.get("/email-providers")
+async def get_email_providers(
+    current_user: User = Depends(get_current_user),
+):
+    """Get list of supported email provider presets with help text."""
+    from app.services.email_service import EMAIL_PROVIDERS
+
+    return {
+        key: {
+            "label": p["label"],
+            "help_url": p.get("help_url", ""),
+            "help_text": p.get("help_text", ""),
+        }
+        for key, p in EMAIL_PROVIDERS.items()
+    }
+

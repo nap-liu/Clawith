@@ -541,6 +541,126 @@ BUILTIN_TOOLS = [
             ]
         },
     },
+    # --- Email tools ---
+    {
+        "name": "send_email",
+        "display_name": "Send Email",
+        "description": "Send an email to one or more recipients. Supports subject, body text, CC, and file attachments from workspace.",
+        "category": "email",
+        "icon": "📧",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "Recipient email address(es), comma-separated for multiple"},
+                "subject": {"type": "string", "description": "Email subject line"},
+                "body": {"type": "string", "description": "Email body text"},
+                "cc": {"type": "string", "description": "CC recipients, comma-separated (optional)"},
+                "attachments": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of workspace-relative file paths to attach (optional)",
+                },
+            },
+            "required": ["to", "subject", "body"],
+        },
+        "config": {},
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "email_provider",
+                    "label": "Email Provider",
+                    "type": "select",
+                    "options": [
+                        {"value": "qq", "label": "QQ邮箱"},
+                        {"value": "163", "label": "163邮箱"},
+                        {"value": "gmail", "label": "Gmail"},
+                        {"value": "outlook", "label": "Outlook / Microsoft 365"},
+                        {"value": "qq_enterprise", "label": "腾讯企业邮箱"},
+                        {"value": "aliyun", "label": "阿里企业邮箱"},
+                        {"value": "custom", "label": "Custom"},
+                    ],
+                    "default": "qq",
+                },
+                {
+                    "key": "email_address",
+                    "label": "Email Address",
+                    "type": "text",
+                    "placeholder": "your@email.com",
+                },
+                {
+                    "key": "auth_code",
+                    "label": "Authorization Code",
+                    "type": "password",
+                    "placeholder": "Authorization code (not your login password)",
+                },
+                {
+                    "key": "imap_host",
+                    "label": "IMAP Host",
+                    "type": "text",
+                    "placeholder": "imap.example.com",
+                    "depends_on": {"email_provider": ["custom"]},
+                },
+                {
+                    "key": "imap_port",
+                    "label": "IMAP Port",
+                    "type": "number",
+                    "default": 993,
+                    "depends_on": {"email_provider": ["custom"]},
+                },
+                {
+                    "key": "smtp_host",
+                    "label": "SMTP Host",
+                    "type": "text",
+                    "placeholder": "smtp.example.com",
+                    "depends_on": {"email_provider": ["custom"]},
+                },
+                {
+                    "key": "smtp_port",
+                    "label": "SMTP Port",
+                    "type": "number",
+                    "default": 465,
+                    "depends_on": {"email_provider": ["custom"]},
+                },
+            ]
+        },
+    },
+    {
+        "name": "read_emails",
+        "display_name": "Read Emails",
+        "description": "Read emails from your inbox. Can limit the number returned and search by criteria (e.g. FROM, SUBJECT, SINCE date).",
+        "category": "email",
+        "icon": "📬",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max number of emails to return (default 10, max 30)", "default": 10},
+                "search": {"type": "string", "description": "IMAP search criteria, e.g. 'FROM \"john@example.com\"', 'SUBJECT \"meeting\"', 'SINCE 01-Mar-2026'. Default: all emails."},
+                "folder": {"type": "string", "description": "Mailbox folder (default INBOX)", "default": "INBOX"},
+            },
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "reply_email",
+        "display_name": "Reply Email",
+        "description": "Reply to an email by its Message-ID. Maintains the email thread with proper In-Reply-To headers.",
+        "category": "email",
+        "icon": "↩️",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "string", "description": "Message-ID of the email to reply to (from read_emails output)"},
+                "body": {"type": "string", "description": "Reply body text"},
+            },
+            "required": ["message_id", "body"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
 ]
 
 

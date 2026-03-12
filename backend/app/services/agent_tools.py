@@ -651,6 +651,86 @@ AGENT_TOOLS = [
             },
         },
     },
+    # ─── Email Tools ────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": "Send an email to one or more recipients. Supports subject, body text, CC, and file attachments from workspace. Requires email configuration in tool settings.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient email address(es), comma-separated for multiple",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Email subject line",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Email body text",
+                    },
+                    "cc": {
+                        "type": "string",
+                        "description": "CC recipients, comma-separated (optional)",
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of workspace-relative file paths to attach (optional)",
+                    },
+                },
+                "required": ["to", "subject", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_emails",
+            "description": "Read emails from your inbox. Can limit the number returned and search by criteria (e.g. FROM, SUBJECT, SINCE date). Requires email configuration in tool settings.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of emails to return (default 10, max 30)",
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "IMAP search criteria, e.g. 'FROM \"john@example.com\"', 'SUBJECT \"meeting\"', 'SINCE 01-Mar-2026'. Default: all emails.",
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": "Mailbox folder, default INBOX",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reply_email",
+            "description": "Reply to an email by its Message-ID. Maintains the email thread with proper In-Reply-To headers. Requires email configuration in tool settings.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "string",
+                        "description": "Message-ID of the email to reply to (from read_emails output)",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Reply body text",
+                    },
+                },
+                "required": ["message_id", "body"],
+            },
+        },
+    },
 ]
 
 
@@ -958,6 +1038,9 @@ async def execute_tool(
             result = await _feishu_calendar_update(agent_id, arguments)
         elif tool_name == "feishu_calendar_delete":
             result = await _feishu_calendar_delete(agent_id, arguments)
+        # ── Email Tools ──
+        elif tool_name in ("send_email", "read_emails", "reply_email"):
+            result = await _handle_email_tool(tool_name, agent_id, ws, arguments)
         else:
             # Try MCP tool execution
             result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id)
@@ -3504,3 +3587,74 @@ async def _feishu_contacts_refresh(agent_id: uuid.UUID) -> None:
             _cache_file.unlink()
     except Exception:
         pass
+
+
+# ─── Email Tool Helpers ─────────────────────────────────────
+
+async def _get_email_config(agent_id: uuid.UUID) -> dict:
+    """Retrieve per-agent email config from the send_email tool's AgentTool config."""
+    from app.models.tool import Tool, AgentTool
+
+    async with async_session() as db:
+        # Find the send_email tool
+        r = await db.execute(select(Tool).where(Tool.name == "send_email"))
+        tool = r.scalar_one_or_none()
+        if not tool:
+            return {}
+
+        # Get per-agent config
+        at_r = await db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == agent_id,
+                AgentTool.tool_id == tool.id,
+            )
+        )
+        at = at_r.scalar_one_or_none()
+        agent_config = (at.config or {}) if at else {}
+        # Merge global + agent override
+        return {**(tool.config or {}), **agent_config}
+
+
+async def _handle_email_tool(tool_name: str, agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
+    """Dispatch email tool calls to the email_service module."""
+    from app.services.email_service import send_email, read_emails, reply_email
+
+    config = await _get_email_config(agent_id)
+    if not config.get("email_address") or not config.get("auth_code"):
+        return (
+            "❌ Email not configured for this agent.\n\n"
+            "Please go to Agent → Tools → Send Email → Config to set up your email:\n"
+            "1. Select your email provider\n"
+            "2. Enter your email address\n"
+            "3. Enter your authorization code (not your login password)"
+        )
+
+    try:
+        if tool_name == "send_email":
+            return await send_email(
+                config=config,
+                to=arguments.get("to", ""),
+                subject=arguments.get("subject", ""),
+                body=arguments.get("body", ""),
+                cc=arguments.get("cc"),
+                attachments=arguments.get("attachments"),
+                workspace_path=ws,
+            )
+        elif tool_name == "read_emails":
+            return await read_emails(
+                config=config,
+                limit=arguments.get("limit", 10),
+                search=arguments.get("search"),
+                folder=arguments.get("folder", "INBOX"),
+            )
+        elif tool_name == "reply_email":
+            return await reply_email(
+                config=config,
+                message_id=arguments.get("message_id", ""),
+                body=arguments.get("body", ""),
+            )
+        else:
+            return f"❌ Unknown email tool: {tool_name}"
+    except Exception as e:
+        return f"❌ Email tool error: {str(e)[:200]}"
+
