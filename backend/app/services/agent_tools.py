@@ -2246,22 +2246,72 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             chat_session.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 
-            # Call target LLM (single request-response)
+            # Call target LLM with tool support (multi-round)
             from app.services.llm_utils import get_provider_base_url
+            from app.services.agent_tools import get_agent_tools_for_llm, execute_tool
             base_url = get_provider_base_url(target_model.provider, target_model.base_url)
             url = f"{base_url.rstrip('/')}/chat/completions"
             full_msgs = [{"role": "system", "content": target_system}] + conversation_messages
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    url,
-                    json={"model": target_model.model, "messages": full_msgs, "temperature": 0.7, "max_tokens": 2048},
-                    headers={"Authorization": f"Bearer {target_model.api_key_encrypted}"},
-                )
-                data = resp.json()
 
+            # Load tools for target agent
+            tools_for_llm = await get_agent_tools_for_llm(target.id)
+
+            max_tool_rounds = 5
             target_reply = ""
-            if "choices" in data and data["choices"]:
-                target_reply = data["choices"][0].get("message", {}).get("content", "")
+
+            async with httpx.AsyncClient(timeout=120) as client:
+                for _round in range(max_tool_rounds):
+                    req_body: dict = {
+                        "model": target_model.model,
+                        "messages": full_msgs,
+                        "temperature": 0.7,
+                        "max_tokens": 4096,
+                    }
+                    if tools_for_llm:
+                        req_body["tools"] = tools_for_llm
+                        req_body["tool_choice"] = "auto"
+
+                    resp = await client.post(
+                        url,
+                        json=req_body,
+                        headers={"Authorization": f"Bearer {target_model.api_key_encrypted}"},
+                    )
+                    data = resp.json()
+
+                    if "choices" not in data or not data["choices"]:
+                        break
+
+                    choice = data["choices"][0]
+                    msg = choice.get("message", {})
+
+                    # Check for tool calls
+                    tool_calls = msg.get("tool_calls")
+                    if tool_calls:
+                        # Add assistant message with tool calls to conversation
+                        full_msgs.append(msg)
+
+                        # Execute each tool call
+                        for tc in tool_calls:
+                            fn = tc.get("function", {})
+                            tool_name = fn.get("name", "")
+                            try:
+                                tool_args = json.loads(fn.get("arguments", "{}"))
+                            except Exception:
+                                tool_args = {}
+
+                            tool_result = await execute_tool(tool_name, tool_args, target.id, owner_id)
+
+                            # Add tool result to conversation
+                            full_msgs.append({
+                                "role": "tool",
+                                "tool_call_id": tc.get("id", ""),
+                                "content": tool_result[:4000],
+                            })
+                        continue  # Next LLM round
+
+                    # No tool calls — this is the final text response
+                    target_reply = msg.get("content", "")
+                    break
 
             if not target_reply:
                 return f"⚠️ {target.name} did not respond (LLM returned empty)"
