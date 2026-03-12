@@ -817,7 +817,7 @@ export default function EnterpriseSettings() {
                             <div style={{ display: 'flex', gap: '24px', marginTop: '8px' }}>
                                 <span className="badge badge-info">{t('enterprise.stats.users', { count: stats.total_users })}</span>
                                 <span className="badge badge-success">{t('enterprise.stats.runningAgents', { running: stats.running_agents, total: stats.total_agents })}</span>
-                                {stats.pending_approvals > 0 && <span className="badge badge-warning">⏳ {stats.pending_approvals} {t('enterprise.tabs.approval')}</span>}
+                                {stats.pending_approvals > 0 && <span className="badge badge-warning">{stats.pending_approvals} {t('enterprise.tabs.approvals')}</span>}
                             </div>
                         )}
                     </div>
