@@ -934,7 +934,7 @@ export default function EnterpriseSettings() {
                                 <div>
                                     <div style={{ fontWeight: 500 }}>{a.action_type}</div>
                                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
-                                        Agent: {a.agent_id.slice(0, 8)} · {new Date(a.created_at).toLocaleString()}
+                                        {a.agent_name || `Agent ${a.agent_id.slice(0, 8)}`} · {new Date(a.created_at).toLocaleString()}
                                     </div>
                                 </div>
                                 {a.status === 'pending' ? (

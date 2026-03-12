@@ -175,18 +175,32 @@ async def list_approvals(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List approval requests for agents the current user created."""
-    # Get agent IDs user is creator of
-    agent_ids = (
-        select(Agent.id).where(Agent.creator_id == current_user.id)
-    )
-    query = select(ApprovalRequest).where(ApprovalRequest.agent_id.in_(agent_ids))
+    """List approval requests. Platform admins see all; others see their own agents."""
+    query = select(ApprovalRequest)
+    # Platform admins see all approvals; regular users only see their own agents'
+    if current_user.role != "platform_admin":
+        agent_ids = select(Agent.id).where(Agent.creator_id == current_user.id)
+        query = query.where(ApprovalRequest.agent_id.in_(agent_ids))
     if status_filter:
         query = query.where(ApprovalRequest.status == status_filter)
     query = query.order_by(ApprovalRequest.created_at.desc())
 
     result = await db.execute(query)
-    return [ApprovalRequestOut.model_validate(a) for a in result.scalars().all()]
+    approvals = result.scalars().all()
+
+    # Batch-load agent names
+    agent_ids_set = {a.agent_id for a in approvals}
+    agent_names: dict[uuid.UUID, str] = {}
+    if agent_ids_set:
+        agents_r = await db.execute(select(Agent.id, Agent.name).where(Agent.id.in_(agent_ids_set)))
+        agent_names = {row.id: row.name for row in agents_r.all()}
+
+    out = []
+    for a in approvals:
+        d = ApprovalRequestOut.model_validate(a)
+        d.agent_name = agent_names.get(a.agent_id)
+        out.append(d)
+    return out
 
 
 @router.post("/approvals/{approval_id}/resolve", response_model=ApprovalRequestOut)
