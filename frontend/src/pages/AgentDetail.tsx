@@ -932,9 +932,11 @@ function AgentDetailInner() {
                     // 4003 = Agent expired, 4002 = Config error (no model, setup failed)
                     if (e.code === 4003) setAgentExpired(true);
                     setWsConnected(false);
+                    setIsWaiting(false);
+                    setIsStreaming(false);
                     return;
                 }
-                if (!cancelled) { setWsConnected(false); setTimeout(connect, 2000); }
+                if (!cancelled) { setWsConnected(false); setIsWaiting(false); setIsStreaming(false); setTimeout(connect, 2000); }
             };
             ws.onerror = () => { if (!cancelled) setWsConnected(false); };
             ws.onmessage = (e) => {
