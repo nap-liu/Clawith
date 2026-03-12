@@ -2731,9 +2731,9 @@ function AgentDetailInner() {
                                             if (m.role === 'tool_call') {
                                                 let parsed: any = {}; try { parsed = typeof m.content === 'string' ? JSON.parse(m.content) : m.content; } catch { parsed = { name: 'tool', result: m.content }; }
                                                 return (
-                                                    <div key={i} style={{ display: 'flex', gap: '8px', marginBottom: '6px', paddingLeft: '36px' }}>
-                                                        <details style={{ flex: 1, borderRadius: '8px', background: 'var(--accent-subtle)', border: '1px solid var(--accent-subtle)', fontSize: '12px' }}>
-                                                            <summary style={{ padding: '6px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', userSelect: 'none', listStyle: 'none' }}>
+                                                    <div key={i} style={{ display: 'flex', gap: '8px', marginBottom: '6px', paddingLeft: '36px', minWidth: 0 }}>
+                                                        <details style={{ flex: 1, minWidth: 0, borderRadius: '8px', background: 'var(--accent-subtle)', border: '1px solid var(--accent-subtle)', fontSize: '12px', overflow: 'hidden' }}>
+                                                            <summary style={{ padding: '6px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', userSelect: 'none', listStyle: 'none', overflow: 'hidden' }}>
                                                                 <span style={{ fontWeight: 600, color: 'var(--accent-text)' }}>{parsed.name || 'tool'}</span>
                                                                 <span style={{ color: 'var(--text-tertiary)', fontSize: '11px', marginLeft: 'auto' }}>done</span>
                                                             </summary>
