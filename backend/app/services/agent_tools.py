@@ -2038,7 +2038,10 @@ async def _send_web_message(agent_id: uuid.UUID, args: dict) -> str:
 
 
 async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
-    """Send a message to another digital employee and have a multi-turn conversation."""
+    """Send a message to another digital employee. Uses a single request-response pattern:
+    the source agent sends a message, the target agent replies once, and the result is returned.
+    If the source agent needs to continue the conversation, it can call this tool again.
+    """
     agent_name = args.get("agent_name", "").strip()
     message_text = args.get("message", "").strip()
 
@@ -2050,14 +2053,9 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
         from app.models.audit import ChatMessage
         from app.models.chat_session import ChatSession
         from app.models.participant import Participant
-        from app.models.system_settings import SystemSetting
         from datetime import datetime, timezone
 
         async with async_session() as db:
-            # Read max_rounds from system settings
-            setting_r = await db.execute(select(SystemSetting).where(SystemSetting.key == "agent_conversation"))
-            setting = setting_r.scalar_one_or_none()
-            max_rounds = (setting.value.get("max_rounds", 5) if setting else 5)
             # Look up source agent
             src_result = await db.execute(select(Agent).where(Agent.id == from_agent_id))
             source_agent = src_result.scalar_one_or_none()
@@ -2083,9 +2081,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target.id))
             tgt_participant = tgt_part_r.scalar_one_or_none()
 
-            # Find or create ChatSession for this agent pair
-            # Use agent_id = source, peer_agent_id = target, source_channel = 'agent'
-            # Order the pair consistently so the same session is reused regardless of who initiates
+            # Find or create ChatSession for this agent pair (ordered consistently)
             session_agent_id = min(from_agent_id, target.id, key=str)
             session_peer_id = max(from_agent_id, target.id, key=str)
             sess_r = await db.execute(
@@ -2097,7 +2093,6 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             )
             chat_session = sess_r.scalar_one_or_none()
             if not chat_session:
-                # user_id = creator of the initiating agent (for backward compat)
                 owner_id = source_agent.creator_id if source_agent else from_agent_id
                 src_part_id = src_participant.id if src_participant else None
                 chat_session = ChatSession(
@@ -2113,12 +2108,11 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
             session_id = str(chat_session.id)
 
-            # Prepare LLM for both agents
+            # Prepare target LLM
             from app.services.agent_context import build_agent_context
             from app.models.llm import LLMModel
             import httpx
 
-            # Check target has LLM configured
             if not target.primary_model_id:
                 return f"⚠️ {target.name} has no LLM model configured"
 
@@ -2127,66 +2121,16 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             if not target_model:
                 return f"⚠️ {target.name}'s model configuration is invalid"
 
-            # Also load source agent's model (for multi-turn, source needs to respond too)
-            source_model = None
-            if source_agent and source_agent.primary_model_id:
-                sm_r = await db.execute(select(LLMModel).where(LLMModel.id == source_agent.primary_model_id))
-                source_model = sm_r.scalar_one_or_none()
-
-            # Conversation termination instruction — appended to both agents' system prompts
-            CONV_INSTRUCTION = (
-                "\n\n--- Agent-to-Agent Conversation Rules ---\n"
-                "You are now in a conversation with another digital employee. Communicate efficiently and stay on topic.\n"
-                "When you believe the conversation has achieved its purpose, information exchange is complete, "
-                "or there is nothing more valuable to add, append the marker [DONE] at the end of your reply.\n"
-                "Note: Only add [DONE] when you genuinely feel the conversation can naturally conclude. Do not end prematurely.\n"
+            # Build target system prompt
+            target_system = await build_agent_context(target.id, target.name, target.role_description or "")
+            target_system += (
+                "\n\n--- Agent-to-Agent Message ---\n"
+                "You are receiving a message from another digital employee. "
+                "Reply concisely and helpfully. Focus on the request and provide a clear answer.\n"
             )
 
-            # Build system prompts
-            target_system = await build_agent_context(target.id, target.name, target.role_description or "")
-            target_system += CONV_INSTRUCTION
-
-            source_system = ""
-            if source_agent:
-                source_system = await build_agent_context(source_agent.id, source_agent.name, source_agent.role_description or "")
-                source_system += CONV_INSTRUCTION
-
-            # Helper: call LLM
-            async def call_llm(model: LLMModel, system: str, messages_list: list[dict]) -> str:
-                from app.services.llm_utils import get_provider_base_url
-                base_url = get_provider_base_url(model.provider, model.base_url)
-                url = f"{base_url.rstrip('/')}/chat/completions"
-                full_msgs = [{"role": "system", "content": system}] + messages_list
-                async with httpx.AsyncClient(timeout=60) as client:
-                    resp = await client.post(
-                        url,
-                        json={"model": model.model, "messages": full_msgs, "temperature": 0.7, "max_tokens": 1024},
-                        headers={"Authorization": f"Bearer {model.api_key_encrypted}"},
-                    )
-                    data = resp.json()
-                if "choices" in data and data["choices"]:
-                    return data["choices"][0].get("message", {}).get("content", "")
-                return ""
-
-            # Save a message as ChatMessage
-            async def save_msg(sender_agent_id, content, role):
-                part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == sender_agent_id))
-                part = part_r.scalar_one_or_none()
-                owner_id = source_agent.creator_id if source_agent else from_agent_id
-                db.add(ChatMessage(
-                    agent_id=session_agent_id,
-                    user_id=owner_id,
-                    role=role,
-                    content=content,
-                    conversation_id=session_id,
-                    participant_id=part.id if part else None,
-                ))
-                await db.commit()
-
-            # -- Multi-turn conversation loop --
+            # Load recent history for context
             conversation_messages: list[dict] = []
-
-            # Load recent history from ChatMessage
             hist_result = await db.execute(
                 select(ChatMessage)
                 .where(
@@ -2197,85 +2141,76 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 .limit(6)
             )
             for m in reversed(hist_result.scalars().all()):
-                # Determine role from participant_id
                 if m.participant_id and src_participant and m.participant_id == src_participant.id:
                     role = "user"
                 else:
                     role = "assistant"
                 conversation_messages.append({"role": role, "content": m.content})
 
-            # Add the initial message from source
+            # Add the new message from source
             conversation_messages.append({"role": "user", "content": f"[From {source_name}] {message_text}"})
-            await save_msg(from_agent_id, message_text, "user")
 
-            # Update session timestamp
+            # Save source message
+            owner_id = source_agent.creator_id if source_agent else from_agent_id
+            db.add(ChatMessage(
+                agent_id=session_agent_id,
+                user_id=owner_id,
+                role="user",
+                content=message_text,
+                conversation_id=session_id,
+                participant_id=src_participant.id if src_participant else None,
+            ))
             chat_session.last_message_at = datetime.now(timezone.utc)
+            await db.commit()
 
-            transcript = []  # Human-readable transcript
-            transcript.append(f"📤 {source_name}: {message_text}")
+            # Call target LLM (single request-response)
+            from app.services.llm_utils import get_provider_base_url
+            base_url = get_provider_base_url(target_model.provider, target_model.base_url)
+            url = f"{base_url.rstrip('/')}/chat/completions"
+            full_msgs = [{"role": "system", "content": target_system}] + conversation_messages
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    url,
+                    json={"model": target_model.model, "messages": full_msgs, "temperature": 0.7, "max_tokens": 2048},
+                    headers={"Authorization": f"Bearer {target_model.api_key_encrypted}"},
+                )
+                data = resp.json()
 
-            for round_num in range(1, max_rounds + 1):
-                # -- Target agent responds --
-                target_reply = await call_llm(target_model, target_system, conversation_messages)
-                if not target_reply:
-                    transcript.append(f"⚠️ {target.name} no reply (LLM returned empty)")
-                    break
+            target_reply = ""
+            if "choices" in data and data["choices"]:
+                target_reply = data["choices"][0].get("message", {}).get("content", "")
 
-                # Check for DONE signal
-                target_done = "[DONE]" in target_reply
-                clean_reply = target_reply.replace("[DONE]", "").strip()
+            if not target_reply:
+                return f"⚠️ {target.name} did not respond (LLM returned empty)"
 
-                await save_msg(target.id, clean_reply, "assistant")
-                conversation_messages.append({"role": "assistant", "content": clean_reply})
-                transcript.append(f"💬 {target.name}: {clean_reply}")
+            # Save target reply
+            async with async_session() as db2:
+                part_r = await db2.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target.id))
+                tgt_part = part_r.scalar_one_or_none()
+                db2.add(ChatMessage(
+                    agent_id=session_agent_id,
+                    user_id=owner_id,
+                    role="assistant",
+                    content=target_reply,
+                    conversation_id=session_id,
+                    participant_id=tgt_part.id if tgt_part else None,
+                ))
+                await db2.commit()
 
-                if target_done:
-                    break  # Target feels conversation is complete
-
-                # -- Source agent responds (if has model and not last round) --
-                if round_num >= max_rounds:
-                    break  # Max rounds reached
-
-                if not source_model:
-                    break  # Source can't continue without a model
-
-                # Build messages from source's perspective (swap roles)
-                source_messages = []
-                for m in conversation_messages:
-                    if m["role"] == "user":
-                        source_messages.append({"role": "assistant", "content": m["content"]})
-                    else:
-                        source_messages.append({"role": "user", "content": f"[From {target.name}] {m['content']}"})
-
-                source_reply = await call_llm(source_model, source_system, source_messages)
-                if not source_reply:
-                    break
-
-                source_done = "[DONE]" in source_reply
-                clean_source = source_reply.replace("[DONE]", "").strip()
-
-                await save_msg(from_agent_id, clean_source, "user")
-                conversation_messages.append({"role": "user", "content": clean_source})
-                transcript.append(f"📤 {source_name}: {clean_source}")
-
-                if source_done:
-                    break  # Source feels conversation is complete
-
-            # Log activity for both agents
+            # Log activity
             from app.services.activity_logger import log_activity
-            round_count = len([t for t in transcript if t.startswith("💬") or t.startswith("📤")])
             await log_activity(
                 target.id, "agent_msg_sent",
-                f"Had {round_count} rounds of conversation with {source_name}",
-                detail={"partner": source_name, "rounds": round_count, "transcript": "\n".join(transcript)[:2000]},
+                f"Replied to message from {source_name}",
+                detail={"partner": source_name, "message": message_text[:200], "reply": target_reply[:200]},
             )
             await log_activity(
                 from_agent_id, "agent_msg_sent",
-                f"Had {round_count} rounds of conversation with {target.name}",
-                detail={"partner": target.name, "rounds": round_count, "transcript": "\n".join(transcript)[:2000]},
+                f"Sent message to {target.name} and received reply",
+                detail={"partner": target.name, "message": message_text[:200], "reply": target_reply[:200]},
             )
 
-            return "💬 Conversation transcript:\n" + "\n".join(transcript)
+            return f"💬 {target.name} replied:\n{target_reply}"
 
     except Exception as e:
         import traceback
@@ -2283,7 +2218,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
         return f"❌ Message send error: {str(e)[:200]}"
 
 
-# ═══════════════════════════════════════════════════════
+
 # Plaza Tools — Agent Square social feed
 # ═══════════════════════════════════════════════════════
 

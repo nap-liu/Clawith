@@ -270,19 +270,13 @@ function ThemeColorPicker() {
 function PlatformSettings() {
     const { t } = useTranslation();
     const [publicBaseUrl, setPublicBaseUrl] = useState('');
-    const [maxRounds, setMaxRounds] = useState(5);
     const [saving, setSaving] = useState(false);
     const [saved, setSaved] = useState(false);
 
     useEffect(() => {
-        // Load platform settings
         fetchJson<any>('/enterprise/system-settings/platform')
             .then(d => {
                 if (d.value?.public_base_url) setPublicBaseUrl(d.value.public_base_url);
-            }).catch(() => { });
-        fetchJson<any>('/enterprise/system-settings/agent_conversation')
-            .then(d => {
-                if (d.value?.max_rounds) setMaxRounds(d.value.max_rounds);
             }).catch(() => { });
     }, []);
 
@@ -291,9 +285,6 @@ function PlatformSettings() {
         try {
             await fetchJson('/enterprise/system-settings/platform', {
                 method: 'PUT', body: JSON.stringify({ value: { public_base_url: publicBaseUrl } }),
-            });
-            await fetchJson('/enterprise/system-settings/agent_conversation', {
-                method: 'PUT', body: JSON.stringify({ value: { max_rounds: Number(maxRounds) } }),
             });
             setSaved(true);
             setTimeout(() => setSaved(false), 2000);
@@ -304,22 +295,12 @@ function PlatformSettings() {
 
     return (
         <div className="card" style={{ padding: '16px' }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
-                <div className="form-group">
-                    <label className="form-label">{t('enterprise.config.publicUrl')}</label>
-                    <input className="form-input" value={publicBaseUrl} onChange={e => setPublicBaseUrl(e.target.value)}
-                        placeholder={t("enterprise.config.publicUrlPlaceholder")} />
-                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                        {t('enterprise.config.publicUrl')}
-                    </div>
-                </div>
-                <div className="form-group">
-                    <label className="form-label">{t('enterprise.config.maxRounds')}</label>
-                    <input className="form-input" type="number" min={1} max={20} value={maxRounds}
-                        onChange={e => setMaxRounds(Number(e.target.value))} />
-                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                        {t('enterprise.config.maxRoundsDesc', 'Maximum number of conversation rounds between two agents in a single interaction. Controls how many back-and-forth messages agents can exchange when collaborating.')}
-                    </div>
+            <div className="form-group">
+                <label className="form-label">{t('enterprise.config.publicUrl')}</label>
+                <input className="form-input" value={publicBaseUrl} onChange={e => setPublicBaseUrl(e.target.value)}
+                    placeholder={t("enterprise.config.publicUrlPlaceholder")} />
+                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                    {t('enterprise.config.publicUrl')}
                 </div>
             </div>
             <div style={{ marginTop: '12px', display: 'flex', gap: '8px', alignItems: 'center' }}>
