@@ -1327,8 +1327,3 @@ select:focus {
     transform: scale(1);
   }
 }
-
-/* Agent row pin button — show on hover */
-div:hover > div > .pin-btn {
-  opacity: 1 !important;
-}

@@ -199,11 +199,12 @@ function AgentRow({ agent, tasks, recentActivity, isPinned, onTogglePin }: {
                     style={{
                         background: 'none', border: 'none', cursor: 'pointer', padding: '2px',
                         color: isPinned ? 'var(--primary)' : 'var(--text-tertiary)',
-                        opacity: isPinned ? 1 : 0,
+                        opacity: isPinned ? 1 : 0.25,
                         transition: 'opacity 120ms, color 120ms',
                         fontSize: '12px', flexShrink: 0,
                     }}
-                    className="pin-btn"
+                    onMouseEnter={e => { if (!isPinned) (e.currentTarget as HTMLElement).style.opacity = '0.7'; }}
+                    onMouseLeave={e => { if (!isPinned) (e.currentTarget as HTMLElement).style.opacity = '0.25'; }}
                 >
                     <svg width="14" height="14" viewBox="0 0 24 24" fill={isPinned ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                         <path d="M12 17v5" /><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16h14v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V5a1 1 0 0 1 1-1h1V2H7v2h1a1 1 0 0 1 1 1z" />
