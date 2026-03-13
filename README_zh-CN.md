@@ -201,7 +201,7 @@ git clone https://gitclone.com/github.com/dataelement/Clawith.git
 
 ## ⭐ Star History
 
-[![Star History Chart](https://api.star-history.com/image?repos=dataelement/Clawith&type=date&legend=top-left)](https://www.star-history.com/?repos=dataelement%2FClawith&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/image?repos=dataelement/Clawith&type=date&legend=top-left&v=2)](https://www.star-history.com/?repos=dataelement%2FClawith&type=date&legend=top-left)
 
 ## 📄 许可证
 

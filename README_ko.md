@@ -122,7 +122,7 @@ bash restart.sh   # 서비스 시작
 
 ## ⭐ Star History
 
-[![Star History Chart](https://api.star-history.com/image?repos=dataelement/Clawith&type=date&legend=top-left)](https://www.star-history.com/?repos=dataelement%2FClawith&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/image?repos=dataelement/Clawith&type=date&legend=top-left&v=2)](https://www.star-history.com/?repos=dataelement%2FClawith&type=date&legend=top-left)
 
 ## 📄 라이선스
 
