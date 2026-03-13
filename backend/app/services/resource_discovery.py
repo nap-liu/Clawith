@@ -287,6 +287,38 @@ async def import_mcp_from_smithery(
     except Exception:
         pass  # non-critical — key is still usable from MCP tool configs
 
+    # ---- Early exit: check if this server's tools are already installed for this agent ----
+    clean_id_check = server_id.replace("/", "_").replace("@", "")
+    try:
+        async with async_session() as db:
+            existing_server_r = await db.execute(
+                select(Tool).where(
+                    Tool.name.like(f"mcp_{clean_id_check}%"),
+                    Tool.type == "mcp",
+                )
+            )
+            existing_server_tools = existing_server_r.scalars().all()
+            if existing_server_tools and not config:
+                # Check if this agent has assignments for these tools
+                tool_ids = [t.id for t in existing_server_tools]
+                agent_assignments_r = await db.execute(
+                    select(AgentTool).where(
+                        AgentTool.agent_id == agent_id,
+                        AgentTool.tool_id.in_(tool_ids),
+                    )
+                )
+                agent_assignments = agent_assignments_r.scalars().all()
+                if len(agent_assignments) >= len(existing_server_tools):
+                    tool_names = [t.display_name for t in existing_server_tools[:5]]
+                    more = f" ... and {len(existing_server_tools) - 5} more" if len(existing_server_tools) > 5 else ""
+                    return (
+                        f"⏭️ You already have **{len(existing_server_tools)}** tools from this MCP server installed:\n"
+                        + "\n".join(f"  • {n}" for n in tool_names) + more
+                        + "\n\nNo action needed. These tools are ready to use."
+                    )
+    except Exception:
+        pass  # non-critical — proceed to normal import flow
+
     # Step 1: Search for server by ID
     headers = {"Accept": "application/json"}
 
