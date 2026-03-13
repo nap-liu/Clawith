@@ -5,6 +5,7 @@ Each agent stores its own email credentials in per-agent tool config.
 """
 
 import imaplib
+import socket
 import smtplib
 import ssl
 import email as email_lib
@@ -81,6 +82,21 @@ EMAIL_PROVIDERS = {
         "help_text": "Use your email password directly",
     },
 }
+
+
+def _resolve_ipv4(hostname: str) -> str:
+    """Resolve hostname to an IPv4 address.
+
+    Docker containers often lack IPv6 support, causing [Errno 99] when
+    Python's default DNS resolution picks an AAAA record first.
+    """
+    try:
+        results = socket.getaddrinfo(hostname, None, socket.AF_INET)
+        if results:
+            return results[0][4][0]
+    except socket.gaierror:
+        pass
+    return hostname  # Fallback to original hostname
 
 
 def resolve_config(config: dict) -> dict:
@@ -199,10 +215,12 @@ async def send_email(
                 msg.attach(part)
 
     try:
+        smtp_ip = _resolve_ipv4(cfg["smtp_host"])
         if cfg.get("smtp_ssl", True):
             # Direct SSL connection (port 465)
             context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"], context=context, timeout=15) as server:
+            with smtplib.SMTP_SSL(smtp_ip, cfg["smtp_port"], context=context, timeout=15) as server:
+                server.ehlo(cfg["smtp_host"])
                 server.login(addr, password)
                 recipients = [r.strip() for r in to.split(",")]
                 if cc:
@@ -210,10 +228,10 @@ async def send_email(
                 server.sendmail(addr, recipients, msg.as_string())
         else:
             # STARTTLS connection (port 587)
-            with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=15) as server:
-                server.ehlo()
+            with smtplib.SMTP(smtp_ip, cfg["smtp_port"], timeout=15) as server:
+                server.ehlo(cfg["smtp_host"])
                 server.starttls(context=ssl.create_default_context())
-                server.ehlo()
+                server.ehlo(cfg["smtp_host"])
                 server.login(addr, password)
                 recipients = [r.strip() for r in to.split(",")]
                 if cc:
@@ -252,7 +270,8 @@ async def read_emails(
 
     try:
         context = ssl.create_default_context()
-        with imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"], ssl_context=context) as mail:
+        imap_ip = _resolve_ipv4(cfg["imap_host"])
+        with imaplib.IMAP4_SSL(imap_ip, cfg["imap_port"], ssl_context=context) as mail:
             mail.login(addr, password)
             mail.select(folder, readonly=True)
 
@@ -332,10 +351,11 @@ async def reply_email(
     try:
         # First, fetch the original email to get From/Subject
         context = ssl.create_default_context()
+        imap_ip = _resolve_ipv4(cfg["imap_host"])
         original_from = ""
         original_subject = ""
 
-        with imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"], ssl_context=context) as mail:
+        with imaplib.IMAP4_SSL(imap_ip, cfg["imap_port"], ssl_context=context) as mail:
             mail.login(addr, password)
             mail.select(folder, readonly=True)
             _, msg_nums = mail.search(None, f'HEADER Message-ID "{message_id}"')
@@ -363,16 +383,18 @@ async def reply_email(
         reply_msg.attach(MIMEText(body, "plain", "utf-8"))
 
         # Send
+        smtp_ip = _resolve_ipv4(cfg["smtp_host"])
         if cfg.get("smtp_ssl", True):
             ctx = ssl.create_default_context()
-            with smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"], context=ctx, timeout=15) as server:
+            with smtplib.SMTP_SSL(smtp_ip, cfg["smtp_port"], context=ctx, timeout=15) as server:
+                server.ehlo(cfg["smtp_host"])
                 server.login(addr, password)
                 server.sendmail(addr, [reply_msg["To"]], reply_msg.as_string())
         else:
-            with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=15) as server:
-                server.ehlo()
+            with smtplib.SMTP(smtp_ip, cfg["smtp_port"], timeout=15) as server:
+                server.ehlo(cfg["smtp_host"])
                 server.starttls(context=ssl.create_default_context())
-                server.ehlo()
+                server.ehlo(cfg["smtp_host"])
                 server.login(addr, password)
                 server.sendmail(addr, [reply_msg["To"]], reply_msg.as_string())
 
@@ -398,8 +420,9 @@ async def test_connection(config: dict) -> dict:
 
     # Test IMAP
     try:
+        imap_ip = _resolve_ipv4(cfg["imap_host"])
         context = ssl.create_default_context()
-        with imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"], ssl_context=context) as mail:
+        with imaplib.IMAP4_SSL(imap_ip, cfg["imap_port"], ssl_context=context) as mail:
             mail.login(addr, password)
             mail.select("INBOX", readonly=True)
             _, msg_nums = mail.search(None, "ALL")
@@ -414,16 +437,18 @@ async def test_connection(config: dict) -> dict:
 
     # Test SMTP
     try:
+        smtp_ip = _resolve_ipv4(cfg["smtp_host"])
         if cfg.get("smtp_ssl", True):
             context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"], context=context, timeout=10) as server:
+            with smtplib.SMTP_SSL(smtp_ip, cfg["smtp_port"], context=context, timeout=10) as server:
+                server.ehlo(cfg["smtp_host"])
                 server.login(addr, password)
                 result["smtp"] = "✅ SMTP connected"
         else:
-            with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=10) as server:
-                server.ehlo()
+            with smtplib.SMTP(smtp_ip, cfg["smtp_port"], timeout=10) as server:
+                server.ehlo(cfg["smtp_host"])
                 server.starttls(context=ssl.create_default_context())
-                server.ehlo()
+                server.ehlo(cfg["smtp_host"])
                 server.login(addr, password)
                 result["smtp"] = "✅ SMTP connected"
     except smtplib.SMTPAuthenticationError:
