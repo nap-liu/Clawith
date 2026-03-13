@@ -1016,6 +1016,42 @@ _TOOL_AUTONOMY_MAP = {
 }
 
 
+async def _execute_tool_direct(
+    tool_name: str,
+    arguments: dict,
+    agent_id: uuid.UUID,
+) -> str:
+    """Execute a tool directly, bypassing autonomy checks.
+
+    Used by the approval post-processing hook after an action
+    has been approved and needs to actually run.
+    """
+    ws = await ensure_workspace(agent_id)
+    try:
+        if tool_name == "delete_file":
+            return _delete_file(ws, arguments.get("path", ""))
+        elif tool_name == "write_file":
+            path = arguments.get("path")
+            content = arguments.get("content", "")
+            if not path:
+                return "Missing path"
+            return _write_file(ws, path, content)
+        elif tool_name == "execute_code":
+            return await _execute_code(agent_id, ws, arguments)
+        elif tool_name == "web_search":
+            return await _web_search(arguments)
+        elif tool_name == "jina_search":
+            return await _jina_search(arguments)
+        elif tool_name == "send_feishu_message":
+            return await _send_feishu_message(agent_id, arguments)
+        elif tool_name == "send_message_to_agent":
+            return await _send_message_to_agent(agent_id, arguments)
+        else:
+            return f"Tool {tool_name} does not support post-approval execution"
+    except Exception as e:
+        return f"Error executing {tool_name}: {e}"
+
+
 async def execute_tool(
     tool_name: str,
     arguments: dict,

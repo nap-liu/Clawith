@@ -123,22 +123,68 @@ class AutonomyService:
             details={"approval_id": str(approval.id), "action_type": approval.action_type},
         ))
 
+        # Post-processing: execute the approved action
+        execution_result = None
+        if approval.status == "approved" and approval.details:
+            execution_result = await self._execute_approved_action(
+                approval.agent_id, approval.action_type, approval.details
+            )
+            logger.info(f"Post-approval execution for {approval.action_type}: {execution_result}")
+
         # Web notification to agent creator about the result
         if agent:
             from app.services.notification_service import send_notification
             status_label = "approved" if approval.status == "approved" else "rejected"
+            body_text = json.dumps(approval.details, ensure_ascii=False)[:200]
+            if execution_result:
+                body_text = f"Result: {execution_result}"
             await send_notification(
                 db,
                 user_id=agent.creator_id,
                 type="approval_resolved",
                 title=f"[{agent.name}] {approval.action_type} — {status_label}",
-                body=json.dumps(approval.details, ensure_ascii=False)[:200],
+                body=body_text,
                 link=f"/agents/{agent.id}#approvals",
                 ref_id=approval.id,
             )
 
         await db.flush()
         return approval
+
+    async def _execute_approved_action(
+        self, agent_id: uuid.UUID, action_type: str, details: dict
+    ) -> str | None:
+        """Execute the tool action that was approved.
+
+        Reads the tool name and arguments from the approval details,
+        then directly calls the tool executor (bypassing autonomy check).
+        """
+        tool_name = details.get("tool")
+        args_raw = details.get("args", "{}")
+        if not tool_name:
+            return None
+
+        try:
+            # Parse args — stored as str(dict) so we need ast.literal_eval
+            import ast
+            if isinstance(args_raw, str):
+                try:
+                    arguments = ast.literal_eval(args_raw)
+                except (ValueError, SyntaxError):
+                    try:
+                        arguments = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        arguments = {}
+            else:
+                arguments = args_raw
+
+            # Import and call the tool's direct executor (no autonomy re-check)
+            from app.services.agent_tools import _execute_tool_direct
+            result = await _execute_tool_direct(tool_name, arguments, agent_id)
+            return result
+        except Exception as e:
+            logger.error(f"Failed to execute approved action {tool_name}: {e}")
+            return f"Execution failed: {e}"
 
     async def _notify_creator(self, db: AsyncSession, agent: Agent,
                                action_type: str, details: dict) -> None:
