@@ -807,6 +807,10 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 if not enabled:
                     continue
 
+                # Skip feishu tools if the agent has no Feishu channel configured
+                if t.category == "feishu" and not has_feishu:
+                    continue
+
                 # Build OpenAI function-calling format
                 tool_def = {
                     "type": "function",
