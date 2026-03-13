@@ -634,7 +634,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "import_mcp_server",
-            "description": "Import an MCP server from Smithery registry into the platform. The server's tools become available for use. Use discover_resources first to find the server ID.",
+            "description": "Import an MCP server from Smithery registry into the platform. The server's tools become available for use. Use discover_resources first to find the server ID. If previously imported tools stopped working (e.g. OAuth expired), set reauthorize=true to re-run the authorization flow.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -645,6 +645,10 @@ AGENT_TOOLS = [
                     "config": {
                         "type": "object",
                         "description": "Optional server configuration (e.g. API keys required by the server)",
+                    },
+                    "reauthorize": {
+                        "type": "boolean",
+                        "description": "Set to true to force re-authorization of existing tools (e.g. when OAuth token has expired)",
                     },
                 },
                 "required": ["server_id"],
@@ -2628,6 +2632,7 @@ async def _discover_resources(arguments: dict) -> str:
 async def _import_mcp_server(agent_id: uuid.UUID, arguments: dict) -> str:
     """Import an MCP server — either from Smithery or by direct URL."""
     config = arguments.get("config") or {}
+    reauthorize = arguments.get("reauthorize", False)
     mcp_url = config.pop("mcp_url", None) if isinstance(config, dict) else None
 
     if mcp_url:
@@ -2643,7 +2648,7 @@ async def _import_mcp_server(agent_id: uuid.UUID, arguments: dict) -> str:
         return "❌ Please provide a server_id (e.g. 'github'). Use discover_resources first to find available servers."
 
     from app.services.resource_discovery import import_mcp_from_smithery
-    return await import_mcp_from_smithery(server_id, agent_id, config or None)
+    return await import_mcp_from_smithery(server_id, agent_id, config or None, reauthorize=reauthorize)
 
 
 # ─── Trigger Management Handlers (Pulse Engine) ────────────────────

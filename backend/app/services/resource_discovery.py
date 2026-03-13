@@ -239,6 +239,7 @@ async def import_mcp_from_smithery(
     server_id: str,
     agent_id: uuid.UUID,
     config: dict | None = None,
+    reauthorize: bool = False,
 ) -> str:
     """Import an MCP server from Smithery into the platform.
 
@@ -304,7 +305,7 @@ async def import_mcp_from_smithery(
                 )
             )
             existing_server_tools = existing_server_r.scalars().all()
-            if existing_server_tools and not config:
+            if existing_server_tools and not config and not reauthorize:
                 # Check if this agent has assignments for these tools
                 tool_ids = [t.id for t in existing_server_tools]
                 agent_assignments_r = await db.execute(
@@ -321,6 +322,7 @@ async def import_mcp_from_smithery(
                         f"⏭️ You already have **{len(existing_server_tools)}** tools from this MCP server installed:\n"
                         + "\n".join(f"  • {n}" for n in tool_names) + more
                         + "\n\nNo action needed. These tools are ready to use."
+                        + "\n\n💡 If tools stopped working (e.g. OAuth expired), use `import_mcp_server(server_id=\"....\", reauthorize=true)` to re-authorize."
                     )
     except Exception:
         pass  # non-critical — proceed to normal import flow
@@ -436,8 +438,8 @@ async def import_mcp_from_smithery(
                     config=agent_tool_config,
                 ))
 
-        # On re-import with config: update ALL existing tools for this server
-        if config:
+        # On re-import/reauthorize: update ALL existing tools for this server
+        if config or reauthorize:
             existing_server_tools_r = await db.execute(
                 select(Tool).where(Tool.mcp_server_name == display_name, Tool.type == "mcp")
             )
@@ -467,7 +469,9 @@ async def import_mcp_from_smithery(
                 if existing_tool:
                     existing_tool.mcp_server_url = base_mcp_url
                     await _ensure_agent_tool(existing_tool.id)
-                    if config:
+                    if reauthorize:
+                        imported_tools.append(f"🔄 {tool_display} (reauthorized)")
+                    elif config:
                         imported_tools.append(f"🔄 {tool_display} (config updated)")
                     else:
                         imported_tools.append(f"⏭️ {tool_display} (already imported)")
