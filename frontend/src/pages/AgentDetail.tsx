@@ -26,6 +26,12 @@ const getCategoryLabels = (t: any): Record<string, string> => ({
     task: t('agent.toolCategories.task'),
     communication: t('agent.toolCategories.communication'),
     search: t('agent.toolCategories.search'),
+    pulse: t('agent.toolCategories.pulse', 'Pulse & Triggers'),
+    social: t('agent.toolCategories.social', 'Social'),
+    code: t('agent.toolCategories.code', 'Code & Execution'),
+    discovery: t('agent.toolCategories.discovery', 'Discovery'),
+    email: t('agent.toolCategories.email', 'Email'),
+    feishu: t('agent.toolCategories.feishu', 'Feishu / Lark'),
     custom: t('agent.toolCategories.custom'),
     general: t('agent.toolCategories.general'),
 });
