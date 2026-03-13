@@ -864,14 +864,28 @@ async def seed_builtin_tools():
                     new_tool_ids.append(tool.id)
                 print(f"[ToolSeeder] Created builtin tool: {t['name']}")
             else:
-                # Update config_schema for existing tools (schema may evolve)
+                # Sync fields that may evolve
+                updated_fields = []
+                if existing.category != t["category"]:
+                    existing.category = t["category"]
+                    updated_fields.append("category")
+                if existing.description != t["description"]:
+                    existing.description = t["description"]
+                    updated_fields.append("description")
+                if existing.display_name != t["display_name"]:
+                    existing.display_name = t["display_name"]
+                    updated_fields.append("display_name")
+                if existing.icon != t["icon"]:
+                    existing.icon = t["icon"]
+                    updated_fields.append("icon")
                 if t.get("config_schema") and existing.config_schema != t["config_schema"]:
                     existing.config_schema = t["config_schema"]
-                    print(f"[ToolSeeder] Updated config_schema: {t['name']}")
-                # Set default config if empty
+                    updated_fields.append("config_schema")
                 if not existing.config and t.get("config"):
                     existing.config = t["config"]
-                    print(f"[ToolSeeder] Set default config: {t['name']}")
+                    updated_fields.append("config")
+                if updated_fields:
+                    print(f"[ToolSeeder] Updated {', '.join(updated_fields)}: {t['name']}")
 
         # Auto-assign new default tools to all existing agents
         if new_tool_ids:
