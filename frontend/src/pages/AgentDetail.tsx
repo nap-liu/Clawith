@@ -1641,7 +1641,14 @@ function AgentDetailInner() {
                                     </span>
                                 )}
                                 {(agent as any).is_expired && (
-                                    <span style={{ background: 'var(--error)', color: '#fff', padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: 600 }}>⏰ Expired</span>
+                                    <span style={{ background: 'var(--error)', color: '#fff', padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: 600 }}>Expired</span>
+                                )}
+                                {(agent as any).agent_type === 'openclaw' && (
+                                    <span style={{
+                                        fontSize: '10px', padding: '2px 6px', borderRadius: '4px',
+                                        background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', color: '#fff', fontWeight: 600,
+                                        letterSpacing: '0.5px',
+                                    }}>OpenClaw · Lab</span>
                                 )}
                                 {!(agent as any).is_expired && (agent as any).expires_at && (
                                     <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
@@ -1662,11 +1669,15 @@ function AgentDetailInner() {
                     </div>
                     <div style={{ display: 'flex', gap: '8px' }}>
                         <button className="btn btn-primary" onClick={() => setActiveTab('chat')}>{t('agent.actions.chat')}</button>
-                        {agent.status === 'stopped' ? (
-                            <button className="btn btn-secondary" onClick={async () => { await agentApi.start(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.start')}</button>
-                        ) : agent.status === 'running' ? (
-                            <button className="btn btn-secondary" onClick={async () => { await agentApi.stop(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.stop')}</button>
-                        ) : null}
+                        {(agent as any)?.agent_type !== 'openclaw' && (
+                            <>
+                                {agent.status === 'stopped' ? (
+                                    <button className="btn btn-secondary" onClick={async () => { await agentApi.start(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.start')}</button>
+                                ) : agent.status === 'running' ? (
+                                    <button className="btn btn-secondary" onClick={async () => { await agentApi.stop(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.stop')}</button>
+                                ) : null}
+                            </>
+                        )}
                     </div>
                 </div>
 
@@ -1675,7 +1686,11 @@ function AgentDetailInner() {
                     {TABS.filter(tab => {
                         // 'use' access: hide settings and approvals tabs
                         if ((agent as any)?.access_level === 'use') {
-                            return tab !== 'settings' && tab !== 'approvals';
+                            if (tab === 'settings' || tab === 'approvals') return false;
+                        }
+                        // OpenClaw agents: only show status, chat, activityLog, approvals, settings
+                        if ((agent as any)?.agent_type === 'openclaw') {
+                            return ['status', 'chat', 'activityLog', 'approvals', 'settings'].includes(tab);
                         }
                         return true;
                     }).map((tab) => (

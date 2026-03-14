@@ -129,7 +129,7 @@ export const agentApi = {
     get: (id: string) => request<Agent>(`/agents/${id}`),
 
     create: (data: any) =>
-        request<Agent>('/agents/', { method: 'POST', body: JSON.stringify(data) }),
+        request<any>('/agents/', { method: 'POST', body: JSON.stringify(data) }),
 
     update: (id: string, data: Partial<Agent>) =>
         request<Agent>(`/agents/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
@@ -151,6 +151,13 @@ export const agentApi = {
 
     templates: () =>
         request<any[]>('/agents/templates'),
+
+    // OpenClaw gateway
+    generateApiKey: (id: string) =>
+        request<{ api_key: string; message: string }>(`/agents/${id}/api-key`, { method: 'POST' }),
+
+    gatewayMessages: (id: string) =>
+        request<any[]>(`/agents/${id}/gateway-messages`),
 };
 
 // ─── Tasks ────────────────────────────────────────────
