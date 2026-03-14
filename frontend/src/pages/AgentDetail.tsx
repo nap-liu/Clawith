@@ -3012,6 +3012,7 @@ function AgentDetailInner() {
                                                     );
                                                 }
                                                 {/* Assistant message with no text content: show inline thinking or skip */}
+                                                if (msg.role === 'assistant') console.log('[DBG] assistant msg:', i, 'content:', JSON.stringify(msg.content), 'thinking:', !!msg.thinking, '_streaming:', !!(msg as any)._streaming, 'contentFalsy:', !msg.content);
                                                 if (msg.role === 'assistant' && !msg.content) {
                                                     if (msg.thinking) {
                                                         return (
@@ -3225,6 +3226,7 @@ function AgentDetailInner() {
                                 {/* Filter tabs */}
                                 <div style={{ display: 'flex', gap: '6px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
                                     {filterBtn('user', '👤 ' + t('agent.activityLog.userActions', 'User Actions'))}
+                                    {(agent as any)?.agent_type !== 'openclaw' && (<>
                                     {filterBtn('backend', '⚙️ ' + t('agent.activityLog.backendServices', 'Backend Services'))}
                                     {(logFilter === 'backend' || logFilter === 'heartbeat' || logFilter === 'schedule' || logFilter === 'messages') && (
                                         <>
@@ -3234,6 +3236,7 @@ function AgentDetailInner() {
                                             {filterBtn('messages', '📨 Messages', true)}
                                         </>
                                     )}
+                                    </>)}
                                 </div>
 
                                 {filteredLogs.length > 0 ? (
