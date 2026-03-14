@@ -1069,6 +1069,11 @@ function AgentDetailInner() {
                             const last = prev[lastIdx];
                             if (last && last.role === 'tool_call' && last.toolName === d.name && last.toolStatus === 'running') return [...prev.slice(0, lastIdx), toolMsg];
                         }
+                        // Remove orphaned empty streaming assistant message (thinking-only, no content)
+                        const last = prev[prev.length - 1];
+                        if (last && last.role === 'assistant' && (last as any)._streaming && !last.content) {
+                            return [...prev.slice(0, -1), toolMsg];
+                        }
                         return [...prev, toolMsg];
                     });
                 } else if (d.type === 'chunk') {
