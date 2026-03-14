@@ -199,53 +199,137 @@ export default function AgentCreate() {
         );
     }
 
+    // ── Type Selector (shared between both modes) ──
+    const typeSelector = (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', maxWidth: '640px', marginBottom: '24px' }}>
+            <div
+                onClick={() => { setAgentType('native'); setStep(0); }}
+                style={{
+                    padding: '16px', borderRadius: '8px', cursor: 'pointer',
+                    border: `1.5px solid ${agentType === 'native' ? 'var(--accent-primary)' : 'var(--border-default)'}`,
+                    background: agentType === 'native' ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
+                }}
+            >
+                <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>{t('openclaw.nativeTitle', 'Platform Hosted')}</div>
+                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('openclaw.nativeDesc', 'Full agent running on Clawith platform')}</div>
+            </div>
+            <div
+                onClick={() => { setAgentType('openclaw'); setStep(0); }}
+                style={{
+                    padding: '16px', borderRadius: '8px', cursor: 'pointer', position: 'relative',
+                    border: `1.5px solid ${agentType === 'openclaw' ? 'var(--accent-primary)' : 'var(--border-default)'}`,
+                    background: agentType === 'openclaw' ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
+                }}
+            >
+                <span style={{
+                    position: 'absolute', top: '8px', right: '8px',
+                    fontSize: '10px', padding: '2px 6px', borderRadius: '4px',
+                    background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', color: '#fff', fontWeight: 600,
+                    letterSpacing: '0.5px',
+                }}>Lab</span>
+                <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>{t('openclaw.openclawTitle', 'Link OpenClaw')}</div>
+                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('openclaw.openclawDesc', 'Connect your existing OpenClaw agent')}</div>
+            </div>
+        </div>
+    );
+
+    // ── OpenClaw mode: completely separate page ──
+    if (agentType === 'openclaw') {
+        return (
+            <div>
+                <div className="page-header">
+                    <h1 className="page-title">{t('nav.newAgent')}</h1>
+                </div>
+
+                {typeSelector}
+
+                {error && (
+                    <div style={{ background: 'var(--error-subtle)', color: 'var(--error)', padding: '8px 12px', borderRadius: '6px', fontSize: '13px', marginBottom: '16px', maxWidth: '640px' }}>
+                        {error}
+                    </div>
+                )}
+
+                <div className="card" style={{ maxWidth: '640px' }}>
+                    <h3 style={{ marginBottom: '6px', fontWeight: 600, fontSize: '15px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {t('openclaw.basicTitle', 'Link OpenClaw Agent')}
+                        <span style={{
+                            fontSize: '10px', padding: '2px 6px', borderRadius: '4px',
+                            background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', color: '#fff', fontWeight: 600,
+                        }}>Lab</span>
+                    </h3>
+                    <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '20px' }}>
+                        {t('openclaw.basicDesc', 'Give your OpenClaw agent a name and description. The LLM model, personality, and skills are configured on your OpenClaw instance.')}
+                    </p>
+
+                    <div className="form-group">
+                        <label className="form-label">{t('agent.fields.name')} *</label>
+                        <input className="form-input" value={form.name}
+                            onChange={(e) => setForm({ ...form, name: e.target.value })}
+                            placeholder={t('openclaw.namePlaceholder', 'e.g. My OpenClaw Bot')} autoFocus />
+                    </div>
+                    <div className="form-group">
+                        <label className="form-label">{t('agent.fields.role')}</label>
+                        <input className="form-input" value={form.role_description}
+                            onChange={(e) => setForm({ ...form, role_description: e.target.value })}
+                            placeholder={t('openclaw.rolePlaceholder', 'e.g. Personal assistant running on my Mac')} />
+                    </div>
+
+                    {/* Permissions */}
+                    <div className="form-group" style={{ marginTop: '8px' }}>
+                        <label className="form-label">{t('wizard.step4.title')}</label>
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                            {[
+                                { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
+                                { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
+                            ].map((scope) => (
+                                <label key={scope.value} style={{
+                                    flex: 1, display: 'flex', alignItems: 'center', gap: '10px', padding: '12px',
+                                    background: form.permission_scope_type === scope.value ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
+                                    border: `1px solid ${form.permission_scope_type === scope.value ? 'var(--accent-primary)' : 'var(--border-default)'}`,
+                                    borderRadius: '8px', cursor: 'pointer',
+                                }}>
+                                    <input type="radio" name="scope" checked={form.permission_scope_type === scope.value}
+                                        onChange={() => setForm({ ...form, permission_scope_type: scope.value })} />
+                                    <div>
+                                        <div style={{ fontWeight: 500, fontSize: '13px' }}>{scope.label}</div>
+                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{scope.desc}</div>
+                                    </div>
+                                </label>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* Actions */}
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '24px' }}>
+                        <button className="btn btn-secondary" onClick={() => navigate('/')}>{t('common.cancel')}</button>
+                        <button className="btn btn-primary" onClick={handleFinish}
+                            disabled={createMutation.isPending || !form.name}>
+                            {createMutation.isPending ? t('common.loading') : t('openclaw.createBtn', 'Link Agent')}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    // ── Native mode: original multi-step wizard ──
     return (
         <div>
             <div className="page-header">
                 <h1 className="page-title">{t('nav.newAgent')}</h1>
             </div>
 
-            {/* Agent Type Selector */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', maxWidth: '640px', marginBottom: '24px' }}>
-                <div
-                    onClick={() => { setAgentType('native'); setStep(0); }}
-                    style={{
-                        padding: '16px', borderRadius: '8px', cursor: 'pointer',
-                        border: `1.5px solid ${agentType === 'native' ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-                        background: agentType === 'native' ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
-                    }}
-                >
-                    <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>{t('openclaw.nativeTitle', 'Platform Hosted')}</div>
-                    <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('openclaw.nativeDesc', 'Full agent running on Clawith platform')}</div>
-                </div>
-                <div
-                    onClick={() => { setAgentType('openclaw'); setStep(0); }}
-                    style={{
-                        padding: '16px', borderRadius: '8px', cursor: 'pointer', position: 'relative',
-                        border: `1.5px solid ${agentType === 'openclaw' ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-                        background: agentType === 'openclaw' ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
-                    }}
-                >
-                    <span style={{
-                        position: 'absolute', top: '8px', right: '8px',
-                        fontSize: '10px', padding: '2px 6px', borderRadius: '4px',
-                        background: 'linear-gradient(135deg, #6366f1, #8b5cf6)', color: '#fff', fontWeight: 600,
-                        letterSpacing: '0.5px',
-                    }}>Lab</span>
-                    <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>{t('openclaw.openclawTitle', 'Link OpenClaw')}</div>
-                    <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('openclaw.openclawDesc', 'Connect your existing OpenClaw agent')}</div>
-                </div>
-            </div>
+            {typeSelector}
 
             {/* Stepper */}
             <div className="wizard-steps">
-                {activeSteps.map((s, i) => (
+                {STEPS.map((s, i) => (
                     <div key={s} style={{ display: 'contents' }}>
                         <div className={`wizard-step ${i === step ? 'active' : i < step ? 'completed' : ''}`}>
                             <div className="wizard-step-number">{i < step ? '\u2713' : i + 1}</div>
                             <span>{t(`wizard.steps.${s}`)}</span>
                         </div>
-                        {i < activeSteps.length - 1 && <div className="wizard-connector" />}
+                        {i < STEPS.length - 1 && <div className="wizard-connector" />}
                     </div>
                 ))}
             </div>
@@ -382,30 +466,8 @@ export default function AgentCreate() {
                     </div>
                 )}
 
-                {/* OpenClaw Step 1: Just name + role (reuse of basicInfo step index 0 when agentType is openclaw) */}
-                {step === 0 && agentType === 'openclaw' && (
-                    <div>
-                        <h3 style={{ marginBottom: '20px', fontWeight: 600, fontSize: '15px' }}>{t('openclaw.basicTitle', 'OpenClaw Agent Information')}</h3>
-                        <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
-                            {t('openclaw.basicDesc', 'Give your OpenClaw agent a name and description. The LLM model, personality, and skills are configured on your OpenClaw instance.')}
-                        </p>
-                        <div className="form-group">
-                            <label className="form-label">{t('agent.fields.name')} *</label>
-                            <input className="form-input" value={form.name}
-                                onChange={(e) => setForm({ ...form, name: e.target.value })}
-                                placeholder={t('openclaw.namePlaceholder', 'e.g. My OpenClaw Bot')} autoFocus />
-                        </div>
-                        <div className="form-group">
-                            <label className="form-label">{t('agent.fields.role')}</label>
-                            <input className="form-input" value={form.role_description}
-                                onChange={(e) => setForm({ ...form, role_description: e.target.value })}
-                                placeholder={t('openclaw.rolePlaceholder', 'e.g. Personal assistant running on my Mac')} />
-                        </div>
-                    </div>
-                )}
-
                 {/* Step 2: Personality */}
-                {step === 1 && agentType === 'native' && (
+                {step === 1 && (
                     <div>
                         <h3 style={{ marginBottom: '20px', fontWeight: 600, fontSize: '15px' }}>{t('wizard.step2.title')}</h3>
                         <div className="form-group">
@@ -424,7 +486,7 @@ export default function AgentCreate() {
                 )}
 
                 {/* Step 3: Skills */}
-                {step === 2 && agentType === 'native' && (
+                {step === 2 && (
                     <div>
                         <h3 style={{ marginBottom: '20px', fontWeight: 600, fontSize: '15px' }}>{t('wizard.step3.title')}</h3>
                         <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
@@ -474,7 +536,7 @@ export default function AgentCreate() {
                 )}
 
                 {/* Step 4: Permissions */}
-                {((step === 3 && agentType === 'native') || (step === 1 && agentType === 'openclaw')) && (
+                {step === 3 && (
                     <div>
                         <h3 style={{ marginBottom: '20px', fontWeight: 600, fontSize: '15px' }}>{t('wizard.step4.title')}</h3>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '20px' }}>
@@ -531,7 +593,7 @@ export default function AgentCreate() {
                 )}
 
                 {/* Step 5: Channel */}
-                {step === 4 && agentType === 'native' && (
+                {step === 4 && (
                     <div>
                         <h3 style={{ marginBottom: '20px', fontWeight: 600, fontSize: '15px' }}>{t('wizard.step5.title', 'Channel Configuration')}</h3>
                         <p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
@@ -747,7 +809,7 @@ export default function AgentCreate() {
                         disabled={createMutation.isPending}>
                         {step === 0 ? t('common.cancel') : t('wizard.prev')}
                     </button>
-                    {step < activeSteps.length - 1 ? (
+                    {step < STEPS.length - 1 ? (
                         <button className="btn btn-primary" onClick={() => setStep(step + 1)}
                             disabled={step === 0 && !form.name}>
                             {t('wizard.next')} →
