@@ -1237,13 +1237,36 @@ export default function EnterpriseSettings() {
                                     <h4 style={{ marginBottom: '12px' }}>MCP Server</h4>
                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                                         <div>
-                                            <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>{t('enterprise.tools.mcpServerName')}</label>
-                                            <input className="form-input" value={mcpForm.server_name} onChange={e => setMcpForm(p => ({ ...p, server_name: e.target.value }))} placeholder="My MCP Server" />
+                                            <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>JSON Config</label>
+                                            <textarea className="form-input" value={mcpForm.server_url} onChange={e => {
+                                                const val = e.target.value;
+                                                setMcpForm(p => ({ ...p, server_url: val }));
+                                                // Auto-parse JSON config format
+                                                try {
+                                                    const parsed = JSON.parse(val);
+                                                    const servers = parsed.mcpServers || parsed;
+                                                    const names = Object.keys(servers);
+                                                    if (names.length > 0) {
+                                                        const name = names[0];
+                                                        const cfg = servers[name];
+                                                        const url = cfg.url || cfg.uri || '';
+                                                        setMcpForm({ server_name: name, server_url: url });
+                                                    }
+                                                } catch { /* not JSON yet, that's fine */ }
+                                            }} placeholder={'{\n  "mcpServers": {\n    "server-name": {\n      "type": "sse",\n      "url": "https://mcp.example.com/sse"\n    }\n  }\n}\n\nor paste a URL directly'} style={{ minHeight: '120px', fontFamily: 'var(--font-mono)', fontSize: '12px', resize: 'vertical' }} />
                                         </div>
-                                        <div>
-                                            <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>MCP Server URL</label>
-                                            <input className="form-input" value={mcpForm.server_url} onChange={e => setMcpForm(p => ({ ...p, server_url: e.target.value }))} placeholder="http://localhost:3000/mcp" />
-                                        </div>
+                                        {mcpForm.server_name && (
+                                            <div style={{ display: 'flex', gap: '12px', fontSize: '12px', color: 'var(--text-secondary)', padding: '8px 12px', background: 'var(--bg-tertiary)', borderRadius: '6px' }}>
+                                                <span>Name: <strong>{mcpForm.server_name}</strong></span>
+                                                <span>URL: <strong>{mcpForm.server_url}</strong></span>
+                                            </div>
+                                        )}
+                                        {!mcpForm.server_name && (
+                                            <div>
+                                                <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>{t('enterprise.tools.mcpServerName')}</label>
+                                                <input className="form-input" value={mcpForm.server_name} onChange={e => setMcpForm(p => ({ ...p, server_name: e.target.value }))} placeholder="My MCP Server" />
+                                            </div>
+                                        )}
                                         <div style={{ display: 'flex', gap: '8px' }}>
                                             <button className="btn btn-secondary" disabled={mcpTesting || !mcpForm.server_url} onClick={async () => {
                                                 setMcpTesting(true); setMcpTestResult(null);
@@ -1253,7 +1276,7 @@ export default function EnterpriseSettings() {
                                                 } catch (e: any) { setMcpTestResult({ ok: false, error: e.message }); }
                                                 setMcpTesting(false);
                                             }}>{mcpTesting ? t('enterprise.tools.testing') : t('enterprise.tools.testConnection')}</button>
-                                            <button className="btn btn-secondary" onClick={() => { setShowAddMCP(false); setMcpTestResult(null); }}>{t('common.cancel')}</button>
+                                            <button className="btn btn-secondary" onClick={() => { setShowAddMCP(false); setMcpTestResult(null); setMcpForm({ server_url: '', server_name: '' }); }}>{t('common.cancel')}</button>
                                         </div>
                                         {mcpTestResult && (
                                             <div className="card" style={{ padding: '12px', background: mcpTestResult.ok ? 'rgba(0,200,100,0.1)' : 'rgba(255,0,0,0.1)' }}>

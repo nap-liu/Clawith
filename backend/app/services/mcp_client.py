@@ -82,7 +82,7 @@ class MCPClient:
     # ── Streamable HTTP Transport ────────────────────────────────
 
     async def _streamable_initialize(self, client: httpx.AsyncClient) -> None:
-        """Send MCP initialize handshake (Streamable HTTP)."""
+        """Send MCP initialize + initialized handshake (Streamable HTTP)."""
         try:
             resp = await client.post(
                 self.server_url,
@@ -100,6 +100,12 @@ class MCPClient:
             )
             if resp.status_code == 200:
                 self._parse_response(resp)  # captures Mcp-Session-Id if present
+            # Send initialized notification (required by MCP spec before other requests)
+            await client.post(
+                self.server_url,
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                headers=self._headers(),
+            )
         except Exception:
             pass  # initialization failure is non-fatal — server may be stateless
 
@@ -109,9 +115,7 @@ class MCPClient:
             if not self._session_id:
                 await self._streamable_initialize(client)
 
-            body: dict = {"jsonrpc": "2.0", "id": 1, "method": method}
-            if params:
-                body["params"] = params
+            body: dict = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
 
             resp = await client.post(self.server_url, json=body, headers=self._headers())
             if resp.status_code not in (200, 201):
@@ -182,9 +186,7 @@ class MCPClient:
             headers_sse["Authorization"] = f"Bearer {self.api_key}"
             headers_post["Authorization"] = f"Bearer {self.api_key}"
 
-        body: dict = {"jsonrpc": "2.0", "id": 1, "method": method}
-        if params:
-            body["params"] = params
+        body: dict = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
 
         timeout = 60 if method == "tools/call" else 30
 
@@ -215,8 +217,7 @@ class MCPClient:
                 if not messages_url:
                     raise Exception("SSE endpoint did not return a messages URL")
 
-                # Phase 2: Send the JSON-RPC request to the messages endpoint
-                # Initialize first
+                # Phase 2: MCP handshake — initialize + initialized notification
                 init_body = {
                     "jsonrpc": "2.0", "id": 0, "method": "initialize",
                     "params": {
@@ -226,6 +227,12 @@ class MCPClient:
                     },
                 }
                 await client.post(messages_url, json=init_body, headers=headers_post)
+                # Send initialized notification (required before other requests)
+                await client.post(
+                    messages_url,
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    headers=headers_post,
+                )
 
                 # Send the actual request
                 post_resp = await client.post(messages_url, json=body, headers=headers_post)
