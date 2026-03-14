@@ -63,14 +63,18 @@ async function uploadFile(url: string, file: File, extraFields?: Record<string, 
     return res.json();
 }
 
-// Upload with progress tracking via XMLHttpRequest
+// Upload with progress tracking via XMLHttpRequest.
+// Returns { promise, abort } — call abort() to cancel the upload.
+// Progress callback: 0-100 = upload phase, 101 = processing phase (server is parsing the file).
 export function uploadFileWithProgress(
     url: string,
     file: File,
     onProgress?: (percent: number) => void,
     extraFields?: Record<string, string>,
-): Promise<any> {
-    return new Promise((resolve, reject) => {
+    timeoutMs: number = 120_000,
+): { promise: Promise<any>; abort: () => void } {
+    const xhr = new XMLHttpRequest();
+    const promise = new Promise<any>((resolve, reject) => {
         const token = localStorage.getItem('token');
         const formData = new FormData();
         formData.append('file', file);
@@ -79,14 +83,20 @@ export function uploadFileWithProgress(
                 formData.append(k, v);
             }
         }
-        const xhr = new XMLHttpRequest();
         xhr.open('POST', `${API_BASE}${url}`);
         if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+
+        // Upload phase: 0-100%
         xhr.upload.onprogress = (e) => {
             if (e.lengthComputable && onProgress) {
                 onProgress(Math.round((e.loaded / e.total) * 100));
             }
         };
+        // Upload bytes finished → enter processing phase
+        xhr.upload.onload = () => {
+            if (onProgress) onProgress(101); // 101 = "processing" sentinel
+        };
+
         xhr.onload = () => {
             if (xhr.status >= 200 && xhr.status < 300) {
                 try { resolve(JSON.parse(xhr.responseText)); } catch { resolve(undefined); }
@@ -98,8 +108,12 @@ export function uploadFileWithProgress(
             }
         };
         xhr.onerror = () => reject(new Error('Network error'));
+        xhr.ontimeout = () => reject(new Error('Upload timed out'));
+        xhr.onabort = () => reject(new Error('Upload cancelled'));
+        xhr.timeout = timeoutMs;
         xhr.send(formData);
     });
+    return { promise, abort: () => xhr.abort() };
 }
 
 // ─── Auth ─────────────────────────────────────────────
@@ -203,7 +217,7 @@ export const fileApi = {
 
     upload: (agentId: string, file: File, path: string = 'workspace/knowledge_base', onProgress?: (pct: number) => void) =>
         onProgress
-            ? uploadFileWithProgress(`/agents/${agentId}/files/upload?path=${encodeURIComponent(path)}`, file, onProgress)
+            ? uploadFileWithProgress(`/agents/${agentId}/files/upload?path=${encodeURIComponent(path)}`, file, onProgress).promise
             : uploadFile(`/agents/${agentId}/files/upload?path=${encodeURIComponent(path)}`, file),
 
     importSkill: (agentId: string, skillId: string) =>

@@ -904,6 +904,7 @@ function AgentDetailInner() {
     const [isWaiting, setIsWaiting] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
     const [uploadProgress, setUploadProgress] = useState(-1);
+    const uploadAbortRef = useRef<(() => void) | null>(null);
     const [attachedFile, setAttachedFile] = useState<{ name: string; text: string; path?: string; imageUrl?: string } | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const chatEndRef = useRef<HTMLDivElement>(null);
@@ -1213,14 +1214,18 @@ function AgentDetailInner() {
         const file = e.target.files?.[0]; if (!file) return;
         setUploading(true); setUploadProgress(0);
         try {
-            const data = await uploadFileWithProgress(
+            const { promise, abort } = uploadFileWithProgress(
                 `/chat/upload`,
                 file,
                 (pct) => setUploadProgress(pct),
                 id ? { agent_id: id } : undefined,
             );
+            uploadAbortRef.current = abort;
+            const data = await promise;
             setAttachedFile({ name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined });
-        } catch (err) { alert(t('agent.upload.failed')); } finally { setUploading(false); setUploadProgress(-1); if (fileInputRef.current) fileInputRef.current.value = ''; }
+        } catch (err: any) {
+            if (err?.message !== 'Upload cancelled') alert(t('agent.upload.failed'));
+        } finally { setUploading(false); setUploadProgress(-1); uploadAbortRef.current = null; if (fileInputRef.current) fileInputRef.current.value = ''; }
     };
 
     // Clipboard paste handler — auto-upload pasted images
@@ -1238,14 +1243,18 @@ function AgentDetailInner() {
                 const file = new File([blob], fileName, { type: blob.type });
                 setUploading(true); setUploadProgress(0);
                 try {
-                    const data = await uploadFileWithProgress(
+                    const { promise, abort } = uploadFileWithProgress(
                         `/chat/upload`,
                         file,
                         (pct) => setUploadProgress(pct),
                         id ? { agent_id: id } : undefined,
                     );
+                    uploadAbortRef.current = abort;
+                    const data = await promise;
                     setAttachedFile({ name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined });
-                } catch (err) { alert(t('agent.upload.failed')); } finally { setUploading(false); setUploadProgress(-1); }
+                } catch (err: any) {
+                    if (err?.message !== 'Upload cancelled') alert(t('agent.upload.failed'));
+                } finally { setUploading(false); setUploadProgress(-1); uploadAbortRef.current = null; }
                 return; // Only handle the first image
             }
         }
@@ -3086,11 +3095,23 @@ function AgentDetailInner() {
                                             <input type="file" ref={fileInputRef} onChange={handleChatFile} style={{ display: 'none' }} />
                                             <button className="btn btn-secondary" onClick={() => fileInputRef.current?.click()} disabled={!wsConnected || uploading || isWaiting || isStreaming} style={{ padding: '6px 10px', fontSize: '14px', minWidth: 'auto' }}>{uploading ? '⏳' : '⦹'}</button>
                                             {uploading && uploadProgress >= 0 && (
-                                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: '0 0 120px' }}>
-                                                    <div style={{ flex: 1, height: '4px', borderRadius: '2px', background: 'var(--bg-tertiary)', overflow: 'hidden' }}>
-                                                        <div style={{ height: '100%', borderRadius: '2px', background: 'var(--accent-primary)', width: `${uploadProgress}%`, transition: 'width 0.15s ease' }} />
-                                                    </div>
-                                                    <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{uploadProgress}%</span>
+                                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: '0 0 140px' }}>
+                                                    {uploadProgress <= 100 ? (
+                                                        /* Upload phase: show progress bar */
+                                                        <>
+                                                            <div style={{ flex: 1, height: '4px', borderRadius: '2px', background: 'var(--bg-tertiary)', overflow: 'hidden' }}>
+                                                                <div style={{ height: '100%', borderRadius: '2px', background: 'var(--accent-primary)', width: `${uploadProgress}%`, transition: 'width 0.15s ease' }} />
+                                                            </div>
+                                                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{uploadProgress}%</span>
+                                                        </>
+                                                    ) : (
+                                                        /* Processing phase (progress = 101): server is parsing the file */
+                                                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                                            <span style={{ display: 'inline-block', width: '5px', height: '5px', borderRadius: '50%', background: 'var(--accent-primary)', animation: 'pulse 1.2s ease-in-out infinite' }} />
+                                                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>Processing...</span>
+                                                        </div>
+                                                    )}
+                                                    <button onClick={() => { uploadAbortRef.current?.(); }} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: '12px', padding: '0 2px', lineHeight: 1 }} title="Cancel upload">✕</button>
                                                 </div>
                                             )}
                                             <input ref={chatInputRef} className="chat-input" value={chatInput} onChange={e => setChatInput(e.target.value)}
