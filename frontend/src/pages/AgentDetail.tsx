@@ -2845,6 +2845,34 @@ function AgentDetailInner() {
                                                     );
                                                 }
 
+                                                {/* Assistant message with no content: show inline thinking or skip */}
+                                                if (m.role === 'assistant' && !m.content) {
+                                                    if (m.thinking) {
+                                                        return (
+                                                            <div key={i} style={{ paddingLeft: '36px', marginBottom: '6px' }}>
+                                                                <details style={{
+                                                                    fontSize: '12px',
+                                                                    background: 'rgba(147, 130, 220, 0.08)', borderRadius: '6px',
+                                                                    border: '1px solid rgba(147, 130, 220, 0.15)',
+                                                                }}>
+                                                                    <summary style={{
+                                                                        padding: '6px 10px', cursor: 'pointer',
+                                                                        color: 'rgba(147, 130, 220, 0.9)', fontWeight: 500,
+                                                                        userSelect: 'none', display: 'flex', alignItems: 'center', gap: '4px',
+                                                                    }}>Thinking</summary>
+                                                                    <div style={{
+                                                                        padding: '4px 10px 8px',
+                                                                        fontSize: '12px', lineHeight: '1.6',
+                                                                        color: 'var(--text-secondary)',
+                                                                        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                                                        maxHeight: '300px', overflow: 'auto',
+                                                                    }}>{m.thinking}</div>
+                                                                </details>
+                                                            </div>
+                                                        );
+                                                    }
+                                                    return null;
+                                                }
                                                 return (
                                                     <div key={i} style={{ display: 'flex', flexDirection: m.role === 'assistant' ? 'row' : 'row-reverse', gap: '8px', marginBottom: '8px' }}>
                                                         <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: m.role === 'assistant' ? 'var(--bg-elevated)' : 'rgba(16,185,129,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', flexShrink: 0, color: 'var(--text-secondary)', fontWeight: 600 }}>{m.sender_name ? m.sender_name[0] : (m.role === 'assistant' ? 'A' : 'U')}</div>
