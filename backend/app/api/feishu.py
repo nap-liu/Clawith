@@ -887,13 +887,26 @@ async def _call_agent_llm(db: AsyncSession, agent_id: uuid.UUID, user_text: str,
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
 
-    if not agent.primary_model_id:
-        return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
+    # Load primary model
+    model = None
+    if agent.primary_model_id:
+        model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
+        model = model_result.scalar_one_or_none()
 
-    model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-    model = model_result.scalar_one_or_none()
+    # Load fallback model
+    fallback_model = None
+    if agent.fallback_model_id:
+        fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
+        fallback_model = fb_result.scalar_one_or_none()
+
+    # Config-level fallback: primary missing -> use fallback
+    if not model and fallback_model:
+        model = fallback_model
+        fallback_model = None
+        print(f"[Channel] Primary model unavailable, using fallback: {model.model}")
+
     if not model:
-        return "⚠️ 配置的模型不存在"
+        return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
 
     # Build conversation messages (without system prompt — call_llm adds it)
     messages: list[dict] = []
@@ -921,7 +934,26 @@ async def _call_agent_llm(db: AsyncSession, agent_id: uuid.UUID, user_text: str,
         import traceback
         traceback.print_exc()
         error_msg = str(e) or repr(e)
-        print(f"[LLM] Error: {error_msg}")
+        print(f"[LLM] Primary model error: {error_msg}")
+        # Runtime fallback: primary model failed -> retry with fallback model
+        if fallback_model:
+            print(f"[LLM] Retrying with fallback model: {fallback_model.model}")
+            try:
+                reply = await call_llm(
+                    fallback_model,
+                    messages,
+                    agent.name,
+                    agent.role_description or "",
+                    agent_id=agent_id,
+                    user_id=effective_user_id,
+                    supports_vision=getattr(fallback_model, 'supports_vision', False),
+                    on_chunk=on_chunk,
+                    on_thinking=on_thinking,
+                )
+                return reply
+            except Exception as e2:
+                traceback.print_exc()
+                return f"⚠️ 调用模型出错: Primary: {str(e)[:80]} | Fallback: {str(e2)[:80]}"
         return f"⚠️ 调用模型出错: {error_msg[:150]}"
 
 

@@ -2431,13 +2431,21 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             from app.services.agent_context import build_agent_context
             from app.models.llm import LLMModel
 
-            if not target.primary_model_id:
-                return f"⚠️ {target.name} has no LLM model configured"
+            # Load primary model (with fallback support)
+            target_model = None
+            if target.primary_model_id:
+                model_r = await db.execute(select(LLMModel).where(LLMModel.id == target.primary_model_id))
+                target_model = model_r.scalar_one_or_none()
 
-            model_r = await db.execute(select(LLMModel).where(LLMModel.id == target.primary_model_id))
-            target_model = model_r.scalar_one_or_none()
+            # Config-level fallback: primary missing -> use fallback
+            if not target_model and target.fallback_model_id:
+                fb_r = await db.execute(select(LLMModel).where(LLMModel.id == target.fallback_model_id))
+                target_model = fb_r.scalar_one_or_none()
+                if target_model:
+                    print(f"[A2A] Primary model unavailable for {target.name}, using fallback: {target_model.model}")
+
             if not target_model:
-                return f"⚠️ {target.name}'s model configuration is invalid"
+                return f"⚠️ {target.name} has no LLM model configured"
 
             # Build target system prompt
             target_system = await build_agent_context(target.id, target.name, target.role_description or "")
