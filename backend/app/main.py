@@ -97,11 +97,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[startup] ⚠️ create_all failed: {e}", flush=True)
 
-    # Startup: seed data (non-fatal)
-    try:
-        print("[startup] seeding...", flush=True)
+    # Startup: seed data — each step isolated so one failure doesn't block others
+    print("[startup] seeding...", flush=True)
 
-        # Seed default company (Tenant) — required before users can register
+    # Seed default company (Tenant) — required before users can register
+    try:
         from app.models.tenant import Tenant
         from app.database import async_session as _session
         from sqlalchemy import select as _select
@@ -111,8 +111,15 @@ async def lifespan(app: FastAPI):
                 _db.add(Tenant(name="Default", slug="default", im_provider="web_only"))
                 await _db.commit()
                 print("[startup] ✅ Default company created", flush=True)
+    except Exception as e:
+        print(f"[startup] ⚠️ Default company seed failed: {e}", flush=True)
 
+    try:
         await seed_builtin_tools()
+    except Exception as e:
+        print(f"[startup] ⚠️ Builtin tools seed failed: {e}", flush=True)
+
+    try:
         from app.services.tool_seeder import seed_atlassian_rovo_config, get_atlassian_api_key
         await seed_atlassian_rovo_config()
         # Auto-import Atlassian Rovo tools if an API key is already configured
@@ -120,14 +127,26 @@ async def lifespan(app: FastAPI):
         if _rovo_key:
             from app.services.resource_discovery import seed_atlassian_rovo_tools
             await seed_atlassian_rovo_tools(_rovo_key)
+    except Exception as e:
+        print(f"[startup] ⚠️ Atlassian tools seed failed: {e}", flush=True)
+
+    try:
         await seed_agent_templates()
+    except Exception as e:
+        print(f"[startup] ⚠️ Agent templates seed failed: {e}", flush=True)
+
+    try:
         from app.services.skill_seeder import seed_skills, push_default_skills_to_existing_agents
         await seed_skills()
         await push_default_skills_to_existing_agents()
+    except Exception as e:
+        print(f"[startup] ⚠️ Skills seed failed: {e}", flush=True)
+
+    try:
         from app.services.agent_seeder import seed_default_agents
         await seed_default_agents()
     except Exception as e:
-        print(f"[startup] ⚠️ Seeding failed (non-fatal): {e}", flush=True)
+        print(f"[startup] ⚠️ Default agents seed failed: {e}", flush=True)
 
     # Start background tasks (always, even if seeding failed)
     try:

@@ -42,21 +42,24 @@ async def register(data: UserRegister, db: AsyncSession = Depends(get_db)):
     user_count = await db.execute(select(func.count()).select_from(User))
     is_first_user = user_count.scalar() == 0
 
-    # Resolve tenant — required; fall back to default if not provided
+    # Resolve tenant — auto-create default if missing (lazy initialization)
     from app.models.tenant import Tenant
     tenant_uuid = None
     if data.tenant_id:
         t_result = await db.execute(select(Tenant).where(Tenant.id == uuid.UUID(data.tenant_id)))
         tenant = t_result.scalar_one_or_none()
         if not tenant:
-            raise HTTPException(status_code=400, detail="选择的公司不存在")
+            raise HTTPException(status_code=400, detail="Selected company does not exist")
         tenant_uuid = tenant.id
     else:
-        # Auto-assign to the default company
+        # Auto-assign to the default company; create it if startup seed failed
         default = await db.execute(select(Tenant).where(Tenant.slug == "default"))
         tenant = default.scalar_one_or_none()
-        if tenant:
-            tenant_uuid = tenant.id
+        if not tenant:
+            tenant = Tenant(name="Default", slug="default", im_provider="web_only")
+            db.add(tenant)
+            await db.flush()
+        tenant_uuid = tenant.id
 
     # ── Invitation code check ──
     from app.models.system_settings import SystemSetting

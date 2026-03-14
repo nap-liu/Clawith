@@ -69,7 +69,15 @@ export default function Login() {
             setAuth(res.user, res.access_token);
             navigate('/');
         } catch (err: any) {
-            setError(err.message || t('common.error'));
+            // Friendlier messages for infrastructure / network errors
+            const msg = err.message || '';
+            if (!msg || msg === 'Failed to fetch' || msg.includes('NetworkError') || msg.includes('ERR_CONNECTION')) {
+                setError('Unable to reach server. Please check if the service is running and try again.');
+            } else if (msg.includes('500') || msg.includes('Internal Server Error')) {
+                setError('Service is starting up or experiencing issues. Please try again in a few seconds.');
+            } else {
+                setError(msg || t('common.error'));
+            }
         } finally {
             setLoading(false);
         }
@@ -174,12 +182,13 @@ export default function Login() {
                                         placeholder={t('auth.emailPlaceholder')}
                                     />
                                 </div>
+                                {/* Only show company selector if there are tenants to choose from */}
+                                {tenants.length > 0 && (
                                 <div className="login-field">
                                     <label>{t('auth.selectCompany')}</label>
                                     <select
                                         value={form.tenant_id}
                                         onChange={(e) => setForm({ ...form, tenant_id: e.target.value })}
-                                        required
                                     >
                                         <option value="">{t('auth.selectCompanyPlaceholder')}</option>
                                         {tenants.map((tenant) => (
@@ -187,6 +196,7 @@ export default function Login() {
                                         ))}
                                     </select>
                                 </div>
+                                )}
                                 {invitationRequired && (
                                     <div className="login-field">
                                         <label>{t('auth.invitationCode')}</label>

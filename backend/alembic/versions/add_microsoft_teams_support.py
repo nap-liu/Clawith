@@ -12,15 +12,8 @@ depends_on = None
 def upgrade() -> None:
     # Add 'microsoft_teams' to im_provider_enum
     op.execute("ALTER TYPE im_provider_enum ADD VALUE IF NOT EXISTS 'microsoft_teams'")
-    # Add 'thinking' column only if it doesn't already exist
-    # (create_all in main.py may have already created it from the ORM model)
-    conn = op.get_bind()
-    result = conn.execute(sa.text(
-        "SELECT 1 FROM information_schema.columns "
-        "WHERE table_name='chat_messages' AND column_name='thinking'"
-    ))
-    if not result.fetchone():
-        op.add_column('chat_messages', sa.Column('thinking', sa.Text(), nullable=True))
+    # Add 'thinking' column to chat_messages if it does not already exist
+    op.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS thinking TEXT")
     # Add 'microsoft_teams' to channel_type_enum
     op.execute("ALTER TYPE channel_type_enum ADD VALUE IF NOT EXISTS 'microsoft_teams'")
 
