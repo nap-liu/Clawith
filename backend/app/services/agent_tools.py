@@ -2464,7 +2464,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                     ChatMessage.agent_id == session_agent_id,
                 )
                 .order_by(ChatMessage.created_at.desc())
-                .limit(6)
+                .limit(20)
             )
             for m in reversed(hist_result.scalars().all()):
                 if m.participant_id and src_participant and m.participant_id == src_participant.id:
@@ -2507,7 +2507,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             # Load tools for target agent
             tools_for_llm = await get_agent_tools_for_llm(target.id)
 
-            max_tool_rounds = 5
+            max_tool_rounds = target.max_tool_rounds or 50
             target_reply = ""
             _a2a_accumulated_tokens = 0
 
