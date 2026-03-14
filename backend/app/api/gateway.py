@@ -170,6 +170,7 @@ async def report_result(
         from app.models.audit import ChatMessage
         assistant_msg = ChatMessage(
             agent_id=agent.id,
+            user_id=msg.sender_user_id,
             role="assistant",
             content=body.result,
             conversation_id=msg.conversation_id,
