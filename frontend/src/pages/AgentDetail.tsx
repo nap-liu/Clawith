@@ -1069,11 +1069,6 @@ function AgentDetailInner() {
                             const last = prev[lastIdx];
                             if (last && last.role === 'tool_call' && last.toolName === d.name && last.toolStatus === 'running') return [...prev.slice(0, lastIdx), toolMsg];
                         }
-                        // Remove orphaned empty streaming assistant message (thinking-only, no content)
-                        const last = prev[prev.length - 1];
-                        if (last && last.role === 'assistant' && (last as any)._streaming && !last.content) {
-                            return [...prev.slice(0, -1), toolMsg];
-                        }
                         return [...prev, toolMsg];
                     });
                 } else if (d.type === 'chunk') {
@@ -2928,6 +2923,31 @@ function AgentDetailInner() {
                                                                     {msg.toolStatus === 'running' && <span style={{ color: 'var(--text-tertiary)', fontSize: '11px', marginLeft: 'auto' }}>{t('common.loading')}</span>}
                                                                 </summary>
                                                                 {msg.toolResult && <div style={{ padding: '4px 10px 8px' }}><div style={{ color: 'var(--text-secondary)', fontSize: '11px', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '240px', overflow: 'auto', background: 'rgba(0,0,0,0.15)', borderRadius: '4px', padding: '4px 6px' }}>{msg.toolResult}</div></div>}
+                                                            </details>
+                                                        </div>
+                                                    );
+                                                }
+                                                {/* Thinking-only streaming assistant: render inline collapsible without bubble */}
+                                                if (msg.role === 'assistant' && (msg as any)._streaming && !msg.content && msg.thinking) {
+                                                    return (
+                                                        <div key={i} style={{ paddingLeft: '36px', marginBottom: '6px' }}>
+                                                            <details style={{
+                                                                fontSize: '12px',
+                                                                background: 'rgba(147, 130, 220, 0.08)', borderRadius: '6px',
+                                                                border: '1px solid rgba(147, 130, 220, 0.15)',
+                                                            }}>
+                                                                <summary style={{
+                                                                    padding: '6px 10px', cursor: 'pointer',
+                                                                    color: 'rgba(147, 130, 220, 0.9)', fontWeight: 500,
+                                                                    userSelect: 'none', display: 'flex', alignItems: 'center', gap: '4px',
+                                                                }}>Thinking</summary>
+                                                                <div style={{
+                                                                    padding: '4px 10px 8px',
+                                                                    fontSize: '12px', lineHeight: '1.6',
+                                                                    color: 'var(--text-secondary)',
+                                                                    whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                                                                    maxHeight: '300px', overflow: 'auto',
+                                                                }}>{msg.thinking}</div>
                                                             </details>
                                                         </div>
                                                     );
