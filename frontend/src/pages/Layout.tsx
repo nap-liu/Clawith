@@ -590,6 +590,11 @@ export default function Layout() {
                                 {SidebarIcons.logout}
                             </button>
                         </div>
+                        {/* Version */}
+                        <div style={{ textAlign: 'center', fontSize: '10px', color: 'var(--text-quaternary)', marginTop: '8px', letterSpacing: '0.3px' }}>
+                            v{(typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '').split('+')[0]}
+                            <span style={{ opacity: 0.6 }}>{(typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '').includes('+') ? ` b${(typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '').split('+')[1]}` : ''}</span>
+                        </div>
                     </div>
                 </div>
             </nav>
