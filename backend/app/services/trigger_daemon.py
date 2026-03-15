@@ -250,10 +250,16 @@ async def _check_new_agent_messages(trigger: AgentTrigger) -> bool:
         return False
 
     since = trigger.last_fired_at or trigger.created_at
-    # For never-fired on_message triggers, look back 5 minutes before creation
-    # to catch replies that arrived while the Agent was still creating the trigger
-    if trigger.fire_count == 0 and not trigger.last_fired_at and from_user_name:
-        since = trigger.created_at - timedelta(minutes=5)
+    # Use _since_ts snapshot from trigger creation (set by _handle_set_trigger)
+    # This is more precise than the old 5-minute lookback which caused false positives
+    if trigger.fire_count == 0 and not trigger.last_fired_at:
+        since_ts_str = cfg.get("_since_ts")
+        if since_ts_str:
+            try:
+                since = datetime.fromisoformat(since_ts_str)
+            except Exception:
+                since = trigger.created_at
+        # No _since_ts and no last_fired_at → use trigger.created_at (no lookback)
 
     try:
         async with async_session() as db:

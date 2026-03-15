@@ -3029,6 +3029,25 @@ async def _handle_set_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
     elif ttype == "on_message":
         if not config.get("from_agent_name") and not config.get("from_user_name"):
             return "❌ on_message trigger requires config.from_agent_name (for agents) or config.from_user_name (for human users on Feishu/Slack/Discord)"
+        # Snapshot the latest message timestamp so we only detect NEW messages after this point
+        # This prevents false positives from already-processed messages
+        try:
+            from app.models.audit import ChatMessage
+            from app.models.chat_session import ChatSession
+            from sqlalchemy import cast as sa_cast, String as SaString
+            async with async_session() as _snap_db:
+                _snap_q = select(ChatMessage.created_at).join(
+                    ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
+                ).where(
+                    ChatSession.agent_id == agent_id,
+                    ChatMessage.created_at.isnot(None),
+                ).order_by(ChatMessage.created_at.desc()).limit(1)
+                _snap_r = await _snap_db.execute(_snap_q)
+                _latest_ts = _snap_r.scalar_one_or_none()
+                if _latest_ts:
+                    config["_since_ts"] = _latest_ts.isoformat()
+        except Exception:
+            pass  # Fallback to trigger.created_at in the daemon
     elif ttype == "webhook":
         # Auto-generate a unique token for the webhook URL
         import secrets
