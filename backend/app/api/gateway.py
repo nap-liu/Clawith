@@ -447,6 +447,8 @@ async def send_message(
     )
     target_agent = result.scalars().first()
 
+    logger.info(f"[Gateway] send_message: target='{target_name}', found_agent={target_agent.name if target_agent else None}, agent_type={getattr(target_agent, 'agent_type', None) if target_agent else None}, channel_hint='{channel_hint}'")
+
     if target_agent and (not channel_hint or channel_hint == "agent"):
         conv_id = f"gw_agent_{agent.id}_{target_agent.id}"
 
