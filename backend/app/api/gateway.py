@@ -307,11 +307,20 @@ async def heartbeat(
 # ─── Send message ───────────────────────────────────────
 
 async def _send_to_agent_background(
-    source_agent: Agent,
-    target_agent: Agent,
+    source_agent_id: str,
+    source_agent_name: str,
+    target_agent_id: str,
+    target_agent_name: str,
+    target_primary_model_id: str,
+    target_role_description: str,
+    target_creator_id: str,
     content: str,
 ):
-    """Background task: invoke target agent LLM and write reply to gateway_messages."""
+    """Background task: invoke target agent LLM and write reply to gateway_messages.
+    
+    Accepts plain values (not ORM objects) to avoid stale session references
+    since this runs after the request's DB session has closed.
+    """
     try:
         from app.api.websocket import call_llm
         from app.services.agent_context import build_agent_context
@@ -321,20 +330,20 @@ async def _send_to_agent_background(
 
         async with async_session() as db:
             # Load target agent's LLM model
-            if not target_agent.primary_model_id:
-                logger.warning(f"Target agent {target_agent.name} has no LLM model")
+            if not target_primary_model_id:
+                logger.warning(f"Target agent {target_agent_name} has no LLM model")
                 return
-            result = await db.execute(select(LLMModel).where(LLMModel.id == target_agent.primary_model_id))
+            result = await db.execute(select(LLMModel).where(LLMModel.id == target_primary_model_id))
             model = result.scalar_one_or_none()
             if not model:
                 return
 
             # Create or find a dedicated conversation between the two agents
-            conv_id = f"gw_agent_{source_agent.id}_{target_agent.id}"
+            conv_id = f"gw_agent_{source_agent_id}_{target_agent_id}"
 
             # Build system prompt for target agent
             system_prompt = await build_agent_context(
-                target_agent.id, target_agent.name, target_agent.role_description or ""
+                target_agent_id, target_agent_name, target_role_description
             )
 
             # Load recent conversation history for context
@@ -351,16 +360,16 @@ async def _send_to_agent_background(
                 messages.append({"role": h.role, "content": h.content or ""})
 
             # Add the new message
-            user_msg = f"[Message from agent: {source_agent.name}]\n{content}"
+            user_msg = f"[Message from agent: {source_agent_name}]\n{content}"
             messages.append({"role": "user", "content": user_msg})
 
             # Save user message to conversation
             db.add(ChatMessage(
-                agent_id=target_agent.id,
+                agent_id=target_agent_id,
                 conversation_id=conv_id,
                 role="user",
                 content=user_msg,
-                user_id=target_agent.creator_id,
+                user_id=target_creator_id,
             ))
             await db.commit()
 
@@ -372,10 +381,10 @@ async def _send_to_agent_background(
         reply = await call_llm(
             model=model,
             messages=messages,
-            agent_name=target_agent.name,
-            role_description=target_agent.role_description or "",
-            agent_id=target_agent.id,
-            user_id=target_agent.creator_id,
+            agent_name=target_agent_name,
+            role_description=target_role_description,
+            agent_id=target_agent_id,
+            user_id=target_creator_id,
             on_chunk=on_chunk,
         )
         final_reply = reply or "".join(collected)
@@ -383,17 +392,17 @@ async def _send_to_agent_background(
         # Save assistant reply to conversation
         async with async_session() as db:
             db.add(ChatMessage(
-                agent_id=target_agent.id,
+                agent_id=target_agent_id,
                 conversation_id=conv_id,
                 role="assistant",
                 content=final_reply,
-                user_id=target_agent.creator_id,
+                user_id=target_creator_id,
             ))
 
             # Write reply to gateway_messages for source (OpenClaw) to poll
             gw_reply = GatewayMessage(
-                agent_id=source_agent.id,
-                sender_agent_id=target_agent.id,
+                agent_id=source_agent_id,
+                sender_agent_id=target_agent_id,
                 content=final_reply,
                 status="pending",
                 conversation_id=conv_id,
@@ -401,7 +410,7 @@ async def _send_to_agent_background(
             db.add(gw_reply)
             await db.commit()
 
-        logger.info(f"[Gateway] Agent {target_agent.name} replied to {source_agent.name}")
+        logger.info(f"[Gateway] Agent {target_agent_name} replied to {source_agent_name}")
 
     except Exception as e:
         logger.error(f"[Gateway] send_to_agent_background failed: {e}")
@@ -456,8 +465,19 @@ async def send_message(
             }
         else:
             # Native agent: async LLM processing
+            # Extract plain values before session closes to avoid stale ORM references
+            _src_id = str(agent.id)
+            _src_name = agent.name
+            _tgt_id = str(target_agent.id)
+            _tgt_name = target_agent.name
+            _tgt_model = str(target_agent.primary_model_id) if target_agent.primary_model_id else ""
+            _tgt_role = target_agent.role_description or ""
+            _tgt_creator = str(target_agent.creator_id) if target_agent.creator_id else ""
             await db.commit()
-            asyncio.create_task(_send_to_agent_background(agent, target_agent, content))
+            asyncio.create_task(_send_to_agent_background(
+                _src_id, _src_name, _tgt_id, _tgt_name,
+                _tgt_model, _tgt_role, _tgt_creator, content,
+            ))
             return {
                 "status": "accepted",
                 "target": target_agent.name,
