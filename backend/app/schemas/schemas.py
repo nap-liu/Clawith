@@ -397,6 +397,13 @@ class GatewayHistoryItem(BaseModel):
     created_at: datetime
 
 
+class GatewayRelationshipItem(BaseModel):
+    name: str
+    type: str  # "human" or "agent"
+    role: str | None = None  # e.g. "collaborator", "supervisor"
+    description: str | None = None
+
+
 class GatewayMessageOut(BaseModel):
     id: uuid.UUID
     conversation_id: str | None = None
@@ -410,8 +417,10 @@ class GatewayMessageOut(BaseModel):
 
 class GatewayPollResponse(BaseModel):
     messages: list[GatewayMessageOut] = []
+    relationships: list[GatewayRelationshipItem] = []
 
 
 class GatewayReportRequest(BaseModel):
     message_id: uuid.UUID
     result: str = Field(min_length=1)
+

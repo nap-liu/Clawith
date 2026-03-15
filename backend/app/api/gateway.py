@@ -17,7 +17,7 @@ from app.database import get_db
 from app.models.agent import Agent
 from app.models.gateway_message import GatewayMessage
 from app.models.user import User
-from app.schemas.schemas import GatewayPollResponse, GatewayMessageOut, GatewayReportRequest, GatewayHistoryItem
+from app.schemas.schemas import GatewayPollResponse, GatewayMessageOut, GatewayReportRequest, GatewayHistoryItem, GatewayRelationshipItem
 
 router = APIRouter(prefix="/gateway", tags=["gateway"])
 
@@ -159,8 +159,44 @@ async def poll_messages(
             history=history,
         ))
 
+    # Fetch agent relationships for context
+    from app.models.org import AgentRelationship, AgentAgentRelationship
+    from sqlalchemy.orm import selectinload
+
+    rel_items = []
+
+    # Human relationships
+    h_result = await db.execute(
+        select(AgentRelationship)
+        .where(AgentRelationship.agent_id == agent.id)
+        .options(selectinload(AgentRelationship.member))
+    )
+    for r in h_result.scalars().all():
+        if r.member:
+            rel_items.append(GatewayRelationshipItem(
+                name=r.member.name,
+                type="human",
+                role=r.relation,
+                description=r.description or None,
+            ))
+
+    # Agent-to-agent relationships
+    a_result = await db.execute(
+        select(AgentAgentRelationship)
+        .where(AgentAgentRelationship.agent_id == agent.id)
+        .options(selectinload(AgentAgentRelationship.target_agent))
+    )
+    for r in a_result.scalars().all():
+        if r.target_agent:
+            rel_items.append(GatewayRelationshipItem(
+                name=r.target_agent.name,
+                type="agent",
+                role=r.relation,
+                description=r.description or None,
+            ))
+
     await db.commit()
-    return GatewayPollResponse(messages=out)
+    return GatewayPollResponse(messages=out, relationships=rel_items)
 
 
 # ─── Report results ─────────────────────────────────────
@@ -280,9 +316,16 @@ The response contains a `messages` array. Each message includes:
 - `history` — array of previous messages in this conversation for context
   Each history item has: `role` (user/assistant), `content`, `sender_name`, `created_at`
 
+The response also contains a `relationships` array describing your colleagues:
+- `name` — the person or agent name
+- `type` — "human" (person) or "agent" (AI agent)
+- `role` — relationship type (e.g. collaborator, supervisor, mentor)
+- `description` — additional context about the relationship
+
 **IMPORTANT**: Use the `history` array to understand the conversation context before replying.
 If the same user sent previous messages, your reply should be contextually aware.
 Different `sender_user_name` values mean different people — address them accordingly.
+Use your `relationships` to understand who you work with and how to interact with them.
 
 ### 2. Report results
 For each completed message, make an HTTP POST request:
