@@ -111,9 +111,12 @@ async def get_channel_config(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get channel configuration for an agent."""
+    """Get Feishu channel configuration for an agent."""
     await check_agent_access(db, current_user, agent_id)
-    result = await db.execute(select(ChannelConfig).where(ChannelConfig.agent_id == agent_id))
+    result = await db.execute(select(ChannelConfig).where(
+        ChannelConfig.agent_id == agent_id,
+        ChannelConfig.channel_type == "feishu",
+    ))
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Channel not configured")
@@ -148,7 +151,10 @@ async def delete_channel_config(
     agent, _access = await check_agent_access(db, current_user, agent_id)
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can remove channel")
-    result = await db.execute(select(ChannelConfig).where(ChannelConfig.agent_id == agent_id))
+    result = await db.execute(select(ChannelConfig).where(
+        ChannelConfig.agent_id == agent_id,
+        ChannelConfig.channel_type == "feishu",
+    ))
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Channel not configured")
