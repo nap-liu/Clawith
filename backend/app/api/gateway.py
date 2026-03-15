@@ -306,6 +306,9 @@ async def heartbeat(
 
 # ─── Send message ───────────────────────────────────────
 
+# Track background tasks to prevent garbage collection
+_background_tasks: set = set()
+
 async def _send_to_agent_background(
     source_agent_id: str,
     source_agent_name: str,
@@ -321,6 +324,7 @@ async def _send_to_agent_background(
     Accepts plain values (not ORM objects) to avoid stale session references
     since this runs after the request's DB session has closed.
     """
+    logger.info(f"[Gateway] _send_to_agent_background started: {source_agent_name} -> {target_agent_name}")
     try:
         from app.api.websocket import call_llm
         from app.services.agent_context import build_agent_context
@@ -474,10 +478,12 @@ async def send_message(
             _tgt_role = target_agent.role_description or ""
             _tgt_creator = str(target_agent.creator_id) if target_agent.creator_id else ""
             await db.commit()
-            asyncio.create_task(_send_to_agent_background(
+            task = asyncio.create_task(_send_to_agent_background(
                 _src_id, _src_name, _tgt_id, _tgt_name,
                 _tgt_model, _tgt_role, _tgt_creator, content,
             ))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
             return {
                 "status": "accepted",
                 "target": target_agent.name,
