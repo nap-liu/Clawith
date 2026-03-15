@@ -342,8 +342,48 @@ async def _send_to_agent_background(
             if not model:
                 return
 
-            # Create or find a dedicated conversation between the two agents
-            conv_id = f"gw_agent_{source_agent_id}_{target_agent_id}"
+            # Create or find a ChatSession for this agent pair
+            # Use deterministic UUID so the same pair always gets the same session
+            import uuid as _uuid
+            _ns = _uuid.UUID("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+            # Sort IDs so session is the same regardless of who initiates
+            sorted_ids = sorted([source_agent_id, target_agent_id])
+            session_uuid = _uuid.uuid5(_ns, f"{sorted_ids[0]}_{sorted_ids[1]}")
+            conv_id = str(session_uuid)
+
+            # Find or create the ChatSession
+            existing = await db.execute(
+                select(ChatSession).where(ChatSession.id == session_uuid)
+            )
+            session = existing.scalar_one_or_none()
+            if not session:
+                from datetime import datetime, timezone
+                session = ChatSession(
+                    id=session_uuid,
+                    agent_id=target_agent_id,
+                    user_id=target_creator_id,
+                    title=f"{source_agent_name} ↔ {target_agent_name}",
+                    source_channel="agent",
+                    peer_agent_id=source_agent_id,
+                    created_at=datetime.now(timezone.utc),
+                )
+                db.add(session)
+                await db.commit()
+                await db.refresh(session)
+
+                # Migrate any existing messages from old gw_agent_ format
+                old_conv_id = f"gw_agent_{source_agent_id}_{target_agent_id}"
+                from sqlalchemy import update
+                await db.execute(
+                    update(ChatMessage)
+                    .where(ChatMessage.conversation_id == old_conv_id)
+                    .values(conversation_id=conv_id)
+                )
+                await db.commit()
+
+            # Update last_message_at
+            from datetime import datetime, timezone
+            session.last_message_at = datetime.now(timezone.utc)
 
             # Build system prompt for target agent
             system_prompt = await build_agent_context(
