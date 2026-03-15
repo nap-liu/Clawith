@@ -373,11 +373,11 @@ export default function Layout() {
                             </select>
                             {tenants.length > 1 && (
                                 <div style={{ marginTop: '4px', display: 'flex', flexWrap: 'wrap', gap: '2px' }}>
-                                    {tenants.filter((t: any) => t.id !== currentTenant).map((t: any) => (
+                                    {tenants.filter((tn: any) => tn.id !== currentTenant).map((tn: any) => (
                                         <button
-                                            key={t.id}
-                                            onClick={() => deleteCompany(t.id, t.name)}
-                                            title={t('layout.deleteCompany', { name: t.name }) || `Delete ${t.name}`}
+                                            key={tn.id}
+                                            onClick={() => deleteCompany(tn.id, tn.name)}
+                                            title={`${t('layout.delete') || 'Delete'} ${tn.name}`}
                                             style={{
                                                 fontSize: '10px', padding: '2px 6px',
                                                 background: 'transparent', color: 'var(--text-tertiary)',
@@ -388,7 +388,7 @@ export default function Layout() {
                                             onMouseEnter={e => { (e.target as HTMLElement).style.opacity = '1'; (e.target as HTMLElement).style.color = 'var(--status-error)'; }}
                                             onMouseLeave={e => { (e.target as HTMLElement).style.opacity = '0.6'; (e.target as HTMLElement).style.color = 'var(--text-tertiary)'; }}
                                         >
-                                            × {t.name}
+                                            × {tn.name}
                                         </button>
                                     ))}
                                 </div>
