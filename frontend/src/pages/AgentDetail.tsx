@@ -1376,7 +1376,7 @@ function AgentDetailInner() {
     });
 
     // ─── Channel config — Feishu ────────────────────────
-    const [channelForm, setChannelForm] = useState({ app_id: '', app_secret: '', encrypt_key: '', connection_mode: 'webhook' });
+    const [channelForm, setChannelForm] = useState({ app_id: '', app_secret: '', encrypt_key: '', connection_mode: 'websocket' });
     const [feishuEditing, setFeishuEditing] = useState(false);
 
     const saveChannel = useMutation({
@@ -4521,7 +4521,7 @@ function AgentDetailInner() {
                                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', background: 'var(--bg-secondary)', padding: '6px 10px', borderRadius: '6px' }}>💡 {t('channelGuide.feishu.note')}</div>
                                                     </details>
                                                     <div style={{ display: 'flex', gap: '8px' }}>
-                                                        <button className="btn btn-secondary" style={{ fontSize: '12px', padding: '4px 12px' }} onClick={() => { setChannelForm({ app_id: channelConfig.app_id || '', app_secret: channelConfig.app_secret || '', encrypt_key: channelConfig.encrypt_key || '', connection_mode: channelConfig.extra_config?.connection_mode || 'webhook' }); setFeishuEditing(true); }}>Edit</button>
+                                                        <button className="btn btn-secondary" style={{ fontSize: '12px', padding: '4px 12px' }} onClick={() => { setChannelForm({ app_id: channelConfig.app_id || '', app_secret: channelConfig.app_secret || '', encrypt_key: channelConfig.encrypt_key || '', connection_mode: channelConfig.extra_config?.connection_mode || 'websocket' }); setFeishuEditing(true); }}>Edit</button>
                                                         <button className="btn btn-danger" style={{ fontSize: '12px', padding: '4px 12px' }} onClick={async () => { await channelApi.delete(id!); queryClient.invalidateQueries({ queryKey: ['channel', id] }); }}>Disconnect</button>
                                                     </div>
                                                 </div>
@@ -4555,6 +4555,7 @@ function AgentDetailInner() {
                                                             <li>{t('channelGuide.feishu.ws_step5')}</li>
                                                             <li>{t('channelGuide.feishu.ws_step6')}</li>
                                                             <li>{t('channelGuide.feishu.ws_step7')}</li>
+                                                            <li>{t('channelGuide.feishu.ws_step8')}</li>
                                                             </>) : (<>
                                                             <li>{t('channelGuide.feishu.step1')}</li>
                                                             <li>{t('channelGuide.feishu.step2')}</li>

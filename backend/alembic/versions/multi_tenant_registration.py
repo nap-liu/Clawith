@@ -2,12 +2,12 @@
 historical codes, assign org_admin to earliest company members.
 
 Revision ID: multi_tenant_registration
-Revises: add_skill_tenant_id
+Revises: add_llm_max_output_tokens
 """
 from alembic import op
 
 revision = "multi_tenant_registration"
-down_revision = "add_skill_tenant_id"
+down_revision = "add_llm_max_output_tokens"
 branch_labels = None
 depends_on = None
 
