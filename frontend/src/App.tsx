@@ -3,6 +3,7 @@ import { useAuthStore } from './stores';
 import { useEffect, useState } from 'react';
 import { authApi } from './services/api';
 import Login from './pages/Login';
+import CompanySetup from './pages/CompanySetup';
 import Layout from './pages/Layout';
 import Dashboard from './pages/Dashboard';
 import Plaza from './pages/Plaza';
@@ -15,7 +16,10 @@ import InvitationCodes from './pages/InvitationCodes';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
+    const user = useAuthStore((s) => s.user);
     if (!token) return <Navigate to="/login" replace />;
+    // Force company setup for users without a tenant
+    if (user && !user.tenant_id) return <Navigate to="/setup-company" replace />;
     return <>{children}</>;
 }
 
@@ -99,6 +103,7 @@ export default function App() {
             <NotificationBar />
             <Routes>
                 <Route path="/login" element={<Login />} />
+                <Route path="/setup-company" element={<CompanySetup />} />
                 <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
                     <Route index element={<Navigate to="/plaza" replace />} />
                     <Route path="dashboard" element={<Dashboard />} />
