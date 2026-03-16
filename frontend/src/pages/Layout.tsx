@@ -394,7 +394,16 @@ export default function Layout() {
                                 <span className="sidebar-item-text">{t('nav.enterprise')}</span>
                             </NavLink>
                         )}
-
+                        {user && user.role === 'platform_admin' && (
+                            <NavLink to="/admin/companies" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`} title={t('nav.adminCompanies', 'Companies')}>
+                                <span className="sidebar-item-icon" style={{ display: 'flex' }}>
+                                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                                        <rect x="2" y="5" width="12" height="9" rx="1" /><path d="M5 5V3a2 2 0 012-2h2a2 2 0 012 2v2" />
+                                    </svg>
+                                </span>
+                                <span className="sidebar-item-text">{t('nav.adminCompanies', 'Companies')}</span>
+                            </NavLink>
+                        )}
                     </div>
 
                     <div className="sidebar-footer">

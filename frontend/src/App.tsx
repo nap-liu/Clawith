@@ -13,6 +13,7 @@ import Chat from './pages/Chat';
 import Messages from './pages/Messages';
 import EnterpriseSettings from './pages/EnterpriseSettings';
 import InvitationCodes from './pages/InvitationCodes';
+import AdminCompanies from './pages/AdminCompanies';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
@@ -114,6 +115,7 @@ export default function App() {
                     <Route path="messages" element={<Messages />} />
                     <Route path="enterprise" element={<EnterpriseSettings />} />
                     <Route path="invitations" element={<InvitationCodes />} />
+                    <Route path="admin/companies" element={<AdminCompanies />} />
                 </Route>
             </Routes>
         </>
