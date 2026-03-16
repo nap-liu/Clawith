@@ -122,7 +122,6 @@ const CHANNEL_REGISTRY: ChannelDef[] = [
         nameFallback: 'Microsoft Teams',
         desc: 'Teams Bot',
         apiSlug: 'teams-channel',
-        editOnly: true,
         fields: [
             { key: 'app_id', label: 'App ID (Client ID)', placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx', required: true },
             { key: 'app_secret', label: 'App Secret (Client Secret)', type: 'password', required: true },
@@ -180,7 +179,6 @@ const CHANNEL_REGISTRY: ChannelDef[] = [
         nameFallback: 'DingTalk',
         desc: 'Stream Mode',
         apiSlug: 'dingtalk-channel',
-        editOnly: true,
         fields: [
             { key: 'app_key', label: 'AppKey', type: 'password', required: true },
             { key: 'app_secret', label: 'AppSecret', type: 'password', required: true },
@@ -194,7 +192,6 @@ const CHANNEL_REGISTRY: ChannelDef[] = [
         nameFallback: 'Atlassian',
         desc: 'Jira / Confluence / Compass (Rovo MCP)',
         apiSlug: 'atlassian-channel',
-        editOnly: true,
         hasTestConnection: true,
         fields: [
             { key: 'api_key', label: 'API Key', type: 'password', required: true },
@@ -508,14 +505,30 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
 
     // ─── Render create mode channel card ─────────────────
     const renderCreateChannel = (ch: ChannelDef) => {
-        if (ch.editOnly) return null;
         const isOpen = openChannels[ch.id] || false;
 
+        // Ensure we default to 'websocket' for connectionMode in create view if enabled
+        const connMode = ch.connectionMode ? (connectionModes[ch.id] || 'websocket') : null;
+        const isWs = connMode === 'websocket';
+        
+        // Active fields for current mode
+        const activeFields = (ch.connectionMode && isWs && ch.wsFields) ? ch.wsFields : ch.fields;
+        
+        // Special Feishu field filtering (hide encrypt_key if websocket mode)
+        const formFields = ch.id === 'feishu' && isWs
+            ? ch.fields.filter(f => f.key !== 'encrypt_key')
+            : activeFields;
+
         // Determine if configured (any required field has value)
-        const hasValues = ch.fields.some(f => f.required && values?.[`${ch.id}_${f.key}`]);
+        const hasValues = formFields.some(f => f.required && values?.[`${ch.id}_${f.key}`]);
+
+        let subtitle = ch.desc;
+        if (ch.connectionMode && hasValues) {
+            subtitle = isWs ? 'WebSocket Mode' : 'Webhook Mode';
+        }
 
         return (
-            <div key={ch.id} style={{ border: '1px solid var(--border-default)', borderRadius: '8px', overflow: 'hidden' }}>
+            <div key={ch.id} style={{ border: '1px solid var(--border-default)', borderRadius: '8px', overflow: 'hidden', marginBottom: '8px' }}>
                 <div
                     onClick={() => toggleChannel(ch.id)}
                     style={{
@@ -526,33 +539,44 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                 >
                     {ch.icon}
                     <div style={{ flex: 1 }}>
-                        <div style={{ fontWeight: 500, fontSize: '13px' }}>{ch.nameFallback}</div>
-                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{ch.desc}</div>
+                        <div style={{ fontWeight: 500, fontSize: '13px' }}>{t(ch.nameKey, ch.nameFallback)}</div>
+                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{subtitle}</div>
                     </div>
-                    {hasValues && <span style={{ fontSize: '10px', padding: '2px 8px', borderRadius: '10px', background: 'rgba(16,185,129,0.15)', color: 'rgb(16,185,129)', fontWeight: 500 }}>Configured</span>}
+                    {hasValues && <span style={{ fontSize: '10px', padding: '2px 8px', borderRadius: '10px', background: 'rgba(16,185,129,0.15)', color: 'rgb(16,185,129)', fontWeight: 500 }}>{t('agent.settings.channel.configured', 'Configured')}</span>}
                     <span style={{ fontSize: '12px', color: 'var(--text-tertiary)', transition: 'transform 0.2s', transform: isOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}>&#9660;</span>
                 </div>
                 {isOpen && (
                     <div style={{ padding: '16px' }}>
-                        {/* Feishu: extra config steps in create mode */}
-                        {ch.id === 'feishu' && (
-                            <div style={{ background: 'var(--bg-elevated)', borderRadius: '8px', padding: '12px', marginBottom: '14px', fontSize: '12px', lineHeight: '1.8' }}>
-                                <strong>{t('wizard.step5.configSteps')}</strong>
-                                <ol style={{ paddingLeft: '16px', margin: '6px 0 0' }}>
-                                    <li>{t('wizard.step5.step1Feishu')} <a href="https://open.feishu.cn" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-primary)' }}>{t('wizard.step5.feishuPlatform')}</a></li>
-                                    <li>{t('wizard.step5.step2Feishu')}</li>
-                                    <li>{t('wizard.step5.step3Feishu')}</li>
-                                    <li>{t('wizard.step5.step4Feishu')}</li>
-                                </ol>
+                        {/* Connection Mode Toggle */}
+                        {ch.connectionMode && (
+                            <div style={{ marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <label style={{ fontSize: '12px', fontWeight: 500, width: '120px' }}>{t('agent.settings.channel.mode', 'Connection Mode')}</label>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', cursor: 'pointer' }}>
+                                    <input type="radio" checked={isWs} onChange={() => setConnectionModes(p => ({ ...p, [ch.id]: 'websocket' }))} />
+                                    {t('agent.settings.channel.modeWs', 'WebSocket (Recommended)')}
+                                </label>
+                                <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', cursor: 'pointer', marginLeft: '12px' }}>
+                                    <input type="radio" checked={!isWs} onChange={() => setConnectionModes(p => ({ ...p, [ch.id]: 'webhook' }))} />
+                                    {t('agent.settings.channel.modeWebhook', 'Webhook')}
+                                </label>
                             </div>
                         )}
-                        {renderGuide(ch.guide, false, ch)}
-                        {ch.fields.map(field => (
+                        
+                        {renderGuide(ch.guide, !!isWs, ch)}
+                        
+                        {formFields.map(field => (
                             <div className="form-group" key={field.key}>
                                 {renderField(
                                     field, ch.id,
                                     values?.[`${ch.id}_${field.key}`] || '',
-                                    (val) => onChange?.({ ...values, [`${ch.id}_${field.key}`]: val }),
+                                    (val) => {
+                                        const newValues = { ...values, [`${ch.id}_${field.key}`]: val };
+                                        // Save connection mode if this channel supports it
+                                        if (ch.connectionMode) {
+                                            newValues[`${ch.id}_connection_mode`] = connMode || 'websocket';
+                                        }
+                                        onChange?.(newValues);
+                                    },
                                 )}
                             </div>
                         ))}
