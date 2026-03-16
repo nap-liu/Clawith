@@ -647,10 +647,10 @@ export default function EnterpriseSettings() {
     const [companyIntroSaving, setCompanyIntroSaving] = useState(false);
     const [companyIntroSaved, setCompanyIntroSaved] = useState(false);
 
-    // Company intro key: per-tenant (company_intro_{tenantId}), fallback to global for default company
+    // Company intro key: always per-tenant scoped
     const companyIntroKey = selectedTenantId ? `company_intro_${selectedTenantId}` : 'company_intro';
 
-    // Load Company Intro (try tenant-scoped key first, fallback to global)
+    // Load Company Intro (tenant-scoped only, no fallback to global)
     useEffect(() => {
         setCompanyIntro('');
         if (!selectedTenantId) return;
@@ -659,11 +659,8 @@ export default function EnterpriseSettings() {
             .then(d => {
                 if (d?.value?.content) {
                     setCompanyIntro(d.value.content);
-                } else {
-                    // Fallback: check global key for backward compat (default company)
-                    return fetchJson<any>('/enterprise/system-settings/company_intro')
-                        .then(g => { if (g?.value?.content) setCompanyIntro(g.value.content); });
                 }
+                // No fallback — each company starts empty with placeholder watermark
             })
             .catch(() => { });
     }, [selectedTenantId]);
