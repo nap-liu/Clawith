@@ -927,7 +927,7 @@ function AgentDetailInner() {
     const [isStreaming, setIsStreaming] = useState(false);
     const [uploadProgress, setUploadProgress] = useState(-1);
     const uploadAbortRef = useRef<(() => void) | null>(null);
-    const [attachedFile, setAttachedFile] = useState<{ name: string; text: string; path?: string; imageUrl?: string } | null>(null);
+    const [attachedFiles, setAttachedFiles] = useState<{ name: string; text: string; path?: string; imageUrl?: string }[]>([]);
     const wsRef = useRef<WebSocket | null>(null);
     const chatEndRef = useRef<HTMLDivElement>(null);
     const chatContainerRef = useRef<HTMLDivElement>(null);
@@ -1199,87 +1199,136 @@ function AgentDetailInner() {
 
     const sendChatMsg = () => {
         if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-        if (!chatInput.trim() && !attachedFile) return;
+        if (!chatInput.trim() && attachedFiles.length === 0) return;
+        
         let userMsg = chatInput.trim();
         let contentForLLM = userMsg;
-        if (attachedFile) {
-            if (attachedFile.imageUrl && supportsVision) {
-                // Vision model — embed image data for direct analysis
-                const imageMarker = `[image_data:${attachedFile.imageUrl}]`;
-                contentForLLM = userMsg ? `${imageMarker}\n${userMsg}` : `${imageMarker}\n请分析这张图片`;
-                userMsg = userMsg || `[图片] ${attachedFile.name}`;
-            } else if (attachedFile.imageUrl) {
-                // Non-vision model — just reference the file path
-                const wsPath = attachedFile.path || '';
-                contentForLLM = userMsg
-                    ? `[图片文件已上传: ${attachedFile.name}，保存在 ${wsPath}]\n\n${userMsg}`
-                    : `[图片文件已上传: ${attachedFile.name}，保存在 ${wsPath}]\n请描述或处理这个图片文件。你可以使用 read_document 工具读取它。`;
-                userMsg = userMsg || `[图片] ${attachedFile.name}`;
+        let displayFiles = '';
+
+        if (attachedFiles.length > 0) {
+            let filesPrompt = '';
+            let filesDisplay = '';
+            
+            attachedFiles.forEach(file => {
+                filesDisplay += `[📎 ${file.name}] `;
+                if (file.imageUrl && supportsVision) {
+                    filesPrompt += `[image_data:${file.imageUrl}]\n`;
+                } else if (file.imageUrl) {
+                    filesPrompt += `[图片文件已上传: ${file.name}，保存在 ${file.path || ''}]\n`;
+                } else {
+                    const wsPath = file.path || '';
+                    const codePath = wsPath.replace(/^workspace\//, '');
+                    const fileLoc = wsPath ? `\nFile location: ${wsPath} (for read_file/read_document tools)\nIn execute_code, use relative path: "${codePath}" (working directory is workspace/)\n` : '';
+                    filesPrompt += `[File: ${file.name}]${fileLoc}\n${file.text}\n\n`;
+                }
+            });
+
+            if (supportsVision && attachedFiles.some(f => f.imageUrl)) {
+                contentForLLM = userMsg ? `${filesPrompt}\n${userMsg}` : `${filesPrompt}\n请分析这些文件`;
             } else {
-                const wsPath = attachedFile.path || '';
-                const codePath = wsPath.replace(/^workspace\//, '');
-                const fileLoc = wsPath ? `\nFile location: ${wsPath} (for read_file/read_document tools)\nIn execute_code, use relative path: "${codePath}" (working directory is workspace/)` : '';
-                const fc = `[File: ${attachedFile.name}]${fileLoc}\n\n${attachedFile.text}`;
-                contentForLLM = userMsg ? `${fc}\n\nQuestion: ${userMsg}` : `Please analyze this file:\n\n${fc}`;
-                userMsg = userMsg || `⌆ ${attachedFile.name}`;
+                contentForLLM = userMsg ? `${filesPrompt}\nQuestion: ${userMsg}` : `Please analyze these files:\n\n${filesPrompt}`;
             }
+            
+            displayFiles = filesDisplay.trim();
+            userMsg = userMsg ? `${displayFiles}\n${userMsg}` : displayFiles;
         }
 
         setIsWaiting(true);
         setIsStreaming(false);
-        setChatMessages(prev => [...prev, { role: 'user', content: userMsg, fileName: attachedFile?.name, imageUrl: attachedFile?.imageUrl, timestamp: new Date().toISOString() }]);
-        wsRef.current.send(JSON.stringify({ content: contentForLLM, display_content: userMsg, file_name: attachedFile?.name || '' }));
-        setChatInput(''); setAttachedFile(null);
+        setChatMessages(prev => [...prev, { 
+            role: 'user', 
+            content: userMsg, 
+            fileName: attachedFiles.map(f => f.name).join(', '), 
+            imageUrl: attachedFiles.length === 1 ? attachedFiles[0].imageUrl : undefined, 
+            timestamp: new Date().toISOString() 
+        }]);
+        wsRef.current.send(JSON.stringify({ 
+            content: contentForLLM, 
+            display_content: userMsg, 
+            file_name: attachedFiles.map(f => f.name).join(', ') 
+        }));
+        
+        setChatInput(''); 
+        setAttachedFiles([]);
     };
 
     const handleChatFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0]; if (!file) return;
+        const files = Array.from(e.target.files || []);
+        if (!files.length) return;
+        const allowedFiles = files.slice(0, 10 - attachedFiles.length);
+        if (!allowedFiles.length) {
+            alert('Limit of 10 attached files reached.');
+            return;
+        }
+        
         setUploading(true); setUploadProgress(0);
         try {
-            const { promise, abort } = uploadFileWithProgress(
-                `/chat/upload`,
-                file,
-                (pct) => setUploadProgress(pct),
-                id ? { agent_id: id } : undefined,
-            );
-            uploadAbortRef.current = abort;
-            const data = await promise;
-            setAttachedFile({ name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined });
+            const uploadPromises = allowedFiles.map(file => {
+                const { promise } = uploadFileWithProgress(
+                    `/chat/upload`,
+                    file,
+                    () => {}, // Avoid updating progress per file to prevent flickering, could implement total progress
+                    id ? { agent_id: id } : undefined,
+                );
+                return promise;
+            });
+            const results = await Promise.all(uploadPromises);
+            const newAttached = results.map(data => ({
+                name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined
+            }));
+            setAttachedFiles(prev => [...prev, ...newAttached].slice(0, 10));
         } catch (err: any) {
             if (err?.message !== 'Upload cancelled') alert(t('agent.upload.failed'));
-        } finally { setUploading(false); setUploadProgress(-1); uploadAbortRef.current = null; if (fileInputRef.current) fileInputRef.current.value = ''; }
+        } finally { 
+            setUploading(false); setUploadProgress(-1); uploadAbortRef.current = null; 
+            if (fileInputRef.current) fileInputRef.current.value = ''; 
+        }
     };
 
     // Clipboard paste handler — auto-upload pasted images
     const handlePaste = async (e: React.ClipboardEvent) => {
         const items = e.clipboardData?.items;
         if (!items) return;
+        
+        const filesToUpload: File[] = [];
         for (let i = 0; i < items.length; i++) {
             if (items[i].type.startsWith('image/')) {
-                e.preventDefault();
                 const blob = items[i].getAsFile();
-                if (!blob) return;
-                // Generate a filename from timestamp
-                const ext = blob.type.split('/')[1] || 'png';
-                const fileName = `paste-${Date.now()}.${ext}`;
-                const file = new File([blob], fileName, { type: blob.type });
-                setUploading(true); setUploadProgress(0);
-                try {
-                    const { promise, abort } = uploadFileWithProgress(
-                        `/chat/upload`,
-                        file,
-                        (pct) => setUploadProgress(pct),
-                        id ? { agent_id: id } : undefined,
-                    );
-                    uploadAbortRef.current = abort;
-                    const data = await promise;
-                    setAttachedFile({ name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined });
-                } catch (err: any) {
-                    if (err?.message !== 'Upload cancelled') alert(t('agent.upload.failed'));
-                } finally { setUploading(false); setUploadProgress(-1); uploadAbortRef.current = null; }
-                return; // Only handle the first image
+                if (blob) {
+                    const ext = blob.type.split('/')[1] || 'png';
+                    const fileName = `paste-${Date.now()}-${i}.${ext}`;
+                    filesToUpload.push(new File([blob], fileName, { type: blob.type }));
+                }
             }
         }
+        
+        if (!filesToUpload.length) return;
+        e.preventDefault();
+        const allowedFiles = filesToUpload.slice(0, 10 - attachedFiles.length);
+        if (!allowedFiles.length) {
+            alert('Limit of 10 attached files reached.');
+            return;
+        }
+
+        setUploading(true); setUploadProgress(0);
+        try {
+            const uploadPromises = allowedFiles.map(file => {
+                const { promise } = uploadFileWithProgress(
+                    `/chat/upload`,
+                    file,
+                    () => {},
+                    id ? { agent_id: id } : undefined,
+                );
+                return promise;
+            });
+            const results = await Promise.all(uploadPromises);
+            const newAttached = results.map(data => ({
+                name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined
+            }));
+            setAttachedFiles(prev => [...prev, ...newAttached].slice(0, 10));
+        } catch (err: any) {
+            if (err?.message !== 'Upload cancelled') alert(t('agent.upload.failed'));
+        } finally { setUploading(false); setUploadProgress(-1); uploadAbortRef.current = null; }
     };
 
     // Expandable activity log
@@ -3040,20 +3089,24 @@ function AgentDetailInner() {
                                                 Connecting...
                                             </div>
                                         ) : null}
-                                        {attachedFile && (
-                                            <div style={{ padding: '6px 16px', background: 'var(--bg-elevated)', borderTop: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '11px' }}>
-                                                {attachedFile.imageUrl ? (
-                                                    <img src={attachedFile.imageUrl} alt={attachedFile.name} style={{ width: '40px', height: '40px', borderRadius: '6px', objectFit: 'cover', border: '1px solid var(--border-subtle)' }} />
-                                                ) : (
-                                                    <span>📎</span>
-                                                )}
-                                                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{attachedFile.name}</span>
-                                                <button onClick={() => setAttachedFile(null)} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: '14px', padding: '2px 4px' }}>✕</button>
+                                        {attachedFiles.length > 0 && (
+                                            <div style={{ padding: '6px 16px', background: 'var(--bg-elevated)', borderTop: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                                                {attachedFiles.map((file, idx) => (
+                                                    <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', background: 'var(--bg-secondary)', padding: '4px 6px', borderRadius: '4px', border: '1px solid var(--border-subtle)', maxWidth: '200px' }}>
+                                                        {file.imageUrl ? (
+                                                            <img src={file.imageUrl} alt={file.name} style={{ width: '20px', height: '20px', borderRadius: '4px', objectFit: 'cover' }} />
+                                                        ) : (
+                                                            <span>📎</span>
+                                                        )}
+                                                        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{file.name}</span>
+                                                        <button onClick={() => setAttachedFiles(prev => prev.filter((_, i) => i !== idx))} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: '14px', padding: '0 2px' }} title="Remove file">✕</button>
+                                                    </div>
+                                                ))}
                                             </div>
                                         )}
                                         <div style={{ display: 'flex', gap: '8px', padding: '6px 12px', borderTop: '1px solid var(--border-subtle)' }}>
-                                            <input type="file" ref={fileInputRef} onChange={handleChatFile} style={{ display: 'none' }} />
-                                            <button className="btn btn-secondary" onClick={() => fileInputRef.current?.click()} disabled={!wsConnected || uploading || isWaiting || isStreaming} style={{ padding: '6px 10px', fontSize: '14px', minWidth: 'auto', ...( (!wsConnected || uploading || isWaiting || isStreaming) ? { cursor: 'not-allowed', opacity: 0.4 } : {}) }}>{uploading ? '⏳' : '⦹'}</button>
+                                            <input type="file" multiple ref={fileInputRef} onChange={handleChatFile} style={{ display: 'none' }} />
+                                            <button className="btn btn-secondary" onClick={() => fileInputRef.current?.click()} disabled={!wsConnected || uploading || isWaiting || isStreaming || attachedFiles.length >= 10} style={{ padding: '6px 10px', fontSize: '14px', minWidth: 'auto', ...( (!wsConnected || uploading || isWaiting || isStreaming) ? { cursor: 'not-allowed', opacity: 0.4 } : {}) }}>{uploading ? '⏳' : '⦹'}</button>
                                             {uploading && uploadProgress >= 0 && (
                                                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: '0 0 140px' }}>
                                                     {uploadProgress <= 100 ? (
@@ -3077,14 +3130,14 @@ function AgentDetailInner() {
                                             <input ref={chatInputRef} className="chat-input" value={chatInput} onChange={e => setChatInput(e.target.value)}
                                                 onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMsg(); } }}
                                                 onPaste={handlePaste}
-                                                placeholder={!wsConnected && (!activeSession?.user_id || !currentUser || activeSession.user_id === String(currentUser?.id)) ? 'Connecting...' : attachedFile ? t('agent.chat.askAboutFile', { name: attachedFile.name }) : t('chat.placeholder')}
+                                                placeholder={!wsConnected && (!activeSession?.user_id || !currentUser || activeSession.user_id === String(currentUser?.id)) ? 'Connecting...' : attachedFiles.length > 0 ? t('agent.chat.askAboutFile', { name: attachedFiles.length === 1 ? attachedFiles[0].name : `${attachedFiles.length} files` }) : t('chat.placeholder')}
                                                 disabled={!wsConnected || isWaiting || isStreaming} style={{ flex: 1 }} autoFocus />
                                             {(isStreaming || isWaiting) ? (
                                                 <button className="btn btn-stop-generation" onClick={() => { if (wsRef.current?.readyState === WebSocket.OPEN) { wsRef.current.send(JSON.stringify({ type: 'abort' })); setIsStreaming(false); setIsWaiting(false); } }} style={{ padding: '6px 16px' }} title={t('chat.stop', 'Stop')}>
                                                     <span className="stop-icon" />
                                                 </button>
                                             ) : (
-                                                <button className="btn btn-primary" onClick={sendChatMsg} disabled={!wsConnected || (!chatInput.trim() && !attachedFile)} style={{ padding: '6px 16px' }}>{t('chat.send')}</button>
+                                                <button className="btn btn-primary" onClick={sendChatMsg} disabled={!wsConnected || (!chatInput.trim() && attachedFiles.length === 0)} style={{ padding: '6px 16px' }}>{t('chat.send')}</button>
                                             )}
                                         </div>
                                     </>
