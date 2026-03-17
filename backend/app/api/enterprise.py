@@ -71,8 +71,9 @@ async def test_llm_model(
             base_url=data.base_url or None,
         )
         # Simple test: ask model to say "ok"
+        from app.services.llm_client import LLMMessage
         response = await client.complete(
-            messages=[{"role": "user", "content": "Say 'ok' and nothing else."}],
+            messages=[LLMMessage(role="user", content="Say 'ok' and nothing else.")],
             max_tokens=16,
         )
         latency_ms = int((time.time() - start) * 1000)
@@ -96,7 +97,14 @@ async def list_llm_models(
     if tid:
         query = query.where(LLMModel.tenant_id == uuid.UUID(tid))
     result = await db.execute(query)
-    return [LLMModelOut.model_validate(m) for m in result.scalars().all()]
+    models = []
+    for m in result.scalars().all():
+        out = LLMModelOut.model_validate(m)
+        # Mask API key: show last 4 chars
+        key = m.api_key_encrypted or ""
+        out.api_key_masked = f"****{key[-4:]}" if len(key) > 4 else "****"
+        models.append(out)
+    return models
 
 
 @router.post("/llm-models", response_model=LLMModelOut, status_code=status.HTTP_201_CREATED)
@@ -189,7 +197,7 @@ async def update_llm_model(
             model.label = data.label
         if hasattr(data, 'base_url') and data.base_url is not None:
             model.base_url = data.base_url
-        if data.api_key and data.api_key.strip():  # Only update API key if provided (not empty)
+        if data.api_key and data.api_key.strip() and not data.api_key.startswith('****'):  # Skip masked values
             model.api_key_encrypted = data.api_key.strip()
         if data.max_tokens_per_day is not None:
             model.max_tokens_per_day = data.max_tokens_per_day

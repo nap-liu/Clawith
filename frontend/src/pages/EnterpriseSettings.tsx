@@ -26,7 +26,7 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
 
 interface LLMModel {
     id: string; provider: string; model: string; label: string;
-    base_url?: string; max_tokens_per_day?: number; enabled: boolean; supports_vision?: boolean; max_output_tokens?: number; created_at: string;
+    base_url?: string; api_key_masked?: string; max_tokens_per_day?: number; enabled: boolean; supports_vision?: boolean; max_output_tokens?: number; created_at: string;
 }
 
 interface LLMProviderSpec {
@@ -904,7 +904,7 @@ export default function EnterpriseSettings() {
                                         {m.supports_vision && <span className="badge" style={{ background: 'rgba(99,102,241,0.15)', color: 'rgb(99,102,241)', fontSize: '10px' }}>👁 Vision</span>}
                                         <button className="btn btn-ghost" onClick={() => {
                                             setEditingModelId(m.id);
-                                            setModelForm({ provider: m.provider, model: m.model, label: m.label, base_url: m.base_url || '', api_key: '', supports_vision: m.supports_vision || false, max_output_tokens: m.max_output_tokens ? String(m.max_output_tokens) : '' });
+                                            setModelForm({ provider: m.provider, model: m.model, label: m.label, base_url: m.base_url || '', api_key: m.api_key_masked || '', supports_vision: m.supports_vision || false, max_output_tokens: m.max_output_tokens ? String(m.max_output_tokens) : '' });
                                             setShowAddModel(true);
                                         }} style={{ fontSize: '12px' }}>✏️ Edit</button>
                                         <button className="btn btn-ghost" onClick={() => deleteModel.mutate({ id: m.id })} style={{ color: 'var(--error)' }}>{t('common.delete')}</button>
