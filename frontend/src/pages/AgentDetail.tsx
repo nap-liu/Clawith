@@ -805,7 +805,10 @@ function AgentDetailInner() {
         try {
             const tkn = localStorage.getItem('token');
             const res = await fetch(`/api/agents/${id}/sessions?scope=all`, { headers: { Authorization: `Bearer ${tkn}` } });
-            if (res.ok) setAllSessions(await res.json());
+            if (res.ok) {
+                const all = await res.json();
+                setAllSessions(all.filter((s: any) => s.source_channel !== 'trigger'));
+            }
         } catch { }
     };
 
@@ -848,7 +851,10 @@ function AgentDetailInner() {
             const r1 = await fetch(`/api/agents/${id}/sessions?scope=mine`, { headers: { Authorization: `Bearer ${tkn}` } });
             if (r1.ok) setSessions(await r1.json());
             const r2 = await fetch(`/api/agents/${id}/sessions?scope=all`, { headers: { Authorization: `Bearer ${tkn}` } });
-            if (r2.ok) setAllSessions(await r2.json());
+            if (r2.ok) {
+                const all2 = await r2.json();
+                setAllSessions(all2.filter((s: any) => s.source_channel !== 'trigger'));
+            }
         } catch (e: any) {
             alert(e.message || 'Delete failed');
         }

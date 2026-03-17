@@ -75,11 +75,8 @@ async def list_sessions(
         result = await db.execute(
             select(ChatSession)
             .where(
-                (
-                    (ChatSession.agent_id == agent_id)
-                    | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
-                ),
-                ChatSession.source_channel != "trigger",  # Reflections only shown in Aware tab
+                (ChatSession.agent_id == agent_id)
+                | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
             )
             .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
         )
