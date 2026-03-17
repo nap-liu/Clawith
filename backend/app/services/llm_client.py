@@ -1621,7 +1621,7 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         protocol="anthropic",
         default_base_url="https://api.anthropic.com",
         supports_tool_choice=False,
-        default_max_tokens=4096,
+        default_max_tokens=8192,
     ),
     "openai": ProviderSpec(
         provider="openai",
@@ -1684,6 +1684,13 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         protocol="gemini",
         default_base_url="https://generativelanguage.googleapis.com/v1beta",
         default_max_tokens=8192,
+    ),
+    "kimi": ProviderSpec(
+        provider="kimi",
+        display_name="Kimi (Moonshot)",
+        protocol="openai_compatible",
+        default_base_url="https://api.moonshot.cn/v1",
+        default_max_tokens=4096,
     ),
     "custom": ProviderSpec(
         provider="custom",
