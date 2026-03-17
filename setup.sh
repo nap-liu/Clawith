@@ -27,9 +27,9 @@ get_server_ip() {
 }
 
 # --- Check Python version (>= 3.12 required) ---
-PYTHON_BIN="python3"
-if command -v python3 &>/dev/null; then
-    PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if command -v "$PYTHON_BIN" &>/dev/null; then
+    PY_VER=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
     PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
     if [ "$PY_MAJOR" -lt 3 ] || ([ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 12 ]); then
@@ -46,7 +46,6 @@ if command -v python3 &>/dev/null; then
         exit 1
     fi
 fi
-PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # --- Optional package mirror overrides ---
 PIP_INSTALL_ARGS=()
