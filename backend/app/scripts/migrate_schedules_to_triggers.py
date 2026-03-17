@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from app.database import async_session
+from app.models.agent import Agent  # noqa: F401 — needed for FK resolution
 from app.models.schedule import AgentSchedule
 from app.models.trigger import AgentTrigger
 
