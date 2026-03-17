@@ -41,13 +41,13 @@ interface LLMProviderSpec {
 const FALLBACK_LLM_PROVIDERS: LLMProviderSpec[] = [
     { provider: 'anthropic', display_name: 'Anthropic', protocol: 'anthropic', default_base_url: 'https://api.anthropic.com', supports_tool_choice: false, default_max_tokens: 4096 },
     { provider: 'openai', display_name: 'OpenAI', protocol: 'openai_compatible', default_base_url: 'https://api.openai.com/v1', supports_tool_choice: true, default_max_tokens: 16384 },
-    { provider: 'deepseek', display_name: 'DeepSeek', protocol: 'openai_compatible', default_base_url: 'https://api.deepseek.com/v1', supports_tool_choice: true, default_max_tokens: 16384 },
+    { provider: 'deepseek', display_name: 'DeepSeek', protocol: 'openai_compatible', default_base_url: 'https://api.deepseek.com/v1', supports_tool_choice: true, default_max_tokens: 8192 },
     { provider: 'minimax', display_name: 'MiniMax', protocol: 'openai_compatible', default_base_url: 'https://api.minimaxi.com/v1', supports_tool_choice: true, default_max_tokens: 16384 },
     { provider: 'qwen', display_name: 'Qwen (DashScope)', protocol: 'openai_compatible', default_base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', supports_tool_choice: true, default_max_tokens: 8192 },
-    { provider: 'zhipu', display_name: 'Zhipu', protocol: 'openai_compatible', default_base_url: 'https://open.bigmodel.cn/api/paas/v4', supports_tool_choice: true, default_max_tokens: 16384 },
-    { provider: 'gemini', display_name: 'Gemini', protocol: 'gemini', default_base_url: 'https://generativelanguage.googleapis.com/v1beta', supports_tool_choice: true, default_max_tokens: 16384 },
-    { provider: 'openrouter', display_name: 'OpenRouter', protocol: 'openai_compatible', default_base_url: 'https://openrouter.ai/api/v1', supports_tool_choice: true, default_max_tokens: 16384 },
-    { provider: 'custom', display_name: 'Custom', protocol: 'openai_compatible', default_base_url: '', supports_tool_choice: true, default_max_tokens: 16384 },
+    { provider: 'zhipu', display_name: 'Zhipu', protocol: 'openai_compatible', default_base_url: 'https://open.bigmodel.cn/api/paas/v4', supports_tool_choice: true, default_max_tokens: 4096 },
+    { provider: 'gemini', display_name: 'Gemini', protocol: 'gemini', default_base_url: 'https://generativelanguage.googleapis.com/v1beta', supports_tool_choice: true, default_max_tokens: 8192 },
+    { provider: 'openrouter', display_name: 'OpenRouter', protocol: 'openai_compatible', default_base_url: 'https://openrouter.ai/api/v1', supports_tool_choice: true, default_max_tokens: 4096 },
+    { provider: 'custom', display_name: 'Custom', protocol: 'openai_compatible', default_base_url: '', supports_tool_choice: true, default_max_tokens: 4096 },
 ];
 
 
@@ -765,7 +765,18 @@ export default function EnterpriseSettings() {
                 {activeTab === 'llm' && (
                     <div>
                         <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '16px' }}>
-                            <button className="btn btn-primary" onClick={() => { setEditingModelId(null); setModelForm({ provider: 'anthropic', model: '', api_key: '', base_url: '', label: '', supports_vision: false, max_output_tokens: '' }); setShowAddModel(true); }}>+ {t('enterprise.llm.addModel')}</button>
+                            <button className="btn btn-primary" onClick={() => {
+                                setEditingModelId(null);
+                                const defaultSpec = providerOptions[0];
+                                setModelForm({
+                                    provider: defaultSpec?.provider || 'anthropic',
+                                    model: '', api_key: '',
+                                    base_url: defaultSpec?.default_base_url || '',
+                                    label: '', supports_vision: false,
+                                    max_output_tokens: defaultSpec ? String(defaultSpec.default_max_tokens) : '4096',
+                                });
+                                setShowAddModel(true);
+                            }}>+ {t('enterprise.llm.addModel')}</button>
                         </div>
 
                         {showAddModel && (
@@ -774,7 +785,22 @@ export default function EnterpriseSettings() {
                                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                                     <div className="form-group">
                                         <label className="form-label">Provider</label>
-                                        <select className="form-input" value={modelForm.provider} onChange={e => setModelForm({ ...modelForm, provider: e.target.value })}>
+                                        <select className="form-input" value={modelForm.provider} onChange={e => {
+                                            const newProvider = e.target.value;
+                                            const spec = providerOptions.find(p => p.provider === newProvider);
+                                            const updates: any = { provider: newProvider };
+                                            // Auto-fill base_url when adding new model (not editing)
+                                            if (!editingModelId && spec?.default_base_url) {
+                                                updates.base_url = spec.default_base_url;
+                                            } else if (!editingModelId) {
+                                                updates.base_url = '';
+                                            }
+                                            // Auto-fill max_output_tokens with provider default
+                                            if (!editingModelId && spec) {
+                                                updates.max_output_tokens = String(spec.default_max_tokens);
+                                            }
+                                            setModelForm(f => ({ ...f, ...updates }));
+                                        }}>
                                             {providerOptions.map((p) => (
                                                 <option key={p.provider} value={p.provider}>{p.display_name}</option>
                                             ))}
@@ -808,8 +834,8 @@ export default function EnterpriseSettings() {
                                     </div>
                                     <div className="form-group">
                                         <label className="form-label">Max Output Tokens</label>
-                                        <input className="form-input" type="number" placeholder="Auto (provider default)" value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
-                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>Override the default output token limit. Leave empty to use provider default (4096).</div>
+                                        <input className="form-input" type="number" placeholder={`Provider default`} value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
+                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>Override the default output token limit. Auto-filled from provider; adjust as needed.</div>
                                     </div>
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>

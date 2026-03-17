@@ -1602,7 +1602,7 @@ class ProviderSpec:
     protocol: Literal["openai_compatible", "anthropic", "openai_responses", "gemini"]
     default_base_url: str | None
     supports_tool_choice: bool = True
-    default_max_tokens: int = 16384
+    default_max_tokens: int = 4096
     model_max_tokens: dict[str, int] = field(default_factory=dict)
 
 
@@ -1628,18 +1628,21 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         display_name="OpenAI",
         protocol="openai_compatible",
         default_base_url="https://api.openai.com/v1",
+        default_max_tokens=16384,
     ),
     "openai-response": ProviderSpec(
         provider="openai-response",
         display_name="OpenAI Responses",
         protocol="openai_responses",
         default_base_url="https://api.openai.com/v1",
+        default_max_tokens=16384,
     ),
     "deepseek": ProviderSpec(
         provider="deepseek",
         display_name="DeepSeek",
         protocol="openai_compatible",
         default_base_url="https://api.deepseek.com/v1",
+        default_max_tokens=8192,
     ),
     "qwen": ProviderSpec(
         provider="qwen",
@@ -1666,24 +1669,28 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         display_name="OpenRouter",
         protocol="openai_compatible",
         default_base_url="https://openrouter.ai/api/v1",
+        default_max_tokens=4096,
     ),
     "zhipu": ProviderSpec(
         provider="zhipu",
         display_name="Zhipu",
         protocol="openai_compatible",
         default_base_url="https://open.bigmodel.cn/api/paas/v4",
+        default_max_tokens=4096,
     ),
     "gemini": ProviderSpec(
         provider="gemini",
         display_name="Gemini",
         protocol="gemini",
         default_base_url="https://generativelanguage.googleapis.com/v1beta",
+        default_max_tokens=8192,
     ),
     "custom": ProviderSpec(
         provider="custom",
         display_name="Custom",
         protocol="openai_compatible",
         default_base_url=None,
+        default_max_tokens=4096,
     ),
 }
 
