@@ -223,7 +223,9 @@ async def _save_skill_to_db(
         await db.flush()
 
         for f in files:
-            db.add(SkillFile(skill_id=skill.id, path=f["path"], content=f["content"]))
+            # PostgreSQL text columns cannot store null bytes
+            content = f["content"].replace("\x00", "") if f.get("content") else ""
+            db.add(SkillFile(skill_id=skill.id, path=f["path"], content=content))
 
         await db.commit()
         return {"id": str(skill.id), "name": skill.name, "folder_name": skill.folder_name}
