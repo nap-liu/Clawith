@@ -329,21 +329,29 @@ class OrgSyncService:
                                 select(User).where(User.feishu_user_id == user_id)
                             )
                             platform_user = pu_result.scalar_one_or_none()
+                        # Fallback: match by real email (most reliable cross-app identifier)
+                        member_email = u.get("email", "")
+                        if not platform_user and member_email and "@" in member_email and not member_email.endswith("@feishu.local"):
+                            pu_result = await db.execute(
+                                select(User).where(User.email == member_email)
+                            )
+                            platform_user = pu_result.scalar_one_or_none()
 
                         member_name = u.get("name", "")
                         if platform_user:
                             # Update existing user info
                             platform_user.display_name = member_name or platform_user.display_name
-                            if open_id and not platform_user.feishu_open_id:
+                            # Always update feishu IDs to track the current app's values
+                            if open_id:
                                 platform_user.feishu_open_id = open_id
-                            if user_id and not platform_user.feishu_user_id:
+                            if user_id:
                                 platform_user.feishu_user_id = user_id
                             if tenant_id and not platform_user.tenant_id:
                                 platform_user.tenant_id = tenant_id
                         else:
                             # Create new user
                             username_base = f"feishu_{user_id or (open_id[:16] if open_id else uuid.uuid4().hex[:8])}"
-                            email = u.get("email") or f"{username_base}@feishu.local"
+                            email = member_email or f"{username_base}@feishu.local"
                             platform_user = User(
                                 username=username_base,
                                 email=email,
