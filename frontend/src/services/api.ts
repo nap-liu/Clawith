@@ -388,9 +388,11 @@ export const skillApi = {
         request<any>('/skills/import-from-url/preview', { method: 'POST', body: JSON.stringify({ url }) }),
     // Tenant-level settings
     settings: {
-        getToken: () => request<{ configured: boolean; source: string; masked: string }>('/skills/settings/token'),
+        getToken: () => request<{ configured: boolean; source: string; masked: string; clawhub_configured: boolean; clawhub_masked: string }>('/skills/settings/token'),
         setToken: (github_token: string) =>
             request<any>('/skills/settings/token', { method: 'PUT', body: JSON.stringify({ github_token }) }),
+        setClawhubKey: (clawhub_key: string) =>
+            request<any>('/skills/settings/token', { method: 'PUT', body: JSON.stringify({ clawhub_key }) }),
     },
     // Agent-level import (writes to agent workspace)
     agentImport: {

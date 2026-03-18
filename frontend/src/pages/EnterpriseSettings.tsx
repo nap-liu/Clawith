@@ -372,8 +372,10 @@ function SkillsTab() {
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
     const [showSettings, setShowSettings] = useState(false);
     const [tokenInput, setTokenInput] = useState('');
-    const [tokenStatus, setTokenStatus] = useState<{ configured: boolean; source: string; masked: string } | null>(null);
+    const [tokenStatus, setTokenStatus] = useState<{ configured: boolean; source: string; masked: string; clawhub_configured?: boolean; clawhub_masked?: string } | null>(null);
     const [savingToken, setSavingToken] = useState(false);
+    const [clawhubKeyInput, setClawhubKeyInput] = useState('');
+    const [savingClawhubKey, setSavingClawhubKey] = useState(false);
 
     const showToast = (message: string, type: 'success' | 'error' = 'success') => {
         setToast({ message, type });
@@ -590,6 +592,79 @@ function SkillsTab() {
                                 Clear
                             </button>
                         )}
+                    </div>
+
+                    {/* ClawHub API Key */}
+                    <div style={{ marginTop: '16px' }}>
+                        <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            ClawHub API Key
+                            <span className="metric-tooltip-trigger" style={{ display: 'inline-flex', alignItems: 'center', cursor: 'help', color: 'var(--text-tertiary)' }}>
+                                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="8" cy="8" r="6.5" /><path d="M8 7v4M8 5.5v0" /></svg>
+                                <span className="metric-tooltip" style={{ width: '280px', bottom: 'auto', top: 'calc(100% + 6px)', left: '-8px', fontWeight: 400 }}>
+                                    Authenticate ClawHub API calls to avoid rate limiting when browsing and installing skills from ClawHub.
+                                </span>
+                            </span>
+                        </div>
+                        <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
+                            Authenticated requests get higher rate limits for ClawHub skill browsing and installation.
+                        </p>
+                        {tokenStatus?.clawhub_configured && (
+                            <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '8px' }}>
+                                Current key: <code style={{ padding: '2px 6px', borderRadius: '4px', background: 'var(--bg-tertiary)', fontSize: '11px' }}>{tokenStatus.clawhub_masked}</code>
+                            </div>
+                        )}
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                            <input type="text" name="prevent_autofill_ch_user" style={{ display: 'none' }} tabIndex={-1} />
+                            <input type="password" name="prevent_autofill_ch_pass" style={{ display: 'none' }} tabIndex={-1} />
+                            <input
+                                type="text"
+                                className="input"
+                                autoComplete="off"
+                                data-form-type="other"
+                                placeholder="sk-ant-xxxxxxxxxxxx"
+                                value={clawhubKeyInput}
+                                onChange={e => setClawhubKeyInput(e.target.value)}
+                                style={{ flex: 1, fontSize: '13px', fontFamily: 'monospace', WebkitTextSecurity: 'disc' } as React.CSSProperties}
+                            />
+                            <button
+                                className="btn btn-primary"
+                                style={{ fontSize: '13px' }}
+                                disabled={!clawhubKeyInput.trim() || savingClawhubKey}
+                                onClick={async () => {
+                                    setSavingClawhubKey(true);
+                                    try {
+                                        await skillApi.settings.setClawhubKey(clawhubKeyInput.trim());
+                                        const status = await skillApi.settings.getToken();
+                                        setTokenStatus(status);
+                                        setClawhubKeyInput('');
+                                        showToast('ClawHub API key saved');
+                                    } catch (e: any) {
+                                        showToast(e.message || 'Failed to save', 'error');
+                                    }
+                                    setSavingClawhubKey(false);
+                                }}
+                            >
+                                {savingClawhubKey ? 'Saving...' : 'Save'}
+                            </button>
+                            {tokenStatus?.clawhub_configured && (
+                                <button
+                                    className="btn btn-secondary"
+                                    style={{ fontSize: '13px' }}
+                                    onClick={async () => {
+                                        try {
+                                            await skillApi.settings.setClawhubKey('');
+                                            const status = await skillApi.settings.getToken();
+                                            setTokenStatus(status);
+                                            showToast('ClawHub key cleared');
+                                        } catch (e: any) {
+                                            showToast(e.message || 'Failed', 'error');
+                                        }
+                                    }}
+                                >
+                                    Clear
+                                </button>
+                            )}
+                        </div>
                     </div>
                 </div>
             )}

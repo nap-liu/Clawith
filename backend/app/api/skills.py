@@ -27,8 +27,8 @@ _GITHUB_TOKEN_ENV = os.environ.get("GITHUB_TOKEN", "")
 MAX_SKILL_SIZE = 512_000  # 500 KB total limit per skill
 
 
-async def _get_github_token(tenant_id: str | None = None) -> str:
-    """Resolve GitHub token: tenant_settings DB > env var > empty."""
+async def _get_tenant_setting(tenant_id: str | None, key: str) -> str:
+    """Resolve a tenant setting value: tenant_settings DB > empty."""
     if tenant_id:
         try:
             from app.models.tenant_setting import TenantSetting
@@ -37,7 +37,7 @@ async def _get_github_token(tenant_id: str | None = None) -> str:
                 result = await db.execute(
                     select(TenantSetting).where(
                         TenantSetting.tenant_id == _uid.UUID(tenant_id),
-                        TenantSetting.key == "github_token",
+                        TenantSetting.key == key,
                     )
                 )
                 setting = result.scalar_one_or_none()
@@ -45,7 +45,26 @@ async def _get_github_token(tenant_id: str | None = None) -> str:
                     return setting.value["token"]
         except Exception:
             pass
-    return _GITHUB_TOKEN_ENV
+    return ""
+
+
+async def _get_github_token(tenant_id: str | None = None) -> str:
+    """Resolve GitHub token: tenant DB > env var > empty."""
+    db_val = await _get_tenant_setting(tenant_id, "github_token")
+    return db_val or _GITHUB_TOKEN_ENV
+
+
+async def _get_clawhub_key(tenant_id: str | None = None) -> str:
+    """Resolve ClawHub API key: tenant DB > env var > empty."""
+    db_val = await _get_tenant_setting(tenant_id, "clawhub_key")
+    return db_val or os.environ.get("CLAWHUB_API_KEY", "")
+
+
+def _clawhub_headers(api_key: str) -> dict:
+    """Build request headers for ClawHub API calls."""
+    if api_key:
+        return {"Authorization": f"Bearer {api_key}"}
+    return {}
 
 
 class SkillFileIn(BaseModel):
@@ -244,10 +263,12 @@ async def _save_skill_to_db(
 
 
 @router.get("/clawhub/search")
-async def search_clawhub(q: str, _=Depends(require_role("platform_admin"))):
+async def search_clawhub(q: str, current_user: User = Depends(get_current_user)):
     """Proxy search requests to the ClawHub API."""
+    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
+    api_key = await _get_clawhub_key(tenant_id)
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(f"{CLAWHUB_BASE}/search", params={"q": q})
+        resp = await client.get(f"{CLAWHUB_BASE}/search", params={"q": q}, headers=_clawhub_headers(api_key))
         if resp.status_code != 200:
             raise HTTPException(502, f"ClawHub search failed: {resp.status_code}")
         data = resp.json()
@@ -264,11 +285,13 @@ async def search_clawhub(q: str, _=Depends(require_role("platform_admin"))):
 
 
 @router.get("/clawhub/detail/{slug}")
-async def clawhub_detail(slug: str, _=Depends(require_role("platform_admin"))):
+async def clawhub_detail(slug: str, current_user: User = Depends(get_current_user)):
     """Fetch full metadata for a skill from ClawHub."""
+    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
+    api_key = await _get_clawhub_key(tenant_id)
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(f"{CLAWHUB_BASE}/v1/skills/{slug}")
+            resp = await client.get(f"{CLAWHUB_BASE}/v1/skills/{slug}", headers=_clawhub_headers(api_key))
             if resp.status_code == 404:
                 raise HTTPException(404, f"Skill '{slug}' not found on ClawHub")
             if resp.status_code == 429:
@@ -291,11 +314,13 @@ async def install_from_clawhub(body: ClawhubInstallIn, current_user: User = Depe
     slug = body.slug
 
     # 1. Fetch metadata from ClawHub (with retry for rate limits)
+    api_key = await _get_clawhub_key(tenant_id)
+    ch_headers = _clawhub_headers(api_key)
     meta = None
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(f"{CLAWHUB_BASE}/v1/skills/{slug}")
+                resp = await client.get(f"{CLAWHUB_BASE}/v1/skills/{slug}", headers=ch_headers)
                 if resp.status_code == 404:
                     raise HTTPException(404, f"Skill '{slug}' not found on ClawHub")
                 if resp.status_code == 429:
@@ -603,19 +628,51 @@ async def delete_skill(skill_id: str, _=Depends(require_role("platform_admin")))
 
 class SkillSettingsIn(BaseModel):
     github_token: str = ""
+    clawhub_key: str = ""
+
+
+async def _upsert_tenant_setting(tenant_id, key: str, value: str):
+    """Helper to upsert a tenant setting."""
+    from app.models.tenant_setting import TenantSetting
+    async with async_session() as db:
+        result = await db.execute(
+            select(TenantSetting).where(
+                TenantSetting.tenant_id == tenant_id,
+                TenantSetting.key == key,
+            )
+        )
+        existing = result.scalar_one_or_none()
+        if existing:
+            existing.value = {"token": value}
+        else:
+            db.add(TenantSetting(
+                tenant_id=tenant_id,
+                key=key,
+                value={"token": value},
+            ))
+        await db.commit()
+
+
+def _mask_token(token: str) -> str:
+    if token and len(token) > 8:
+        return f"{token[:4]}...{token[-4:]}"
+    return "****" if token else ""
 
 
 @router.get("/settings/token")
 async def get_skill_token_status(
     current_user=Depends(require_role("platform_admin")),
 ):
-    """Check if GitHub token is configured for this tenant."""
+    """Check if GitHub token and ClawHub key are configured for this tenant."""
     tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
-    token = await _get_github_token(tenant_id)
+    gh_token = await _get_github_token(tenant_id)
+    ch_key = await _get_clawhub_key(tenant_id)
     return {
-        "configured": bool(token),
+        "configured": bool(gh_token),
         "source": "tenant" if tenant_id else "env",
-        "masked": f"{token[:4]}...{token[-4:]}" if token and len(token) > 8 else ("****" if token else ""),
+        "masked": _mask_token(gh_token),
+        "clawhub_configured": bool(ch_key),
+        "clawhub_masked": _mask_token(ch_key),
     }
 
 
@@ -624,28 +681,14 @@ async def set_skill_token(
     body: SkillSettingsIn,
     current_user=Depends(require_role("platform_admin")),
 ):
-    """Save GitHub token for this tenant."""
+    """Save GitHub token and/or ClawHub key for this tenant."""
     if not current_user.tenant_id:
         raise HTTPException(400, "No tenant associated")
 
-    from app.models.tenant_setting import TenantSetting
-    async with async_session() as db:
-        result = await db.execute(
-            select(TenantSetting).where(
-                TenantSetting.tenant_id == current_user.tenant_id,
-                TenantSetting.key == "github_token",
-            )
-        )
-        existing = result.scalar_one_or_none()
-        if existing:
-            existing.value = {"token": body.github_token}
-        else:
-            db.add(TenantSetting(
-                tenant_id=current_user.tenant_id,
-                key="github_token",
-                value={"token": body.github_token},
-            ))
-        await db.commit()
+    if body.github_token is not None:
+        await _upsert_tenant_setting(current_user.tenant_id, "github_token", body.github_token)
+    if body.clawhub_key is not None:
+        await _upsert_tenant_setting(current_user.tenant_id, "clawhub_key", body.clawhub_key)
     return {"ok": True}
 
 
@@ -673,9 +716,11 @@ async def browse_list(path: str = "", tenant_id: str | None = None):
         # Inside a skill folder — resolve the skill and relative subpath
         clean = path.strip("/")
         folder = clean.split("/")[0]
-        result = await db.execute(
-            select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
-        )
+        # Resolve skill folder scoped by tenant
+        skill_q = select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
+        if tenant_id:
+            skill_q = skill_q.where(_or(Skill.tenant_id == None, Skill.tenant_id == _uuid.UUID(tenant_id)))
+        result = await db.execute(skill_q)
         skill = result.scalar_one_or_none()
         if not skill:
             return []
