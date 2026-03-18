@@ -415,12 +415,16 @@ select:focus {
   position: relative;
 }
 
-.sidebar-agent-item.owned .sidebar-item {
-  background: linear-gradient(90deg, color-mix(in srgb, var(--accent-primary) 12%, transparent) 0%, transparent 70%);
-}
-
-.sidebar-agent-item.owned .sidebar-item:hover {
-  background: linear-gradient(90deg, color-mix(in srgb, var(--accent-primary) 20%, transparent) 0%, color-mix(in srgb, var(--accent-primary) 5%, transparent) 70%);
+.sidebar-agent-item.owned .agent-avatar::after {
+  content: '';
+  position: absolute;
+  bottom: -2px;
+  left: -2px;
+  width: 7px;
+  height: 7px;
+  background: var(--accent-primary);
+  border-radius: 50%;
+  border: 1.5px solid var(--bg-secondary);
 }
 
 .sidebar-pin-btn {
@@ -685,6 +689,7 @@ select:focus {
 
 /* Agent avatar — sidebar letter icon */
 .agent-avatar {
+  position: relative;
   width: 20px;
   height: 20px;
   border-radius: 6px;
