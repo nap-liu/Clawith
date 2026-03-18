@@ -784,9 +784,10 @@ export default function EnterpriseSettings() {
                             }}>+ {t('enterprise.llm.addModel')}</button>
                         </div>
 
-                        {showAddModel && (
+                        {/* Add Model form — only shown at top when adding new */}
+                        {showAddModel && !editingModelId && (
                             <div className="card" style={{ marginBottom: '16px' }}>
-                                <h3 style={{ marginBottom: '16px' }}>{editingModelId ? 'Edit Model' : t('enterprise.llm.addModel')}</h3>
+                                <h3 style={{ marginBottom: '16px' }}>{t('enterprise.llm.addModel')}</h3>
                                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                                     <div className="form-group">
                                         <label className="form-label">Provider</label>
@@ -794,14 +795,12 @@ export default function EnterpriseSettings() {
                                             const newProvider = e.target.value;
                                             const spec = providerOptions.find(p => p.provider === newProvider);
                                             const updates: any = { provider: newProvider };
-                                            // Auto-fill base_url when adding new model (not editing)
-                                            if (!editingModelId && spec?.default_base_url) {
+                                            if (spec?.default_base_url) {
                                                 updates.base_url = spec.default_base_url;
-                                            } else if (!editingModelId) {
+                                            } else {
                                                 updates.base_url = '';
                                             }
-                                            // Auto-fill max_output_tokens with provider default
-                                            if (!editingModelId && spec) {
+                                            if (spec) {
                                                 updates.max_output_tokens = String(spec.default_max_tokens);
                                             }
                                             setModelForm(f => ({ ...f, ...updates }));
@@ -809,9 +808,6 @@ export default function EnterpriseSettings() {
                                             {providerOptions.map((p) => (
                                                 <option key={p.provider} value={p.provider}>{p.display_name}</option>
                                             ))}
-                                            {!providerOptions.some((p) => p.provider === modelForm.provider) && (
-                                                <option value={modelForm.provider}>{modelForm.provider}</option>
-                                            )}
                                         </select>
                                     </div>
                                     <div className="form-group">
@@ -828,7 +824,7 @@ export default function EnterpriseSettings() {
                                     </div>
                                     <div className="form-group" style={{ gridColumn: 'span 2' }}>
                                         <label className="form-label">API Key</label>
-                                        <input className="form-input" type="password" placeholder={editingModelId ? '•••••••• (Leave blank to keep unchanged)' : 'Enter API Key'} value={modelForm.api_key} onChange={e => setModelForm({ ...modelForm, api_key: e.target.value })} />
+                                        <input className="form-input" type="password" placeholder="Enter API Key" value={modelForm.api_key} onChange={e => setModelForm({ ...modelForm, api_key: e.target.value })} />
                                     </div>
                                     <div className="form-group" style={{ gridColumn: 'span 2' }}>
                                         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '13px' }}>
@@ -839,13 +835,13 @@ export default function EnterpriseSettings() {
                                     </div>
                                     <div className="form-group">
                                         <label className="form-label">Max Output Tokens</label>
-                                        <input className="form-input" type="number" placeholder={`Provider default`} value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
+                                        <input className="form-input" type="number" placeholder="Provider default" value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>Override the default output token limit. Auto-filled from provider; adjust as needed.</div>
                                     </div>
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
                                     <button className="btn btn-secondary" onClick={() => { setShowAddModel(false); setEditingModelId(null); }}>{t('common.cancel')}</button>
-                                    <button className="btn btn-secondary" style={{ display: 'flex', alignItems: 'center', gap: '6px' }} disabled={!modelForm.model || (!editingModelId && !modelForm.api_key)} onClick={async () => {
+                                    <button className="btn btn-secondary" style={{ display: 'flex', alignItems: 'center', gap: '6px' }} disabled={!modelForm.model || !modelForm.api_key} onClick={async () => {
                                         const btn = document.activeElement as HTMLButtonElement;
                                         const origText = btn?.textContent || '';
                                         if (btn) btn.textContent = 'Testing...';
@@ -853,7 +849,6 @@ export default function EnterpriseSettings() {
                                             const token = localStorage.getItem('token');
                                             const testData: any = { provider: modelForm.provider, model: modelForm.model, base_url: modelForm.base_url || undefined };
                                             if (modelForm.api_key) testData.api_key = modelForm.api_key;
-                                            if (editingModelId) testData.model_id = editingModelId;
                                             const res = await fetch('/api/enterprise/llm-test', {
                                                 method: 'POST',
                                                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -873,14 +868,9 @@ export default function EnterpriseSettings() {
                                         }
                                     }}>Test</button>
                                     <button className="btn btn-primary" onClick={() => {
-                                        if (editingModelId) {
-                                            const data = { ...modelForm, max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null };
-                                            updateModel.mutate({ id: editingModelId, data });
-                                        } else {
-                                            const data = { ...modelForm, max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null };
-                                            addModel.mutate(data);
-                                        }
-                                    }} disabled={!modelForm.model || (!editingModelId && !modelForm.api_key)}>
+                                        const data = { ...modelForm, max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null };
+                                        addModel.mutate(data);
+                                    }} disabled={!modelForm.model || !modelForm.api_key}>
                                         {t('common.save')}
                                     </button>
                                 </div>
@@ -889,26 +879,116 @@ export default function EnterpriseSettings() {
 
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                             {models.map((m) => (
-                                <div key={m.id} className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                    <div>
-                                        <div style={{ fontWeight: 500 }}>{m.label}</div>
-                                        <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
-                                            {m.provider}/{m.model}
-                                            {m.base_url && <span> · {m.base_url}</span>}
+                                <div key={m.id}>
+                                    {editingModelId === m.id ? (
+                                        /* Inline edit form */
+                                        <div className="card" style={{ border: '1px solid var(--accent-primary)' }}>
+                                            <h3 style={{ marginBottom: '16px' }}>Edit Model</h3>
+                                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                                                <div className="form-group">
+                                                    <label className="form-label">Provider</label>
+                                                    <select className="form-input" value={modelForm.provider} onChange={e => {
+                                                        const newProvider = e.target.value;
+                                                        setModelForm(f => ({ ...f, provider: newProvider }));
+                                                    }}>
+                                                        {providerOptions.map((p) => (
+                                                            <option key={p.provider} value={p.provider}>{p.display_name}</option>
+                                                        ))}
+                                                        {!providerOptions.some((p) => p.provider === modelForm.provider) && (
+                                                            <option value={modelForm.provider}>{modelForm.provider}</option>
+                                                        )}
+                                                    </select>
+                                                </div>
+                                                <div className="form-group">
+                                                    <label className="form-label">Model</label>
+                                                    <input className="form-input" placeholder="claude-sonnet-4-5" value={modelForm.model} onChange={e => setModelForm({ ...modelForm, model: e.target.value })} />
+                                                </div>
+                                                <div className="form-group">
+                                                    <label className="form-label">{t('enterprise.llm.label')}</label>
+                                                    <input className="form-input" placeholder="Claude Sonnet" value={modelForm.label} onChange={e => setModelForm({ ...modelForm, label: e.target.value })} />
+                                                </div>
+                                                <div className="form-group">
+                                                    <label className="form-label">{t('enterprise.llm.baseUrl')}</label>
+                                                    <input className="form-input" placeholder="https://api.custom.com/v1" value={modelForm.base_url} onChange={e => setModelForm({ ...modelForm, base_url: e.target.value })} />
+                                                </div>
+                                                <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                                                    <label className="form-label">API Key</label>
+                                                    <input className="form-input" type="password" placeholder="•••••••• (Leave blank to keep unchanged)" value={modelForm.api_key} onChange={e => setModelForm({ ...modelForm, api_key: e.target.value })} />
+                                                </div>
+                                                <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                                                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '13px' }}>
+                                                        <input type="checkbox" checked={modelForm.supports_vision} onChange={e => setModelForm({ ...modelForm, supports_vision: e.target.checked })} />
+                                                        👁 Supports Vision (Multimodal)
+                                                        <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', fontWeight: 400 }}>— Enable for models that can analyze images (GPT-4o, Claude, Qwen-VL, etc.)</span>
+                                                    </label>
+                                                </div>
+                                                <div className="form-group">
+                                                    <label className="form-label">Max Output Tokens</label>
+                                                    <input className="form-input" type="number" placeholder="Provider default" value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
+                                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>Override the default output token limit. Auto-filled from provider; adjust as needed.</div>
+                                                </div>
+                                            </div>
+                                            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
+                                                <button className="btn btn-secondary" onClick={() => { setShowAddModel(false); setEditingModelId(null); }}>{t('common.cancel')}</button>
+                                                <button className="btn btn-secondary" style={{ display: 'flex', alignItems: 'center', gap: '6px' }} disabled={!modelForm.model} onClick={async () => {
+                                                    const btn = document.activeElement as HTMLButtonElement;
+                                                    const origText = btn?.textContent || '';
+                                                    if (btn) btn.textContent = 'Testing...';
+                                                    try {
+                                                        const token = localStorage.getItem('token');
+                                                        const testData: any = { provider: modelForm.provider, model: modelForm.model, base_url: modelForm.base_url || undefined };
+                                                        if (modelForm.api_key) testData.api_key = modelForm.api_key;
+                                                        testData.model_id = editingModelId;
+                                                        const res = await fetch('/api/enterprise/llm-test', {
+                                                            method: 'POST',
+                                                            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                                                            body: JSON.stringify(testData),
+                                                        });
+                                                        const result = await res.json();
+                                                        if (result.success) {
+                                                            if (btn) { btn.textContent = `OK (${result.latency_ms}ms)`; btn.style.color = 'var(--success)'; }
+                                                            setTimeout(() => { if (btn) { btn.textContent = origText; btn.style.color = ''; } }, 3000);
+                                                        } else {
+                                                            alert(`Test failed: ${result.error || 'Unknown error'}\n\nLatency: ${result.latency_ms}ms`);
+                                                            if (btn) btn.textContent = origText;
+                                                        }
+                                                    } catch (e: any) {
+                                                        alert(`Test error: ${e.message}`);
+                                                        if (btn) btn.textContent = origText;
+                                                    }
+                                                }}>Test</button>
+                                                <button className="btn btn-primary" onClick={() => {
+                                                    const data = { ...modelForm, max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null };
+                                                    updateModel.mutate({ id: editingModelId!, data });
+                                                }} disabled={!modelForm.model}>
+                                                    {t('common.save')}
+                                                </button>
+                                            </div>
                                         </div>
-                                    </div>
-                                    <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                                        <span className={`badge ${m.enabled ? 'badge-success' : 'badge-warning'}`}>
-                                            {m.enabled ? t('enterprise.llm.enabled') : t('enterprise.llm.disabled')}
-                                        </span>
-                                        {m.supports_vision && <span className="badge" style={{ background: 'rgba(99,102,241,0.15)', color: 'rgb(99,102,241)', fontSize: '10px' }}>👁 Vision</span>}
-                                        <button className="btn btn-ghost" onClick={() => {
-                                            setEditingModelId(m.id);
-                                            setModelForm({ provider: m.provider, model: m.model, label: m.label, base_url: m.base_url || '', api_key: m.api_key_masked || '', supports_vision: m.supports_vision || false, max_output_tokens: m.max_output_tokens ? String(m.max_output_tokens) : '' });
-                                            setShowAddModel(true);
-                                        }} style={{ fontSize: '12px' }}>✏️ Edit</button>
-                                        <button className="btn btn-ghost" onClick={() => deleteModel.mutate({ id: m.id })} style={{ color: 'var(--error)' }}>{t('common.delete')}</button>
-                                    </div>
+                                    ) : (
+                                        /* Normal model row */
+                                        <div className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                            <div>
+                                                <div style={{ fontWeight: 500 }}>{m.label}</div>
+                                                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                                    {m.provider}/{m.model}
+                                                    {m.base_url && <span> · {m.base_url}</span>}
+                                                </div>
+                                            </div>
+                                            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                                <span className={`badge ${m.enabled ? 'badge-success' : 'badge-warning'}`}>
+                                                    {m.enabled ? t('enterprise.llm.enabled') : t('enterprise.llm.disabled')}
+                                                </span>
+                                                {m.supports_vision && <span className="badge" style={{ background: 'rgba(99,102,241,0.15)', color: 'rgb(99,102,241)', fontSize: '10px' }}>👁 Vision</span>}
+                                                <button className="btn btn-ghost" onClick={() => {
+                                                    setEditingModelId(m.id);
+                                                    setModelForm({ provider: m.provider, model: m.model, label: m.label, base_url: m.base_url || '', api_key: m.api_key_masked || '', supports_vision: m.supports_vision || false, max_output_tokens: m.max_output_tokens ? String(m.max_output_tokens) : '' });
+                                                    setShowAddModel(true);
+                                                }} style={{ fontSize: '12px' }}>✏️ Edit</button>
+                                                <button className="btn btn-ghost" onClick={() => deleteModel.mutate({ id: m.id })} style={{ color: 'var(--error)' }}>{t('common.delete')}</button>
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
                             ))}
                             {models.length === 0 && <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-tertiary)' }}>{t('common.noData')}</div>}
