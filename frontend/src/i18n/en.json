@@ -77,11 +77,12 @@
       "active": "Active"
     },
     "status": {
-      "running": "Running",
-      "idle": "Standby",
+      "running": "Ready",
+      "idle": "Ready",
       "stopped": "Stopped",
       "error": "Error",
-      "creating": "Creating"
+      "creating": "Creating",
+      "disconnected": "Disconnected"
     },
     "noActivity": "No activity yet",
     "noLimit": "Unlimited",
@@ -96,11 +97,12 @@
   },
   "agent": {
     "status": {
-      "running": "Working",
-      "idle": "Idle",
+      "running": "Ready",
+      "idle": "Ready",
       "stopped": "Stopped",
       "creating": "Creating",
-      "error": "Error"
+      "error": "Error",
+      "disconnected": "Disconnected"
     },
     "tabs": {
       "status": "Status",

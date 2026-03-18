@@ -76,14 +76,28 @@ const fetchJson = async <T,>(url: string): Promise<T> => {
     return res.json();
 };
 
-const statusDotClass = (status: string) => {
-    switch (status) {
-        case 'running': return 'running';
-        case 'stopped': return 'stopped';
-        case 'creating': return 'creating';
-        case 'error': return 'error';
-        default: return 'idle';
+/* Agent avatar color palette — deterministic by name hash */
+const AVATAR_COLORS = [
+    '#5B5FC7', '#7B61FF', '#2E7D9C', '#2D8C5A', '#8B5CF6',
+    '#C4532D', '#6366F1', '#0891B2', '#7C3AED', '#059669',
+];
+const getAvatarColor = (name: string) => {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+};
+
+/* Compute display badge status for an agent */
+const getAgentBadgeStatus = (agent: any): string | null => {
+    if (agent.status === 'error') return 'error';
+    if (agent.status === 'creating') return 'creating';
+    // OpenClaw disconnected detection: 60 min timeout
+    if (agent.agent_type === 'openclaw' && agent.status === 'running' && agent.openclaw_last_seen) {
+        const elapsed = Date.now() - new Date(agent.openclaw_last_seen).getTime();
+        if (elapsed > 60 * 60 * 1000) return 'disconnected';
     }
+    // idle / running / stopped → no badge
+    return null;
 };
 
 /* ────── Account Settings Modal ────── */
@@ -336,7 +350,11 @@ export default function Layout() {
                             const bp = pinnedAgents.has(b.id) ? 1 : 0;
                             return bp - ap;
                         });
-                        const renderAgent = (agent: any) => (
+                        const renderAgent = (agent: any) => {
+                            const badge = getAgentBadgeStatus(agent);
+                            const avatarChar = (agent.name || '?')[0].toUpperCase();
+                            const avatarBg = getAvatarColor(agent.name || '');
+                            return (
                             <div key={agent.id} style={{ position: 'relative' }} className={`sidebar-agent-item${agent.creator_id === user?.id ? ' owned' : ''}`}>
                                 <NavLink
                                     to={`/agents/${agent.id}`}
@@ -344,8 +362,9 @@ export default function Layout() {
                                     title={agent.name}
                                     style={{ paddingRight: '28px' }}
                                 >
-                                    <span className="sidebar-item-icon">
-                                        <span className={`status-dot ${statusDotClass(agent.status)}`} />
+                                    <span className="sidebar-item-icon" style={{ position: 'relative' }}>
+                                        <span className="agent-avatar" style={{ background: avatarBg }}>{avatarChar}</span>
+                                        {badge && <span className={`agent-avatar-badge ${badge}`} />}
                                     </span>
                                     <span className="sidebar-item-text">{agent.name}</span>
                                 </NavLink>
@@ -361,7 +380,7 @@ export default function Layout() {
                                     </button>
                                 )}
                             </div>
-                        );
+                        );};
                         return (
                             <>
                                 {sortedAgents.map(renderAgent)}

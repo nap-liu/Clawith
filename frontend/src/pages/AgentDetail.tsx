@@ -1521,7 +1521,18 @@ function AgentDetailInner() {
         return <div style={{ padding: '40px', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>;
     }
 
-    const statusKey = agent.status === 'running' ? 'running' : agent.status === 'stopped' ? 'stopped' : agent.status === 'creating' ? 'creating' : 'idle';
+    // Compute display status (including OpenClaw disconnected detection)
+    const computeStatusKey = () => {
+        if (agent.status === 'error') return 'error';
+        if (agent.status === 'creating') return 'creating';
+        if (agent.status === 'stopped') return 'stopped';
+        if ((agent as any).agent_type === 'openclaw' && agent.status === 'running' && (agent as any).openclaw_last_seen) {
+            const elapsed = Date.now() - new Date((agent as any).openclaw_last_seen).getTime();
+            if (elapsed > 60 * 60 * 1000) return 'disconnected';
+        }
+        return agent.status === 'running' ? 'running' : 'idle';
+    };
+    const statusKey = computeStatusKey();
     const canManage = (agent as any).access_level === 'manage' || isAdmin;
 
     return (

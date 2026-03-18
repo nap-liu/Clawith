@@ -83,11 +83,12 @@
       "active": "活跃"
     },
     "status": {
-      "running": "运行中",
-      "idle": "待命中",
+      "running": "就绪",
+      "idle": "就绪",
       "stopped": "已停止",
       "error": "错误",
-      "creating": "创建中"
+      "creating": "创建中",
+      "disconnected": "已断开"
     },
     "noActivity": "暂无活动记录",
     "noLimit": "无限制",
@@ -102,11 +103,12 @@
   },
   "agent": {
     "status": {
-      "running": "正在工作",
-      "idle": "待命中",
+      "running": "就绪",
+      "idle": "就绪",
       "stopped": "已停止",
       "creating": "创建中",
-      "error": "异常"
+      "error": "异常",
+      "disconnected": "已断开"
     },
     "tabs": {
       "status": "状态",
