@@ -13,7 +13,8 @@ from sqlalchemy.orm import selectinload
 
 from app.database import async_session
 from app.models.skill import Skill, SkillFile
-from app.core.security import require_role
+from app.core.security import require_role, get_current_user
+from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
@@ -271,8 +272,11 @@ async def clawhub_detail(slug: str, _=Depends(require_role("platform_admin"))):
 
 
 @router.post("/clawhub/install")
-async def install_from_clawhub(body: ClawhubInstallIn, _=Depends(require_role("platform_admin"))):
+async def install_from_clawhub(body: ClawhubInstallIn, current_user: User = Depends(get_current_user)):
     """Install a skill from ClawHub into the global registry."""
+    # Resolve tenant GitHub token
+    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
+    token = await _get_github_token(tenant_id)
     slug = body.slug
 
     # 1. Fetch metadata from ClawHub
@@ -306,7 +310,7 @@ async def install_from_clawhub(body: ClawhubInstallIn, _=Depends(require_role("p
     # 3. Fetch files from GitHub archive
     github_path = f"skills/{handle}/{slug}"
     try:
-        files = await _fetch_github_directory("openclaw", "skills", github_path, "main")
+        files = await _fetch_github_directory("openclaw", "skills", github_path, "main", token=token)
     except HTTPException as e:
         if e.status_code == 404:
             raise HTTPException(
@@ -353,8 +357,10 @@ async def install_from_clawhub(body: ClawhubInstallIn, _=Depends(require_role("p
 
 
 @router.post("/import-from-url")
-async def import_from_url(body: UrlImportIn, _=Depends(require_role("platform_admin"))):
+async def import_from_url(body: UrlImportIn, current_user: User = Depends(get_current_user)):
     """Import a skill from any GitHub URL into the global registry."""
+    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
+    token = await _get_github_token(tenant_id)
     parsed = _parse_github_url(body.url)
     if not parsed:
         raise HTTPException(400, "Invalid GitHub URL. Expected format: https://github.com/{owner}/{repo}/tree/{branch}/{path}")
@@ -362,7 +368,7 @@ async def import_from_url(body: UrlImportIn, _=Depends(require_role("platform_ad
     owner, repo, branch, path = parsed["owner"], parsed["repo"], parsed["branch"], parsed["path"]
 
     # Fetch files
-    files = await _fetch_github_directory(owner, repo, path, branch)
+    files = await _fetch_github_directory(owner, repo, path, branch, token=token)
     if not files:
         raise HTTPException(404, "No files found at the specified path")
 
@@ -398,15 +404,17 @@ async def import_from_url(body: UrlImportIn, _=Depends(require_role("platform_ad
 
 
 @router.post("/import-from-url/preview")
-async def preview_url_import(body: UrlImportIn, _=Depends(require_role("platform_admin"))):
+async def preview_url_import(body: UrlImportIn, current_user: User = Depends(get_current_user)):
     """Preview what will be imported from a GitHub URL without saving."""
+    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
+    token = await _get_github_token(tenant_id)
     parsed = _parse_github_url(body.url)
     if not parsed:
         raise HTTPException(400, "Invalid GitHub URL format")
 
     owner, repo, branch, path = parsed["owner"], parsed["repo"], parsed["branch"], parsed["path"]
 
-    files = await _fetch_github_directory(owner, repo, path, branch)
+    files = await _fetch_github_directory(owner, repo, path, branch, token=token)
     if not files:
         raise HTTPException(404, "No files found at the specified path")
 
