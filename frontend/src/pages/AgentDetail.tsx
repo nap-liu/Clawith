@@ -1351,6 +1351,15 @@ function AgentDetailInner() {
         queryFn: () => skillApi.list(),
         enabled: showImportSkillModal,
     });
+    // Agent-level import from ClawHub / URL
+    const [showAgentClawhub, setShowAgentClawhub] = useState(false);
+    const [agentClawhubQuery, setAgentClawhubQuery] = useState('');
+    const [agentClawhubResults, setAgentClawhubResults] = useState<any[]>([]);
+    const [agentClawhubSearching, setAgentClawhubSearching] = useState(false);
+    const [agentClawhubInstalling, setAgentClawhubInstalling] = useState<string | null>(null);
+    const [showAgentUrlImport, setShowAgentUrlImport] = useState(false);
+    const [agentUrlInput, setAgentUrlInput] = useState('');
+    const [agentUrlImporting, setAgentUrlImporting] = useState(false);
 
     const { data: schedules = [] } = useQuery({
         queryKey: ['schedules', id],
@@ -2616,20 +2625,153 @@ function AgentDetailInner() {
                                             <h3 style={{ marginBottom: '4px' }}>{t('agent.skills.title')}</h3>
                                             <p style={{ fontSize: '13px', color: 'var(--text-tertiary)' }}>{t('agent.skills.description')}</p>
                                         </div>
-                                        <button
-                                            className="btn btn-primary"
-                                            style={{ display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}
-                                            onClick={() => setShowImportSkillModal(true)}
-                                        >
-                                            📦 {t('agent.skills.importPreset', 'Import from Presets')}
-                                        </button>
+                                        <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                                            <button
+                                                className="btn btn-secondary"
+                                                style={{ fontSize: '13px' }}
+                                                onClick={() => { setShowAgentUrlImport(true); setAgentUrlInput(''); }}
+                                            >
+                                                Import from URL
+                                            </button>
+                                            <button
+                                                className="btn btn-secondary"
+                                                style={{ fontSize: '13px' }}
+                                                onClick={() => { setShowAgentClawhub(true); setAgentClawhubQuery(''); setAgentClawhubResults([]); }}
+                                            >
+                                                Browse ClawHub
+                                            </button>
+                                            <button
+                                                className="btn btn-primary"
+                                                style={{ display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}
+                                                onClick={() => setShowImportSkillModal(true)}
+                                            >
+                                                Import from Presets
+                                            </button>
+                                        </div>
                                     </div>
                                     <div style={{ marginTop: '8px', padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: '8px', fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                                        <strong>📁 Skill Format:</strong><br />
+                                        <strong>Skill Format:</strong><br />
                                         • <code>skills/my-skill/SKILL.md</code> — {t('agent.skills.folderFormat', 'Each skill is a folder with a SKILL.md file and optional auxiliary files (scripts/, examples/)')}
                                     </div>
                                 </div>
                                 <FileBrowser api={adapter} rootPath="skills" features={{ newFile: true, edit: true, delete: true, newFolder: true, upload: true, directoryNavigation: true }} title={t('agent.skills.skillFiles')} />
+
+                                {/* Browse ClawHub Modal */}
+                                {showAgentClawhub && (
+                                    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setShowAgentClawhub(false)}>
+                                        <div onClick={e => e.stopPropagation()} style={{ background: 'var(--bg-primary)', borderRadius: '12px', padding: '24px', maxWidth: '600px', width: '90%', maxHeight: '70vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                                                <h3>Browse ClawHub</h3>
+                                                <button onClick={() => setShowAgentClawhub(false)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}>x</button>
+                                            </div>
+                                            <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '0 0 12px' }}>
+                                                Search and install skills from ClawHub directly into this agent's workspace.
+                                            </p>
+                                            <div style={{ display: 'flex', gap: '8px', marginBottom: '16px' }}>
+                                                <input
+                                                    className="input"
+                                                    placeholder="Search skills..."
+                                                    value={agentClawhubQuery}
+                                                    onChange={e => setAgentClawhubQuery(e.target.value)}
+                                                    onKeyDown={e => {
+                                                        if (e.key === 'Enter' && agentClawhubQuery.trim()) {
+                                                            setAgentClawhubSearching(true);
+                                                            skillApi.clawhub.search(agentClawhubQuery).then(r => { setAgentClawhubResults(r); setAgentClawhubSearching(false); }).catch(() => setAgentClawhubSearching(false));
+                                                        }
+                                                    }}
+                                                    style={{ flex: 1, fontSize: '13px' }}
+                                                />
+                                                <button
+                                                    className="btn btn-primary"
+                                                    style={{ fontSize: '13px' }}
+                                                    disabled={!agentClawhubQuery.trim() || agentClawhubSearching}
+                                                    onClick={() => {
+                                                        setAgentClawhubSearching(true);
+                                                        skillApi.clawhub.search(agentClawhubQuery).then(r => { setAgentClawhubResults(r); setAgentClawhubSearching(false); }).catch(() => setAgentClawhubSearching(false));
+                                                    }}
+                                                >
+                                                    {agentClawhubSearching ? 'Searching...' : 'Search'}
+                                                </button>
+                                            </div>
+                                            <div style={{ flex: 1, overflowY: 'auto' }}>
+                                                {agentClawhubResults.length === 0 && !agentClawhubSearching && (
+                                                    <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-tertiary)', fontSize: '13px' }}>Search ClawHub to find skills</div>
+                                                )}
+                                                {agentClawhubResults.map((r: any) => (
+                                                    <div key={r.slug} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 12px', borderRadius: '8px', marginBottom: '6px', border: '1px solid var(--border-subtle)', background: 'var(--bg-secondary)' }}>
+                                                        <div style={{ flex: 1 }}>
+                                                            <div style={{ fontWeight: 600, fontSize: '13px' }}>{r.displayName || r.slug}</div>
+                                                            <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{r.summary?.substring(0, 100)}</div>
+                                                        </div>
+                                                        <button
+                                                            className="btn btn-secondary"
+                                                            style={{ fontSize: '12px', padding: '5px 12px', marginLeft: '12px' }}
+                                                            disabled={agentClawhubInstalling === r.slug}
+                                                            onClick={async () => {
+                                                                setAgentClawhubInstalling(r.slug);
+                                                                try {
+                                                                    const res = await skillApi.agentImport.fromClawhub(id!, r.slug);
+                                                                    alert(`Installed "${r.displayName || r.slug}" (${res.files_written} files)`);
+                                                                    queryClient.invalidateQueries({ queryKey: ['files', id, 'skills'] });
+                                                                } catch (err: any) {
+                                                                    alert(`Import failed: ${err?.message || err}`);
+                                                                } finally {
+                                                                    setAgentClawhubInstalling(null);
+                                                                }
+                                                            }}
+                                                        >
+                                                            {agentClawhubInstalling === r.slug ? 'Installing...' : 'Install'}
+                                                        </button>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Import from URL Modal */}
+                                {showAgentUrlImport && (
+                                    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }} onClick={() => setShowAgentUrlImport(false)}>
+                                        <div onClick={e => e.stopPropagation()} style={{ background: 'var(--bg-primary)', borderRadius: '12px', padding: '24px', maxWidth: '500px', width: '90%', boxShadow: '0 20px 60px rgba(0,0,0,0.3)' }}>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                                                <h3>Import from GitHub URL</h3>
+                                                <button onClick={() => setShowAgentUrlImport(false)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)', padding: '4px 8px' }}>x</button>
+                                            </div>
+                                            <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '0 0 12px' }}>
+                                                Paste a GitHub URL pointing to a skill directory (must contain SKILL.md).
+                                            </p>
+                                            <input
+                                                className="input"
+                                                placeholder="https://github.com/owner/repo/tree/main/path/to/skill"
+                                                value={agentUrlInput}
+                                                onChange={e => setAgentUrlInput(e.target.value)}
+                                                style={{ width: '100%', fontSize: '13px', marginBottom: '12px', boxSizing: 'border-box' }}
+                                            />
+                                            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+                                                <button className="btn btn-secondary" onClick={() => setShowAgentUrlImport(false)}>Cancel</button>
+                                                <button
+                                                    className="btn btn-primary"
+                                                    disabled={!agentUrlInput.trim() || agentUrlImporting}
+                                                    onClick={async () => {
+                                                        setAgentUrlImporting(true);
+                                                        try {
+                                                            const res = await skillApi.agentImport.fromUrl(id!, agentUrlInput.trim());
+                                                            alert(`Imported ${res.files_written} files`);
+                                                            queryClient.invalidateQueries({ queryKey: ['files', id, 'skills'] });
+                                                            setShowAgentUrlImport(false);
+                                                        } catch (err: any) {
+                                                            alert(`Import failed: ${err?.message || err}`);
+                                                        } finally {
+                                                            setAgentUrlImporting(false);
+                                                        }
+                                                    }}
+                                                >
+                                                    {agentUrlImporting ? 'Importing...' : 'Import'}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
 
                                 {/* Import from Presets Modal */}
                                 {showImportSkillModal && (
