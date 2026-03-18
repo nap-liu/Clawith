@@ -25,6 +25,9 @@ async def main():
     from app.models.system_settings import SystemSetting
     from app.models.chat_session import ChatSession
     from app.models.audit import ChatMessage
+    # Import all FK-referenced models so SQLAlchemy can resolve relationships
+    from app.models.participant import Participant  # noqa: F401
+    from app.models.agent import Agent  # noqa: F401
     from sqlalchemy import select, update, func
     import httpx
 
