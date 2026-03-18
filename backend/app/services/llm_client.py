@@ -8,15 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Literal
 
 import httpx
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 # ============================================================================

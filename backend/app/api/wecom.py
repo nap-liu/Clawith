@@ -13,6 +13,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -162,9 +163,9 @@ async def configure_wecom_channel(
             asyncio.create_task(
                 wecom_stream_manager.start_client(agent_id, bot_id, bot_secret)
             )
-            print(f"[WeCom] WebSocket client start triggered for agent {agent_id}", flush=True)
+            logger.info(f"[WeCom] WebSocket client start triggered for agent {agent_id}")
         except Exception as e:
-            print(f"[WeCom] Failed to start WebSocket client: {e}", flush=True)
+            logger.error(f"[WeCom] Failed to start WebSocket client: {e}")
 
     return config_out
 
@@ -260,7 +261,7 @@ async def wecom_verify_webhook(
     # Verify signature
     expected_sig = _verify_signature(token, timestamp, nonce, echostr)
     if expected_sig != msg_signature:
-        print(f"[WeCom] Signature mismatch: expected={expected_sig}, got={msg_signature}")
+        logger.warning(f"[WeCom] Signature mismatch: expected={expected_sig}, got={msg_signature}")
         return Response(status_code=403)
 
     # Decrypt echostr and return plaintext
@@ -268,7 +269,7 @@ async def wecom_verify_webhook(
         decrypted, _ = _decrypt_msg(encoding_aes_key, echostr)
         return Response(content=decrypted, media_type="text/plain")
     except Exception as e:
-        print(f"[WeCom] Failed to decrypt echostr: {e}")
+        logger.error(f"[WeCom] Failed to decrypt echostr: {e}")
         return Response(status_code=500)
 
 
@@ -304,29 +305,29 @@ async def wecom_event_webhook(
         root = ET.fromstring(body_bytes)
         encrypt_text = root.findtext("Encrypt", "")
     except Exception as e:
-        print(f"[WeCom] Failed to parse XML body: {e}")
+        logger.error(f"[WeCom] Failed to parse XML body: {e}")
         return Response(content="success", media_type="text/plain")
 
     # Verify signature
     expected_sig = _verify_signature(token, timestamp, nonce, encrypt_text)
     if expected_sig != msg_signature:
-        print(f"[WeCom] Signature mismatch on POST")
+        logger.warning("[WeCom] Signature mismatch on POST")
         return Response(status_code=403)
 
     # Decrypt message
     try:
         decrypted_xml, recv_corp_id = _decrypt_msg(encoding_aes_key, encrypt_text)
     except Exception as e:
-        print(f"[WeCom] Failed to decrypt message: {e}")
+        logger.error(f"[WeCom] Failed to decrypt message: {e}")
         return Response(content="success", media_type="text/plain")
 
-    print(f"[WeCom] Decrypted event for {agent_id}")
+    logger.info(f"[WeCom] Decrypted event for {agent_id}")
 
     # Parse decrypted message XML
     try:
         msg_root = ET.fromstring(decrypted_xml)
     except Exception as e:
-        print(f"[WeCom] Failed to parse decrypted XML: {e}")
+        logger.error(f"[WeCom] Failed to parse decrypted XML: {e}")
         return Response(content="success", media_type="text/plain")
 
     msg_type = msg_root.findtext("MsgType", "")
@@ -341,7 +342,7 @@ async def wecom_event_webhook(
         if len(_processed_wecom_events) > 1000:
             _processed_wecom_events.clear()
 
-    print(f"[WeCom] Message type={msg_type}, from={from_user}, msg_id={msg_id}")
+    logger.info(f"[WeCom] Message type={msg_type}, from={from_user}, msg_id={msg_id}")
 
     if msg_type == "text":
         user_text = msg_root.findtext("Content", "").strip()
@@ -356,7 +357,7 @@ async def wecom_event_webhook(
 
     elif msg_type in ("image", "file"):
         # TODO: Handle image/file messages in future
-        print(f"[WeCom] Received {msg_type} message (not yet handled)")
+        logger.info(f"[WeCom] Received {msg_type} message (not yet handled)")
 
     return Response(content="success", media_type="text/plain")
 
@@ -386,7 +387,7 @@ async def _process_wecom_text(
         agent_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
         agent_obj = agent_r.scalar_one_or_none()
         if not agent_obj:
-            print(f"[WeCom] Agent {agent_id} not found")
+            logger.warning(f"[WeCom] Agent {agent_id} not found")
             return
         creator_id = agent_obj.creator_id
         ctx_size = agent_obj.context_window_size if agent_obj else 20
@@ -416,7 +417,7 @@ async def _process_wecom_text(
                     if user_data.get("errcode") == 0:
                         display_name = user_data.get("name", display_name)
         except Exception as e:
-            print(f"[WeCom] Failed to resolve user info: {e}")
+            logger.error(f"[WeCom] Failed to resolve user info: {e}")
 
         if not platform_user:
             import uuid as _uuid
@@ -466,7 +467,7 @@ async def _process_wecom_text(
             db, agent_id, user_text,
             history=history, user_id=platform_user_id,
         )
-        print(f"[WeCom] LLM reply: {reply_text[:100]}")
+        logger.info(f"[WeCom] LLM reply: {reply_text[:100]}")
 
         # Send reply via WeCom API
         wecom_agent_id = (config.extra_config or {}).get("wecom_agent_id", "")
@@ -489,7 +490,7 @@ async def _process_wecom_text(
                         },
                     )
         except Exception as e:
-            print(f"[WeCom] Failed to send reply: {e}")
+            logger.error(f"[WeCom] Failed to send reply: {e}")
 
         # Save assistant reply
         db.add(ChatMessage(

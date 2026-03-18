@@ -4,6 +4,7 @@ import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -54,9 +55,9 @@ async def configure_discord_channel(
         await db.flush()
         try:
             reg = await _register_slash_commands(application_id, bot_token)
-            print(f"[Discord] Slash command registration (update): {reg['status']}")
+            logger.info(f"[Discord] Slash command registration (update): {reg['status']}")
         except Exception as e:
-            print(f"[Discord] Warning: could not register slash commands: {e}")
+            logger.warning(f"[Discord] Could not register slash commands: {e}")
         return ChannelConfigOut.model_validate(existing)
 
     config = ChannelConfig(
@@ -71,9 +72,9 @@ async def configure_discord_channel(
     await db.flush()
     try:
         reg = await _register_slash_commands(application_id, bot_token)
-        print(f"[Discord] Slash command registration (new): {reg['status']}")
+        logger.info(f"[Discord] Slash command registration (new): {reg['status']}")
     except Exception as e:
-        print(f"[Discord] Warning: could not register slash commands: {e}")
+        logger.warning(f"[Discord] Could not register slash commands: {e}")
     return ChannelConfigOut.model_validate(config)
 
 
@@ -259,7 +260,7 @@ async def discord_interaction_webhook(
         channel_id = body.get("channel_id", "")
         conv_id = f"discord_{channel_id}_{sender_id}" if channel_id else f"discord_dm_{sender_id}"
 
-        print(f"[Discord] /{command_name} from {sender_id}: {user_text[:80]}")
+        logger.info(f"[Discord] /{command_name} from {sender_id}: {user_text[:80]}")
 
         # Defer response immediately (Discord requires response within 3 seconds)
         # We return type 5 (DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE) and reply later
@@ -327,7 +328,7 @@ async def discord_interaction_webhook(
 
                 # Call LLM
                 reply_text = await _call_agent_llm(bg_db, agent_id, user_text, history=history)
-                print(f"[Discord] LLM reply: {reply_text[:80]}")
+                logger.info(f"[Discord] LLM reply: {reply_text[:80]}")
 
                 # Save reply
                 bg_db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="assistant", content=reply_text, conversation_id=session_conv_id))
@@ -349,7 +350,7 @@ async def discord_interaction_webhook(
                     try:
                         await _send_discord_followup(app_id_bg, bot_token_bg, interaction_token, reply_text)
                     except Exception as e:
-                        print(f"[Discord] Failed to send follow-up: {e}")
+                        logger.error(f"[Discord] Failed to send follow-up: {e}")
 
         asyncio.create_task(handle_in_background())
         # Return DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE — shows "thinking..." to user

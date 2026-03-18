@@ -2,19 +2,17 @@
 
 import asyncio
 import json
-import logging
 import threading
 from typing import Any, Dict
 import uuid
 
 import lark_oapi as lark
 import lark_oapi.ws as ws
+from loguru import logger
 
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
 from sqlalchemy import select
-
-logger = logging.getLogger(__name__)
 
 
 class FeishuWSManager:

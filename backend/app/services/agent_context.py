@@ -166,12 +166,7 @@ async def build_agent_context(agent_id: uuid.UUID, agent_name: str, role_descrip
         soul = "\n".join(soul.split("\n")[1:]).strip()
 
     # --- Memory ---
-    memory = (
-        _read_file_safe(tool_ws / "memory" / "memory.md", 2000)
-        or _read_file_safe(tool_ws / "memory.md", 2000)
-        or _read_file_safe(data_ws / "memory" / "memory.md", 2000)
-        or _read_file_safe(data_ws / "memory.md", 2000)
-    )
+    memory = _read_file_safe(tool_ws / "memory" / "memory.md", 2000) or _read_file_safe(tool_ws / "memory.md", 2000)
     if memory.startswith("# "):
         memory = "\n".join(memory.split("\n")[1:]).strip()
 
@@ -246,7 +241,7 @@ The following tools are available in your toolset. **You MUST call them via the 
 | `feishu_doc_share` | `document_token`, `action`(add/remove/list), `member_names`(姓名列表，自动查找), `permission`(view/edit/full_access). |
 | `send_feishu_message` | `open_id` or `email`, `content`. |
 
-🚫 **NEVER:**
+🚫 **NEVER**:
 - Use `discover_resources` or `import_mcp_server` for any Feishu tool above
 - Ask for user email or open_id when you can call `feishu_user_search` to look them up
 - Generate a `.ics` file instead of calling `feishu_calendar_create`
@@ -267,6 +262,15 @@ The following tools are available in your toolset. **You MUST call them via the 
 ✅ **When user asks to invite a colleague to a calendar event:**
 → Use `attendee_names=["覃睿"]` in `feishu_calendar_create` — names are resolved automatically.
 → Or use `attendee_open_ids=["ou_xxx"]` if you already have the open_id.""")
+
+    # --- DingTalk Built-in Tools (only injected when agent has DingTalk configured) ---
+    try:
+        from app.services.agent.context.dingtalk import get_dingtalk_context
+        dingtalk_context = await get_dingtalk_context(agent_id)
+        if dingtalk_context:
+            parts.append(dingtalk_context)
+    except Exception:
+        pass
 
     # --- Atlassian Rovo Tools (injected when Atlassian channel is configured) ---
     try:
@@ -322,39 +326,20 @@ You have access to Atlassian tools via the Rovo MCP server. **Always call them v
     except Exception:
         pass
 
-    # --- Company Intro (per-tenant, with global fallback) ---
+    # --- Company Intro (from system settings) ---
     try:
         from app.database import async_session
         from app.models.system_settings import SystemSetting
-        from app.models.agent import Agent as _AgentModel
         from sqlalchemy import select as sa_select
         async with async_session() as db:
-            # Resolve agent's tenant_id
-            _ag_r = await db.execute(sa_select(_AgentModel.tenant_id).where(_AgentModel.id == agent_id))
-            _agent_tenant_id = _ag_r.scalar_one_or_none()
-
-            company_intro = ""
-            # Try tenant-scoped key first
-            if _agent_tenant_id:
-                tenant_key = f"company_intro_{_agent_tenant_id}"
-                result = await db.execute(
-                    sa_select(SystemSetting).where(SystemSetting.key == tenant_key)
-                )
-                setting = result.scalar_one_or_none()
-                if setting and setting.value and setting.value.get("content"):
-                    company_intro = setting.value["content"].strip()
-
-            # Fallback to global key
-            if not company_intro:
-                result = await db.execute(
-                    sa_select(SystemSetting).where(SystemSetting.key == "company_intro")
-                )
-                setting = result.scalar_one_or_none()
-                if setting and setting.value and setting.value.get("content"):
-                    company_intro = setting.value["content"].strip()
-
-            if company_intro:
-                parts.append(f"\n## Company Information\n{company_intro}")
+            result = await db.execute(
+                sa_select(SystemSetting).where(SystemSetting.key == "company_intro")
+            )
+            setting = result.scalar_one_or_none()
+            if setting and setting.value and setting.value.get("content"):
+                company_intro = setting.value["content"].strip()
+                if company_intro:
+                    parts.append(f"\n## Company Information\n{company_intro}")
     except Exception:
         pass  # Don't break agent if DB is unavailable
 
@@ -480,12 +465,12 @@ You have a dedicated workspace with this structure:
    - Decide whether to mention pending tasks based on timing, context, and urgency
    - DON'T mechanically remind people of every pending item
 
-9. **Use `send_feishu_message` to message human colleagues in your relationships.**
+9. **Use `send_feishu_message` or `send_dingtalk_message` to message human colleagues in your relationships.**
    - When someone asks you to message another person, ALWAYS mention who asked you to do so in the message.
    - Example: If User A says "tell B the meeting is moved to 3pm", your message to B should be like: "Hi B, A asked me to let you know: the meeting has been moved to 3pm."
    - Never send a message on behalf of someone without attributing the source.
-   - **IMPORTANT: After sending a Feishu/Slack/Discord message and you need to wait for a reply, ALWAYS create an `on_message` trigger with `from_user_name` to auto-wake when they reply.**
-     Example: After sending a feishu message to 张三, create:
+   - **IMPORTANT: After sending a Feishu/DingTalk/Slack/Discord message and you need to wait for a reply, ALWAYS create an `on_message` trigger with `from_user_name` to auto-wake when they reply.**
+     Example: After sending a dingtalk message to 张三, create:
      `set_trigger(name="wait_zhangsan_reply", type="on_message", config={"from_user_name": "张三"}, reason="张三 replied, process their response and continue the task")`
 
 10. **Reply in the same language the user uses.**
@@ -513,4 +498,3 @@ You have internet access through these tools — **use them proactively when you
         parts.append(f"\n## Current Conversation\nYou are currently chatting with **{current_user_name}**. Address them by name when appropriate.")
 
     return "\n".join(parts)
-

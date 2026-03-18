@@ -7,10 +7,10 @@ Implements the three-level autonomy system:
 """
 
 import json
-import logging
 import uuid
 from datetime import datetime, timezone
 
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,8 +19,6 @@ from app.models.audit import ApprovalRequest, AuditLog
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.services.feishu_service import feishu_service
-
-logger = logging.getLogger(__name__)
 
 
 class AutonomyService:

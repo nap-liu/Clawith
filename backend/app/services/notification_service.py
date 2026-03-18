@@ -1,14 +1,12 @@
 """Notification service — unified entry point for sending in-app notifications."""
 
-import logging
 import uuid
 from typing import Optional
 
+from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.notification import Notification
-
-logger = logging.getLogger(__name__)
 
 
 async def send_notification(

@@ -4,9 +4,12 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from loguru import logger
 
 from app.config import get_settings
 from app.core.events import close_redis
+from app.core.logging_config import configure_logging, intercept_standard_logging
+from app.core.middleware import TraceIdMiddleware
 from app.schemas.schemas import HealthResponse
 
 settings = get_settings()
@@ -16,19 +19,19 @@ async def _start_ss_local() -> None:
     """Start ss-local SOCKS5 proxy for Discord API calls. Tries nodes in priority order."""
     import asyncio, json, os, shutil, tempfile
     if not shutil.which("ss-local"):
-        print("[Proxy] ss-local not found — Discord proxy disabled", flush=True)
+        logger.info("[Proxy] ss-local not found — Discord proxy disabled")
         return
     # Load proxy nodes from config file (gitignored, mounted as Docker volume)
     import json as _json
     cfg_file = os.environ.get("SS_CONFIG_FILE", "/data/ss-nodes.json")
     if os.path.exists(cfg_file):
         nodes = _json.load(open(cfg_file))
-        print(f"[Proxy] Loaded {len(nodes)} node(s) from {cfg_file}", flush=True)
+        logger.info(f"[Proxy] Loaded {len(nodes)} node(s) from {cfg_file}")
     elif os.environ.get("SS_SERVER") and os.environ.get("SS_PASSWORD"):
         nodes = [{"server": os.environ["SS_SERVER"], "port": int(os.environ.get("SS_PORT", "1080")),
                   "password": os.environ["SS_PASSWORD"], "method": os.environ.get("SS_METHOD", "chacha20-ietf-poly1305"), "label": "env"}]
     else:
-        print(f"[Proxy] {cfg_file} not found and SS_SERVER not set — skipping proxy", flush=True)
+        logger.info(f"[Proxy] {cfg_file} not found and SS_SERVER not set — skipping proxy")
         return
     for node in nodes:
         cfg = {"server": node["server"], "server_port": node["port"], "local_address": "127.0.0.1",
@@ -42,18 +45,23 @@ async def _start_ss_local() -> None:
             await asyncio.sleep(2)
             if proc.returncode is None:
                 os.environ["DISCORD_PROXY"] = "socks5h://127.0.0.1:1080"
-                print(f"[Proxy] ss-local → {node['label']} ({node['server']}:{node['port']})", flush=True)
+                logger.info(f"[Proxy] ss-local → {node['label']} ({node['server']}:{node['port']})")
                 return
             err = (await proc.stderr.read()).decode()[:120]
-            print(f"[Proxy] {node['label']} failed: {err}", flush=True)
+            logger.warning(f"[Proxy] {node['label']} failed: {err}")
         except Exception as e:
-            print(f"[Proxy] {node['label']} error: {e}", flush=True)
-    print("[Proxy] All SS nodes failed — Discord API calls will run without proxy", flush=True)
+            logger.error(f"[Proxy] {node['label']} error: {e}")
+    logger.warning("[Proxy] All SS nodes failed — Discord API calls will run without proxy")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown events."""
+    # Configure logging first
+    configure_logging()
+    intercept_standard_logging()
+    logger.info("[startup] Logging configured")
+
     import asyncio
     import sys
     import os
@@ -96,12 +104,12 @@ async def lifespan(app: FastAPI):
                     "ALTER TYPE channel_type_enum ADD VALUE IF NOT EXISTS 'atlassian'"
                 )
             )
-        print("[startup] ✅ Database tables ready", flush=True)
+        logger.info("[startup] Database tables ready")
     except Exception as e:
-        print(f"[startup] ⚠️ create_all failed: {e}", flush=True)
+        logger.warning(f"[startup] create_all failed: {e}")
 
     # Startup: seed data — each step isolated so one failure doesn't block others
-    print("[startup] seeding...", flush=True)
+    logger.info("[startup] seeding...")
 
     # Seed default company (Tenant) — required before users can register
     try:
@@ -113,14 +121,14 @@ async def lifespan(app: FastAPI):
             if not _existing.scalar_one_or_none():
                 _db.add(Tenant(name="Default", slug="default", im_provider="web_only"))
                 await _db.commit()
-                print("[startup] ✅ Default company created", flush=True)
+                logger.info("[startup] Default company created")
     except Exception as e:
-        print(f"[startup] ⚠️ Default company seed failed: {e}", flush=True)
+        logger.warning(f"[startup] Default company seed failed: {e}")
 
     try:
         await seed_builtin_tools()
     except Exception as e:
-        print(f"[startup] ⚠️ Builtin tools seed failed: {e}", flush=True)
+        logger.warning(f"[startup] Builtin tools seed failed: {e}")
 
     try:
         from app.services.tool_seeder import seed_atlassian_rovo_config, get_atlassian_api_key
@@ -131,29 +139,29 @@ async def lifespan(app: FastAPI):
             from app.services.resource_discovery import seed_atlassian_rovo_tools
             await seed_atlassian_rovo_tools(_rovo_key)
     except Exception as e:
-        print(f"[startup] ⚠️ Atlassian tools seed failed: {e}", flush=True)
+        logger.warning(f"[startup] Atlassian tools seed failed: {e}")
 
     try:
         await seed_agent_templates()
     except Exception as e:
-        print(f"[startup] ⚠️ Agent templates seed failed: {e}", flush=True)
+        logger.warning(f"[startup] Agent templates seed failed: {e}")
 
     try:
         from app.services.skill_seeder import seed_skills, push_default_skills_to_existing_agents
         await seed_skills()
         await push_default_skills_to_existing_agents()
     except Exception as e:
-        print(f"[startup] ⚠️ Skills seed failed: {e}", flush=True)
+        logger.warning(f"[startup] Skills seed failed: {e}")
 
     try:
         from app.services.agent_seeder import seed_default_agents
         await seed_default_agents()
     except Exception as e:
-        print(f"[startup] ⚠️ Default agents seed failed: {e}", flush=True)
+        logger.warning(f"[startup] Default agents seed failed: {e}")
 
     # Start background tasks (always, even if seeding failed)
     try:
-        print("[startup] starting background tasks...", flush=True)
+        logger.info("[startup] starting background tasks...")
         from app.services.audit_logger import write_audit_log
         await write_audit_log("server_startup", {"pid": os.getpid()})
 
@@ -164,7 +172,7 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 return
             if exc:
-                print(f"[startup] ⚠️ Background task {t.get_name()} CRASHED: {exc}", flush=True)
+                logger.error(f"[startup] Background task {t.get_name()} CRASHED: {exc}")
                 import traceback
                 traceback.print_exception(type(exc), exc, exc.__traceback__)
 
@@ -176,10 +184,10 @@ async def lifespan(app: FastAPI):
         ]:
             task = asyncio.create_task(coro, name=name)
             task.add_done_callback(_bg_task_error)
-            print(f"[startup] created bg task: {name}", flush=True)
-        print("[startup] all background tasks created!", flush=True)
+            logger.info(f"[startup] created bg task: {name}")
+        logger.info("[startup] all background tasks created!")
     except Exception as e:
-        print(f"[startup] ⛔ Background tasks failed: {e}", flush=True)
+        logger.error(f"[startup] Background tasks failed: {e}")
         import traceback
         traceback.print_exc()
 
@@ -197,6 +205,9 @@ app = FastAPI(
     version=settings.APP_VERSION,
     lifespan=lifespan,
 )
+
+# Add TraceIdMiddleware first so it's executed for all requests
+app.add_middleware(TraceIdMiddleware)
 
 # CORS
 _cors_origins = settings.CORS_ORIGINS

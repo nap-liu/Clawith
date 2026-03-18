@@ -6,12 +6,12 @@ to poll for messages, report results, send messages, and send heartbeat pings.
 
 import asyncio
 import hashlib
-import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header, HTTPException, Depends, BackgroundTasks
+from loguru import logger
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,7 +24,6 @@ from app.schemas.schemas import (
     GatewayHistoryItem, GatewayRelationshipItem, GatewaySendMessageRequest,
 )
 
-logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/gateway", tags=["gateway"])
 
 
@@ -96,7 +95,7 @@ async def poll_messages(
     Returns all pending messages and marks them as delivered.
     Also updates openclaw_last_seen for online status tracking.
     """
-    print(f"[Gateway] poll called, key_prefix={x_api_key[:8]}...")
+    logger.info(f"[Gateway] poll called, key_prefix={x_api_key[:8]}...")
     agent = await _get_agent_by_key(x_api_key, db)
 
     # Update last seen
@@ -223,7 +222,7 @@ async def report_result(
     """OpenClaw agent reports the result of a processed message."""
     if not x_api_key:
         raise HTTPException(status_code=401, detail="Missing X-Api-Key header")
-    print(f"[Gateway] report called, key_prefix={x_api_key[:8]}..., msg_id={body.message_id}")
+    logger.info(f"[Gateway] report called, key_prefix={x_api_key[:8]}..., msg_id={body.message_id}")
     agent = await _get_agent_by_key(x_api_key, db)
 
     result = await db.execute(
@@ -324,7 +323,7 @@ async def _send_to_agent_background(
     Accepts plain values (not ORM objects) to avoid stale session references
     since this runs after the request's DB session has closed.
     """
-    print(f"[Gateway] _send_to_agent_background started: {source_agent_name} -> {target_agent_name}")
+    logger.info(f"[Gateway] _send_to_agent_background started: {source_agent_name} -> {target_agent_name}")
     try:
         from app.api.websocket import call_llm
         from app.services.agent_context import build_agent_context
@@ -454,7 +453,7 @@ async def _send_to_agent_background(
             db.add(gw_reply)
             await db.commit()
 
-        print(f"[Gateway] Agent {target_agent_name} replied to {source_agent_name}")
+        logger.info(f"[Gateway] Agent {target_agent_name} replied to {source_agent_name}")
 
     except Exception as e:
         logger.error(f"[Gateway] send_to_agent_background failed: {e}")
@@ -487,7 +486,7 @@ async def send_message(
     )
     target_agent = result.scalars().first()
 
-    print(f"[Gateway] send_message: target='{target_name}', found_agent={target_agent.name if target_agent else None}, agent_type={getattr(target_agent, 'agent_type', None) if target_agent else None}, channel_hint='{channel_hint}'")
+    logger.info(f"[Gateway] send_message: target='{target_name}', found_agent={target_agent.name if target_agent else None}, agent_type={getattr(target_agent, 'agent_type', None) if target_agent else None}, channel_hint='{channel_hint}'")
 
     if target_agent and (not channel_hint or channel_hint == "agent"):
         conv_id = f"gw_agent_{agent.id}_{target_agent.id}"

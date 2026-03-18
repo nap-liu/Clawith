@@ -8,13 +8,11 @@ Runs as a background task inside the FastAPI process.
 """
 
 import asyncio
-import logging
 import uuid
 from datetime import datetime, timezone, timedelta
 
+from loguru import logger
 from sqlalchemy import select
-
-logger = logging.getLogger(__name__)
 
 # Default heartbeat instruction used when HEARTBEAT.md doesn't exist
 DEFAULT_HEARTBEAT_INSTRUCTION = """[Heartbeat Check]

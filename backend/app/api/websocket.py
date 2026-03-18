@@ -4,6 +4,7 @@ import json
 import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -258,20 +259,18 @@ async def call_llm(
             )
         except LLMError as e:
             # Record accumulated tokens before returning error
-            print(
+            logger.error(
                 f"[LLM] LLMError provider={getattr(model, 'provider', '?')} "
-                f"model={getattr(model, 'model', '?')} round={round_i + 1}: {e}",
-                flush=True,
+                f"model={getattr(model, 'model', '?')} round={round_i + 1}: {e}"
             )
             if agent_id and _accumulated_tokens > 0:
                 await record_token_usage(agent_id, _accumulated_tokens)
             return f"[LLM Error] {e}"
         except Exception as e:
-            print(
+            logger.error(
                 f"[LLM] Unexpected error provider={getattr(model, 'provider', '?')} "
                 f"model={getattr(model, 'model', '?')} round={round_i + 1}: "
-                f"{type(e).__name__}: {str(e)[:300]}",
-                flush=True,
+                f"{type(e).__name__}: {str(e)[:300]}"
             )
             if agent_id and _accumulated_tokens > 0:
                 await record_token_usage(agent_id, _accumulated_tokens)
@@ -294,7 +293,7 @@ async def call_llm(
             return response.content or "[LLM returned empty content]"
 
         # Execute tool calls
-        print(f"[LLM] Round {round_i+1}: {len(response.tool_calls)} tool call(s)")
+        logger.info(f"[LLM] Round {round_i+1}: {len(response.tool_calls)} tool call(s)")
 
         # Add assistant message with tool calls
         api_messages.append(LLMMessage(
@@ -314,13 +313,13 @@ async def call_llm(
             fn = tc["function"]
             tool_name = fn["name"]
             raw_args = fn.get("arguments", "{}")
-            print(f"[LLM] Raw arguments for {tool_name}: {repr(raw_args[:300])}", flush=True)
+            logger.debug(f"[LLM] Raw arguments for {tool_name}: {repr(raw_args[:300])}")
             try:
                 args = json.loads(raw_args) if raw_args else {}
             except json.JSONDecodeError:
                 args = {}
 
-            print(f"[LLM] Calling tool: {tool_name}({args})")
+            logger.info(f"[LLM] Calling tool: {tool_name}({args})")
             # Notify client about tool call (in-progress)
             if on_tool_call:
                 try:
@@ -338,7 +337,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id or agent_id,
             )
-            print(f"[LLM] Tool result: {result[:100]}")
+            logger.debug(f"[LLM] Tool result: {result[:100]}")
 
             # Notify client about tool call result
             if on_tool_call:
@@ -407,16 +406,16 @@ async def websocket_chat(
 
     try:
         async with async_session() as db:
-            print(f"[WS] Looking up user {user_id}")
+            logger.info(f"[WS] Looking up user {user_id}")
             result = await db.execute(select(User).where(User.id == user_id))
             user = result.scalar_one_or_none()
             if not user:
-                print("[WS] User not found")
+                logger.info("[WS] User not found")
                 await websocket.send_json({"type": "error", "content": "User not found"})
                 await websocket.close(code=4001)
                 return
 
-            print(f"[WS] Checking agent access for {agent_id}")
+            logger.info(f"[WS] Checking agent access for {agent_id}")
             agent, _ = await check_agent_access(db, user, agent_id)
             # Check agent expiry
             if is_agent_expired(agent):
@@ -428,7 +427,7 @@ async def websocket_chat(
             role_description = agent.role_description or ""
             welcome_message = agent.welcome_message or ""
             ctx_size = agent.context_window_size or 100
-            print(f"[WS] Agent: {agent_name}, type: {agent_type}, model_id: {agent.primary_model_id}, ctx: {ctx_size}")
+            logger.info(f"[WS] Agent: {agent_name}, type: {agent_type}, model_id: {agent.primary_model_id}, ctx: {ctx_size}")
 
             # Load the agent's primary model
             if agent.primary_model_id:
@@ -436,7 +435,7 @@ async def websocket_chat(
                     select(LLMModel).where(LLMModel.id == agent.primary_model_id)
                 )
                 llm_model = model_result.scalar_one_or_none()
-                print(f"[WS] Primary model loaded: {llm_model.model if llm_model else 'None'}")
+                logger.info(f"[WS] Primary model loaded: {llm_model.model if llm_model else 'None'}")
 
             # Load fallback model
             if agent.fallback_model_id:
@@ -445,13 +444,13 @@ async def websocket_chat(
                 )
                 fallback_llm_model = fb_result.scalar_one_or_none()
                 if fallback_llm_model:
-                    print(f"[WS] Fallback model loaded: {fallback_llm_model.model}")
+                    logger.info(f"[WS] Fallback model loaded: {fallback_llm_model.model}")
 
             # Config-level fallback: primary missing -> use fallback
             if not llm_model and fallback_llm_model:
                 llm_model = fallback_llm_model
                 fallback_llm_model = None  # No further fallback available
-                print(f"[WS] Primary model unavailable, using fallback: {llm_model.model}")
+                logger.info(f"[WS] Primary model unavailable, using fallback: {llm_model.model}")
 
             # Resolve or create chat session
             from app.models.chat_session import ChatSession
@@ -493,7 +492,7 @@ async def websocket_chat(
                     await db.commit()
                     await db.refresh(_new_session)
                     conv_id = str(_new_session.id)
-                    print(f"[WS] Created default session {conv_id}")
+                    logger.info(f"[WS] Created default session {conv_id}")
 
             try:
                 history_result = await db.execute(
@@ -503,11 +502,11 @@ async def websocket_chat(
                     .limit(20)
                 )
                 history_messages = list(reversed(history_result.scalars().all()))
-                print(f"[WS] Loaded {len(history_messages)} history messages for session {conv_id}")
+                logger.info(f"[WS] Loaded {len(history_messages)} history messages for session {conv_id}")
             except Exception as e:
-                print(f"[WS] History load failed (non-fatal): {e}")
+                logger.warning(f"[WS] History load failed (non-fatal): {e}")
     except Exception as e:
-        print(f"[WS] Setup error: {type(e).__name__}: {e}")
+        logger.error(f"[WS] Setup error: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
         await websocket.send_json({"type": "error", "content": "Setup failed"})
@@ -518,7 +517,7 @@ async def websocket_chat(
     if agent_id_str not in manager.active_connections:
         manager.active_connections[agent_id_str] = []
     manager.active_connections[agent_id_str].append((websocket, conv_id))
-    print(f"[WS] Ready! Agent={agent_name}")
+    logger.info(f"[WS] Ready! Agent={agent_name}")
 
     # Build conversation context from history
     # IMPORTANT: Include tool_call messages so the LLM maintains tool-calling behavior.
@@ -567,12 +566,12 @@ async def websocket_chat(
             await websocket.send_json({"type": "done", "role": "assistant", "content": welcome_message})
 
         while True:
-            print(f"[WS] Waiting for message from {agent_name}...")
+            logger.info(f"[WS] Waiting for message from {agent_name}...")
             data = await websocket.receive_json()
             content = data.get("content", "")
             display_content = data.get("display_content", "")  # User-facing display text
             file_name = data.get("file_name", "")  # Original file name for attachment display
-            print(f"[WS] Received: {content[:50]}")
+            logger.info(f"[WS] Received: {content[:50]}")
 
             if not content:
                 continue
@@ -629,7 +628,7 @@ async def websocket_chat(
                             clean_title = f"📎 {file_name}"
                         _sess.title = clean_title[:40] if clean_title else content[:40]
                 await db.commit()
-            print("[WS] User message saved")
+            logger.info("[WS] User message saved")
 
             # ── OpenClaw routing: insert into gateway_messages instead of LLM ──
             if agent_type == "openclaw":
@@ -644,7 +643,7 @@ async def websocket_chat(
                     )
                     db.add(gw_msg)
                     await db.commit()
-                print(f"[WS] OpenClaw: message queued for gateway poll")
+                logger.info("[WS] OpenClaw: message queued for gateway poll")
                 await websocket.send_json({
                     "type": "done",
                     "role": "assistant",
@@ -662,7 +661,7 @@ async def websocket_chat(
             # Call LLM with streaming
             if llm_model:
                 try:
-                    print(f"[WS] Calling LLM {llm_model.model} (streaming)...")
+                    logger.info(f"[WS] Calling LLM {llm_model.model} (streaming)...")
                     
                     # Accumulate partial content for abort handling
                     partial_chunks: list[str] = []
@@ -696,7 +695,7 @@ async def websocket_chat(
                                     _tc_db.add(tc_msg)
                                     await _tc_db.commit()
                             except Exception as _tc_err:
-                                print(f"[WS] Failed to save tool_call: {_tc_err}")
+                                logger.warning(f"[WS] Failed to save tool_call: {_tc_err}")
                     
                     # Track thinking content for storage
                     thinking_content = []
@@ -731,7 +730,7 @@ async def websocket_chat(
                                 websocket.receive_json(), timeout=0.5
                             )
                             if msg.get("type") == "abort":
-                                print(f"[WS] Abort received, cancelling LLM task")
+                                logger.info(f"[WS] Abort received, cancelling LLM task")
                                 llm_task.cancel()
                                 aborted = True
                                 break
@@ -755,10 +754,10 @@ async def websocket_chat(
                             assistant_response = partial_text + "\n\n*[Generation stopped]*"
                         else:
                             assistant_response = "*[Generation stopped]*"
-                        print(f"[WS] LLM aborted, partial: {assistant_response[:80]}")
+                        logger.info(f"[WS] LLM aborted, partial: {assistant_response[:80]}")
                     else:
                         assistant_response = await llm_task
-                        print(f"[WS] LLM response: {assistant_response[:80]}")
+                        logger.info(f"[WS] LLM response: {assistant_response[:80]}")
 
                     # Update last_active_at
                     from datetime import datetime, timezone as tz
@@ -783,12 +782,12 @@ async def websocket_chat(
                 except WebSocketDisconnect:
                     raise
                 except Exception as e:
-                    print(f"[WS] LLM error: {e}")
+                    logger.error(f"[WS] LLM error: {e}")
                     import traceback
                     traceback.print_exc()
                     # Runtime fallback: primary model failed -> retry with fallback model
                     if fallback_llm_model:
-                        print(f"[WS] Primary model failed, retrying with fallback: {fallback_llm_model.model}")
+                        logger.info(f"[WS] Primary model failed, retrying with fallback: {fallback_llm_model.model}")
                         try:
                             await websocket.send_json({"type": "info", "content": f"Primary model error, switching to fallback model ({fallback_llm_model.model})..."})
                             assistant_response = await call_llm(
@@ -803,9 +802,9 @@ async def websocket_chat(
                                 on_thinking=thinking_to_ws,
                                 supports_vision=getattr(fallback_llm_model, 'supports_vision', False),
                             )
-                            print(f"[WS] Fallback LLM response: {assistant_response[:80]}")
+                            logger.info(f"[WS] Fallback LLM response: {assistant_response[:80]}")
                         except Exception as e2:
-                            print(f"[WS] Fallback LLM also failed: {e2}")
+                            logger.error(f"[WS] Fallback LLM also failed: {e2}")
                             traceback.print_exc()
                             assistant_response = f"[LLM call error] Primary: {str(e)[:100]} | Fallback: {str(e2)[:100]}"
                     else:
@@ -835,9 +834,9 @@ async def websocket_chat(
                             task_id = task.id
                         _asyncio.create_task(execute_task(task_id, agent_id))
                         assistant_response += f"\n\n📋 Task synced to task board: [{task_title}]"
-                        print(f"[WS] Created task: {task_title}")
+                        logger.info(f"[WS] Created task: {task_title}")
                     except Exception as e:
-                        print(f"[WS] Failed to create task: {e}")
+                        logger.error(f"[WS] Failed to create task: {e}")
 
             # Add assistant response to conversation
             conversation.append({"role": "assistant", "content": assistant_response})
@@ -854,7 +853,7 @@ async def websocket_chat(
                 )
                 db.add(asst_msg)
                 await db.commit()
-            print("[WS] Assistant message saved")
+            logger.info("[WS] Assistant message saved")
 
             # Send done signal with final content (for non-streaming clients)
             await websocket.send_json({
@@ -862,13 +861,13 @@ async def websocket_chat(
                 "role": "assistant",
                 "content": assistant_response,
             })
-            print("[WS] Response done sent to client")
+            logger.info("[WS] Response done sent to client")
 
     except WebSocketDisconnect:
-        print(f"[WS] Client disconnected: {agent_name}")
+        logger.info(f"[WS] Client disconnected: {agent_name}")
         manager.disconnect(agent_id_str, websocket)
     except Exception as e:
-        print(f"[WS] Error in message loop: {type(e).__name__}: {e}")
+        logger.error(f"[WS] Error in message loop: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
         manager.disconnect(agent_id_str, websocket)

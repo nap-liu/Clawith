@@ -3,11 +3,11 @@
 Pulls departments and members from Feishu Contact API and upserts into local DB.
 """
 
-import logging
 import uuid
 from datetime import datetime, timezone
 
 import httpx
+from loguru import logger
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,8 +16,6 @@ from app.models.org import OrgDepartment, OrgMember
 from app.models.system_settings import SystemSetting
 from app.models.user import User
 from app.core.security import hash_password
-
-logger = logging.getLogger(__name__)
 
 FEISHU_APP_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
 FEISHU_DEPT_CHILDREN_URL = "https://open.feishu.cn/open-apis/contact/v3/departments"
@@ -45,7 +43,7 @@ class OrgSyncService:
                 "app_secret": app_secret,
             })
             data = resp.json()
-            print(f"[OrgSync] Token response: code={data.get('code')}, msg={data.get('msg')}")
+            logger.info(f"[OrgSync] Token response: code={data.get('code')}, msg={data.get('msg')}")
             token = data.get("tenant_access_token") or data.get("app_access_token") or ""
             return token
 
@@ -64,21 +62,21 @@ class OrgSyncService:
                 if page_token:
                     params["page_token"] = page_token
 
-                print(f"[OrgSync] GET {url} params={params}")
+                logger.info(f"[OrgSync] GET {url} params={params}")
                 resp = await client.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
                 data = resp.json()
-                print(f"[OrgSync] Dept response: code={data.get('code')}, msg={data.get('msg')}, items={len(data.get('data', {}).get('items', []))}")
+                logger.info(f"[OrgSync] Dept response: code={data.get('code')}, msg={data.get('msg')}, items={len(data.get('data', {}).get('items', []))}")
 
                 if data.get("code") != 0:
-                    print(f"[OrgSync] Dept API error: {data}")
+                    logger.error(f"[OrgSync] Dept API error: {data}")
                     break
 
                 items = data.get("data", {}).get("items", [])
                 if items and not all_depts:  # Print first raw item for debugging
-                    print(f"[OrgSync] RAW first dept item keys: {list(items[0].keys())}")
-                    print(f"[OrgSync] RAW first dept item: {items[0]}")
+                    logger.info(f"[OrgSync] RAW first dept item keys: {list(items[0].keys())}")
+                    logger.info(f"[OrgSync] RAW first dept item: {items[0]}")
                 for item in items:
-                    print(f"[OrgSync]   dept: {item.get('name')} (id={item.get('open_department_id')})")
+                    logger.info(f"[OrgSync]   dept: {item.get('name')} (id={item.get('open_department_id')})")
                 all_depts.extend(items)
 
                 if not data.get("data", {}).get("has_more"):
@@ -87,7 +85,7 @@ class OrgSyncService:
 
         # If fetch_child=true didn't work (no items), try without recursion + manual recurse
         if not all_depts:
-            print(f"[OrgSync] fetch_child=true returned nothing, trying simple list...")
+            logger.info("[OrgSync] fetch_child=true returned nothing, trying simple list...")
             all_depts = await self._fetch_departments_simple(token, parent_id)
 
         return all_depts
@@ -104,10 +102,10 @@ class OrgSyncService:
                     params["page_token"] = page_token
                 resp = await client.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
                 data = resp.json()
-                print(f"[OrgSync] Simple dept response (parent={parent_id}): code={data.get('code')}, items={len(data.get('data', {}).get('items', []))}")
+                logger.info(f"[OrgSync] Simple dept response (parent={parent_id}): code={data.get('code')}, items={len(data.get('data', {}).get('items', []))}")
 
                 if data.get("code") != 0:
-                    print(f"[OrgSync] Simple dept error: {data}")
+                    logger.error(f"[OrgSync] Simple dept error: {data}")
                     break
 
                 items = data.get("data", {}).get("items", [])
@@ -148,16 +146,16 @@ class OrgSyncService:
                     headers={"Authorization": f"Bearer {token}"},
                 )
                 data = resp.json()
-                print(f"[OrgSync] Users response (dept={dept_id}): code={data.get('code')}, items={len(data.get('data', {}).get('items', []))}")
+                logger.info(f"[OrgSync] Users response (dept={dept_id}): code={data.get('code')}, items={len(data.get('data', {}).get('items', []))}")
 
                 if data.get("code") != 0:
-                    print(f"[OrgSync] Users API error: {data}")
+                    logger.error(f"[OrgSync] Users API error: {data}")
                     break
 
                 items = data.get("data", {}).get("items", [])
                 if items and not all_users:  # Print first raw user for debugging
-                    print(f"[OrgSync] RAW first user item keys: {list(items[0].keys())}")
-                    print(f"[OrgSync] RAW first user item: {items[0]}")
+                    logger.info(f"[OrgSync] RAW first user item keys: {list(items[0].keys())}")
+                    logger.info(f"[OrgSync] RAW first user item: {items[0]}")
                 all_users.extend(items)
                 if not data.get("data", {}).get("has_more"):
                     break
@@ -180,7 +178,7 @@ class OrgSyncService:
                 token = await self._get_app_token(app_id, app_secret)
                 if not token:
                     return {"error": "获取飞书 token 失败"}
-                print(f"[OrgSync] Got token: {token[:20]}...")
+                logger.info(f"[OrgSync] Got token: {token[:20]}...")
             except Exception as e:
                 return {"error": f"连接飞书失败: {str(e)[:100]}"}
 
@@ -199,7 +197,7 @@ class OrgSyncService:
             # --- Sync departments ---
             try:
                 depts = await self._fetch_departments(token, "0")
-                print(f"[OrgSync] Total departments fetched: {len(depts)}")
+                logger.info(f"[OrgSync] Total departments fetched: {len(depts)}")
 
                 for d in depts:
                     feishu_id = d.get("open_department_id", "")
@@ -369,7 +367,7 @@ class OrgSyncService:
             await db.commit()
 
             stats = {"departments": dept_count, "members": member_count, "users_created": user_count, "synced_at": now.isoformat()}
-            print(f"[OrgSync] Complete: {stats}")
+            logger.info(f"[OrgSync] Complete: {stats}")
             return stats
 
 

@@ -19,6 +19,8 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
+from loguru import logger
+
 from sqlalchemy import select
 
 from app.database import async_session
@@ -919,7 +921,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                         result.append(t)
                 return result
     except Exception as e:
-        print(f"[Tools] DB load failed, using fallback: {e}")
+        logger.error(f"[Tools] DB load failed, using fallback: {e}")
 
     # Fallback to hardcoded tools
     return AGENT_TOOLS
@@ -1004,7 +1006,7 @@ async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
             encoding="utf-8",
         )
     except Exception as e:
-        print(f"[AgentTools] Failed to sync tasks: {e}")
+        logger.error(f"[AgentTools] Failed to sync tasks: {e}")
 
 
 # ─── Tool Executors ─────────────────────────────────────────────
@@ -1085,7 +1087,7 @@ async def execute_tool(
                             return f"⏳ This action requires approval. An approval request has been sent. Please wait for approval before retrying. (Approval ID: {result_check.get('approval_id', 'N/A')})"
                         return f"❌ Action denied: {result_check.get('message', 'unknown reason')}"
         except Exception as e:
-            print(f"[Autonomy] Check failed — blocking as safety measure: {e}")
+            logger.error(f"[Autonomy] Check failed — blocking as safety measure: {e}")
             return f"⚠️ Autonomy check failed ({e}). Operation blocked for safety. Please retry or contact admin."
 
     try:
@@ -2235,9 +2237,9 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                     ))
                     sess.last_message_at = _dt.now(_tz.utc)
                     await db.commit()
-                    print(f"[Feishu] Saved outgoing message to session {sess.id} ({member_name})")
+                    logger.info(f"[Feishu] Saved outgoing message to session {sess.id} ({member_name})")
                 except Exception as e:
-                    print(f"[Feishu] Failed to save outgoing message to history: {e}")
+                    logger.error(f"[Feishu] Failed to save outgoing message to history: {e}")
 
             # Step 1: Try using feishu_user_id (tenant-stable, works across apps)
             if target_member.feishu_user_id:
@@ -2492,7 +2494,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 fb_r = await db.execute(select(LLMModel).where(LLMModel.id == target.fallback_model_id))
                 target_model = fb_r.scalar_one_or_none()
                 if target_model:
-                    print(f"[A2A] Primary model unavailable for {target.name}, using fallback: {target_model.model}")
+                    logger.warning(f"[A2A] Primary model unavailable for {target.name}, using fallback: {target_model.model}")
 
             if not target_model:
                 return f"⚠️ {target.name} has no LLM model configured"
@@ -2634,7 +2636,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                                     ))
                                     await _tc_db.commit()
                             except Exception as _tc_err:
-                                print(f"[A2A] Failed to save tool_call: {_tc_err}")
+                                logger.error(f"[A2A] Failed to save tool_call: {_tc_err}")
 
                             # Add tool result to conversation
                             full_msgs.append(LLMMessage(
@@ -3303,7 +3305,7 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                     private_key = agent_tool.config.get("private_key", "") or private_key
                     url_endpoint = agent_tool.config.get("url_endpoint", "") or url_endpoint
     except Exception as e:
-        print(f"[UploadImage] Config load error: {e}")
+        logger.error(f"[UploadImage] Config load error: {e}")
 
     if not private_key:
         return "❌ ImageKit Private Key not configured. Ask your admin to configure it in Enterprise Settings → Tools → Upload Image, or set it in your agent's tool config."
@@ -4273,7 +4275,7 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
     if user_email:
         organizer_open_id = await _feishu_resolve_open_id(token, user_email)
         if not organizer_open_id:
-            print(f"[Feishu Calendar] Could not resolve open_id for '{user_email}', continuing without organizer invite")
+            logger.warning(f"[Feishu Calendar] Could not resolve open_id for '{user_email}', continuing without organizer invite")
 
     agent_cal_id, cal_err = await _get_agent_calendar_id(token)
     if not agent_cal_id:
@@ -4327,7 +4329,7 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
                 attendee_open_ids.append(_oid)
                 attendee_display.append(aname)
         else:
-            print(f"[Calendar] Could not resolve attendee '{aname}': {_sr[:100]}")
+                logger.warning(f"[Calendar] Could not resolve attendee '{aname}': {_sr[:100]}")
 
     # 3. From explicit attendee_emails
     attendee_emails: list[str] = list(arguments.get("attendee_emails") or [])
