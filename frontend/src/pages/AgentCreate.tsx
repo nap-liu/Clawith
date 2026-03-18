@@ -337,9 +337,10 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                     </div>
                     <div className="form-group">
                         <label className="form-label">{t('agent.fields.role')}</label>
-                        <input className="form-input" value={form.role_description}
-                            onChange={(e) => setForm({ ...form, role_description: e.target.value })}
+                        <input className={`form-input${fieldErrors.role_description ? ' input-error' : ''}`} value={form.role_description}
+                            onChange={(e) => { setForm({ ...form, role_description: e.target.value }); clearFieldError('role_description'); }}
                             placeholder={t('openclaw.rolePlaceholder', 'e.g. Personal assistant running on my Mac')} />
+                        {fieldErrors.role_description && <div style={{ color: 'var(--error)', fontSize: '12px', marginTop: '4px' }}>{fieldErrors.role_description}</div>}
                     </div>
 
                     {/* Permissions */}
