@@ -76,17 +76,6 @@ const fetchJson = async <T,>(url: string): Promise<T> => {
     return res.json();
 };
 
-/* Agent avatar color palette — deterministic by name hash */
-const AVATAR_COLORS = [
-    '#5B5FC7', '#7B61FF', '#2E7D9C', '#2D8C5A', '#8B5CF6',
-    '#C4532D', '#6366F1', '#0891B2', '#7C3AED', '#059669',
-];
-const getAvatarColor = (name: string) => {
-    let hash = 0;
-    for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
-    return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
-};
-
 /* Compute display badge status for an agent */
 const getAgentBadgeStatus = (agent: any): string | null => {
     if (agent.status === 'error') return 'error';
@@ -353,7 +342,6 @@ export default function Layout() {
                         const renderAgent = (agent: any) => {
                             const badge = getAgentBadgeStatus(agent);
                             const avatarChar = (agent.name || '?')[0].toUpperCase();
-                            const avatarBg = getAvatarColor(agent.name || '');
                             return (
                             <div key={agent.id} style={{ position: 'relative' }} className={`sidebar-agent-item${agent.creator_id === user?.id ? ' owned' : ''}`}>
                                 <NavLink
@@ -363,7 +351,7 @@ export default function Layout() {
                                     style={{ paddingRight: '28px' }}
                                 >
                                     <span className="sidebar-item-icon" style={{ position: 'relative' }}>
-                                        <span className="agent-avatar" style={{ background: avatarBg }}>{avatarChar}</span>
+                                        <span className="agent-avatar">{avatarChar}</span>
                                         {badge && <span className={`agent-avatar-badge ${badge}`} />}
                                     </span>
                                     <span className="sidebar-item-text">{agent.name}</span>
