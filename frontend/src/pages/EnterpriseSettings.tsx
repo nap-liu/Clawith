@@ -358,6 +358,22 @@ function EnterpriseKBBrowser({ onRefresh }: { onRefresh: () => void; refreshKey:
 function SkillsTab() {
     const { t } = useTranslation();
     const [refreshKey, setRefreshKey] = useState(0);
+    const [showClawhubModal, setShowClawhubModal] = useState(false);
+    const [showUrlModal, setShowUrlModal] = useState(false);
+    const [searchQuery, setSearchQuery] = useState('');
+    const [searchResults, setSearchResults] = useState<any[]>([]);
+    const [searching, setSearching] = useState(false);
+    const [installing, setInstalling] = useState<string | null>(null);
+    const [urlInput, setUrlInput] = useState('');
+    const [urlPreview, setUrlPreview] = useState<any | null>(null);
+    const [urlPreviewing, setUrlPreviewing] = useState(false);
+    const [urlImporting, setUrlImporting] = useState(false);
+    const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
+    const showToast = (message: string, type: 'success' | 'error' = 'success') => {
+        setToast({ message, type });
+        setTimeout(() => setToast(null), 4000);
+    };
 
     const adapter: FileBrowserApi = {
         list: (path) => skillApi.browse.list(path),
@@ -366,14 +382,104 @@ function SkillsTab() {
         delete: (path) => skillApi.browse.delete(path),
     };
 
+    const handleSearch = async () => {
+        if (!searchQuery.trim()) return;
+        setSearching(true);
+        setSearchResults([]);
+        try {
+            const results = await skillApi.clawhub.search(searchQuery);
+            setSearchResults(results);
+        } catch (e: any) {
+            showToast(e.message || 'Search failed', 'error');
+        }
+        setSearching(false);
+    };
+
+    const handleInstall = async (slug: string) => {
+        setInstalling(slug);
+        try {
+            const result = await skillApi.clawhub.install(slug);
+            const tierLabel = result.tier === 1 ? 'Tier 1 (Pure Prompt)' : result.tier === 2 ? 'Tier 2 (CLI/API)' : 'Tier 3 (OpenClaw Native)';
+            showToast(`Installed "${result.name}" — ${tierLabel}, ${result.file_count} files`);
+            setRefreshKey(k => k + 1);
+            // Remove from search results
+            setSearchResults(prev => prev.filter(r => r.slug !== slug));
+        } catch (e: any) {
+            showToast(e.message || 'Install failed', 'error');
+        }
+        setInstalling(null);
+    };
+
+    const handleUrlPreview = async () => {
+        if (!urlInput.trim()) return;
+        setUrlPreviewing(true);
+        setUrlPreview(null);
+        try {
+            const preview = await skillApi.previewUrl(urlInput);
+            setUrlPreview(preview);
+        } catch (e: any) {
+            showToast(e.message || 'Preview failed', 'error');
+        }
+        setUrlPreviewing(false);
+    };
+
+    const handleUrlImport = async () => {
+        if (!urlInput.trim()) return;
+        setUrlImporting(true);
+        try {
+            const result = await skillApi.importFromUrl(urlInput);
+            showToast(`Imported "${result.name}" — ${result.file_count} files`);
+            setRefreshKey(k => k + 1);
+            setShowUrlModal(false);
+            setUrlInput('');
+            setUrlPreview(null);
+        } catch (e: any) {
+            showToast(e.message || 'Import failed', 'error');
+        }
+        setUrlImporting(false);
+    };
+
+    const tierBadge = (tier: number) => {
+        const styles: Record<number, { bg: string; color: string; label: string }> = {
+            1: { bg: 'rgba(52,199,89,0.12)', color: 'var(--success, #34c759)', label: 'Tier 1 · Pure Prompt' },
+            2: { bg: 'rgba(255,159,10,0.12)', color: 'var(--warning, #ff9f0a)', label: 'Tier 2 · CLI/API' },
+            3: { bg: 'rgba(255,59,48,0.12)', color: 'var(--error, #ff3b30)', label: 'Tier 3 · OpenClaw Native' },
+        };
+        const s = styles[tier] || styles[1];
+        return (
+            <span style={{ padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: 500, background: s.bg, color: s.color }}>
+                {s.label}
+            </span>
+        );
+    };
+
     return (
         <div>
-            <div style={{ marginBottom: '12px' }}>
-                <h3>{t('enterprise.tabs.skills', 'Skill Registry')}</h3>
-                <p style={{ fontSize: '13px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                    Manage global skills. Each skill is a folder with a SKILL.md file. Skills selected during agent creation are copied to the agent's workspace.
-                </p>
+            <div style={{ marginBottom: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                <div>
+                    <h3>{t('enterprise.tabs.skills', 'Skill Registry')}</h3>
+                    <p style={{ fontSize: '13px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                        Manage global skills. Each skill is a folder with a SKILL.md file. Skills selected during agent creation are copied to the agent's workspace.
+                    </p>
+                </div>
+                <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                    <button
+                        className="btn btn-secondary"
+                        style={{ fontSize: '13px' }}
+                        onClick={() => { setShowUrlModal(true); setUrlInput(''); setUrlPreview(null); }}
+                    >
+                        Import from URL
+                    </button>
+                    <button
+                        className="btn btn-primary"
+                        style={{ fontSize: '13px' }}
+                        onClick={() => { setShowClawhubModal(true); setSearchQuery(''); setSearchResults([]); }}
+                    >
+                        Browse ClawHub
+                    </button>
+                </div>
             </div>
+
             <FileBrowser
                 key={refreshKey}
                 api={adapter}
@@ -381,6 +487,156 @@ function SkillsTab() {
                 title={t('agent.skills.skillFiles', 'Skill Files')}
                 onRefresh={() => setRefreshKey(k => k + 1)}
             />
+
+            {/* Toast */}
+            {toast && (
+                <div style={{
+                    position: 'fixed', bottom: '24px', right: '24px', zIndex: 10000,
+                    padding: '12px 20px', borderRadius: '8px', fontSize: '13px', fontWeight: 500,
+                    background: toast.type === 'error' ? 'rgba(255,59,48,0.95)' : 'rgba(52,199,89,0.95)',
+                    color: '#fff', boxShadow: '0 4px 16px rgba(0,0,0,0.2)', maxWidth: '400px',
+                    animation: 'fadeIn 200ms ease',
+                }}>
+                    {toast.message}
+                </div>
+            )}
+
+            {/* ClawHub Search Modal */}
+            {showClawhubModal && (
+                <div style={{
+                    position: 'fixed', inset: 0, zIndex: 9999,
+                    background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }} onClick={() => setShowClawhubModal(false)}>
+                    <div style={{
+                        background: 'var(--bg-primary)', borderRadius: '12px', width: '640px', maxHeight: '80vh',
+                        display: 'flex', flexDirection: 'column', border: '1px solid var(--border-default)',
+                        boxShadow: '0 16px 48px rgba(0,0,0,0.2)',
+                    }} onClick={e => e.stopPropagation()}>
+                        {/* Header */}
+                        <div style={{ padding: '20px 24px 16px', borderBottom: '1px solid var(--border-subtle)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                                <h3 style={{ margin: 0, fontSize: '16px' }}>Browse ClawHub</h3>
+                                <button className="btn btn-ghost" onClick={() => setShowClawhubModal(false)} style={{ padding: '4px 8px', fontSize: '16px', lineHeight: 1 }}>x</button>
+                            </div>
+                            <div style={{ display: 'flex', gap: '8px' }}>
+                                <input
+                                    className="input"
+                                    placeholder="Search skills..."
+                                    value={searchQuery}
+                                    onChange={e => setSearchQuery(e.target.value)}
+                                    onKeyDown={e => e.key === 'Enter' && handleSearch()}
+                                    autoFocus
+                                    style={{ flex: 1, fontSize: '13px' }}
+                                />
+                                <button className="btn btn-primary" onClick={handleSearch} disabled={searching} style={{ fontSize: '13px' }}>
+                                    {searching ? 'Searching...' : 'Search'}
+                                </button>
+                            </div>
+                        </div>
+                        {/* Results */}
+                        <div style={{ flex: 1, overflowY: 'auto', padding: '12px 24px' }}>
+                            {searchResults.length === 0 && !searching && (
+                                <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-tertiary)', fontSize: '13px' }}>
+                                    {searchQuery ? 'No results found' : 'Search for skills on ClawHub marketplace'}
+                                </div>
+                            )}
+                            {searching && (
+                                <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-tertiary)', fontSize: '13px' }}>
+                                    Searching ClawHub...
+                                </div>
+                            )}
+                            {searchResults.map((r: any) => (
+                                <div key={r.slug} style={{
+                                    padding: '12px 0', borderBottom: '1px solid var(--border-subtle)',
+                                    display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px',
+                                }}>
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                                            <span style={{ fontWeight: 600, fontSize: '14px' }}>{r.displayName}</span>
+                                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>{r.slug}</span>
+                                        </div>
+                                        <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: '1.4' }}>
+                                            {r.summary?.slice(0, 160)}{r.summary?.length > 160 ? '...' : ''}
+                                        </div>
+                                    </div>
+                                    <button
+                                        className="btn btn-secondary"
+                                        style={{ fontSize: '12px', flexShrink: 0 }}
+                                        disabled={installing === r.slug}
+                                        onClick={() => handleInstall(r.slug)}
+                                    >
+                                        {installing === r.slug ? 'Installing...' : 'Install'}
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* URL Import Modal */}
+            {showUrlModal && (
+                <div style={{
+                    position: 'fixed', inset: 0, zIndex: 9999,
+                    background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                }} onClick={() => setShowUrlModal(false)}>
+                    <div style={{
+                        background: 'var(--bg-primary)', borderRadius: '12px', width: '560px',
+                        border: '1px solid var(--border-default)', boxShadow: '0 16px 48px rgba(0,0,0,0.2)',
+                    }} onClick={e => e.stopPropagation()}>
+                        <div style={{ padding: '20px 24px 16px', borderBottom: '1px solid var(--border-subtle)' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+                                <h3 style={{ margin: 0, fontSize: '16px' }}>Import from URL</h3>
+                                <button className="btn btn-ghost" onClick={() => setShowUrlModal(false)} style={{ padding: '4px 8px', fontSize: '16px', lineHeight: 1 }}>x</button>
+                            </div>
+                            <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', margin: '0 0 12px' }}>
+                                Paste a GitHub URL pointing to a skill directory containing SKILL.md
+                            </p>
+                            <div style={{ display: 'flex', gap: '8px' }}>
+                                <input
+                                    className="input"
+                                    placeholder="https://github.com/owner/repo/tree/main/skills/my-skill"
+                                    value={urlInput}
+                                    onChange={e => { setUrlInput(e.target.value); setUrlPreview(null); }}
+                                    autoFocus
+                                    style={{ flex: 1, fontSize: '13px', fontFamily: 'var(--font-mono)' }}
+                                    onKeyDown={e => e.key === 'Enter' && handleUrlPreview()}
+                                />
+                                <button className="btn btn-secondary" onClick={handleUrlPreview} disabled={urlPreviewing || !urlInput.trim()} style={{ fontSize: '12px' }}>
+                                    {urlPreviewing ? 'Loading...' : 'Preview'}
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Preview result */}
+                        {urlPreview && (
+                            <div style={{ padding: '16px 24px' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+                                    <span style={{ fontWeight: 600, fontSize: '14px' }}>{urlPreview.name}</span>
+                                    {tierBadge(urlPreview.tier)}
+                                    {urlPreview.has_scripts && (
+                                        <span style={{ padding: '2px 8px', borderRadius: '4px', fontSize: '11px', background: 'rgba(255,59,48,0.1)', color: 'var(--error, #ff3b30)' }}>
+                                            Contains scripts
+                                        </span>
+                                    )}
+                                </div>
+                                {urlPreview.description && (
+                                    <p style={{ fontSize: '12px', color: 'var(--text-secondary)', margin: '0 0 8px' }}>{urlPreview.description}</p>
+                                )}
+                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
+                                    {urlPreview.files?.length} files, {(urlPreview.total_size / 1024).toFixed(1)} KB
+                                </div>
+                                <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                                    <button className="btn btn-secondary" onClick={() => setShowUrlModal(false)} style={{ fontSize: '13px' }}>Cancel</button>
+                                    <button className="btn btn-primary" onClick={handleUrlImport} disabled={urlImporting} style={{ fontSize: '13px' }}>
+                                        {urlImporting ? 'Importing...' : 'Import'}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
