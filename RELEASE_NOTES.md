@@ -2,6 +2,13 @@
 
 ## What's New
 
+### ClawHub Skills Marketplace
+- Browse and install skills directly from ClawHub (the OpenClaw skill registry)
+- Import skills from any GitHub URL
+- ClawHub API key configuration for authenticated access to the skill registry
+- Tenant-scoped GitHub token configuration for higher API rate limits
+- Skill tenant isolation — imported skills are properly scoped to the importing company
+
 ### Feishu User Identity Architecture Fix
 Replaced `open_id` (per-app, unstable) with `user_id` (cross-app, stable) as the primary identifier for Feishu users. This fixes:
 - Duplicate user records when switching Feishu Apps or using multiple bots
@@ -10,22 +17,10 @@ Replaced `open_id` (per-app, unstable) with `user_id` (cross-app, stable) as the
 
 All changes include `open_id` fallback for environments that haven't enabled `user_id` permissions yet.
 
-### ClawHub Skills Marketplace
-- Browse and install skills directly from ClawHub (the OpenClaw skill registry)
-- Import skills from any GitHub URL 
-- Tenant-scoped GitHub token configuration for higher API rate limits
-- Skill tenant isolation — imported skills are properly scoped to the importing company
-
 ### Logging System Overhaul
 - Unified logging with loguru and trace ID support for request tracing
 - LLM Request ID tracking for debugging model interactions
 - Improved error messages throughout the platform
-
-### Tool & Channel Improvements
-- Recipient-aware `send_channel_file` for cross-channel file delivery
-- Guard against empty tool call arguments from LLM
-- Feishu WebSocket connection mode support
-- DingTalk stream and WeChat Work integration improvements
 
 ### Bug Fixes
 - Fixed notification badge cramping for multi-digit counts
@@ -111,7 +106,8 @@ All changes include `open_id` fallback for environments that haven't enabled `us
 | Component | Dependency | Required |
 |-----------|-----------|----------|
 | Backend | `loguru>=0.7.0` | Yes |
-| Docker | `GITHUB_TOKEN` env var | Optional |
+| Docker | `GITHUB_TOKEN` env var | Optional (raises GitHub API rate limit from 60 to 5,000/hr) |
+| Platform | ClawHub API Key (Company Settings > Skills) | Optional (for authenticated ClawHub access) |
 
 ### New Database Changes (auto-applied by Alembic)
 - New table: `tenant_settings` (per-tenant key-value configuration)
