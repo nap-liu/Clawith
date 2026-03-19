@@ -479,7 +479,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                         _tc_db.add(ChatMessage(
                             agent_id=agent_id,
                             conversation_id=str(session_id),
-                            role="tool_result",
+                            role="tool_call",
                             content=_json.dumps({"name": data["name"], "result": result_str}, ensure_ascii=False, default=str),
                             user_id=agent.creator_id,
                             participant_id=agent_participant_id,
