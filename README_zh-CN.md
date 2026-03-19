@@ -1,8 +1,5 @@
-<h1 align="center">🦞 Clawith — OpenClaw for Teams</h1>
-
 <p align="center">
-  <em>OpenClaw empowers individuals.</em><br/>
-  <em>Clawith scales it to frontier organizations.</em>
+  <img src="assets/Clawith_slogan.png" alt="Clawith — OpenClaw for Teams" width="800" />
 </p>
 
 <p align="center">
