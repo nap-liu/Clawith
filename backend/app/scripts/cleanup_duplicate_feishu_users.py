@@ -219,12 +219,23 @@ async def main():
                     primary.feishu_open_id = dup.feishu_open_id
                 if dup.feishu_union_id and not primary.feishu_union_id:
                     primary.feishu_union_id = dup.feishu_union_id
-                # Delete duplicate
+                # Clear unique fields on duplicate before delete to avoid constraint violations
+                dup.feishu_open_id = None
+                dup.email = f"deleted_{dup.id}@deleted.local"
+                dup.username = f"deleted_{dup.id}"
+                await db.flush()
+                # Now safe to delete
                 await db.delete(dup)
                 merge_count += 1
-                logger.info(f"    Merged {dup.username} (oid={dup.feishu_open_id or 'N/A'}) into {primary.username}")
+                logger.info(f"    Merged {dup.display_name} ({dup.id}) into {primary.username}")
 
-        await db.commit()
+            # Commit after each group to isolate errors
+            try:
+                await db.commit()
+            except Exception as e:
+                logger.error(f"  Failed to commit merge for '{name}': {e}")
+                await db.rollback()
+
         logger.info(f"Merged {merge_count} duplicate users")
 
         # ── Step 4: Update conv_ids ──
