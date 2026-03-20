@@ -4951,7 +4951,24 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     except Exception as e:
         return f"Failed to publish: {e}"
 
-    url = f"/p/{short_id}"
+    # Build public URL using configured PUBLIC_BASE_URL
+    public_base = ""
+    try:
+        from app.models.system_settings import SystemSetting
+        async with async_session() as db2:
+            r = await db2.execute(
+                select(SystemSetting).where(SystemSetting.key == "platform")
+            )
+            setting = r.scalar_one_or_none()
+            if setting and setting.value and setting.value.get("public_base_url"):
+                raw = setting.value["public_base_url"].strip().rstrip("/")
+                if raw and not raw.startswith("http"):
+                    raw = f"https://{raw}"
+                public_base = raw
+    except Exception:
+        pass
+
+    url = f"{public_base}/p/{short_id}" if public_base else f"/p/{short_id}"
 
     return f"Published successfully!\n\nPublic URL: {url}\nTitle: {title}\n\nAnyone can access this page without logging in."
 

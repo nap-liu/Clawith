@@ -430,13 +430,13 @@ export default function Layout() {
                             </NavLink>
                         )}
                         {user && user.role === 'platform_admin' && (
-                            <NavLink to="/admin/companies" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`} title={t('nav.adminCompanies', 'Companies')}>
+                            <NavLink to="/admin/platform-settings" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`} title={t('nav.platformSettings', 'Platform Settings')}>
                                 <span className="sidebar-item-icon" style={{ display: 'flex' }}>
                                     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                                        <rect x="2" y="5" width="12" height="9" rx="1" /><path d="M5 5V3a2 2 0 012-2h2a2 2 0 012 2v2" />
+                                        <circle cx="8" cy="8" r="2.5" /><path d="M13.5 8a5.5 5.5 0 01-.3 1.8l1.3.8-.8 1.4-1.3-.8a5.5 5.5 0 01-1.5 1l.1 1.5H9.2l.1-1.5a5.5 5.5 0 01-1.5-1l-1.3.8-.8-1.4 1.3-.8A5.5 5.5 0 016.7 8a5.5 5.5 0 01.3-1.8l-1.3-.8.8-1.4 1.3.8a5.5 5.5 0 011.5-1L9.2 2.3h1.6l-.1 1.5a5.5 5.5 0 011.5 1l1.3-.8.8 1.4-1.3.8a5.5 5.5 0 01.5 1.8z" />
                                     </svg>
                                 </span>
-                                <span className="sidebar-item-text">{t('nav.adminCompanies', 'Companies')}</span>
+                                <span className="sidebar-item-text">{t('nav.platformSettings', 'Platform Settings')}</span>
                             </NavLink>
                         )}
                     </div>
