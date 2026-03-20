@@ -4940,9 +4940,10 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     except Exception as e:
         return f"Failed to publish: {e}"
 
-    # Build public URL
+    # Build public URL — use only scheme+host from public_base_url (strip any path)
     public_base = ""
     try:
+        from urllib.parse import urlparse
         from app.models.system_settings import SystemSetting
         async with async_session() as db:
             r = await db.execute(
@@ -4950,7 +4951,8 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
             )
             setting = r.scalar_one_or_none()
             if setting and setting.value and setting.value.get("public_base_url"):
-                public_base = setting.value["public_base_url"].rstrip("/")
+                parsed = urlparse(setting.value["public_base_url"])
+                public_base = f"{parsed.scheme}://{parsed.netloc}"
     except Exception:
         pass
 
