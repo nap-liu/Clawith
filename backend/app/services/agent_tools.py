@@ -1058,6 +1058,20 @@ _TOOL_AUTONOMY_MAP = {
 }
 
 
+async def _get_agent_tenant_id(agent_id: uuid.UUID) -> str | None:
+    """Get the agent tenant ID for tenant-scoped shared paths."""
+    try:
+        from app.models.agent import Agent
+        async with async_session() as db:
+            r = await db.execute(select(Agent.tenant_id).where(Agent.id == agent_id))
+            tenant_id = r.scalar_one_or_none()
+            if tenant_id:
+                return str(tenant_id)
+    except Exception:
+        pass
+    return None
+
+
 async def _execute_tool_direct(
     tool_name: str,
     arguments: dict,
@@ -1068,7 +1082,8 @@ async def _execute_tool_direct(
     Used by the approval post-processing hook after an action
     has been approved and needs to actually run.
     """
-    ws = await ensure_workspace(agent_id)
+    _agent_tenant_id = await _get_agent_tenant_id(agent_id)
+    ws = await ensure_workspace(agent_id, tenant_id=_agent_tenant_id)
     try:
         if tool_name == "delete_file":
             return _delete_file(ws, arguments.get("path", ""))
@@ -1077,9 +1092,9 @@ async def _execute_tool_direct(
             content = arguments.get("content", "")
             if not path:
                 return "Missing path"
-            return _write_file(ws, path, content)
+            return _write_file(ws, path, content, tenant_id=_agent_tenant_id)
         elif tool_name == "execute_code":
-            return await _execute_code(agent_id, ws, arguments)
+            return await _execute_code(ws, arguments)
         elif tool_name == "web_search":
             return await _web_search(arguments)
         elif tool_name == "jina_search":
@@ -1101,19 +1116,7 @@ async def execute_tool(
     user_id: uuid.UUID,
 ) -> str:
     """Execute a tool call and return the result as a string."""
-    # Look up agent's tenant_id for tenant-scoped operations
-    _agent_tenant_id = None
-    try:
-        from app.models.agent import Agent as _Ag
-        from app.database import async_session as _ases
-        from sqlalchemy import select as _ssel
-        async with _ases() as _tdb:
-            _ag = await _tdb.execute(_ssel(_Ag.tenant_id).where(_Ag.id == agent_id))
-            _tid = _ag.scalar_one_or_none()
-            if _tid:
-                _agent_tenant_id = str(_tid)
-    except Exception:
-        pass
+    _agent_tenant_id = await _get_agent_tenant_id(agent_id)
 
     ws = await ensure_workspace(agent_id, tenant_id=_agent_tenant_id)
 
@@ -1161,7 +1164,7 @@ async def execute_tool(
                 return "❌ Missing required argument 'path' for write_file. Please provide a file path like 'skills/my-skill/SKILL.md'"
             if content is None:
                 return "❌ Missing required argument 'content' for write_file"
-            result = _write_file(ws, path, content)
+            result = _write_file(ws, path, content, tenant_id=_agent_tenant_id)
         elif tool_name == "delete_file":
             result = _delete_file(ws, arguments.get("path", ""))
         elif tool_name == "manage_tasks":
@@ -1514,10 +1517,10 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     """Send a file to a person or back to the current channel.
     
     Priority:
-    1. If channel_file_sender ContextVar is set (channel-initiated), use it directly.
-    2. If member_name is provided, resolve the recipient across all configured channels
+    1. If member_name is provided, resolve the recipient across all configured channels
        and deliver via the appropriate one (Feishu, Slack, etc.).
-    3. Fall back to web chat download URL.
+    2. If channel_file_sender ContextVar is set (channel-initiated), use it directly.
+    3. Fall back to web chat download URL when no explicit recipient is requested.
     """
     rel_path = arguments.get("file_path", "").strip()
     accompany_msg = arguments.get("message", "")
@@ -1535,7 +1538,17 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     if not file_path.exists():
         return f"Error: File not found: {rel_path}"
 
-    # Priority 1: channel-initiated (ContextVar set by channel webhook handler)
+    # Priority 1: explicit recipient - resolve member across channels
+    if member_name:
+        result = await _send_file_to_recipient(agent_id, file_path, member_name, accompany_msg)
+        if result:
+            return result
+        return (
+            f"Failed to send file to '{member_name}': recipient not reachable via configured channels. "
+            "Use send_message_to_agent for digital employees, or omit member_name to return a download link."
+        )
+
+    # Priority 2: channel-initiated (ContextVar set by channel webhook handler)
     sender = channel_file_sender.get()
     if sender is not None:
         try:
@@ -1543,12 +1556,6 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
             return f"File '{file_path.name}' sent to user via channel."
         except Exception as e:
             return f"Failed to send file: {e}"
-
-    # Priority 2: recipient-aware - resolve member across channels
-    if member_name:
-        result = await _send_file_to_recipient(agent_id, file_path, member_name, accompany_msg)
-        if result:
-            return result
 
     # Priority 3: Web chat fallback — return download URL
     aid = channel_web_agent_id.get() or str(agent_id)
@@ -2203,14 +2210,27 @@ async def _read_document(ws: Path, rel_path: str, max_chars: int = 8000, tenant_
         return f"Document read failed: {str(e)[:200]}"
 
 
-def _write_file(ws: Path, rel_path: str, content: str) -> str:
+def _write_file(ws: Path, rel_path: str, content: str, tenant_id: str | None = None) -> str:
     # Protect tasks.json from direct writes
     if rel_path.strip("/") == "tasks.json":
         return "tasks.json is read-only. Use manage_tasks tool to manage tasks."
 
-    file_path = (ws / rel_path).resolve()
-    if not str(file_path).startswith(str(ws.resolve())):
-        return "Access denied for this path"
+    # Handle enterprise_info/ as shared directory (tenant-scoped)
+    if rel_path and rel_path.startswith("enterprise_info"):
+        if tenant_id:
+            enterprise_root = (WORKSPACE_ROOT / f"enterprise_info_{tenant_id}").resolve()
+        else:
+            enterprise_root = (WORKSPACE_ROOT / "enterprise_info").resolve()
+        sub = rel_path[len("enterprise_info"):].lstrip("/")
+        if not sub:
+            return "Write failed: please provide a file path under enterprise_info/, e.g. enterprise_info/knowledge_base/report.md"
+        file_path = (enterprise_root / sub).resolve()
+        if not str(file_path).startswith(str(enterprise_root)):
+            return "Access denied for this path"
+    else:
+        file_path = (ws / rel_path).resolve()
+        if not str(file_path).startswith(str(ws.resolve())):
+            return "Access denied for this path"
 
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
