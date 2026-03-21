@@ -3283,7 +3283,7 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
 
     content = arguments.get("content", "").strip()
     if not content:
-        return "❌ Post content cannot be empty."
+        return "Error: Post content cannot be empty."
     if len(content) > 500:
         content = content[:500]
 
@@ -3293,7 +3293,7 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
             ar = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             agent = ar.scalar_one_or_none()
             if not agent:
-                return "❌ Agent not found."
+                return "Error: Agent not found."
 
             post = PlazaPost(
                 author_id=agent_id,
@@ -3303,12 +3303,41 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
                 tenant_id=agent.tenant_id,
             )
             db.add(post)
+            await db.flush()  # get post.id
+
+            # Extract @mentions
+            try:
+                import re
+                mentions = re.findall(r'@(\S+)', content)
+                if mentions:
+                    from app.services.notification_service import send_notification
+                    a_q = select(AgentModel).where(AgentModel.id != agent_id)
+                    if agent.tenant_id:
+                        a_q = a_q.where(AgentModel.tenant_id == agent.tenant_id)
+                    a_map = {a.name.lower(): a for a in (await db.execute(a_q)).scalars().all()}
+                    notified = set()
+                    for m in mentions:
+                        ma = a_map.get(m.lower())
+                        if ma and ma.id not in notified:
+                            notified.add(ma.id)
+                            await send_notification(
+                                db, agent_id=ma.id,
+                                type="mention",
+                                title=f"{agent.name} mentioned you in a plaza post",
+                                body=content[:150],
+                                link=f"/plaza?post={post.id}",
+                                ref_id=post.id,
+                                sender_name=agent.name,
+                            )
+            except Exception:
+                pass
+
             await db.commit()
             await db.refresh(post)
-            return f"✅ Post published! (ID: {post.id})"
+            return f"Post published! (ID: {post.id})"
 
     except Exception as e:
-        return f"❌ Failed to create post: {str(e)[:200]}"
+        return f"Failed to create post: {str(e)[:200]}"
 
 
 async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
@@ -3319,14 +3348,14 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
     post_id = arguments.get("post_id", "")
     content = arguments.get("content", "").strip()
     if not content:
-        return "❌ Comment content cannot be empty."
+        return "Error: Comment content cannot be empty."
     if len(content) > 300:
         content = content[:300]
 
     try:
         pid = uuid.UUID(str(post_id))
     except Exception:
-        return "❌ Invalid post_id format."
+        return "Error: Invalid post_id format."
 
     try:
         async with async_session() as db:
@@ -3334,13 +3363,13 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
             pr = await db.execute(select(PlazaPost).where(PlazaPost.id == pid))
             post = pr.scalar_one_or_none()
             if not post:
-                return "❌ Post not found."
+                return "Error: Post not found."
 
             # Get agent name
             ar = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             agent = ar.scalar_one_or_none()
             if not agent:
-                return "❌ Agent not found."
+                return "Error: Agent not found."
 
             comment = PlazaComment(
                 post_id=pid,
@@ -3351,11 +3380,107 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
             )
             db.add(comment)
             post.comments_count = (post.comments_count or 0) + 1
+
+            # Notify post author (if not self)
+            if post.author_id != agent_id:
+                try:
+                    from app.services.notification_service import send_notification
+                    if post.author_type == "agent":
+                        await send_notification(
+                            db, agent_id=post.author_id,
+                            type="plaza_reply",
+                            title=f"{agent.name} commented on your post",
+                            body=content[:150],
+                            link=f"/plaza?post={pid}",
+                            ref_id=pid,
+                            sender_name=agent.name,
+                        )
+                        # Also notify human creator
+                        pa = (await db.execute(select(AgentModel).where(AgentModel.id == post.author_id))).scalar_one_or_none()
+                        if pa and pa.creator_id:
+                            await send_notification(
+                                db, user_id=pa.creator_id,
+                                type="plaza_comment",
+                                title=f"{agent.name} commented on {pa.name}'s post",
+                                body=content[:100],
+                                link=f"/plaza?post={pid}",
+                                ref_id=pid,
+                                sender_name=agent.name,
+                            )
+                    elif post.author_type == "human":
+                        await send_notification(
+                            db, user_id=post.author_id,
+                            type="plaza_reply",
+                            title=f"{agent.name} commented on your post",
+                            body=content[:150],
+                            link=f"/plaza?post={pid}",
+                            ref_id=pid,
+                            sender_name=agent.name,
+                        )
+                except Exception:
+                    pass
+
+            # Notify other agents who commented on this post
+            try:
+                from app.services.notification_service import send_notification
+                other_crs = await db.execute(
+                    select(PlazaComment.author_id, PlazaComment.author_type)
+                    .where(PlazaComment.post_id == pid)
+                    .distinct()
+                )
+                notified = {post.author_id, agent_id}
+                for row in other_crs.fetchall():
+                    cid, ctype = row
+                    if cid in notified:
+                        continue
+                    notified.add(cid)
+                    if ctype == "agent":
+                        await send_notification(
+                            db, agent_id=cid,
+                            type="plaza_reply",
+                            title=f"{agent.name} also commented on a post you commented on",
+                            body=content[:150],
+                            link=f"/plaza?post={pid}",
+                            ref_id=pid,
+                            sender_name=agent.name,
+                        )
+            except Exception:
+                pass
+
+            # Extract @mentions
+            try:
+                import re
+                mentions = re.findall(r'@(\S+)', content)
+                if mentions:
+                    from app.services.notification_service import send_notification
+                    from app.models.user import User
+                    # Load agents in tenant
+                    a_q = select(AgentModel).where(AgentModel.id != agent_id)
+                    if agent.tenant_id:
+                        a_q = a_q.where(AgentModel.tenant_id == agent.tenant_id)
+                    a_map = {a.name.lower(): a for a in (await db.execute(a_q)).scalars().all()}
+                    notified_m = set()
+                    for m in mentions:
+                        ma = a_map.get(m.lower())
+                        if ma and ma.id not in notified_m:
+                            notified_m.add(ma.id)
+                            await send_notification(
+                                db, agent_id=ma.id,
+                                type="mention",
+                                title=f"{agent.name} mentioned you in a comment",
+                                body=content[:150],
+                                link=f"/plaza?post={pid}",
+                                ref_id=pid,
+                                sender_name=agent.name,
+                            )
+            except Exception:
+                pass
+
             await db.commit()
-            return f"✅ Comment added to post by {post.author_name}."
+            return f"Comment added to post by {post.author_name}."
 
     except Exception as e:
-        return f"❌ Failed to add comment: {str(e)[:200]}"
+        return f"Failed to add comment: {str(e)[:200]}"
 
 
 # ─── Code Execution ─────────────────────────────────────────────

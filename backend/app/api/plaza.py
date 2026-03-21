@@ -1,5 +1,6 @@
 """Plaza (Agent Square) REST API."""
 
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -62,6 +63,67 @@ class CommentOut(BaseModel):
 
 class PostDetail(PostOut):
     comments: list[CommentOut] = []
+
+
+# ── Helpers ─────────────────────────────────────────
+
+async def _notify_mentions(db, content: str, author_id: uuid.UUID, author_name: str,
+                           post_id: uuid.UUID, tenant_id: uuid.UUID | None):
+    """Parse @mentions in content and send notifications to mentioned agents/users."""
+    from app.models.agent import Agent
+    from app.services.notification_service import send_notification
+
+    mentions = re.findall(r'@(\S+)', content)
+    if not mentions:
+        return
+
+    # Find matching agents in the same tenant
+    agent_q = select(Agent).where(Agent.id != author_id)
+    if tenant_id:
+        agent_q = agent_q.where(Agent.tenant_id == tenant_id)
+    agents_result = await db.execute(agent_q)
+    agent_map = {a.name.lower(): a for a in agents_result.scalars().all()}
+
+    # Find matching users in the same tenant
+    user_q = select(User).where(User.id != author_id)
+    if tenant_id:
+        user_q = user_q.where(User.tenant_id == tenant_id)
+    users_result = await db.execute(user_q)
+    user_map = {}
+    for u in users_result.scalars().all():
+        name = (u.display_name or u.username or "").lower()
+        if name:
+            user_map[name] = u
+
+    notified_ids = set()
+    for m in mentions:
+        m_lower = m.lower()
+        # Try agent match
+        agent = agent_map.get(m_lower)
+        if agent and agent.id not in notified_ids:
+            notified_ids.add(agent.id)
+            await send_notification(
+                db, agent_id=agent.id,
+                type="mention",
+                title=f"{author_name} mentioned you in a post",
+                body=content[:150],
+                link=f"/plaza?post={post_id}",
+                ref_id=post_id,
+                sender_name=author_name,
+            )
+        # Try user match
+        user = user_map.get(m_lower)
+        if user and user.id not in notified_ids:
+            notified_ids.add(user.id)
+            await send_notification(
+                db, user_id=user.id,
+                type="mention",
+                title=f"{author_name} mentioned you in a post",
+                body=content[:150],
+                link=f"/plaza?post={post_id}",
+                ref_id=post_id,
+                sender_name=author_name,
+            )
 
 
 # ── Routes ──────────────────────────────────────────
@@ -141,6 +203,14 @@ async def create_post(body: PostCreate):
             tenant_id=body.tenant_id,
         )
         db.add(post)
+        await db.flush()  # get post.id before commit
+
+        # Extract @mentions and notify
+        try:
+            await _notify_mentions(db, body.content, body.author_id, body.author_name, post.id, body.tenant_id)
+        except Exception:
+            pass
+
         await db.commit()
         await db.refresh(post)
         return PostOut.model_validate(post)

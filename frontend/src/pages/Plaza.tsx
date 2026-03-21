@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '../stores';
@@ -95,15 +95,20 @@ const postJson = async (url: string, body: any) => {
     return res.json();
 };
 
-// Auto-detect URLs and #hashtags in text
+// Auto-detect URLs, #hashtags, and @mentions in text
 const linkifyContent = (text: string) => {
-    const parts = text.split(/(https?:\/\/[^\s<>"'()，。！？、；：]+|#[\w\u4e00-\u9fff]+)/g);
+    const parts = text.split(/(https?:\/\/[^\s<>"'()\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a]+|#[\w\u4e00-\u9fff]+|@\S+)/g);
     if (parts.length <= 1) return text;
     return parts.map((part, i) => {
         if (i % 2 === 1) {
             if (part.startsWith('#')) {
                 return (
                     <span key={i} style={{ color: 'var(--accent-primary)', fontWeight: 500 }}>{part}</span>
+                );
+            }
+            if (part.startsWith('@')) {
+                return (
+                    <span key={i} style={{ color: 'var(--accent-primary)', fontWeight: 600, cursor: 'default' }}>{part}</span>
                 );
             }
             return (
@@ -298,6 +303,165 @@ const styles = `
     .delete-btn:hover { opacity: 1; color: #ef4444; background: var(--bg-hover); }
 `;
 
+/* ────── Mention Autocomplete Component ────── */
+
+function MentionInput({ value, onChange, onSubmit, agents, placeholder, maxLength, multiline, style }: {
+    value: string;
+    onChange: (val: string) => void;
+    onSubmit?: () => void;
+    agents: Agent[];
+    placeholder?: string;
+    maxLength?: number;
+    multiline?: boolean;
+    style?: React.CSSProperties;
+}) {
+    const [showDropdown, setShowDropdown] = useState(false);
+    const [mentionFilter, setMentionFilter] = useState('');
+    const [mentionStart, setMentionStart] = useState(-1);
+    const [selectedIdx, setSelectedIdx] = useState(0);
+    const containerRef = useRef<HTMLDivElement>(null);
+    const inputRef = useRef<HTMLTextAreaElement | HTMLInputElement>(null);
+
+    const filtered = agents.filter(a =>
+        a.name.toLowerCase().includes(mentionFilter.toLowerCase())
+    ).slice(0, 6);
+
+    const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement | HTMLInputElement>) => {
+        const val = e.target.value;
+        onChange(val);
+
+        const cursorPos = e.target.selectionStart || 0;
+        // Find @ before cursor
+        const textBeforeCursor = val.substring(0, cursorPos);
+        const atIdx = textBeforeCursor.lastIndexOf('@');
+        if (atIdx >= 0 && (atIdx === 0 || /\s/.test(textBeforeCursor[atIdx - 1]))) {
+            const query = textBeforeCursor.substring(atIdx + 1);
+            if (!/\s/.test(query)) {
+                setMentionStart(atIdx);
+                setMentionFilter(query);
+                setShowDropdown(true);
+                setSelectedIdx(0);
+                return;
+            }
+        }
+        setShowDropdown(false);
+    }, [onChange]);
+
+    const insertMention = useCallback((agentName: string) => {
+        const before = value.substring(0, mentionStart);
+        const after = value.substring(mentionStart + mentionFilter.length + 1);
+        const newVal = before + '@' + agentName + ' ' + after;
+        onChange(newVal);
+        setShowDropdown(false);
+        // Re-focus input
+        setTimeout(() => inputRef.current?.focus(), 0);
+    }, [value, mentionStart, mentionFilter, onChange]);
+
+    const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+        if (showDropdown && filtered.length > 0) {
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setSelectedIdx(i => (i + 1) % filtered.length);
+                return;
+            }
+            if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setSelectedIdx(i => (i - 1 + filtered.length) % filtered.length);
+                return;
+            }
+            if (e.key === 'Enter' || e.key === 'Tab') {
+                e.preventDefault();
+                insertMention(filtered[selectedIdx].name);
+                return;
+            }
+            if (e.key === 'Escape') {
+                setShowDropdown(false);
+                return;
+            }
+        }
+        if (e.key === 'Enter' && !e.shiftKey && !multiline && onSubmit) {
+            e.preventDefault();
+            onSubmit();
+        }
+    }, [showDropdown, filtered, selectedIdx, insertMention, multiline, onSubmit]);
+
+    useEffect(() => {
+        const handleClick = (e: MouseEvent) => {
+            if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+                setShowDropdown(false);
+            }
+        };
+        document.addEventListener('mousedown', handleClick);
+        return () => document.removeEventListener('mousedown', handleClick);
+    }, []);
+
+    const InputTag = multiline ? 'textarea' : 'input';
+
+    return (
+        <div ref={containerRef} style={{ position: 'relative', flex: style?.flex || 1 }}>
+            <InputTag
+                ref={inputRef as any}
+                value={value}
+                onChange={handleChange}
+                onKeyDown={handleKeyDown}
+                placeholder={placeholder}
+                maxLength={maxLength}
+                rows={multiline ? 2 : undefined}
+                style={{
+                    width: '100%', boxSizing: 'border-box',
+                    resize: multiline ? 'none' : undefined,
+                    padding: multiline ? '8px 12px' : '6px 10px',
+                    fontSize: 'var(--text-sm)', lineHeight: 1.5,
+                    background: 'var(--bg-secondary)',
+                    color: 'var(--text-primary)',
+                    border: '1px solid var(--border-default)',
+                    borderRadius: 'var(--radius-md)',
+                    fontFamily: 'var(--font-family)',
+                    transition: 'border-color var(--transition-fast)',
+                    ...style,
+                }}
+                onFocus={e => {
+                    e.currentTarget.style.borderColor = 'var(--accent-primary)';
+                    e.currentTarget.style.boxShadow = '0 0 0 2px var(--accent-subtle)';
+                    if (multiline) (e.currentTarget as HTMLTextAreaElement).rows = 3;
+                }}
+                onBlur={e => {
+                    e.currentTarget.style.borderColor = 'var(--border-default)';
+                    e.currentTarget.style.boxShadow = 'none';
+                    if (multiline && !value) (e.currentTarget as HTMLTextAreaElement).rows = 2;
+                }}
+            />
+            {showDropdown && filtered.length > 0 && (
+                <div style={{
+                    position: 'absolute', left: 0, top: '100%', zIndex: 100,
+                    marginTop: '4px', width: '200px',
+                    background: 'var(--bg-primary)', border: '1px solid var(--border-default)',
+                    borderRadius: 'var(--radius-md)', boxShadow: 'var(--shadow-lg)',
+                    overflow: 'hidden',
+                }}>
+                    {filtered.map((a, idx) => (
+                        <div key={a.id}
+                            onMouseDown={e => { e.preventDefault(); insertMention(a.name); }}
+                            style={{
+                                padding: '6px 10px', cursor: 'pointer',
+                                fontSize: 'var(--text-sm)',
+                                display: 'flex', alignItems: 'center', gap: '8px',
+                                background: idx === selectedIdx ? 'var(--bg-hover)' : 'transparent',
+                                color: 'var(--text-primary)',
+                            }}
+                            onMouseEnter={() => setSelectedIdx(idx)}
+                        >
+                            <Avatar name={a.name} isAgent={true} size={20} />
+                            <span>{a.name}</span>
+                            <span style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginLeft: 'auto' }}>AI</span>
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
 /* ────── Main Component ────── */
 
 export default function Plaza() {
@@ -444,24 +608,13 @@ export default function Plaza() {
                     }}>
                         <div style={{ display: 'flex', gap: '10px' }}>
                             <Avatar name={user?.display_name || 'U'} isAgent={false} size={32} />
-                            <textarea
+                            <MentionInput
                                 value={newPost}
-                                onChange={e => setNewPost(e.target.value)}
+                                onChange={setNewPost}
+                                agents={agents}
                                 placeholder={t('plaza.writeSomething', "What's on your mind?")}
                                 maxLength={500}
-                                rows={2}
-                                style={{
-                                    flex: 1, resize: 'none', padding: '8px 12px',
-                                    fontSize: 'var(--text-sm)', lineHeight: 1.5,
-                                    background: 'var(--bg-secondary)',
-                                    color: 'var(--text-primary)',
-                                    border: '1px solid var(--border-default)',
-                                    borderRadius: 'var(--radius-md)',
-                                    fontFamily: 'var(--font-family)',
-                                    transition: 'border-color var(--transition-fast)',
-                                }}
-                                onFocus={e => { e.currentTarget.style.borderColor = 'var(--accent-primary)'; e.currentTarget.style.boxShadow = '0 0 0 2px var(--accent-subtle)'; e.currentTarget.rows = 3; }}
-                                onBlur={e => { e.currentTarget.style.borderColor = 'var(--border-default)'; e.currentTarget.style.boxShadow = 'none'; if (!newPost) e.currentTarget.rows = 2; }}
+                                multiline
                             />
                         </div>
                         <div style={{
@@ -469,7 +622,7 @@ export default function Plaza() {
                             alignItems: 'center', marginTop: '10px', paddingLeft: '42px',
                         }}>
                             <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
-                                {newPost.length}/500 · {t('plaza.hashtagTip', 'Use #hashtags to add topics')}
+                                {newPost.length}/500 · {t('plaza.hashtagTip', 'Use #hashtags and @mentions')}
                             </span>
                             <button
                                 className={`btn ${newPost.trim() ? 'btn-primary' : 'btn-secondary'}`}
@@ -627,25 +780,18 @@ export default function Plaza() {
                                                 </div>
                                             ))}
                                             <div style={{ display: 'flex', gap: '8px', marginTop: '6px' }}>
-                                                <input
+                                                <MentionInput
                                                     value={newComment}
-                                                    onChange={e => setNewComment(e.target.value)}
-                                                    placeholder={t('plaza.writeComment', 'Write a comment...')}
-                                                    maxLength={300}
-                                                    onKeyDown={e => {
-                                                        if (e.key === 'Enter' && newComment.trim()) {
+                                                    onChange={setNewComment}
+                                                    onSubmit={() => {
+                                                        if (newComment.trim()) {
                                                             addComment.mutate({ postId: post.id, content: newComment });
                                                         }
                                                     }}
-                                                    style={{
-                                                        flex: 1, padding: '6px 10px',
-                                                        fontSize: 'var(--text-sm)',
-                                                        background: 'var(--bg-secondary)',
-                                                        color: 'var(--text-primary)',
-                                                        border: '1px solid var(--border-default)',
-                                                        borderRadius: 'var(--radius-md)',
-                                                        height: '32px',
-                                                    }}
+                                                    agents={agents}
+                                                    placeholder={t('plaza.writeComment', 'Write a comment...')}
+                                                    maxLength={300}
+                                                    style={{ height: '32px' }}
                                                 />
                                                 <button
                                                     className={`btn ${newComment.trim() ? 'btn-primary' : 'btn-secondary'}`}
