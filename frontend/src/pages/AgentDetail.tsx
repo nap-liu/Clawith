@@ -788,6 +788,7 @@ function AgentDetailInner() {
     const [allUserFilter, setAllUserFilter] = useState<string>('');  // filter by username in All Users
     const [historyMsgs, setHistoryMsgs] = useState<any[]>([]);
     const [sessionsLoading, setSessionsLoading] = useState(false);
+    const [allSessionsLoading, setAllSessionsLoading] = useState(false);
     const [agentExpired, setAgentExpired] = useState(false);
 
     const fetchMySessions = async (silent = false) => {
@@ -804,6 +805,7 @@ function AgentDetailInner() {
 
     const fetchAllSessions = async () => {
         if (!id) return;
+        setAllSessionsLoading(true);
         try {
             const tkn = localStorage.getItem('token');
             const res = await fetch(`/api/agents/${id}/sessions?scope=all`, { headers: { Authorization: `Bearer ${tkn}` } });
@@ -812,6 +814,7 @@ function AgentDetailInner() {
                 setAllSessions(all.filter((s: any) => s.source_channel !== 'trigger'));
             }
         } catch { }
+        setAllSessionsLoading(false);
     };
 
     const createNewSession = async () => {
@@ -2973,8 +2976,21 @@ function AgentDetailInner() {
                                                     ))}
                                                 </select>
                                             </div>
+                                            {/* Loading skeleton */}
+                                            {allSessionsLoading ? (
+                                                <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                                                    {[...Array(6)].map((_, i) => (
+                                                        <div key={i} style={{ padding: '6px 0', animation: 'pulse 1.5s ease-in-out infinite', animationDelay: `${i * 0.1}s` }}>
+                                                            <div style={{ height: '12px', width: `${70 + (i % 3) * 10}%`, background: 'var(--bg-tertiary)', borderRadius: '4px', marginBottom: '6px' }} />
+                                                            <div style={{ height: '10px', width: `${40 + (i % 4) * 8}%`, background: 'var(--bg-tertiary)', borderRadius: '3px', opacity: 0.6 }} />
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            ) : allSessions.length === 0 ? (
+                                                <div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)', textAlign: 'center' }}>{t('agent.chat.noSessionsYet')}</div>
+                                            ) : null}
                                             {/* Filtered session list */}
-                                            {allSessions
+                                            {!allSessionsLoading && allSessions
                                                 .filter((s: any) => !allUserFilter || (s.username || s.user_id) === allUserFilter)
                                                 .map((s: any) => {
                                                     const isActive = activeSession?.id === s.id;
@@ -3035,8 +3051,21 @@ function AgentDetailInner() {
                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '12px', padding: '4px 8px', background: 'var(--bg-secondary)', borderRadius: '4px', display: 'inline-block' }}>
                                                 {activeSession.source_channel === 'agent' ? `🤖 Agent Conversation · ${activeSession.username || 'Agents'}` : `Read-only · ${activeSession.username || 'User'}`}
                                             </div>
-                                            {historyMsgs.map((m: any, i: number) => {
-                                                if (m.role === 'tool_call') {
+                                            {(() => {
+                                                // For A2A sessions, determine which participant is "this agent" (left side)
+                                                // Use agent.name matching against sender_name from messages
+                                                const isA2A = activeSession.source_channel === 'agent' || activeSession.participant_type === 'agent';
+                                                const thisAgentName = (agent as any)?.name;
+                                                // Find this agent's participant_id from loaded messages
+                                                const thisAgentPid = isA2A && thisAgentName
+                                                    ? historyMsgs.find((m: any) => m.sender_name === thisAgentName)?.participant_id
+                                                    : null;
+                                                return historyMsgs.map((m: any, i: number) => {
+                                                // Determine if this message is from "this agent" (left) or peer (right)
+                                                const isLeft = isA2A && thisAgentPid
+                                                    ? m.participant_id === thisAgentPid
+                                                    : m.role === 'assistant';
+                                            if (m.role === 'tool_call') {
                                                     const tName = m.toolName || (() => { try { return JSON.parse(m.content || '{}').name; } catch { return 'tool'; } })();
                                                     const tArgs = m.toolArgs || (() => { try { return JSON.parse(m.content || '{}').args; } catch { return {}; } })();
                                                     const tResult = m.toolResult ?? (() => { try { return JSON.parse(m.content || '{}').result; } catch { return ''; } })();
@@ -3083,9 +3112,9 @@ function AgentDetailInner() {
                                                     return null;
                                                 }
                                                 return (
-                                                    <div key={i} style={{ display: 'flex', flexDirection: m.role === 'assistant' ? 'row' : 'row-reverse', gap: '8px', marginBottom: '8px' }}>
-                                                        <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: m.role === 'assistant' ? 'var(--bg-elevated)' : 'rgba(16,185,129,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', flexShrink: 0, color: 'var(--text-secondary)', fontWeight: 600 }}>{m.sender_name ? m.sender_name[0] : (m.role === 'assistant' ? 'A' : 'U')}</div>
-                                                        <div style={{ maxWidth: '70%', padding: '8px 12px', borderRadius: '12px', background: m.role === 'assistant' ? 'var(--bg-secondary)' : 'rgba(16,185,129,0.1)', fontSize: '13px', lineHeight: '1.5', wordBreak: 'break-word' }}>
+                                                    <div key={i} style={{ display: 'flex', flexDirection: isLeft ? 'row' : 'row-reverse', gap: '8px', marginBottom: '8px' }}>
+                                                        <div style={{ width: '28px', height: '28px', borderRadius: '50%', background: isLeft ? 'var(--bg-elevated)' : 'rgba(16,185,129,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '11px', flexShrink: 0, color: 'var(--text-secondary)', fontWeight: 600 }}>{m.sender_name ? m.sender_name[0] : (isLeft ? 'A' : 'U')}</div>
+                                                        <div style={{ maxWidth: '70%', padding: '8px 12px', borderRadius: '12px', background: isLeft ? 'var(--bg-secondary)' : 'rgba(16,185,129,0.1)', fontSize: '13px', lineHeight: '1.5', wordBreak: 'break-word' }}>
                                                             {m.sender_name && <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginBottom: '2px', fontWeight: 600 }}>🤖 {m.sender_name}</div>}
                                                             {(() => {
                                                                 const pm = parseChatMsg({ role: m.role as ChatMsg['role'], content: m.content || '' });
@@ -3131,7 +3160,8 @@ function AgentDetailInner() {
                                                         </div>
                                                     </div>
                                                 );
-                                            })}
+                                            });
+                                            })()}
                                         </div>
                                         {showHistoryScrollBtn && (
                                             <button onClick={scrollHistoryToBottom} style={{ position: 'absolute', bottom: '20px', right: '20px', width: '32px', height: '32px', borderRadius: '50%', background: 'var(--bg-elevated)', border: '1px solid var(--border-default)', color: 'var(--text-secondary)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', boxShadow: '0 2px 8px rgba(0,0,0,0.3)', zIndex: 10 }} title="Scroll to bottom">↓</button>
