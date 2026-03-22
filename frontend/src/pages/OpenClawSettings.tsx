@@ -35,7 +35,7 @@ export default function OpenClawSettings({ agent, agentId }: OpenClawSettingsPro
 
     const hasKey = agent?.has_api_key || false;
 
-    const handleRegenerate = async () => {
+    const handleRegenerate = async (autoCopy = false) => {
         setRegenerating(true);
         try {
             const result = await fetchAuth<{ api_key: string }>(`/agents/${agentId}/api-key`, { method: 'POST' });
@@ -43,6 +43,9 @@ export default function OpenClawSettings({ agent, agentId }: OpenClawSettingsPro
             setShowConfirm(false);
             // Refresh agent data so has_api_key updates
             queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
+            if (autoCopy) {
+                handleCopy(result.api_key);
+            }
         } catch (e) {
             console.error('Failed to regenerate API key', e);
         } finally {
@@ -146,6 +149,13 @@ export default function OpenClawSettings({ agent, agentId }: OpenClawSettingsPro
                             >
                                 {copied ? 'Copied' : 'Copy'}
                             </button>
+                            <button
+                                className="btn btn-secondary"
+                                onClick={() => setShowConfirm(true)}
+                                style={{ padding: '4px 12px', fontSize: '12px', whiteSpace: 'nowrap' }}
+                            >
+                                {isChinese ? '重新生成' : 'Regenerate'}
+                            </button>
                         </div>
                         <div style={{
                             fontSize: '11px', color: 'var(--warning)',
@@ -172,6 +182,17 @@ export default function OpenClawSettings({ agent, agentId }: OpenClawSettingsPro
                                 ? 'oc-••••••••••••••••••••••••••••••••'
                                 : (isChinese ? '未生成' : 'Not generated')}
                         </div>
+                        {hasKey && (
+                            <button
+                                className="btn btn-secondary"
+                                onClick={() => handleRegenerate(true)}
+                                disabled={regenerating}
+                                style={{ padding: '6px 16px', fontSize: '12px', whiteSpace: 'nowrap' }}
+                                title={isChinese ? '重新生成并复制新 Key' : 'Regenerate and copy new key'}
+                            >
+                                {regenerating ? (isChinese ? '生成中...' : 'Generating...') : 'Copy'}
+                            </button>
+                        )}
                         <button
                             className="btn btn-secondary"
                             onClick={() => setShowConfirm(true)}
@@ -215,7 +236,7 @@ export default function OpenClawSettings({ agent, agentId }: OpenClawSettingsPro
                             </button>
                             <button
                                 className="btn btn-primary"
-                                onClick={handleRegenerate}
+                                onClick={() => handleRegenerate(false)}
                                 disabled={regenerating}
                                 style={{ padding: '5px 14px', fontSize: '12px' }}
                             >
