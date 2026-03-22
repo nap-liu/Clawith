@@ -2768,12 +2768,30 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, ws: Path, args: dict) ->
                 )
                 target_agent = fuzzy_result.scalars().first()
             if not target_agent:
-                all_r = await db.execute(select(Agent).where(*base_filter))
-                names = [a.name for a in all_r.scalars().all()]
-                return f"❌ No agent found matching '{agent_name}'. Available: {', '.join(names) if names else 'none'}"
+                # Only show agents from relationships, not all agents
+                from app.models.org import AgentAgentRelationship
+                rel_r = await db.execute(
+                    select(Agent.name).join(
+                        AgentAgentRelationship,
+                        (AgentAgentRelationship.target_agent_id == Agent.id) & (AgentAgentRelationship.agent_id == from_agent_id)
+                    )
+                )
+                rel_names = [n for (n,) in rel_r.all()]
+                return f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}"
 
             if target_agent.is_expired or (target_agent.expires_at and datetime.now(timezone.utc) >= target_agent.expires_at):
                 return f"⚠️ {target_agent.name} is currently unavailable — their service period has ended. Please contact the platform administrator."
+
+            # Enforce relationship: only allow file transfer with agents in relationships
+            from app.models.org import AgentAgentRelationship
+            rel_check = await db.execute(
+                select(AgentAgentRelationship.id).where(
+                    ((AgentAgentRelationship.agent_id == from_agent_id) & (AgentAgentRelationship.target_agent_id == target_agent.id))
+                    | ((AgentAgentRelationship.agent_id == target_agent.id) & (AgentAgentRelationship.target_agent_id == from_agent_id))
+                ).limit(1)
+            )
+            if not rel_check.scalar_one_or_none():
+                return f"❌ You do not have a relationship with {target_agent.name}. Only agents in your relationship list can receive files. Ask your administrator to add a relationship if needed."
 
             target_tenant_id = str(target_agent.tenant_id) if target_agent.tenant_id else None
             target_name = target_agent.name
@@ -2908,13 +2926,31 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 )
                 target = fuzzy_result.scalars().first()
             if not target:
-                all_r = await db.execute(select(Agent).where(*base_filter))
-                names = [a.name for a in all_r.scalars().all()]
-                return f"❌ No agent found matching '{agent_name}'. Available: {', '.join(names) if names else 'none'}"
+                # Only show agents from relationships, not all agents
+                from app.models.org import AgentAgentRelationship
+                rel_r = await db.execute(
+                    select(Agent.name).join(
+                        AgentAgentRelationship,
+                        (AgentAgentRelationship.target_agent_id == Agent.id) & (AgentAgentRelationship.agent_id == from_agent_id)
+                    )
+                )
+                rel_names = [n for (n,) in rel_r.all()]
+                return f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}"
 
             # Check if target agent has expired
             if target.is_expired or (target.expires_at and datetime.now(timezone.utc) >= target.expires_at):
                 return f"⚠️ {target.name} is currently unavailable — their service period has ended. Please contact the platform administrator."
+
+            # Enforce relationship: only allow communication with agents in relationships
+            from app.models.org import AgentAgentRelationship
+            rel_check = await db.execute(
+                select(AgentAgentRelationship.id).where(
+                    ((AgentAgentRelationship.agent_id == from_agent_id) & (AgentAgentRelationship.target_agent_id == target.id))
+                    | ((AgentAgentRelationship.agent_id == target.id) & (AgentAgentRelationship.target_agent_id == from_agent_id))
+                ).limit(1)
+            )
+            if not rel_check.scalar_one_or_none():
+                return f"❌ You do not have a relationship with {target.name}. Only agents in your relationship list can be contacted. Ask your administrator to add a relationship if needed."
 
             # ── OpenClaw target: queue message for gateway poll ──
             if getattr(target, "agent_type", "native") == "openclaw":
