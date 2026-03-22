@@ -108,7 +108,7 @@ class AgentOut(BaseModel):
     min_poll_interval_min: int = 5
     webhook_rate_limit: int = 5
     heartbeat_enabled: bool = True
-    heartbeat_interval_minutes: int = 30
+    heartbeat_interval_minutes: int = 240
     heartbeat_active_hours: str = "09:00-18:00"
     last_heartbeat_at: datetime | None = None
     timezone: str | None = None

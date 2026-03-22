@@ -425,7 +425,7 @@ async def _heartbeat_tick():
                     continue
 
                 # Check interval
-                interval = timedelta(minutes=agent.heartbeat_interval_minutes or 30)
+                interval = timedelta(minutes=agent.heartbeat_interval_minutes or 240)
                 if agent.last_heartbeat_at and (now - agent.last_heartbeat_at) < interval:
                     continue
 
