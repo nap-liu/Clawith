@@ -119,6 +119,7 @@ class AgentOut(BaseModel):
     agent_type: str = "native"
     openclaw_last_seen: datetime | None = None
     has_api_key: bool = False
+    api_key_hash: str | None = None
     created_at: datetime
     last_active_at: datetime | None = None
 

@@ -127,83 +127,66 @@ export default function OpenClawSettings({ agent, agentId }: OpenClawSettingsPro
                         : 'OpenClaw uses this key to connect to the platform. Regenerating will immediately invalidate the old key.'}
                 </p>
 
-                {apiKey ? (
-                    /* New key just generated — show in full */
-                    <div>
-                        <div style={{
-                            display: 'flex', alignItems: 'center', gap: '8px',
-                            padding: '10px 14px', background: 'rgba(99,102,241,0.06)',
-                            borderRadius: '8px', border: '1px solid var(--accent-primary)',
-                            marginBottom: '8px',
-                        }}>
-                            <code style={{
-                                flex: 1, fontSize: '13px', fontFamily: 'monospace',
-                                wordBreak: 'break-all', color: 'var(--text-primary)',
+                {/* API Key Display Logic */}
+                {(() => {
+                    const activeKey = apiKey || (agent?.api_key_hash?.startsWith('oc-') ? agent.api_key_hash : null);
+                    const isLegacyHash = hasKey && !activeKey;
+
+                    if (activeKey) {
+                        return (
+                            <div style={{
+                                display: 'flex', alignItems: 'center', gap: '8px',
+                                padding: '10px 14px', background: 'rgba(99,102,241,0.06)',
+                                borderRadius: '8px', border: '1px solid var(--accent-primary)',
                             }}>
-                                {apiKey}
-                            </code>
-                            <button
-                                className="btn btn-secondary"
-                                onClick={() => handleCopy(apiKey)}
-                                style={{ padding: '4px 12px', fontSize: '12px', whiteSpace: 'nowrap' }}
-                            >
-                                {copied ? 'Copied' : 'Copy'}
-                            </button>
+                                <code style={{
+                                    flex: 1, fontSize: '13px', fontFamily: 'monospace',
+                                    wordBreak: 'break-all', color: 'var(--text-primary)',
+                                }}>
+                                    {activeKey}
+                                </code>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={() => handleCopy(activeKey)}
+                                    style={{ padding: '4px 12px', fontSize: '12px', whiteSpace: 'nowrap' }}
+                                >
+                                    {copied ? 'Copied' : 'Copy'}
+                                </button>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={() => setShowConfirm(true)}
+                                    style={{ padding: '4px 12px', fontSize: '12px', whiteSpace: 'nowrap' }}
+                                >
+                                    {isChinese ? '重新生成' : 'Regenerate'}
+                                </button>
+                            </div>
+                        );
+                    }
+
+                    return (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            <div style={{
+                                flex: 1, padding: '8px 14px', borderRadius: '8px',
+                                background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)',
+                                fontFamily: 'monospace', fontSize: '13px', color: 'var(--text-secondary)',
+                                letterSpacing: '0.5px',
+                            }}>
+                                {isLegacyHash
+                                    ? (isChinese ? '旧版密钥（已加密隐藏），请重新生成以查看明文' : 'Legacy key (encrypted), please regenerate to view')
+                                    : (isChinese ? '未生成' : 'Not generated')}
+                            </div>
                             <button
                                 className="btn btn-secondary"
                                 onClick={() => setShowConfirm(true)}
-                                style={{ padding: '4px 12px', fontSize: '12px', whiteSpace: 'nowrap' }}
-                            >
-                                {isChinese ? '重新生成' : 'Regenerate'}
-                            </button>
-                        </div>
-                        <div style={{
-                            fontSize: '11px', color: 'var(--warning)',
-                            display: 'flex', alignItems: 'flex-start', gap: '6px',
-                        }}>
-                            <span style={{ flexShrink: 0, marginTop: '1px' }}>&#9888;</span>
-                            <span>
-                                {isChinese
-                                    ? '请立即保存此 Key 并更新到 OpenClaw 的 clawith_sync Skill 中。关闭后将无法再次查看。'
-                                    : 'Save this key now and update it in your OpenClaw clawith_sync skill. It will not be shown again.'}
-                            </span>
-                        </div>
-                    </div>
-                ) : (
-                    /* Default state — show masked key or "not generated" */
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                        <div style={{
-                            flex: 1, padding: '8px 14px', borderRadius: '8px',
-                            background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)',
-                            fontFamily: 'monospace', fontSize: '13px', color: 'var(--text-secondary)',
-                            letterSpacing: '0.5px',
-                        }}>
-                            {hasKey
-                                ? 'oc-••••••••••••••••••••••••••••••••'
-                                : (isChinese ? '未生成' : 'Not generated')}
-                        </div>
-                        {hasKey && (
-                            <button
-                                className="btn btn-secondary"
-                                onClick={() => handleRegenerate(true)}
-                                disabled={regenerating}
                                 style={{ padding: '6px 16px', fontSize: '12px', whiteSpace: 'nowrap' }}
-                                title={isChinese ? '重新生成并复制新 Key' : 'Regenerate and copy new key'}
                             >
-                                {regenerating ? (isChinese ? '生成中...' : 'Generating...') : 'Copy'}
+                                {isLegacyHash
+                                    ? (isChinese ? '重新生成' : 'Regenerate')
+                                    : (isChinese ? '生成' : 'Generate')}
                             </button>
-                        )}
-                        <button
-                            className="btn btn-secondary"
-                            onClick={() => setShowConfirm(true)}
-                            style={{ padding: '6px 16px', fontSize: '12px', whiteSpace: 'nowrap' }}
-                        >
-                            {hasKey
-                                ? (isChinese ? '重新生成' : 'Regenerate')
-                                : (isChinese ? '生成' : 'Generate')}
-                        </button>
-                    </div>
-                )}
+                        </div>
+                    );
+                })()}
 
                 {/* Confirmation dialog */}
                 {showConfirm && (
