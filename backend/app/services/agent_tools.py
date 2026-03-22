@@ -2989,10 +2989,11 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 "\n\n--- Agent-to-Agent Message ---\n"
                 "You are receiving a message from another digital employee. "
                 "Reply concisely and helpfully. Focus on the request and provide a clear answer.\n"
-                "\nIMPORTANT: If the requesting agent asks you to create a file, report, or document, "
-                "you MUST use `send_file_to_agent` to deliver the result to them after writing it. "
-                "Do NOT just save the file in your workspace and tell them the path — "
-                "they cannot access your workspace. Always deliver files explicitly.\n"
+                "\n** CRITICAL FILE DELIVERY RULE **\n"
+                "After you write any file (report, document, analysis, etc.) that the requesting agent needs, "
+                "you MUST call `send_file_to_agent(agent_name=\"<requester_name>\", file_path=\"<path>\")` "
+                "to deliver it. The other agent CANNOT access your workspace. "
+                "Never just tell them the path — always deliver explicitly.\n"
             )
 
             # Load recent history for context
@@ -3144,6 +3145,15 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                                     tool_args = {}
 
                             tool_result = await execute_tool(tool_name, tool_args, target.id, owner_id)
+
+                            # Nudge: after write_file in A2A, remind to deliver via send_file_to_agent
+                            if tool_name == "write_file" and isinstance(tool_result, str) and tool_result.startswith("\u2705"):
+                                wrote_path = tool_args.get("path", "")
+                                tool_result += (
+                                    f"\n\n⚠️ REMINDER: The requesting agent ({source_name}) cannot access your workspace. "
+                                    f"You MUST now call `send_file_to_agent(agent_name=\"{source_name}\", file_path=\"{wrote_path}\")` "
+                                    f"to deliver this file to them."
+                                )
 
                             # Save tool_call to DB so it appears in chat history
                             try:
