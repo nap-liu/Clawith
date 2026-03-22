@@ -971,7 +971,7 @@ function AgentDetailInner() {
                 setIsWaiting(false);
             }
             await fetchMySessions(false, id);
-            await fetchAllSessions(id);
+            await fetchAllSessions();
         } catch (e: any) {
             alert(e.message || 'Delete failed');
         }
@@ -3212,8 +3212,9 @@ function AgentDetailInner() {
                                                     : null;
                                                 return historyMsgs.map((m: any, i: number) => {
                                                 // Determine if this message is from "this agent" (left) or peer (right)
+                                                // Actually, "this agent" should be on the RIGHT (like 'me'), and peer on the LEFT
                                                 const isLeft = isA2A && thisAgentPid
-                                                    ? m.participant_id === thisAgentPid
+                                                    ? m.participant_id !== thisAgentPid
                                                     : m.role === 'assistant';
                                             if (m.role === 'tool_call') {
                                                     const tName = m.toolName || (() => { try { return JSON.parse(m.content || '{}').name; } catch { return 'tool'; } })();
