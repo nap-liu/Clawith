@@ -432,6 +432,14 @@ async def _send_to_agent_background(
             user_msg = f"[Message from agent: {source_agent_name}]\n{content}"
             messages.append({"role": "user", "content": user_msg})
 
+            from app.models.participant import Participant
+            
+            # Lookup participants for both agents
+            src_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == source_agent_id))
+            tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id))
+            src_participant = src_part_r.scalar_one_or_none()
+            tgt_participant = tgt_part_r.scalar_one_or_none()
+            
             # Save user message to conversation
             db.add(ChatMessage(
                 agent_id=target_agent_id,
@@ -439,6 +447,7 @@ async def _send_to_agent_background(
                 role="user",
                 content=user_msg,
                 user_id=target_creator_id,
+                participant_id=src_participant.id if src_participant else None,
             ))
             await db.commit()
 
@@ -460,12 +469,17 @@ async def _send_to_agent_background(
 
         # Save assistant reply to conversation
         async with async_session() as db:
+            from app.models.participant import Participant
+            tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id))
+            tgt_participant = tgt_part_r.scalar_one_or_none()
+            
             db.add(ChatMessage(
                 agent_id=target_agent_id,
                 conversation_id=conv_id,
                 role="assistant",
                 content=final_reply,
                 user_id=target_creator_id,
+                participant_id=tgt_participant.id if tgt_participant else None,
             ))
 
             # Write reply to gateway_messages for source (OpenClaw) to poll
