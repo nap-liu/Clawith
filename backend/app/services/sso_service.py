@@ -94,13 +94,10 @@ class SSOService:
         if tenant:
             return str(tenant.id)
 
-        # Try to find tenant by matching tenant name/domain
+        # Try to find tenant by matching tenant name
         result = await db.execute(
             select(Tenant).where(
-                or_(
-                    Tenant.name.ilike(f"%{domain.split('.')[0]}%"),
-                    Tenant.sso_domain.ilike(f"%{domain}%"),
-                )
+                Tenant.name.ilike(f"%{domain.split('.')[0]}%")
             )
         )
         tenant = result.scalar_one_or_none()

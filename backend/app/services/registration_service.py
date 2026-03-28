@@ -43,10 +43,7 @@ class RegistrationService:
         # Try to find tenant by custom domain
         result = await db.execute(
             select(Tenant).where(
-                or_(
-                    Tenant.sso_domain.ilike(f"%{domain}%"),
-                    Tenant.sso_domain.ilike(f"%{domain}%"),
-                ),
+                Tenant.sso_domain.ilike(f"%{domain}%"),
                 Tenant.is_active == True,
             )
         )
