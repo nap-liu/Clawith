@@ -177,6 +177,10 @@ class BaseOrgSyncAdapter(ABC):
                 await self._reconcile(db, provider.id, sync_start)
                 await db.flush()
 
+                # Recalculate member counts for all departments (crucial for DingTalk/WeCom)
+                await self._update_member_counts(db, provider.id)
+                await db.flush()
+
         except Exception as e:
             import traceback
             logger.error(f"[OrgSync] Critical error during sync: {e}\n{traceback.format_exc()}")
@@ -211,6 +215,25 @@ class BaseOrgSyncAdapter(ABC):
             .where(OrgDepartment.synced_at < sync_start)
             .where(OrgDepartment.status != "deleted")
             .values(status="deleted", synced_at=datetime.now())
+        )
+
+    async def _update_member_counts(self, db: AsyncSession, provider_id: uuid.UUID):
+        """Update member_count for all departments of a provider based on current active members."""
+        from sqlalchemy import update, select, func
+        
+        # Subquery to count active members for each department
+        subquery = (
+            select(func.count(OrgMember.id))
+            .where(OrgMember.department_id == OrgDepartment.id)
+            .where(OrgMember.status == "active")
+            .scalar_subquery()
+        )
+        
+        await db.execute(
+            update(OrgDepartment)
+            .where(OrgDepartment.provider_id == provider_id)
+            .where(OrgDepartment.status == "active")
+            .values(member_count=subquery)
         )
 
     async def _ensure_provider(self, db: AsyncSession) -> IdentityProvider:
