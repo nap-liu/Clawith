@@ -19,28 +19,10 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
+from app.services.dingtalk_token import dingtalk_token_manager
 
 
 # ─── DingTalk Media Helpers ─────────────────────────────
-
-async def _get_dingtalk_access_token(app_key: str, app_secret: str) -> Optional[str]:
-    """Get DingTalk access token via OAuth2."""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                "https://api.dingtalk.com/v1.0/oauth2/accessToken",
-                json={"appKey": app_key, "appSecret": app_secret},
-            )
-            data = resp.json()
-            token = data.get("accessToken")
-            if token:
-                logger.debug("[DingTalk] Got access token successfully")
-                return token
-            logger.error(f"[DingTalk] Failed to get access token: {data}")
-            return None
-    except Exception as e:
-        logger.error(f"[DingTalk] Error getting access token: {e}")
-        return None
 
 
 async def _get_media_download_url(
@@ -84,7 +66,7 @@ async def _download_dingtalk_media(
 
     Steps: get access_token -> get download URL -> download file bytes.
     """
-    access_token = await _get_dingtalk_access_token(app_key, app_secret)
+    access_token = await dingtalk_token_manager.get_token(app_key, app_secret)
     if not access_token:
         return None
 
@@ -285,7 +267,7 @@ async def _upload_dingtalk_media(
     Returns:
         mediaId string on success, None on failure.
     """
-    access_token = await _get_dingtalk_access_token(app_key, app_secret)
+    access_token = await dingtalk_token_manager.get_token(app_key, app_secret)
     if not access_token:
         return None
 
@@ -346,7 +328,7 @@ async def _send_dingtalk_media_message(
     Returns:
         True on success, False on failure.
     """
-    access_token = await _get_dingtalk_access_token(app_key, app_secret)
+    access_token = await dingtalk_token_manager.get_token(app_key, app_secret)
     if not access_token:
         return False
 

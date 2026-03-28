@@ -1,31 +1,8 @@
 """DingTalk emotion reaction service — "thinking" indicator on user messages."""
 
-import time
 import asyncio
 from loguru import logger
-
-_token_cache: dict[str, tuple[str, float]] = {}
-
-
-async def _get_access_token(app_key: str, app_secret: str) -> str:
-    """Get DingTalk access token with caching (7200s validity, refresh at 7000s)."""
-    import httpx
-
-    cache_key = app_key
-    cached = _token_cache.get(cache_key)
-    if cached and cached[1] > time.time():
-        return cached[0]
-
-    async with httpx.AsyncClient(timeout=5) as client:
-        resp = await client.post(
-            "https://api.dingtalk.com/v1.0/oauth2/accessToken",
-            json={"appKey": app_key, "appSecret": app_secret},
-        )
-        data = resp.json()
-        token = data.get("accessToken", "")
-        if token:
-            _token_cache[cache_key] = (token, time.time() + 7000)
-        return token
+from app.services.dingtalk_token import dingtalk_token_manager
 
 
 async def add_thinking_reaction(
@@ -41,7 +18,7 @@ async def add_thinking_reaction(
         return False
 
     try:
-        token = await _get_access_token(app_key, app_secret)
+        token = await dingtalk_token_manager.get_token(app_key, app_secret)
         if not token:
             logger.warning("[DingTalk Reaction] Failed to get access token")
             return False
@@ -97,7 +74,7 @@ async def recall_thinking_reaction(
             await asyncio.sleep(delay)
 
         try:
-            token = await _get_access_token(app_key, app_secret)
+            token = await dingtalk_token_manager.get_token(app_key, app_secret)
             if not token:
                 continue
 
