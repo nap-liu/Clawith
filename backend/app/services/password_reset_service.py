@@ -7,12 +7,16 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models.password_reset_token import PasswordResetToken
+from app.core.events import get_redis
 from app.models.system_settings import SystemSetting
+
+# Key prefixes for Redis
+TOKEN_PREFIX = "pwd_reset:token:"
+USER_PREFIX = "pwd_reset:user:"
 
 
 def _hash_token(token: str) -> str:
@@ -20,25 +24,32 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-async def create_password_reset_token(db: AsyncSession, user_id: uuid.UUID) -> tuple[str, datetime]:
-    """Create a new single-use token and invalidate older unused tokens."""
-    now = datetime.now(timezone.utc)
-    await db.execute(
-        update(PasswordResetToken)
-        .where(PasswordResetToken.user_id == user_id, PasswordResetToken.used_at.is_(None))
-        .values(used_at=now)
-    )
+async def create_password_reset_token(user_id: uuid.UUID) -> tuple[str, datetime]:
+    """Create a new single-use token and invalidate older unused tokens in Redis."""
+    redis = await get_redis()
+    user_key = f"{USER_PREFIX}{user_id}"
+    
+    # Invalidate previous token for this user if exists
+    old_token_hash = await redis.get(user_key)
+    if old_token_hash:
+        await redis.delete(f"{TOKEN_PREFIX}{old_token_hash}")
 
     raw_token = secrets.token_urlsafe(32)
-    expires_at = now + timedelta(minutes=get_settings().PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
-    db.add(
-        PasswordResetToken(
-            user_id=user_id,
-            token_hash=_hash_token(raw_token),
-            expires_at=expires_at,
-        )
-    )
-    await db.flush()
+    token_hash = _hash_token(raw_token)
+    
+    now = datetime.now(timezone.utc)
+    expiry_minutes = get_settings().PASSWORD_RESET_TOKEN_EXPIRE_MINUTES
+    expires_at = now + timedelta(minutes=expiry_minutes)
+    
+    # Store the new token (bi-directional mapping for easy invalidation)
+    token_key = f"{TOKEN_PREFIX}{token_hash}"
+    ttl_seconds = int(expiry_minutes * 60)
+    
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.setex(token_key, ttl_seconds, str(user_id))
+        pipe.setex(user_key, ttl_seconds, token_hash)
+        await pipe.execute()
+        
     return raw_token, expires_at
 
 
@@ -66,16 +77,23 @@ async def build_password_reset_url(db: AsyncSession, raw_token: str) -> str:
     return f"{base_url}/reset-password?token={raw_token}"
 
 
-async def consume_password_reset_token(db: AsyncSession, raw_token: str) -> PasswordResetToken | None:
-    """Load a valid reset token and mark it used."""
-    now = datetime.now(timezone.utc)
-    result = await db.execute(
-        select(PasswordResetToken).where(PasswordResetToken.token_hash == _hash_token(raw_token))
-    )
-    token = result.scalar_one_or_none()
-    if not token or token.used_at or token.expires_at <= now:
+async def consume_password_reset_token(raw_token: str) -> dict | None:
+    """Load a valid reset token from Redis and mark it used (by deleting)."""
+    redis = await get_redis()
+    token_hash = _hash_token(raw_token)
+    token_key = f"{TOKEN_PREFIX}{token_hash}"
+    
+    user_id_str = await redis.get(token_key)
+    if not user_id_str:
         return None
-
-    token.used_at = now
-    await db.flush()
-    return token
+        
+    user_id = uuid.UUID(user_id_str)
+    user_key = f"{USER_PREFIX}{user_id}"
+    
+    # Atomic delete to ensure single-use
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.delete(token_key)
+        pipe.delete(user_key)
+        await pipe.execute()
+    
+    return {"user_id": user_id}

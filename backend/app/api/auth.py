@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, get_current_user, hash_password, verify_password
 from app.database import get_db
-from app.models.password_reset_token import PasswordResetToken
 from app.models.user import User
 from app.schemas.schemas import (
     ForgotPasswordRequest,
@@ -265,6 +264,15 @@ async def forgot_password(
     db: AsyncSession = Depends(get_db),
 ):
     """Request a password reset link without revealing account existence."""
+    from app.config import get_settings
+    settings = get_settings()
+
+    if not settings.SYSTEM_SMTP_HOST or not settings.SYSTEM_EMAIL_FROM_ADDRESS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password reset is currently unavailable (no mail server configured)."
+        )
+
     generic_response = {
         "ok": True,
         "message": "If an account with that email exists, a password reset email has been sent.",
@@ -284,8 +292,7 @@ async def forgot_password(
         )
 
         get_system_email_config()
-        raw_token, expires_at = await create_password_reset_token(db, user.id)
-        await db.commit()
+        raw_token, expires_at = await create_password_reset_token(user.id)
 
         reset_url = await build_password_reset_url(db, raw_token)
         expiry_minutes = int((expires_at - datetime.now(timezone.utc)).total_seconds() // 60)
@@ -308,24 +315,17 @@ async def reset_password(data: ResetPasswordRequest, db: AsyncSession = Depends(
     """Reset a password using a valid single-use token."""
     from app.services.password_reset_service import consume_password_reset_token
 
-    token = await consume_password_reset_token(db, data.token)
+    token = await consume_password_reset_token(data.token)
     if not token:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
-    result = await db.execute(select(User).where(User.id == token.user_id))
+    user_id = token["user_id"]
+    result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
     user.password_hash = hash_password(data.new_password)
-
-    # Invalidate any other older token rows for the same user.
-    other_tokens = await db.execute(select(PasswordResetToken).where(PasswordResetToken.user_id == user.id))
-    now = datetime.now(timezone.utc)
-    for row in other_tokens.scalars().all():
-        if row.id != token.id and row.used_at is None:
-            row.used_at = now
-
     await db.flush()
     return {"ok": True}
 

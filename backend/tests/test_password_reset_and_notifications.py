@@ -10,7 +10,6 @@ from starlette.background import BackgroundTasks
 from app.api import auth as auth_api
 from app.api.notification import BroadcastRequest, broadcast_notification
 from app.core.security import verify_password
-from app.models.password_reset_token import PasswordResetToken
 from app.models.user import User
 from app.schemas.schemas import ForgotPasswordRequest, ResetPasswordRequest
 from app.services import password_reset_service, system_email_service
@@ -35,6 +34,36 @@ class DummyResult:
 
     def scalars(self):
         return DummyScalars(self._values)
+
+
+class MockRedis:
+    def __init__(self, initial_data=None):
+        self._data = initial_data or {}
+        self.deleted = []
+        self.setex_calls = []
+
+    async def get(self, key):
+        return self._data.get(key)
+
+    async def delete(self, key):
+        self.deleted.append(key)
+        self._data.pop(key, None)
+
+    async def setex(self, key, ttl, value):
+        self.setex_calls.append((key, ttl, value))
+        self._data[key] = value
+
+    def pipeline(self, transaction=True):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        pass
+
+    async def execute(self):
+        pass
 
 
 class RecordingDB:
@@ -83,19 +112,21 @@ async def test_create_password_reset_token_invalidates_older_tokens(monkeypatch)
         "get_settings",
         lambda: SimpleNamespace(PASSWORD_RESET_TOKEN_EXPIRE_MINUTES=15, PUBLIC_BASE_URL=""),
     )
+    mock_redis = MockRedis(initial_data={"pwd_reset:user:user-id-123": "old-token-hash"})
+    async def fake_get_redis(): return mock_redis
+    monkeypatch.setattr(password_reset_service, "get_redis", fake_get_redis)
+
     db = RecordingDB()
     user_id = uuid.uuid4()
 
-    raw_token, expires_at = await password_reset_service.create_password_reset_token(db, user_id)
+    raw_token, expires_at = await password_reset_service.create_password_reset_token(user_id)
 
-    assert db.flushed is True
-    assert len(db.executed) == 1
-    assert "UPDATE password_reset_tokens" in str(db.executed[0])
-    assert len(db.added) == 1
-    saved_token = db.added[0]
-    assert isinstance(saved_token, PasswordResetToken)
-    assert saved_token.user_id == user_id
-    assert saved_token.token_hash != raw_token
+    # Verify old token invalidation
+    assert "pwd_reset:token:old-token-hash" in mock_redis.deleted
+
+    # Verify new token storage
+    assert len(mock_redis.setex_calls) == 2
+    # Verify raw token is long
     assert len(raw_token) >= 20
     assert expires_at > datetime.now(timezone.utc)
 
@@ -115,18 +146,27 @@ async def test_build_password_reset_url_uses_env_public_base_url(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_consume_password_reset_token_rejects_expired_tokens():
-    expired = PasswordResetToken(
-        user_id=uuid.uuid4(),
-        token_hash="hashed",
-        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
-    )
-    db = RecordingDB([DummyResult(expired)])
+async def test_consume_password_reset_token_works_correctly(monkeypatch):
+    user_id = uuid.uuid4()
+    raw_token = "raw-token"
+    token_hash = password_reset_service._hash_token(raw_token)
+    
+    initial_data = {
+        f"pwd_reset:token:{token_hash}": str(user_id),
+        f"pwd_reset:user:{user_id}": token_hash,
+    }
+    mock_redis = MockRedis(initial_data=initial_data)
+    async def fake_get_redis(): return mock_redis
+    monkeypatch.setattr(password_reset_service, "get_redis", fake_get_redis)
 
-    token = await password_reset_service.consume_password_reset_token(db, "raw-token")
+    db = RecordingDB()
+    result = await password_reset_service.consume_password_reset_token(raw_token)
 
-    assert token is None
-    assert expired.used_at is None
+    assert result is not None
+    assert result["user_id"] == user_id
+    # Should be deleted after consumption
+    assert f"pwd_reset:token:{token_hash}" in mock_redis.deleted
+    assert f"pwd_reset:user:{user_id}" in mock_redis.deleted
 
 
 @pytest.mark.asyncio
@@ -281,24 +321,12 @@ def test_send_system_email_uses_configured_timeout(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reset_password_updates_user_and_invalidates_other_tokens(monkeypatch):
+async def test_reset_password_updates_user(monkeypatch):
     user = make_user(password_hash=auth_api.hash_password("old-password"))
-    consumed = PasswordResetToken(
-        id=uuid.uuid4(),
-        user_id=user.id,
-        token_hash="current",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
-    )
-    older = PasswordResetToken(
-        id=uuid.uuid4(),
-        user_id=user.id,
-        token_hash="older",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
-    )
-    db = RecordingDB([DummyResult(user), DummyResult(values=[consumed, older])])
+    db = RecordingDB([DummyResult(user)])
 
     async def fake_consume_password_reset_token(*_args, **_kwargs):
-        return consumed
+        return {"user_id": user.id}
 
     monkeypatch.setattr(password_reset_service, "consume_password_reset_token", fake_consume_password_reset_token)
 
@@ -309,7 +337,6 @@ async def test_reset_password_updates_user_and_invalidates_other_tokens(monkeypa
 
     assert response == {"ok": True}
     assert verify_password("new-password", user.password_hash)
-    assert older.used_at is not None
     assert db.flushed is True
 
 
