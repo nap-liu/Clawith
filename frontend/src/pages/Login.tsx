@@ -231,7 +231,7 @@ export default function Login() {
                             {!ssoLoading && ssoProviders.length > 0 && (
                                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px' }}>
                                     {ssoProviders.map(p => {
-                                        const meta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' };
+                                        const baseMeta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' }; const meta = { ...baseMeta, label: p.name || baseMeta.label };
                                         return (
                                             <button
                                                 key={p.provider_type}
