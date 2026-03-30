@@ -792,7 +792,6 @@ function CompaniesTab() {
 // ─── Edit Company Modal ───────────────────────────────
 function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { company: any, publicBaseUrl: string, onClose: () => void, onUpdated: () => void }) {
     const { t } = useTranslation();
-    const [ssoEnabled, setSsoEnabled] = useState(!!company.sso_enabled);
     const [subdomainPrefix, setSubdomainPrefix] = useState(company.subdomain_prefix || '');
     const [prefixStatus, setPrefixStatus] = useState<'idle' | 'checking' | 'available' | 'taken'>('idle');
     const [saving, setSaving] = useState(false);
@@ -817,7 +816,6 @@ function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { comp
         setError('');
         try {
             await adminApi.updateCompany(company.id, {
-                sso_enabled: ssoEnabled,
                 subdomain_prefix: subdomainPrefix.trim() || null,
             });
             onUpdated();
@@ -854,22 +852,10 @@ function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { comp
                     {t('admin.ssoConfigTitle', 'SSO & Domain Configuration')}
                 </h3>
                 <p style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '16px', lineHeight: '1.4' }}>
-                    {t('admin.ssoConfigDesc', 'Configure SSO and custom domain for this company.')}
+                    {t('admin.ssoConfigDesc', 'Configure company-specific access domain. SSO login options will appear automatically after configuring an identity provider in enterprise settings.')}
                 </p>
 
                 <div style={{ marginBottom: '16px', background: 'var(--bg-secondary)', padding: '12px', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
-                    <div style={{ marginBottom: '12px' }}>
-                        <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '13px', fontWeight: 500 }}>
-                            <input
-                                type="checkbox"
-                                checked={ssoEnabled}
-                                onChange={e => setSsoEnabled(e.target.checked)}
-                                style={{ width: '16px', height: '16px', cursor: 'pointer' }}
-                            />
-                            {t('admin.ssoEnabled', 'Enable SSO')}
-                        </label>
-                    </div>
-
                     <div style={{ marginBottom: '12px' }}>
                         <label className="form-label" style={{ fontSize: '12px', marginBottom: '4px' }}>
                             {t('admin.subdomainPrefix', 'Subdomain Prefix')}

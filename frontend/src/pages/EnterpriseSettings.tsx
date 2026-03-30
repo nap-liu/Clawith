@@ -122,29 +122,23 @@ function OrgTab({ tenant }: { tenant: any }) {
     const qc = useQueryClient();
 
     const SsoStatus = () => {
-        const [isExpanded, setIsExpanded] = useState(!!tenant?.sso_enabled);
-        const [ssoEnabled, setSsoEnabled] = useState(!!tenant?.sso_enabled);
         const [ssoDomain, setSsoDomain] = useState(tenant?.sso_domain || '');
         const [saving, setSaving] = useState(false);
         const [error, setError] = useState('');
 
         useEffect(() => {
-            setSsoEnabled(!!tenant?.sso_enabled);
             setSsoDomain(tenant?.sso_domain || '');
-            setIsExpanded(!!tenant?.sso_enabled);
         }, [tenant]);
 
-        const handleSave = async (forceEnabled?: boolean) => {
+        const handleSave = async () => {
             if (!tenant?.id) return;
-            const targetEnabled = forceEnabled !== undefined ? forceEnabled : ssoEnabled;
             setSaving(true);
             setError('');
             try {
                 await fetchJson(`/tenants/${tenant.id}`, {
                     method: 'PUT',
                     body: JSON.stringify({
-                        sso_enabled: targetEnabled,
-                        sso_domain: targetEnabled ? (ssoDomain.trim() || null) : null,
+                        sso_domain: ssoDomain.trim() || null,
                     }),
                 });
                 qc.invalidateQueries({ queryKey: ['tenant', tenant.id] });
@@ -154,79 +148,40 @@ function OrgTab({ tenant }: { tenant: any }) {
             setSaving(false);
         };
 
-        const handleToggle = (e: React.ChangeEvent<HTMLInputElement>) => {
-            const checked = e.target.checked;
-            setSsoEnabled(checked);
-            setIsExpanded(checked);
-            if (!checked) {
-                // auto-save when disabling
-                handleSave(false);
-            }
-        };
-
         return (
             <div className="card" style={{ marginBottom: '24px', overflow: 'hidden' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px' }}>
-                    <div>
-                        <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>
-                            {t('enterprise.identity.ssoTitle', 'Enterprise SSO')}
-                        </div>
-                        <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                            {t('enterprise.identity.ssoDisabledHint', 'Seamless enterprise login via Single Sign-On.')}
+                <div style={{ padding: '16px' }}>
+                    <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>
+                        {t('enterprise.identity.ssoTitle', 'Enterprise SSO')}
+                    </div>
+                    <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
+                        {t('enterprise.identity.ssoDisabledHint', 'Seamless enterprise login via Single Sign-On.')}
+                    </div>
+
+                    <div style={{ marginBottom: '16px' }}>
+                        <label className="form-label" style={{ fontSize: '12px', marginBottom: '8px' }}>
+                            {t('enterprise.identity.ssoDomain', 'Custom Access Domain')}
+                        </label>
+                        <input
+                            className="form-input"
+                            value={ssoDomain}
+                            onChange={e => setSsoDomain(e.target.value)}
+                            placeholder={t('enterprise.identity.ssoDomainPlaceholder', 'e.g. acme.clawith.com')}
+                            style={{ fontSize: '13px', width: '100%', maxWidth: '400px' }}
+                        />
+                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '6px' }}>
+                            {t('enterprise.identity.ssoDomainDesc', 'The custom domain users will use to log in via SSO.')}
                         </div>
                     </div>
-                    <div>
-                        <label style={{ position: 'relative', display: 'inline-block', width: '36px', height: '20px' }}>
-                            <input 
-                                type="checkbox" 
-                                checked={ssoEnabled} 
-                                onChange={handleToggle}
-                                style={{ opacity: 0, width: 0, height: 0 }} 
-                            />
-                            <span style={{
-                                position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-                                borderRadius: '20px', cursor: 'pointer',
-                                background: ssoEnabled ? 'var(--accent-primary)' : 'var(--border-subtle)',
-                                transition: '0.2s'
-                            }}>
-                                <span style={{
-                                    position: 'absolute', left: ssoEnabled ? '18px' : '2px', top: '2px',
-                                    width: '16px', height: '16px', borderRadius: '50%',
-                                    background: '#fff', transition: '0.2s',
-                                    boxShadow: '0 1px 2px rgba(0,0,0,0.1)'
-                                }} />
-                            </span>
-                        </label>
+
+                    {error && <div style={{ color: 'var(--error)', fontSize: '12px', marginBottom: '12px' }}>{error}</div>}
+
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                        <button className="btn btn-primary btn-sm" onClick={() => handleSave()} disabled={saving || !ssoDomain.trim()}>
+                            {saving ? t('common.loading') : t('common.save', 'Save Configuration')}
+                        </button>
                     </div>
                 </div>
-
-                {isExpanded && (
-                    <div style={{ padding: '0 16px 16px', borderTop: '1px solid var(--border-subtle)', paddingTop: '16px' }}>
-                        <div style={{ marginBottom: '16px' }}>
-                            <label className="form-label" style={{ fontSize: '12px', marginBottom: '8px' }}>
-                                {t('enterprise.identity.ssoDomain', 'Custom Access Domain')}
-                            </label>
-                            <input
-                                className="form-input"
-                                value={ssoDomain}
-                                onChange={e => setSsoDomain(e.target.value)}
-                                placeholder={t('enterprise.identity.ssoDomainPlaceholder', 'e.g. acme.clawith.com')}
-                                style={{ fontSize: '13px', width: '100%', maxWidth: '400px' }}
-                            />
-                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '6px' }}>
-                                {t('enterprise.identity.ssoDomainDesc', 'The custom domain users will use to log in via SSO.')}
-                            </div>
-                        </div>
-
-                        {error && <div style={{ color: 'var(--error)', fontSize: '12px', marginBottom: '12px' }}>{error}</div>}
-
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                            <button className="btn btn-primary btn-sm" onClick={() => handleSave()} disabled={saving || !ssoDomain.trim()}>
-                                {saving ? t('common.loading') : t('common.save', 'Save Configuration')}
-                            </button>
-                        </div>
-                    </div>
-                )}
             </div>
         );
     };
