@@ -56,6 +56,17 @@ const FALLBACK_LLM_PROVIDERS: LLMProviderSpec[] = [
     { provider: 'custom', display_name: 'Custom', protocol: 'openai_compatible', default_base_url: '', supports_tool_choice: true, default_max_tokens: 4096 },
 ];
 
+const FEISHU_SYNC_PERM_JSON = `{
+  "scopes": {
+    "tenant": [
+      "contact:contact.base:readonly",
+      "contact:department.base:readonly",
+      "contact:user.base:readonly",
+      "contact:user.employee_id:readonly"
+    ],
+    "user": []
+  }
+}`;
 
 
 // ─── Department Tree ───────────────────────────────
@@ -396,12 +407,69 @@ function OrgTab({ tenant }: { tenant: any }) {
     const renderForm = (type: string, existingProvider?: any) => {
         return (
             <div style={{ marginTop: '16px', paddingTop: '16px', borderTop: '1px solid var(--border-subtle)' }}>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '16px' }}>
-                    <div className="form-group">
-                        <label className="form-label">{t('enterprise.identity.name')}</label>
-                        <input className="form-input" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
+                {/* Setup Guide moved to the top */}
+                {['feishu', 'dingtalk', 'wecom'].includes(type) && (
+                    <div style={{ background: 'var(--bg-primary)', padding: '16px', borderRadius: '8px', border: '1px solid var(--border-subtle)', marginBottom: '20px', fontSize: '12px' }}>
+                        <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', color: 'var(--text-primary)' }}>
+                            👉 {t('enterprise.org.syncSetupGuide', 'Setup Guide & Required Permissions')}
+                        </div>
+                        <div style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                            {type === 'feishu' && (
+                                <>
+                                    {Array.from({ length: 7 }).map((_, i) => (
+                                        <div key={i} style={{ marginBottom: '6px' }}>
+                                            {i + 1}. {t(`enterprise.org.syncGuide.feishu.step${i + 1}`)}
+                                        </div>
+                                    ))}
+                                    <div style={{ marginTop: '16px', marginBottom: '8px' }}>
+                                        {t('enterprise.org.feishuGuideText', 'Permission JSON (bulk import)')}
+                                    </div>
+                                    <div style={{ position: 'relative', background: '#282c34', borderRadius: '6px', padding: '12px', paddingRight: '40px', color: '#abb2bf', fontFamily: 'monospace', fontSize: '11px', whiteSpace: 'pre-wrap', overflowX: 'auto' }}>
+                                        <button 
+                                            className="btn btn-ghost" 
+                                            style={{ position: 'absolute', top: '8px', right: '8px', fontSize: '10px', color: '#abb2bf', padding: '4px 8px', background: 'rgba(255,255,255,0.1)', cursor: 'pointer', border: 'none', borderRadius: '4px' }}
+                                            onClick={(e) => { e.preventDefault(); navigator.clipboard.writeText(FEISHU_SYNC_PERM_JSON); e.currentTarget.textContent = 'Copied✓'; setTimeout(() => { e.currentTarget.textContent = 'Copy'; }, 2000); }}
+                                        >
+                                            Copy
+                                        </button>
+                                        {FEISHU_SYNC_PERM_JSON}
+                                    </div>
+                                    <div style={{ marginTop: '8px', color: 'var(--text-secondary)' }}>
+                                        {t('enterprise.org.feishuGuideWarning', 'Note: You must re-publish the app each time you add new permissions.')}
+                                    </div>
+                                </>
+                            )}
+                            {type === 'dingtalk' && (
+                                <>
+                                    {Array.from({ length: 6 }).map((_, i) => (
+                                        <div key={i} style={{ marginBottom: '6px' }}>
+                                            {i + 1}. {t(`enterprise.org.syncGuide.dingtalk.step${i + 1}`)}
+                                        </div>
+                                    ))}
+                                </>
+                            )}
+                            {type === 'wecom' && (
+                                <>
+                                    {Array.from({ length: 5 }).map((_, i) => (
+                                        <div key={i} style={{ marginBottom: '6px' }}>
+                                            {i + 1}. {t(`enterprise.org.syncGuide.wecom.step${i + 1}`)}
+                                        </div>
+                                    ))}
+                                </>
+                            )}
+                        </div>
                     </div>
-                </div>
+                )}
+
+                {/* Name field only for oauth2 */}
+                {type === 'oauth2' && (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '16px' }}>
+                        <div className="form-group">
+                            <label className="form-label">{t('enterprise.identity.name')}</label>
+                            <input className="form-input" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} />
+                        </div>
+                    </div>
+                )}
 
                 {type === 'oauth2' ? (
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
@@ -513,6 +581,8 @@ function OrgTab({ tenant }: { tenant: any }) {
                         )}
                     </div>
                 </div>
+
+
                 <div style={{ display: 'flex', gap: '16px' }}>
                     <div style={{ width: '260px', borderRight: '1px solid var(--border-subtle)', paddingRight: '16px', maxHeight: '500px', overflowY: 'auto' }}>
                         <div style={{ padding: '6px 8px', borderRadius: '4px', cursor: 'pointer', fontSize: '13px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: !selectedDept ? 'rgba(224,238,238,0.1)' : 'transparent' }} onClick={() => setSelectedDept(null)}>
@@ -601,14 +671,18 @@ function OrgTab({ tenant }: { tenant: any }) {
                                     <div style={{ padding: '0 20px 20px', background: 'var(--bg-secondary)' }}>
                                         {renderForm(idp.type, existingProvider)}
 
-                                        {/* Per-channel SSO Login toggle — only for configured, sync-capable providers */}
-                                        {existingProvider && ['feishu', 'dingtalk', 'wecom'].includes(idp.type) && (() => {
-                                            const ssoEnabled = !!existingProvider.sso_login_enabled;
+                                        {/* Per-channel SSO Login URLs & Toggle */}
+                                        {['feishu', 'dingtalk', 'wecom', 'oauth2'].includes(idp.type) && (() => {
+                                            const ssoEnabled = existingProvider ? !!existingProvider.sso_login_enabled : false;
                                             const slug = tenant?.slug || '';
                                             const domain = tenant?.sso_domain || (slug ? `${slug}.clawith.ai` : '');
                                             const callbackUrl = domain ? `https://${domain}/api/auth/${idp.type}/callback` : '';
 
                                             const handleSsoToggle = async () => {
+                                                if (!existingProvider) {
+                                                    alert(t('enterprise.identity.saveFirst', 'Please save the configuration first to enable SSO.'));
+                                                    return;
+                                                }
                                                 const newVal = !ssoEnabled;
                                                 try {
                                                     await fetchJson(`/enterprise/identity-providers/${existingProvider.id}`, {
@@ -626,7 +700,7 @@ function OrgTab({ tenant }: { tenant: any }) {
                                             return (
                                                 <div style={{ marginTop: '20px', paddingTop: '20px', borderTop: '1px dashed var(--border-subtle)' }}>
                                                     {/* SSO Toggle */}
-                                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: ssoEnabled ? '16px' : 0 }}>
+                                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
                                                         <div>
                                                             <div style={{ fontWeight: 500, fontSize: '13px' }}>{t('enterprise.identity.ssoLoginToggle', 'SSO Login')}</div>
                                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
@@ -644,7 +718,8 @@ function OrgTab({ tenant }: { tenant: any }) {
                                                                 position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
                                                                 borderRadius: '20px', cursor: 'pointer',
                                                                 background: ssoEnabled ? 'var(--accent-primary)' : 'var(--border-subtle)',
-                                                                transition: '0.2s'
+                                                                transition: '0.2s',
+                                                                opacity: existingProvider ? 1 : 0.5
                                                             }}>
                                                                 <span style={{
                                                                     position: 'absolute', left: ssoEnabled ? '18px' : '2px', top: '2px',
@@ -656,9 +731,8 @@ function OrgTab({ tenant }: { tenant: any }) {
                                                         </label>
                                                     </div>
 
-                                                    {/* Callback URL & domain info — shown when SSO is enabled */}
-                                                    {ssoEnabled && (
-                                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                                                    {/* Callback URL & domain info — always shown so users can configure it before saving */}
+                                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                                                             {/* Company subdomain */}
                                                             <div>
                                                                 <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px', color: 'var(--text-secondary)' }}>
@@ -674,7 +748,14 @@ function OrgTab({ tenant }: { tenant: any }) {
                                                                     <button
                                                                         className="btn btn-ghost btn-sm"
                                                                         style={{ fontSize: '11px' }}
-                                                                        onClick={() => { navigator.clipboard.writeText(`https://${domain}`); }}
+                                                                        onClick={(e) => { 
+                                                                            e.preventDefault();
+                                                                            navigator.clipboard.writeText(`https://${domain}`);
+                                                                            const el = e.currentTarget;
+                                                                            const old = el.textContent;
+                                                                            el.textContent = 'Copied✓';
+                                                                            setTimeout(() => { el.textContent = old; }, 2000);
+                                                                        }}
                                                                     >
                                                                         {t('common.copy', 'Copy')}
                                                                     </button>
@@ -699,7 +780,14 @@ function OrgTab({ tenant }: { tenant: any }) {
                                                                     <button
                                                                         className="btn btn-ghost btn-sm"
                                                                         style={{ fontSize: '11px' }}
-                                                                        onClick={() => { navigator.clipboard.writeText(callbackUrl); }}
+                                                                        onClick={(e) => { 
+                                                                            e.preventDefault();
+                                                                            navigator.clipboard.writeText(callbackUrl);
+                                                                            const el = e.currentTarget;
+                                                                            const old = el.textContent;
+                                                                            el.textContent = 'Copied✓';
+                                                                            setTimeout(() => { el.textContent = old; }, 2000);
+                                                                        }}
                                                                     >
                                                                         {t('common.copy', 'Copy')}
                                                                     </button>
@@ -709,7 +797,6 @@ function OrgTab({ tenant }: { tenant: any }) {
                                                                 </div>
                                                             </div>
                                                         </div>
-                                                    )}
                                                 </div>
                                             );
                                         })()}
@@ -1432,8 +1519,9 @@ function BroadcastSection() {
     const { t } = useTranslation();
     const [title, setTitle] = useState('');
     const [body, setBody] = useState('');
+    const [sendEmail, setSendEmail] = useState(false);
     const [sending, setSending] = useState(false);
-    const [result, setResult] = useState<{ users: number; agents: number } | null>(null);
+    const [result, setResult] = useState<{ users: number; agents: number; emails: number } | null>(null);
 
     const handleSend = async () => {
         if (!title.trim()) return;
@@ -1444,7 +1532,7 @@ function BroadcastSection() {
             const res = await fetch('/api/notifications/broadcast', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                body: JSON.stringify({ title: title.trim(), body: body.trim() }),
+                body: JSON.stringify({ title: title.trim(), body: body.trim(), send_email: sendEmail }),
             });
             if (!res.ok) {
                 const err = await res.json().catch(() => ({}));
@@ -1453,9 +1541,14 @@ function BroadcastSection() {
                 return;
             }
             const data = await res.json();
-            setResult({ users: data.users_notified, agents: data.agents_notified });
+            setResult({
+                users: data.users_notified,
+                agents: data.agents_notified,
+                emails: data.emails_sent || 0,
+            });
             setTitle('');
             setBody('');
+            setSendEmail(false);
         } catch (e: any) {
             alert(e.message || 'Failed');
         }
@@ -1486,13 +1579,25 @@ function BroadcastSection() {
                     rows={3}
                     style={{ resize: 'vertical', fontSize: '13px', marginBottom: '12px' }}
                 />
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '12px', fontSize: '13px' }}>
+                    <input
+                        type="checkbox"
+                        checked={sendEmail}
+                        onChange={e => setSendEmail(e.target.checked)}
+                    />
+                    <span>{t('enterprise.broadcast.sendEmail', 'Also send email to users with a configured address')}</span>
+                </label>
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                     <button className="btn btn-primary" onClick={handleSend} disabled={sending || !title.trim()}>
                         {sending ? t('common.loading') : t('enterprise.broadcast.send', 'Send Broadcast')}
                     </button>
                     {result && (
                         <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-                            {t('enterprise.broadcast.sent', `Sent to ${result.users} users and ${result.agents} agents`, { users: result.users, agents: result.agents })}
+                            {t(
+                                'enterprise.broadcast.sentWithEmail',
+                                `Sent to ${result.users} users, ${result.agents} agents, and ${result.emails} email recipients`,
+                                { users: result.users, agents: result.agents, emails: result.emails },
+                            )}
                         </span>
                     )}
                 </div>
@@ -2561,25 +2666,46 @@ export default function EnterpriseSettings() {
                                             return (
                                                 <div key={category}>
                                                     {/* Category header */}
-                                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0 14px', marginBottom: '8px' }}>
                                                         <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
                                                             {categoryLabels[category] || category}
                                                         </div>
-                                                        {hasCategoryConfig && (
-                                                            <button
-                                                                onClick={() => {
-                                                                    setConfigCategory(category);
-                                                                    setEditingConfig({});
-                                                                    // Load existing global config from the first tool in this category
-                                                                    const firstToolWithConfig = (catTools as any[]).find((tl: any) => tl.config_schema?.fields?.length > 0);
-                                                                    if (firstToolWithConfig?.config) {
-                                                                        setEditingConfig({ ...firstToolWithConfig.config });
-                                                                    }
-                                                                }}
-                                                                style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }}
-                                                                title={`Configure ${category}`}
-                                                            >Configure</button>
-                                                        )}
+                                                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                                            {hasCategoryConfig && (
+                                                                <button
+                                                                    onClick={() => {
+                                                                        setConfigCategory(category);
+                                                                        setEditingConfig({});
+                                                                        // Load existing global config from the first tool in this category
+                                                                        const firstToolWithConfig = (catTools as any[]).find((tl: any) => tl.config_schema?.fields?.length > 0);
+                                                                        if (firstToolWithConfig?.config) {
+                                                                            setEditingConfig({ ...firstToolWithConfig.config });
+                                                                        }
+                                                                    }}
+                                                                    style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }}
+                                                                    title={`Configure ${category}`}
+                                                                >Configure</button>
+                                                            )}
+                                                            {/* Category Bulk Toggle */}
+                                                            <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }} title={`Enable/Disable all ${categoryLabels[category] || category} tools`}>
+                                                                <input type="checkbox"
+                                                                    checked={(catTools as any[]).every(t => t.enabled)}
+                                                                    onChange={async (e) => {
+                                                                        const targetEnabled = e.target.checked;
+                                                                        try {
+                                                                            const payload = (catTools as any[]).map(t => ({ tool_id: t.id, enabled: targetEnabled }));
+                                                                            await fetchJson('/tools/bulk', { method: 'PUT', body: JSON.stringify(payload) });
+                                                                            loadAllTools();
+                                                                        } catch (err: any) {
+                                                                            alert('Bulk update failed: ' + err.message);
+                                                                        }
+                                                                    }}
+                                                                    style={{ opacity: 0, width: 0, height: 0 }} />
+                                                                <span style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, borderRadius: '22px', background: (catTools as any[]).every(t => t.enabled) ? 'var(--accent-primary)' : 'var(--bg-tertiary)', transition: '0.3s', boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.1)' }}>
+                                                                    <span style={{ position: 'absolute', left: (catTools as any[]).every(t => t.enabled) ? '20px' : '2px', top: '2px', width: '18px', height: '18px', borderRadius: '50%', background: '#fff', transition: '0.3s', boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }} />
+                                                                </span>
+                                                            </label>
+                                                        </div>
                                                     </div>
 
                                                     {/* Tools in this category */}
@@ -2648,7 +2774,7 @@ export default function EnterpriseSettings() {
                                                                                     await fetchJson(`/tools/${tool.id}`, { method: 'PUT', body: JSON.stringify({ enabled: e.target.checked }) });
                                                                                     loadAllTools();
                                                                                 }} style={{ opacity: 0, width: 0, height: 0 }} />
-                                                                                <span style={{ position: 'absolute', inset: 0, background: tool.enabled ? '#22c55e' : 'var(--bg-tertiary)', borderRadius: '11px', transition: 'background 0.2s' }}>
+                                                                                <span style={{ position: 'absolute', inset: 0, background: tool.enabled ? 'var(--accent-primary)' : 'var(--bg-tertiary)', borderRadius: '11px', transition: 'background 0.2s' }}>
                                                                                     <span style={{ position: 'absolute', left: tool.enabled ? '20px' : '2px', top: '2px', width: '18px', height: '18px', background: '#fff', borderRadius: '50%', transition: 'left 0.2s' }} />
                                                                                 </span>
                                                                             </label>
@@ -2656,62 +2782,7 @@ export default function EnterpriseSettings() {
                                                                     </div>
 
                                                                     {/* Inline config editing form (per-tool only) */}
-                                                                    {isEditing && hasOwnConfig && (
-                                                                        <div style={{ borderTop: '1px solid var(--border-color)', padding: '16px', background: 'var(--bg-secondary)' }}>
-                                                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                                                                                {(tool.config_schema.fields || []).map((field: any) => {
-                                                                                    // Check depends_on
-                                                                                    if (field.depends_on) {
-                                                                                        const visible = Object.entries(field.depends_on).every(([k, vals]: [string, any]) =>
-                                                                                            vals.includes(editingConfig[k])
-                                                                                        );
-                                                                                        if (!visible) return null;
-                                                                                    }
-                                                                                    return (
-                                                                                        <div key={field.key}>
-                                                                                            <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>{field.label}</label>
-                                                                                            {field.type === 'select' ? (
-                                                                                                <select className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))}>
-                                                                                                    {(field.options || []).map((opt: any) => (
-                                                                                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
-                                                                                                    ))}
-                                                                                                </select>
-                                                                                            ) : field.type === 'number' ? (
-                                                                                                <input type="number" className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} min={field.min} max={field.max}
-                                                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: Number(e.target.value) }))} />
-                                                                                            ) : field.type === 'password' ? (
-                                                                                                <input type="password" autoComplete="new-password" className="form-input" value={editingConfig[field.key] ?? ''} placeholder={field.placeholder || ''}
-                                                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
-                                                                                            ) : (
-                                                                                                <input type="text" className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} placeholder={field.placeholder || ''}
-                                                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
-                                                                                            )}
-                                                                                        </div>
-                                                                                    );
-                                                                                })}
-                                                                                <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
-                                                                                    <button className="btn btn-primary" onClick={async () => {
-                                                                                        if (tool.name === 'jina_search' || tool.name === 'jina_read') {
-                                                                                            // Save api_key to system_settings (shared by both jina tools)
-                                                                                            if (editingConfig.api_key) {
-                                                                                                const token = localStorage.getItem('token');
-                                                                                                await fetch('/api/enterprise/system-settings/jina_api_key', {
-                                                                                                    method: 'PUT',
-                                                                                                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                                                                                                    body: JSON.stringify({ value: { api_key: editingConfig.api_key } }),
-                                                                                                });
-                                                                                            }
-                                                                                        } else {
-                                                                                            await fetchJson(`/tools/${tool.id}`, { method: 'PUT', body: JSON.stringify({ config: editingConfig }) });
-                                                                                        }
-                                                                                        setEditingToolId(null);
-                                                                                        loadAllTools();
-                                                                                    }}>{t('enterprise.tools.saveConfig')}</button>
-                                                                                    <button className="btn btn-secondary" onClick={() => setEditingToolId(null)}>{t('common.cancel')}</button>
-                                                                                </div>
-                                                                            </div>
-                                                                        </div>
-                                                                    )}
+                                                                    {/* Inline config editing form replaced by global modal */}
                                                                 </div>
                                                             );
                                                         })}
@@ -2719,6 +2790,97 @@ export default function EnterpriseSettings() {
                                                 </div>
                                             );
                                         })}
+                                    </div>
+                                );
+                            })()}
+
+                            {/* Per-Tool Config Modal */}
+                            {editingToolId && (() => {
+                                const tool = allTools.find(t => t.id === editingToolId);
+                                if (!tool) return null;
+                                return (
+                                    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.55)', zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                                        onClick={() => setEditingToolId(null)}>
+                                        <div onClick={e => e.stopPropagation()} style={{ background: 'var(--bg-primary)', borderRadius: '12px', padding: '24px', width: '480px', maxWidth: '95vw', maxHeight: '80vh', overflow: 'auto', boxShadow: '0 20px 60px rgba(0,0,0,0.4)' }}>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                                                <div>
+                                                    <h3 style={{ margin: 0 }}>⚙️ {tool.display_name}</h3>
+                                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>Global configuration used by all agents</div>
+                                                </div>
+                                                <button onClick={() => setEditingToolId(null)} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)' }}>✕</button>
+                                            </div>
+                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                                                {(tool.config_schema.fields || []).map((field: any) => {
+                                                    // Check depends_on
+                                                    if (field.depends_on) {
+                                                        const visible = Object.entries(field.depends_on).every(([k, vals]: [string, any]) =>
+                                                            vals.includes(editingConfig[k])
+                                                        );
+                                                        if (!visible) return null;
+                                                    }
+                                                    return (
+                                                        <div key={field.key}>
+                                                            <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>{field.label}</label>
+                                                            {field.type === 'checkbox' ? (
+                                                                <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer' }}>
+                                                                    <input
+                                                                        type="checkbox"
+                                                                        checked={editingConfig[field.key] ?? field.default ?? false}
+                                                                        onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.checked }))}
+                                                                        style={{ opacity: 0, width: 0, height: 0 }}
+                                                                    />
+                                                                    <span style={{
+                                                                        position: 'absolute', inset: 0,
+                                                                        background: (editingConfig[field.key] ?? field.default) ? 'var(--accent-primary)' : 'var(--bg-tertiary)',
+                                                                        borderRadius: '11px', transition: 'background 0.2s',
+                                                                    }}>
+                                                                        <span style={{
+                                                                            position: 'absolute', left: (editingConfig[field.key] ?? field.default) ? '20px' : '2px', top: '2px',
+                                                                            width: '18px', height: '18px', background: '#fff',
+                                                                            borderRadius: '50%', transition: 'left 0.2s',
+                                                                        }} />
+                                                                    </span>
+                                                                </label>
+                                                            ) : field.type === 'select' ? (
+                                                                <select className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))}>
+                                                                    {(field.options || []).map((opt: any) => (
+                                                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                                                    ))}
+                                                                </select>
+                                                            ) : field.type === 'number' ? (
+                                                                <input type="number" className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} min={field.min} max={field.max}
+                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: Number(e.target.value) }))} />
+                                                            ) : field.type === 'password' ? (
+                                                                <input type="password" autoComplete="new-password" className="form-input" value={editingConfig[field.key] ?? ''} placeholder={field.placeholder || ''}
+                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                            ) : (
+                                                                <input type="text" className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} placeholder={field.placeholder || ''}
+                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
+                                                <div style={{ display: 'flex', gap: '8px', marginTop: '12px', justifyContent: 'flex-end', borderTop: '1px solid var(--border-subtle)', paddingTop: '16px' }}>
+                                                    <button className="btn btn-secondary" onClick={() => setEditingToolId(null)}>{t('common.cancel')}</button>
+                                                    <button className="btn btn-primary" onClick={async () => {
+                                                        if (tool.name === 'jina_search' || tool.name === 'jina_read') {
+                                                            if (editingConfig.api_key) {
+                                                                const token = localStorage.getItem('token');
+                                                                await fetch('/api/enterprise/system-settings/jina_api_key', {
+                                                                    method: 'PUT',
+                                                                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                                                                    body: JSON.stringify({ value: { api_key: editingConfig.api_key } }),
+                                                                });
+                                                            }
+                                                        } else {
+                                                            await fetchJson(`/tools/${tool.id}`, { method: 'PUT', body: JSON.stringify({ config: editingConfig }) });
+                                                        }
+                                                        setEditingToolId(null);
+                                                        loadAllTools();
+                                                    }}>{t('enterprise.tools.saveConfig')}</button>
+                                                </div>
+                                            </div>
+                                        </div>
                                     </div>
                                 );
                             })()}

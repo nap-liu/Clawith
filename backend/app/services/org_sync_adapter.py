@@ -310,7 +310,7 @@ class BaseOrgSyncAdapter(ABC):
             query = query.where(IdentityProvider.tenant_id.is_(None))
             
         result = await db.execute(query)
-        provider = result.scalar_one_or_none()
+        provider = result.scalars().first()
 
         if not provider:
             provider = IdentityProvider(
@@ -337,7 +337,7 @@ class BaseOrgSyncAdapter(ABC):
                 OrgDepartment.provider_id == provider.id,
             )
         )
-        existing = result.scalar_one_or_none()
+        existing = result.scalars().first()
 
         now = datetime.now()
         path = f"{dept.parent_external_id}/{dept.name}" if dept.parent_external_id else dept.name
@@ -351,7 +351,7 @@ class BaseOrgSyncAdapter(ABC):
                     OrgDepartment.provider_id == provider.id,
                 )
             )
-            parent_dept = parent_result.scalar_one_or_none()
+            parent_dept = parent_result.scalars().first()
             if parent_dept:
                 parent_id = parent_dept.id
 
@@ -402,7 +402,7 @@ class BaseOrgSyncAdapter(ABC):
                         OrgDepartment.provider_id == provider.id,
                     )
                 )
-                department = dept_result.scalar_one_or_none()
+                department = dept_result.scalars().first()
                 if department:
                     break
         # Fallback: use the department_external_id that was set during fetch_users
@@ -413,7 +413,7 @@ class BaseOrgSyncAdapter(ABC):
                     OrgDepartment.provider_id == provider.id,
                 )
             )
-            department = dept_result.scalar_one_or_none()
+            department = dept_result.scalars().first()
 
         # Check if exists by external_id and provider
         result = await db.execute(
@@ -422,7 +422,7 @@ class BaseOrgSyncAdapter(ABC):
                 OrgMember.provider_id == provider.id,
             )
         )
-        existing_member = result.scalar_one_or_none()
+        existing_member = result.scalars().first()
 
         now = datetime.now()
 
@@ -440,7 +440,7 @@ class BaseOrgSyncAdapter(ABC):
             if self.tenant_id:
                 user_query = user_query.where(User.tenant_id == self.tenant_id)
             user_res = await db.execute(user_query)
-            platform_user = user_res.scalar_one_or_none()
+            platform_user = user_res.scalars().first()
             if platform_user:
                 user_id = platform_user.id
 
@@ -449,7 +449,7 @@ class BaseOrgSyncAdapter(ABC):
             if self.tenant_id:
                 user_query = user_query.where(User.tenant_id == self.tenant_id)
             user_res = await db.execute(user_query)
-            platform_user = user_res.scalar_one_or_none()
+            platform_user = user_res.scalars().first()
             if platform_user:
                 user_id = platform_user.id
 
@@ -510,7 +510,7 @@ class BaseOrgSyncAdapter(ABC):
         if not target_user and (user_id or (existing_member and existing_member.user_id)):
             target_id = user_id or existing_member.user_id
             user_res = await db.execute(select(User).where(User.id == target_id))
-            target_user = user_res.scalar_one_or_none()
+            target_user = user_res.scalars().first()
 
         if target_user:
             if email and target_user.email != email:
@@ -529,7 +529,7 @@ class BaseOrgSyncAdapter(ABC):
             result = await db.execute(
                 select(User).where(User.email.ilike(email))
             )
-            u = result.scalar_one_or_none()
+            u = result.scalars().first()
             if u: return u
 
         # 2. Try by mobile matching
@@ -538,7 +538,7 @@ class BaseOrgSyncAdapter(ABC):
             result = await db.execute(
                 select(User).where(User.primary_mobile == mobile)
             )
-            u = result.scalar_one_or_none()
+            u = result.scalars().first()
             if u: return u
 
         return None
@@ -648,7 +648,12 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
         return all_depts
 
     async def fetch_users(self, department_external_id: str) -> list[ExternalUser]:
-        """Fetch users in a department."""
+        """Fetch users in a department.
+        
+        Uses user_id_type=user_id which requires the contact:user.employee_id:readonly
+        permission. If the Feishu API returns an error due to missing permission, raises
+        a clear error instructing the user to add the required scope.
+        """
         token = await self.get_access_token()
         users: list[ExternalUser] = []
         page_token = ""
@@ -658,7 +663,7 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                 params = {
                     "department_id": department_external_id,
                     "department_id_type": "open_department_id",
-                    "user_id_type": "user_id", # Return stable user_ids for mapping
+                    "user_id_type": "user_id",  # Requires contact:user.employee_id:readonly
                     "page_size": "50",
                 }
                 if page_token:
@@ -672,18 +677,38 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                 data = resp.json()
 
                 if data.get("code") != 0:
-                    logger.error(f"Feishu fetch users error for dept {department_external_id}: {data}")
-                    break
+                    error_code = data.get("code")
+                    error_msg = data.get("msg", "")
+                    logger.error(
+                        f"Feishu fetch users error for dept {department_external_id}: "
+                        f"code={error_code}, msg={error_msg}"
+                    )
+                    # Raise a user-friendly error for permission issues
+                    raise RuntimeError(
+                        f"Feishu API error (code {error_code}): {error_msg}. "
+                        f"Please ensure the Feishu app has the 'contact:user.employee_id:readonly' "
+                        f"permission enabled. Go to Feishu Open Platform -> App -> Permissions -> "
+                        f"search 'employee_id' -> enable and publish a new version."
+                    )
 
                 res_data = data.get("data", {})
                 items = res_data.get("items", []) or []
                 for item in items:
-                    # Collect all departments the user belongs to for better mapping resolution
+                    # Collect all departments the user belongs to
                     raw_dept_ids = item.get("department_ids", [])
                     department_ids = [str(did) for did in raw_dept_ids] if raw_dept_ids else [department_external_id]
                     
+                    external_id = item.get("user_id", "") or item.get("open_id", "")
+                    
+                    # For Feishu, a user is considered inactive if they are explicitly frozen or resigned.
+                    # Merely not being activated (is_activated=False) shouldn't hide them from the org chart.
+                    feishu_status = item.get("status", {})
+                    is_frozen = feishu_status.get("is_frozen", False)
+                    is_resigned = feishu_status.get("is_resigned", False)
+                    member_status = "inactive" if (is_frozen or is_resigned) else "active"
+
                     user = ExternalUser(
-                        external_id=item.get("user_id", "") or item.get("open_id", ""), 
+                        external_id=external_id,
                         open_id=item.get("open_id", ""),
                         unionid=item.get("union_id", ""),
                         name=item.get("name", ""),
@@ -693,7 +718,7 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                         department_external_id=department_external_id,
                         department_ids=department_ids,
                         mobile=item.get("mobile", ""),
-                        status="active" if item.get("status", {}).get("is_activated") else "inactive",
+                        status=member_status,
                         raw_data=item,
                     )
                     users.append(user)

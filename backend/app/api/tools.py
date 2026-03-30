@@ -126,22 +126,15 @@ async def list_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """List platform tools scoped by tenant (builtin + tenant-specific)."""
-    from sqlalchemy import or_ as _or, and_ as _and
-    # Exclude tools that were installed by agents via import_mcp_server
-    agent_installed_tids = select(AgentTool.tool_id).where(AgentTool.source == "user_installed")
-    # Also exclude orphaned MCP tools (no AgentTool records, no tenant_id)
-    # These can appear when admin deletes agent-tool assignments but Tool records remain
-    all_assigned_tids = select(AgentTool.tool_id).distinct()
-    orphaned_mcp = _and(Tool.type == "mcp", Tool.tenant_id == None, ~Tool.id.in_(all_assigned_tids))
     query = (
         select(Tool)
-        .where(~Tool.id.in_(agent_installed_tids))
-        .where(~orphaned_mcp)
+        .where(Tool.source.in_(["builtin", "admin"]))
         .order_by(Tool.category, Tool.name)
     )
     # Scope by tenant: show builtin (tenant_id is NULL) + tenant-specific tools
     tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
     if tid:
+        from sqlalchemy import or_ as _or
         query = query.where(_or(Tool.tenant_id == None, Tool.tenant_id == uuid.UUID(tid)))
     result = await db.execute(query)
     tools = result.scalars().all()
@@ -189,10 +182,10 @@ async def create_tool(
         icon=data.icon,
         parameters_schema=data.parameters_schema,
         mcp_server_url=data.mcp_server_url,
-        mcp_server_name=data.mcp_server_name,
         mcp_tool_name=data.mcp_tool_name,
         is_default=data.is_default,
         tenant_id=current_user.tenant_id,
+        source="admin",
     )
     db.add(tool)
     await db.commit()
@@ -220,6 +213,29 @@ async def update_tool(
 
     for field, value in update_data.items():
         setattr(tool, field, value)
+    await db.commit()
+    return {"ok": True}
+
+
+class BulkToolUpdateItem(BaseModel):
+    tool_id: str
+    enabled: bool
+
+@router.put("/bulk")
+async def update_tools_bulk(
+    updates: list[BulkToolUpdateItem],
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bulk update the enabled status of multiple tools."""
+    tool_ids = [uuid.UUID(u.tool_id) for u in updates]
+    result = await db.execute(select(Tool).where(Tool.id.in_(tool_ids)))
+    tools_map = {str(t.id): t for t in result.scalars().all()}
+    
+    for update in updates:
+        if update.tool_id in tools_map:
+            tools_map[update.tool_id].enabled = update.enabled
+            
     await db.commit()
     return {"ok": True}
 
@@ -270,11 +286,10 @@ async def get_agent_tools(
             continue
         tid = str(t.id)
         at = assignments.get(tid)
-        # MCP tools installed by agents (no tenant_id) only show for that agent.
-        # MCP tools imported by admin in company settings (tenant_id set) show for all agents (default disabled).
-        if t.type == "mcp" and not at:
-            if not t.tenant_id:
-                continue
+        # MCP tools installed by agents only show for that agent.
+        # MCP admin tools show for all agents (default disabled).
+        if t.source == "agent" and not at:
+            continue
         # If no explicit assignment, use is_default
         enabled = at.enabled if at else t.is_default
         result.append({
@@ -490,11 +505,10 @@ async def get_agent_tools_with_config(
             continue
         tid = str(t.id)
         at = assignments.get(tid)
-        # MCP tools installed by agents (no tenant_id) only show for that agent.
-        # MCP tools imported by admin in company settings (tenant_id set) show for all agents (default disabled).
-        if t.type == "mcp" and not at:
-            if not t.tenant_id:
-                continue
+        # MCP tools installed by agents only show for that agent.
+        # MCP admin tools show for all agents (default disabled).
+        if t.source == "agent" and not at:
+            continue
         enabled = at.enabled if at else t.is_default
         result.append({
             "id": tid,
@@ -511,7 +525,7 @@ async def get_agent_tools_with_config(
             "config_schema": t.config_schema or {},
             "global_config": t.config or {},
             "agent_config": (at.config if at else {}) or {},
-            "source": at.source if at else "system",
+            "source": t.source,
         })
     return result
 

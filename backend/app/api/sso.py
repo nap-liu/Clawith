@@ -97,8 +97,17 @@ async def get_sso_config(sid: uuid.UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(query)
     providers = result.scalars().all()
     
-    # Base URL for callbacks (adjust to your platform's public address)
+    # Determine the base URL for OAuth callbacks:
+    # If the tenant has an sso_domain configured, use it (e.g. https://default.clawith.ai)
+    # Otherwise, fall back to PUBLIC_BASE_URL env var
     public_base = os.environ.get("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+    if session.tenant_id:
+        from app.models.tenant import Tenant
+        tenant_result = await db.execute(select(Tenant).where(Tenant.id == session.tenant_id))
+        tenant_obj = tenant_result.scalar_one_or_none()
+        if tenant_obj and tenant_obj.sso_domain:
+            # Use the tenant's SSO domain as the callback base URL
+            public_base = f"https://{tenant_obj.sso_domain}"
     
     auth_urls = []
     for p in providers:

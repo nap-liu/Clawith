@@ -50,7 +50,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
     const [configData, setConfigData] = useState<Record<string, any>>({});
     const [configJson, setConfigJson] = useState('');
     const [configSaving, setConfigSaving] = useState(false);
-    const [toolTab, setToolTab] = useState<'platform' | 'installed'>('platform');
+    const [toolTab, setToolTab] = useState<'company' | 'installed'>('company');
     const [deletingToolId, setDeletingToolId] = useState<string | null>(null);
     const [configCategory, setConfigCategory] = useState<string | null>(null);
 
@@ -154,9 +154,9 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
 
     if (loading) return <div style={{ color: 'var(--text-tertiary)', padding: '20px' }}>{t('common.loading')}</div>;
 
-    // Split by source first, then group by category
-    const systemTools = tools.filter(t => t.source !== 'user_installed');
-    const agentInstalledTools = tools.filter(t => t.source === 'user_installed');
+    // Company tools = platform presets (builtin) + company admin-added tools (admin)
+    const companyTools = tools.filter(t => t.source === 'builtin' || t.source === 'admin');
+    const agentInstalledTools = tools.filter(t => t.source === 'agent');
 
     const groupByCategory = (toolList: any[]) =>
         toolList.reduce((acc: Record<string, any[]>, t) => {
@@ -168,17 +168,48 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
     const renderToolGroup = (groupedTools: Record<string, any[]>) =>
         Object.entries(groupedTools).map(([category, catTools]) => (
             <div key={category}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0 14px', marginBottom: '8px' }}>
                     <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
                         {getCategoryLabels(t)[category] || category}
                     </div>
-                    {CATEGORY_CONFIG_SCHEMAS[category] && canManage && (
-                        <button
-                            onClick={() => openCategoryConfig(category)}
-                            style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }}
-                            title={`Configure ${category}`}
-                        ><Settings size={14} style={{display:'inline',verticalAlign:'middle',marginRight:'4px'}} />Config</button>
-                    )}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {CATEGORY_CONFIG_SCHEMAS[category] && canManage && (
+                            <button
+                                onClick={() => openCategoryConfig(category)}
+                                style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }}
+                                title={`Configure ${category}`}
+                            ><Settings size={14} style={{display:"inline",verticalAlign:"middle",marginRight:"4px"}} />Config</button>
+                        )}
+                        {canManage && (
+                            <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }} title={`Enable/Disable all ${getCategoryLabels(t)[category] || category} tools`}>
+                                <input type="checkbox"
+                                    checked={(catTools as any[]).every(t => t.enabled)}
+                                    onChange={async (e) => {
+                                        const targetEnabled = e.target.checked;
+                                        // Optimistic fast update
+                                        const catToolIds = new Set((catTools as any[]).map(t => t.id));
+                                        setTools(prev => prev.map(t => catToolIds.has(t.id) ? { ...t, enabled: targetEnabled } : t));
+                                        try {
+                                            const token = localStorage.getItem('token');
+                                            const payload = Array.from(catToolIds).map(id => ({ tool_id: id, enabled: targetEnabled }));
+                                            await fetch(`/api/tools/agents/${agentId}`, {
+                                                method: 'PUT',
+                                                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                                                body: JSON.stringify(payload),
+                                            });
+                                        } catch (err: any) {
+                                            console.error('Bulk update failed', err);
+                                            loadTools();
+                                        }
+                                    }}
+                                    style={{ opacity: 0, width: 0, height: 0 }} />
+                                <span style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, borderRadius: '22px', background: (catTools as any[]).every(t => t.enabled) ? 'var(--accent-primary)' : 'var(--bg-tertiary)', transition: '0.3s', boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.1)' }}>
+                                    <span style={{ position: 'absolute', left: (catTools as any[]).every(t => t.enabled) ? '20px' : '2px', top: '2px', width: '18px', height: '18px', borderRadius: '50%', background: '#fff', transition: '0.3s', boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }} />
+                                </span>
+                            </label>
+                        )}
+                    </div>
+
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                     {(catTools as any[]).map((tool: any) => {
@@ -216,7 +247,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                             title="Configure per-agent settings"
                                         ><Settings size={14} style={{display:'inline',verticalAlign:'middle',marginRight:'4px'}} />Config</button>
                                     )}
-                                    {canManage && tool.source === 'user_installed' && tool.agent_tool_id && (
+                                    {canManage && tool.source === 'agent' && tool.agent_tool_id && (
                                         <button
                                             onClick={async () => {
                                                 if (!confirm(t('agent.tools.confirmDelete', `Remove "${tool.display_name}" from this agent?`))) return;
@@ -247,7 +278,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                             />
                                             <span style={{
                                                 position: 'absolute', inset: 0,
-                                                background: tool.enabled ? '#22c55e' : 'var(--bg-tertiary)',
+                                                background: tool.enabled ? 'var(--accent-primary)' : 'var(--bg-tertiary)',
                                                 borderRadius: '11px', transition: 'background 0.2s',
                                             }}>
                                                 <span style={{
@@ -270,24 +301,23 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
             </div>
         ));
 
-    const activeTools = toolTab === 'platform' ? systemTools : agentInstalledTools;
+    const activeTools = toolTab === 'company' ? companyTools : agentInstalledTools;
 
     return (
         <>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                {/* Tab Bar */}
-                <div style={{ display: 'flex', gap: '2px', background: 'var(--bg-tertiary)', borderRadius: '8px', padding: '3px' }}>
+                <div style={{ display: 'flex', gap: '4px', padding: '4px', background: 'var(--bg-secondary)', borderRadius: '8px', marginBottom: '12px' }}>
                     <button
-                        onClick={() => setToolTab('platform')}
+                        onClick={() => setToolTab('company')}
                         style={{
                             flex: 1, padding: '7px 12px', border: 'none', borderRadius: '6px', cursor: 'pointer',
                             fontSize: '12px', fontWeight: 600, transition: 'all 0.2s',
-                            background: toolTab === 'platform' ? 'var(--bg-primary)' : 'transparent',
-                            color: toolTab === 'platform' ? 'var(--text-primary)' : 'var(--text-tertiary)',
-                            boxShadow: toolTab === 'platform' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
+                            background: toolTab === 'company' ? 'var(--bg-primary)' : 'transparent',
+                            color: toolTab === 'company' ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                            boxShadow: toolTab === 'company' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
                         }}
                     >
-                        <Wrench size={14} style={{display:'inline',verticalAlign:'middle',marginRight:'4px'}} />{t('agent.tools.platformTools', 'Platform Tools')} ({systemTools.length})
+                        <Wrench size={14} style={{display:'inline',verticalAlign:'middle',marginRight:'4px'}} />{t('agent.tools.companyTools', 'Company Tools')} ({companyTools.length})
                     </button>
                     <button
                         onClick={() => setToolTab('installed')}
@@ -299,7 +329,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                             boxShadow: toolTab === 'installed' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
                         }}
                     >
-                        <Bot size={14} style={{display:'inline',verticalAlign:'middle',marginRight:'4px'}} />{t('agent.tools.agentInstalled', 'Agent-Installed Tools')} ({agentInstalledTools.length})
+                        <Bot size={14} style={{display:'inline',verticalAlign:'middle',marginRight:'4px'}} />{t('agent.tools.agentInstalled', 'Agent Self-Installed Tools')} ({agentInstalledTools.length})
                     </button>
                 </div>
 
@@ -308,7 +338,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                     renderToolGroup(groupByCategory(activeTools))
                 ) : (
                     <div className="card" style={{ textAlign: 'center', padding: '30px', color: 'var(--text-tertiary)' }}>
-                        {toolTab === 'installed' ? t('agent.tools.noInstalled', 'No agent-installed tools yet') : t('common.noData')}
+                        {toolTab === 'installed' ? t('agent.tools.noInstalled', 'No agent-installed tools yet') : t('agent.tools.noCompany', 'No company-configured tools')}
                     </div>
                 )}
             </div>

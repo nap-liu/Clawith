@@ -86,7 +86,7 @@ class FeishuService:
         provider_query = select(IdentityProvider).where(IdentityProvider.provider_type == "feishu")
         provider_query = provider_query.where(IdentityProvider.tenant_id == tenant_id)
         provider_result = await db.execute(provider_query)
-        provider = provider_result.scalar_one_or_none()
+        provider = provider_result.scalars().first()
         if not provider:
             provider = IdentityProvider(
                 provider_type="feishu",
@@ -109,7 +109,7 @@ class FeishuService:
                     OrgMember.status == "active",
                 )
             )
-            member = member_r.scalar_one_or_none()
+            member = member_r.scalars().first()
         if not member and user_id:
             member_r = await db.execute(
                 select(OrgMember).where(
@@ -118,13 +118,13 @@ class FeishuService:
                     OrgMember.status == "active",
                 )
             )
-            member = member_r.scalar_one_or_none()
+            member = member_r.scalars().first()
 
         # 2. Resolve User from OrgMember
         user = None
         if member and member.user_id:
             u_result = await db.execute(select(User).where(User.id == member.user_id))
-            user = u_result.scalar_one_or_none()
+            user = u_result.scalars().first()
 
         # 3. Fallback: find by email or primary_mobile (new generic fields)
         if not user and fs_email:
@@ -132,7 +132,7 @@ class FeishuService:
             if tenant_id:
                 query = query.where(User.tenant_id == tenant_id)
             result = await db.execute(query)
-            user = result.scalar_one_or_none()
+            user = result.scalars().first()
 
         if user:
             # Existing user — sync latest profile from Feishu
@@ -156,7 +156,7 @@ class FeishuService:
 
             # Ensure unique username
             existing_r = await db.execute(select(User).where(User.username == username))
-            if existing_r.scalar_one_or_none():
+            if existing_r.scalars().first():
                 username = f"{username}_{open_id[:6]}"
 
             user = User(

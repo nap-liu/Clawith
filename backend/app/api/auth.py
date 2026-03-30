@@ -1,8 +1,8 @@
 """Authentication API routes."""
 
-import uuid
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException,Query, status
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,6 +11,8 @@ from app.core.security import create_access_token, get_current_user, hash_passwo
 from app.database import get_db
 from app.models.user import User
 from app.schemas.schemas import (
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
     IdentityBindRequest,
     IdentityUnbindRequest,
     OAuthAuthorizeResponse,
@@ -209,7 +211,11 @@ async def register(data: UserRegister, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=TokenResponse)
 async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
-    """Login with username and password."""
+    """Login with username and password.
+    
+    When tenant_id is provided (e.g., from a company-specific SSO domain),
+    non-platform_admin users must belong to that tenant.
+    """
     result = await db.execute(
         select(User)
         .where(User.username == data.username)
@@ -233,6 +239,15 @@ async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
                 detail="Your company has been disabled. Please contact the platform administrator.",
             )
 
+    # Tenant-scoped login: when accessing from a company-specific domain,
+    # only allow users who belong to that company (platform_admin exempt)
+    if data.tenant_id and user.role != "platform_admin":
+        if str(user.tenant_id) != str(data.tenant_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This account does not belong to this organization.",
+            )
+
     needs_setup = user.tenant_id is None
     token = create_access_token(str(user.id), user.role)
     return TokenResponse(
@@ -240,6 +255,79 @@ async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
         user=UserOut.model_validate(user),
         needs_company_setup=needs_setup,
     )
+
+
+@router.post("/forgot-password")
+async def forgot_password(
+    data: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Request a password reset link without revealing account existence."""
+    from app.config import get_settings
+    settings = get_settings()
+
+    if not settings.SYSTEM_SMTP_HOST or not settings.SYSTEM_EMAIL_FROM_ADDRESS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password reset is currently unavailable (no mail server configured)."
+        )
+
+    generic_response = {
+        "ok": True,
+        "message": "If an account with that email exists, a password reset email has been sent.",
+    }
+
+    result = await db.execute(select(User).where(User.email == data.email))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        return generic_response
+
+    try:
+        from app.services.password_reset_service import build_password_reset_url, create_password_reset_token
+        from app.services.system_email_service import (
+            get_system_email_config,
+            run_background_email_job,
+            send_password_reset_email,
+        )
+
+        get_system_email_config()
+        raw_token, expires_at = await create_password_reset_token(user.id)
+
+        reset_url = await build_password_reset_url(db, raw_token)
+        expiry_minutes = int((expires_at - datetime.now(timezone.utc)).total_seconds() // 60)
+        background_tasks.add_task(
+            run_background_email_job,
+            send_password_reset_email,
+            user.email,
+            user.display_name or user.username,
+            reset_url,
+            expiry_minutes,
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to process password reset email for {data.email}: {exc}")
+
+    return generic_response
+
+
+@router.post("/reset-password")
+async def reset_password(data: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    """Reset a password using a valid single-use token."""
+    from app.services.password_reset_service import consume_password_reset_token
+
+    token = await consume_password_reset_token(data.token)
+    if not token:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    user_id = token["user_id"]
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    user.password_hash = hash_password(data.new_password)
+    await db.flush()
+    return {"ok": True}
 
 
 @router.get("/me", response_model=UserOut)

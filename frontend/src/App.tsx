@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react';
 import { authApi } from './services/api';
 import { X } from 'lucide-react';
 import Login from './pages/Login';
+import ForgotPassword from './pages/ForgotPassword';
+import ResetPassword from './pages/ResetPassword';
 import CompanySetup from './pages/CompanySetup';
 import Layout from './pages/Layout';
 import Dashboard from './pages/Dashboard';
@@ -106,6 +108,8 @@ export default function App() {
             <NotificationBar />
             <Routes>
                 <Route path="/login" element={<Login />} />
+                <Route path="/forgot-password" element={<ForgotPassword />} />
+                <Route path="/reset-password" element={<ResetPassword />} />
                 <Route path="/sso/entry" element={<SSOEntry />} />
                 <Route path="/setup-company" element={<CompanySetup />} />
                 <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>

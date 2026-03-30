@@ -455,7 +455,7 @@ BUILTIN_TOOLS = [
             "api_url": "",
             "cpu_limit": "0.5",
             "memory_limit": "256m",
-            "allow_network": False,
+            "allow_network": True,
             "default_timeout": 30,
             "max_timeout": 60,
         },
@@ -497,7 +497,7 @@ BUILTIN_TOOLS = [
                     "key": "allow_network",
                     "label": "Allow Network Access",
                     "type": "checkbox",
-                    "default": False,
+                    "default": True,
                     "depends_on": {"sandbox_type": ["subprocess"]},
                     "read_only_for_roles": ["agent_admin", "member"],
                 },
@@ -1428,9 +1428,9 @@ async def seed_builtin_tools():
                     category=t["category"],
                     icon=t["icon"],
                     is_default=t["is_default"],
-                    parameters_schema=t["parameters_schema"],
                     config=t.get("config", {}),
                     config_schema=t.get("config_schema", {}),
+                    source="builtin",
                 )
                 db.add(tool)
                 await db.flush()  # get tool.id
@@ -1593,6 +1593,7 @@ async def seed_atlassian_rovo_config():
                 config_schema=t["config_schema"],
                 mcp_server_url=ATLASSIAN_ROVO_MCP_URL,
                 mcp_server_name="Atlassian Rovo",
+                source="admin",
             )
             db.add(tool)
             await db.commit()
