@@ -26,30 +26,9 @@ _corp_token_cache: dict[str, tuple[str, float]] = {}  # {app_key: (token, expire
 
 
 async def _get_corp_access_token(app_key: str, app_secret: str) -> str | None:
-    """Get corp access_token with in-memory cache (2h validity, refresh 5min early)."""
-    import httpx
-
-    cached = _corp_token_cache.get(app_key)
-    if cached and cached[1] > _time.time():
-        return cached[0]
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://oapi.dingtalk.com/gettoken",
-                params={"appkey": app_key, "appsecret": app_secret},
-            )
-            data = resp.json()
-            token = data.get("access_token")
-            expires_in = data.get("expires_in", 7200)
-            if not token:
-                logger.warning(f"[DingTalk] Failed to get corp access_token: {data}")
-                return None
-            _corp_token_cache[app_key] = (token, _time.time() + expires_in - 300)
-            return token
-    except Exception as e:
-        logger.warning(f"[DingTalk] _get_corp_access_token error: {e}")
-        return None
+    """Get corp access_token via global DingTalkTokenManager (shared with stream/reaction)."""
+    from app.services.dingtalk_token import dingtalk_token_manager
+    return await dingtalk_token_manager.get_token(app_key, app_secret)
 
 
 async def _get_dingtalk_user_detail(
