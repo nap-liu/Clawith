@@ -508,10 +508,9 @@ class OAuth2AuthProvider(BaseAuthProvider):
             resp = await client.post(
                 self.token_url,
                 headers={
-                    "Content-Type": "application/json",
                     "Authorization": f"Basic {credentials}",
                 },
-                json={
+                data={
                     "grant_type": "authorization_code",
                     "code": code,
                 },
