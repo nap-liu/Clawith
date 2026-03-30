@@ -471,6 +471,88 @@ class WeComAuthProvider(BaseAuthProvider):
         )
 
 
+
+class OAuth2AuthProvider(BaseAuthProvider):
+    """Generic OAuth2 provider implementation (RFC 6749 Authorization Code flow)."""
+
+    provider_type = "oauth2"
+
+    def __init__(self, provider=None, config=None):
+        super().__init__(provider, config)
+        self.client_id = self.config.get("client_id") or self.config.get("app_id", "")
+        self.client_secret = self.config.get("client_secret") or self.config.get("app_secret", "")
+        self.authorize_url = self.config.get("authorize_url", "")
+        self.scope = self.config.get("scope", "")
+        
+        # 自动推导 token_url 和 user_info_url（如果为空）
+        base = self.authorize_url.rsplit("/", 1)[0] if self.authorize_url else ""
+        self.token_url = self.config.get("token_url") or f"{base}/token"
+        self.user_info_url = self.config.get("user_info_url") or f"{base}/userinfo"
+
+    async def get_authorization_url(self, redirect_uri: str, state: str) -> str:
+        from urllib.parse import quote
+        params = (
+            f"response_type=code"
+            f"&client_id={quote(self.client_id)}"
+            f"&redirect_uri={quote(redirect_uri)}"
+            f"&scope={quote(self.scope)}"
+            f"&state={state}"
+        )
+        return f"{self.authorize_url}?{params}"
+
+    async def exchange_code_for_token(self, code: str) -> dict:
+        import base64
+        credentials = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                self.token_url,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Basic {credentials}",
+                },
+                json={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                },
+            )
+            if resp.status_code != 200:
+                logger.error(f"OAuth2 token exchange failed (HTTP {resp.status_code}): {resp.text}")
+                return {}
+            return resp.json()
+
+    async def get_user_info(self, access_token: str) -> ExternalUserInfo:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                self.user_info_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            resp_data = resp.json()
+            
+            # 爷爷茶格式: {"status": 0, "data": {...}}
+            # 标准 OIDC 格式: 直接返回 flat object
+            if "data" in resp_data and isinstance(resp_data["data"], dict):
+                info = resp_data["data"]
+            else:
+                info = resp_data
+            
+            logger.info(f"OAuth2 user info: {info}")
+            
+            # 映射字段（兼容标准 OIDC 和爷爷茶格式）
+            user_id = info.get("userId") or info.get("sub") or info.get("id") or ""
+            name = info.get("userName") or info.get("name") or info.get("preferred_username") or ""
+            email = info.get("email") or ""
+            mobile = info.get("mobile") or info.get("phone_number") or ""
+            
+            return ExternalUserInfo(
+                provider_type=self.provider_type,
+                provider_user_id=str(user_id),
+                name=name,
+                email=email,
+                mobile=mobile,
+                raw_data=info,
+            )
+
 class MicrosoftTeamsAuthProvider(BaseAuthProvider):
     """Microsoft Teams OAuth provider implementation."""
 
@@ -492,5 +574,6 @@ PROVIDER_CLASSES = {
     "feishu": FeishuAuthProvider,
     "dingtalk": DingTalkAuthProvider,
     "wecom": WeComAuthProvider,
+    "oauth2": OAuth2AuthProvider,
     "microsoft_teams": MicrosoftTeamsAuthProvider,
 }

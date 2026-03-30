@@ -138,6 +138,7 @@ export default function Login() {
         feishu: { label: 'Feishu', icon: '/feishu.png' },
         dingtalk: { label: 'DingTalk', icon: '/dingtalk.png' },
         wecom: { label: 'WeCom', icon: '/wecom.png' },
+        oauth2: { label: 'SSO', icon: '' },
     };
 
     return (

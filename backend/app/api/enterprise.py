@@ -784,12 +784,18 @@ async def create_oauth2_provider(
         provider_type="oauth2",
         name=data.name,
         is_active=data.is_active,
+        sso_login_enabled=True,
         config=config,
         tenant_id=tid
     )
     db.add(provider)
     await db.commit()
     await db.refresh(provider)
+
+    # 同步 tenant SSO 状态
+    if provider.tenant_id:
+        await _sync_tenant_sso_state(db, provider.tenant_id)
+
     return IdentityProviderOut.model_validate(provider)
 
 

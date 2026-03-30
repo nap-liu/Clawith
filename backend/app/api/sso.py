@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from loguru import logger
 from app.models.identity import SSOScanSession, IdentityProvider
 from app.schemas.schemas import TokenResponse, UserOut
 
@@ -136,5 +137,94 @@ async def get_sso_config(sid: uuid.UUID, db: AsyncSession = Depends(get_db)):
                 url = f"https://open.work.weixin.qq.com/wwopen/sso/qrConnect?appid={corp_id}&agentid={agent_id}&redirect_uri={quote(redir)}&state={sid}"
                 auth_urls.append({"provider_type": "wecom", "name": p.name, "url": url})
 
+        elif p.provider_type == "oauth2":
+            from app.services.auth_registry import auth_provider_registry
+            auth_provider = await auth_provider_registry.get_provider(
+                db, "oauth2", str(session.tenant_id) if session.tenant_id else None
+            )
+            if auth_provider:
+                redir = f"{public_base}/api/auth/oauth2/callback"
+                url = await auth_provider.get_authorization_url(redir, str(sid))
+                auth_urls.append({"provider_type": "oauth2", "name": p.name, "url": url})
+
     return auth_urls
+
+@router.get("/auth/oauth2/callback")
+async def oauth2_callback(
+    code: str,
+    state: str = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Callback for Generic OAuth2 SSO login."""
+    from app.core.security import create_access_token
+    from fastapi.responses import HTMLResponse
+    from app.services.auth_registry import auth_provider_registry
+
+    # 1. 从 state (=sid) 获取 tenant 上下文
+    tenant_id = None
+    sid = None
+    if state:
+        try:
+            sid = uuid.UUID(state)
+            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+            session = s_res.scalar_one_or_none()
+            if session:
+                tenant_id = session.tenant_id
+        except (ValueError, AttributeError):
+            pass
+
+    # 2. 获取 OAuth2 provider
+    auth_provider = await auth_provider_registry.get_provider(
+        db, "oauth2", str(tenant_id) if tenant_id else None
+    )
+    if not auth_provider:
+        return HTMLResponse("Auth failed: OAuth2 provider not configured")
+
+    # 3. 换 token → 获取用户信息 → 查找/创建用户
+    try:
+        token_data = await auth_provider.exchange_code_for_token(code)
+        access_token = token_data.get("access_token")
+        if not access_token:
+            logger.error(f"OAuth2 token exchange failed: {token_data}")
+            return HTMLResponse("Auth failed: Token exchange error")
+
+        user_info = await auth_provider.get_user_info(access_token)
+        if not user_info.provider_user_id:
+            logger.error(f"OAuth2 user info missing userId: {user_info.raw_data}")
+            return HTMLResponse("Auth failed: No user ID returned")
+
+        user, is_new = await auth_provider.find_or_create_user(
+            db, user_info, tenant_id=str(tenant_id) if tenant_id else None
+        )
+        if not user:
+            return HTMLResponse("Auth failed: User resolution failed")
+
+    except Exception as e:
+        logger.error(f"OAuth2 login error: {e}")
+        return HTMLResponse(f"Auth failed: {str(e)}")
+
+    # 4. 生成 JWT，更新 SSO session
+    token = create_access_token(str(user.id), user.role)
+
+    if sid:
+        try:
+            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+            session = s_res.scalar_one_or_none()
+            if session:
+                session.status = "authorized"
+                session.provider_type = "oauth2"
+                session.user_id = user.id
+                session.access_token = token
+                session.error_msg = None
+                await db.commit()
+                return HTMLResponse(
+                    f'<html><head><meta charset="utf-8" /></head>'
+                    f'<body><div>SSO login successful. Redirecting...</div>'
+                    f'<script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>'
+                    f'</body></html>'
+                )
+        except Exception as e:
+            logger.exception("Failed to update SSO session (oauth2) %s", e)
+
+    return HTMLResponse(f"Logged in successfully.")
 
