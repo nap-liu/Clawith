@@ -852,9 +852,9 @@ function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { comp
     };
 
     const StatusBadge = ({ status }: { status: 'idle' | 'checking' | 'available' | 'taken' }) => {
-        if (status === 'checking') return <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>checking...</span>;
-        if (status === 'available') return <span style={{ fontSize: '11px', color: 'var(--success)' }}>Available</span>;
-        if (status === 'taken') return <span style={{ fontSize: '11px', color: 'var(--error)' }}>Taken</span>;
+        if (status === 'checking') return <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{t('admin.prefixChecking', 'checking...')}</span>;
+        if (status === 'available') return <span style={{ fontSize: '11px', color: 'var(--success)' }}>{t('admin.prefixAvailable', 'Available')}</span>;
+        if (status === 'taken') return <span style={{ fontSize: '11px', color: 'var(--error)' }}>{t('admin.prefixTaken', 'Already taken')}</span>;
         return null;
     };
 
@@ -928,7 +928,7 @@ function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { comp
                                     setPrefixStatus('idle');
                                 }}
                                 onBlur={() => checkPrefix(subdomainPrefix)}
-                                placeholder="acme"
+                                placeholder={slug}
                                 style={{ fontSize: '13px', maxWidth: '120px' }}
                             />
                             {globalHostname && (
@@ -938,9 +938,9 @@ function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { comp
                             )}
                             <StatusBadge status={prefixStatus} />
                         </div>
-                        {subdomainPrefix && globalHostname && (
+                        {(subdomainPrefix || slug) && globalHostname && (
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '6px', fontFamily: 'var(--font-mono)' }}>
-                                {globalProtocol}{subdomainPrefix}.{globalHostname}
+                                {globalProtocol}{subdomainPrefix || slug}.{globalHostname}
                             </div>
                         )}
                     </div>
