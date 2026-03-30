@@ -686,9 +686,8 @@ function OrgTab({ tenant }: { tenant: any }) {
                                         {/* Per-channel SSO Login URLs & Toggle */}
                                         {['feishu', 'dingtalk', 'wecom', 'oauth2'].includes(idp.type) && (() => {
                                             const ssoEnabled = existingProvider ? !!existingProvider.sso_login_enabled : false;
-                                            const slug = tenant?.slug || '';
-                                            const domain = tenant?.sso_domain || (slug ? `${slug}.clawith.ai` : '');
-                                            const callbackUrl = domain ? `https://${domain}/api/auth/${idp.type}/callback` : '';
+                                            const baseUrl = tenant?.effective_base_url || '';
+                                            const callbackUrl = baseUrl ? `${baseUrl}/api/auth/${idp.type}/callback` : '';
 
                                             const handleSsoToggle = async () => {
                                                 if (!existingProvider) {
