@@ -875,7 +875,7 @@ function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { comp
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             backdropFilter: 'blur(4px)',
         }} onClick={onClose}>
-            <div className=card style={{
+            <div className="card" style={{
                 padding: '24px', maxWidth: '480px', width: '90%',
                 boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
             }} onClick={e => e.stopPropagation()}>
@@ -933,12 +933,12 @@ function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { comp
                     </div>
 
                     <div style={{ background: 'var(--bg-secondary)', padding: '12px', borderRadius: '8px', border: '1px solid var(--border-subtle)' }}>
-                        <label className=form-label style={{ fontSize: '12px', marginBottom: '4px', display: 'block' }}>
+                        <label className="form-label" style={{ fontSize: '12px', marginBottom: '4px', display: 'block' }}>
                             {t('admin.subdomainPrefix', 'Subdomain Prefix')}
                         </label>
                         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
                             <input
-                                className=form-input
+                                className="form-input"
                                 value={subdomainPrefix}
                                 onChange={e => {
                                     const v = e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, '');
