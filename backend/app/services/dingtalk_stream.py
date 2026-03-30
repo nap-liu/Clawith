@@ -483,7 +483,10 @@ class DingTalkStreamManager:
                     msg_data = callback.data if isinstance(callback.data, dict) else json.loads(callback.data)
 
                     msgtype = msg_data.get("msgtype", "text")
-                    sender_staff_id = incoming.sender_staff_id or incoming.sender_id or ""
+                    sender_staff_id = incoming.sender_staff_id or ""
+                    sender_id = incoming.sender_id or ""
+                    if not sender_staff_id and sender_id:
+                        sender_staff_id = sender_id  # fallback
                     sender_nick = incoming.sender_nick or ""
                     message_id = incoming.message_id or ""
                     conversation_id = incoming.conversation_id or ""
@@ -524,6 +527,7 @@ class DingTalkStreamManager:
                                     session_webhook=session_webhook,
                                     sender_nick=sender_nick,
                                     message_id=message_id,
+                                    sender_id=sender_id,
                                 ),
                                 main_loop,
                             )
@@ -560,6 +564,7 @@ class DingTalkStreamManager:
                                     session_webhook=session_webhook,
                                     sender_nick=sender_nick,
                                     message_id=message_id,
+                                    sender_id=sender_id,
                                 ),
                                 main_loop,
                             )
@@ -591,6 +596,7 @@ class DingTalkStreamManager:
                 session_webhook: str,
                 sender_nick: str = "",
                 message_id: str = "",
+                sender_id: str = "",
             ):
                 """Download media, then dispatch to process_dingtalk_message."""
                 from app.api.dingtalk import process_dingtalk_message
@@ -617,6 +623,7 @@ class DingTalkStreamManager:
                     saved_file_paths=saved_file_paths,
                     sender_nick=sender_nick,
                     message_id=message_id,
+                    sender_id=sender_id,
                 )
 
         while not stop_event.is_set() and retries <= MAX_RETRIES:

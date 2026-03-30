@@ -35,7 +35,7 @@ async def _get_corp_access_token(app_key: str, app_secret: str) -> str | None:
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
+            resp = await client.get(
                 "https://oapi.dingtalk.com/gettoken",
                 params={"appkey": app_key, "appsecret": app_secret},
             )
@@ -225,6 +225,7 @@ async def process_dingtalk_message(
     saved_file_paths: list[str] | None = None,
     sender_nick: str = "",
     message_id: str = "",
+    sender_id: str = "",
 ):
     """Process an incoming DingTalk bot message and reply via session webhook.
 
@@ -273,60 +274,98 @@ async def process_dingtalk_message(
         _early_app_key = _early_cfg.app_id if _early_cfg else None
         _early_app_secret = _early_cfg.app_secret if _early_cfg else None
 
-        # -- Multi-dimension user matching to prevent duplicate creation --
+        # -- Multi-dimension user matching (optimized: local-first, API-last) --
+        from app.models.org import OrgMember
+        from app.models.identity import IdentityProvider
+        from sqlalchemy import or_ as _or
+
         dt_username = f"dingtalk_{sender_staff_id}"
+        platform_user = None
+        dt_unionid = ""
+        matched_via = ""
 
-        # Step 1: Exact username match (backward compatible)
-        u_r = await db.execute(_select(UserModel).where(UserModel.username == dt_username))
-        platform_user = u_r.scalar_one_or_none()
+        # Find the DingTalk identity provider for this tenant
+        _ip_r = await db.execute(
+            _select(IdentityProvider).where(
+                IdentityProvider.provider_type == "dingtalk",
+                IdentityProvider.tenant_id == agent_obj.tenant_id,
+            )
+        )
+        _dingtalk_provider = _ip_r.scalar_one_or_none()
 
-        if not platform_user and _early_app_key and _early_app_secret:
-            # Step 2: Call DingTalk corp API to get unionId/mobile/email
+        # Step 1: Match via sender_id (openId) in org_members.external_id (fastest, no API)
+        if sender_id and _dingtalk_provider and not platform_user:
+            _om_r = await db.execute(
+                _select(OrgMember).where(
+                    OrgMember.provider_id == _dingtalk_provider.id,
+                    OrgMember.external_id == sender_id,
+                    OrgMember.status == "active",
+                )
+            )
+            _om = _om_r.scalar_one_or_none()
+            if _om and _om.user_id:
+                _u_r = await db.execute(_select(UserModel).where(UserModel.id == _om.user_id))
+                platform_user = _u_r.scalar_one_or_none()
+                if platform_user:
+                    matched_via = "org_member.external_id(sender_id)"
+                    logger.info(f"[DingTalk] Step1: Matched user via sender_id {sender_id}: {platform_user.username}")
+
+        # Step 2: Match via sender_staff_id in org_members.external_id (compat with old data)
+        if sender_staff_id and _dingtalk_provider and not platform_user:
+            _om_r = await db.execute(
+                _select(OrgMember).where(
+                    OrgMember.provider_id == _dingtalk_provider.id,
+                    OrgMember.external_id == sender_staff_id,
+                    OrgMember.status == "active",
+                )
+            )
+            _om = _om_r.scalar_one_or_none()
+            if _om and _om.user_id:
+                _u_r = await db.execute(_select(UserModel).where(UserModel.id == _om.user_id))
+                platform_user = _u_r.scalar_one_or_none()
+                if platform_user:
+                    matched_via = "org_member.external_id(staff_id)"
+                    logger.info(f"[DingTalk] Step2: Matched user via staff_id {sender_staff_id}: {platform_user.username}")
+
+        # Step 3: Match via username = dingtalk_{staffId} (compat with old users)
+        if sender_staff_id and not platform_user:
+            _u_r = await db.execute(_select(UserModel).where(UserModel.username == dt_username))
+            platform_user = _u_r.scalar_one_or_none()
+            if platform_user:
+                matched_via = "username"
+                logger.info(f"[DingTalk] Step3: Matched user via username {dt_username}")
+
+        # Step 4: Call DingTalk API to get unionId/mobile/email (only on first encounter)
+        if not platform_user and _early_app_key and _early_app_secret and sender_staff_id:
             dt_user_detail = await _get_dingtalk_user_detail(
                 _early_app_key, _early_app_secret, sender_staff_id
             )
-
             if dt_user_detail:
                 dt_unionid = dt_user_detail.get("unionid", "")
                 dt_mobile = dt_user_detail.get("mobile", "")
                 dt_email = dt_user_detail.get("email", "")
 
-                # Step 3: Match via org_members unionId (SSO users)
-                if dt_unionid and not platform_user:
-                    from app.models.org import OrgMember
-                    from app.models.identity import IdentityProvider
-                    from sqlalchemy import or_ as _or
-                    _ip_r = await db.execute(
-                        _select(IdentityProvider).where(
-                            IdentityProvider.provider_type == "dingtalk",
-                            IdentityProvider.tenant_id == agent_obj.tenant_id,
+                # 4a: Match via unionId in org_members
+                if dt_unionid and _dingtalk_provider and not platform_user:
+                    _om_r = await db.execute(
+                        _select(OrgMember).where(
+                            OrgMember.provider_id == _dingtalk_provider.id,
+                            OrgMember.status == "active",
+                            _or(
+                                OrgMember.unionid == dt_unionid,
+                                OrgMember.external_id == dt_unionid,
+                            ),
                         )
                     )
-                    _ip = _ip_r.scalar_one_or_none()
-                    if _ip:
-                        _om_r = await db.execute(
-                            _select(OrgMember).where(
-                                OrgMember.provider_id == _ip.id,
-                                OrgMember.status == "active",
-                                _or(
-                                    OrgMember.unionid == dt_unionid,
-                                    OrgMember.external_id == dt_unionid,
-                                ),
-                            )
-                        )
-                        _om = _om_r.scalar_one_or_none()
-                        if _om and _om.user_id:
-                            _u_r = await db.execute(
-                                _select(UserModel).where(UserModel.id == _om.user_id)
-                            )
-                            platform_user = _u_r.scalar_one_or_none()
-                            if platform_user:
-                                logger.info(
-                                    f"[DingTalk] Matched user via org_members unionid "
-                                    f"{dt_unionid}: {platform_user.username}"
-                                )
+                    _om = _om_r.scalar_one_or_none()
+                    if _om and _om.user_id:
+                        _u_r = await db.execute(_select(UserModel).where(UserModel.id == _om.user_id))
+                        platform_user = _u_r.scalar_one_or_none()
+                        if platform_user:
+                            matched_via = "org_member.unionid"
+                            logger.info(f"[DingTalk] Step4a: Matched user via unionid {dt_unionid}: {platform_user.username}")
 
-                # Step 4: Match via mobile
+                # 4b: Match via mobile
                 if dt_mobile and not platform_user:
                     _u_r = await db.execute(
                         _select(UserModel).where(
@@ -336,12 +375,10 @@ async def process_dingtalk_message(
                     )
                     platform_user = _u_r.scalar_one_or_none()
                     if platform_user:
-                        logger.info(
-                            f"[DingTalk] Matched user via mobile {dt_mobile}: "
-                            f"{platform_user.username}"
-                        )
+                        matched_via = "mobile"
+                        logger.info(f"[DingTalk] Step4b: Matched user via mobile: {platform_user.username}")
 
-                # Step 5: Match via email
+                # 4c: Match via email
                 if dt_email and not platform_user:
                     _u_r = await db.execute(
                         _select(UserModel).where(
@@ -351,13 +388,11 @@ async def process_dingtalk_message(
                     )
                     platform_user = _u_r.scalar_one_or_none()
                     if platform_user:
-                        logger.info(
-                            f"[DingTalk] Matched user via email {dt_email}: "
-                            f"{platform_user.username}"
-                        )
+                        matched_via = "email"
+                        logger.info(f"[DingTalk] Step4c: Matched user via email: {platform_user.username}")
 
+        # Step 5: No match found — create new user
         if not platform_user:
-            # Step 6: No match found, create new user
             import uuid as _uuid
             platform_user = UserModel(
                 username=dt_username,
@@ -370,7 +405,8 @@ async def process_dingtalk_message(
             )
             db.add(platform_user)
             await db.flush()
-            logger.info(f"[DingTalk] Created new user: {dt_username}")
+            matched_via = "created"
+            logger.info(f"[DingTalk] Step5: Created new user: {dt_username}")
         else:
             # Update display_name and source for existing users
             updated = False
@@ -382,6 +418,38 @@ async def process_dingtalk_message(
                 updated = True
             if updated:
                 await db.flush()
+
+        # -- Ensure org_member record exists (for future Step 1 fast-path) --
+        if _dingtalk_provider and sender_id:
+            _om_check_r = await db.execute(
+                _select(OrgMember).where(
+                    OrgMember.user_id == platform_user.id,
+                    OrgMember.provider_id == _dingtalk_provider.id,
+                )
+            )
+            _existing_om = _om_check_r.scalar_one_or_none()
+            if not _existing_om:
+                # Create org_member so next message hits Step 1 directly
+                _new_om = OrgMember(
+                    user_id=platform_user.id,
+                    provider_id=_dingtalk_provider.id,
+                    external_id=sender_id,
+                    unionid=dt_unionid or None,
+                    name=sender_nick or platform_user.display_name or dt_username,
+                    status="active",
+                    tenant_id=agent_obj.tenant_id,
+                )
+                db.add(_new_om)
+                await db.flush()
+                logger.info(f"[DingTalk] Created org_member for user {platform_user.username}, external_id={sender_id}")
+            elif _existing_om.external_id != sender_id:
+                # Update external_id to sender_id if it was using staff_id before
+                _existing_om.external_id = sender_id
+                if dt_unionid and not _existing_om.unionid:
+                    _existing_om.unionid = dt_unionid
+                await db.flush()
+                logger.info(f"[DingTalk] Updated org_member external_id to {sender_id} for user {platform_user.username}")
+
         platform_user_id = platform_user.id
 
         # Check for channel commands (/new, /reset)
