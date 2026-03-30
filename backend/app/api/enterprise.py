@@ -1024,8 +1024,10 @@ async def list_org_members(
         if str(current_user.tenant_id) != tenant_id:
             raise HTTPException(status_code=403, detail="Cannot access other tenant's data")
 
-    query = select(OrgMember, IdentityProvider.name.label("provider_name"), IdentityProvider.provider_type).outerjoin(
+    query = select(OrgMember, IdentityProvider.name.label("provider_name"), IdentityProvider.provider_type, User.display_name.label("user_display_name")).outerjoin(
         IdentityProvider, OrgMember.provider_id == IdentityProvider.id
+    ).outerjoin(
+        User, OrgMember.user_id == User.id
     ).where(OrgMember.status == "active")
     if tenant_id:
         query = query.where(OrgMember.tenant_id == uuid.UUID(tenant_id))
@@ -1070,6 +1072,7 @@ async def list_org_members(
             "id": str(m.id),
             "name": m.name,
             "email": m.email,
+            "phone": m.phone,
             "title": m.title,
             "department_path": m.department_path,
             "avatar_url": m.avatar_url,
@@ -1077,8 +1080,9 @@ async def list_org_members(
             "provider_id": str(m.provider_id) if m.provider_id else None,
             "provider_name": provider_name if m.provider_id else None,
             "provider_type": provider_type if m.provider_id else None,
+            "user_display_name": user_display_name,
         }
-        for m, provider_name, provider_type in rows
+        for m, provider_name, provider_type, user_display_name in rows
     ]
 
 

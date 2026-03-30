@@ -876,7 +876,11 @@
           "step4": "将 CorpID 和 Secret 填入下方 → 点击保存配置",
           "step5": "如需使用企微免登：打开下方的SSO登录开关，然后在企微中配置：应用管理 → 网页授权及JS-SDK → 设置可信域名（即下方 Redirect URL 的域名部分）。分享下方的 SSO Login URL 给团队成员即可登录。"
         }
-      }
+      },
+      "companyUrl": "企业访问地址",
+      "memberEmail": "邮箱",
+      "memberPhone": "手机",
+      "memberSource": "来源"
     },
     "config": {
       "title": "平台配置",
@@ -942,6 +946,29 @@
       "textPlaceholder": "输入通知条文案，如： v2.1 已发布！",
       "description": "在页面顶部显示一行通知条，所有用户（含未登录用户）可见。",
       "preview": "预览"
+    },
+    "identity": {
+      "title": "组织架构同步",
+      "description": "配置企业目录同步和身份提供商设置。",
+      "statusActive": "已配置",
+      "statusNotConfigured": "未配置",
+      "syncDirectory": "同步通讯录",
+      "syncSyncing": "同步中...",
+      "syncComplete": "同步完成：创建 {{users_created}} 个用户，同步 {{profiles_synced}} 个档案。",
+      "syncError": "错误：{{error}}",
+      "deleteConfirmProvider": "确定要删除此配置吗？",
+      "savedStatus": "已保存",
+      "feishuDesc": "飞书集成",
+      "dingtalkDesc": "钉钉集成",
+      "wecomDesc": "企业微信集成",
+      "oauth2Desc": "通用 OIDC 提供商",
+      "ssoLoginToggle": "SSO 登录",
+      "ssoLoginToggleHint": "允许用户通过此身份提供商登录。",
+      "ssoSubdomain": "SSO 登录地址",
+      "ssoSubdomainHint": "将此地址分享给团队成员，访问后会出现 SSO 登录按钮。",
+      "callbackUrl": "回调地址（粘贴到应用设置中）",
+      "callbackUrlHint": "将此 URL 添加为身份提供商应用配置中的 OAuth 重定向 URI。",
+      "saveFirst": "请先保存配置后再启用 SSO。"
     }
   },
   "common": {
@@ -1040,7 +1067,17 @@
     "setAsDefault": "默认企业",
     "setAsDefaultDesc": "通过全局域名访问的用户将自动关联到此企业。",
     "currentDefault": "当前默认",
-    "prefixTakenError": "子域名前缀已被占用，请选择其他前缀。"
+    "prefixTakenError": "子域名前缀已被占用，请选择其他前缀。",
+    "edit": "编辑",
+    "delete": "删除",
+    "confirmDelete": "确认删除",
+    "deleteCompany": "删除公司",
+    "deleteCompanyWarning": "此操作不可逆。以下数据将被永久删除：",
+    "deleteDataUsers": "该公司所有用户",
+    "deleteDataAgents": "所有数字员工及其对话记录",
+    "deleteDataSkills": "所有技能和 LLM 模型配置",
+    "deleteDataOther": "所有邀请码、组织架构、Token 记录",
+    "deleteCompanyName": "公司"
   },
   "companySetup": {
     "title": "设置你的公司",
@@ -1184,5 +1221,11 @@
       "saml": "SAML：需填写 entry_point, issuer, cert (公钥)",
       "microsoft_teams": "Microsoft Teams：需填写 client_id, client_secret, tenant_id"
     }
+  },
+  "users": {
+    "newPassword": "新密码",
+    "newPasswordPlaceholder": "留空则不修改密码",
+    "newPasswordHint": "可选。填写后将重置用户密码。",
+    "passwordResetSuccess": "密码已重置"
   }
 }

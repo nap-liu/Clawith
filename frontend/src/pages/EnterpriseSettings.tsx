@@ -323,10 +323,10 @@ function OrgTab({ tenant }: { tenant: any }) {
     };
 
     const IDP_TYPES = [
-        { type: 'feishu', name: 'Feishu', desc: 'Feishu / Lark Integration', icon: <img src="/feishu.png" width="20" height="20" alt="Feishu"/> },
-        { type: 'wecom', name: 'WeCom', desc: 'WeChat Work Integration', icon: <img src="/wecom.png" width="20" height="20" style={{ borderRadius: '4px' }} alt="WeCom"/> },
-        { type: 'dingtalk', name: 'DingTalk', desc: 'DingTalk App Integration', icon: <img src="/dingtalk.png" width="20" height="20" style={{ borderRadius: '4px' }} alt="DingTalk"/> },
-        { type: 'oauth2', name: 'OAuth2', desc: 'Generic OIDC Provider', icon: <div style={{width: 20, height: 20, background: 'var(--accent-primary)', borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 10, fontWeight: 700}}>O</div> }
+        { type: 'feishu', name: 'Feishu', desc: t('enterprise.identity.feishuDesc', 'Feishu / Lark Integration'), icon: <img src="/feishu.png" width="20" height="20" alt="Feishu"/> },
+        { type: 'wecom', name: 'WeCom', desc: t('enterprise.identity.wecomDesc', 'WeChat Work Integration'), icon: <img src="/wecom.png" width="20" height="20" style={{ borderRadius: '4px' }} alt="WeCom"/> },
+        { type: 'dingtalk', name: 'DingTalk', desc: t('enterprise.identity.dingtalkDesc', 'DingTalk App Integration'), icon: <img src="/dingtalk.png" width="20" height="20" style={{ borderRadius: '4px' }} alt="DingTalk"/> },
+        { type: 'oauth2', name: 'OAuth2', desc: t('enterprise.identity.oauth2Desc', 'Generic OIDC Provider'), icon: <div style={{width: 20, height: 20, background: 'var(--accent-primary)', borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 10, fontWeight: 700}}>O</div> }
     ];
 
     const handleExpand = (type: string, existingProvider?: any) => {
@@ -517,10 +517,10 @@ function OrgTab({ tenant }: { tenant: any }) {
                         {savingProvider ? t('common.loading') : t('common.save', 'Save')}
                     </button>
                     {saveProviderOk && (
-                        <span style={{ fontSize: '12px', color: 'var(--success)' }}>Saved</span>
+                        <span style={{ fontSize: '12px', color: 'var(--success)' }}>{t('enterprise.identity.savedStatus', 'Saved')}</span>
                     )}
                     {existingProvider && (
-                        <button className="btn btn-ghost btn-sm" style={{ color: 'var(--error)' }} onClick={() => confirm('Are you sure you want to delete this configuration?') && deleteProvider.mutate(existingProvider.id)}>
+                        <button className="btn btn-ghost btn-sm" style={{ color: 'var(--error)' }} onClick={() => confirm(t('enterprise.identity.deleteConfirmProvider', 'Are you sure you want to delete this configuration?')) && deleteProvider.mutate(existingProvider.id)}>
                             {t('common.delete', 'Delete')}
                         </button>
                     )}
@@ -538,12 +538,12 @@ function OrgTab({ tenant }: { tenant: any }) {
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '8px' }}>
                         {['feishu', 'dingtalk', 'wecom'].includes(p.provider_type) && (
                             <button className="btn btn-secondary btn-sm" style={{ fontSize: '12px' }} onClick={() => triggerSync(p.id)} disabled={!!syncing}>
-                                {syncing === p.id ? 'Syncing...' : 'Sync Directory'}
+                                {syncing === p.id ? t('enterprise.identity.syncSyncing', 'Syncing...') : t('enterprise.identity.syncDirectory', 'Sync Directory')}
                             </button>
                         )}
                         {syncResult && (
                             <div style={{ padding: '6px 10px', borderRadius: '4px', fontSize: '11px', background: syncResult.error ? 'rgba(255,0,0,0.1)' : 'rgba(0,200,0,0.1)' }}>
-                                {syncResult.error ? `Error: ${syncResult.error}` : `Sync complete: ${syncResult.users_created || 0} users created, ${syncResult.profiles_synced || 0} profiles synced.`}
+                                {syncResult.error ? t('enterprise.identity.syncError', { error: syncResult.error, defaultValue: 'Error: {{error}}' }) : t('enterprise.identity.syncComplete', { users_created: syncResult.users_created || 0, profiles_synced: syncResult.profiles_synced || 0, defaultValue: 'Sync complete: {{users_created}} users created, {{profiles_synced}} profiles synced.' })}
                             </div>
                         )}
                     </div>
@@ -564,12 +564,16 @@ function OrgTab({ tenant }: { tenant: any }) {
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '400px', overflowY: 'auto' }}>
                             {members.map((m: any) => (
                                 <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '8px', borderRadius: '6px', border: '1px solid var(--border-subtle)' }}>
-                                    <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: 'var(--bg-tertiary)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 600 }}>{m.name?.[0]}</div>
-                                    <div>
-                                        <div style={{ fontWeight: 500, fontSize: '13px' }}>{m.name}</div>
-                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                            {m.provider_type && <span style={{ marginRight: '4px', padding: '1px 4px', borderRadius: '3px', background: 'var(--bg-secondary)', fontSize: '10px' }}>{m.provider_type}</span>}
-                                            {m.title || '-'} · {m.department_path || m.department_id || '-'}
+                                    <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: 'var(--bg-tertiary)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 600 }}>{(m.user_display_name || m.name)?.[0]}</div>
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                            <span style={{ fontWeight: 500, fontSize: '13px' }}>{m.user_display_name || m.name}</span>
+                                            {m.provider_type && <span style={{ padding: '1px 4px', borderRadius: '3px', background: 'var(--bg-secondary)', fontSize: '10px', color: 'var(--text-tertiary)' }}>{m.provider_type}</span>}
+                                        </div>
+                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '2px' }}>
+                                            {m.email && <span>{m.email}</span>}
+                                            {m.phone && <span>{m.phone}</span>}
+                                            {!m.email && !m.phone && <span>{m.title || '-'} · {m.department_path || m.department_id || '-'}</span>}
                                         </div>
                                     </div>
                                 </div>
@@ -605,7 +609,7 @@ function OrgTab({ tenant }: { tenant: any }) {
                         {t('enterprise.identity.title', 'Organization & Directory Sync')}
                     </h3>
                     <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-                        Configure enterprise directory synchronization and Identity Provider settings.
+                        {t('enterprise.identity.description', 'Configure enterprise directory synchronization and Identity Provider settings.')}
                     </div>
                 </div>
 
@@ -630,7 +634,7 @@ function OrgTab({ tenant }: { tenant: any }) {
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
                                         {existingProvider ? (
                                             <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end', gap: '8px' }}>
-                                                <span className="badge badge-success" style={{ fontSize: '10px' }}>Active</span>
+                                                <span className="badge badge-success" style={{ fontSize: '10px' }}>{t('enterprise.identity.statusActive', 'Active')}</span>
                                                 {existingProvider.last_synced_at && (
                                                     <span style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>
                                                         Synced: {new Date(existingProvider.last_synced_at).toLocaleDateString()}
@@ -638,7 +642,7 @@ function OrgTab({ tenant }: { tenant: any }) {
                                                 )}
                                             </div>
                                         ) : (
-                                            <span className="badge badge-secondary" style={{ fontSize: '10px' }}>Not configured</span>
+                                            <span className="badge badge-secondary" style={{ fontSize: '10px' }}>{t('enterprise.identity.statusNotConfigured', 'Not configured')}</span>
                                         )}
                                         <div style={{ color: 'var(--text-tertiary)', transform: isExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s', fontSize: '12px' }}>
                                             ▼

@@ -478,6 +478,7 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
         email: user.email || '',
         primary_mobile: user.primary_mobile || '',
         is_active: user.is_active,
+        new_password: '',
     });
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState('');
@@ -490,14 +491,18 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
         setSaving(true);
         setError('');
         try {
-            await fetchJson(`/users/${user.id}/profile`, {
-                method: 'PATCH',
-                body: JSON.stringify({
+            const payload: any = {
                     display_name: form.display_name.trim(),
                     email: form.email.trim(),
                     primary_mobile: form.primary_mobile.trim() || null,
                     is_active: form.is_active,
-                }),
+                };
+            if (form.new_password.trim()) {
+                payload.new_password = form.new_password.trim();
+            }
+            await fetchJson(`/users/${user.id}/profile`, {
+                method: 'PATCH',
+                body: JSON.stringify(payload),
             });
             onUpdated();
             onClose();
@@ -579,6 +584,25 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
                             placeholder={isChinese ? '可选' : 'Optional'}
                             style={{ fontSize: '13px' }}
                         />
+                    </div>
+
+                    <div className="form-group">
+                        <label className="form-label" style={{ fontSize: '12px' }}>
+                            {t('users.newPassword', isChinese ? '新密码' : 'New Password')}
+                        </label>
+                        <input
+                            className="form-input"
+                            type="password"
+                            value={form.new_password}
+                            onChange={e => setForm({ ...form, new_password: e.target.value })}
+                            disabled={isReadOnly}
+                            placeholder={t('users.newPasswordPlaceholder', isChinese ? '留空则不修改密码' : 'Leave blank to keep current password')}
+                            style={{ fontSize: '13px' }}
+                            autoComplete="new-password"
+                        />
+                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                            {t('users.newPasswordHint', isChinese ? '可选。填写后将重置用户密码。' : 'Optional. If provided, user password will be reset.')}
+                        </div>
                     </div>
 
                     {user.role !== 'platform_admin' && (

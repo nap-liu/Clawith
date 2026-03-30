@@ -228,6 +228,7 @@ class UserProfileUpdate(BaseModel):
     email: str | None = None
     primary_mobile: str | None = None
     is_active: bool | None = None
+    new_password: str | None = None
 
 
 @router.patch("/{user_id}/profile", response_model=UserOut)
@@ -279,6 +280,11 @@ async def update_user_profile(
         target.primary_mobile = data.primary_mobile.strip() or None
     if data.is_active is not None:
         target.is_active = data.is_active
+    if data.new_password is not None and data.new_password.strip():
+        from app.core.security import hash_password
+        if len(data.new_password.strip()) < 6:
+            raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+        target.password_hash = hash_password(data.new_password.strip())
 
     await db.commit()
     await db.refresh(target)
