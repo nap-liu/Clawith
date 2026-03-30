@@ -793,7 +793,6 @@ function CompaniesTab() {
 function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { company: any, publicBaseUrl: string, onClose: () => void, onUpdated: () => void }) {
     const { t } = useTranslation();
     const [ssoEnabled, setSsoEnabled] = useState(!!company.sso_enabled);
-    const [ssoDomain, setSsoDomain] = useState(company.sso_domain || '');
     const [subdomainPrefix, setSubdomainPrefix] = useState(company.subdomain_prefix || '');
     const [prefixStatus, setPrefixStatus] = useState<'idle' | 'checking' | 'available' | 'taken'>('idle');
     const [saving, setSaving] = useState(false);
@@ -819,7 +818,6 @@ function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { comp
         try {
             await adminApi.updateCompany(company.id, {
                 sso_enabled: ssoEnabled,
-                sso_domain: ssoDomain.trim() || null,
                 subdomain_prefix: subdomainPrefix.trim() || null,
             });
             onUpdated();
@@ -905,16 +903,6 @@ function EditCompanyModal({ company, publicBaseUrl, onClose, onUpdated }: { comp
                         )}
                     </div>
 
-                    <div>
-                        <label className="form-label" style={{ fontSize: '12px', marginBottom: '4px' }}>{t('admin.ssoDomain', 'Custom Access Domain')}</label>
-                        <input
-                            className="form-input"
-                            value={ssoDomain}
-                            onChange={e => setSsoDomain(e.target.value)}
-                            placeholder={t('admin.ssoDomainPlaceholder', 'e.g. acme.clawith.com')}
-                            style={{ fontSize: '13px' }}
-                        />
-                    </div>
                 </div>
 
                 {error && <div style={{ color: 'var(--error)', fontSize: '12px', marginBottom: '16px', textAlign: 'center' }}>{error}</div>}

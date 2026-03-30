@@ -33,6 +33,7 @@ class CompanyStats(BaseModel):
     is_active: bool
     sso_enabled: bool = False
     sso_domain: str | None = None
+    subdomain_prefix: str | None = None
     created_at: datetime | None = None
     user_count: int = 0
     agent_count: int = 0
@@ -115,6 +116,7 @@ async def list_companies(
             is_active=tenant.is_active,
             sso_enabled=tenant.sso_enabled,
             sso_domain=tenant.sso_domain,
+            subdomain_prefix=tenant.subdomain_prefix,
             created_at=tenant.created_at,
             user_count=user_count,
             agent_count=agent_count,
