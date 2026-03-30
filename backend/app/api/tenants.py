@@ -145,7 +145,7 @@ async def self_create_company(
     # Seed default agents (Morty & Meeseeks) for the new company
     try:
         from app.services.agent_seeder import seed_default_agents
-        await seed_default_agents(tenant_id=tenant.id, creator_id=current_user.id)
+        await seed_default_agents(tenant_id=tenant.id, creator_id=current_user.id, db=db)
     except Exception as e:
         logger.warning(f"[self_create_company] Failed to seed default agents: {e}")
 
