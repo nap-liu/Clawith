@@ -164,11 +164,12 @@ class BaseAuthProvider(ABC):
         if not user and user_info.provider_user_id:
             from sqlalchemy import and_
 
-            # 构建查询条件：tenant_id 有值时精确匹配，为 None 时不限制租户
+            # 构建查询条件：tenant_id 有值时匹配该租户或无租户的用户，为 None 时不限制租户
             if tenant_id:
+                from sqlalchemy import or_
                 where_clause = and_(
                     User.username == user_info.provider_user_id,
-                    User.tenant_id == tenant_id,
+                    or_(User.tenant_id == tenant_id, User.tenant_id.is_(None)),
                 )
             else:
                 where_clause = User.username == user_info.provider_user_id
