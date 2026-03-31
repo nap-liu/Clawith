@@ -348,6 +348,13 @@ function CompaniesTab() {
     const [deleteConfirmCompany, setDeleteConfirmCompany] = useState<any>(null);
     const [publicBaseUrl, setPublicBaseUrl] = useState('');
 
+    // Invitation codes modal
+    const [codesModal, setCodesModal] = useState<{ companyId: string; companyName: string } | null>(null);
+    const [companyCodes, setCompanyCodes] = useState<any[]>([]);
+    const [loadingCodes, setLoadingCodes] = useState(false);
+    const [newlyGeneratedCode, setNewlyGeneratedCode] = useState('');
+    const [codeCopied2, setCodeCopied2] = useState(false);
+
     // Toast
     const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
     const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
@@ -431,6 +438,31 @@ function CompaniesTab() {
             setCodeCopied(true);
             setTimeout(() => setCodeCopied(false), 2000);
         });
+    };
+
+    const handleViewCodes = async (companyId: string, companyName: string) => {
+        setCodesModal({ companyId, companyName });
+        setNewlyGeneratedCode('');
+        setLoadingCodes(true);
+        try {
+            const res = await adminApi.listCompanyCodes(companyId);
+            setCompanyCodes(res.codes || []);
+        } catch { setCompanyCodes([]); }
+        setLoadingCodes(false);
+    };
+
+    const handleGenerateCode = async () => {
+        if (!codesModal) return;
+        try {
+            const res = await adminApi.createCompanyCode(codesModal.companyId);
+            setNewlyGeneratedCode(res.code || '');
+            setCodeCopied2(false);
+            // Refresh list
+            const listRes = await adminApi.listCompanyCodes(codesModal.companyId);
+            setCompanyCodes(listRes.codes || []);
+        } catch (e: any) {
+            showToast(e.message || 'Failed', 'error');
+        }
     };
 
     const handleToggle = async (id: string, currentlyActive: boolean) => {
@@ -647,6 +679,99 @@ function CompaniesTab() {
                 </div>
             )}
 
+            {/* Invitation Codes Modal */}
+            {codesModal && (
+                <div style={{
+                    position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 10001,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    backdropFilter: 'blur(4px)',
+                }} onClick={() => { setCodesModal(null); setNewlyGeneratedCode(''); }}>
+                    <div className="card" style={{
+                        padding: '24px', maxWidth: '480px', width: '90%',
+                        boxShadow: '0 20px 60px rgba(0,0,0,0.3)',
+                    }} onClick={e => e.stopPropagation()}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                            <h2 style={{ fontSize: '16px', fontWeight: 600 }}>
+                                邀请码 — {codesModal.companyName}
+                            </h2>
+                            <button onClick={() => { setCodesModal(null); setNewlyGeneratedCode(''); }}
+                                style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)' }}>
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                                </svg>
+                            </button>
+                        </div>
+
+                        {newlyGeneratedCode && (
+                            <div style={{
+                                padding: '12px 16px', borderRadius: '8px',
+                                background: 'rgba(34,197,94,0.06)', border: '1px solid rgba(34,197,94,0.2)',
+                                marginBottom: '16px',
+                            }}>
+                                <div style={{ fontSize: '11px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '6px' }}>
+                                    新生成的邀请码
+                                </div>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <span style={{
+                                        fontFamily: 'monospace', fontSize: '18px', fontWeight: 700,
+                                        letterSpacing: '2px', color: 'var(--success)', userSelect: 'all',
+                                    }}>{newlyGeneratedCode}</span>
+                                    <button
+                                        className="btn btn-secondary"
+                                        style={{ padding: '2px 8px', fontSize: '11px', height: '24px' }}
+                                        onClick={() => {
+                                            navigator.clipboard.writeText(newlyGeneratedCode).then(() => {
+                                                setCodeCopied2(true);
+                                                setTimeout(() => setCodeCopied2(false), 2000);
+                                            });
+                                        }}
+                                    >
+                                        {codeCopied2 ? '已复制' : '复制'}
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+
+                        <div style={{ marginBottom: '12px' }}>
+                            <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)', marginBottom: '8px' }}>
+                                有效邀请码
+                            </div>
+                            {loadingCodes ? (
+                                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', padding: '12px 0' }}>加载中...</div>
+                            ) : companyCodes.length === 0 ? (
+                                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', padding: '12px 0' }}>暂无有效邀请码</div>
+                            ) : (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '200px', overflowY: 'auto' }}>
+                                    {companyCodes.map((c: any) => (
+                                        <div key={c.id} style={{
+                                            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                                            padding: '8px 12px', borderRadius: '6px',
+                                            background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
+                                            fontSize: '12px',
+                                        }}>
+                                            <span style={{ fontFamily: 'monospace', fontWeight: 600, letterSpacing: '1px' }}>{c.code}</span>
+                                            <span style={{ color: 'var(--text-tertiary)', fontSize: '11px' }}>
+                                                {c.used_count}/{c.max_uses === 0 ? '∞' : c.max_uses} 次使用
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        <div style={{ display: 'flex', gap: '8px' }}>
+                            <button className="btn btn-primary" onClick={handleGenerateCode} style={{ flex: 1 }}>
+                                生成新邀请码
+                            </button>
+                            <button className="btn btn-secondary" onClick={() => { setCodesModal(null); setNewlyGeneratedCode(''); }}
+                                style={{ padding: '0 20px' }}>
+                                关闭
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Create Company button */}
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: '16px' }}>
                 <button className="btn btn-primary" onClick={() => { setShowCreate(true); setCreatedCode(''); }}>
@@ -813,6 +938,13 @@ function CompaniesTab() {
                                 onClick={() => setEditingCompany(c)}
                             >
                                 {t('admin.edit', 'Edit')}
+                            </button>
+                            <button
+                                className="btn btn-ghost"
+                                style={{ padding: '2px 8px', fontSize: '11px', height: '24px', color: 'var(--text-secondary)' }}
+                                onClick={() => handleViewCodes(c.id, c.name)}
+                            >
+                                邀请码
                             </button>
                             <button
                                 className="btn btn-ghost"

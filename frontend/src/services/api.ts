@@ -187,6 +187,12 @@ export const adminApi = {
 
     updatePlatformSettings: (data: any) =>
         request<any>('/admin/platform-settings', { method: 'PUT', body: JSON.stringify(data) }),
+
+    listCompanyCodes: (companyId: string) =>
+        request<any>(`/admin/companies/${companyId}/invitation-codes`),
+
+    createCompanyCode: (companyId: string) =>
+        request<any>(`/admin/companies/${companyId}/invitation-codes`, { method: 'POST' }),
 };
 
 // ─── Agents ───────────────────────────────────────────

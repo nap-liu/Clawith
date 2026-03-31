@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
+from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy import func as sqla_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -159,6 +160,13 @@ async def create_company(
     db.add(invite)
     await db.flush()
 
+    # Seed default agents (Morty & Meeseeks) for the new company
+    try:
+        from app.services.agent_seeder import seed_default_agents
+        await seed_default_agents(tenant_id=tenant.id, creator_id=current_user.id, db=db)
+    except Exception as e:
+        logger.warning(f"[create_company] Failed to seed default agents: {e}")
+
     return CompanyCreateResponse(
         company=CompanyStats(
             id=tenant.id,
@@ -197,6 +205,56 @@ async def toggle_company(
     await db.flush()
     return {"ok": True, "is_active": new_state}
 
+
+
+@router.get("/companies/{company_id}/invitation-codes")
+async def list_company_invitation_codes(
+    company_id: uuid.UUID,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(InvitationCode)
+        .where(InvitationCode.tenant_id == company_id)
+        .where(InvitationCode.is_active == True)
+        .order_by(InvitationCode.created_at.desc())
+    )
+    codes = result.scalars().all()
+    return {
+        "codes": [
+            {
+                "id": str(c.id),
+                "code": c.code,
+                "max_uses": c.max_uses,
+                "used_count": c.used_count,
+                "is_active": c.is_active,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+            }
+            for c in codes
+        ]
+    }
+
+
+@router.post("/companies/{company_id}/invitation-codes")
+async def create_company_invitation_code(
+    company_id: uuid.UUID,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    t_result = await db.execute(select(Tenant).where(Tenant.id == company_id))
+    if not t_result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    code_str = secrets.token_urlsafe(12)[:16].upper()
+    invite = InvitationCode(
+        code=code_str,
+        tenant_id=company_id,
+        max_uses=1,
+        created_by=current_user.id,
+    )
+    db.add(invite)
+    await db.flush()
+    return {"code": code_str}
 
 # ─── Platform Metrics Dashboard ─────────────────────────
 
