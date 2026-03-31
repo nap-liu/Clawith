@@ -587,7 +587,16 @@ class OAuth2AuthProvider(BaseAuthProvider):
                 self.user_info_url,
                 headers={"Authorization": f"Bearer {access_token}"},
             )
-            resp_data = resp.json()
+            # 检查响应状态
+            if resp.status_code != 200:
+                logger.error(f"OAuth2 userinfo returned {resp.status_code}: {resp.text[:200]}")
+                raise HTTPException(status_code=502, detail=f"OAuth2 userinfo error: {resp.status_code}")
+            
+            try:
+                resp_data = resp.json()
+            except Exception as e:
+                logger.error(f"OAuth2 userinfo JSON parse failed: {e}, body: {resp.text[:200]}")
+                raise HTTPException(status_code=502, detail="OAuth2 userinfo parse error")
             
             # 爷爷茶格式: {"status": 0, "data": {...}}
             # 标准 OIDC 格式: 直接返回 flat object
