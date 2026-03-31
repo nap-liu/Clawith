@@ -601,7 +601,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
             )
             resp_data = resp.json()
             
-            # 爷爷茶格式: {"status": 0, "data": {...}}
+            # 特殊格式: {"status": 0, "data": {...}}
             # 标准 OIDC 格式: 直接返回 flat object
             if "data" in resp_data and isinstance(resp_data["data"], dict):
                 info = resp_data["data"]
@@ -647,12 +647,12 @@ class OAuth2AuthProvider(BaseAuthProvider):
     async def _create_new_user(
         self, db, user_info, tenant_id
     ):
-        """Override to use provider_user_id as username for OAuth2 (it is a readable user ID like 'liuxi')."""
+        """Override to use provider_user_id as username for OAuth2 (it is a readable user ID like 'zhangsan')."""
         from sqlalchemy import select
         from app.models.user import User
         from app.core.security import hash_password
 
-        # 优先用 provider_user_id（如 userId="liuxi"），再用 email 前缀，最后 fallback
+        # 优先用 provider_user_id（如 userId="zhangsan"），再用 email 前缀，最后 fallback
         username = (
             user_info.provider_user_id[:8] if user_info.provider_user_id and len(user_info.provider_user_id) > 8 else user_info.provider_user_id
             or (user_info.email.split("@")[0] if user_info.email else None)

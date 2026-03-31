@@ -266,7 +266,7 @@ async def resolve_tenant_by_domain(
             tenant = result.scalar_one_or_none()
 
     # 2.5 Subdomain prefix match
-    # e.g. domain=acme.clawith.yeyecha.com, global hostname=clawith.yeyecha.com -> prefix acme
+    # e.g. domain=acme.clawith.com, global hostname=clawith.com -> prefix acme
     if not tenant:
         from urllib.parse import urlparse as _urlparse
         setting_r2 = await db.execute(

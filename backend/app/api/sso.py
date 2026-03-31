@@ -184,13 +184,13 @@ async def oauth2_callback(
             logger.error(f"OAuth2 token exchange failed: {token_data}")
             return HTMLResponse("Auth failed: Token exchange error")
 
-        # Try userinfo endpoint first; fallback to token_data if it fails (爷爷茶 returns 401 for new users)
+        # Try userinfo endpoint first; fallback to token_data if it fails (returns 401 for new users)
         try:
             user_info = await auth_provider.get_user_info(access_token)
         except Exception as e:
             logger.warning(f"OAuth2 userinfo failed, trying token_data fallback: {e}")
             logger.info(f"token_data keys: {list(token_data.keys()) if token_data else 'empty'}")
-            # 爷爷茶 token response 包含 openid，可以用 openid 作为 provider_user_id 创建用户
+            # token response 包含 openid，可以用 openid 作为 provider_user_id 创建用户
             if any(k in str(token_data) for k in ["userId", "userName", "userCode", "mobile", "userInfo", "openid"]):
                 try:
                     user_info = await auth_provider.get_user_info_from_token_data(token_data)
