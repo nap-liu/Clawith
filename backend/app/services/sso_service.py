@@ -36,8 +36,12 @@ class SSOService:
         Returns:
             User if found, None otherwise
         """
-        # 1. Try direct match in User table (within tenant if provided)
-        query = select(User).where(User.email.ilike(email))
+        # 1. Try direct match via Identity join
+        query = (
+            select(User)
+            .join(User.identity)
+            .where(Identity.email == email)
+        )
         if tenant_id:
             query = query.where(User.tenant_id == tenant_id)
         
@@ -48,8 +52,8 @@ class SSOService:
             return user
             
         # 2. If not found and tenant_id is provided, try to find an Identity
-        if tenant_id:
-            id_query = select(Identity).where(Identity.email.ilike(email))
+        if email:
+            id_query = select(Identity).where(Identity.email == email)
             id_result = await db.execute(id_query)
             identity = id_result.scalar_one_or_none()
             if identity:
@@ -77,8 +81,12 @@ class SSOService:
         if not normalized_mobile:
             return None
 
-        # 1. Try direct match in User table
-        query = select(User).where(User.primary_mobile.ilike(f"%{normalized_mobile}%"))
+        # 1. Try direct match via Identity join
+        query = (
+            select(User)
+            .join(User.identity)
+            .where(Identity.phone == normalized_mobile)
+        )
         if tenant_id:
             query = query.where(User.tenant_id == tenant_id)
             
@@ -88,7 +96,7 @@ class SSOService:
             return user
 
         # 2. Try Identity match
-        id_query = select(Identity).where(Identity.phone.ilike(f"%{normalized_mobile}%"))
+        id_query = select(Identity).where(Identity.phone == normalized_mobile)
         id_result = await db.execute(id_query)
         identity = id_result.scalar_one_or_none()
         if identity:

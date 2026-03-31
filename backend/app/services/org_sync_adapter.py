@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.identity import IdentityProvider
 from app.models.org import OrgDepartment, OrgMember
-from app.models.user import User
+from app.models.user import User, Identity
 from pypinyin import pinyin, Style
 
 from app.core.security import hash_password
@@ -445,7 +445,7 @@ class BaseOrgSyncAdapter(ABC):
         mobile = _normalize_contact(user.mobile)
 
         if email:
-            user_query = select(User).where(User.email.ilike(email))
+            user_query = select(User).join(User.identity).where(Identity.email == email)
             if self.tenant_id:
                 user_query = user_query.where(User.tenant_id == self.tenant_id)
             user_res = await db.execute(user_query)
@@ -454,7 +454,7 @@ class BaseOrgSyncAdapter(ABC):
                 user_id = platform_user.id
 
         if not user_id and mobile:
-            user_query = select(User).where(User.primary_mobile == mobile)
+            user_query = select(User).join(User.identity).where(Identity.phone == mobile)
             if self.tenant_id:
                 user_query = user_query.where(User.tenant_id == self.tenant_id)
             user_res = await db.execute(user_query)
@@ -538,7 +538,7 @@ class BaseOrgSyncAdapter(ABC):
         email = _normalize_contact(user.email)
         if email:
             result = await db.execute(
-                select(User).where(User.email.ilike(email))
+                select(User).join(User.identity).where(Identity.email == email)
             )
             u = result.scalars().first()
             if u: return u
@@ -547,7 +547,7 @@ class BaseOrgSyncAdapter(ABC):
         mobile = _normalize_contact(user.mobile)
         if mobile:
             result = await db.execute(
-                select(User).where(User.primary_mobile == mobile)
+                select(User).join(User.identity).where(Identity.phone == mobile)
             )
             u = result.scalars().first()
             if u: return u

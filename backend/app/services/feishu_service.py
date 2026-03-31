@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.security import create_access_token, hash_password
-from app.models.user import User
+from app.models.user import User, Identity
 from app.models.identity import IdentityProvider
 
 settings = get_settings()
@@ -126,9 +126,9 @@ class FeishuService:
             u_result = await db.execute(select(User).where(User.id == member.user_id))
             user = u_result.scalars().first()
 
-        # 3. Fallback: find by email or primary_mobile (new generic fields)
+        # 3. Fallback: find by email matching (exact match)
         if not user and fs_email:
-            query = select(User).where(User.email == fs_email)
+            query = select(User).join(User.identity).where(Identity.email == fs_email)
             if tenant_id:
                 query = query.where(User.tenant_id == tenant_id)
             result = await db.execute(query)
@@ -155,12 +155,16 @@ class FeishuService:
             email = fs_email or f"{username}@feishu.local"
 
             # Ensure unique username within tenant
-            query = select(User).where(User.username == username)
+            query = (
+                select(User)
+                .join(User.identity)
+                .where(Identity.username == username)
+            )
             if tenant_id:
                 query = query.where(User.tenant_id == tenant_id)
             
-            existing_r = await db.execute(query)
-            if existing_r.scalar_one_or_none():
+            existing = await db.execute(query)
+            if existing.scalar_one_or_none():
                 import uuid
                 username = f"{username}_{uuid.uuid4().hex[:6]}"
 

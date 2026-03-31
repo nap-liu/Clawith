@@ -67,7 +67,7 @@ async def admin_update_user(
             select(User)
             .join(Identity, User.identity_id == Identity.id)
             .where(
-                Identity.email.ilike(update_data["email"]),
+                Identity.email == update_data["email"],
                 User.tenant_id == user.tenant_id,
                 User.id != user.id,
             )

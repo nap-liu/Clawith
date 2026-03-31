@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import hash_password
 from app.models.identity import IdentityProvider
 from app.models.tenant import Tenant
-from app.models.user import Identity, User
+from app.models.user import User, Identity
 from app.services.sso_service import sso_service
 from loguru import logger
 
@@ -71,7 +71,7 @@ class RegistrationService:
 
         # 1. Check Global Identity Conflicts
         if email:
-            ident_result = await db.execute(select(Identity).where(Identity.email.ilike(email)))
+            ident_result = await db.execute(select(Identity).where(Identity.email == email))
             if ident_result.scalar_one_or_none():
                 conflicts.append({
                     "type": "email",
@@ -108,7 +108,7 @@ class RegistrationService:
         
         # Try to find by email
         if email:
-            res = await db.execute(select(Identity).where(Identity.email.ilike(email)))
+            res = await db.execute(select(Identity).where(Identity.email == email))
             identity = res.scalar_one_or_none()
             
         # Try to find by phone
@@ -407,7 +407,7 @@ class RegistrationService:
         if user.email:
             result = await db.execute(
                 select(OrgMember).where(
-                    OrgMember.email.ilike(user.email),
+                    OrgMember.email == user.email,
                     OrgMember.tenant_id == user.tenant_id,
                     OrgMember.user_id == None
                 )

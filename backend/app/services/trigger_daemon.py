@@ -312,10 +312,15 @@ async def _check_new_agent_messages(trigger: AgentTrigger) -> bool:
 
                 # Look up user by display name or username within tenant
                 from sqlalchemy import or_
-                query = select(User).where(
-                    or_(
-                        User.display_name.ilike(f"%{from_user_name}%"),
-                        User.username.ilike(f"%{from_user_name}%"),
+                from app.models.user import User, Identity
+                query = (
+                    select(User)
+                    .join(User.identity)
+                    .where(
+                        or_(
+                            User.display_name.ilike(f"%{from_user_name}%"),
+                            Identity.username.ilike(f"%{from_user_name}%"),
+                        )
                     )
                 )
                 if agent and agent.tenant_id:

@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
 from app.models.identity import IdentityProvider
-from app.models.user import User
+from app.models.user import User, Identity
 from loguru import logger
 
 
@@ -230,7 +230,11 @@ class BaseAuthProvider(ABC):
         username = user_info.email.split("@")[0] if user_info.email else f"{self.provider_type}_{effective_id[:8]}"
 
         # Ensure unique username within tenant
-        query = select(User).where(User.username == username)
+        query = (
+            select(User)
+            .join(User.identity)
+            .where(Identity.username == username)
+        )
         if tenant_id:
             query = query.where(User.tenant_id == tenant_id)
         existing = await db.execute(query)

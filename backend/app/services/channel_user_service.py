@@ -257,9 +257,16 @@ class ChannelUserService:
             username = f"{channel_type}_{external_user_id[:12]}"
 
         # Ensure unique username within tenant
-        existing = await db.execute(
-            select(Identity).where(Identity.username == username)
+        from app.models.user import User, Identity
+        query = (
+            select(User)
+            .join(User.identity)
+            .where(Identity.username == username)
         )
+        if tenant_id:
+            query = query.where(User.tenant_id == tenant_id)
+
+        existing = await db.execute(query)
         if existing.scalar_one_or_none():
             username = f"{username}_{external_user_id[:6]}"
 
@@ -267,12 +274,11 @@ class ChannelUserService:
 
         # Step 1: Find or create global Identity
         identity = None
-        if email and email != f"{username}@{channel_type}.local":
-            # Try to find existing identity by real email
-            res = await db.execute(
-                select(Identity).where(Identity.email.ilike(email))
-            )
-            identity = res.scalar_one_or_none()
+        if email:
+            from app.models.user import Identity
+            query = select(Identity).where(Identity.email == email)
+            id_result = await db.execute(query)
+            identity = id_result.scalar_one_or_none()
 
         if not identity:
             identity = Identity(
@@ -360,7 +366,12 @@ async def get_platform_user_by_org_member(
         username = f"{channel_type}_{org_member.id.hex[:12]}"
 
     # Ensure unique username within tenant
-    query = select(User).where(User.username == username)
+    from app.models.user import User, Identity
+    query = (
+        select(User)
+        .join(User.identity)
+        .where(Identity.username == username)
+    )
     if agent_tenant_id:
         query = query.where(User.tenant_id == agent_tenant_id)
 

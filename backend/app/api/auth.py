@@ -67,7 +67,7 @@ async def check_duplicate(
     if email:
         # Check Identity email
         existing = await db.execute(
-            select(Identity).where(Identity.email.ilike(email))
+            select(Identity).where(Identity.email == email)
         )
         if existing.scalar_one_or_none():
             result["email_exists"] = True
@@ -320,7 +320,7 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
     from app.services.registration_service import registration_service
     
     # Check if this email is already registered globally
-    identity_query = select(Identity).where(Identity.email.ilike(data.email))
+    identity_query = select(Identity).where(Identity.email == data.email)
     ident_res = await db.execute(identity_query)
     identity = ident_res.scalar_one_or_none()
 
@@ -560,7 +560,7 @@ async def forgot_password(
     }
 
     # Find Identity by email
-    identity_query = select(Identity).where(Identity.email.ilike(data.email))
+    identity_query = select(Identity).where(Identity.email == data.email)
     identity_result = await db.execute(identity_query)
     identity = identity_result.scalar_one_or_none()
     
@@ -651,7 +651,7 @@ async def update_me(
             select(User)
             .join(Identity, User.identity_id == Identity.id)
             .where(
-                Identity.email.ilike(update_data["email"]),
+                Identity.email == update_data["email"],
                 User.tenant_id == current_user.tenant_id,
                 User.id != current_user.id,
             )
@@ -1067,7 +1067,7 @@ async def resend_verification(
         return generic_response
 
     # Find Identity by email
-    id_result = await db.execute(select(Identity).where(Identity.email.ilike(data.email)))
+    id_result = await db.execute(select(Identity).where(Identity.email == data.email))
     identity = id_result.scalar_one_or_none()
 
     # Don't reveal if user exists or already verified
