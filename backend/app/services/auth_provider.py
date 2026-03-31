@@ -6,6 +6,7 @@ and concrete implementations for each supported provider.
 
 import httpx
 from abc import ABC, abstractmethod
+from fastapi import HTTPException
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
