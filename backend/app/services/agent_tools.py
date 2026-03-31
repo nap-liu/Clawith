@@ -4746,6 +4746,9 @@ async def _handle_cancel_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
 async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
     """List all active triggers for the agent."""
     from app.models.trigger import AgentTrigger
+    from app.models.agent import Agent as AgentModel
+    from app.models.tenant import Tenant as TenantModel
+    from app.core.domain import resolve_base_url
 
     try:
         async with async_session() as db:
@@ -4756,23 +4759,37 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
             )
             triggers = result.scalars().all()
 
+            # Resolve base_url for webhook triggers
+            _a_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            _agent = _a_r.scalar_one_or_none()
+            _tenant_id = str(_agent.tenant_id) if _agent and _agent.tenant_id else None
+            _base_url = (await resolve_base_url(db, request=None, tenant_id=_tenant_id)).rstrip("/")
+
         if not triggers:
             return "No triggers found. Use set_trigger to create one."
 
-        lines = ["| Name | Type | Config | Reason | Status | Fires |", "|------|------|--------|--------|--------|-------|"]
+        lines = ["| Name | Type | Config | Webhook URL | Reason | Status | Fires |", "|------|------|--------|-------------|--------|--------|-------|"]
         for t in triggers:
             status = "✅ active" if t.is_enabled else "⏸ disabled"
-            config_str = str(t.config)[:50]
+            config = t.config or {}
+            if t.type == "webhook" and config.get("token"):
+                config_str = f"token: {config['token']}"
+                webhook_url = f"{_base_url}/api/webhooks/t/{config['token']}"
+            else:
+                config_str = str(config)[:50]
+                webhook_url = "-"
             reason_str = t.reason[:40] if t.reason else ""
-            lines.append(f"| {t.name} | {t.type} | {config_str} | {reason_str} | {status} | {t.fire_count} |")
+            lines.append(f"| {t.name} | {t.type} | {config_str} | {webhook_url} | {reason_str} | {status} | {t.fire_count} |")
 
         return "\n".join(lines)
+
+
+
 
     except Exception as e:
         return f"❌ Failed to list triggers: {e}"
 
 
-# ─── Image Upload (ImageKit CDN) ────────────────────────────────
 
 async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     """Upload an image to ImageKit CDN and return the public URL.
