@@ -246,20 +246,14 @@ function OrgTab({ tenant }: { tenant: any }) {
     // Mutations
     const addProvider = useMutation({
         mutationFn: (data: any) => {
-            let payload = { ...data, tenant_id: currentTenantId, is_active: true };
-            if (data.provider_type === 'oauth2' && useOAuth2Form) {
-                const fmPayload: Record<string, string> = {};
-                if (data.field_mapping?.user_id) fmPayload.user_id = data.field_mapping.user_id;
-                if (data.field_mapping?.name) fmPayload.name = data.field_mapping.name;
-                if (data.field_mapping?.email) fmPayload.email = data.field_mapping.email;
-                if (data.field_mapping?.mobile) fmPayload.mobile = data.field_mapping.mobile;
-                payload = { ...payload, field_mapping: Object.keys(fmPayload).length > 0 ? fmPayload : null };
+            if (data.provider_type === 'oauth2') {
+                // 直接发送，config 已经在正确位置
                 return fetchJson('/enterprise/identity-providers/oauth2', {
                     method: 'POST',
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify({ ...data, tenant_id: currentTenantId })
                 });
             }
-            return fetchJson('/enterprise/identity-providers', { method: 'POST', body: JSON.stringify(payload) });
+            return fetchJson('/enterprise/identity-providers', { method: 'POST', body: JSON.stringify(data) });
         },
         onSuccess: () => {
             qc.invalidateQueries({ queryKey: ['identity-providers'] });
@@ -273,16 +267,11 @@ function OrgTab({ tenant }: { tenant: any }) {
 
     const updateProvider = useMutation({
         mutationFn: ({ id, data }: { id: string; data: any }) => {
-            if (data.provider_type === 'oauth2' && useOAuth2Form) {
-                const fmPayload: Record<string, string> = {};
-                if (data.field_mapping?.user_id) fmPayload.user_id = data.field_mapping.user_id;
-                if (data.field_mapping?.name) fmPayload.name = data.field_mapping.name;
-                if (data.field_mapping?.email) fmPayload.email = data.field_mapping.email;
-                if (data.field_mapping?.mobile) fmPayload.mobile = data.field_mapping.mobile;
-                const updateData = { ...data, field_mapping: Object.keys(fmPayload).length > 0 ? fmPayload : null };
+            if (data.provider_type === 'oauth2') {
+                // 直接发送，config 已经在正确位置
                 return fetchJson(`/enterprise/identity-providers/${id}/oauth2`, {
                     method: 'PATCH',
-                    body: JSON.stringify(updateData)
+                    body: JSON.stringify(data)
                 });
             }
             return fetchJson(`/enterprise/identity-providers/${id}`, { method: 'PUT', body: JSON.stringify(data) });
@@ -317,8 +306,9 @@ function OrgTab({ tenant }: { tenant: any }) {
         setSyncing(null);
     };
 
-    const initOAuth2FromConfig = (config: any) => {
-        const fm = config?.field_mapping || {};
+    const initOAuth2FromConfig = (config: any): { app_id: string; app_secret: string; authorize_url: string; token_url: string; user_info_url: string; scope: string; field_mapping: { user_id: string; name: string; email: string; mobile: string } | null } => {
+        const fm = config?.field_mapping;
+        const hasFieldMapping = fm && Object.keys(fm).length > 0;
         return {
             app_id: config?.app_id || config?.client_id || '',
             app_secret: config?.app_secret || config?.client_secret || '',
@@ -326,12 +316,12 @@ function OrgTab({ tenant }: { tenant: any }) {
             token_url: config?.token_url || '',
             user_info_url: config?.user_info_url || '',
             scope: config?.scope || 'openid profile email',
-            field_mapping: {
+            field_mapping: hasFieldMapping ? {
                 user_id: fm.user_id || '',
                 name: fm.name || '',
                 email: fm.email || '',
                 mobile: fm.mobile || '',
-            }
+            } : null,
         };
     };
 
@@ -362,7 +352,15 @@ function OrgTab({ tenant }: { tenant: any }) {
         setUseOAuth2Form(type === 'oauth2');
         
         if (existingProvider) {
-            setForm({ ...existingProvider, ...(type === 'oauth2' ? initOAuth2FromConfig(existingProvider.config) : {}) });
+            if (type === 'oauth2') {
+                const oauth2Config = initOAuth2FromConfig(existingProvider.config || {});
+                setForm({
+                    ...existingProvider,
+                    config: oauth2Config,
+                } as any);
+            } else {
+                setForm({ ...existingProvider });
+            }
         } else {
             const defaults: any = {
                 feishu: { app_id: '', app_secret: '', corp_id: '' },
@@ -370,14 +368,31 @@ function OrgTab({ tenant }: { tenant: any }) {
                 wecom: { corp_id: '', secret: '', agent_id: '', bot_id: '', bot_secret: '' },
             };
             const nameMap: Record<string, string> = { feishu: 'Feishu', wecom: 'WeCom', dingtalk: 'DingTalk', oauth2: 'OAuth2' };
-            setForm({
-                provider_type: type,
-                name: nameMap[type] || type,
-                config: defaults[type] || {},
-                app_id: '', app_secret: '', authorize_url: '', token_url: '', user_info_url: '',
-                scope: 'openid profile email',
-                field_mapping: { user_id: '', name: '', email: '', mobile: '' }
-            });
+            if (type === 'oauth2') {
+                setForm({
+                    provider_type: type,
+                    name: nameMap[type] || type,
+                    is_active: true,
+                    sso_login_enabled: true,
+                    config: {
+                        app_id: '',
+                        app_secret: '',
+                        authorize_url: '',
+                        token_url: '',
+                        user_info_url: '',
+                        scope: 'openid profile email',
+                        field_mapping: null,
+                    },
+                    tenant_id: currentTenantId,
+                } as any);
+            } else {
+                setForm({
+                    provider_type: type,
+                    name: nameMap[type] || type,
+                    config: defaults[type] || {},
+                    tenant_id: currentTenantId,
+                } as any);
+            }
         }
         setSelectedDept(null);
         setMemberSearch('');
@@ -454,57 +469,73 @@ function OrgTab({ tenant }: { tenant: any }) {
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                         <div className="form-group">
                             <label className="form-label">Client ID</label>
-                            <input className="form-input" value={form.app_id} onChange={e => setForm({ ...form, app_id: e.target.value })} />
+                            <input className="form-input" value={form.config?.app_id || ''} onChange={e => setForm({ ...form, config: { ...form.config, app_id: e.target.value } })} />
                         </div>
                         <div className="form-group">
                             <label className="form-label">Client Secret</label>
-                            <input className="form-input" type="password" value={form.app_secret} onChange={e => setForm({ ...form, app_secret: e.target.value })} />
+                            <input className="form-input" type="password" value={form.config?.app_secret || ''} onChange={e => setForm({ ...form, config: { ...form.config, app_secret: e.target.value } })} />
                         </div>
                         <div className="form-group" style={{ gridColumn: '1 / -1' }}>
                             <label className="form-label">Authorize URL</label>
-                            <input className="form-input" value={form.authorize_url} onChange={e => setForm({ ...form, authorize_url: e.target.value })} placeholder="https://sso.example.com/oauth2/authorize" />
+                            <input className="form-input" value={form.config?.authorize_url || ''} onChange={e => setForm({ ...form, config: { ...form.config, authorize_url: e.target.value } })} placeholder="https://sso.example.com/oauth2/authorize" />
                         </div>
                         <div className="form-group" style={{ gridColumn: '1 / -1' }}>
                             <label className="form-label">Token URL</label>
-                            <input className="form-input" value={form.token_url} onChange={e => setForm({ ...form, token_url: e.target.value })} placeholder="Leave empty to auto-derive from Authorize URL" />
+                            <input className="form-input" value={form.config?.token_url || ''} onChange={e => setForm({ ...form, config: { ...form.config, token_url: e.target.value } })} placeholder="Leave empty to auto-derive from Authorize URL" />
                         </div>
                         <div className="form-group" style={{ gridColumn: '1 / -1' }}>
                             <label className="form-label">UserInfo URL</label>
-                            <input className="form-input" value={form.user_info_url} onChange={e => setForm({ ...form, user_info_url: e.target.value })} placeholder="Leave empty to auto-derive from Authorize URL" />
+                            <input className="form-input" value={form.config?.user_info_url || ''} onChange={e => setForm({ ...form, config: { ...form.config, user_info_url: e.target.value } })} placeholder="Leave empty to auto-derive from Authorize URL" />
                         </div>
                         <div className="form-group" style={{ gridColumn: '1 / -1' }}>
                             <label className="form-label">Scope</label>
-                            <input className="form-input" value={form.scope} onChange={e => setForm({ ...form, scope: e.target.value })} placeholder="openid profile email" />
+                            <input className="form-input" value={form.config?.scope || ''} onChange={e => setForm({ ...form, config: { ...form.config, scope: e.target.value } })} placeholder="openid profile email" />
                         </div>
                         <div style={{ gridColumn: '1 / -1', marginTop: '4px' }}>
                             <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '8px' }}>
-                                字段映射（可选，留空使用标准 OIDC 字段）
+                                Field Mapping (Optional, leave empty to use standard OIDC fields)
                             </div>
                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                                 <div className="form-group">
-                                    <label className="form-label" style={{ fontSize: '11px' }}>用户 ID 字段</label>
-                                    <input className="form-input" value={form.field_mapping?.user_id || ''}
-                                        onChange={e => setForm({ ...form, field_mapping: { ...form.field_mapping, user_id: e.target.value } })}
-                                        placeholder="留空用标准字段 sub" style={{ fontSize: '12px' }} />
+                                    <label className="form-label" style={{ fontSize: '11px' }}>User ID Field</label>
+                                    <div style={{ display: 'flex', gap: '4px' }}>
+                                        <input className="form-input" value={form.config?.field_mapping?.user_id || ''}
+                                            onChange={e => setForm({ ...form, config: { ...form.config, field_mapping: form.config.field_mapping ? { ...form.config.field_mapping, user_id: e.target.value } : { user_id: e.target.value, name: '', email: '', mobile: '' } } })}
+                                            placeholder="Default: sub" style={{ fontSize: '12px', flex: 1 }} />
+                                        <button className="btn btn-ghost btn-sm" onClick={() => setForm({ ...form, config: { ...form.config, field_mapping: form.config.field_mapping ? { ...form.config.field_mapping, user_id: '' } : { user_id: '', name: '', email: '', mobile: '' } } })} title="Clear this field" style={{ minWidth: 'auto', padding: '4px 8px' }}>✕</button>
+                                    </div>
                                 </div>
                                 <div className="form-group">
-                                    <label className="form-label" style={{ fontSize: '11px' }}>姓名字段</label>
-                                    <input className="form-input" value={form.field_mapping?.name || ''}
-                                        onChange={e => setForm({ ...form, field_mapping: { ...form.field_mapping, name: e.target.value } })}
-                                        placeholder="留空用标准字段 name" style={{ fontSize: '12px' }} />
+                                    <label className="form-label" style={{ fontSize: '11px' }}>Name Field</label>
+                                    <div style={{ display: 'flex', gap: '4px' }}>
+                                        <input className="form-input" value={form.config?.field_mapping?.name || ''}
+                                            onChange={e => setForm({ ...form, config: { ...form.config, field_mapping: form.config.field_mapping ? { ...form.config.field_mapping, name: e.target.value } : { user_id: '', name: e.target.value, email: '', mobile: '' } } })}
+                                            placeholder="Default: name" style={{ fontSize: '12px', flex: 1 }} />
+                                        <button className="btn btn-ghost btn-sm" onClick={() => setForm({ ...form, config: { ...form.config, field_mapping: form.config.field_mapping ? { ...form.config.field_mapping, name: '' } : { user_id: '', name: '', email: '', mobile: '' } } })} title="Clear this field" style={{ minWidth: 'auto', padding: '4px 8px' }}>✕</button>
+                                    </div>
                                 </div>
                                 <div className="form-group">
-                                    <label className="form-label" style={{ fontSize: '11px' }}>邮箱字段</label>
-                                    <input className="form-input" value={form.field_mapping?.email || ''}
-                                        onChange={e => setForm({ ...form, field_mapping: { ...form.field_mapping, email: e.target.value } })}
-                                        placeholder="留空用标准字段 email" style={{ fontSize: '12px' }} />
+                                    <label className="form-label" style={{ fontSize: '11px' }}>Email Field</label>
+                                    <div style={{ display: 'flex', gap: '4px' }}>
+                                        <input className="form-input" value={form.config?.field_mapping?.email || ''}
+                                            onChange={e => setForm({ ...form, config: { ...form.config, field_mapping: form.config.field_mapping ? { ...form.config.field_mapping, email: e.target.value } : { user_id: '', name: '', email: e.target.value, mobile: '' } } })}
+                                            placeholder="Default: email" style={{ fontSize: '12px', flex: 1 }} />
+                                        <button className="btn btn-ghost btn-sm" onClick={() => setForm({ ...form, config: { ...form.config, field_mapping: form.config.field_mapping ? { ...form.config.field_mapping, email: '' } : { user_id: '', name: '', email: '', mobile: '' } } })} title="Clear this field" style={{ minWidth: 'auto', padding: '4px 8px' }}>✕</button>
+                                    </div>
                                 </div>
                                 <div className="form-group">
-                                    <label className="form-label" style={{ fontSize: '11px' }}>手机号字段</label>
-                                    <input className="form-input" value={form.field_mapping?.mobile || ''}
-                                        onChange={e => setForm({ ...form, field_mapping: { ...form.field_mapping, mobile: e.target.value } })}
-                                        placeholder="留空用标准字段 phone_number" style={{ fontSize: '12px' }} />
+                                    <label className="form-label" style={{ fontSize: '11px' }}>Mobile Field</label>
+                                    <div style={{ display: 'flex', gap: '4px' }}>
+                                        <input className="form-input" value={form.config?.field_mapping?.mobile || ''}
+                                            onChange={e => setForm({ ...form, config: { ...form.config, field_mapping: form.config.field_mapping ? { ...form.config.field_mapping, mobile: e.target.value } : { user_id: '', name: '', email: '', mobile: e.target.value } } })}
+                                            placeholder="Default: phone_number" style={{ fontSize: '12px', flex: 1 }} />
+                                        <button className="btn btn-ghost btn-sm" onClick={() => setForm({ ...form, config: { ...form.config, field_mapping: form.config.field_mapping ? { ...form.config.field_mapping, mobile: '' } : { user_id: '', name: '', email: '', mobile: '' } } })} title="Clear this field" style={{ minWidth: 'auto', padding: '4px 8px' }}>✕</button>
+                                    </div>
                                 </div>
+                            </div>
+                            <div style={{ marginTop: '8px' }}>
+                                <button className="btn btn-ghost btn-sm" onClick={() => setForm({ ...form, config: { ...form.config, field_mapping: null } })} disabled={!form.config?.field_mapping} style={{ fontSize: '11px' }}>🗑️ Clear All Field Mappings</button>
+                                {form.config?.field_mapping && <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginLeft: '8px' }}>Custom field mapping configured</span>}
                             </div>
                         </div>
                     </div>

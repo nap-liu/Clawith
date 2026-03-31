@@ -16,6 +16,8 @@ from app.models.user import User
 from app.models.agent import Agent
 from app.models.llm import LLMModel
 from app.models.audit import AuditLog, ApprovalRequest, EnterpriseInfo
+from app.schemas.oauth2 import OAuth2ProviderCreate, OAuth2ProviderUpdate, OAuth2Config
+from app.schemas.oauth2 import OAuth2ProviderCreate, OAuth2ProviderUpdate, OAuth2Config
 from app.schemas.schemas import (
     ApprovalAction, ApprovalRequestOut, AuditLogOut, EnterpriseInfoOut,
     EnterpriseInfoUpdate, LLMModelCreate, LLMModelOut, LLMModelUpdate,
@@ -614,6 +616,13 @@ class IdentityProviderCreate(BaseModel):
     tenant_id: uuid.UUID | None = None
 
 
+class IdentityProviderUpdate(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+    sso_login_enabled: bool | None = None
+    config: dict | None = None
+
+
 class OAuth2Config(BaseModel):
     """OAuth2 provider configuration with friendly field names."""
     app_id: str | None = None          # Alias for client_id
@@ -750,82 +759,50 @@ async def create_identity_provider(
 
 @router.post("/identity-providers/oauth2", response_model=IdentityProviderOut)
 async def create_oauth2_provider(
-    data: IdentityProviderOAuth2Create,
+    data: OAuth2ProviderCreate,
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new OAuth2 identity provider with simplified fields (app_id, app_secret, authorize_url, etc.)."""
-    # Convert to config dict
-    oauth_config = OAuth2Config(
-        app_id=data.app_id,
-        app_secret=data.app_secret,
-        authorize_url=data.authorize_url,
-        token_url=data.token_url,
-        user_info_url=data.user_info_url,
-        scope=data.scope,
-        field_mapping=data.field_mapping,
-    )
-    config = oauth_config.to_config_dict()
-
-    # Validate
-    validate_provider_config("oauth2", config)
-
-    # Validate and determine tenant_id
-    tid = data.tenant_id
-    if current_user.role == "platform_admin":
-        # Platform admins can use any tenant_id (including None for global providers)
-        pass
-    else:
-        # Non-platform admins: use request tenant_id if provided, else fall back to user's tenant
-        if tid is None:
-            tid = current_user.tenant_id
-        elif str(tid) != str(current_user.tenant_id):
-            # Validate they can only manage their own tenant
-            raise HTTPException(status_code=403, detail="Can only create providers for your own tenant")
-
+    """Create OAuth2 provider - strict config format only."""
+    # Validate tenant
+    tid = data.tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
     if not tid:
-        raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
+        raise HTTPException(status_code=400, detail="tenant_id is required")
 
+    # Build config dict from validated model
+    config_dict = data.config.model_dump(mode='json', exclude_unset=True)
+    
+    # Handle field_mapping: None means no mapping, empty dict also means None
+    if config_dict.get('field_mapping') == {}:
+        config_dict['field_mapping'] = None
+    
     provider = IdentityProvider(
         provider_type="oauth2",
         name=data.name,
         is_active=data.is_active,
-        sso_login_enabled=True,
-        config=config,
-        tenant_id=tid
+        sso_login_enabled=data.sso_login_enabled,
+        config=config_dict,
+        tenant_id=uuid.UUID(tid) if tid else None,
     )
     db.add(provider)
     await db.commit()
     await db.refresh(provider)
 
-    # 同步 tenant SSO 状态
+    # Sync tenant SSO state
     if provider.tenant_id:
         await _sync_tenant_sso_state(db, provider.tenant_id)
 
     return IdentityProviderOut.model_validate(provider)
 
 
-class OAuth2ConfigUpdate(BaseModel):
-    """OAuth2 provider configuration update with dedicated fields."""
-    name: str | None = None
-    is_active: bool | None = None
-    app_id: str | None = None
-    app_secret: str | None = None  # Set to None to keep existing, empty to clear
-    authorize_url: str | None = None
-    token_url: str | None = None
-    user_info_url: str | None = None
-    scope: str | None = None
-    field_mapping: dict | None = None  # Custom field name mapping
-
-
 @router.patch("/identity-providers/{provider_id}/oauth2", response_model=IdentityProviderOut)
 async def update_oauth2_provider(
     provider_id: uuid.UUID,
-    data: OAuth2ConfigUpdate,
+    data: OAuth2ProviderUpdate,
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update an OAuth2 identity provider with simplified fields."""
+    """Update OAuth2 provider - config format only, no backward compatibility."""
     result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
     provider = result.scalar_one_or_none()
     if not provider:
@@ -837,52 +814,38 @@ async def update_oauth2_provider(
     if current_user.role != "platform_admin" and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to update this provider")
 
-    # Update name and is_active
+    # Update basic fields
     if data.name is not None:
         provider.name = data.name
     if data.is_active is not None:
         provider.is_active = data.is_active
+    if data.sso_login_enabled is not None:
+        provider.sso_login_enabled = data.sso_login_enabled
 
-    # Update config fields
-    if any([data.app_id, data.app_secret is not None, data.authorize_url, data.token_url, data.user_info_url, data.scope, data.field_mapping is not None]):
+    # Update config if provided
+    if data.config is not None:
+        config_dict = data.config.model_dump(mode='json', exclude_unset=True)
         current_config = provider.config.copy()
-
-        if data.app_id is not None:
-            current_config["app_id"] = data.app_id
-            current_config["client_id"] = data.app_id
-        if data.app_secret is not None:
-            # Only update if explicitly set (not None) - allows clearing
-            if data.app_secret:
-                current_config["app_secret"] = data.app_secret
-                current_config["client_secret"] = data.app_secret
-            else:
-                current_config.pop("app_secret", None)
-                current_config.pop("client_secret", None)
-        if data.authorize_url is not None:
-            current_config["authorize_url"] = data.authorize_url
-        if data.token_url is not None:
-            current_config["token_url"] = data.token_url
-        if data.user_info_url is not None:
-            current_config["user_info_url"] = data.user_info_url
-        if data.scope is not None:
-            current_config["scope"] = data.scope
-        if data.field_mapping is not None:
-            current_config["field_mapping"] = data.field_mapping
-
-        # Validate the updated config
+        
+        # Merge config fields
+        for key, value in config_dict.items():
+            if key == 'field_mapping':
+                # field_mapping: None = clear, {} = use defaults, {...} = custom mapping
+                if value is None:
+                    current_config.pop('field_mapping', None)
+                elif value == {}:
+                    current_config.pop('field_mapping', None)
+                else:
+                    current_config['field_mapping'] = value
+            elif value is not None:
+                current_config[key] = value
+        
         validate_provider_config("oauth2", current_config)
         provider.config = current_config
 
     await db.commit()
     await db.refresh(provider)
     return IdentityProviderOut.model_validate(provider)
-
-
-class IdentityProviderUpdate(BaseModel):
-    name: str | None = None
-    is_active: bool | None = None
-    sso_login_enabled: bool | None = None
-    config: dict | None = None
 
 
 @router.put("/identity-providers/{provider_id}", response_model=IdentityProviderOut)
