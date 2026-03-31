@@ -398,13 +398,16 @@ export default function Chat() {
      * Must be called AFTER React has committed the new value to the DOM,
      * so we use the ref rather than the event target for reliability.
      */
+    const MAX_TEXTAREA_HEIGHT = 130;
     const resizeTextarea = () => {
         const el = textareaRef.current;
         if (!el) return;
         // Reset to 'auto' so the element can shrink when text is deleted
         el.style.height = 'auto';
-        // scrollHeight gives the natural height needed for the full content
-        el.style.height = Math.min(el.scrollHeight, 130) + 'px';
+        const natural = el.scrollHeight;
+        el.style.height = Math.min(natural, MAX_TEXTAREA_HEIGHT) + 'px';
+        // When content exceeds the cap, enable scrolling; otherwise hide scrollbar
+        el.style.overflowY = natural > MAX_TEXTAREA_HEIGHT ? 'auto' : 'hidden';
     };
 
     const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -619,8 +622,8 @@ export default function Chat() {
                         style={{
                             // Disable manual resize handle; height is controlled by JS
                             resize: 'none',
-                            // Hide scrollbar — height is always exactly the content height
-                            overflow: 'hidden',
+                            // overflow-y is dynamically toggled by resizeTextarea()
+                            overflowY: 'hidden',
                             lineHeight: '22px',
                             paddingTop: '8px',
                             paddingBottom: '8px',

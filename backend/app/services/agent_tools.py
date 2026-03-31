@@ -1608,8 +1608,14 @@ async def execute_tool(
     arguments: dict,
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
+    session_id: str = "",
 ) -> str:
-    """Execute a tool call and return the result as a string."""
+    """Execute a tool call and return the result as a string.
+
+    Args:
+        session_id: The ChatSession ID, used to isolate AgentBay instances
+                    per conversation. Passed through to agentbay_* tools.
+    """
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
 
     ws = await ensure_workspace(agent_id, tenant_id=_agent_tenant_id)
@@ -1639,6 +1645,12 @@ async def execute_tool(
         except Exception as e:
             logger.exception(f"[Autonomy] Check failed: {e}")
             return f"⚠️ Autonomy check failed ({e}). Operation blocked for safety. Please retry or contact admin."
+
+    # Pre-inject session_id into arguments for AgentBay tools so each
+    # _agentbay_* handler can pass it to get_agentbay_client_for_agent()
+    # for per-ChatSession isolation of cloud instances.
+    if tool_name.startswith("agentbay_"):
+        arguments["_session_id"] = session_id
 
     try:
         if tool_name == "list_files":
@@ -5175,19 +5187,46 @@ async def _resolve_bitable_app_token(agent_id: uuid.UUID, parsed_url: dict) -> s
     return None
 
 def _check_feishu_err(resp: dict) -> str | None:
+    """Check Feishu API response for errors and return a user-friendly message.
+
+    For permission-related errors, returns detailed step-by-step instructions
+    guiding the user through the Feishu UI to grant the bot app access to
+    the target document or Bitable.
+    """
     code = resp.get("code")
     if code != 0:
         msg = str(resp.get("msg", ""))
-        if code in [99991663, 10006, 99991661, 99991668] or "permission" in msg.lower() or "403" in msg:
+        msg_lower = msg.lower()
+        # Common Feishu permission/access error codes:
+        #   99991663 - no permission to access resource
+        #   99991661 - token invalid / access denied
+        #   99991668 - permission denied on resource
+        #   10006    - no permission
+        #   91403    - Forbidden (bitable write without app access)
+        #   91404    - bitable record not found (sometimes permission)
+        #   1063001  - doc permission denied
+        #   1063004  - doc operation forbidden
+        _perm_codes = {99991663, 10006, 99991661, 99991668, 91403, 1063001, 1063004}
+        _perm_keywords = ("permission", "forbidden", "no access", "access denied", "403")
+        is_perm_error = code in _perm_codes or any(kw in msg_lower for kw in _perm_keywords)
+        if is_perm_error:
             return (
-                f"Failed: Permission denied (code: {code}). "
+                f"Failed: Permission denied (code: {code}, msg: {msg}). "
                 "The bot app does not have access to this document/Bitable. "
-                "CRITICAL INSTRUCTION for the Agent: You MUST explicitly output the following "
-                "step-by-step instructions to the user in your reply to help them grant permission:\n"
-                "1. 在飞书文档左上或者右上角点击「...」菜单。\n"
-                "2. 将鼠标悬浮至「更多」。\n"
-                "3. 点击「添加文档应用」。\n"
-                "4. 搜索当前机器人名字或者 Clawith 并点击添加。"
+                "CRITICAL INSTRUCTION for the Agent: You MUST explicitly output ALL of the following "
+                "step-by-step instructions to the user in your reply. Do NOT omit or summarize any step:\n\n"
+                "---\n"
+                "**The bot needs to be added to this document/table as an authorized app. "
+                "Please follow these steps:**\n\n"
+                "1. Open the target document or Bitable in the Feishu client (web or desktop).\n"
+                "2. Click the **「...」** menu button in the top-right corner of the page.\n"
+                "3. In the dropdown menu, hover over **「更多」** (More) at the bottom.\n"
+                "4. In the sub-menu that appears, click **「添加文档应用」** (Add Document App).\n"
+                "5. In the search box, type the name of your Feishu bot app (the one bound to this Agent's channel), then click to add it.\n"
+                "6. After adding, retry the same operation.\n\n"
+                "If you cannot find 「添加文档应用」, it means the document owner may need to enable this option, "
+                "or you can try: click **「分享」** (Share) button -> invite the bot app directly.\n"
+                "---"
             )
         return f"Failed: API Error {code} - {msg}"
     return None
@@ -5223,10 +5262,10 @@ async def _bitable_list_tables(agent_id: uuid.UUID, arguments: dict) -> str:
 
 
 async def _bitable_create_app(agent_id: uuid.UUID, arguments: dict) -> str:
-    """Create a new Feishu Bitable (多维表格) app in the user's Drive.
+    """Create a new Feishu Bitable (多维表格) app.
 
-    Calls the Drive v1 files API with type='bitable'.
-    Resolves the tenant domain to return a user-accessible URL.
+    Calls the Bitable v1 apps API: POST /open-apis/bitable/v1/apps
+    The API response includes a user-accessible URL with the tenant's own domain.
     """
     name = arguments.get("name", "").strip()
     if not name:
@@ -5245,23 +5284,28 @@ async def _bitable_create_app(agent_id: uuid.UUID, arguments: dict) -> str:
         if err:
             return err
 
-        # The Drive API returns the new file info under data.file (or data.token in some versions)
-        file_info = resp.get("data", {}).get("file", {}) or resp.get("data", {})
-        app_token = file_info.get("token", "") or file_info.get("app_token", "")
+        # API response structure: data.app.{app_token, name, url, default_table_id, folder_token}
+        app_info = resp.get("data", {}).get("app", {})
+        app_token = app_info.get("app_token", "")
+        bitable_url = app_info.get("url", "")
+        default_table_id = app_info.get("default_table_id", "")
         if not app_token:
             return f"Failed: Bitable created but could not extract app_token from response: {resp}"
 
-        # Build a user-accessible URL with the tenant's real domain
-        tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
-        bitable_url = await _get_feishu_bitable_url(tenant_token, app_token)
+        # Fallback URL resolution if the API didn't return one
+        if not bitable_url:
+            tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
+            bitable_url = await _get_feishu_bitable_url(tenant_token, app_token)
 
-        return (
-            f"✅ 多维表格创建成功！\n"
-            f"名称：{name}\n"
-            f"App Token：{app_token}\n"
-            f"🔗 访问链接：{bitable_url}\n"
-            f"下一步：可以调用 bitable_list_tables(url='{bitable_url}') 查看初始数据表。"
+        result = (
+            f"OK: Bitable created successfully!\n"
+            f"Name: {name}\n"
+            f"App Token: {app_token}\n"
+            f"URL: {bitable_url}"
         )
+        if default_table_id:
+            result += f"\nDefault Table ID: {default_table_id}"
+        return result
     except Exception as e:
         return f"Failed: {str(e)[:300]}"
 
@@ -6876,7 +6920,8 @@ async def _agentbay_browser_navigate(agent_id: Optional[uuid.UUID], ws: Path, ar
     save_to_workspace = arguments.get("save_to_workspace", False)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         # Always request a screenshot for navigation so the model can observe the result
         result = await client.browser_navigate(url, wait_for=wait_for, screenshot=True)
 
@@ -6955,7 +7000,8 @@ async def _agentbay_browser_screenshot(agent_id: Optional[uuid.UUID], ws: Path, 
     save_to_workspace = arguments.get("save_to_workspace", False)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         result = await client.browser_screenshot()
 
         screenshot_data = result.get("screenshot")
@@ -7014,7 +7060,8 @@ async def _agentbay_browser_click(agent_id: Optional[uuid.UUID], ws: Path, argum
     selector = arguments.get("selector", "")
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         await client.browser_click(selector)
         return f"✅ 已点击元素: {selector}"
     except RuntimeError as e:
@@ -7035,7 +7082,8 @@ async def _agentbay_browser_type(agent_id: Optional[uuid.UUID], ws: Path, argume
     text = arguments.get("text", "")
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         await client.browser_type(selector, text)
         return f"✅ 已在 {selector} 输入文本"
     except RuntimeError as e:
@@ -7060,7 +7108,8 @@ async def _agentbay_code_execute(agent_id: Optional[uuid.UUID], ws: Path, argume
         return "❌ 请提供要执行的代码"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "code")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "code", session_id=_session_id)
         result = await client.code_execute(language, code, timeout)
 
         # 格式化返回结果
@@ -7423,7 +7472,8 @@ async def _agentbay_browser_extract(agent_id: Optional[uuid.UUID], ws: Path, arg
         return "Missing required argument 'instruction'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         result = await client.browser_extract(instruction, selector=selector)
 
         if result.get("success"):
@@ -7455,7 +7505,8 @@ async def _agentbay_browser_observe(agent_id: Optional[uuid.UUID], ws: Path, arg
         return "Missing required argument 'instruction'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         result = await client.browser_observe(instruction, selector=selector)
 
         if result.get("success"):
@@ -7497,7 +7548,8 @@ async def _agentbay_browser_login(agent_id: Optional[uuid.UUID], ws: Path, argum
         return "Missing required argument 'login_config' (JSON string with api_key + skill_id)"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "browser")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
         result = await client.browser_login(url, login_config)
 
         if result.get("success"):
@@ -7527,7 +7579,8 @@ async def _agentbay_command_exec(agent_id: Optional[uuid.UUID], ws: Path, argume
         return "Missing required argument 'command'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "code")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "code", session_id=_session_id)
         result = await client.command_exec(command, timeout_ms=timeout_ms, cwd=cwd)
 
         parts = []
@@ -7600,7 +7653,8 @@ async def _agentbay_computer_screenshot(agent_id: Optional[uuid.UUID], ws: Path,
     save_to_workspace = arguments.get("save_to_workspace", False)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_screenshot()
 
         if not (result.get("success") and result.get("data")):
@@ -7662,7 +7716,8 @@ async def _agentbay_computer_click(agent_id: Optional[uuid.UUID], ws: Path, argu
     button = arguments.get("button", "left")
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_click(x, y, button=button)
         if result.get("success"):
             return f"Clicked at ({x}, {y}) with {button} button"
@@ -7686,7 +7741,8 @@ async def _agentbay_computer_input_text(agent_id: Optional[uuid.UUID], ws: Path,
         return "Missing required argument 'text'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_input_text(text)
         if result.get("success"):
             return f"Typed text: {text[:100]}"
@@ -7712,7 +7768,8 @@ async def _agentbay_computer_press_keys(agent_id: Optional[uuid.UUID], ws: Path,
         return "Missing required argument 'keys'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_press_keys(keys, hold=hold)
         key_str = "+".join(keys)
         if result.get("success"):
@@ -7738,7 +7795,8 @@ async def _agentbay_computer_scroll(agent_id: Optional[uuid.UUID], ws: Path, arg
     amount = arguments.get("amount", 1)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_scroll(x, y, direction=direction, amount=amount)
         if result.get("success"):
             return f"Scrolled {direction} by {amount} step(s) at ({x}, {y})"
@@ -7761,7 +7819,8 @@ async def _agentbay_computer_move_mouse(agent_id: Optional[uuid.UUID], ws: Path,
     y = arguments.get("y", 0)
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_move_mouse(x, y)
         if result.get("success"):
             return f"Mouse moved to ({x}, {y})"
@@ -7787,7 +7846,8 @@ async def _agentbay_computer_drag_mouse(agent_id: Optional[uuid.UUID], ws: Path,
     button = arguments.get("button", "left")
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_drag_mouse(from_x, from_y, to_x, to_y, button=button)
         if result.get("success"):
             return f"Dragged from ({from_x}, {from_y}) to ({to_x}, {to_y})"
@@ -7807,7 +7867,8 @@ async def _agentbay_computer_get_screen_size(agent_id: Optional[uuid.UUID], ws: 
     from app.services.agentbay_client import get_agentbay_client_for_agent
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_get_screen_size()
         if result.get("success"):
             import json
@@ -7836,7 +7897,8 @@ async def _agentbay_computer_start_app(agent_id: Optional[uuid.UUID], ws: Path, 
         return "Missing required argument 'cmd'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_start_app(cmd, work_dir=work_dir)
         if result.get("success"):
             # result.data may contain non-serializable objects (e.g. Process),
@@ -7867,7 +7929,8 @@ async def _agentbay_computer_get_cursor_position(agent_id: Optional[uuid.UUID], 
     from app.services.agentbay_client import get_agentbay_client_for_agent
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_get_cursor_position()
         if result.get("success"):
             import json
@@ -7890,7 +7953,8 @@ async def _agentbay_computer_get_active_window(agent_id: Optional[uuid.UUID], ws
     from app.services.agentbay_client import get_agentbay_client_for_agent
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_get_active_window()
         if result.get("success"):
             import json
@@ -7917,7 +7981,8 @@ async def _agentbay_computer_activate_window(agent_id: Optional[uuid.UUID], ws: 
         return "Missing required argument 'window_id'"
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_activate_window(int(window_id))
         if result.get("success"):
             return f"Window {window_id} activated (brought to front)"
@@ -7937,7 +8002,8 @@ async def _agentbay_computer_list_visible_apps(agent_id: Optional[uuid.UUID], ws
     from app.services.agentbay_client import get_agentbay_client_for_agent
 
     try:
-        client = await get_agentbay_client_for_agent(agent_id, "computer")
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "computer", session_id=_session_id)
         result = await client.computer_list_visible_apps()
         if result.get("success"):
             import json

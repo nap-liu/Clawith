@@ -3723,12 +3723,16 @@ function AgentDetailInner() {
                                                 value={chatInput}
                                                 onChange={e => {
                                                     setChatInput(e.target.value);
-                                                    // Auto-resize: reset then expand up to ~5 lines (130px)
+                                                    // Auto-resize: reset then expand up to ~5 lines (130px);
+                                                    // enable scrolling when content exceeds that cap.
+                                                    const MAX_H = 130;
                                                     requestAnimationFrame(() => {
                                                         const el = chatInputRef.current;
                                                         if (!el) return;
                                                         el.style.height = 'auto';
-                                                        el.style.height = Math.min(el.scrollHeight, 130) + 'px';
+                                                        const natural = el.scrollHeight;
+                                                        el.style.height = Math.min(natural, MAX_H) + 'px';
+                                                        el.style.overflowY = natural > MAX_H ? 'auto' : 'hidden';
                                                     });
                                                 }}
                                                 onKeyDown={e => {
@@ -3745,7 +3749,7 @@ function AgentDetailInner() {
                                                 style={{
                                                     flex: 1,
                                                     resize: 'none',
-                                                    overflow: 'hidden',
+                                                    overflowY: 'hidden',
                                                     lineHeight: '22px',
                                                     paddingTop: '7px',
                                                     paddingBottom: '7px',
