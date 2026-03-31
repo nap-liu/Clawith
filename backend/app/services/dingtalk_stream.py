@@ -408,6 +408,17 @@ async def _send_dingtalk_media_message(
 
 # ─── Stream Manager ─────────────────────────────────────
 
+def _fire_and_forget(loop, coro):
+    """Schedule a coroutine on the main loop and log any unhandled exception."""
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    def _on_done(f):
+        try:
+            f.result()
+        except Exception:
+            logger.exception("[DingTalk Stream] Unhandled error in fire-and-forget coroutine")
+    future.add_done_callback(_on_done)
+
+
 class DingTalkStreamManager:
     """Manages DingTalk Stream clients for all agents."""
 
@@ -513,11 +524,9 @@ class DingTalkStreamManager:
                         if main_loop and main_loop.is_running():
                             # Add thinking reaction immediately
                             from app.services.dingtalk_reaction import add_thinking_reaction
-                            asyncio.run_coroutine_threadsafe(
-                                add_thinking_reaction(app_key, app_secret, message_id, conversation_id),
-                                main_loop,
-                            )
-                            asyncio.run_coroutine_threadsafe(
+                            _fire_and_forget(main_loop,
+                                add_thinking_reaction(app_key, app_secret, message_id, conversation_id))
+                            _fire_and_forget(main_loop,
                                 process_dingtalk_message(
                                     agent_id=agent_id,
                                     sender_staff_id=sender_staff_id,
@@ -528,9 +537,7 @@ class DingTalkStreamManager:
                                     sender_nick=sender_nick,
                                     message_id=message_id,
                                     sender_id=sender_id,
-                                ),
-                                main_loop,
-                            )
+                                ))
                             # Fire-and-forget: ACK immediately, do not wait for LLM
                         else:
                             logger.warning("[DingTalk Stream] Main loop not available")
@@ -542,12 +549,10 @@ class DingTalkStreamManager:
                         if main_loop and main_loop.is_running():
                             # Add thinking reaction immediately
                             from app.services.dingtalk_reaction import add_thinking_reaction
-                            asyncio.run_coroutine_threadsafe(
-                                add_thinking_reaction(app_key, app_secret, message_id, conversation_id),
-                                main_loop,
-                            )
+                            _fire_and_forget(main_loop,
+                                add_thinking_reaction(app_key, app_secret, message_id, conversation_id))
                             # Process media (download + encode) in the main loop
-                            asyncio.run_coroutine_threadsafe(
+                            _fire_and_forget(main_loop,
                                 self._handle_media_and_dispatch(
                                     msg_data=msg_data,
                                     app_key=app_key,
@@ -560,9 +565,7 @@ class DingTalkStreamManager:
                                     sender_nick=sender_nick,
                                     message_id=message_id,
                                     sender_id=sender_id,
-                                ),
-                                main_loop,
-                            )
+                                ))
                             # Fire-and-forget: ACK immediately, do not wait for LLM
                         else:
                             logger.warning("[DingTalk Stream] Main loop not available")

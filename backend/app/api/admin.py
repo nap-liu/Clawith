@@ -458,6 +458,7 @@ async def delete_company(
     from app.models.tenant_setting import TenantSetting
     from app.models.trigger import AgentTrigger
     from app.models.tool import AgentTool
+    from app.models.identity import IdentityProvider, SSOScanSession
 
     # 3.1 Collect agent_ids and user_ids for this tenant
     agent_ids_result = await db.execute(
@@ -478,6 +479,12 @@ async def delete_company(
         await db.execute(sa_delete(ChannelConfig).where(ChannelConfig.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(AgentTool).where(AgentTool.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(Notification).where(Notification.agent_id.in_(agent_ids)))
+        # Delete TaskLog before Task (FK: task_id -> tasks.id, no cascade)
+        from app.models.task import TaskLog
+        task_ids_r = await db.execute(select(Task.id).where(Task.agent_id.in_(agent_ids)))
+        task_ids = [row[0] for row in task_ids_r.all()]
+        if task_ids:
+            await db.execute(sa_delete(TaskLog).where(TaskLog.task_id.in_(task_ids)))
         await db.execute(sa_delete(Task).where(Task.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(AuditLog).where(AuditLog.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(ApprovalRequest).where(ApprovalRequest.agent_id.in_(agent_ids)))
@@ -517,9 +524,19 @@ async def delete_company(
     await db.execute(sa_delete(OrgMember).where(OrgMember.tenant_id == company_id))
     await db.execute(sa_delete(OrgDepartment).where(OrgDepartment.tenant_id == company_id))
     await db.execute(sa_delete(InvitationCode).where(InvitationCode.tenant_id == company_id))
+    # Delete SkillFile before Skill (FK: skill_id -> skills.id, no cascade)
+    from app.models.skill import SkillFile
+    skill_ids_r = await db.execute(select(Skill.id).where(Skill.tenant_id == company_id))
+    skill_ids = [row[0] for row in skill_ids_r.all()]
+    if skill_ids:
+        await db.execute(sa_delete(SkillFile).where(SkillFile.skill_id.in_(skill_ids)))
     await db.execute(sa_delete(Skill).where(Skill.tenant_id == company_id))
     await db.execute(sa_delete(LLMModel).where(LLMModel.tenant_id == company_id))
     await db.execute(sa_delete(TenantSetting).where(TenantSetting.tenant_id == company_id))
+
+    # 3.4b Delete identity tables with tenant_id (soft FK)
+    await db.execute(sa_delete(IdentityProvider).where(IdentityProvider.tenant_id == company_id))
+    await db.execute(sa_delete(SSOScanSession).where(SSOScanSession.tenant_id == company_id))
 
     # 3.5 Delete agents (after all agent-dependent tables)
     await db.execute(sa_delete(Agent).where(Agent.tenant_id == company_id))
