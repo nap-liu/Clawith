@@ -22,8 +22,6 @@ router = APIRouter(tags=["dingtalk"])
 # --- DingTalk Corp API helpers -----------------------------------------
 import time as _time
 
-_corp_token_cache: dict[str, tuple[str, float]] = {}  # {app_key: (token, expire_ts)}
-
 
 async def _get_corp_access_token(app_key: str, app_secret: str) -> str | None:
     """Get corp access_token via global DingTalkTokenManager (shared with stream/reaction)."""
