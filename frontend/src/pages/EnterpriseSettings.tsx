@@ -207,7 +207,8 @@ function OrgTab({ tenant }: { tenant: any }) {
         authorize_url: '',
         token_url: '',
         user_info_url: '',
-        scope: 'openid profile email'
+        scope: 'openid profile email',
+        field_mapping: { user_id: '', name: '', email: '', mobile: '' } as Record<string, string>
     });
 
     const currentTenantId = localStorage.getItem('current_tenant_id') || '';
@@ -245,8 +246,14 @@ function OrgTab({ tenant }: { tenant: any }) {
     // Mutations
     const addProvider = useMutation({
         mutationFn: (data: any) => {
-            const payload = { ...data, tenant_id: currentTenantId, is_active: true };
+            let payload = { ...data, tenant_id: currentTenantId, is_active: true };
             if (data.provider_type === 'oauth2' && useOAuth2Form) {
+                const fmPayload: Record<string, string> = {};
+                if (data.field_mapping?.user_id) fmPayload.user_id = data.field_mapping.user_id;
+                if (data.field_mapping?.name) fmPayload.name = data.field_mapping.name;
+                if (data.field_mapping?.email) fmPayload.email = data.field_mapping.email;
+                if (data.field_mapping?.mobile) fmPayload.mobile = data.field_mapping.mobile;
+                payload = { ...payload, field_mapping: Object.keys(fmPayload).length > 0 ? fmPayload : null };
                 return fetchJson('/enterprise/identity-providers/oauth2', {
                     method: 'POST',
                     body: JSON.stringify(payload)
@@ -267,9 +274,15 @@ function OrgTab({ tenant }: { tenant: any }) {
     const updateProvider = useMutation({
         mutationFn: ({ id, data }: { id: string; data: any }) => {
             if (data.provider_type === 'oauth2' && useOAuth2Form) {
+                const fmPayload: Record<string, string> = {};
+                if (data.field_mapping?.user_id) fmPayload.user_id = data.field_mapping.user_id;
+                if (data.field_mapping?.name) fmPayload.name = data.field_mapping.name;
+                if (data.field_mapping?.email) fmPayload.email = data.field_mapping.email;
+                if (data.field_mapping?.mobile) fmPayload.mobile = data.field_mapping.mobile;
+                const updateData = { ...data, field_mapping: Object.keys(fmPayload).length > 0 ? fmPayload : null };
                 return fetchJson(`/enterprise/identity-providers/${id}/oauth2`, {
                     method: 'PATCH',
-                    body: JSON.stringify(data)
+                    body: JSON.stringify(updateData)
                 });
             }
             return fetchJson(`/enterprise/identity-providers/${id}`, { method: 'PUT', body: JSON.stringify(data) });
@@ -304,14 +317,23 @@ function OrgTab({ tenant }: { tenant: any }) {
         setSyncing(null);
     };
 
-    const initOAuth2FromConfig = (config: any) => ({
-        app_id: config?.app_id || config?.client_id || '',
-        app_secret: config?.app_secret || config?.client_secret || '',
-        authorize_url: config?.authorize_url || '',
-        token_url: config?.token_url || '',
-        user_info_url: config?.user_info_url || '',
-        scope: config?.scope || 'openid profile email'
-    });
+    const initOAuth2FromConfig = (config: any) => {
+        const fm = config?.field_mapping || {};
+        return {
+            app_id: config?.app_id || config?.client_id || '',
+            app_secret: config?.app_secret || config?.client_secret || '',
+            authorize_url: config?.authorize_url || '',
+            token_url: config?.token_url || '',
+            user_info_url: config?.user_info_url || '',
+            scope: config?.scope || 'openid profile email',
+            field_mapping: {
+                user_id: fm.user_id || '',
+                name: fm.name || '',
+                email: fm.email || '',
+                mobile: fm.mobile || '',
+            }
+        };
+    };
 
     const save = () => {
         setSavingProvider(true);
@@ -353,7 +375,8 @@ function OrgTab({ tenant }: { tenant: any }) {
                 name: nameMap[type] || type,
                 config: defaults[type] || {},
                 app_id: '', app_secret: '', authorize_url: '', token_url: '', user_info_url: '',
-                scope: 'openid profile email'
+                scope: 'openid profile email',
+                field_mapping: { user_id: '', name: '', email: '', mobile: '' }
             });
         }
         setSelectedDept(null);
@@ -452,6 +475,37 @@ function OrgTab({ tenant }: { tenant: any }) {
                         <div className="form-group" style={{ gridColumn: '1 / -1' }}>
                             <label className="form-label">Scope</label>
                             <input className="form-input" value={form.scope} onChange={e => setForm({ ...form, scope: e.target.value })} placeholder="openid profile email" />
+                        </div>
+                        <div style={{ gridColumn: '1 / -1', marginTop: '4px' }}>
+                            <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '8px' }}>
+                                字段映射（可选，留空使用标准 OIDC 字段）
+                            </div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                                <div className="form-group">
+                                    <label className="form-label" style={{ fontSize: '11px' }}>用户 ID 字段</label>
+                                    <input className="form-input" value={form.field_mapping?.user_id || ''}
+                                        onChange={e => setForm({ ...form, field_mapping: { ...form.field_mapping, user_id: e.target.value } })}
+                                        placeholder="留空用标准字段 sub" style={{ fontSize: '12px' }} />
+                                </div>
+                                <div className="form-group">
+                                    <label className="form-label" style={{ fontSize: '11px' }}>姓名字段</label>
+                                    <input className="form-input" value={form.field_mapping?.name || ''}
+                                        onChange={e => setForm({ ...form, field_mapping: { ...form.field_mapping, name: e.target.value } })}
+                                        placeholder="留空用标准字段 name" style={{ fontSize: '12px' }} />
+                                </div>
+                                <div className="form-group">
+                                    <label className="form-label" style={{ fontSize: '11px' }}>邮箱字段</label>
+                                    <input className="form-input" value={form.field_mapping?.email || ''}
+                                        onChange={e => setForm({ ...form, field_mapping: { ...form.field_mapping, email: e.target.value } })}
+                                        placeholder="留空用标准字段 email" style={{ fontSize: '12px' }} />
+                                </div>
+                                <div className="form-group">
+                                    <label className="form-label" style={{ fontSize: '11px' }}>手机号字段</label>
+                                    <input className="form-input" value={form.field_mapping?.mobile || ''}
+                                        onChange={e => setForm({ ...form, field_mapping: { ...form.field_mapping, mobile: e.target.value } })}
+                                        placeholder="留空用标准字段 phone_number" style={{ fontSize: '12px' }} />
+                                </div>
+                            </div>
                         </div>
                     </div>
                 ) : type === 'wecom' ? (
