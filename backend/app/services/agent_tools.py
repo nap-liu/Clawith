@@ -4439,11 +4439,12 @@ async def _handle_set_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
 
         # Return webhook URL for webhook triggers
         if ttype == "webhook":
-            from app.config import get_settings
-            settings = get_settings()
-            base = getattr(settings, 'PUBLIC_URL', '') or ''
-            if not base:
-                base = 'https://try.clawith.ai'  # fallback
+            from app.core.domain import resolve_base_url
+            from app.models.agent import Agent as AgentModel
+            _a_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            _agent = _a_r.scalar_one_or_none()
+            _tenant_id = str(_agent.tenant_id) if _agent and _agent.tenant_id else None
+            base = await resolve_base_url(db, request=None, tenant_id=_tenant_id)
             webhook_url = f"{base.rstrip('/')}/api/webhooks/t/{config['token']}"
             return f"✅ Webhook trigger '{name}' created.\n\nWebhook URL: {webhook_url}\n\nTell the user to configure this URL in their external service (e.g. GitHub, Grafana). When the service sends a POST to this URL, you will be woken up with the payload as context."
 
