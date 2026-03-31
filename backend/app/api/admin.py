@@ -277,10 +277,15 @@ async def get_platform_timeseries(
                 DATE(created_at) AS d,
                 user_id
             FROM chat_sessions
-            WHERE created_at >= :range_start::timestamptz AND created_at <= :range_end::timestamptz
+            WHERE created_at >= CAST(:range_start AS timestamptz)
+              AND created_at <= CAST(:range_end AS timestamptz)
         ),
         day_series AS (
-            SELECT generate_series(:series_start::date, :series_end::date, '1 day'::interval)::date AS d
+            SELECT generate_series(
+                CAST(:series_start AS date),
+                CAST(:series_end AS date),
+                '1 day'::interval
+            )::date AS d
         )
         SELECT
             ds.d,
@@ -291,7 +296,6 @@ async def get_platform_timeseries(
         FROM day_series ds
         ORDER BY ds.d
     """), {
-        # Extend range back 30 days to have data for initial WAU/MAU calculation
         "range_start": (start_date - timedelta(days=30)).isoformat(),
         "range_end": end_date.isoformat(),
         "series_start": start_date.date().isoformat(),
