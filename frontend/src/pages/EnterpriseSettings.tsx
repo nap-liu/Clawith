@@ -8,6 +8,7 @@ import type { FileBrowserApi } from '../components/FileBrowser';
 import { saveAccentColor, getSavedAccentColor, resetAccentColor, PRESET_COLORS } from '../utils/theme';
 import UserManagement from './UserManagement';
 import InvitationCodes from './InvitationCodes';
+import { copyToClipboard } from '../utils/clipboard';
 
 // API helpers for enterprise endpoints
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
@@ -383,7 +384,7 @@ function OrgTab({ tenant }: { tenant: any }) {
                                         <button 
                                             className="btn btn-ghost" 
                                             style={{ position: 'absolute', top: '8px', right: '8px', fontSize: '10px', color: '#abb2bf', padding: '4px 8px', background: 'rgba(255,255,255,0.1)', cursor: 'pointer', border: 'none', borderRadius: '4px' }}
-                                            onClick={(e) => { e.preventDefault(); navigator.clipboard.writeText(FEISHU_SYNC_PERM_JSON); e.currentTarget.textContent = 'Copied✓'; setTimeout(() => { e.currentTarget.textContent = 'Copy'; }, 2000); }}
+                                            onClick={(e) => { e.preventDefault(); copyToClipboard(FEISHU_SYNC_PERM_JSON); e.currentTarget.textContent = 'Copied✓'; setTimeout(() => { e.currentTarget.textContent = 'Copy'; }, 2000); }}
                                         >
                                             Copy
                                         </button>
@@ -732,7 +733,7 @@ function OrgTab({ tenant }: { tenant: any }) {
                                                                         style={{ fontSize: '11px' }}
                                                                         onClick={(e) => { 
                                                                             e.preventDefault();
-                                                                            navigator.clipboard.writeText(baseUrl);
+                                                                            copyToClipboard(baseUrl);
                                                                             const el = e.currentTarget;
                                                                             const old = el.textContent;
                                                                             el.textContent = 'Copied✓';
@@ -764,7 +765,7 @@ function OrgTab({ tenant }: { tenant: any }) {
                                                                         style={{ fontSize: '11px' }}
                                                                         onClick={(e) => { 
                                                                             e.preventDefault();
-                                                                            navigator.clipboard.writeText(callbackUrl);
+                                                                            copyToClipboard(callbackUrl);
                                                                             const el = e.currentTarget;
                                                                             const old = el.textContent;
                                                                             el.textContent = 'Copied✓';
