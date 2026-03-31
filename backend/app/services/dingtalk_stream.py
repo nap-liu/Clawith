@@ -517,7 +517,7 @@ class DingTalkStreamManager:
                                 add_thinking_reaction(app_key, app_secret, message_id, conversation_id),
                                 main_loop,
                             )
-                            future = asyncio.run_coroutine_threadsafe(
+                            asyncio.run_coroutine_threadsafe(
                                 process_dingtalk_message(
                                     agent_id=agent_id,
                                     sender_staff_id=sender_staff_id,
@@ -531,12 +531,7 @@ class DingTalkStreamManager:
                                 ),
                                 main_loop,
                             )
-                            try:
-                                future.result(timeout=120)
-                            except Exception as e:
-                                logger.error(f"[DingTalk Stream] LLM processing error: {e}")
-                                import traceback
-                                traceback.print_exc()
+                            # Fire-and-forget: ACK immediately, do not wait for LLM
                         else:
                             logger.warning("[DingTalk Stream] Main loop not available")
 
@@ -552,7 +547,7 @@ class DingTalkStreamManager:
                                 main_loop,
                             )
                             # Process media (download + encode) in the main loop
-                            future = asyncio.run_coroutine_threadsafe(
+                            asyncio.run_coroutine_threadsafe(
                                 self._handle_media_and_dispatch(
                                     msg_data=msg_data,
                                     app_key=app_key,
@@ -568,12 +563,7 @@ class DingTalkStreamManager:
                                 ),
                                 main_loop,
                             )
-                            try:
-                                future.result(timeout=120)
-                            except Exception as e:
-                                logger.error(f"[DingTalk Stream] Media processing error: {e}")
-                                import traceback
-                                traceback.print_exc()
+                            # Fire-and-forget: ACK immediately, do not wait for LLM
                         else:
                             logger.warning("[DingTalk Stream] Main loop not available")
 
