@@ -189,9 +189,16 @@ async def oauth2_callback(
             user_info = await auth_provider.get_user_info(access_token)
         except Exception as e:
             logger.warning(f"OAuth2 userinfo failed, trying token_data fallback: {e}")
-            if any(k in token_data for k in ["userId", "userName", "userCode", "mobile", "userInfo"]):
-                user_info = await auth_provider.get_user_info_from_token_data(token_data)
+            logger.info(f"token_data keys: {list(token_data.keys()) if token_data else 'empty'}")
+            if any(k in str(token_data) for k in ["userId", "userName", "userCode", "mobile", "userInfo"]):
+                try:
+                    user_info = await auth_provider.get_user_info_from_token_data(token_data)
+                    logger.info(f"token_data fallback succeeded: user_id={user_info.provider_user_id}")
+                except Exception as fallback_e:
+                    logger.error(f"token_data fallback also failed: {fallback_e}, token_data={token_data}")
+                    raise
             else:
+                logger.error(f"token_data has no user fields: {token_data}")
                 raise
 
         if not user_info.provider_user_id:
