@@ -526,10 +526,13 @@ export default function UserManagement() {
                                 ) : (
                                     <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                                         <input className="form-input" value={inviteLink} readOnly style={{ width: '200px', fontSize: '11px', padding: '4px 8px' }} />
-                                        <button className="btn btn-secondary" style={{ fontSize: '11px', padding: '4px 8px' }} onClick={async () => {
+                                        <button className="btn btn-secondary" style={{ fontSize: '11px', padding: '4px 8px' }} onClick={async (e) => {
+                                            e.preventDefault();
                                             await copyToClipboard(inviteLink);
-                                            setToast(isChinese ? '已复制' : 'Copied!');
-                                            setTimeout(() => setToast(''), 2000);
+                                            const el = e.currentTarget;
+                                            const old = el.textContent;
+                                            el.textContent = isChinese ? '已复制✓' : 'Copied✓';
+                                            setTimeout(() => { el.textContent = old; }, 2000);
                                         }}>
                                             {isChinese ? '复制' : 'Copy'}
                                         </button>
