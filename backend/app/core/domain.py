@@ -44,8 +44,8 @@ async def resolve_base_url(
                 domain = tenant.sso_domain
                 return f"https://{domain}".rstrip("/")
 
-            # Level 2: subdomain prefix + global hostname
-            if tenant.subdomain_prefix:
+            # Level 2: subdomain prefix + global hostname (skip for default tenant)
+            if tenant.subdomain_prefix and not getattr(tenant, 'is_default', False):
                 global_url = await _get_global_base_url(db)
                 if global_url:
                     from urllib.parse import urlparse

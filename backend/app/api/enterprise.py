@@ -660,7 +660,7 @@ async def _sync_tenant_sso_state(db: AsyncSession, tenant_id: uuid.UUID):
     tenant.sso_enabled = active_sso_count > 0
 
     # Auto-assign subdomain on first SSO enablement based on Platform rules
-    if tenant.sso_enabled and not tenant.sso_domain:
+    if tenant.sso_enabled and not tenant.sso_domain and not getattr(tenant, 'is_default', False):
         sso_base = await resolve_base_url(db, tenant_id=str(tenant.id) if tenant else None)
         host = sso_base.split("://")[-1].split(":")[0].split("/")[0]
         is_ip = platform_service.is_ip_address(host)
@@ -707,9 +707,12 @@ async def _regenerate_all_sso_domains(db: AsyncSession):
             else:
                 tenant.sso_domain = None
         else:
-            # Domain mode: each tenant gets their own subdomain
-            sso_base = await resolve_base_url(db, tenant_id=str(tenant.id) if tenant else None)
-            tenant.sso_domain = sso_base
+            # Domain mode: each tenant gets their own subdomain (skip default tenant)
+            if getattr(tenant, 'is_default', False):
+                tenant.sso_domain = None
+            else:
+                sso_base = await resolve_base_url(db, tenant_id=str(tenant.id) if tenant else None)
+                tenant.sso_domain = sso_base
         logger.info(f"[SSO regen] tenant={tenant.slug} sso_domain={tenant.sso_domain}")
 
     if tenants:
