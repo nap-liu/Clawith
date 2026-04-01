@@ -252,7 +252,8 @@ async def update_user_profile(
         raise HTTPException(status_code=403, detail="Admin access required")
 
     # Fetch target user
-    result = await db.execute(select(User).where(User.id == user_id))
+    from sqlalchemy.orm import selectinload
+    result = await db.execute(select(User).where(User.id == user_id).options(selectinload(User.identity)))
     target = result.scalar_one_or_none()
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
@@ -273,21 +274,25 @@ async def update_user_profile(
         email_val = data.email.strip().lower()
         if email_val:
             # Check email uniqueness (exclude self)
+            from app.models.user import Identity as IdentityModel
             existing = await db.execute(
-                select(User).where(User.email == email_val, User.id != user_id)
+                select(User).join(User.identity).where(IdentityModel.email == email_val, User.id != user_id)
             )
             if existing.scalar_one_or_none():
                 raise HTTPException(status_code=400, detail="Email already in use by another user")
-            target.email = email_val
+            if target.identity:
+                target.identity.email = email_val
     if data.primary_mobile is not None:
-        target.primary_mobile = data.primary_mobile.strip() or None
+        if target.identity:
+            target.identity.phone = data.primary_mobile.strip() or None
     if data.is_active is not None:
         target.is_active = data.is_active
     if data.new_password is not None and data.new_password.strip():
         from app.core.security import hash_password
         if len(data.new_password.strip()) < 6:
             raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-        target.password_hash = hash_password(data.new_password.strip())
+        if target.identity:
+            target.identity.password_hash = hash_password(data.new_password.strip())
 
     await db.commit()
     await db.refresh(target)

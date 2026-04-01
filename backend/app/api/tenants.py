@@ -404,8 +404,10 @@ async def resolve_tenant_by_domain(
         if platform2 and platform2.value.get("public_base_url"):
             parsed2 = _urlparse(platform2.value["public_base_url"])
             global_hostname = parsed2.hostname
-            if global_hostname and domain.endswith(f".{global_hostname}"):
-                prefix = domain[: -(len(global_hostname) + 1)]
+            # Strip port from domain for comparison
+            domain_host = domain.split(":")[0] if ":" in domain else domain
+            if global_hostname and domain_host.endswith(f".{global_hostname}"):
+                prefix = domain_host[: -(len(global_hostname) + 1)]
                 if prefix and "." not in prefix:  # only single-level prefix
                     result = await db.execute(
                         select(Tenant).where(Tenant.subdomain_prefix == prefix)
@@ -424,7 +426,8 @@ async def resolve_tenant_by_domain(
             global_host = parsed.hostname
             if parsed.port and parsed.port not in (80, 443):
                 global_host = f"{global_host}:{parsed.port}"
-            if domain == global_host or domain == parsed.hostname:
+            domain_host_only = domain.split(":")[0] if ":" in domain else domain
+            if domain == global_host or domain == parsed.hostname or domain_host_only == parsed.hostname:
                 result = await db.execute(
                     select(Tenant).where(Tenant.is_active == True, Tenant.is_default == True)
                 )

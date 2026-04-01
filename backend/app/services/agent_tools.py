@@ -3545,9 +3545,10 @@ async def _send_web_message(agent_id: uuid.UUID, args: dict) -> str:
 
             # 1. Look up target user by username or display_name within tenant
 
-            query = select(UserModel).where(
+            from app.models.user import Identity as _IdentityModel
+            query = select(UserModel).outerjoin(UserModel.identity).where(
                 or_(
-                    UserModel.username == username,
+                    _IdentityModel.username == username,
                     UserModel.display_name == username,
                 )
             )

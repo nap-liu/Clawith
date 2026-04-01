@@ -300,7 +300,9 @@ async def _process_wecom_stream_message(
 
         # Find or create platform user
         wc_username = f"wecom_{sender_id}"
-        query = _select(UserModel).where(UserModel.username == wc_username)
+        from app.models.user import Identity as _IdentityModel
+        from sqlalchemy.orm import selectinload as _selectinload
+        query = _select(UserModel).join(UserModel.identity).where(_IdentityModel.username == wc_username).options(_selectinload(UserModel.identity))
         if agent and agent.tenant_id:
             query = query.where(UserModel.tenant_id == agent.tenant_id)
             
@@ -308,14 +310,20 @@ async def _process_wecom_stream_message(
         platform_user = u_r.scalar_one_or_none()
 
         if not platform_user:
-            platform_user = UserModel(
-                username=wc_username,
+            from app.services.registration_service import registration_service as _reg_svc
+            _wc_identity = await _reg_svc.find_or_create_identity(
+                db,
                 email=f"{wc_username}@wecom.local",
-                password_hash=hash_password(str(_uuid.uuid4())),
+                username=wc_username,
+                password=str(_uuid.uuid4()),
+            )
+            platform_user = UserModel(
+                identity_id=_wc_identity.id,
                 display_name=f"WeCom {sender_id[:8]}",
                 role="member",
                 tenant_id=agent.tenant_id if agent else None,
                 registration_source="wecom",
+                is_active=True,
             )
 
             db.add(platform_user)
