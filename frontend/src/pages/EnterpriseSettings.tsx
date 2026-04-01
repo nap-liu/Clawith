@@ -8,8 +8,7 @@ import type { FileBrowserApi } from '../components/FileBrowser';
 import { saveAccentColor, getSavedAccentColor, resetAccentColor, PRESET_COLORS } from '../utils/theme';
 import UserManagement from './UserManagement';
 import InvitationCodes from './InvitationCodes';
-import { copyToClipboard } from '../utils/clipboard';
-
+import LinearCopyButton from '../components/LinearCopyButton';
 // API helpers for enterprise endpoints
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
     const token = localStorage.getItem('token');
@@ -27,7 +26,7 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
 
 interface LLMModel {
     id: string; provider: string; model: string; label: string;
-    base_url?: string; api_key_masked?: string; max_tokens_per_day?: number; enabled: boolean; supports_vision?: boolean; max_output_tokens?: number; temperature?: number; created_at: string;
+    base_url?: string; api_key_masked?: string; max_tokens_per_day?: number; enabled: boolean; supports_vision?: boolean; max_output_tokens?: number; request_timeout?: number; temperature?: number; created_at: string;
 }
 
 interface LLMProviderSpec {
@@ -85,14 +84,14 @@ function DeptTree({ departments, parentId, selectedDept, onSelect, level }: {
                 <div key={d.id}>
                     <div
                         style={{
-                            padding: '5px 8px', 
-                            paddingLeft: `${8 + level * 16}px`, 
+                            padding: '5px 8px',
+                            paddingLeft: `${8 + level * 16}px`,
                             borderRadius: '4px',
-                            cursor: 'pointer', 
-                            fontSize: '13px', 
+                            cursor: 'pointer',
+                            fontSize: '13px',
                             marginBottom: '1px',
                             background: selectedDept === d.id ? 'rgba(224,238,238,0.12)' : 'transparent',
-                            display: 'flex', 
+                            display: 'flex',
                             justifyContent: 'space-between',
                             alignItems: 'center'
                         }}
@@ -117,10 +116,153 @@ function DeptTree({ departments, parentId, selectedDept, onSelect, level }: {
     );
 }
 
+// ─── SSO Channel Section ────────────────────────────────
+function SsoChannelSection({ idpType, existingProvider, tenant, t }: {
+    idpType: string; existingProvider: any; tenant: any; t: any;
+}) {
+    const qc = useQueryClient();
+    const [liveDomain, setLiveDomain] = useState<string>(existingProvider?.sso_domain || tenant?.sso_domain || '');
+    const [ssoError, setSsoError] = useState<string>('');
+    const [toggling, setToggling] = useState(false);
+
+    useEffect(() => {
+        setLiveDomain(existingProvider?.sso_domain || tenant?.sso_domain || '');
+    }, [existingProvider?.sso_domain, tenant?.sso_domain]);
+
+    const ssoEnabled = existingProvider ? !!existingProvider.sso_login_enabled : false;
+    const domain = liveDomain;
+    const callbackUrl = domain ? (domain.startsWith('http') ? `${domain}/api/auth/${idpType}/callback` : `https://${domain}/api/auth/${idpType}/callback`) : '';
+
+    const handleSsoToggle = async () => {
+        if (!existingProvider) {
+            alert(t('enterprise.identity.saveFirst', 'Please save the configuration first to enable SSO.'));
+            return;
+        }
+        const newVal = !ssoEnabled;
+        setToggling(true);
+        setSsoError('');
+        try {
+            const result = await fetchJson<any>(`/enterprise/identity-providers/${existingProvider.id}`, {
+                method: 'PUT',
+                body: JSON.stringify({ sso_login_enabled: newVal }),
+            });
+            if (result?.sso_domain) setLiveDomain(result.sso_domain);
+            qc.invalidateQueries({ queryKey: ['identity-providers'] });
+            if (tenant?.id) qc.invalidateQueries({ queryKey: ['tenant', tenant.id] });
+        } catch (e: any) {
+            const msg = e?.message || '';
+            if (msg.includes('IP address') || msg.includes('multi-tenant')) {
+                setSsoError(t('enterprise.identity.ssoIpConflict', 'IP 模式下只能有一个企业开启 SSO，当前已有其他企业占用。'));
+            } else {
+                setSsoError(msg || t('enterprise.identity.ssoToggleFailed', 'Failed to toggle SSO'));
+            }
+        } finally {
+            setToggling(false);
+        }
+    };
+
+    return (
+        <div style={{ marginTop: '20px', paddingTop: '20px', borderTop: '1px dashed var(--border-subtle)' }}>
+            {/* SSO Toggle */}
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: ssoError ? '8px' : '16px' }}>
+                <div>
+                    <div style={{ fontWeight: 500, fontSize: '13px' }}>{t('enterprise.identity.ssoLoginToggle', 'SSO Login')}</div>
+                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
+                        {t('enterprise.identity.ssoLoginToggleHint', 'Allow users to log in via this identity provider.')}
+                    </div>
+                </div>
+                <label style={{ position: 'relative', display: 'inline-block', width: '36px', height: '20px', flexShrink: 0, opacity: (existingProvider && !toggling) ? 1 : 0.5 }}>
+                    <input
+                        type="checkbox"
+                        checked={ssoEnabled}
+                        onChange={handleSsoToggle}
+                        disabled={!existingProvider || toggling}
+                        style={{ opacity: 0, width: 0, height: 0 }}
+                    />
+                    <span style={{
+                        position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+                        borderRadius: '20px', cursor: (existingProvider && !toggling) ? 'pointer' : 'not-allowed',
+                        background: ssoEnabled ? 'var(--accent-primary)' : 'var(--border-subtle)',
+                        transition: '0.2s',
+                    }}>
+                        <span style={{
+                            position: 'absolute', left: ssoEnabled ? '18px' : '2px', top: '2px',
+                            width: '16px', height: '16px', borderRadius: '50%',
+                            background: '#fff', transition: '0.2s',
+                            boxShadow: '0 1px 2px rgba(0,0,0,0.1)'
+                        }} />
+                    </span>
+                </label>
+            </div>
+            {ssoError && (
+                <div style={{ fontSize: '12px', color: 'var(--error)', marginBottom: '12px', padding: '6px 10px', background: 'rgba(var(--error-rgb,220,38,38),0.08)', borderRadius: '6px' }}>
+                    {ssoError}
+                </div>
+            )}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                <div>
+                    <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px', color: 'var(--text-secondary)' }}>
+                        {t('enterprise.identity.ssoSubdomain', 'SSO Login URL')}
+                    </label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <input
+                            className="form-input"
+                            readOnly
+                            value={domain ? (domain.startsWith('http') ? domain : `https://${domain}`) : ''}
+                            placeholder={t('enterprise.identity.ssoUrlEmpty', '请先开启 SSO 以生成地址')}
+                            style={{ fontSize: '12px', flex: 1, maxWidth: '400px', background: 'var(--bg-primary)', cursor: 'default' }}
+                        />
+                        <LinearCopyButton
+                            className="btn btn-ghost btn-sm"
+                            style={{ fontSize: '11px', width: 'auto', minWidth: '70px' }}
+                            disabled={!domain}
+                            textToCopy={domain ? (domain.startsWith('http') ? domain : `https://${domain}`) : ''}
+                            label={t('common.copy', 'Copy')}
+                            copiedLabel="Copied"
+                        />
+                    </div>
+                    <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                        {t('enterprise.identity.ssoSubdomainHint', 'Share this URL with your team. SSO login buttons will appear when they visit this address.')}
+                    </div>
+                </div>
+                <div>
+                    <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px', color: 'var(--text-secondary)' }}>
+                        {t('enterprise.identity.callbackUrl', 'Redirect URL (paste this in your app settings)')}
+                    </label>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <input
+                            className="form-input"
+                            readOnly
+                            value={callbackUrl}
+                            placeholder={t('enterprise.identity.ssoUrlEmpty', '请先开启 SSO 以生成地址')}
+                            style={{ fontSize: '12px', flex: 1, maxWidth: '400px', background: 'var(--bg-primary)', cursor: 'default' }}
+                        />
+                        <LinearCopyButton
+                            className="btn btn-ghost btn-sm"
+                            style={{ fontSize: '11px', width: 'auto', minWidth: '70px' }}
+                            disabled={!callbackUrl}
+                            textToCopy={callbackUrl}
+                            label={t('common.copy', 'Copy')}
+                            copiedLabel="Copied"
+                        />
+                    </div>
+                    <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                        {t('enterprise.identity.callbackUrlHint', "Add this URL as the OAuth redirect URI in your identity provider's app configuration.")}
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+
 // ─── Org & Identity Tab ─────────────────────────────
 function OrgTab({ tenant }: { tenant: any }) {
     const { t } = useTranslation();
     const qc = useQueryClient();
+
+
+
 
     const SsoStatus = () => {
         const [ssoDomain, setSsoDomain] = useState(tenant?.sso_domain || '');
@@ -174,13 +316,28 @@ function OrgTab({ tenant }: { tenant: any }) {
                             {t('enterprise.identity.ssoDomainDesc', 'The custom domain users will use to log in via SSO.')}
                         </div>
                     </div>
-
-                    {error && <div style={{ color: 'var(--error)', fontSize: '12px', marginBottom: '12px' }}>{error}</div>}
-
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                        <button className="btn btn-primary btn-sm" onClick={() => handleSave()} disabled={saving || !ssoDomain.trim()}>
-                            {saving ? t('common.loading') : t('common.save', 'Save Configuration')}
-                        </button>
+                    <div>
+                        <label style={{ position: 'relative', display: 'inline-block', width: '36px', height: '20px' }}>
+                            <input
+                                type="checkbox"
+                                checked={ssoEnabled}
+                                onChange={handleToggle}
+                                style={{ opacity: 0, width: 0, height: 0 }}
+                            />
+                            <span style={{
+                                position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+                                borderRadius: '20px', cursor: 'pointer',
+                                background: ssoEnabled ? 'var(--accent-primary)' : 'var(--border-subtle)',
+                                transition: '0.2s'
+                            }}>
+                                <span style={{
+                                    position: 'absolute', left: ssoEnabled ? '18px' : '2px', top: '2px',
+                                    width: '16px', height: '16px', borderRadius: '50%',
+                                    background: '#fff', transition: '0.2s',
+                                    boxShadow: '0 1px 2px rgba(0,0,0,0.1)'
+                                }} />
+                            </span>
+                        </label>
                     </div>
                 </div>
             </div>
@@ -350,7 +507,7 @@ function OrgTab({ tenant }: { tenant: any }) {
         setExpandedType(type);
         setEditingId(existingProvider ? existingProvider.id : null);
         setUseOAuth2Form(type === 'oauth2');
-        
+
         if (existingProvider) {
             if (type === 'oauth2') {
                 const oauth2Config = initOAuth2FromConfig(existingProvider.config || {});
@@ -419,13 +576,13 @@ function OrgTab({ tenant }: { tenant: any }) {
                                         {t('enterprise.org.feishuGuideText', 'Permission JSON (bulk import)')}
                                     </div>
                                     <div style={{ position: 'relative', background: '#282c34', borderRadius: '6px', padding: '12px', paddingRight: '40px', color: '#abb2bf', fontFamily: 'monospace', fontSize: '11px', whiteSpace: 'pre-wrap', overflowX: 'auto' }}>
-                                        <button 
-                                            className="btn btn-ghost" 
-                                            style={{ position: 'absolute', top: '8px', right: '8px', fontSize: '10px', color: '#abb2bf', padding: '4px 8px', background: 'rgba(255,255,255,0.1)', cursor: 'pointer', border: 'none', borderRadius: '4px' }}
-                                            onClick={(e) => { e.preventDefault(); copyToClipboard(FEISHU_SYNC_PERM_JSON); e.currentTarget.textContent = 'Copied✓'; setTimeout(() => { e.currentTarget.textContent = 'Copy'; }, 2000); }}
-                                        >
-                                            Copy
-                                        </button>
+                                        <LinearCopyButton
+                                            className="btn btn-ghost"
+                                            style={{ position: 'absolute', top: '8px', right: '8px', fontSize: '10px', color: '#abb2bf', padding: '4px 8px', background: 'rgba(255,255,255,0.1)', cursor: 'pointer', border: 'none', borderRadius: '4px', height: 'fit-content', minWidth: '60px' }}
+                                            textToCopy={FEISHU_SYNC_PERM_JSON}
+                                            label="Copy"
+                                            copiedLabel="Copied✓"
+                                        />
                                         {FEISHU_SYNC_PERM_JSON}
                                     </div>
                                     <div style={{ marginTop: '8px', color: 'var(--text-secondary)' }}>
@@ -623,7 +780,7 @@ function OrgTab({ tenant }: { tenant: any }) {
             <div style={{ marginTop: '24px', paddingTop: '24px', borderTop: '1px dashed var(--border-subtle)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px' }}>
                     <div style={{ fontWeight: 500, fontSize: '14px' }}>{t('enterprise.org.orgBrowser', 'Organization Browser')}</div>
-                    
+
                     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '8px' }}>
                         {['feishu', 'dingtalk', 'wecom'].includes(p.provider_type) && (
                             <button className="btn btn-secondary btn-sm" style={{ fontSize: '12px' }} onClick={() => triggerSync(p.id)} disabled={!!syncing}>
@@ -706,10 +863,10 @@ function OrgTab({ tenant }: { tenant: any }) {
                     {IDP_TYPES.map((idp, index) => {
                         const existingProvider = providers.find((p: any) => p.provider_type === idp.type);
                         const isExpanded = expandedType === idp.type;
-                        
+
                         return (
                             <div key={idp.type} style={{ borderBottom: index < IDP_TYPES.length - 1 ? '1px solid var(--border-subtle)' : 'none' }}>
-                                <div 
+                                <div
                                     style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px', cursor: 'pointer', background: isExpanded ? 'var(--bg-secondary)' : 'transparent', transition: 'background 0.2s' }}
                                     onClick={() => handleExpand(idp.type, existingProvider)}
                                 >
@@ -744,134 +901,14 @@ function OrgTab({ tenant }: { tenant: any }) {
                                         {renderForm(idp.type, existingProvider)}
 
                                         {/* Per-channel SSO Login URLs & Toggle */}
-                                        {['feishu', 'dingtalk', 'wecom', 'oauth2'].includes(idp.type) && (() => {
-                                            const ssoEnabled = existingProvider ? !!existingProvider.sso_login_enabled : false;
-                                            const baseUrl = tenant?.effective_base_url || '';
-                                            const callbackUrl = baseUrl ? `${baseUrl}/api/auth/${idp.type}/callback` : '';
-
-                                            const handleSsoToggle = async () => {
-                                                if (!existingProvider) {
-                                                    alert(t('enterprise.identity.saveFirst', 'Please save the configuration first to enable SSO.'));
-                                                    return;
-                                                }
-                                                const newVal = !ssoEnabled;
-                                                try {
-                                                    await fetchJson(`/enterprise/identity-providers/${existingProvider.id}`, {
-                                                        method: 'PUT',
-                                                        body: JSON.stringify({ sso_login_enabled: newVal }),
-                                                    });
-                                                    qc.invalidateQueries({ queryKey: ['identity-providers'] });
-                                                    // Refresh tenant data so sso_domain updates in UI
-                                                    if (tenant?.id) qc.invalidateQueries({ queryKey: ['tenant', tenant.id] });
-                                                } catch (e) {
-                                                    console.error('Failed to toggle SSO:', e);
-                                                }
-                                            };
-
-                                            return (
-                                                <div style={{ marginTop: '20px', paddingTop: '20px', borderTop: '1px dashed var(--border-subtle)' }}>
-                                                    {/* SSO Toggle */}
-                                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
-                                                        <div>
-                                                            <div style={{ fontWeight: 500, fontSize: '13px' }}>{t('enterprise.identity.ssoLoginToggle', 'SSO Login')}</div>
-                                                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
-                                                                {t('enterprise.identity.ssoLoginToggleHint', 'Allow users to log in via this identity provider.')}
-                                                            </div>
-                                                        </div>
-                                                        <label style={{ position: 'relative', display: 'inline-block', width: '36px', height: '20px', flexShrink: 0 }}>
-                                                            <input
-                                                                type="checkbox"
-                                                                checked={ssoEnabled}
-                                                                onChange={handleSsoToggle}
-                                                                style={{ opacity: 0, width: 0, height: 0 }}
-                                                            />
-                                                            <span style={{
-                                                                position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-                                                                borderRadius: '20px', cursor: 'pointer',
-                                                                background: ssoEnabled ? 'var(--accent-primary)' : 'var(--border-subtle)',
-                                                                transition: '0.2s',
-                                                                opacity: existingProvider ? 1 : 0.5
-                                                            }}>
-                                                                <span style={{
-                                                                    position: 'absolute', left: ssoEnabled ? '18px' : '2px', top: '2px',
-                                                                    width: '16px', height: '16px', borderRadius: '50%',
-                                                                    background: '#fff', transition: '0.2s',
-                                                                    boxShadow: '0 1px 2px rgba(0,0,0,0.1)'
-                                                                }} />
-                                                            </span>
-                                                        </label>
-                                                    </div>
-
-                                                    {/* Callback URL & domain info — always shown so users can configure it before saving */}
-                                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                                                            {/* Company subdomain */}
-                                                            <div>
-                                                                <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px', color: 'var(--text-secondary)' }}>
-                                                                    {t('enterprise.identity.ssoSubdomain', 'SSO Login URL')}
-                                                                </label>
-                                                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                                                    <input
-                                                                        className="form-input"
-                                                                        readOnly
-                                                                        value={baseUrl || 'Generating...'}
-                                                                        style={{ fontSize: '12px', flex: 1, maxWidth: '400px', background: 'var(--bg-primary)', cursor: 'default' }}
-                                                                    />
-                                                                    <button
-                                                                        className="btn btn-ghost btn-sm"
-                                                                        style={{ fontSize: '11px' }}
-                                                                        onClick={(e) => { 
-                                                                            e.preventDefault();
-                                                                            copyToClipboard(baseUrl);
-                                                                            const el = e.currentTarget;
-                                                                            const old = el.textContent;
-                                                                            el.textContent = 'Copied✓';
-                                                                            setTimeout(() => { el.textContent = old; }, 2000);
-                                                                        }}
-                                                                    >
-                                                                        {t('common.copy', 'Copy')}
-                                                                    </button>
-                                                                </div>
-                                                                <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                                                                    {t('enterprise.identity.ssoSubdomainHint', 'Share this URL with your team. SSO login buttons will appear when they visit this address.')}
-                                                                </div>
-                                                            </div>
-
-                                                            {/* Callback URL */}
-                                                            <div>
-                                                                <label className="form-label" style={{ fontSize: '11px', marginBottom: '4px', color: 'var(--text-secondary)' }}>
-                                                                    {t('enterprise.identity.callbackUrl', 'Redirect URL (paste this in your app settings)')}
-                                                                </label>
-                                                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                                                    <input
-                                                                        className="form-input"
-                                                                        readOnly
-                                                                        value={callbackUrl}
-                                                                        style={{ fontSize: '12px', flex: 1, maxWidth: '400px', background: 'var(--bg-primary)', cursor: 'default' }}
-                                                                    />
-                                                                    <button
-                                                                        className="btn btn-ghost btn-sm"
-                                                                        style={{ fontSize: '11px' }}
-                                                                        onClick={(e) => { 
-                                                                            e.preventDefault();
-                                                                            copyToClipboard(callbackUrl);
-                                                                            const el = e.currentTarget;
-                                                                            const old = el.textContent;
-                                                                            el.textContent = 'Copied✓';
-                                                                            setTimeout(() => { el.textContent = old; }, 2000);
-                                                                        }}
-                                                                    >
-                                                                        {t('common.copy', 'Copy')}
-                                                                    </button>
-                                                                </div>
-                                                                <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                                                                    {t('enterprise.identity.callbackUrlHint', 'Add this URL as the OAuth redirect URI in your identity provider\'s app configuration.')}
-                                                                </div>
-                                                            </div>
-                                                        </div>
-                                                </div>
-                                            );
-                                        })()}
-
+                                        {['feishu', 'dingtalk', 'wecom', 'oauth2'].includes(idp.type) && (
+                                            <SsoChannelSection
+                                                idpType={idp.type}
+                                                existingProvider={existingProvider}
+                                                tenant={tenant}
+                                                t={t}
+                                            />
+                                        )}
                                         {existingProvider && renderOrgBrowser(existingProvider)}
                                     </div>
                                 )}
@@ -880,6 +917,7 @@ function OrgTab({ tenant }: { tenant: any }) {
                     })}
                 </div>
             </div>
+
         </div>
     );
 }
@@ -1725,6 +1763,7 @@ export default function EnterpriseSettings() {
     const [companyIntroSaving, setCompanyIntroSaving] = useState(false);
     const [companyIntroSaved, setCompanyIntroSaved] = useState(false);
 
+
     // Company intro key: always per-tenant scoped
     const companyIntroKey = selectedTenantId ? `company_intro_${selectedTenantId}` : 'company_intro';
 
@@ -1875,7 +1914,7 @@ export default function EnterpriseSettings() {
     });
     const [showAddModel, setShowAddModel] = useState(false);
     const [editingModelId, setEditingModelId] = useState<string | null>(null);
-    const [modelForm, setModelForm] = useState({ provider: 'anthropic', model: '', api_key: '', base_url: '', label: '', supports_vision: false, max_output_tokens: '' as string, temperature: '' as string });
+    const [modelForm, setModelForm] = useState({ provider: 'anthropic', model: '', api_key: '', base_url: '', label: '', supports_vision: false, max_output_tokens: '' as string, request_timeout: '' as string, temperature: '' as string });
     const { data: providerSpecs = [] } = useQuery({
         queryKey: ['llm-provider-specs'],
         queryFn: () => fetchJson<LLMProviderSpec[]>('/enterprise/llm-providers'),
@@ -1978,6 +2017,7 @@ export default function EnterpriseSettings() {
                                     base_url: defaultSpec?.default_base_url || '',
                                     label: '', supports_vision: false,
                                     max_output_tokens: defaultSpec ? String(defaultSpec.default_max_tokens) : '4096',
+                                    request_timeout: '',
                                     temperature: '',
                                 });
                                 setShowAddModel(true);
@@ -2044,6 +2084,11 @@ export default function EnterpriseSettings() {
                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.maxOutputTokensDesc', 'Limits generation length')}</div>
                                     </div>
                                     <div className="form-group">
+                                        <label className="form-label">{t('enterprise.llm.requestTimeout', 'Request Timeout (s)')}</label>
+                                        <input className="form-input" type="number" min="1" placeholder={t('enterprise.llm.requestTimeoutPlaceholder', 'e.g. 120 (Leave empty for default)')} value={modelForm.request_timeout} onChange={e => setModelForm({ ...modelForm, request_timeout: e.target.value })} />
+                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.requestTimeoutDesc', 'Increase for slow local models.')}</div>
+                                    </div>
+                                    <div className="form-group">
                                         <label className="form-label">{t('enterprise.llm.temperature', 'Temperature')}</label>
                                         <input className="form-input" type="number" step="0.1" min="0" max="2" placeholder={t('enterprise.llm.temperaturePlaceholder', 'e.g. 0.7 or 1.0 (Leave empty for default)')} value={modelForm.temperature} onChange={e => setModelForm({ ...modelForm, temperature: e.target.value })} />
                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.temperatureDesc', 'Leave empty to use the provider default. o1/o3 reasoning models usually require 1.0')}</div>
@@ -2081,6 +2126,7 @@ export default function EnterpriseSettings() {
                                         const data = {
                                             ...modelForm,
                                             max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null,
+                                            request_timeout: modelForm.request_timeout ? Number(modelForm.request_timeout) : null,
                                             temperature: modelForm.temperature !== '' ? Number(modelForm.temperature) : null
                                         };
                                         addModel.mutate(data);
@@ -2147,6 +2193,11 @@ export default function EnterpriseSettings() {
                                                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.maxOutputTokensDesc', 'Limits generation length')}</div>
                                                 </div>
                                                 <div className="form-group">
+                                                    <label className="form-label">{t('enterprise.llm.requestTimeout', 'Request Timeout (s)')}</label>
+                                                    <input className="form-input" type="number" min="1" placeholder={t('enterprise.llm.requestTimeoutPlaceholder', 'e.g. 120 (Leave empty for default)')} value={modelForm.request_timeout} onChange={e => setModelForm({ ...modelForm, request_timeout: e.target.value })} />
+                                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.requestTimeoutDesc', 'Increase for slow local models.')}</div>
+                                                </div>
+                                                <div className="form-group">
                                                     <label className="form-label">{t('enterprise.llm.temperature', 'Temperature')}</label>
                                                     <input className="form-input" type="number" step="0.1" min="0" max="2" placeholder={t('enterprise.llm.temperaturePlaceholder', 'e.g. 0.7 or 1.0 (Leave empty for default)')} value={modelForm.temperature} onChange={e => setModelForm({ ...modelForm, temperature: e.target.value })} />
                                                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.temperatureDesc', 'Leave empty to use the provider default. o1/o3 reasoning models usually require 1.0')}</div>
@@ -2185,6 +2236,7 @@ export default function EnterpriseSettings() {
                                                     const data = {
                                                         ...modelForm,
                                                         max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null,
+                                                        request_timeout: modelForm.request_timeout ? Number(modelForm.request_timeout) : null,
                                                         temperature: modelForm.temperature !== '' ? Number(modelForm.temperature) : null
                                                     };
                                                     updateModel.mutate({ id: editingModelId!, data });
@@ -2233,7 +2285,7 @@ export default function EnterpriseSettings() {
                                                 {m.supports_vision && <span className="badge" style={{ background: 'rgba(99,102,241,0.15)', color: 'rgb(99,102,241)', fontSize: '10px' }}>Vision</span>}
                                                 <button className="btn btn-ghost" onClick={() => {
                                                     setEditingModelId(m.id);
-                                                    setModelForm({ provider: m.provider, model: m.model, label: m.label, base_url: m.base_url || '', api_key: m.api_key_masked || '', supports_vision: m.supports_vision || false, max_output_tokens: m.max_output_tokens ? String(m.max_output_tokens) : '', temperature: m.temperature !== null && m.temperature !== undefined ? String(m.temperature) : '' });
+                                                    setModelForm({ provider: m.provider, model: m.model, label: m.label, base_url: m.base_url || '', api_key: m.api_key_masked || '', supports_vision: m.supports_vision || false, max_output_tokens: m.max_output_tokens ? String(m.max_output_tokens) : '', request_timeout: m.request_timeout ? String(m.request_timeout) : '', temperature: m.temperature !== null && m.temperature !== undefined ? String(m.temperature) : '' });
                                                     setShowAddModel(true);
                                                 }} style={{ fontSize: '12px' }}>✏️ {t('enterprise.tools.edit')}</button>
                                                 <button className="btn btn-ghost" onClick={() => deleteModel.mutate({ id: m.id })} style={{ color: 'var(--error)' }}>{t('common.delete')}</button>
@@ -2345,7 +2397,7 @@ export default function EnterpriseSettings() {
                         {/* ── 0.5. Company Timezone ── */}
                         <CompanyTimezoneEditor key={`tz-${selectedTenantId}`} />
 
-                        {/* ── 1. Company Intro ── */}
+                        {/* ── 2. Company Intro ── */}
                         <h3 style={{ marginBottom: '8px' }}>{t('enterprise.companyIntro.title', 'Company Intro')}</h3>
                         <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
                             {t('enterprise.companyIntro.description', 'Describe your company\'s mission, products, and culture. This information is included in every agent conversation as context.')}
@@ -2747,15 +2799,19 @@ export default function EnterpriseSettings() {
                                                                     onClick={() => {
                                                                         setConfigCategory(category);
                                                                         setEditingConfig({});
-                                                                        // Load existing global config from the first tool in this category
-                                                                        const firstToolWithConfig = (catTools as any[]).find((tl: any) => tl.config_schema?.fields?.length > 0);
+                                                                        // Load existing global config from the first tool in this category that has a non-empty config.
+                                                                        // Do NOT require config_schema — some categories (e.g. AgentBay)
+                                                                        // define their schema only in frontend CATEGORY_CONFIG_SCHEMAS.
+                                                                        const firstToolWithConfig = (catTools as any[]).find((tl: any) => tl.config && Object.keys(tl.config).length > 0);
                                                                         if (firstToolWithConfig?.config) {
                                                                             setEditingConfig({ ...firstToolWithConfig.config });
                                                                         }
                                                                     }}
                                                                     style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }}
                                                                     title={`Configure ${category}`}
-                                                                >Configure</button>
+                                                                >
+                                                                    ⚙️ {t('enterprise.tools.configure', 'Configure')}
+                                                                </button>
                                                             )}
                                                             {/* Category Bulk Toggle */}
                                                             <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }} title={`Enable/Disable all ${categoryLabels[category] || category} tools`}>
@@ -2798,6 +2854,9 @@ export default function EnterpriseSettings() {
                                                                                         {tool.type === 'mcp' ? 'MCP' : 'Built-in'}
                                                                                     </span>
                                                                                     {tool.is_default && <span style={{ fontSize: '10px', background: 'rgba(0,200,100,0.15)', color: 'var(--success)', borderRadius: '4px', padding: '1px 5px' }}>Default</span>}
+                                                                                    {tool.config && Object.keys(tool.config).length > 0 && (
+                                                                                        <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px' }}>{t('enterprise.tools.configured', 'Configured')}</span>
+                                                                                    )}
                                                                                 </div>
                                                                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                                                                                     {tool.description?.slice(0, 80)}
@@ -2809,13 +2868,12 @@ export default function EnterpriseSettings() {
                                                                         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
                                                                             {/* Per-tool config button: only if the tool has its own schema AND is NOT part of a category config */}
                                                                             {hasOwnConfig && (
-                                                                                <button className="btn btn-secondary" style={{ padding: '4px 8px', fontSize: '11px' }} onClick={async () => {
-                                                                                    if (isEditing) {
-                                                                                        setEditingToolId(null);
-                                                                                    } else {
+                                                                                <button
+                                                                                    style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }}
+                                                                                    title={t('enterprise.tools.configureSettings', 'Configure settings')}
+                                                                                    onClick={async () => {
                                                                                         setEditingToolId(tool.id);
                                                                                         const cfg = { ...tool.config };
-                                                                                        // Pre-load jina api_key from system_settings
                                                                                         if (tool.name === 'jina_search' || tool.name === 'jina_read') {
                                                                                             try {
                                                                                                 const token = localStorage.getItem('token');
@@ -2825,8 +2883,10 @@ export default function EnterpriseSettings() {
                                                                                             } catch { }
                                                                                         }
                                                                                         setEditingConfig(cfg);
-                                                                                    }
-                                                                                }}>{isEditing ? t('enterprise.tools.collapse') : t('enterprise.tools.configure')}</button>
+                                                                                    }}
+                                                                                >
+                                                                                    ⚙️ {t('enterprise.tools.configure')}
+                                                                                </button>
                                                                             )}
 
                                                                             {/* Delete (non-builtin only) */}
@@ -2975,6 +3035,10 @@ export default function EnterpriseSettings() {
                                                     {field.type === 'password' ? (
                                                         <input type="password" autoComplete="new-password" className="form-input" value={editingConfig[field.key] ?? ''} placeholder={field.placeholder || ''}
                                                             onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                    ) : field.type === 'select' ? (
+                                                        <select className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))}>
+                                                            {(field.options || []).map((o: any) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                                        </select>
                                                     ) : (
                                                         <input type="text" className="form-input" value={editingConfig[field.key] ?? ''} placeholder={field.placeholder || ''}
                                                             onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
@@ -2984,10 +3048,12 @@ export default function EnterpriseSettings() {
                                             <div style={{ display: 'flex', gap: '8px', marginTop: '8px', justifyContent: 'flex-end' }}>
                                                 <button className="btn btn-secondary" onClick={() => setConfigCategory(null)}>{t('common.cancel')}</button>
                                                 <button className="btn btn-primary" onClick={async () => {
-                                                    // Save config to all tools in this category that have config_schema
-                                                    const catTools = allTools.filter((tl: any) => (tl.category || 'general') === configCategory && tl.config_schema?.fields?.length > 0);
-                                                    for (const tl of catTools) {
-                                                        await fetchJson(`/tools/${tl.id}`, { method: 'PUT', body: JSON.stringify({ config: editingConfig }) });
+                                                    // Save config to the first tool in this category.
+                                                    // We write to one representative tool per category;
+                                                    // get_category_config endpoint reads it back.
+                                                    const catTools = allTools.filter((tl: any) => (tl.category || 'general') === configCategory);
+                                                    if (catTools.length > 0) {
+                                                        await fetchJson(`/tools/${catTools[0].id}`, { method: 'PUT', body: JSON.stringify({ config: editingConfig }) });
                                                     }
                                                     setConfigCategory(null);
                                                     loadAllTools();

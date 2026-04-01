@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, delete, func, select, update
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, delete, func, or_, select, update
 
 import httpx
 from loguru import logger
@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.identity import IdentityProvider
 from app.models.org import OrgDepartment, OrgMember
-from app.models.user import User
+from app.models.user import User, Identity
 from pypinyin import pinyin, Style
 
 from app.core.security import hash_password
@@ -415,13 +415,22 @@ class BaseOrgSyncAdapter(ABC):
             )
             department = dept_result.scalars().first()
 
-        # Check if exists by external_id and provider
-        result = await db.execute(
-            select(OrgMember).where(
-                OrgMember.external_id == user.external_id,
-                OrgMember.provider_id == provider.id,
+        # Check if exists by unionid or external_id or open_id (any matches), and provider
+        conditions = []
+        if user.unionid:
+            conditions.append(OrgMember.unionid == user.unionid)
+        if user.external_id:
+            conditions.append(OrgMember.external_id == user.external_id)
+        if user.open_id:
+            conditions.append(OrgMember.open_id == user.open_id)
+
+        if conditions:
+            result = await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    or_(*conditions)
+                )
             )
-        )
         existing_member = result.scalars().first()
 
         now = datetime.now()
@@ -436,7 +445,7 @@ class BaseOrgSyncAdapter(ABC):
         mobile = _normalize_contact(user.mobile)
 
         if email:
-            user_query = select(User).where(User.email.ilike(email))
+            user_query = select(User).join(User.identity).where(Identity.email == email)
             if self.tenant_id:
                 user_query = user_query.where(User.tenant_id == self.tenant_id)
             user_res = await db.execute(user_query)
@@ -445,7 +454,7 @@ class BaseOrgSyncAdapter(ABC):
                 user_id = platform_user.id
 
         if not user_id and mobile:
-            user_query = select(User).where(User.primary_mobile == mobile)
+            user_query = select(User).join(User.identity).where(Identity.phone == mobile)
             if self.tenant_id:
                 user_query = user_query.where(User.tenant_id == self.tenant_id)
             user_res = await db.execute(user_query)
@@ -473,7 +482,8 @@ class BaseOrgSyncAdapter(ABC):
             # Universal ID fields
             existing_member.external_id = user.external_id
             existing_member.open_id = user.open_id
-            
+            existing_member.unionid = user.unionid
+
             existing_member.provider_id = provider.id
             existing_member.synced_at = now
             if user_id and not existing_member.user_id:
@@ -486,6 +496,7 @@ class BaseOrgSyncAdapter(ABC):
             new_member = OrgMember(
                 external_id=user.external_id,
                 open_id=user.open_id,
+                unionid=user.unionid,
 
                 provider_id=provider.id,
                 user_id=user_id,
@@ -527,7 +538,7 @@ class BaseOrgSyncAdapter(ABC):
         email = _normalize_contact(user.email)
         if email:
             result = await db.execute(
-                select(User).where(User.email.ilike(email))
+                select(User).join(User.identity).where(Identity.email == email)
             )
             u = result.scalars().first()
             if u: return u
@@ -536,7 +547,7 @@ class BaseOrgSyncAdapter(ABC):
         mobile = _normalize_contact(user.mobile)
         if mobile:
             result = await db.execute(
-                select(User).where(User.primary_mobile == mobile)
+                select(User).join(User.identity).where(Identity.phone == mobile)
             )
             u = result.scalars().first()
             if u: return u

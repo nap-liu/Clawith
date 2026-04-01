@@ -7,12 +7,14 @@ import re
 import uuid
 from typing import Any
 
+from loguru import logger
 from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.identity import IdentityProvider
 from app.models.tenant import Tenant
-from app.models.user import User
+from app.models.user import Identity, User
+from app.services.platform_service import platform_service
 
 
 class SSOService:
@@ -34,13 +36,32 @@ class SSOService:
         Returns:
             User if found, None otherwise
         """
-        query = select(User).where(User.email.ilike(f"%{email}%"))
-
+        # 1. Try direct match via Identity join
+        query = (
+            select(User)
+            .join(User.identity)
+            .where(Identity.email == email)
+        )
         if tenant_id:
             query = query.where(User.tenant_id == tenant_id)
-
+        
         result = await db.execute(query)
-        return result.scalar_one_or_none()
+        user = result.scalar_one_or_none()
+        
+        if user:
+            return user
+            
+        # 2. If not found and tenant_id is provided, try to find an Identity
+        if email:
+            id_query = select(Identity).where(Identity.email == email)
+            id_result = await db.execute(id_query)
+            identity = id_result.scalar_one_or_none()
+            if identity:
+                # Find any user for this identity (representative)
+                u_res = await db.execute(select(User).where(User.identity_id == identity.id).limit(1))
+                return u_res.scalar_one_or_none()
+                
+        return None
 
     async def match_user_by_mobile(
         self, db: AsyncSession, mobile: str, tenant_id: str | None = None
@@ -55,16 +76,34 @@ class SSOService:
         Returns:
             User if found, None otherwise
         """
-        # Normalize mobile number (remove spaces, dashes, etc.)
+        # Normalize mobile number
         normalized_mobile = re.sub(r"[\s\-\+]", "", mobile)
+        if not normalized_mobile:
+            return None
 
-        query = select(User).where(User.primary_mobile.ilike(f"%{normalized_mobile}%"))
-
+        # 1. Try direct match via Identity join
+        query = (
+            select(User)
+            .join(User.identity)
+            .where(Identity.phone == normalized_mobile)
+        )
         if tenant_id:
             query = query.where(User.tenant_id == tenant_id)
-
+            
         result = await db.execute(query)
-        return result.scalar_one_or_none()
+        user = result.scalar_one_or_none()
+        if user:
+            return user
+
+        # 2. Try Identity match
+        id_query = select(Identity).where(Identity.phone == normalized_mobile)
+        id_result = await db.execute(id_query)
+        identity = id_result.scalar_one_or_none()
+        if identity:
+             u_res = await db.execute(select(User).where(User.identity_id == identity.id).limit(1))
+             return u_res.scalar_one_or_none()
+
+        return None
 
     async def auto_associate_tenant(self, db: AsyncSession, email: str) -> str | None:
         """Detect tenant based on email domain.
@@ -152,7 +191,10 @@ class SSOService:
             return None
 
         # Get user
-        user_result = await db.execute(select(User).where(User.id == member.user_id))
+        from sqlalchemy.orm import selectinload
+        user_result = await db.execute(
+            select(User).where(User.id == member.user_id).options(selectinload(User.identity))
+        )
         return user_result.scalar_one_or_none()
 
     async def link_identity(
@@ -287,6 +329,56 @@ class SSOService:
             Existing user if identity is already linked, None otherwise
         """
         return await self.resolve_user_identity(db, provider_user_id, provider_type, tenant_id)
+
+    async def validate_sso_enablement(self, db: AsyncSession, tenant_id: uuid.UUID) -> bool:
+        """Check if SSO can be enabled for this tenant under IP restrictions.
+
+        Only checks when THIS tenant doesn't have SSO enabled yet.
+        If tenant already has sso_enabled=True, allows without checking.
+
+        Returns True if allowed, False if another tenant already has SSO enabled on an IP base.
+        """
+        # First check if this tenant already has SSO enabled
+        tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+        tenant = tenant_result.scalar_one_or_none()
+        if tenant and tenant.sso_enabled:
+            # Already has SSO enabled, can freely toggle providers
+            return True
+
+        # This tenant doesn't have SSO enabled yet, check IP restriction
+        base_url = await platform_service.get_public_base_url(db)
+
+        # Parse host
+        parts = base_url.split("://")
+        if len(parts) < 2:
+            return True  # Conservative default
+
+        host = parts[1].split(":")[0].split("/")[0]
+
+        if not platform_service.is_ip_address(host):
+            return True
+
+        # IP Address: only ONE tenant in the whole system can have SSO enabled.
+        # Check if any *other* tenant has an active SSO-enabled provider.
+        query = select(IdentityProvider).where(
+            IdentityProvider.sso_login_enabled == True,
+            IdentityProvider.is_active == True,
+            IdentityProvider.tenant_id != tenant_id,
+        )
+        result = await db.execute(query)
+        other_providers = result.scalars().all()
+
+        if other_providers:
+            # Collect conflicting tenant names
+            conflict_names = []
+            for other_provider in other_providers:
+                tenant_query = await db.execute(select(Tenant).where(Tenant.id == other_provider.tenant_id))
+                conflict_tenant = tenant_query.scalar_one_or_none()
+                name = conflict_tenant.name if conflict_tenant else str(other_provider.tenant_id)
+                conflict_names.append(f"'{name}'")
+            conflict_str = ", ".join(conflict_names)
+            logger.warning(f"[SSO] IP conflict: tenant_id={tenant_id} cannot enable SSO, other tenants already have SSO enabled on IP base: {conflict_str}")
+        return len(other_providers) == 0
 
     def add_domain_hint(self, domain: str, tenant_id: str):
         """Add a domain to tenant mapping hint.

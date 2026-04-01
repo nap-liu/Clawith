@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.security import create_access_token, hash_password
-from app.models.user import User
+from app.models.user import User, Identity
 from app.models.identity import IdentityProvider
 
 settings = get_settings()
@@ -155,9 +155,9 @@ class FeishuService:
             u_result = await db.execute(select(User).where(User.id == member.user_id))
             user = u_result.scalars().first()
 
-        # 3. Fallback: find by email or primary_mobile (new generic fields)
+        # 3. Fallback: find by email matching (exact match)
         if not user and fs_email:
-            query = select(User).where(User.email == fs_email)
+            query = select(User).join(User.identity).where(Identity.email == fs_email)
             if tenant_id:
                 query = query.where(User.tenant_id == tenant_id)
             result = await db.execute(query)
@@ -183,22 +183,41 @@ class FeishuService:
             username = fs_email.split("@")[0] if fs_email else f"feishu_{open_id[:8]}"
             email = fs_email or f"{username}@feishu.local"
 
-            # Ensure unique username
-            existing_r = await db.execute(select(User).where(User.username == username))
-            if existing_r.scalars().first():
-                username = f"{username}_{open_id[:6]}"
+            # Ensure unique username within tenant
+            query = (
+                select(User)
+                .join(User.identity)
+                .where(Identity.username == username)
+            )
+            if tenant_id:
+                query = query.where(User.tenant_id == tenant_id)
+            
+            existing = await db.execute(query)
+            if existing.scalar_one_or_none():
+                import uuid
+                username = f"{username}_{uuid.uuid4().hex[:6]}"
 
-            user = User(
-                username=username,
+            # Step 1: Find or create global Identity using unified registration service
+            from app.services.registration_service import registration_service
+            # No phone available in this specific Feishu login block, but it handles email/username matching
+            identity = await registration_service.find_or_create_identity(
+                db,
                 email=email,
-                password_hash=hash_password(open_id),
+                phone=user_info.get("mobile"),
+                username=username,
+                password=open_id,
+            )
+
+            # Step 2: Create tenant-scoped User linked to Identity
+            user = User(
+                identity_id=identity.id,
                 display_name=fs_name or username,
                 avatar_url=fs_avatar or None,
-                external_id=user_id,
-                feishu_user_id=user_id,
                 registration_source="feishu",
                 tenant_id=tenant_id,
+                is_active=True,
             )
+
             db.add(user)
             await db.flush()
 

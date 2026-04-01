@@ -1,7 +1,7 @@
 """Add sso_login_enabled to identity_providers
 
 Revision ID: add_sso_login_enabled
-Revises:
+Revises: user_refactor_v1
 Create Date: 2026-03-29
 """
 from alembic import op

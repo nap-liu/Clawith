@@ -24,10 +24,10 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-async def create_password_reset_token(user_id: uuid.UUID) -> tuple[str, datetime]:
+async def create_password_reset_token(identity_id: uuid.UUID) -> tuple[str, datetime]:
     """Create a new single-use token and invalidate older unused tokens in Redis."""
     redis = await get_redis()
-    user_key = f"{USER_PREFIX}{user_id}"
+    user_key = f"{USER_PREFIX}{identity_id}"
     
     # Invalidate previous token for this user if exists
     old_token_hash = await redis.get(user_key)
@@ -46,7 +46,7 @@ async def create_password_reset_token(user_id: uuid.UUID) -> tuple[str, datetime
     ttl_seconds = int(expiry_minutes * 60)
     
     async with redis.pipeline(transaction=True) as pipe:
-        pipe.setex(token_key, ttl_seconds, str(user_id))
+        pipe.setex(token_key, ttl_seconds, str(identity_id))
         pipe.setex(user_key, ttl_seconds, token_hash)
         await pipe.execute()
         
@@ -55,20 +55,8 @@ async def create_password_reset_token(user_id: uuid.UUID) -> tuple[str, datetime
 
 async def get_public_base_url(db: AsyncSession) -> str:
     """Resolve the public base URL used for user-facing links."""
-    result = await db.execute(select(SystemSetting).where(SystemSetting.key == "platform"))
-    setting = result.scalar_one_or_none()
-    if setting and setting.value and setting.value.get("public_base_url"):
-        return str(setting.value["public_base_url"]).strip().rstrip("/")
-
-    env_value = getattr(get_settings(), "PUBLIC_BASE_URL", "") if hasattr(get_settings(), "PUBLIC_BASE_URL") else ""
-    env_value = str(env_value).strip().rstrip("/")
-    if env_value:
-        return env_value
-
-    raise RuntimeError(
-        "Public base URL is not configured. Set platform public_base_url or PUBLIC_BASE_URL "
-        "(required in production for reset links)."
-    )
+    from app.services.platform_service import platform_service
+    return await platform_service.get_public_base_url(db)
 
 
 async def build_password_reset_url(db: AsyncSession, raw_token: str) -> str:
@@ -83,12 +71,12 @@ async def consume_password_reset_token(raw_token: str) -> dict | None:
     token_hash = _hash_token(raw_token)
     token_key = f"{TOKEN_PREFIX}{token_hash}"
     
-    user_id_str = await redis.get(token_key)
-    if not user_id_str:
+    identity_id_str = await redis.get(token_key)
+    if not identity_id_str:
         return None
         
-    user_id = uuid.UUID(user_id_str)
-    user_key = f"{USER_PREFIX}{user_id}"
+    identity_id = uuid.UUID(identity_id_str)
+    user_key = f"{USER_PREFIX}{identity_id}"
     
     # Atomic delete to ensure single-use
     async with redis.pipeline(transaction=True) as pipe:
@@ -96,4 +84,4 @@ async def consume_password_reset_token(raw_token: str) -> dict | None:
         pipe.delete(user_key)
         await pipe.execute()
     
-    return {"user_id": user_id}
+    return {"identity_id": identity_id}

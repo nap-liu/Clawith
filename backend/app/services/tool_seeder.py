@@ -263,10 +263,10 @@ BUILTIN_TOOLS = [
     },
     {
         "name": "web_search",
-        "display_name": "DuckDuckGo Search",
-        "description": "Search the internet via DuckDuckGo. May be unavailable on some networks. Use Bing Search as an alternative.",
+        "display_name": "Web Search",
+        "description": "Search the internet using a configurable search engine. Supports DuckDuckGo (free), Tavily, Google, and Bing. Configure the search engine in the tool settings.",
         "category": "search",
-        "icon": "🦆",
+        "icon": "🔍",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
@@ -552,6 +552,147 @@ BUILTIN_TOOLS = [
                     "type": "text",
                     "default": "",
                     "placeholder": "https://ik.imagekit.io/your_imagekit_id",
+                },
+            ]
+        },
+    },
+    {
+        "name": "generate_image_siliconflow",
+        "display_name": "Generate Image (SiliconFlow)",
+        "description": "Generate an image via SiliconFlow FLUX models. China-friendly and fast.",
+        "category": "media",
+        "icon": "🎨",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Detailed image description."},
+                "size": {"type": "string", "description": "Image size (e.g. 1024x1024, 1024x768). Default 1024x1024."},
+                "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
+            },
+            "required": ["prompt"],
+        },
+        "config": {
+            "model": "black-forest-labs/FLUX.1-schnell",
+            "api_key": "",
+            "base_url": "",
+        },
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "model",
+                    "label": "Model",
+                    "type": "text",
+                    "default": "black-forest-labs/FLUX.1-schnell",
+                    "placeholder": "e.g. black-forest-labs/FLUX.1-schnell",
+                },
+                {
+                    "key": "api_key",
+                    "label": "API Key",
+                    "type": "password",
+                    "default": "",
+                    "placeholder": "SiliconFlow API Key",
+                },
+                {
+                    "key": "base_url",
+                    "label": "Base URL (optional)",
+                    "type": "text",
+                    "default": "",
+                    "placeholder": "Default: https://api.siliconflow.cn/v1",
+                },
+            ]
+        },
+    },
+    {
+        "name": "generate_image_openai",
+        "display_name": "Generate Image (OpenAI)",
+        "description": "Generate an image via OpenAI DALL-E models.",
+        "category": "media",
+        "icon": "🎨",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Detailed image description."},
+                "size": {"type": "string", "description": "Image size (e.g. 1024x1024). Default 1024x1024."},
+                "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
+            },
+            "required": ["prompt"],
+        },
+        "config": {
+            "model": "dall-e-3",
+            "api_key": "",
+            "base_url": "",
+        },
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "model",
+                    "label": "Model",
+                    "type": "text",
+                    "default": "dall-e-3",
+                    "placeholder": "e.g. dall-e-3 or dall-e-2",
+                },
+                {
+                    "key": "api_key",
+                    "label": "API Key",
+                    "type": "password",
+                    "default": "",
+                    "placeholder": "OpenAI API Key",
+                },
+                {
+                    "key": "base_url",
+                    "label": "Base URL (optional)",
+                    "type": "text",
+                    "default": "",
+                    "placeholder": "Default: https://api.openai.com/v1",
+                },
+            ]
+        },
+    },
+    {
+        "name": "generate_image_google",
+        "display_name": "Generate Image (Google/Vertex)",
+        "description": "Generate an image via Google Gemini Image (Nano Banana) or Vertex AI.",
+        "category": "media",
+        "icon": "🎨",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Detailed image description."},
+                "size": {"type": "string", "description": "Image size (e.g. 1024x1024). Default 1024x1024."},
+                "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
+            },
+            "required": ["prompt"],
+        },
+        "config": {
+            "model": "gemini-2.5-flash-image",
+            "api_key": "",
+            "base_url": "",
+        },
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "model",
+                    "label": "Model",
+                    "type": "text",
+                    "default": "gemini-2.5-flash-image",
+                    "placeholder": "e.g. gemini-2.5-flash-image",
+                },
+                {
+                    "key": "api_key",
+                    "label": "API Key",
+                    "type": "password",
+                    "default": "",
+                    "placeholder": "Google AI Studio or Vertex API Key",
+                },
+                {
+                    "key": "base_url",
+                    "label": "Base URL (optional)",
+                    "type": "text",
+                    "default": "",
+                    "placeholder": "Can be Vertex API URL: https://aiplatform.googleapis.com/...",
                 },
             ]
         },
@@ -965,6 +1106,46 @@ BUILTIN_TOOLS = [
                 "content": {"type": "string", "description": "Text content to append"},
             },
             "required": ["document_token", "content"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "feishu_drive_share",
+        "display_name": "Feishu Drive Share",
+        "description": "Manage collaborators for any Feishu Drive file (docx, bitable, sheet, etc.). Add, remove, or list collaborators with view/edit/full_access permissions.",
+        "category": "feishu",
+        "icon": "🔗",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "document_token": {"type": "string", "description": "File token (from URL or previous tool output)"},
+                "doc_type": {"type": "string", "enum": ["docx", "bitable", "sheet", "doc", "folder", "mindnote", "slides"], "description": "File type. Default: 'docx'"},
+                "action": {"type": "string", "enum": ["add", "remove", "list"], "description": "'add' to grant, 'remove' to revoke, 'list' to view"},
+                "member_names": {"type": "array", "items": {"type": "string"}, "description": "Colleague names to add/remove (auto-searched)"},
+                "member_open_ids": {"type": "array", "items": {"type": "string"}, "description": "Feishu open_ids directly"},
+                "permission": {"type": "string", "enum": ["view", "edit", "full_access"], "description": "Permission level. Default: 'edit'"},
+            },
+            "required": ["document_token", "action"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "feishu_drive_delete",
+        "display_name": "Feishu Drive Delete",
+        "description": "Delete a file or folder from Feishu Drive. The file is moved to the recycle bin. Supports all file types: docx, bitable, sheet, folder, etc.",
+        "category": "feishu",
+        "icon": "🗑️",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "file_token": {"type": "string", "description": "Token of the file to delete"},
+                "file_type": {"type": "string", "enum": ["file", "docx", "bitable", "folder", "doc", "sheet", "mindnote", "shortcut", "slides"], "description": "Type of the file to delete"},
+            },
+            "required": ["file_token", "file_type"],
         },
         "config": {},
         "config_schema": {},

@@ -65,20 +65,12 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 60
+    EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES: int = 60  # 1 hour
+    EMAIL_VERIFICATION_REQUIRED: bool = False  # Require email verification for login
 
     # File Storage
     AGENT_DATA_DIR: str = _default_agent_data_dir()
     AGENT_TEMPLATE_DIR: str = "/app/agent_template"
-
-    # System email (platform-owned outbound mail)
-    SYSTEM_EMAIL_FROM_ADDRESS: str = ""
-    SYSTEM_EMAIL_FROM_NAME: str = "Clawith"
-    SYSTEM_SMTP_HOST: str = ""
-    SYSTEM_SMTP_PORT: int = 465
-    SYSTEM_SMTP_USERNAME: str = ""
-    SYSTEM_SMTP_PASSWORD: str = ""
-    SYSTEM_SMTP_SSL: bool = True
-    SYSTEM_SMTP_TIMEOUT_SECONDS: int = 15
 
     # Docker (for Agent containers)
     DOCKER_NETWORK: str = "clawith_network"
@@ -96,6 +88,7 @@ class Settings(BaseSettings):
 
     # Jina AI (Reader + Search APIs)
     JINA_API_KEY: str = ""
+
 
     # Sandbox configuration
     SANDBOX_TYPE: SandboxType = SandboxType.SUBPROCESS

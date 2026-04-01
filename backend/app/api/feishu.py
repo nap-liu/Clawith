@@ -199,18 +199,8 @@ async def get_channel_config(
 @router.get("/agents/{agent_id}/channel/webhook-url")
 async def get_webhook_url(agent_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)):
     """Get the webhook URL for this agent's Feishu bot."""
-    import os
-    from app.models.system_settings import SystemSetting
-    # Priority: system_settings > env var > request.base_url
-    public_base = ""
-    result = await db.execute(select(SystemSetting).where(SystemSetting.key == "platform"))
-    setting = result.scalar_one_or_none()
-    if setting and setting.value.get("public_base_url"):
-        public_base = setting.value["public_base_url"].rstrip("/")
-    if not public_base:
-        public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-    if not public_base:
-        public_base = str(request.base_url).rstrip("/")
+    from app.services.platform_service import platform_service
+    public_base = await platform_service.get_public_base_url(db, request)
     return {"webhook_url": f"{public_base}/api/channel/feishu/{agent_id}/webhook"}
 
 
@@ -431,7 +421,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
 
             sender_name = ""
             sender_user_id_feishu = sender_user_id_from_event  # tenant-level user_id, pre-filled from event body
-            platform_user_id = creator_id  # fallback
+            extra_info: dict | None = None
 
             try:
                 async with _httpx.AsyncClient() as _client:
@@ -453,6 +443,14 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                             sender_name = _user_info.get("name", "")
                             sender_user_id_feishu = _user_info.get("user_id", "")
                             sender_email = _user_info.get("email", "") or _user_info.get("enterprise_email", "")
+                            extra_info = {
+                                "name": sender_name,
+                                "email": sender_email,
+                                "mobile": _user_info.get("mobile"),
+                                "avatar_url": _user_info.get("avatar"),
+                                "unionid": _user_info.get("user_id"),  # tenant-level user_id
+                                "open_id": sender_open_id,
+                            }
                             logger.info(f"[Feishu] Resolved sender: {sender_name} (user_id={sender_user_id_feishu})")
                             # Cache sender info so feishu_user_search can find them by name
                             if sender_name and sender_open_id:
@@ -490,101 +488,16 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             except Exception as e:
                 logger.error(f"[Feishu] Failed to resolve sender: {e}")
 
-            # --- Get or Create Feishu Identity Provider ---
-            # Use tenant scoping
-            provider_query = select(IdentityProvider).where(
-                IdentityProvider.provider_type == "feishu",
-                IdentityProvider.tenant_id == (agent_obj.tenant_id if agent_obj else None)
+            # Resolve channel user via unified service (uses OrgMember + SSO patterns)
+            from app.services.channel_user_service import channel_user_service
+            platform_user = await channel_user_service.resolve_channel_user(
+                db=db,
+                agent=agent_obj,
+                channel_type="feishu",
+                external_user_id=sender_open_id,
+                extra_info=extra_info,
             )
-            provider_result = await db.execute(provider_query)
-            provider = provider_result.scalars().first()
-            
-            if not provider:
-                provider = IdentityProvider(
-                    provider_type="feishu",
-                    name="Feishu",
-                    is_active=True,
-                    config={"app_id": config.app_id, "app_secret": config.app_secret},
-                    tenant_id=agent_obj.tenant_id if agent_obj else None
-                )
-                db.add(provider)
-                await db.flush()
-
-            # Look up platform user by OrgMember
-            from app.models.org import OrgMember
-            if sender_user_id_feishu or sender_open_id:
-                member_query = select(OrgMember).where(
-                    OrgMember.provider_id == provider.id,
-                    OrgMember.tenant_id == agent_obj.tenant_id if agent_obj else None,
-                    OrgMember.status == "active",
-                    or_(
-                        OrgMember.external_id == sender_user_id_feishu if sender_user_id_feishu else False,
-                        OrgMember.open_id == sender_open_id if sender_open_id else False,
-                        OrgMember.external_id == sender_open_id if sender_open_id else False
-                    )
-                )
-                member_result = await db.execute(member_query)
-                member = member_result.scalars().first()
-                if member and member.user_id:
-                    platform_user_id = member.user_id
-                    logger.info(f"[Feishu] Matched user via OrgMember: {platform_user_id}")
-
-            # Auto-create user if not found and we have sender info
-            if platform_user_id == creator_id and sender_name:
-                from app.core.security import hash_password
-                new_username = f"feishu_{sender_user_id_feishu or sender_open_id[:16]}"
-                
-                # Check if a user with this username already exists
-                existing_user_query = select(User).where(User.username == new_username)
-                existing_user_result = await db.execute(existing_user_query)
-                existing_user = existing_user_result.scalars().first()
-                
-                if existing_user:
-                    platform_user_id = existing_user.id
-                    logger.info(f"[Feishu] Found existing user by username: {new_username}")
-                else:
-                    new_user = User(
-                        username=new_username,
-                        email=f"{new_username}@feishu.local",
-                        password_hash=hash_password(_uuid.uuid4().hex),  # random password
-                        display_name=sender_name,
-                        role="member",
-                        external_id=sender_user_id_feishu,
-                        feishu_user_id=sender_user_id_feishu or None,
-                        tenant_id=agent_obj.tenant_id if agent_obj else None,
-                    source="feishu",
-                    )
-                    db.add(new_user)
-                    await db.flush()
-                    platform_user_id = new_user.id
-                    logger.info(f"[Feishu] Auto-created user: {sender_name} -> {new_username}")
-            # Ensure OrgMember exists and is linked
-            member_check = await db.execute(
-                select(OrgMember).where(
-                    OrgMember.provider_id == provider.id,
-                    OrgMember.tenant_id == agent_obj.tenant_id if agent_obj else None,
-                    OrgMember.status == "active",
-                    or_(
-                        OrgMember.external_id == sender_user_id_feishu if sender_user_id_feishu else False,
-                        OrgMember.open_id == sender_open_id if sender_open_id else False
-                    )
-                )
-            )
-            member = member_check.scalars().first()
-            if not member:
-                member = OrgMember(
-                    name=sender_name or f"Feishu User {sender_open_id[:8]}",
-                    open_id=sender_open_id,
-                    external_id=sender_user_id_feishu,
-                    provider_id=provider.id,
-                    user_id=platform_user_id,
-                    tenant_id=agent_obj.tenant_id if agent_obj else None
-                )
-                db.add(member)
-            elif not member.user_id:
-                member.user_id = platform_user_id
-            
-            await db.flush()
+            platform_user_id = platform_user.id
 
             # ── Find-or-create a ChatSession via external_conv_id (DB-based, no cache needed) ──
             from datetime import datetime as _dt, timezone as _tz
@@ -936,10 +849,10 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
         agent_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
         agent_obj = agent_r.scalar_one_or_none()
 
-        # Resolve sender identity: prefer user_id from message event
+        # Resolve sender's Feishu user_id (more stable than open_id)
         sender_user_id_feishu = ""
+        extra_info: dict | None = None
         try:
-            # Try to extract user_id from the original message event
             import httpx as _hx
             async with _hx.AsyncClient() as _fc:
                 _tr = await _fc.post(
@@ -955,59 +868,29 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
                     )
                     _ud = _ur.json()
                     if _ud.get("code") == 0:
-                        sender_user_id_feishu = _ud.get("data", {}).get("user", {}).get("user_id", "")
+                        _user_info = _ud.get("data", {}).get("user", {})
+                        sender_user_id_feishu = _user_info.get("user_id", "")
+                        extra_info = {
+                            "name": _user_info.get("name"),
+                            "avatar_url": _user_info.get("avatar"),
+                            "email": _user_info.get("email"),
+                            "mobile": _user_info.get("mobile"),
+                            "unionid": _user_info.get("user_id"),
+                            "open_id": sender_open_id,
+                        }
         except Exception:
             pass
 
-        # Find platform user: prefer OrgMember linkage, then feishu_user_id, then username
-        _pu = None
-        if agent_obj:
-            from app.models.identity import IdentityProvider as IdentityProviderModel
-            from app.models.org import OrgMember as OrgMemberModel
-            _pr = await db.execute(
-                _select(IdentityProviderModel).where(
-                    IdentityProviderModel.provider_type == "feishu",
-                    IdentityProviderModel.tenant_id == agent_obj.tenant_id,
-                )
-            )
-            _provider = _pr.scalars().first()
-            if _provider and (sender_user_id_feishu or sender_open_id):
-                _mr = await db.execute(
-                    _select(OrgMemberModel).where(
-                        OrgMemberModel.provider_id == _provider.id,
-                        OrgMemberModel.tenant_id == agent_obj.tenant_id,
-                        OrgMemberModel.status == "active",
-                        or_(
-                            OrgMemberModel.external_id == sender_user_id_feishu if sender_user_id_feishu else False,
-                            OrgMemberModel.open_id == sender_open_id if sender_open_id else False,
-                        )
-                    )
-                )
-                _member = _mr.scalars().first()
-                if _member and _member.user_id:
-                    _ur = await db.execute(_select(UserModel).where(UserModel.id == _member.user_id))
-                    _pu = _ur.scalars().first()
-        if sender_user_id_feishu:
-            _ur = await db.execute(_select(UserModel).where(UserModel.feishu_user_id == sender_user_id_feishu))
-            _pu = _ur.scalars().first()
-        if not _pu:
-            _un = f"feishu_{sender_user_id_feishu or sender_open_id[:16]}"
-            _ur = await db.execute(_select(UserModel).where(UserModel.username == _un))
-            _pu = _ur.scalars().first()
-        if not _pu:
-            _un = f"feishu_{sender_user_id_feishu or sender_open_id[:16]}"
-            _pu = UserModel(
-                username=_un, email=f"{_un}@feishu.local",
-                password_hash=hash_password(_uuid.uuid4().hex),
-                display_name=f"Feishu {sender_open_id[:8]}",
-                role="member",
-                external_id=sender_user_id_feishu,
-                feishu_user_id=sender_user_id_feishu or None,
-                tenant_id=agent_obj.tenant_id if agent_obj else None,
-            )
-            db.add(_pu)
-            await db.flush()
-        platform_user_id = _pu.id
+        # Resolve channel user via unified service (uses OrgMember + SSO patterns)
+        from app.services.channel_user_service import channel_user_service
+        platform_user = await channel_user_service.resolve_channel_user(
+            db=db,
+            agent=agent_obj,
+            channel_type="feishu",
+            external_user_id=sender_open_id,
+            extra_info=extra_info,
+        )
+        platform_user_id = platform_user.id
 
         # Conv ID — prefer user_id for session continuity
         if chat_type == "group" and chat_id:

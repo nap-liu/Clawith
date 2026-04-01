@@ -300,18 +300,24 @@ async def _process_wecom_stream_message(
 
         # Find or create platform user
         wc_username = f"wecom_{sender_id}"
-        u_r = await db.execute(_select(UserModel).where(UserModel.username == wc_username))
+        query = _select(UserModel).where(UserModel.username == wc_username)
+        if agent and agent.tenant_id:
+            query = query.where(UserModel.tenant_id == agent.tenant_id)
+            
+        u_r = await db.execute(query)
         platform_user = u_r.scalar_one_or_none()
 
         if not platform_user:
             platform_user = UserModel(
                 username=wc_username,
                 email=f"{wc_username}@wecom.local",
-                password_hash=hash_password(_uuid.uuid4().hex),
+                password_hash=hash_password(str(_uuid.uuid4())),
                 display_name=f"WeCom {sender_id[:8]}",
                 role="member",
-                tenant_id=agent_obj.tenant_id if agent_obj else None,
+                tenant_id=agent.tenant_id if agent else None,
+                registration_source="wecom",
             )
+
             db.add(platform_user)
             await db.flush()
         platform_user_id = platform_user.id

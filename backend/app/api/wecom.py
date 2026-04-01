@@ -223,17 +223,8 @@ async def get_wecom_webhook_url(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    import os
-    from app.models.system_settings import SystemSetting
-    public_base = ""
-    result = await db.execute(select(SystemSetting).where(SystemSetting.key == "platform"))
-    setting = result.scalar_one_or_none()
-    if setting and setting.value.get("public_base_url"):
-        public_base = setting.value["public_base_url"].rstrip("/")
-    if not public_base:
-        public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-    if not public_base:
-        public_base = str(request.base_url).rstrip("/")
+    from app.services.platform_service import platform_service
+    public_base = await platform_service.get_public_base_url(db, request)
     return {"webhook_url": f"{public_base}/api/channel/wecom/{agent_id}/webhook"}
 
 
@@ -492,9 +483,8 @@ async def _process_wecom_text(
     from app.database import async_session
     from app.models.agent import Agent as AgentModel
     from app.models.audit import ChatMessage
-    from app.models.user import User as UserModel
-    from app.core.security import hash_password
     from app.services.channel_session import find_or_create_channel_session
+    from app.services.channel_user_service import channel_user_service
     from app.api.feishu import _call_agent_llm
 
     async with async_session() as db:
@@ -514,13 +504,8 @@ async def _process_wecom_text(
         else:
             conv_id = f"wecom_p2p_{from_user}"
 
-        # Find or create platform user
-        wc_username = f"wecom_{from_user}"
-        u_r = await db.execute(_select(UserModel).where(UserModel.username == wc_username))
-        platform_user = u_r.scalar_one_or_none()
-
-        # Try to resolve display name from WeCom API
-        display_name = f"WeCom {from_user[:8]}"
+        # Try to resolve display name from WeCom API (optional enrichment)
+        extra_info: dict | None = None
         try:
             access_token = await _get_wecom_token_cached(config.app_id, config.app_secret)
             if access_token:
@@ -531,22 +516,26 @@ async def _process_wecom_text(
                     )
                     user_data = user_resp.json()
                     if user_data.get("errcode") == 0:
-                        display_name = user_data.get("name", display_name)
+                        extra_info = {
+                            "name": user_data.get("name"),
+                            "avatar_url": user_data.get("avatar_mediaid"),
+                        }
         except Exception as e:
-            logger.error(f"[WeCom] Failed to resolve user info: {e}")
+            logger.debug(f"[WeCom] Failed to resolve user info: {e}")
 
-        if not platform_user:
-            import uuid as _uuid
-            platform_user = UserModel(
-                username=wc_username,
-                email=f"{wc_username}@wecom.local",
-                password_hash=hash_password(_uuid.uuid4().hex),
-                display_name=display_name,
-                role="member",
-                tenant_id=agent_obj.tenant_id if agent_obj else None,
-            )
-            db.add(platform_user)
-            await db.flush()
+        # Ensure unionid is set (from_user is the WeCom userid)
+        if extra_info is None:
+            extra_info = {}
+        extra_info.setdefault("unionid", from_user)
+
+        # Resolve channel user via unified service (uses OrgMember + SSO patterns)
+        platform_user = await channel_user_service.resolve_channel_user(
+            db=db,
+            agent=agent_obj,
+            channel_type="wecom",
+            external_user_id=from_user,
+            extra_info=extra_info,
+        )
         platform_user_id = platform_user.id
 
         # Find or create session
@@ -676,90 +665,27 @@ async def wecom_callback(
     corp_id = config.get("app_id") or config.get("corp_id")
     secret = config.get("app_secret") or config.get("secret")
 
-    # 2. Exchange code for user info
+    # 2. Extract user info and login/register via RegistrationService
     try:
-        access_token = await _get_wecom_token_cached(corp_id, secret)
-        if not access_token:
-            return HTMLResponse(f"Auth failed: Token error")
-        async with httpx.AsyncClient() as client:
-            # Get user info
-            user_res = await client.get(
-                "https://qyapi.weixin.qq.com/cgi-bin/user/getuserinfo",
-                params={"access_token": access_token, "code": code}
-            )
-            wc_user = user_res.json()
-            userid = wc_user.get("UserId")
-            if not userid:
-                logger.error(f"WeCom userinfo error: {wc_user}")
-                return HTMLResponse("Auth failed: No UserId returned")
+        from app.services.auth_provider import auth_provider_registry
+        auth_provider = auth_provider_registry.get_provider(provider)
+        
+        token_data = await auth_provider.exchange_code_for_token(code)
+        access_token_str = token_data.get("access_token")
+        if not access_token_str:
+            return HTMLResponse("Auth failed: Token error")
+            
+        user_info = await auth_provider.get_user_info(access_token_str)
+        if not user_info.provider_user_id:
+            return HTMLResponse("Auth failed: No UserId returned")
+            
+        # Find or Create User (handles Identity and OrgMember linking)
+        user = await auth_provider.find_or_create_user(
+            db, user_info, tenant_id=tenant_id or provider.tenant_id
+        )
     except Exception as e:
-        logger.error(f"WeCom login error: {e}")
+        logger.error(f"WeCom login/register error: {e}", exc_info=True)
         return HTMLResponse(f"Auth failed: {str(e)}")
-
-    # 3. Fetch detailed user info (email, name) from WeCom API
-    wc_name = f"WeCom {userid}"
-    wc_email = None
-    try:
-        _at2 = await _get_wecom_token_cached(corp_id, secret)
-        async with httpx.AsyncClient(timeout=5) as client:
-            if _at2:
-                detail_res = await client.get(
-                    "https://qyapi.weixin.qq.com/cgi-bin/user/get",
-                    params={"access_token": _at2, "userid": userid},
-                )
-                detail_data = detail_res.json()
-                if detail_data.get("errcode") == 0:
-                    wc_name = detail_data.get("name", wc_name)
-                    wc_email = detail_data.get("email") or detail_data.get("biz_mail")
-                    logger.info(f"WeCom user detail: name={wc_name}, email={wc_email}")
-                else:
-                    logger.warning(f"WeCom user/get failed (non-fatal): {detail_data}")
-    except Exception as e:
-        logger.warning(f"WeCom user detail fetch failed (non-fatal): {e}")
-
-    # 4. Find user via OrgMember (SSO users must be in the org directory)
-    from app.models.org import OrgMember
-
-    # WeCom stores userid in external_id during org sync
-    member_result = await db.execute(
-        select(OrgMember).where(
-            OrgMember.external_id == userid,
-            OrgMember.provider_id == provider.id,
-        )
-    )
-    member = member_result.scalar_one_or_none()
-
-    user = None
-    if member and member.user_id:
-        user_result = await db.execute(select(User).where(User.id == member.user_id))
-        user = user_result.scalar_one_or_none()
-
-    if user:
-        # Sync latest info on every login
-        if (not user.email or user.email.endswith("@wecom.local")) and wc_email:
-            user.email = wc_email
-        if wc_name:
-            user.display_name = wc_name
-    else:
-        # Create new User (first login or OrgMember not yet linked)
-        email = wc_email or f"{userid}@wecom.local"
-        username = wc_email.split("@")[0] if wc_email else f"wc_{userid[:12]}"
-        user = User(
-            username=username,
-            email=email,
-            display_name=wc_name,
-            password_hash=hash_password(uuid.uuid4().hex),
-            role="member",
-            tenant_id=tenant_id or provider.tenant_id,
-        )
-        db.add(user)
-        await db.flush()
-
-        # Link back to OrgMember if found
-        if member:
-            member.user_id = user.id
-
-    await db.flush()
 
 
     # Standard login

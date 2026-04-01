@@ -276,9 +276,8 @@ async def process_dingtalk_message(
     from app.database import async_session
     from app.models.agent import Agent as AgentModel
     from app.models.audit import ChatMessage
-    from app.models.user import User as UserModel
-    from app.core.security import hash_password
     from app.services.channel_session import find_or_create_channel_session
+    from app.services.channel_user_service import channel_user_service
     from app.api.feishu import _call_agent_llm
 
     async with async_session() as db:

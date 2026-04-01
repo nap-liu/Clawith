@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
 from app.models.identity import IdentityProvider
-from app.models.user import User
+from app.models.user import User, Identity
 from loguru import logger
 
 
@@ -95,28 +95,26 @@ class BaseAuthProvider(ABC):
     async def find_or_create_user(
         self, db: AsyncSession, user_info: ExternalUserInfo, tenant_id: str | None = None
     ) -> tuple[User, bool]:
-        """Find existing user or create new one via OrgMember.
+        """Find existing user or create new one via Identity/OrgMember.
 
         Args:
             db: Database session
             user_info: User info from provider
             tenant_id: Optional tenant ID for association
-
-        Returns:
-            Tuple of (user, is_new) where is_new indicates if user was created
         """
         from app.services.sso_service import sso_service
+        from sqlalchemy.orm import selectinload
 
         # Ensure provider exists
         await self._ensure_provider(db, tenant_id)
 
         # 1. Try lookup via sso_service (which now uses OrgMember)
-        # Prefer unionid if available, fallback to provider_user_id
         provider_user_id = user_info.provider_union_id or user_info.provider_user_id
         user = await sso_service.resolve_user_identity(
             db, provider_user_id, self.provider_type, tenant_id=tenant_id
         )
-        # Feishu: if union_id lookup misses, fall back to open_id (org sync app may not return union_id)
+        
+        # Feishu: fallback to open_id if union_id lookup misses
         if (
             not user
             and self.provider_type == "feishu"
@@ -129,36 +127,17 @@ class BaseAuthProvider(ABC):
 
         is_new = False
         if not user:
-            # 2. Fallback to legacy columns on User table
-            user = await self._find_user_by_legacy_fields(db, user_info)
-
-        # 3. Also try matching by email if available
-        if not user and user_info.email:
-            user = await sso_service.match_user_by_email(db, user_info.email, tenant_id)
+            # 2. Try matching by email/mobile (which now checks Identity too)
+            if user_info.email:
+                user = await sso_service.match_user_by_email(db, user_info.email, tenant_id)
+            if not user and user_info.mobile:
+                user = await sso_service.match_user_by_mobile(db, user_info.mobile, tenant_id)
+            
             if user:
-                # Link identity (OrgMember) to existing user
-                await sso_service.link_identity(
-                    db,
-                    str(user.id),
-                    self.provider_type,
-                    provider_user_id,
-                    user_info.raw_data,
-                    tenant_id=tenant_id,
-                )
-
-        # 4. Also try matching by mobile if available (critical to prevent duplicate users)
-        if not user and user_info.mobile:
-            user = await sso_service.match_user_by_mobile(db, user_info.mobile, tenant_id)
-            if user:
-                # Link identity (OrgMember) to existing user
-                await sso_service.link_identity(
-                    db,
-                    str(user.id),
-                    self.provider_type,
-                    provider_user_id,
-                    user_info.raw_data,
-                    tenant_id=tenant_id,
-                )
+                # If we found a user via email/mobile matching, it might be in a different tenant
+                if tenant_id and str(user.tenant_id) != tenant_id:
+                    # Identity exists but no user in this tenant
+                    user = None 
 
         # 5. 通过 provider_user_id 匹配现有用户 username（同租户下唯一登录凭证）
         if not user and user_info.provider_user_id:
@@ -195,22 +174,27 @@ class BaseAuthProvider(ABC):
             logger.info(f"[SSO] Auto-bound user {user.username} to tenant {tenant_id}")
 
         if user:
-            # Update user info
+            # Update user info and ensure identity is loaded
+            if not user.identity_id:
+                 from app.services.registration_service import registration_service
+                 identity = await registration_service.find_or_create_identity(db, email=user_info.email, phone=user_info.mobile)
+                 user.identity_id = identity.id
+            
             await self._update_existing_user(db, user, user_info)
         else:
-            # Create new user
+            # 3. Create new user (and Identity if needed)
             user = await self._create_new_user(db, user_info, tenant_id)
             is_new = True
             
-            # Link identity (OrgMember) to the new user
-            await sso_service.link_identity(
-                db,
-                str(user.id),
-                self.provider_type,
-                provider_user_id,
-                user_info.raw_data,
-                tenant_id=tenant_id,
-            )
+        # Ensure OrgMember linkage
+        await sso_service.link_identity(
+            db,
+            str(user.id),
+            self.provider_type,
+            provider_user_id,
+            user_info.raw_data,
+            tenant_id=tenant_id,
+        )
 
         return user, is_new
 
@@ -272,32 +256,54 @@ class BaseAuthProvider(ABC):
         self, db: AsyncSession, user_info: ExternalUserInfo, tenant_id: str | None
     ) -> User:
         """Create new user from external identity."""
-        username = user_info.email.split("@")[0] if user_info.email else f"{self.provider_type}_{user_info.provider_user_id[:8]}"
-
-        # Ensure unique username
-        existing = await db.execute(select(User).where(User.username == username))
-        if existing.scalar_one_or_none():
-            username = f"{username}_{user_info.provider_user_id[:6]}"
-
-        email = user_info.email or f"{username}@{self.provider_type}.local"
-
-        user = User(
-            username=username,
-            email=email,
-            password_hash=hash_password(user_info.provider_user_id),
-            display_name=user_info.name or username,
-            avatar_url=user_info.avatar_url,
-            primary_mobile=user_info.mobile,
-            registration_source=self.provider_type,
-            tenant_id=tenant_id,
+        from app.services.registration_service import registration_service
+        import uuid
+        
+        # 1. Resolve global identity first
+        identity = await registration_service.find_or_create_identity(
+            db,
+            email=user_info.email,
+            phone=user_info.mobile,
+            username=user_info.email.split("@")[0] if user_info.email else None,
+            password=effective_id,
         )
 
-        # Set legacy fields
+
+        # 2. Prepare user fields
+        effective_id = user_info.provider_user_id or user_info.provider_union_id or "unknown"
+        username = user_info.email.split("@")[0] if user_info.email else f"{self.provider_type}_{effective_id[:8]}"
+
+        # Ensure unique username within tenant
+        query = (
+            select(User)
+            .join(User.identity)
+            .where(Identity.username == username)
+        )
+        if tenant_id:
+            query = query.where(User.tenant_id == tenant_id)
+        existing = await db.execute(query)
+        if existing.scalar_one_or_none():
+            username = f"{username}_{uuid.uuid4().hex[:6]}"
+
+        # 3. Create TenantUser record
+        user = User(
+            identity_id=identity.id,
+            display_name=user_info.name or username,
+            avatar_url=user_info.avatar_url,
+            registration_source=self.provider_type,
+            tenant_id=tenant_id,
+            is_active=True,
+        )
+
+
+        # Set legacy fields if needed
         await self._set_legacy_user_fields(user, user_info)
 
         db.add(user)
         await db.flush()
-
+        
+        # Preload identity
+        user.identity = identity
         return user
 
     async def _update_legacy_user_fields(self, user: User, user_info: ExternalUserInfo):
@@ -516,18 +522,56 @@ class WeComAuthProvider(BaseAuthProvider):
                 params={"access_token": access_token, "code": code},
             )
             user_data = user_resp.json()
-            logger.info(f"WeCom user auth info: {user_data}")
-            return user_data
+            userid = user_data.get("UserId")
+            if not userid:
+                logger.error(f"WeCom user auth info missing UserId: {user_data}")
+                return {}
+
+            # Fetch detailed user info
+            detail_res = await client.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/user/get",
+                params={"access_token": access_token, "userid": userid},
+            )
+            detail_data = detail_res.json()
+            if detail_data.get("errcode") == 0:
+                logger.info(f"WeCom user detail fetched for userid {userid}")
+            else:
+                logger.warning(f"WeCom user detail fetch failed: {detail_data}")
+
+            # Pack all info into the access_token string to satisfy BaseAuthProvider interface
+            import json
+            packed_token = json.dumps({
+                "access_token": access_token,
+                "userid": userid,
+                "detail": detail_data
+            })
+            
+            return {"access_token": packed_token}
 
     async def get_user_info(self, access_token: str) -> ExternalUserInfo:
-        # WeCom returns user info in the token exchange response
-        logger.info("WeCom get_user_info called (user info usually handled in exchange_code)")
-        return ExternalUserInfo(
-            provider_type=self.provider_type,
-            provider_user_id="",
-            name="",
-            raw_data={"wecom": "user_info_in_token_response"},
-        )
+        import json
+        try:
+            data = json.loads(access_token)
+            userid = data.get("userid", "")
+            detail = data.get("detail", {})
+            
+            return ExternalUserInfo(
+                provider_type=self.provider_type,
+                provider_user_id=userid,
+                name=detail.get("name") or f"WeCom {userid}",
+                email=detail.get("email") or detail.get("biz_mail") or "",
+                avatar_url=detail.get("avatar") or "",
+                mobile=detail.get("mobile") or "",
+                raw_data=detail,
+            )
+        except Exception as e:
+            logger.error(f"WeCom get_user_info error: {e}")
+            return ExternalUserInfo(
+                provider_type=self.provider_type,
+                provider_user_id="",
+                name="",
+                raw_data={"error": str(e)},
+            )
 
 
 

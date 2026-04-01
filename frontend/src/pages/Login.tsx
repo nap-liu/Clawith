@@ -1,36 +1,46 @@
 import { useState, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { Bot, Brain, Building2, Globe, AlertTriangle } from 'lucide-react';
 import { useAuthStore } from '../stores';
 import { authApi, tenantApi, fetchJson } from '../services/api';
+import type { TokenResponse } from '../types';
 
 export default function Login() {
     const { t, i18n } = useTranslation();
     const navigate = useNavigate();
+    const [searchParams] = useSearchParams();
+    const invitationCode = searchParams.get('code');
     const setAuth = useAuthStore((s) => s.setAuth);
-    const [isRegister, setIsRegister] = useState(false);
+    const [isRegister, setIsRegister] = useState(!!invitationCode);
     const [error, setError] = useState('');
+    const [successMessage, setSuccessMessage] = useState('');
     const [loading, setLoading] = useState(false);
     const [tenant, setTenant] = useState<any>(null);
     const [resolving, setResolving] = useState(true);
     const [ssoProviders, setSsoProviders] = useState<any[]>([]);
     const [ssoLoading, setSsoLoading] = useState(false);
     const [ssoError, setSsoError] = useState('');
+    const [tenantSelection, setTenantSelection] = useState<any[] | null>(null);
 
     const [form, setForm] = useState({
-        username: '',
+        login_identifier: '',
         password: '',
-        email: '',
+        tenant_id: '',
     });
 
     // Login page always uses dark theme (hero panel is dark)
     useEffect(() => {
         document.documentElement.setAttribute('data-theme', 'dark');
 
-        // Resolve tenant by domain (unified — no localhost skip, backend handles fallback)
-        const hostname = window.location.hostname;
-        tenantApi.resolveByDomain(hostname)
+        // Resolve tenant by domain (for SSO detection only, not for login form)
+        const domain = window.location.host;
+        if (domain.startsWith('localhost') || domain.startsWith('127.0.0.1')) {
+            setResolving(false);
+            return;
+        }
+
+        tenantApi.resolveByDomain(domain)
             .then(res => {
                 if (res) {
                     setTenant(res);
@@ -78,35 +88,66 @@ export default function Login() {
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         setError('');
+        setSuccessMessage('');
         setLoading(true);
 
         try {
-            let res;
             if (isRegister) {
-                res = await authApi.register({
-                    ...form,
-                    display_name: form.username,
-                });
-            } else {
-                res = await authApi.login({
-                    username: form.username,
+                const regRes = await authApi.register({
+                    username: form.login_identifier.split('@')[0],
+                    email: form.login_identifier,
                     password: form.password,
-                    // Pass tenant_id for domain-scoped login enforcement
+                    display_name: form.login_identifier.split('@')[0],
+                    ...(invitationCode ? { invitation_code: invitationCode } : {})
+                });
+                // Save authentication state for company selection (user not active yet)
+                if (regRes.access_token && regRes.user) {
+                    setAuth(regRes.user, regRes.access_token);
+                }
+                // Redirect based on whether company setup is needed
+                if (regRes.needs_company_setup === false) {
+                    navigate('/verify-email', { state: { fromRegister: true, email: regRes.email } });
+                } else {
+                    navigate('/setup-company', { state: { fromRegister: true, email: regRes.email } });
+                }
+                return;
+            } else {
+                const res = await authApi.login({
+                    login_identifier: form.login_identifier,
+                    password: form.password,
                     ...(tenant?.id ? { tenant_id: tenant.id } : {}),
                 });
-            }
-            setAuth(res.user, res.access_token);
-            // Redirect to company setup if user has no company assigned
-            if (res.user && !res.user.tenant_id) {
-                navigate('/setup-company');
-            } else {
-                navigate('/');
+
+                // Check if multi-tenant selection is needed
+                if ('requires_tenant_selection' in res && res.requires_tenant_selection) {
+                    setTenantSelection(res.tenants);
+                    setLoading(false);
+                    return;
+                }
+
+                const tokenRes = res as TokenResponse;
+                setAuth(tokenRes.user, tokenRes.access_token);
+
+                if (tokenRes.user && !tokenRes.user.tenant_id) {
+                    navigate('/setup-company');
+                } else {
+                    navigate('/');
+                }
             }
         } catch (err: any) {
+            // Handle structured verification error
+            if (err.detail?.needs_verification) {
+                navigate('/verify-email', { 
+                    state: { 
+                        fromRegister: false, 
+                        email: err.detail.email || form.login_identifier 
+                    } 
+                });
+                return;
+            }
+
             const msg = err.message || '';
-            // Server-returned error messages (e.g. disabled company, invalid credentials)
             if (msg && msg !== 'Failed to fetch' && !msg.includes('NetworkError') && !msg.includes('ERR_CONNECTION')) {
-                // Translate known error messages
                 if (msg.includes('company has been disabled')) {
                     setError(t('auth.companyDisabled'));
                 } else if (msg.includes('Invalid credentials')) {
@@ -117,12 +158,49 @@ export default function Login() {
                     setError(t('auth.notInOrganization', 'This account does not belong to this organization.'));
                 } else if (msg.includes('500') || msg.includes('Internal Server Error')) {
                     setError(t('auth.serverStarting'));
+                } else if (msg.includes('Email already registered') || msg.includes('该邮箱已注册')) {
+                    setError(t('auth.emailAlreadyRegistered', '该邮箱已注册，请直接登录'));
                 } else {
                     setError(msg);
                 }
             } else {
                 setError(t('auth.serverUnreachable'));
             }
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleTenantSelect = async (tenantId: string) => {
+        setForm(f => ({ ...f, tenant_id: tenantId }));
+        setTenantSelection(null);
+        setError('');
+        setLoading(true);
+
+        try {
+            const res = await authApi.login({
+                login_identifier: form.login_identifier,
+                password: form.password,
+                tenant_id: tenantId,
+            });
+
+            // Should not get multi-tenant response when tenant_id is provided
+            if ('requires_tenant_selection' in res && res.requires_tenant_selection) {
+                setTenantSelection(res.tenants);
+                setLoading(false);
+                return;
+            }
+
+            const tokenRes = res as TokenResponse;
+            setAuth(tokenRes.user, tokenRes.access_token);
+            if (tokenRes.user && !tokenRes.user.tenant_id) {
+                navigate('/setup-company');
+            } else {
+                navigate('/');
+            }
+        } catch (err: any) {
+            const msg = err.message || '';
+            setError(msg || t('auth.loginFailed', 'Login failed'));
         } finally {
             setLoading(false);
         }
@@ -207,6 +285,23 @@ export default function Login() {
                         </div>
                     )}
 
+                    {successMessage && (
+                        <div className="login-success" style={{
+                            background: 'rgba(34, 197, 94, 0.1)',
+                            color: '#16a34a',
+                            padding: '12px 16px',
+                            borderRadius: '8px',
+                            marginBottom: '16px',
+                            fontSize: '14px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            border: '1px solid rgba(34, 197, 94, 0.2)',
+                        }}>
+                            <span>✓</span> {successMessage}
+                        </div>
+                    )}
+
                     {tenant && tenant.sso_enabled && !isRegister && (
                         <div style={{ marginBottom: '24px' }}>
                             {/* SSO 提示框已隐藏 - 2026-03-31 */}
@@ -268,28 +363,16 @@ export default function Login() {
 
                     <form onSubmit={handleSubmit} className="login-form">
                         <div className="login-field">
-                            <label>{t('auth.username')}</label>
+                            <label>{t('auth.email')}</label>
                             <input
-                                value={form.username}
-                                onChange={(e) => setForm({ ...form, username: e.target.value })}
+                                type="email"
+                                value={form.login_identifier}
+                                onChange={(e) => setForm({ ...form, login_identifier: e.target.value })}
                                 required
                                 autoFocus
-                                placeholder={t('auth.usernamePlaceholder')}
+                                placeholder={t('auth.emailPlaceholder')}
                             />
                         </div>
-
-                        {isRegister && (
-                            <div className="login-field">
-                                <label>{t('auth.email')}</label>
-                                <input
-                                    type="email"
-                                    value={form.email}
-                                    onChange={(e) => setForm({ ...form, email: e.target.value })}
-                                    required
-                                    placeholder={t('auth.emailPlaceholder')}
-                                />
-                            </div>
-                        )}
 
                         <div className="login-field">
                             <label>{t('auth.password')}</label>
@@ -324,6 +407,109 @@ export default function Login() {
                             )}
                         </button>
                     </form>
+
+                    {/* Multi-tenant selection modal */}
+                    {tenantSelection && (
+                        <div style={{
+                            position: 'fixed',
+                            top: 0,
+                            left: 0,
+                            right: 0,
+                            bottom: 0,
+                            background: 'rgba(0,0,0,0.5)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            zIndex: 1000,
+                        }}>
+                            <div style={{
+                                background: 'var(--bg-primary)',
+                                borderRadius: '16px',
+                                padding: '32px',
+                                maxWidth: '400px',
+                                width: '90%',
+                            }}>
+                                <h3 style={{ fontSize: '18px', fontWeight: 600, marginBottom: '16px', color: 'var(--text-primary)' }}>
+                                    {t('auth.selectOrganization', '选择公司')}
+                                </h3>
+                                <p style={{ fontSize: '14px', color: 'var(--text-secondary)', marginBottom: '20px' }}>
+                                    {t('auth.multiTenantPrompt', '该邮箱对应多个公司，请选择要登录的公司：')}
+                                </p>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                                    {tenantSelection.map((tenant: any) => (
+                                        <button
+                                            key={tenant.tenant_id}
+                                            onClick={() => handleTenantSelect(tenant.tenant_id)}
+                                            style={{
+                                                padding: '12px 16px',
+                                                borderRadius: '8px',
+                                                border: '1px solid var(--border-subtle)',
+                                                background: 'var(--bg-secondary)',
+                                                color: 'var(--text-primary)',
+                                                fontSize: '14px',
+                                                cursor: 'pointer',
+                                                textAlign: 'left',
+                                            }}
+                                        >
+                                            {tenant.tenant_name} {tenant.tenant_slug && `(${tenant.tenant_slug})`}
+                                        </button>
+                                    ))}
+                                    {/* Create or Join Organization */}
+                                    <button
+                                        onClick={async () => {
+                                            // Log in with the first tenant to get a valid token, then redirect to company setup
+                                            try {
+                                                setLoading(true);
+                                                const firstTenant = tenantSelection[0];
+                                                const res = await authApi.login({
+                                                    login_identifier: form.login_identifier,
+                                                    password: form.password,
+                                                    tenant_id: firstTenant.tenant_id,
+                                                });
+                                                const tokenRes = res as TokenResponse;
+                                                setAuth(tokenRes.user, tokenRes.access_token);
+                                                setTenantSelection(null);
+                                                navigate('/setup-company?from=tenant-selection');
+                                            } catch (err: any) {
+                                                setError(err.message || 'Failed');
+                                                setTenantSelection(null);
+                                            } finally {
+                                                setLoading(false);
+                                            }
+                                        }}
+                                        style={{
+                                            padding: '12px 16px',
+                                            borderRadius: '8px',
+                                            border: '1px dashed var(--border-subtle)',
+                                            background: 'transparent',
+                                            color: 'var(--text-secondary)',
+                                            fontSize: '14px',
+                                            cursor: 'pointer',
+                                            textAlign: 'left',
+                                        }}
+                                    >
+                                        {t('auth.createOrJoinOrganization', 'Create or Join Organization')}
+                                    </button>
+                                </div>
+                                <button
+                                    onClick={() => setTenantSelection(null)}
+                                    style={{
+                                        marginTop: '20px',
+                                        padding: '10px 16px',
+                                        borderRadius: '8px',
+                                        border: 'none',
+                                        background: 'var(--bg-tertiary)',
+                                        color: 'var(--text-primary)',
+                                        fontSize: '14px',
+                                        cursor: 'pointer',
+                                        width: '100%',
+                                    }}
+                                >
+                                    {t('common.cancel', 'Cancel')}
+                                </button>
+                            </div>
+                        </div>
+                    )}
 
                     <div className="login-switch">
                         {isRegister ? t('auth.hasAccount') : t('auth.noAccount')}{' '}

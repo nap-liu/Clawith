@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import TakeControlPanel from './TakeControlPanel';
 
 /* ── Types ── */
 export interface LivePreviewState {
@@ -12,6 +13,10 @@ interface Props {
     liveState: LivePreviewState;
     visible: boolean;
     onToggle: () => void;
+    agentId?: string;     // needed for Take Control
+    sessionId?: string;   // needed for Take Control
+    /** Called by TC panel on close to push the latest screenshot into liveState */
+    onLiveUpdate?: (env: 'browser' | 'desktop', screenshotDataUri: string) => void;
 }
 
 /* ── Tab Icons (Linear-style minimal SVGs) ── */
@@ -56,8 +61,11 @@ type TabType = 'desktop' | 'browser' | 'code';
 const MIN_WIDTH = 300;  // minimum panel width in px
 const MAX_WIDTH_VW = 0.65; // maximum panel width as fraction of viewport width
 
-export default function AgentBayLivePanel({ liveState, visible, onToggle }: Props) {
+export default function AgentBayLivePanel({ liveState, visible, onToggle, agentId, sessionId, onLiveUpdate }: Props) {
     const { t } = useTranslation();
+
+    // Take Control state
+    const [showTakeControl, setShowTakeControl] = useState(false);
 
     // Determine available tabs from live state
     const availableTabs: TabType[] = [];
@@ -194,6 +202,19 @@ export default function AgentBayLivePanel({ liveState, visible, onToggle }: Prop
                         </button>
                     ))}
                 </div>
+                {/* Take Control button — shown when browser/desktop has data */}
+                {agentId && sessionId && (activeTab === 'browser' || activeTab === 'desktop') && (
+                    <button
+                        className="live-panel-take-control"
+                        onClick={() => setShowTakeControl(true)}
+                        title="Take Control — manually interact with the browser"
+                    >
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M3 3l5.5 10 1.5-4 4-1.5z" />
+                        </svg>
+                        <span>Control</span>
+                    </button>
+                )}
                 <button className="live-panel-collapse" onClick={onToggle} title="Collapse">
                     {CollapseIcon}
                 </button>
@@ -248,6 +269,22 @@ export default function AgentBayLivePanel({ liveState, visible, onToggle }: Prop
                     </div>
                 )}
             </div>
+
+            {/* Take Control fullscreen panel */}
+            {showTakeControl && agentId && sessionId && (
+                <TakeControlPanel
+                    agentId={agentId}
+                    sessionId={sessionId}
+                    onClose={() => setShowTakeControl(false)}
+                    onLastScreenshot={(dataUri) => {
+                        // Push the final TC screenshot to the live preview
+                        console.log('[LivePanel] Received last screenshot from TC, size:', dataUri.length, 'onLiveUpdate:', !!onLiveUpdate);
+                        if (onLiveUpdate) {
+                            onLiveUpdate('browser', dataUri);
+                        }
+                    }}
+                />
+            )}
         </div>
     );
 }

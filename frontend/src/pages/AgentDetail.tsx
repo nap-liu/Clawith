@@ -11,11 +11,14 @@ import MarkdownRenderer from '../components/MarkdownRenderer';
 import PromptModal from '../components/PromptModal';
 import OpenClawSettings from './OpenClawSettings';
 import AgentBayLivePanel, { LivePreviewState } from '../components/AgentBayLivePanel';
+import AgentCredentials from '../components/AgentCredentials';
 import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress } from '../services/api';
 import { useAppStore } from '../stores';
 import { Settings, X, Wrench, Bot, Zap, Check, CheckCircle, XCircle, FileText, BarChart3, PenLine, Paperclip, Brain, ClipboardList, Landmark, HeartPulse, MessageSquare, Dna, Package, Unlock, Lock, User, Building2, Download, Clock, ChevronRight, Pencil, Eye, Globe, AlertTriangle, Calendar, CalendarDays, MessageCircle, Send, Target } from 'lucide-react';
 import { useAuthStore } from '../stores';
 import { copyToClipboard } from '../utils/clipboard';
+import { formatFileSize } from '../utils/formatFileSize';
+import { IconPaperclip, IconSend } from '@tabler/icons-react';
 
 const TABS = ['chat', 'status', 'aware', 'mind', 'tools', 'skills', 'relationships', 'workspace', 'activityLog', 'approvals', 'settings'] as const;
 
@@ -54,6 +57,10 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
     const [toolTab, setToolTab] = useState<'company' | 'installed'>('company');
     const [deletingToolId, setDeletingToolId] = useState<string | null>(null);
     const [configCategory, setConfigCategory] = useState<string | null>(null);
+    const [focusedField, setFocusedField] = useState<string | null>(null);
+    // Global (company-level) config for the currently open modal — used to show
+    // lock hints and prevent agent from overriding company-set fields.
+    const [configGlobalData, setConfigGlobalData] = useState<Record<string, any>>({});
 
     const CATEGORY_CONFIG_SCHEMAS: Record<string, any> = {
         agentbay: {
@@ -102,17 +109,44 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
         } catch (e) { console.error(e); }
     };
 
+    // Sensitive field keys that should not be pre-filled from masked global config.
+    // Hardcoded fallback set + dynamic extraction from config_schema password-type fields.
+    const SENSITIVE_KEYS_BASE = new Set(['api_key', 'private_key', 'auth_code', 'password', 'secret']);
+
+    const getSensitiveKeys = (schema: any): Set<string> => {
+        const keys = new Set(SENSITIVE_KEYS_BASE);
+        if (schema?.fields) {
+            for (const field of schema.fields) {
+                if (field.type === 'password') keys.add(field.key);
+            }
+        }
+        return keys;
+    };
+
     const openConfig = (tool: any) => {
         setConfigTool(tool);
-        const merged = { ...(tool.global_config || {}), ...(tool.agent_config || {}) };
+        // Build merged config: start with global defaults, overlay agent overrides.
+        // For sensitive fields, only use agent_config values (global ones are masked
+        // like "****xxxx" and should not pre-fill the input).
+        const sensitiveKeys = getSensitiveKeys(tool.config_schema);
+        const globalCfg = tool.global_config || {};
+        const agentCfg = tool.agent_config || {};
+        const merged: Record<string, any> = {};
+        for (const [k, v] of Object.entries(globalCfg)) {
+            if (!sensitiveKeys.has(k)) merged[k] = v;
+        }
+        Object.assign(merged, agentCfg);
         setConfigData(merged);
-        setConfigJson(JSON.stringify(tool.agent_config || {}, null, 2));
+        setConfigJson(JSON.stringify(agentCfg, null, 2));
+        setFocusedField(null);
     };
 
     const openCategoryConfig = async (category: string) => {
         setConfigCategory(category);
         setConfigData({});
+        setConfigGlobalData({});
         setConfigSaving(true);
+        setFocusedField(null);
         try {
             const token = localStorage.getItem('token');
             const res = await fetch(`/api/tools/agents/${agentId}/category-config/${category}`, {
@@ -120,7 +154,21 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
             });
             if (res.ok) {
                 const data = await res.json();
-                setConfigData(data.config || {});
+                // global_config: company-level (masked sensitive fields like ****xxxx)
+                // agent_config: agent-level overrides only
+                const globalCfg = data.global_config || {};
+                const agentCfg = data.agent_config || {};
+                setConfigGlobalData(globalCfg);
+                // Pre-fill only agent-level values; company fields show as hints
+                const catSchema = CATEGORY_CONFIG_SCHEMAS[category];
+                const sensitiveKeys = getSensitiveKeys(catSchema);
+                const merged: Record<string, any> = {};
+                for (const [k, v] of Object.entries(globalCfg)) {
+                    // Non-sensitive global fields (e.g. os_type) pre-fill; sensitive ones don't
+                    if (!sensitiveKeys.has(k)) merged[k] = v;
+                }
+                Object.assign(merged, agentCfg);
+                setConfigData(merged);
             }
         } catch (e) { console.error(e); }
         setConfigSaving(false);
@@ -131,16 +179,34 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
         setConfigSaving(true);
         try {
             const token = localStorage.getItem('token');
+
             if (configCategory) {
+                const raw = configData;
+                // Strip empty sensitive fields so untouched password inputs
+                // don't send empty values that would clear an inherited company key
+                const catSchema = CATEGORY_CONFIG_SCHEMAS[configCategory!];
+                const sensitiveKeys = getSensitiveKeys(catSchema);
+                const payload: Record<string, any> = {};
+                for (const [k, v] of Object.entries(raw)) {
+                    if (sensitiveKeys.has(k) && (v === '' || v === undefined || v === null)) continue;
+                    payload[k] = v;
+                }
                 await fetch(`/api/tools/agents/${agentId}/category-config/${configCategory}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                    body: JSON.stringify({ config: configData }),
+                    body: JSON.stringify({ config: payload }),
                 });
                 setConfigCategory(null);
             } else {
                 const hasSchema = configTool.config_schema?.fields?.length > 0;
-                const payload = hasSchema ? configData : JSON.parse(configJson || '{}');
+                const raw = hasSchema ? configData : JSON.parse(configJson || '{}');
+                // Strip empty sensitive fields only — agent CAN override company values
+                const sensitiveKeys = getSensitiveKeys(configTool.config_schema);
+                const payload: Record<string, any> = {};
+                for (const [k, v] of Object.entries(raw)) {
+                    if (sensitiveKeys.has(k) && (v === '' || v === undefined || v === null)) continue;
+                    payload[k] = v;
+                }
                 await fetch(`/api/tools/agents/${agentId}/tool-config/${configTool.id}`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -231,7 +297,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                 <span style={{ fontSize: '10px', background: 'var(--bg-tertiary)', color: 'var(--text-secondary)', borderRadius: '4px', padding: '1px 5px' }}>Built-in</span>
                                             )}
                                             {hasAgentOverride && (
-                                                <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px' }}>Configured</span>
+                                                <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px' }}>{t('enterprise.tools.configured', 'Configured')}</span>
                                             )}
                                         </div>
                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -387,11 +453,16 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                     <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>
                                                         {field.label}
                                                         {isReadOnly && <span style={{ fontWeight: 400, color: 'var(--text-tertiary)', marginLeft: '4px' }}>(Admin only)</span>}
-                                                        {configTool?.global_config?.[field.key] && (
-                                                            <span style={{ fontWeight: 400, color: 'var(--text-tertiary)', marginLeft: '4px' }}>
-                                                                (global: {String(configTool.global_config[field.key]).slice(0, 20)}{String(configTool.global_config[field.key]).length > 20 ? '…' : ''})
-                                                            </span>
-                                                        )}
+                                                        {/* Show company-configured value as a hint in the label */}
+                                                        {(() => {
+                                                            const globalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
+                                                            if (!globalVal) return null;
+                                                            return (
+                                                                <span style={{ fontWeight: 400, color: 'var(--accent-primary)', marginLeft: '4px', fontSize: '11px' }}>
+                                                                    (company: {String(globalVal).slice(0, 20)}{String(globalVal).length > 20 ? '\u2026' : ''})
+                                                                </span>
+                                                            );
+                                                        })()}
                                                     </label>
                                                     {field.type === 'checkbox' ? (
                                                         <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>
@@ -416,7 +487,35 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                         </label>
                                                     ) : field.type === 'password' ? (
                                                         <>
-                                                        <input type="password" autoComplete="new-password" className="form-input" value={configData[field.key] ?? ''} placeholder={field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default')} onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                        {(() => {
+                                                            const globalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
+                                                            const isUsingGlobal = globalVal && !configData[field.key];
+                                                            
+                                                            if (isUsingGlobal && focusedField !== field.key) {
+                                                                return (
+                                                                    <div 
+                                                                        className="form-input" 
+                                                                        style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', background: 'var(--bg-tertiary)', borderStyle: 'dashed' }}
+                                                                        onClick={() => setFocusedField(field.key)}
+                                                                    >
+                                                                        <span style={{ marginRight: '8px', fontSize: '14px' }}>🏢</span>
+                                                                        <span style={{ flex: 1, color: 'var(--text-secondary)' }}>{t('agent.tools.usingCompanyKey', 'Using company key ({{val}})', { val: globalVal })}</span>
+                                                                        <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('common.edit', 'Override')} ✎</span>
+                                                                    </div>
+                                                                );
+                                                            }
+
+                                                            return (
+                                                                <input type="password" autoComplete="new-password" className="form-input"
+                                                                    autoFocus={focusedField === field.key}
+                                                                    value={configData[field.key] ?? ''}
+                                                                    placeholder={globalVal ? t('agent.tools.usingCompanyKey', 'Using company key ({{val}})', { val: globalVal }) : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
+                                                                    onBlur={(e) => {
+                                                                        if (!e.target.value) setFocusedField(null);
+                                                                    }}
+                                                                    onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                            );
+                                                        })()}
                                                         {/* Per-provider help text for auth_code */}
                                                         {field.key === 'auth_code' && (() => {
                                                             const providerField = configTool?.config_schema?.fields?.find((f: any) => f.key === 'email_provider');
@@ -435,13 +534,44 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
 
                                                         </>
                                                     ) : field.type === 'select' ? (
-                                                        <select className="form-input" value={configData[field.key] ?? field.default ?? ''} onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}>
+                                                        <select className="form-input" value={configData[field.key] ?? field.default ?? ''}
+                                                            onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}>
                                                             {(field.options || []).map((o: any) => <option key={o.value} value={o.value}>{o.label}</option>)}
                                                         </select>
                                                     ) : field.type === 'number' ? (
                                                         <input type="number" className="form-input" value={configData[field.key] ?? field.default ?? ''} placeholder={field.placeholder || ''} min={field.min} max={field.max} onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value ? Number(e.target.value) : '' }))} />
                                                     ) : (
-                                                        <input type="text" className="form-input" value={configData[field.key] ?? ''} placeholder={field.placeholder || 'Leave blank to use global default'} onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                        <>
+                                                        {(() => {
+                                                            const globalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
+                                                            const isUsingGlobal = globalVal && !configData[field.key];
+                                                            
+                                                            if (isUsingGlobal && focusedField !== field.key) {
+                                                                return (
+                                                                    <div 
+                                                                        className="form-input" 
+                                                                        style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', background: 'var(--bg-tertiary)', borderStyle: 'dashed' }}
+                                                                        onClick={() => setFocusedField(field.key)}
+                                                                    >
+                                                                        <span style={{ marginRight: '8px', fontSize: '14px' }}>🏢</span>
+                                                                        <span style={{ flex: 1, color: 'var(--text-secondary)' }}>{t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal })}</span>
+                                                                        <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('common.edit', 'Override')} ✎</span>
+                                                                    </div>
+                                                                );
+                                                            }
+
+                                                            return (
+                                                                <input type="text" className="form-input"
+                                                                    autoFocus={focusedField === field.key}
+                                                                    value={configData[field.key] ?? ''}
+                                                                    placeholder={globalVal ? t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal }) : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
+                                                                    onBlur={(e) => {
+                                                                        if (!e.target.value) setFocusedField(null);
+                                                                    }}
+                                                                    onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                            );
+                                                        })()}
+                                                        </>
                                                     )}
                                                 </div>
                                             );
@@ -1220,14 +1350,14 @@ function AgentDetailInner() {
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const [liveState, setLiveState] = useState<LivePreviewState>({});
     const [livePanelVisible, setLivePanelVisible] = useState(false);
+    const [wsSessionId, setWsSessionId] = useState<string>('');
     const [sessionListCollapsed, setSessionListCollapsed] = useState(false);
     const [chatInput, setChatInput] = useState('');
     const [wsConnected, setWsConnected] = useState(false);
-    const [uploading, setUploading] = useState(false);
     const [isWaiting, setIsWaiting] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
-    const [uploadProgress, setUploadProgress] = useState(-1);
-    const uploadAbortRef = useRef<(() => void) | null>(null);
+    const [chatUploadDrafts, setChatUploadDrafts] = useState<{ id: string; name: string; percent: number; previewUrl?: string; sizeBytes: number }[]>([]);
+    const chatUploadAbortRef = useRef<Map<string, () => void>>(new Map());
     const [attachedFiles, setAttachedFiles] = useState<{ name: string; text: string; path?: string; imageUrl?: string }[]>([]);
     const wsRef = useRef<WebSocket | null>(null);
     const chatEndRef = useRef<HTMLDivElement>(null);
@@ -1433,6 +1563,12 @@ function AgentDetailInner() {
                 setIsWaiting(false);
                 if (['thinking', 'chunk', 'tool_call'].includes(d.type)) setIsStreaming(true);
                 if (['done', 'error', 'quota_exceeded'].includes(d.type)) setIsStreaming(false);
+            }
+
+            // Capture session_id from the 'connected' message for Take Control
+            if (d.type === 'connected' && d.session_id) {
+                if (isActiveRuntime) setWsSessionId(d.session_id);
+                return;
             }
 
             if (d.type === 'thinking') {
@@ -1709,12 +1845,6 @@ function AgentDetailInner() {
         }));
 
         setChatInput('');
-        // Reset textarea height to single line after sending
-        requestAnimationFrame(() => {
-            if (chatInputRef.current) {
-                chatInputRef.current.style.height = 'auto';
-            }
-        });
         setAttachedFiles([]);
     };
 
@@ -1727,28 +1857,51 @@ function AgentDetailInner() {
             return;
         }
 
-        setUploading(true); setUploadProgress(0);
-        try {
-            const uploadPromises = allowedFiles.map(file => {
-                const { promise } = uploadFileWithProgress(
-                    `/chat/upload`,
-                    file,
-                    () => { }, // Avoid updating progress per file to prevent flickering, could implement total progress
-                    id ? { agent_id: id } : undefined,
+        const baseTime = Date.now();
+        const newDrafts = allowedFiles.map((file, i) => ({
+            id: `up-${baseTime}-${i}-${file.name}`,
+            name: file.name,
+            percent: 0,
+            previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined,
+            sizeBytes: file.size,
+        }));
+        setChatUploadDrafts((prev) => [...prev, ...newDrafts]);
+
+        const runOne = async (file: File, draft: (typeof newDrafts)[0]) => {
+            const { promise, abort } = uploadFileWithProgress(
+                `/chat/upload`,
+                file,
+                (pct) => {
+                    setChatUploadDrafts((prev) =>
+                        prev.map((d) => (d.id === draft.id ? { ...d, percent: pct >= 101 ? 100 : pct } : d)),
+                    );
+                },
+                id ? { agent_id: id } : undefined,
+            );
+            chatUploadAbortRef.current.set(draft.id, abort);
+            try {
+                const data = await promise;
+                if (draft.previewUrl) URL.revokeObjectURL(draft.previewUrl);
+                setChatUploadDrafts((prev) => prev.filter((d) => d.id !== draft.id));
+                chatUploadAbortRef.current.delete(draft.id);
+                setAttachedFiles((prev) =>
+                    [...prev, {
+                        name: data.filename,
+                        text: data.extracted_text,
+                        path: data.workspace_path,
+                        imageUrl: data.image_data_url || undefined,
+                    }].slice(0, 10),
                 );
-                return promise;
-            });
-            const results = await Promise.all(uploadPromises);
-            const newAttached = results.map(data => ({
-                name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined
-            }));
-            setAttachedFiles(prev => [...prev, ...newAttached].slice(0, 10));
-        } catch (err: any) {
-            if (err?.message !== 'Upload cancelled') alert(t('agent.upload.failed'));
-        } finally {
-            setUploading(false); setUploadProgress(-1); uploadAbortRef.current = null;
-            if (fileInputRef.current) fileInputRef.current.value = '';
-        }
+            } catch (err: any) {
+                if (draft.previewUrl) URL.revokeObjectURL(draft.previewUrl);
+                setChatUploadDrafts((prev) => prev.filter((d) => d.id !== draft.id));
+                chatUploadAbortRef.current.delete(draft.id);
+                if (err?.message !== 'Upload cancelled') alert(t('agent.upload.failed'));
+            }
+        };
+
+        await Promise.all(allowedFiles.map((file, i) => runOne(file, newDrafts[i])));
+        if (fileInputRef.current) fileInputRef.current.value = '';
     };
 
     // Clipboard paste handler — auto-upload pasted images
@@ -1776,25 +1929,50 @@ function AgentDetailInner() {
             return;
         }
 
-        setUploading(true); setUploadProgress(0);
-        try {
-            const uploadPromises = allowedFiles.map(file => {
-                const { promise } = uploadFileWithProgress(
-                    `/chat/upload`,
-                    file,
-                    () => { },
-                    id ? { agent_id: id } : undefined,
+        const baseTime = Date.now();
+        const newDrafts = allowedFiles.map((file, i) => ({
+            id: `paste-${baseTime}-${i}-${file.name}`,
+            name: file.name,
+            percent: 0,
+            previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined,
+            sizeBytes: file.size,
+        }));
+        setChatUploadDrafts((prev) => [...prev, ...newDrafts]);
+
+        const runOne = async (file: File, draft: (typeof newDrafts)[0]) => {
+            const { promise, abort } = uploadFileWithProgress(
+                `/chat/upload`,
+                file,
+                (pct) => {
+                    setChatUploadDrafts((prev) =>
+                        prev.map((d) => (d.id === draft.id ? { ...d, percent: pct >= 101 ? 100 : pct } : d)),
+                    );
+                },
+                id ? { agent_id: id } : undefined,
+            );
+            chatUploadAbortRef.current.set(draft.id, abort);
+            try {
+                const data = await promise;
+                if (draft.previewUrl) URL.revokeObjectURL(draft.previewUrl);
+                setChatUploadDrafts((prev) => prev.filter((d) => d.id !== draft.id));
+                chatUploadAbortRef.current.delete(draft.id);
+                setAttachedFiles((prev) =>
+                    [...prev, {
+                        name: data.filename,
+                        text: data.extracted_text,
+                        path: data.workspace_path,
+                        imageUrl: data.image_data_url || undefined,
+                    }].slice(0, 10),
                 );
-                return promise;
-            });
-            const results = await Promise.all(uploadPromises);
-            const newAttached = results.map(data => ({
-                name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined
-            }));
-            setAttachedFiles(prev => [...prev, ...newAttached].slice(0, 10));
-        } catch (err: any) {
-            if (err?.message !== 'Upload cancelled') alert(t('agent.upload.failed'));
-        } finally { setUploading(false); setUploadProgress(-1); uploadAbortRef.current = null; }
+            } catch (err: any) {
+                if (draft.previewUrl) URL.revokeObjectURL(draft.previewUrl);
+                setChatUploadDrafts((prev) => prev.filter((d) => d.id !== draft.id));
+                chatUploadAbortRef.current.delete(draft.id);
+                if (err?.message !== 'Upload cancelled') alert(t('agent.upload.failed'));
+            }
+        };
+
+        await Promise.all(allowedFiles.map((file, i) => runOne(file, newDrafts[i])));
     };
 
     // Expandable activity log
@@ -3389,7 +3567,6 @@ function AgentDetailInner() {
                                             <div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('agent.chat.noSessionsYet')}<br />{t('agent.chat.clickToStart')}</div>
                                         ) : sessions.map((s: any) => {
                                             const isActive = activeSession?.id === s.id;
-                                            const isOwn = s.user_id === String(currentUser?.id);
                                             const channelLabel: Record<string, string> = {
                                                 feishu: t('common.channels.feishu'),
                                                 discord: t('common.channels.discord'),
@@ -3409,7 +3586,6 @@ function AgentDetailInner() {
                                                         {chLabel && <span style={{ fontSize: '9px', padding: '1px 4px', borderRadius: '3px', background: 'var(--bg-tertiary)', color: 'var(--text-tertiary)', flexShrink: 0 }}>{chLabel}</span>}
                                                     </div>
                                                     <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                                        {isOwn && isActive && wsConnected && <span className="status-dot running" style={{ width: '5px', height: '5px', flexShrink: 0 }} />}
                                                         {s.last_message_at
                                                             ? new Date(s.last_message_at).toLocaleString(i18n.language === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
                                                             : new Date(s.created_at).toLocaleString(i18n.language === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric' })}
@@ -3679,100 +3855,127 @@ function AgentDetailInner() {
                                                 Connecting...
                                             </div>
                                         ) : null}
-                                        {attachedFiles.length > 0 && (
-                                            <div style={{ padding: '6px 16px', background: 'var(--bg-elevated)', borderTop: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                                                {attachedFiles.map((file, idx) => (
-                                                    <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', background: 'var(--bg-secondary)', padding: '4px 6px', borderRadius: '4px', border: '1px solid var(--border-subtle)', maxWidth: '200px' }}>
-                                                        {file.imageUrl ? (
-                                                            <img src={file.imageUrl} alt={file.name} style={{ width: '20px', height: '20px', borderRadius: '4px', objectFit: 'cover' }} />
-                                                        ) : (
-                                                            <Paperclip size={14} />
-                                                        )}
-                                                        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{file.name}</span>
-                                                        <button onClick={() => setAttachedFiles(prev => prev.filter((_, i) => i !== idx))} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: '14px', padding: '0 2px' }} title="Remove file"><X size={14} /></button>
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        )}
-                                        <div style={{ display: 'flex', gap: '8px', padding: '6px 12px', borderTop: '1px solid var(--border-subtle)' }}>
-                                            <input type="file" multiple ref={fileInputRef} onChange={handleChatFile} style={{ display: 'none' }} />
-                                            <button className="btn btn-secondary" onClick={() => fileInputRef.current?.click()} disabled={!wsConnected || uploading || isWaiting || isStreaming || attachedFiles.length >= 10} style={{ padding: '6px 10px', fontSize: '14px', minWidth: 'auto', ...((!wsConnected || uploading || isWaiting || isStreaming) ? { cursor: 'not-allowed', opacity: 0.4 } : {}) }}>{uploading ? <Clock size={14} /> : <Paperclip size={14} />}</button>
-                                            {uploading && uploadProgress >= 0 && (
-                                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flex: '0 0 140px' }}>
-                                                    {uploadProgress <= 100 ? (
-                                                        /* Upload phase: show progress bar */
-                                                        <>
-                                                            <div style={{ flex: 1, height: '4px', borderRadius: '2px', background: 'var(--bg-tertiary)', overflow: 'hidden' }}>
-                                                                <div style={{ height: '100%', borderRadius: '2px', background: 'var(--accent-primary)', width: `${uploadProgress}%`, transition: 'width 0.15s ease' }} />
+                                        <div className="chat-input-area" style={{ flexShrink: 0 }}>
+                                            <div className="chat-composer">
+                                            {(chatUploadDrafts.length > 0 || attachedFiles.length > 0) && (
+                                                <div className="chat-composer-attachments">
+                                                    {chatUploadDrafts.map((draft) => (
+                                                        <div key={draft.id} className="chat-file-pill">
+                                                            <div
+                                                                className="chat-file-pill__fill"
+                                                                style={{ width: `${draft.percent}%` }}
+                                                            />
+                                                            <div className="chat-file-pill__row">
+                                                                {draft.previewUrl ? (
+                                                                    <img className="chat-file-pill__thumb" src={draft.previewUrl} alt="" />
+                                                                ) : (
+                                                                    <span className="chat-file-pill__icon">
+                                                                        <IconPaperclip size={14} stroke={1.75} />
+                                                                    </span>
+                                                                )}
+                                                                <span className="chat-file-pill__name">{draft.name}</span>
+                                                                <span className="chat-file-pill__size">{formatFileSize(draft.sizeBytes)}</span>
+                                                                <span className="chat-file-pill__pct">{draft.percent}%</span>
+                                                                <button
+                                                                    type="button"
+                                                                    className="chat-file-pill__remove"
+                                                                    onClick={() => {
+                                                                        chatUploadAbortRef.current.get(draft.id)?.();
+                                                                    }}
+                                                                    title="Cancel upload"
+                                                                >
+                                                                    ×
+                                                                </button>
                                                             </div>
-                                                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>{uploadProgress}%</span>
-                                                        </>
-                                                    ) : (
-                                                        /* Processing phase (progress = 101): server is parsing the file */
-                                                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                                                            <span style={{ display: 'inline-block', width: '5px', height: '5px', borderRadius: '50%', background: 'var(--accent-primary)', animation: 'pulse 1.2s ease-in-out infinite' }} />
-                                                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>Processing...</span>
                                                         </div>
-                                                    )}
-                                                    <button onClick={() => { uploadAbortRef.current?.(); }} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', fontSize: '12px', padding: '0 2px', lineHeight: 1 }} title="Cancel upload"><X size={12} /></button>
+                                                    ))}
+                                                    {attachedFiles.map((file, idx) => (
+                                                        <div key={`a-${idx}-${file.name}`} className="chat-file-pill">
+                                                            <div className="chat-file-pill__row">
+                                                                {file.imageUrl ? (
+                                                                    <img className="chat-file-pill__thumb" src={file.imageUrl} alt="" />
+                                                                ) : (
+                                                                    <span className="chat-file-pill__icon">
+                                                                        <IconPaperclip size={14} stroke={1.75} />
+                                                                    </span>
+                                                                )}
+                                                                <span className="chat-file-pill__name">{file.name}</span>
+                                                                <button
+                                                                    type="button"
+                                                                    className="chat-file-pill__remove"
+                                                                    onClick={() => setAttachedFiles((prev) => prev.filter((_, i) => i !== idx))}
+                                                                    title="Remove file"
+                                                                >
+                                                                    ×
+                                                                </button>
+                                                            </div>
+                                                        </div>
+                                                    ))}
                                                 </div>
                                             )}
-                                            <textarea
-                                                ref={chatInputRef}
-                                                className="chat-input"
-                                                value={chatInput}
-                                                onChange={e => {
-                                                    setChatInput(e.target.value);
-                                                    // Auto-resize: reset then expand up to ~5 lines (130px);
-                                                    // enable scrolling when content exceeds that cap.
-                                                    const MAX_H = 130;
-                                                    requestAnimationFrame(() => {
-                                                        const el = chatInputRef.current;
-                                                        if (!el) return;
-                                                        el.style.height = 'auto';
-                                                        const natural = el.scrollHeight;
-                                                        el.style.height = Math.min(natural, MAX_H) + 'px';
-                                                        el.style.overflowY = natural > MAX_H ? 'auto' : 'hidden';
-                                                    });
-                                                }}
-                                                onKeyDown={e => {
-                                                    // Ctrl+Enter (or Cmd+Enter on Mac) sends; plain Enter inserts newline
-                                                    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing && !isWaiting && !isStreaming) {
-                                                        e.preventDefault();
-                                                        sendChatMsg();
-                                                    }
-                                                }}
-                                                onPaste={handlePaste}
-                                                placeholder={!wsConnected && (!activeSession?.user_id || !currentUser || activeSession.user_id === String(currentUser?.id)) ? 'Connecting...' : attachedFiles.length > 0 ? t('agent.chat.askAboutFile', { name: attachedFiles.length === 1 ? attachedFiles[0].name : `${attachedFiles.length} files` }) : t('chat.placeholder')}
-                                                disabled={!wsConnected}
-                                                rows={1}
-                                                style={{
-                                                    flex: 1,
-                                                    resize: 'none',
-                                                    overflowY: 'hidden',
-                                                    lineHeight: '22px',
-                                                    paddingTop: '7px',
-                                                    paddingBottom: '7px',
-                                                }}
-                                                autoFocus
-                                            />
-                                            {(isStreaming || isWaiting) ? (
-                                                <button className="btn btn-stop-generation" onClick={() => {
-                                                    if (!id || !activeSession?.id) return;
-                                                    const activeRuntimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
-                                                    const activeSocket = wsMapRef.current[activeRuntimeKey];
-                                                    if (activeSocket?.readyState === WebSocket.OPEN) {
-                                                        activeSocket.send(JSON.stringify({ type: 'abort' }));
-                                                        setIsStreaming(false);
-                                                        setIsWaiting(false);
-                                                        setSessionUiState(activeRuntimeKey, { isWaiting: false, isStreaming: false });
-                                                    }
-                                                }} style={{ padding: '6px 16px' }} title={t('chat.stop', 'Stop')}>
-                                                    <span className="stop-icon" />
+                                            <div className="chat-composer-input-block">
+                                                <textarea
+                                                    ref={chatInputRef}
+                                                    className="chat-input"
+                                                    value={chatInput}
+                                                    onChange={e => setChatInput(e.target.value)}
+                                                    onKeyDown={e => {
+                                                        // Enter sends the message; Shift+Enter inserts a newline
+                                                        if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isWaiting && !isStreaming) {
+                                                            e.preventDefault();
+                                                            sendChatMsg();
+                                                        }
+                                                    }}
+                                                    onPaste={handlePaste}
+                                                    placeholder={!wsConnected && (!activeSession?.user_id || !currentUser || activeSession.user_id === String(currentUser?.id)) ? 'Connecting...' : t('chat.placeholder')}
+                                                    disabled={!wsConnected}
+                                                    rows={1}
+                                                    autoFocus
+                                                />
+                                            </div>
+                                            <div className="chat-composer-toolbar">
+                                                <input type="file" multiple ref={fileInputRef} onChange={handleChatFile} style={{ display: 'none' }} />
+                                                <button
+                                                    type="button"
+                                                    className="chat-composer-btn"
+                                                    onClick={() => fileInputRef.current?.click()}
+                                                    disabled={!wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || attachedFiles.length >= 10}
+                                                    title={t('agent.workspace.uploadFile')}
+                                                >
+                                                    <IconPaperclip size={16} stroke={1.75} />
                                                 </button>
-                                            ) : (
-                                                <button className="btn btn-primary" onClick={sendChatMsg} disabled={!wsConnected || (!chatInput.trim() && attachedFiles.length === 0)} style={{ padding: '6px 16px' }}>{t('chat.send')}</button>
-                                            )}
+                                                {(isStreaming || isWaiting) ? (
+                                                    <button
+                                                        type="button"
+                                                        className="btn btn-stop-generation"
+                                                        onClick={() => {
+                                                            if (!id || !activeSession?.id) return;
+                                                            const activeRuntimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
+                                                            const activeSocket = wsMapRef.current[activeRuntimeKey];
+                                                            if (activeSocket?.readyState === WebSocket.OPEN) {
+                                                                activeSocket.send(JSON.stringify({ type: 'abort' }));
+                                                                setIsStreaming(false);
+                                                                setIsWaiting(false);
+                                                                setSessionUiState(activeRuntimeKey, { isWaiting: false, isStreaming: false });
+                                                            }
+                                                        }}
+                                                        title={t('chat.stop', 'Stop')}
+                                                    >
+                                                        <span className="stop-icon" />
+                                                    </button>
+                                                ) : (
+                                                    <button
+                                                        type="button"
+                                                        className="btn btn-primary chat-composer-send"
+                                                        onClick={sendChatMsg}
+                                                        disabled={!wsConnected || (!chatInput.trim() && attachedFiles.length === 0)}
+                                                        title={t('chat.send')}
+                                                    >
+                                                        <IconSend size={16} stroke={1.75} />
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
                                         </div>
                                     </>
                                 )}
@@ -3783,6 +3986,8 @@ function AgentDetailInner() {
                                         liveState={liveState}
                                         visible={livePanelVisible}
                                         onToggle={() => setLivePanelVisible(v => !v)}
+                                        agentId={id}
+                                        sessionId={wsSessionId}
                                     />
                                 )}
                             </div>
@@ -4092,8 +4297,7 @@ function AgentDetailInner() {
 
                         return (
                             <div>
-                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px', position: 'sticky', top: 0, zIndex: 10, background: 'var(--bg-primary)', paddingTop: '4px', paddingBottom: '12px', borderBottom: '1px solid var(--border-subtle)' }}>
-                                    <h3 style={{ margin: 0 }}>{t('agent.settings.title')}</h3>
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', marginBottom: '8px', position: 'sticky', top: '41px', zIndex: 6, background: 'var(--bg-primary)', paddingTop: '4px', paddingBottom: '8px' }}>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                                         {settingsSaved && <span style={{ fontSize: '12px', color: 'var(--success)' }}>{t('agent.settings.saved', 'Saved')}</span>}
                                         {settingsError && <span style={{ fontSize: '12px', color: settingsError.includes('adjusted') ? 'var(--warning)' : 'var(--error)', whiteSpace: 'pre-line' }}>{settingsError}</span>}
@@ -4304,6 +4508,11 @@ function AgentDetailInner() {
                                         </div>
                                     );
                                 })()}
+
+                                {/* Credentials Management — for AgentBay cookie injection */}
+                                <div style={{ marginBottom: '12px' }}>
+                                    <AgentCredentials agentId={id!} />
+                                </div>
 
                                 {/* Welcome Message */}
                                 {(() => {

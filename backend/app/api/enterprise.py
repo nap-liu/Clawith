@@ -1,10 +1,13 @@
 """Enterprise management API routes: LLM pool, enterprise info, approvals, audit logs."""
 
 import uuid
+import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+logger = logging.getLogger(__name__)
+
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,11 +24,13 @@ from app.schemas.oauth2 import OAuth2ProviderCreate, OAuth2ProviderUpdate, OAuth
 from app.schemas.schemas import (
     ApprovalAction, ApprovalRequestOut, AuditLogOut, EnterpriseInfoOut,
     EnterpriseInfoUpdate, LLMModelCreate, LLMModelOut, LLMModelUpdate,
-    IdentityProviderOut
+    IdentityProviderOut, UserInviteRequest
 )
 from app.services.autonomy_service import autonomy_service
 from app.services.enterprise_sync import enterprise_sync_service
 from app.services.llm_utils import get_provider_manifest
+from app.services.platform_service import platform_service
+from app.services.sso_service import sso_service
 
 router = APIRouter(prefix="/enterprise", tags=["enterprise"])
 
@@ -136,6 +141,8 @@ async def add_llm_model(
         max_tokens_per_day=data.max_tokens_per_day,
         enabled=data.enabled,
         supports_vision=data.supports_vision,
+        max_output_tokens=data.max_output_tokens,
+        request_timeout=data.request_timeout,
         tenant_id=uuid.UUID(tid) if tid else None,
     )
     db.add(model)
@@ -157,7 +164,7 @@ async def remove_llm_model(
         raise HTTPException(status_code=404, detail="Model not found")
 
     # Check if any agents reference this model
-    from sqlalchemy import or_, update
+    from sqlalchemy import or_
     ref_result = await db.execute(
         select(Agent.name).where(
             or_(Agent.primary_model_id == model_id, Agent.fallback_model_id == model_id)
@@ -216,6 +223,10 @@ async def update_llm_model(
             model.enabled = data.enabled
         if hasattr(data, 'supports_vision') and data.supports_vision is not None:
             model.supports_vision = data.supports_vision
+        if hasattr(data, 'max_output_tokens') and data.max_output_tokens is not None:
+            model.max_output_tokens = data.max_output_tokens
+        if hasattr(data, 'request_timeout') and data.request_timeout is not None:
+            model.request_timeout = data.request_timeout
 
         await db.commit()
         await db.refresh(model)
@@ -474,6 +485,83 @@ async def update_tenant_quotas(
     }
 
 
+# ── System Email: Test & Templates ──────────────────────
+
+
+class TestEmailRequest(BaseModel):
+    email: str
+
+
+@router.post("/system-email/test")
+async def send_test_email_endpoint(
+    data: TestEmailRequest,
+    current_user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Send a test email to verify SMTP configuration (admin only)."""
+    from app.services.system_email_service import send_test_email
+
+    try:
+        await send_test_email(data.email, db=db)
+        return {"success": True, "message": f"Test email sent to {data.email}"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/email-templates")
+async def get_email_templates_endpoint(
+    current_user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get email templates (current values + available variables per scenario)."""
+    from app.services.system_email_service import (
+        get_email_templates,
+        EMAIL_TEMPLATE_VARIABLES,
+        DEFAULT_EMAIL_TEMPLATES,
+    )
+
+    templates = await get_email_templates(db=db)
+    return {
+        "templates": templates,
+        "variables": EMAIL_TEMPLATE_VARIABLES,
+        "defaults": DEFAULT_EMAIL_TEMPLATES,
+    }
+
+
+class EmailTemplatesUpdate(BaseModel):
+    templates: dict
+
+
+@router.put("/email-templates")
+async def update_email_templates_endpoint(
+    data: EmailTemplatesUpdate,
+    current_user: User = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save email templates (admin only)."""
+    from app.services.system_email_service import EMAIL_TEMPLATE_VARIABLES
+
+    # Validate that only known scenario keys are provided
+    for key in data.templates:
+        if key not in EMAIL_TEMPLATE_VARIABLES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown email template scenario: {key}"
+            )
+
+    result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == "email_templates")
+    )
+    setting = result.scalar_one_or_none()
+    if setting:
+        setting.value = data.templates
+    else:
+        setting = SystemSetting(key="email_templates", value=data.templates)
+        db.add(setting)
+    await db.commit()
+    return {"success": True, "message": "Email templates saved"}
+
+
 # ─── System Settings ───────────────────────────────────
 
 from app.models.system_settings import SystemSetting
@@ -533,6 +621,11 @@ async def update_system_setting(
         setting = SystemSetting(key=key, value=data.value)
         db.add(setting)
     await db.commit()
+
+    # When public_base_url changes, regenerate sso_domain for all SSO-enabled tenants
+    if key == "platform" and data.value.get("public_base_url"):
+        await _regenerate_all_sso_domains(db)
+
     return {"key": setting.key, "value": setting.value}
 
 
@@ -545,6 +638,8 @@ async def _sync_tenant_sso_state(db: AsyncSession, tenant_id: uuid.UUID):
     sso_enabled is set to True and sso_domain is auto-assigned if empty.
     When all providers have sso_login_enabled=False, sso_enabled becomes False
     but sso_domain is preserved for potential re-enablement.
+
+    Raises HTTPException(400) if IP mode and another tenant already owns the sso_domain.
     """
     from app.models.tenant import Tenant
     count_result = await db.execute(
@@ -563,11 +658,61 @@ async def _sync_tenant_sso_state(db: AsyncSession, tenant_id: uuid.UUID):
 
     tenant.sso_enabled = active_sso_count > 0
 
-    # sso_domain is now optional — when empty, the fallback chain
-    # (global platform URL -> request URL) handles domain resolution.
-    # No longer auto-assign {slug}.clawith.ai
+    # Auto-assign subdomain on first SSO enablement based on Platform rules
+    if tenant.sso_enabled and not tenant.sso_domain:
+        sso_base = await platform_service.get_tenant_sso_base_url(db, tenant)
+        host = sso_base.split("://")[-1].split(":")[0].split("/")[0]
+        is_ip = platform_service.is_ip_address(host)
+
+        if is_ip:
+            # IP mode: first clear ALL other tenants' sso_domain, then set for this tenant
+            # (unique constraint - only one tenant can hold the IP domain)
+            await db.execute(
+                update(Tenant)
+                .where(Tenant.id != tenant_id)
+                .values(sso_domain=None, sso_enabled=False)
+            )
+            logger.info(f"[SSO] IP mode: cleared sso_domain for all other tenants, setting for tenant_id={tenant_id}")
+
+        tenant.sso_domain = sso_base
 
     await db.commit()
+
+
+async def _regenerate_all_sso_domains(db: AsyncSession):
+    """Regenerate sso_domain for ALL tenants when public_base_url changes.
+
+    - Domain mode: every tenant gets {slug}.{domain}, regardless of SSO status.
+    - IP mode: only ONE tenant can hold the IP domain (unique constraint).
+      The first SSO-enabled tenant keeps it; all others get sso_domain=None.
+      If no SSO-enabled tenant exists, the first tenant in the list gets it.
+    """
+    base_url = await platform_service.get_public_base_url(db)
+    host = base_url.split("://")[-1].split(":")[0].split("/")[0]
+    is_ip = platform_service.is_ip_address(host)
+
+    # Fetch all tenants; put SSO-enabled ones first so they win the IP slot
+    all_tenants_result = await db.execute(
+        select(Tenant).order_by(Tenant.sso_enabled.desc(), Tenant.created_at.asc())
+    )
+    tenants = all_tenants_result.scalars().all()
+
+    for i, tenant in enumerate(tenants):
+        if is_ip:
+            # IP mode: only one tenant can have SSO domain
+            if i == 0:
+                sso_base = await platform_service.get_tenant_sso_base_url(db, tenant)
+                tenant.sso_domain = sso_base
+            else:
+                tenant.sso_domain = None
+        else:
+            # Domain mode: each tenant gets their own subdomain
+            sso_base = await platform_service.get_tenant_sso_base_url(db, tenant)
+            tenant.sso_domain = sso_base
+        logger.info(f"[SSO regen] tenant={tenant.slug} sso_domain={tenant.sso_domain}")
+
+    if tenants:
+        await db.commit()
 
 
 # ─── Identity Providers ─────────────────────────────────
@@ -743,6 +888,13 @@ async def create_identity_provider(
     if not tid:
         raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
         
+    if data.sso_login_enabled:
+        if not await sso_service.validate_sso_enablement(db, tid):
+             raise HTTPException(
+                status_code=400,
+                detail="IP address does not support multi-tenant SSO. Another tenant already has SSO enabled."
+            )
+
     provider = IdentityProvider(
         provider_type=data.provider_type,
         name=data.name,
@@ -869,6 +1021,13 @@ async def update_identity_provider(
     if data.is_active is not None:
         provider.is_active = data.is_active
     if data.sso_login_enabled is not None:
+        if data.sso_login_enabled is True and not provider.sso_login_enabled:
+            # Pre-check IP restriction before writing anything
+            if not await sso_service.validate_sso_enablement(db, provider.tenant_id):
+                raise HTTPException(
+                    status_code=400,
+                    detail="IP address does not support multi-tenant SSO. Another tenant already has SSO enabled."
+                )
         provider.sso_login_enabled = data.sso_login_enabled
     if data.config is not None:
         # Merge config
@@ -884,10 +1043,18 @@ async def update_identity_provider(
     await db.refresh(provider)
 
     # Recompute tenant.sso_enabled derived state whenever sso_login_enabled changes
+    sso_domain = None
     if data.sso_login_enabled is not None and provider.tenant_id:
         await _sync_tenant_sso_state(db, provider.tenant_id)
+        from app.models.tenant import Tenant
+        tenant_result = await db.execute(select(Tenant).where(Tenant.id == provider.tenant_id))
+        t = tenant_result.scalar_one_or_none()
+        if t:
+            sso_domain = t.sso_domain
 
-    return IdentityProviderOut.model_validate(provider)
+    out = IdentityProviderOut.model_validate(provider)
+    out.sso_domain = sso_domain
+    return out
 
 
 @router.delete("/identity-providers/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1132,6 +1299,70 @@ async def create_invitation_codes(
 
     await db.commit()
     return {"created": len(codes_created), "codes": codes_created}
+
+
+@router.post("/invite-users")
+async def invite_users(
+    request: Request,
+    data: UserInviteRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Batch-invite users via email to the current user's company."""
+    _require_tenant_admin(current_user)
+    if not data.emails:
+        raise HTTPException(status_code=400, detail="No emails provided")
+        
+    import random
+    import string
+    from app.services.system_email_service import send_company_invitation_email
+    from app.services.platform_service import platform_service
+    from app.models.tenant import Tenant
+    
+    tenant_result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
+    tenant = tenant_result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    base_url = await platform_service.get_public_base_url(db, request=request)
+    
+    invited_count = 0
+    codes = []
+    
+    for email in data.emails:
+        email = email.lower().strip()
+        if not email:
+            continue
+            
+        code_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+        code = InvitationCode(
+            code=code_str,
+            tenant_id=current_user.tenant_id,
+            max_uses=1,
+            created_by=current_user.id,
+        )
+        db.add(code)
+        codes.append(code)
+        
+        invite_url = f"{base_url}/login?code={code_str}"
+        
+        inviter_name = current_user.display_name or current_user.username
+        
+        # Use background task to send email
+        background_tasks.add_task(
+            send_company_invitation_email,
+            to=email,
+            inviter_name=inviter_name,
+            company_name=tenant.name,
+            invite_url=invite_url,
+        )
+        invited_count += 1
+
+    if invited_count > 0:
+        await db.commit()
+        
+    return {"invited": invited_count, "message": "Invitations sent successfully"}
 
 
 @router.get("/invitation-codes")

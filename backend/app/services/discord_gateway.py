@@ -172,23 +172,24 @@ class DiscordGatewayManager:
                 creator_id = agent_obj.creator_id
                 ctx_size = agent_obj.context_window_size or 20
 
-                # Find or create platform user for this Discord sender
-                _username = f"discord_{sender_id}"
-                _u_r = await db.execute(
-                    select(_User).where(_User.username == _username)
+                # Find or create platform user for this Discord sender via unified service
+                from app.services.channel_user_service import channel_user_service
+                
+                _discord_display_name = message.author.display_name or message.author.name
+                _display = _discord_display_name or f"Discord User {sender_id[:8]}"
+                _extra_info = {"name": _display}
+                
+                _platform_user = await channel_user_service.resolve_channel_user(
+                    db=db,
+                    agent=agent_obj,
+                    channel_type="discord",
+                    external_user_id=sender_id,
+                    extra_info=_extra_info,
                 )
-                _platform_user = _u_r.scalar_one_or_none()
-                if not _platform_user:
-                    _display = message.author.display_name or message.author.name or f"Discord User {sender_id[:8]}"
-                    _platform_user = _User(
-                        username=_username,
-                        email=f"{_username}@discord.local",
-                        password_hash=_hp(_uuid.uuid4().hex),
-                        display_name=_display,
-                        role="member",
-                        tenant_id=agent_obj.tenant_id,
-                    )
-                    db.add(_platform_user)
+                
+                # Update display_name if we now have a better name
+                if _discord_display_name and _platform_user.display_name and _platform_user.display_name.startswith("Discord User ") and _platform_user.display_name != _discord_display_name:
+                    _platform_user.display_name = _discord_display_name
                     await db.flush()
                 platform_user_id = _platform_user.id
 

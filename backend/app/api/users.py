@@ -1,11 +1,10 @@
-"""User management API — admin-only user listing and quota management."""
-
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.security import get_current_user
 from app.database import get_db
@@ -60,7 +59,7 @@ async def list_users(
 
     # Filter users by tenant — platform_admins only shown in their own tenant
     result = await db.execute(
-        select(User).where(
+        select(User).options(selectinload(User.identity)).where(
             User.tenant_id == tid
         ).order_by(User.created_at.asc())
     )
@@ -109,7 +108,9 @@ async def update_user_quota(
     if current_user.role not in ("platform_admin", "org_admin"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
 
-    result = await db.execute(select(User).where(User.id == user_id))
+    result = await db.execute(
+        select(User).options(selectinload(User.identity)).where(User.id == user_id)
+    )
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -188,7 +189,9 @@ async def update_user_role(
         raise HTTPException(status_code=400, detail=f"Invalid role. Allowed: {', '.join(allowed_roles)}")
 
     # Find target user
-    result = await db.execute(select(User).where(User.id == user_id))
+    result = await db.execute(
+        select(User).options(selectinload(User.identity)).where(User.id == user_id)
+    )
     target_user = result.scalar_one_or_none()
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")

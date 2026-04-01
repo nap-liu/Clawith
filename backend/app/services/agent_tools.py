@@ -18,16 +18,25 @@ import uuid
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
+import re
 
 from loguru import logger
-
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from app.database import async_session
 from app.models.task import Task
-from app.config import get_settings
+from app.models.agent import Agent as AgentModel
+from app.models.org import AgentRelationship, OrgMember, AgentAgentRelationship
+from app.models.audit import ChatMessage, AuditLog
+from app.models.chat_session import ChatSession
+from app.models.channel_config import ChannelConfig
+from app.models.user import User as UserModel
 from app.services.auth_registry import auth_provider_registry
+from app.services.channel_session import find_or_create_channel_session
+from app.services.channel_user_service import get_platform_user_by_org_member
+from app.config import get_settings
+
 
 _settings = get_settings()
 WORKSPACE_ROOT = Path(_settings.AGENT_DATA_DIR)
@@ -42,8 +51,12 @@ _TOOL_CONFIG_CACHE_TTL_SECONDS = 60
 SENSITIVE_FIELD_KEYS = {"api_key", "private_key", "auth_code", "password", "secret", "atlassian_api_key"}
 
 
-def _decrypt_sensitive_fields(config: dict) -> dict:
-    """Decrypt sensitive fields in config dict."""
+def _decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
+    """Decrypt sensitive fields in config dict.
+
+    When config_schema is provided, also decrypts fields with type='password'
+    (e.g. smithery_api_key) that are not in the hardcoded SENSITIVE_FIELD_KEYS.
+    """
     if not config:
         return config
 
@@ -53,7 +66,16 @@ def _decrypt_sensitive_fields(config: dict) -> dict:
     settings = get_settings()
     result = dict(config)
 
-    for key in SENSITIVE_FIELD_KEYS:
+    # Build the set of sensitive keys: hardcoded + schema-derived
+    sensitive_keys = set(SENSITIVE_FIELD_KEYS)
+    if config_schema:
+        for field in config_schema.get("fields", []):
+            if field.get("type") == "password":
+                key = field.get("key", "")
+                if key:
+                    sensitive_keys.add(key)
+
+    for key in sensitive_keys:
         if key in result and result[key]:
             value = result[key]
             if isinstance(value, str) and value:
@@ -86,13 +108,16 @@ def _set_cached_tool_config(agent_id: Optional[uuid.UUID], tool_name: str, confi
 
 
 async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Optional[dict]:
-    """获取工具配置（带缓存）。
+    """Get merged tool config (with caching).
 
-    优先级：
-    1. agent_tools.config (per-agent 配置)
-    2. tools.config (全局配置)
+    Priority:
+    1. agent_tools.config (per-agent override)
+    2. tools.config (company/global config)
+
+    Both configs are decrypted using the tool's config_schema for
+    schema-aware field detection (e.g. smithery_api_key with type=password).
     """
-    # 先检查缓存
+    # Check cache first
     cached = _get_cached_tool_config(agent_id, tool_name)
     if cached is not None:
         logger.debug(f"[ToolConfig] Cache hit for {tool_name}, agent_id={agent_id}: {cached}")
@@ -101,32 +126,32 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     from app.models.tool import Tool, AgentTool
 
     async with async_session() as db:
-        # 1. 先查 per-agent 配置
+        # 1. Try per-agent + global config together
         if agent_id:
             result = await db.execute(
-                select(AgentTool.config, Tool.config)
+                select(AgentTool.config, Tool.config, Tool.config_schema)
                 .join(Tool, AgentTool.tool_id == Tool.id)
                 .where(AgentTool.agent_id == agent_id, Tool.name == tool_name)
             )
             row = result.first()
             if row:
-                agent_config, global_config = row
-                # 合并配置：agent_config 覆盖 global_config
+                agent_config, global_config, config_schema = row
+                # Merge: agent overrides global
                 merged = {**(global_config or {}), **(agent_config or {})}
                 if merged:
-                    # Decrypt before returning
-                    merged = _decrypt_sensitive_fields(merged)
-                    logger.info(f"[ToolConfig] DB merged config for {tool_name}, agent_id={agent_id}: {merged}")
+                    # Decrypt with schema awareness
+                    merged = _decrypt_sensitive_fields(merged, config_schema)
+                    logger.info(f"[ToolConfig] DB merged config for {tool_name}, agent_id={agent_id}")
                     _set_cached_tool_config(agent_id, tool_name, merged)
                     return merged
 
-        # 2. 回退到全局配置
+        # 2. Fallback to global config only
         result = await db.execute(select(Tool).where(Tool.name == tool_name))
         tool = result.scalar_one_or_none()
         if tool and tool.config:
-            # Decrypt before returning
-            decrypted = _decrypt_sensitive_fields(tool.config)
-            logger.info(f"[ToolConfig] DB global config for {tool_name}: {decrypted}")
+            # Decrypt with schema awareness
+            decrypted = _decrypt_sensitive_fields(tool.config, tool.config_schema)
+            logger.info(f"[ToolConfig] DB global config for {tool_name}")
             _set_cached_tool_config(agent_id, tool_name, decrypted)
             return decrypted
 
@@ -581,6 +606,81 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "generate_image_siliconflow",
+            "description": "Generate an image via SiliconFlow (FLUX). Save to workspace. Fast and China-friendly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed image description in English.",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "Image size. Default: 1024x1024. Options: 1024x1024, 1024x768, 768x1024",
+                    },
+                    "save_path": {
+                        "type": "string",
+                        "description": "Workspace path to save the image (e.g. workspace/images/sunset.png).",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image_openai",
+            "description": "Generate an image via OpenAI. Save to workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed image description in English.",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "Image size. Default: 1024x1024.",
+                    },
+                    "save_path": {
+                        "type": "string",
+                        "description": "Workspace path to save the image.",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image_google",
+            "description": "Generate an image via Google Gemini Image (Nano Banana) or Vertex AI. Save to workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed image description in English.",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "Image size. Default: 1024x1024.",
+                    },
+                    "save_path": {
+                        "type": "string",
+                        "description": "Workspace path to save the image.",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "discover_resources",
             "description": "Search public MCP registries (Smithery) for tools and capabilities that can extend your abilities. Use this when you encounter a task you cannot handle with your current tools.",
             "parameters": {
@@ -909,12 +1009,14 @@ AGENT_TOOLS = [
             },
         },
     },
+    # ── Feishu Drive Share (collaborator management for all file types) ──
     {
         "type": "function",
         "function": {
-            "name": "feishu_doc_share",
+            "name": "feishu_drive_share",
             "description": (
-                "Manage Feishu document collaborators and permissions. "
+                "Manage Feishu Drive file collaborators and permissions. "
+                "Supports ALL file types: docx, bitable, sheet, doc, folder, mindnote, slides. "
                 "Can add or remove collaborators with viewer/editor/full_access roles, "
                 "or get the current collaborator list. "
                 "Accepts colleague names (auto-searched) or open_ids directly."
@@ -924,7 +1026,12 @@ AGENT_TOOLS = [
                 "properties": {
                     "document_token": {
                         "type": "string",
-                        "description": "Feishu document token (from feishu_doc_create or doc URL)",
+                        "description": "File token (from feishu_doc_create, bitable_create_app, or URL)",
+                    },
+                    "doc_type": {
+                        "type": "string",
+                        "enum": ["docx", "bitable", "sheet", "doc", "folder", "mindnote", "slides"],
+                        "description": "File type. Default: 'docx'. Use 'bitable' for Bitable, 'sheet' for Spreadsheet, etc.",
                     },
                     "action": {
                         "type": "string",
@@ -948,6 +1055,34 @@ AGENT_TOOLS = [
                     },
                 },
                 "required": ["document_token", "action"],
+            },
+        },
+    },
+    # ── Feishu Drive Delete (delete files from cloud space) ──
+    {
+        "type": "function",
+        "function": {
+            "name": "feishu_drive_delete",
+            "description": (
+                "Delete a file or folder from Feishu Drive (cloud space). "
+                "The file will be moved to the recycle bin, not permanently deleted. "
+                "For folders, the deletion is asynchronous. "
+                "Requires ownership + parent folder edit permission, or parent folder full_access."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_token": {
+                        "type": "string",
+                        "description": "Token of the file or folder to delete (from URL or previous tool output)",
+                    },
+                    "file_type": {
+                        "type": "string",
+                        "enum": ["file", "docx", "bitable", "folder", "doc", "sheet", "mindnote", "shortcut", "slides"],
+                        "description": "Type of the file to delete. Use 'docx' for documents, 'bitable' for multitable, 'sheet' for spreadsheets, 'file' for uploaded files, 'folder' for folders.",
+                    },
+                },
+                "required": ["file_token", "file_type"],
             },
         },
     },
@@ -1335,7 +1470,8 @@ _FEISHU_TOOL_NAMES = {
     "feishu_doc_read",
     "feishu_doc_create",
     "feishu_doc_append",
-    "feishu_doc_share",
+    "feishu_drive_share",
+    "feishu_drive_delete",
     "feishu_calendar_list",
     "feishu_calendar_create",
     "feishu_calendar_update",
@@ -1483,9 +1619,9 @@ async def ensure_workspace(agent_id: uuid.UUID, tenant_id: str | None = None) ->
     if not (ws / "soul.md").exists():
         # Try to load from DB
         try:
-            from app.models.agent import Agent
             async with async_session() as db:
-                r = await db.execute(select(Agent).where(Agent.id == agent_id))
+
+                r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                 agent = r.scalar_one_or_none()
                 if agent and agent.role_description:
                     (ws / "soul.md").write_text(
@@ -1549,9 +1685,10 @@ _TOOL_AUTONOMY_MAP = {
 async def _get_agent_tenant_id(agent_id: uuid.UUID) -> str | None:
     """Get the agent tenant ID for tenant-scoped shared paths."""
     try:
-        from app.models.agent import Agent
         async with async_session() as db:
-            r = await db.execute(select(Agent.tenant_id).where(Agent.id == agent_id))
+
+            r = await db.execute(select(AgentModel.tenant_id).where(AgentModel.id == agent_id))
+
             tenant_id = r.scalar_one_or_none()
             if tenant_id:
                 return str(tenant_id)
@@ -1587,7 +1724,7 @@ async def _execute_tool_direct(
         elif tool_name == "sql_execute":
             return await _sql_execute(arguments)
         elif tool_name == "web_search":
-            return await _web_search(arguments)
+            return await _web_search(arguments, agent_id)
         elif tool_name == "jina_search":
             return await _jina_search(arguments)
         elif tool_name == "send_feishu_message":
@@ -1652,6 +1789,17 @@ async def execute_tool(
     if tool_name.startswith("agentbay_"):
         arguments["_session_id"] = session_id
 
+        # Take Control lock: block automatic tool execution while a human
+        # is manually controlling the browser/desktop session. This prevents
+        # input collisions between human clicks and agent-initiated actions.
+        from app.api.agentbay_control import is_session_locked
+        if is_session_locked(str(agent_id), session_id):
+            return (
+                "⏸️ A human operator is currently controlling this browser session "
+                "(Take Control mode). Please wait for them to finish before retrying "
+                "browser/computer operations."
+            )
+
     try:
         if tool_name == "list_files":
             result = _list_files(ws, arguments.get("path", ""), tenant_id=_agent_tenant_id)
@@ -1699,7 +1847,7 @@ async def execute_tool(
         elif tool_name == "send_channel_file":
             result = await _send_channel_file(agent_id, ws, arguments)
         elif tool_name == "web_search":
-            result = await _web_search(arguments)
+            result = await _web_search(arguments, agent_id)
         elif tool_name == "jina_search":
             result = await _jina_search(arguments)
         elif tool_name == "bing_search":
@@ -1721,6 +1869,12 @@ async def execute_tool(
             result = await _sql_execute(arguments)
         elif tool_name == "upload_image":
             result = await _upload_image(agent_id, ws, arguments)
+        elif tool_name == "generate_image_siliconflow":
+            result = await _generate_image(agent_id, ws, arguments, "siliconflow")
+        elif tool_name == "generate_image_openai":
+            result = await _generate_image(agent_id, ws, arguments, "openai")
+        elif tool_name == "generate_image_google":
+            result = await _generate_image(agent_id, ws, arguments, "google")
         elif tool_name == "discover_resources":
             result = await _discover_resources(arguments)
         elif tool_name == "import_mcp_server":
@@ -1750,8 +1904,10 @@ async def execute_tool(
         elif tool_name == "feishu_doc_append":
             result = await _feishu_doc_append(agent_id, arguments)
         # ── Feishu Calendar Tools ──
-        elif tool_name == "feishu_doc_share":
-            result = await _feishu_doc_share(agent_id, arguments)
+        elif tool_name == "feishu_drive_share":
+            result = await _feishu_drive_share(agent_id, arguments)
+        elif tool_name == "feishu_drive_delete":
+            result = await _feishu_drive_delete(agent_id, arguments)
         elif tool_name == "feishu_user_search":
             result = await _feishu_user_search(agent_id, arguments)
         elif tool_name == "feishu_calendar_list":
@@ -1846,8 +2002,11 @@ async def execute_tool(
         return f"Tool execution error ({tool_name}): {type(e).__name__}: {str(e)[:200]}"
 
 
-async def _web_search(arguments: dict) -> str:
-    """Search the web using a configurable search engine (reads config from DB)."""
+async def _web_search(arguments: dict, agent_id: uuid.UUID | None = None) -> str:
+    """Search the web using a configurable search engine.
+
+    Config resolution priority: Agent config > Company config > Defaults.
+    """
     import httpx
     import re
 
@@ -1855,17 +2014,8 @@ async def _web_search(arguments: dict) -> str:
     if not query:
         return "❌ Please provide search keywords"
 
-    # Load config from DB
-    config = {}
-    try:
-        from app.models.tool import Tool
-        async with async_session() as db:
-            r = await db.execute(select(Tool).where(Tool.name == "web_search"))
-            tool = r.scalar_one_or_none()
-            if tool and tool.config:
-                config = tool.config
-    except Exception:
-        pass
+    # Use the standard _get_tool_config helper (Agent > Company, cached, decrypted)
+    config = await _get_tool_config(agent_id, "web_search") or {}
 
     engine = config.get("search_engine", "duckduckgo")
     api_key = config.get("api_key", "")
@@ -2948,12 +3098,11 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
         return "❌ Please provide member_name, user_id, or open_id"
 
     try:
-        from app.models.org import AgentRelationship, OrgMember
-        from app.models.channel_config import ChannelConfig
         from app.services.feishu_service import feishu_service
         from sqlalchemy.orm import selectinload
 
         async with async_session() as db:
+
             # ── Shortcut: if caller provided user_id or open_id directly ──
             config_result = await db.execute(
                 select(ChannelConfig).where(ChannelConfig.agent_id == agent_id, ChannelConfig.channel_type == "feishu")
@@ -3036,25 +3185,20 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
             async def _save_outgoing_to_feishu_session(open_id: str):
                 """Save the outgoing message to the Feishu P2P chat session."""
                 try:
-                    from app.models.audit import ChatMessage
-                    from app.models.agent import Agent as AgentModel
-                    from app.services.channel_session import find_or_create_channel_session
                     from datetime import datetime as _dt, timezone as _tz
+
 
                     agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                     agent_obj = agent_r.scalar_one_or_none()
                     creator_id = agent_obj.creator_id if agent_obj else agent_id
 
-                    # Look up the platform user via OrgMember if possible
-                    from app.models.org import OrgMember as OrgMemberModel
-                    user_id = target_member.user_id or creator_id
-                    if open_id and not target_member.user_id:
-                        om_r = await db.execute(
-                            select(OrgMemberModel).where(OrgMemberModel.open_id == open_id)
-                        )
-                        om = om_r.scalar_one_or_none()
-                        if om and om.user_id:
-                            user_id = om.user_id
+                    # Get or create platform user from OrgMember (unified logic)
+                    platform_user = await get_platform_user_by_org_member(
+                        db=db,
+                        org_member=target_member,
+                        agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+                    )
+                    user_id = platform_user.id
 
                     ext_conv_id = f"feishu_p2p_{open_id}"
                     sess = await find_or_create_channel_session(
@@ -3201,10 +3345,8 @@ async def _send_dingtalk_message(
     target_member: "OrgMember",
 ) -> str:
     """Send message via DingTalk channel using Open API."""
-    import json as _j
-
-    from app.models.channel_config import ChannelConfig
     from app.services.dingtalk_service import send_dingtalk_message
+
 
     try:
         async with async_session() as db:
@@ -3243,40 +3385,41 @@ async def _send_dingtalk_message(
             )
 
             if result.get("errcode") == 0:
-                # Save proactive message to session so it appears in UI
                 try:
-                    from app.services.channel_session import find_or_create_channel_session
-                    from app.models.audit import ChatMessage
-                    from datetime import datetime, timezone
-                    
-                    # 1. Find the platform user for this DingTalk ID
-                    from app.models.user import User as UserModel
-                    dt_username = f"dingtalk_{user_id}"
-                    u_r = await db.execute(select(UserModel).where(UserModel.username == dt_username))
-                    platform_user = u_r.scalar_one_or_none()
-                    
-                    if platform_user:
-                        conv_id = f"dingtalk_p2p_{user_id}"
-                        # 2. Get/Create session
-                        sess = await find_or_create_channel_session(
-                            db=db,
-                            agent_id=agent_id,
-                            user_id=platform_user.id,
-                            external_conv_id=conv_id,
-                            source_channel="dingtalk",
-                            first_message_title=message_text[:30],
-                        )
-                        # 3. Save assistant message
-                        db.add(ChatMessage(
-                            agent_id=agent_id,
-                            user_id=platform_user.id,
-                            role="assistant",
-                            content=message_text,
-                            conversation_id=str(sess.id),
-                        ))
-                        sess.last_message_at = datetime.now(timezone.utc)
-                        await db.commit()
-                        logger.info(f"[DingTalk] Proactive message saved to session {sess.id}")
+                    # Get agent tenant context
+                    agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+                    agent_obj = agent_r.scalar_one_or_none()
+
+
+                    # Get or create platform user from OrgMember (unified logic)
+                    platform_user = await get_platform_user_by_org_member(
+                        db=db,
+                        org_member=target_member,
+                        agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+                    )
+
+
+                    conv_id = f"dingtalk_p2p_{user_id}"
+                    # 2. Get/Create session
+                    sess = await find_or_create_channel_session(
+                        db=db,
+                        agent_id=agent_id,
+                        user_id=platform_user.id,
+                        external_conv_id=conv_id,
+                        source_channel="dingtalk",
+                        first_message_title=message_text[:30],
+                    )
+                    # 3. Save assistant message
+                    db.add(ChatMessage(
+                        agent_id=agent_id,
+                        user_id=platform_user.id,
+                        role="assistant",
+                        content=message_text,
+                        conversation_id=str(sess.id),
+                    ))
+                    sess.last_message_at = datetime.now(timezone.utc)
+                    await db.commit()
+                    logger.info(f"[DingTalk] Proactive message saved to session {sess.id}")
                 except Exception as ex:
                     logger.error(f"[DingTalk] Failed to save proactive message to session: {ex}")
 
@@ -3298,10 +3441,8 @@ async def _send_wecom_message(
     target_member: "OrgMember",
 ) -> str:
     """Send message via WeCom channel using Open API."""
-    import json as _j
-
-    from app.models.channel_config import ChannelConfig
     from app.services.wecom_service import send_wecom_message
+
 
     try:
         async with async_session() as db:
@@ -3335,6 +3476,43 @@ async def _send_wecom_message(
             )
 
             if result.get("errcode") == 0:
+                # Save proactive message to session so it appears in UI
+                try:
+
+                    # Get agent tenant context
+                    agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+                    agent = agent_r.scalar_one_or_none()
+
+
+                    # Get or create platform user from OrgMember (unified logic)
+                    platform_user = await get_platform_user_by_org_member(
+                        db=db,
+                        org_member=target_member,
+                        agent_tenant_id=agent.tenant_id if agent else None,
+                    )
+
+                    conv_id = f"wecom_p2p_{user_id}"
+                    sess = await find_or_create_channel_session(
+                        db=db,
+                        agent_id=agent_id,
+                        user_id=platform_user.id,
+                        external_conv_id=conv_id,
+                        source_channel="wecom",
+                        first_message_title=message_text[:30],
+                    )
+                    db.add(ChatMessage(
+                        agent_id=agent_id,
+                        user_id=platform_user.id,
+                        role="assistant",
+                        content=message_text,
+                        conversation_id=str(sess.id),
+                    ))
+                    sess.last_message_at = datetime.now(timezone.utc)
+                    await db.commit()
+                    logger.info(f"[WeCom] Proactive message saved to session {sess.id}")
+                except Exception as ex:
+                    logger.error(f"[WeCom] Failed to save proactive message to session: {ex}")
+
                 return f"✅ Message sent to {member_name} via WeCom"
             else:
                 errmsg = result.get("errmsg", "Unknown error")
@@ -3355,28 +3533,38 @@ async def _send_web_message(agent_id: uuid.UUID, args: dict) -> str:
         return "❌ Please provide recipient username and message content"
 
     try:
-        from app.models.user import User as UserModel
-        from app.models.audit import ChatMessage
-        from app.models.chat_session import ChatSession
         from datetime import datetime as _dt, timezone as _tz
 
+
         async with async_session() as db:
-            # Look up target user by username or display_name
-            from sqlalchemy import or_
-            u_result = await db.execute(
-                select(UserModel).where(
-                    or_(
-                        UserModel.username == username,
-                        UserModel.display_name == username,
-                    )
+            # 0. Get agent's tenant_id for scoping
+            agent_res = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent = agent_res.scalar_one_or_none()
+            if not agent:
+                return "❌ Agent not found"
+
+            # 1. Look up target user by username or display_name within tenant
+
+            query = select(UserModel).where(
+                or_(
+                    UserModel.username == username,
+                    UserModel.display_name == username,
                 )
             )
+            if agent.tenant_id:
+                query = query.where(UserModel.tenant_id == agent.tenant_id)
+
+            u_result = await db.execute(query)
             target_user = u_result.scalar_one_or_none()
             if not target_user:
-                # List available users for the agent to pick from
-                all_r = await db.execute(select(UserModel.username, UserModel.display_name).limit(20))
+                # List available users for the agent to pick from (within the same tenant)
+                list_query = select(UserModel.username, UserModel.display_name).limit(20)
+                if agent.tenant_id:
+                    list_query = list_query.where(UserModel.tenant_id == agent.tenant_id)
+                
+                all_r = await db.execute(list_query)
                 names = [f"{r.display_name or r.username}" for r in all_r.all()]
-                return f"❌ No user named '{username}' found. Available users: {', '.join(names) if names else 'none'}"
+                return f"❌ No user named '{username}' found in your organization. Available users: {', '.join(names) if names else 'none'}"
 
             # Find or create a web session between the agent and this user
             sess_r = await db.execute(
@@ -3466,41 +3654,41 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, ws: Path, args: dict) ->
         return f"❌ File too large ({size_mb:.1f} MB). Maximum allowed is 50 MB."
 
     try:
-        from app.models.agent import Agent
         from app.services.activity_logger import log_activity
         import shutil
 
         async with async_session() as db:
-            src_result = await db.execute(select(Agent).where(Agent.id == from_agent_id))
+            src_result = await db.execute(select(AgentModel).where(AgentModel.id == from_agent_id))
             source_agent = src_result.scalar_one_or_none()
             source_name = source_agent.name if source_agent else "Unknown agent"
             source_tenant_id = source_agent.tenant_id if source_agent else None
 
             # Build base filter: same tenant + not self
-            base_filter = [Agent.id != from_agent_id]
+            base_filter = [AgentModel.id != from_agent_id]
             if source_tenant_id:
-                base_filter.append(Agent.tenant_id == source_tenant_id)
+                base_filter.append(AgentModel.tenant_id == source_tenant_id)
 
             # Try exact name match first, then fuzzy
             target_agent = None
             exact_result = await db.execute(
-                select(Agent).where(Agent.name == agent_name, *base_filter)
+                select(AgentModel).where(AgentModel.name == agent_name, *base_filter)
             )
             target_agent = exact_result.scalars().first()
             if not target_agent:
                 # Sanitize SQL wildcards in user input
-                safe_name = agent_name.replace("%", "").replace("_", "\_")
+                safe_name = agent_name.replace("%", "").replace("_", r"\_")
                 fuzzy_result = await db.execute(
-                    select(Agent).where(Agent.name.ilike(f"%{safe_name}%"), *base_filter)
+                    select(AgentModel).where(AgentModel.name.ilike(f"%{safe_name}%"), *base_filter)
                 )
                 target_agent = fuzzy_result.scalars().first()
+
             if not target_agent:
                 # Only show agents from relationships, not all agents
                 from app.models.org import AgentAgentRelationship
                 rel_r = await db.execute(
-                    select(Agent.name).join(
+                    select(AgentModel.name).join(
                         AgentAgentRelationship,
-                        (AgentAgentRelationship.target_agent_id == Agent.id) & (AgentAgentRelationship.agent_id == from_agent_id)
+                        (AgentAgentRelationship.target_agent_id == AgentModel.id) & (AgentAgentRelationship.agent_id == from_agent_id)
                     )
                 )
                 rel_names = [n for (n,) in rel_r.all()]
@@ -3510,7 +3698,6 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, ws: Path, args: dict) ->
                 return f"⚠️ {target_agent.name} is currently unavailable — their service period has ended. Please contact the platform administrator."
 
             # Enforce relationship: only allow file transfer with agents in relationships
-            from app.models.org import AgentAgentRelationship
             rel_check = await db.execute(
                 select(AgentAgentRelationship.id).where(
                     ((AgentAgentRelationship.agent_id == from_agent_id) & (AgentAgentRelationship.target_agent_id == target_agent.id))
@@ -3622,47 +3809,45 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
         return "❌ Please provide target agent name and message content"
 
     try:
-        from app.models.agent import Agent
-        from app.models.audit import ChatMessage
-        from app.models.chat_session import ChatSession
         from app.models.participant import Participant
         from datetime import datetime, timezone
 
         async with async_session() as db:
             # Look up source agent
-            src_result = await db.execute(select(Agent).where(Agent.id == from_agent_id))
+            src_result = await db.execute(select(AgentModel).where(AgentModel.id == from_agent_id))
+
             source_agent = src_result.scalar_one_or_none()
             source_name = source_agent.name if source_agent else "Unknown agent"
             source_tenant_id = source_agent.tenant_id if source_agent else None
 
             # Build base filter: same tenant + not self
-            base_filter = [Agent.id != from_agent_id]
+            base_filter = [AgentModel.id != from_agent_id]
             if source_tenant_id:
-                base_filter.append(Agent.tenant_id == source_tenant_id)
+                base_filter.append(AgentModel.tenant_id == source_tenant_id)
 
             # Find target agent by name — exact match first, then fuzzy
             target = None
             exact_result = await db.execute(
-                select(Agent).where(Agent.name == agent_name, *base_filter)
+                select(AgentModel).where(AgentModel.name == agent_name, *base_filter)
             )
             target = exact_result.scalars().first()
             if not target:
-                safe_name = agent_name.replace("%", "").replace("_", "\_")
+                safe_name = agent_name.replace("%", "").replace("_", r"\_")
                 fuzzy_result = await db.execute(
-                    select(Agent).where(Agent.name.ilike(f"%{safe_name}%"), *base_filter)
+                    select(AgentModel).where(AgentModel.name.ilike(f"%{safe_name}%"), *base_filter)
                 )
                 target = fuzzy_result.scalars().first()
             if not target:
                 # Only show agents from relationships, not all agents
-                from app.models.org import AgentAgentRelationship
                 rel_r = await db.execute(
-                    select(Agent.name).join(
+                    select(AgentModel.name).join(
                         AgentAgentRelationship,
-                        (AgentAgentRelationship.target_agent_id == Agent.id) & (AgentAgentRelationship.agent_id == from_agent_id)
+                        (AgentAgentRelationship.target_agent_id == AgentModel.id) & (AgentAgentRelationship.agent_id == from_agent_id)
                     )
                 )
                 rel_names = [n for (n,) in rel_r.all()]
                 return f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}"
+
 
             # Check if target agent has expired
             if target.is_expired or (target.expires_at and datetime.now(timezone.utc) >= target.expires_at):
@@ -3849,7 +4034,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 api_key=target_model.api_key_encrypted,
                 model=target_model.model,
                 base_url=base_url,
-                timeout=120.0,
+                timeout=float(getattr(target_model, 'request_timeout', None) or 120.0),
             )
             _A2A_RETRYABLE_MARKERS = (
                 "http 408", "http 429", "http 500", "http 502", "http 503", "http 504",
@@ -4652,13 +4837,10 @@ async def _handle_set_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
 
         # Return webhook URL for webhook triggers
         if ttype == "webhook":
-            from app.core.domain import resolve_base_url
-            from app.models.agent import Agent as AgentModel
-            _a_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-            _agent = _a_r.scalar_one_or_none()
-            _tenant_id = str(_agent.tenant_id) if _agent and _agent.tenant_id else None
-            base = await resolve_base_url(db, request=None, tenant_id=_tenant_id)
+            from app.services.platform_service import platform_service
+            base = await platform_service.get_public_base_url()
             webhook_url = f"{base.rstrip('/')}/api/webhooks/t/{config['token']}"
+
             return f"✅ Webhook trigger '{name}' created.\n\nWebhook URL: {webhook_url}\n\nTell the user to configure this URL in their external service (e.g. GitHub, Grafana). When the service sends a POST to this URL, you will be woken up with the payload as context."
 
         return f"✅ Trigger '{name}' created ({ttype}). It will fire according to your config and wake you up with the reason as context."
@@ -4821,31 +5003,14 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     if not file_path and not url:
         return "❌ Please provide either 'file_path' (workspace path) or 'url' (public image URL)"
 
-    # ── Load ImageKit credentials (global → per-agent fallback) ──
+    # ── Load ImageKit credentials (Agent > Company priority) ──
     private_key = ""
     url_endpoint = ""
     try:
-        from app.models.tool import Tool, AgentTool
-        async with async_session() as db:
-            # Global config
-            r = await db.execute(select(Tool).where(Tool.name == "upload_image"))
-            tool = r.scalar_one_or_none()
-            if tool and tool.config:
-                private_key = tool.config.get("private_key", "")
-                url_endpoint = tool.config.get("url_endpoint", "")
-
-            # Per-agent override (if global key is empty)
-            if not private_key and tool:
-                r2 = await db.execute(
-                    select(AgentTool).where(
-                        AgentTool.agent_id == agent_id,
-                        AgentTool.tool_id == tool.id,
-                    )
-                )
-                agent_tool = r2.scalar_one_or_none()
-                if agent_tool and agent_tool.config:
-                    private_key = agent_tool.config.get("private_key", "") or private_key
-                    url_endpoint = agent_tool.config.get("url_endpoint", "") or url_endpoint
+        # Use standard _get_tool_config (Agent > Company, cached, schema-aware decryption)
+        config = await _get_tool_config(agent_id, "upload_image") or {}
+        private_key = config.get("private_key", "")
+        url_endpoint = config.get("url_endpoint", "")
     except Exception as e:
         logger.error(f"[UploadImage] Config load error: {e}")
 
@@ -4932,6 +5097,272 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     except Exception as e:
         return f"❌ Upload error: {type(e).__name__}: {str(e)[:300]}"
 
+
+
+# ─── Image Generation (Multi-Provider) ────────────────────────────────────────
+
+async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provider: str) -> str:
+    """Generate an image using the configured provider and save to workspace.
+
+    Supported providers:
+    - siliconflow: OpenAI-compatible API (FLUX models, China-friendly)
+    - openai: Native OpenAI API (GPT Image)
+    - google: Google Gemini Native Image API (Nano Banana)
+
+    The tool config is resolved via the standard _get_tool_config() hierarchy:
+    global tool config (admin-set) -> per-agent tool config override.
+    """
+    import httpx
+    from datetime import datetime
+
+    prompt = arguments.get("prompt")
+    if not prompt:
+        return "❌ Missing required argument 'prompt' for generate_image"
+
+    size = arguments.get("size", "1024x1024")
+    save_path = arguments.get("save_path", "")
+
+    # Load tool config (global -> per-agent override)
+    tool_key = f"generate_image_{provider}"
+    config = await _get_tool_config(agent_id, tool_key) or {}
+    model = config.get("model", "")
+    api_key = config.get("api_key", "")
+    base_url = config.get("base_url", "")
+
+    if not api_key:
+        return (
+            "❌ Image generation API key not configured. "
+            "Ask your admin to configure it in Enterprise Settings → Tools → Generate Image."
+        )
+
+    # Generate the save path if not provided
+    if not save_path:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Derive a short slug from the prompt for a more descriptive filename
+        slug = "_".join(prompt.split()[:4]).lower()
+        slug = "".join(c for c in slug if c.isalnum() or c == "_")[:40]
+        save_path = f"workspace/images/{slug}_{ts}.png"
+
+    # Ensure the target directory exists and path is within workspace
+    full_save_path = (ws / save_path).resolve()
+    if not str(full_save_path).startswith(str(ws.resolve())):
+        return "❌ Access denied: save path is outside the workspace"
+    full_save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if provider == "siliconflow":
+            image_bytes = await _generate_image_siliconflow(
+                api_key,
+                model or "black-forest-labs/FLUX.1-schnell",
+                base_url or "https://api.siliconflow.cn/v1",
+                prompt, size,
+            )
+        elif provider == "openai":
+            image_bytes = await _generate_image_openai(
+                api_key,
+                model or "gpt-image-1",
+                base_url or "https://api.openai.com/v1",
+                prompt, size,
+            )
+        elif provider == "google":
+            image_bytes = await _generate_image_google(
+                api_key,
+                model or "gemini-2.5-flash-image",
+                base_url or "https://generativelanguage.googleapis.com/v1beta",
+                prompt, size,
+            )
+        else:
+            return f"❌ Unknown image generation provider: {provider}. Supported: siliconflow, openai, google"
+
+        if not image_bytes:
+            return "❌ Image generation returned empty result. Please try a different prompt."
+
+        # Save the generated image to workspace
+        full_save_path.write_bytes(image_bytes)
+        size_kb = len(image_bytes) / 1024
+
+        # Build the API path for inline display in chat
+        # The MarkdownRenderer will auto-inject the auth token for /api/agents/ paths
+        api_image_path = f"/api/agents/{agent_id}/files/download?path={save_path}"
+
+        return (
+            f"✅ Image generated and saved to: {save_path}\n"
+            f"Size: {size_kb:.1f} KB | Provider: {provider} | Model: {model or '(default)'}\n\n"
+            f"Display this image to the user using this exact markdown:\n"
+            f"![generated image]({api_image_path})"
+        )
+    except httpx.TimeoutException:
+        logger.error(f"[GenerateImage] Timeout ({provider}): took longer than 120 seconds or network unreachable.")
+        return (
+            f"❌ Image generation failed ({provider}): API request timed out after 120 seconds. "
+            f"This is usually caused by network issues or the model taking too long to generate."
+        )
+    except Exception as e:
+        err_msg = str(e) or type(e).__name__
+        logger.error(f"[GenerateImage] Error ({provider}): {err_msg}")
+        return f"❌ Image generation failed ({provider}): {err_msg[:400]}"
+
+
+async def _generate_image_siliconflow(
+    api_key: str, model: str, base_url: str, prompt: str, size: str
+) -> bytes:
+    """Generate image via SiliconFlow (OpenAI-compatible images.generate API).
+
+    SiliconFlow returns a temporary URL (expires in ~1 hour), so we download
+    the image bytes immediately after generation.
+    """
+    import httpx
+    import base64
+
+    url = f"{base_url.rstrip('/')}/images/generations"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "image_size": size,  # SiliconFlow uses 'image_size' instead of 'size'
+        "n": 1,
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            # Extract API error message for better diagnostics
+            try:
+                err_body = resp.json()
+                err_msg = err_body.get("message") or err_body.get("error", {}).get("message", resp.text[:300])
+            except Exception:
+                err_msg = resp.text[:300]
+            raise ValueError(f"SiliconFlow API error ({resp.status_code}): {err_msg}")
+        data = resp.json()
+
+        # SiliconFlow may return url or b64_json
+        image_data = data.get("data", [{}])[0]
+        image_url = image_data.get("url")
+        if image_url:
+            # Download the temporary URL immediately
+            img_resp = await client.get(image_url, timeout=60)
+            img_resp.raise_for_status()
+            return img_resp.content
+
+        b64 = image_data.get("b64_json")
+        if b64:
+            return base64.b64decode(b64)
+
+        raise ValueError(f"No image URL or b64_json in SiliconFlow response: {data}")
+
+
+async def _generate_image_openai(
+    api_key: str, model: str, base_url: str, prompt: str, size: str
+) -> bytes:
+    """Generate image via OpenAI GPT Image API.
+
+    Requests b64_json format to avoid dealing with URL expiry.
+    """
+    import httpx
+    import base64
+
+    url = f"{base_url.rstrip('/')}/images/generations"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "size": size,
+        "n": 1,
+        "response_format": "b64_json",
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            try:
+                err_body = resp.json()
+                err_msg = err_body.get("error", {}).get("message", resp.text[:300])
+            except Exception:
+                err_msg = resp.text[:300]
+            raise ValueError(f"OpenAI API error ({resp.status_code}): {err_msg}")
+        data = resp.json()
+
+        image_data = data.get("data", [{}])[0]
+        b64 = image_data.get("b64_json")
+        if b64:
+            return base64.b64decode(b64)
+
+        # Fallback: try URL
+        image_url = image_data.get("url")
+        if image_url:
+            img_resp = await client.get(image_url, timeout=60)
+            img_resp.raise_for_status()
+            return img_resp.content
+
+        raise ValueError(f"No b64_json or URL in OpenAI response: {data}")
+
+
+async def _generate_image_google(
+    api_key: str, model: str, base_url: str, prompt: str, size: str
+) -> bytes:
+    """Generate image via Google Gemini Native Image API (Nano Banana) or Vertex AI.
+
+    Uses the Gemini generateContent endpoint with responseModalities=["IMAGE"].
+    Converts WxH size to aspect ratio format (e.g. 1024x1024 -> 1:1).
+    Extracts the generated image from inlineData in the response parts.
+    """
+    import httpx
+    import base64
+
+    url = f"{base_url.rstrip('/')}/models/{model}:generateContent?key={api_key}"
+
+    # Convert WxH size to aspect ratio for Gemini API
+    # Supported: 1:1, 3:4, 4:3, 9:16, 16:9
+    size_to_ratio = {
+        "1024x1024": "1:1",
+        "768x1024": "3:4",
+        "1024x768": "4:3",
+        "768x1366": "9:16",
+        "1366x768": "16:9",
+        "1024x1536": "3:4",
+        "1536x1024": "4:3",
+    }
+    aspect_ratio = size_to_ratio.get(size, "1:1")
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {
+                "numberOfImages": 1,
+                "aspectRatio": aspect_ratio,
+            },
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            url, json=payload, headers={"Content-Type": "application/json"}
+        )
+        if resp.status_code != 200:
+            try:
+                err_body = resp.json()
+                err_msg = err_body.get("error", {}).get("message", resp.text[:300])
+            except Exception:
+                err_msg = resp.text[:300]
+            raise ValueError(f"Google Gemini API error ({resp.status_code}): {err_msg}")
+        data = resp.json()
+
+        # Extract image from response candidates -> content -> parts
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise ValueError(f"No candidates in Gemini response: {data}")
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        for part in parts:
+            if "inlineData" in part:
+                b64 = part["inlineData"]["data"]
+                return base64.b64decode(b64)
+
+        raise ValueError(
+            f"No image (inlineData) found in Gemini response parts. "
+            f"Parts: {[p.get('text', '(image)') if 'text' in p else '(inline)' for p in parts]}"
+        )
 
 
 # ─── Feishu Helper ────────────────────────────────────────────────────────────
@@ -5763,7 +6194,7 @@ async def _feishu_doc_create(agent_id: uuid.UUID, arguments: dict) -> str:
                 async with httpx.AsyncClient(timeout=10) as client:
                     share_resp = await client.post(
                         f"https://open.feishu.cn/open-apis/drive/v1/permissions/{doc_token}/members",
-                        params={"type": "docx", "need_notification": "false"},
+                        params={"type": "docx"},
                         json={
                             "member_type": "openid",
                             "member_id": sender_open_id,
@@ -6009,17 +6440,18 @@ async def _feishu_doc_append(agent_id: uuid.UUID, arguments: dict) -> str:
         return f"Failed: {str(e)[:300]}"
 
 
-# ─── Feishu Document Share ────────────────────────────────────────────────────
+# ─── Feishu Drive Share (All File Types) ────────────────────────────────────────
 
-async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
-    """Manage Feishu document collaborators.
-    Automatically handles both regular docx documents (Drive permissions API)
+async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
+    """Manage Feishu drive file collaborators.
+    Automatically handles both regular docs/files (Drive permissions API)
     and Wiki node documents (Wiki space members API).
     """
     import httpx
     import re as _re
 
     document_token = (arguments.get("document_token") or "").strip()
+    doc_type = (arguments.get("doc_type") or "docx").strip()
     action = (arguments.get("action") or "list").strip()
     permission = (arguments.get("permission") or "edit").strip()
 
@@ -6050,7 +6482,7 @@ async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
                 f"https://open.feishu.cn/open-apis/drive/v1/permissions/{use_token}/members",
-                params={"type": "docx"},
+                params={"type": doc_type},
                 headers=headers,
             )
         data = resp.json()
@@ -6145,7 +6577,7 @@ async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
                     f"https://open.feishu.cn/open-apis/drive/v1/permissions/{document_token}/members",
                     json=body,
                     headers=headers,
-                    params={"type": "docx"},
+                    params={"type": doc_type},
                 )
                 d = resp.json()
                 if d.get("code") == 0:
@@ -6185,7 +6617,7 @@ async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
                 resp = await client.delete(
                     f"https://open.feishu.cn/open-apis/drive/v1/permissions/{document_token}/members/{oid}",
                     headers=headers,
-                    params={"type": "docx", "member_type": "openid"},
+                    params={"type": doc_type, "member_type": "openid"},
                 )
                 d = resp.json()
                 if d.get("code") == 0:
@@ -6194,6 +6626,85 @@ async def _feishu_doc_share(agent_id: uuid.UUID, arguments: dict) -> str:
                     results.append(f"❌ 移除「{display}」失败：{d.get('msg')} (code {d.get('code')})")
 
     return "\n".join(results) if results else "没有需要处理的成员"
+
+
+# ─── Feishu Drive Delete ──────────────────────────────────────────────────────
+
+async def _feishu_drive_delete(agent_id: uuid.UUID, arguments: dict) -> str:
+    """Delete a file or folder from Feishu Drive (cloud space).
+    The file is moved to the recycle bin, not permanently deleted.
+    For folders, the deletion is asynchronous and returns a task_id.
+    """
+    import httpx
+
+    file_token = (arguments.get("file_token") or "").strip()
+    file_type = (arguments.get("file_type") or "").strip()
+
+    if not file_token:
+        return "❌ Missing required argument 'file_token'"
+    if not file_type:
+        return "❌ Missing required argument 'file_type'. Valid values: file, docx, bitable, folder, doc, sheet, mindnote, shortcut, slides"
+
+    valid_types = {"file", "docx", "bitable", "folder", "doc", "sheet", "mindnote", "shortcut", "slides"}
+    if file_type not in valid_types:
+        return f"❌ Invalid file_type '{file_type}'. Valid values: {', '.join(sorted(valid_types))}"
+
+    app_id, app_secret = await _get_feishu_credentials(agent_id)
+    if not app_id or not app_secret:
+        return "❌ Agent has no Feishu channel configured."
+    from app.services.feishu_service import feishu_service
+    token = await feishu_service.get_tenant_access_token(app_id, app_secret)
+
+    # Type label mapping for user-friendly output
+    type_labels = {
+        "file": "文件", "docx": "文档", "bitable": "多维表格",
+        "folder": "文件夹", "doc": "旧版文档", "sheet": "电子表格",
+        "mindnote": "思维笔记", "shortcut": "快捷方式", "slides": "幻灯片",
+    }
+    type_label = type_labels.get(file_type, file_type)
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.delete(
+                f"https://open.feishu.cn/open-apis/drive/v1/files/{file_token}",
+                params={"type": file_type},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        data = resp.json()
+        code = data.get("code", -1)
+
+        if code == 0:
+            # Folder deletion returns a task_id for async tracking
+            task_id = data.get("data", {}).get("task_id")
+            if task_id:
+                return (
+                    f"✅ 已提交{type_label}删除任务（异步执行中）。\n"
+                    f"📋 任务 ID: `{task_id}`\n"
+                    f"文件夹删除为异步操作，文件会被移至回收站。"
+                )
+            return f"✅ {type_label} `{file_token}` 已删除（移至回收站）。"
+
+        # Error handling with specific codes
+        msg = data.get("msg", "Unknown error")
+        if code == 1061003:
+            return f"❌ 未找到文件 `{file_token}`。请确认文件 token 和类型是否正确。"
+        elif code == 1061004:
+            return (
+                f"❌ 权限不足（code {code}）\n"
+                "需要满足以下条件之一：\n"
+                "• 文件所有者 + 父文件夹编辑权限\n"
+                "• 父文件夹的所有者或 full_access 权限\n"
+                "同时需要在飞书开放平台开通：drive:drive 或 space:document:delete"
+            )
+        elif code == 1061007:
+            return f"❌ 文件 `{file_token}` 已被删除。"
+        elif code == 1061045:
+            return f"⚠️ 接口频率限制，请稍后重试。（每秒最多 5 次）"
+        else:
+            return f"❌ 删除{type_label}失败：{msg} (code {code})"
+
+    except Exception as e:
+        return f"❌ 删除文件异常: {str(e)[:300]}"
 
 
 # ─── Feishu Calendar Tools ────────────────────────────────────────────────────
@@ -6848,21 +7359,9 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         return f"Failed to publish: {e}"
 
     # Build public URL using configured PUBLIC_BASE_URL
-    public_base = ""
-    try:
-        from app.models.system_settings import SystemSetting
-        async with async_session() as db2:
-            r = await db2.execute(
-                select(SystemSetting).where(SystemSetting.key == "platform")
-            )
-            setting = r.scalar_one_or_none()
-            if setting and setting.value and setting.value.get("public_base_url"):
-                raw = setting.value["public_base_url"].strip().rstrip("/")
-                if raw and not raw.startswith("http"):
-                    raw = f"https://{raw}"
-                public_base = raw
-    except Exception:
-        pass
+    from app.services.platform_service import platform_service
+    async with async_session() as db2:
+        public_base = await platform_service.get_public_base_url(db2)
 
     url = f"{public_base}/p/{short_id}" if public_base else f"/p/{short_id}"
 

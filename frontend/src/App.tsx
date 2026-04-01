@@ -6,6 +6,7 @@ import { X } from 'lucide-react';
 import Login from './pages/Login';
 import ForgotPassword from './pages/ForgotPassword';
 import ResetPassword from './pages/ResetPassword';
+import VerifyEmail from './pages/VerifyEmail';
 import CompanySetup from './pages/CompanySetup';
 import Layout from './pages/Layout';
 import Dashboard from './pages/Dashboard';
@@ -25,6 +26,10 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
     if (!token) return <Navigate to="/login" replace />;
     // Force company setup for users without a tenant
     if (user && !user.tenant_id) return <Navigate to="/setup-company" replace />;
+    
+    // Force email verification if not active/verified
+    if (user && !user.is_active) return <Navigate to="/verify-email" state={{ email: user.email }} replace />;
+    
     return <>{children}</>;
 }
 
@@ -144,6 +149,7 @@ export default function App() {
                 <Route path="/login" element={<Login />} />
                 <Route path="/forgot-password" element={<ForgotPassword />} />
                 <Route path="/reset-password" element={<ResetPassword />} />
+                <Route path="/verify-email" element={<VerifyEmail />} />
                 <Route path="/sso/entry" element={<SSOEntry />} />
                 <Route path="/setup-company" element={<CompanySetup />} />
                 <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
