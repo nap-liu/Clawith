@@ -413,19 +413,6 @@ async def process_dingtalk_message(
                         matched_via = "email"
                         logger.info(f"[DingTalk] Step3c: Matched user via email: {platform_user.username}")
 
-                # 3d: display_name 匹配（同租户下唯一同名，兜底）
-                if sender_nick and not platform_user:
-                    _u_r = await db.execute(
-                        _select(UserModel).where(
-                            UserModel.display_name == sender_nick,
-                            UserModel.tenant_id == agent_obj.tenant_id,
-                        )
-                    )
-                    _candidates = _u_r.scalars().all()
-                    if len(_candidates) == 1:
-                        platform_user = _candidates[0]
-                        matched_via = "display_name"
-                        logger.info(f"[DingTalk] Step3d: Matched user via unique display_name: {platform_user.username}")
 
         # Step 4: No match found — create new user
         if not platform_user:
