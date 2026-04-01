@@ -130,8 +130,8 @@ function SsoChannelSection({ idpType, existingProvider, tenant, t }: {
     }, [existingProvider?.sso_domain, tenant?.sso_domain]);
 
     const ssoEnabled = existingProvider ? !!existingProvider.sso_login_enabled : false;
-    const domain = liveDomain;
-    const callbackUrl = domain ? (domain.startsWith('http') ? `${domain}/api/auth/${idpType}/callback` : `https://${domain}/api/auth/${idpType}/callback`) : '';
+    const domain = liveDomain || window.location.origin;
+    const callbackUrl = domain.startsWith('http') ? `${domain}/api/auth/${idpType}/callback` : `https://${domain}/api/auth/${idpType}/callback`;
 
     const handleSsoToggle = async () => {
         if (!existingProvider) {

@@ -142,18 +142,22 @@ class BaseAuthProvider(ABC):
         # 5. 通过 provider_user_id 匹配现有用户 username（同租户下唯一登录凭证）
         if not user and user_info.provider_user_id:
             from sqlalchemy import and_
+            from app.models.user import Identity as IdentityModel
+            from sqlalchemy.orm import selectinload
 
             # 构建查询条件：tenant_id 有值时匹配该租户或无租户的用户，为 None 时不限制租户
             if tenant_id:
                 from sqlalchemy import or_
                 where_clause = and_(
-                    User.username == user_info.provider_user_id,
+                    IdentityModel.username == user_info.provider_user_id,
                     or_(User.tenant_id == tenant_id, User.tenant_id.is_(None)),
                 )
             else:
-                where_clause = User.username == user_info.provider_user_id
+                where_clause = IdentityModel.username == user_info.provider_user_id
 
-            result = await db.execute(select(User).where(where_clause))
+            result = await db.execute(
+                select(User).join(User.identity).where(where_clause).options(selectinload(User.identity))
+            )
             candidate = result.scalar_one_or_none()
             if candidate:
                 user = candidate
@@ -179,7 +183,15 @@ class BaseAuthProvider(ABC):
                  from app.services.registration_service import registration_service
                  identity = await registration_service.find_or_create_identity(db, email=user_info.email, phone=user_info.mobile)
                  user.identity_id = identity.id
-            
+
+            # Ensure identity is loaded for proxy field access
+            if not hasattr(user, "identity") or user.identity is None:
+                from sqlalchemy.orm import selectinload as _sil
+                refreshed = await db.execute(
+                    select(User).where(User.id == user.id).options(_sil(User.identity))
+                )
+                user = refreshed.scalar_one()
+
             await self._update_existing_user(db, user, user_info)
         else:
             # 3. Create new user (and Identity if needed)
@@ -236,18 +248,24 @@ class BaseAuthProvider(ABC):
             user.display_name = user_info.name
         if user_info.avatar_url and not user.avatar_url:
             user.avatar_url = user_info.avatar_url
-        if user_info.email and not user.email:
-            user.email = user_info.email
-        if user_info.mobile and not user.primary_mobile:
-            user.primary_mobile = user_info.mobile
-        # OAuth2 登录时用 provider_user_id 更新 dingtalk_ 开头的临时用户名
-        if (
-            user_info.provider_user_id
-            and user.username.startswith("dingtalk_")
-            and self.provider_type == "oauth2"
-        ):
-            user.username = user_info.provider_user_id
-            logger.info(f"[SSO] Updated username from {user.username} to {user_info.provider_user_id}")
+
+        # Update identity fields (email/mobile/username) through the identity relationship
+        identity = user.identity
+        if identity:
+            if user_info.email and not identity.email:
+                identity.email = user_info.email
+            if user_info.mobile and not identity.phone:
+                identity.phone = user_info.mobile
+            # OAuth2 登录时用 provider_user_id 更新 dingtalk_ 开头的临时用户名
+            if (
+                user_info.provider_user_id
+                and identity.username
+                and identity.username.startswith("dingtalk_")
+                and self.provider_type == "oauth2"
+            ):
+                old_username = identity.username
+                identity.username = user_info.provider_user_id
+                logger.info(f"[SSO] Updated username from {old_username} to {user_info.provider_user_id}")
 
         # Update legacy fields if applicable
         await self._update_legacy_user_fields(user, user_info)
@@ -258,26 +276,25 @@ class BaseAuthProvider(ABC):
         """Create new user from external identity."""
         from app.services.registration_service import registration_service
         import uuid
-        
+
+        effective_id = user_info.provider_user_id or user_info.provider_union_id or "unknown"
+        username = user_info.email.split("@")[0] if user_info.email else f"{self.provider_type}_{effective_id[:8]}"
+
         # 1. Resolve global identity first
         identity = await registration_service.find_or_create_identity(
             db,
             email=user_info.email,
             phone=user_info.mobile,
-            username=user_info.email.split("@")[0] if user_info.email else None,
+            username=username,
             password=effective_id,
         )
 
-
-        # 2. Prepare user fields
-        effective_id = user_info.provider_user_id or user_info.provider_union_id or "unknown"
-        username = user_info.email.split("@")[0] if user_info.email else f"{self.provider_type}_{effective_id[:8]}"
-
-        # Ensure unique username within tenant
+        # 2. Ensure unique username within tenant
+        from app.models.user import Identity as IdentityModel
         query = (
             select(User)
             .join(User.identity)
-            .where(Identity.username == username)
+            .where(IdentityModel.username == username)
         )
         if tenant_id:
             query = query.where(User.tenant_id == tenant_id)
@@ -295,14 +312,13 @@ class BaseAuthProvider(ABC):
             is_active=True,
         )
 
-
         # Set legacy fields if needed
         await self._set_legacy_user_fields(user, user_info)
 
         db.add(user)
         await db.flush()
-        
-        # Preload identity
+
+        # Preload identity for downstream access
         user.identity = identity
         return user
 
@@ -699,10 +715,9 @@ class OAuth2AuthProvider(BaseAuthProvider):
         )
 
     async def _create_new_user(self, db, user_info, tenant_id):
-        """Override to use provider_user_id as username for OAuth2 (it is a readable user ID like 'zhangsan')."""
-        from sqlalchemy import select
-        from app.models.user import User
-        from app.core.security import hash_password
+        """Override to use provider_user_id as username for OAuth2."""
+        from app.services.registration_service import registration_service
+        from app.models.user import Identity as IdentityModel
 
         # 优先用 provider_user_id（如 userId="zhangsan"），再用 email 前缀，最后 fallback
         username = (
@@ -711,9 +726,12 @@ class OAuth2AuthProvider(BaseAuthProvider):
             or f"oauth2_user"
         )
 
-        # Ensure unique username -- if conflict exists, it means the match chain above failed unexpectedly
-        from sqlalchemy.ext.asyncio import AsyncSession
-        existing = await db.execute(select(User).where(User.username == username))
+        # Check username uniqueness via Identity
+        existing = await db.execute(
+            select(User).join(User.identity).where(
+                IdentityModel.username == username,
+            )
+        )
         if existing.scalar_one_or_none():
             logger.error(
                 f"[OAuth2] Username conflict detected: {username} already exists in tenant {tenant_id}. "
@@ -726,20 +744,30 @@ class OAuth2AuthProvider(BaseAuthProvider):
 
         email = user_info.email or f"{username}@oauth2.local"
 
-        user = User(
-            username=username,
+        # Create or find Identity
+        identity = await registration_service.find_or_create_identity(
+            db,
             email=email,
-            password_hash=hash_password(user_info.provider_user_id or username),
+            phone=user_info.mobile,
+            username=username,
+            password=user_info.provider_user_id or username,
+        )
+
+        # Create tenant-scoped User
+        user = User(
+            identity_id=identity.id,
             display_name=user_info.name or username,
             avatar_url=user_info.avatar_url,
-            primary_mobile=user_info.mobile,
             registration_source=self.provider_type,
             tenant_id=tenant_id,
+            is_active=True,
         )
 
         db.add(user)
         await db.flush()
 
+        # Preload identity
+        user.identity = identity
         return user
 
 

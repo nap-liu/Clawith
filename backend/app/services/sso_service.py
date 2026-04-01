@@ -37,10 +37,12 @@ class SSOService:
             User if found, None otherwise
         """
         # 1. Try direct match via Identity join
+        from sqlalchemy.orm import selectinload
         query = (
             select(User)
             .join(User.identity)
             .where(Identity.email == email)
+            .options(selectinload(User.identity))
         )
         if tenant_id:
             query = query.where(User.tenant_id == tenant_id)
@@ -82,10 +84,12 @@ class SSOService:
             return None
 
         # 1. Try direct match via Identity join
+        from sqlalchemy.orm import selectinload as _sinload
         query = (
             select(User)
             .join(User.identity)
             .where(Identity.phone == normalized_mobile)
+            .options(_sinload(User.identity))
         )
         if tenant_id:
             query = query.where(User.tenant_id == tenant_id)

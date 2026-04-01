@@ -349,7 +349,11 @@ async def process_dingtalk_message(
 
         # Step 2: Match via username = dingtalk_{staffId} (兼容旧用户)
         if sender_staff_id and not platform_user:
-            _u_r = await db.execute(_select(UserModel).where(UserModel.username == dt_username))
+            from app.models.user import Identity as _IdentityModel
+            from sqlalchemy.orm import selectinload as _selectinload
+            _u_r = await db.execute(
+                _select(UserModel).join(UserModel.identity).where(_IdentityModel.username == dt_username).options(_selectinload(UserModel.identity))
+            )
             platform_user = _u_r.scalar_one_or_none()
             if platform_user:
                 matched_via = "username"
@@ -389,10 +393,10 @@ async def process_dingtalk_message(
                 # 3b: mobile 匹配
                 if dt_mobile and not platform_user:
                     _u_r = await db.execute(
-                        _select(UserModel).where(
-                            UserModel.primary_mobile == dt_mobile,
+                        _select(UserModel).join(UserModel.identity).where(
+                            _IdentityModel.phone == dt_mobile,
                             UserModel.tenant_id == agent_obj.tenant_id,
-                        )
+                        ).options(_selectinload(UserModel.identity))
                     )
                     platform_user = _u_r.scalar_one_or_none()
                     if platform_user:
@@ -402,10 +406,10 @@ async def process_dingtalk_message(
                 # 3c: email 匹配
                 if dt_email and not platform_user:
                     _u_r = await db.execute(
-                        _select(UserModel).where(
-                            UserModel.email == dt_email,
+                        _select(UserModel).join(UserModel.identity).where(
+                            _IdentityModel.email == dt_email,
                             UserModel.tenant_id == agent_obj.tenant_id,
-                        )
+                        ).options(_selectinload(UserModel.identity))
                     )
                     platform_user = _u_r.scalar_one_or_none()
                     if platform_user:
@@ -416,18 +420,27 @@ async def process_dingtalk_message(
         # Step 4: No match found — create new user
         if not platform_user:
             import uuid as _uuid
-            platform_user = UserModel(
-                username=dt_username,
+            from app.services.registration_service import registration_service as _reg_svc
+            # Create or find Identity first
+            _identity = await _reg_svc.find_or_create_identity(
+                db,
                 email=dt_email or f"{dt_username}@dingtalk.local",
-                password_hash=hash_password(_uuid.uuid4().hex),
+                phone=dt_mobile or None,
+                username=dt_username,
+                password=_uuid.uuid4().hex,
+            )
+            # Create tenant-scoped User
+            platform_user = UserModel(
+                identity_id=_identity.id,
                 display_name=sender_nick or f"DingTalk {sender_staff_id[:8]}",
-                primary_mobile=dt_mobile or None,
                 role="member",
                 tenant_id=agent_obj.tenant_id if agent_obj else None,
                 source="dingtalk",
+                is_active=True,
             )
             db.add(platform_user)
             await db.flush()
+            platform_user.identity = _identity
             matched_via = "created"
             logger.info(f"[DingTalk] Step4: Created new user: {dt_username}")
         else:
@@ -439,13 +452,14 @@ async def process_dingtalk_message(
             if not platform_user.source or platform_user.source == "web":
                 platform_user.source = "dingtalk"
                 updated = True
-            # 补充 mobile/email（通讯录获取的信息写入已有用户）
-            if dt_mobile and not platform_user.primary_mobile:
-                platform_user.primary_mobile = dt_mobile
-                updated = True
-            if dt_email and (not platform_user.email or platform_user.email.endswith((".local",))):
-                platform_user.email = dt_email
-                updated = True
+            # 补充 mobile/email（通讯录获取的信息写入已有用户的 Identity）
+            if platform_user.identity:
+                if dt_mobile and not platform_user.identity.phone:
+                    platform_user.identity.phone = dt_mobile
+                    updated = True
+                if dt_email and (not platform_user.identity.email or platform_user.identity.email.endswith((".local",))):
+                    platform_user.identity.email = dt_email
+                    updated = True
             if updated:
                 await db.flush()
 
