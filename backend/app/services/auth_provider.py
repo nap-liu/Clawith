@@ -276,11 +276,10 @@ class BaseAuthProvider(ABC):
         """Create new user from external identity."""
         from app.services.registration_service import registration_service
         import uuid
-
+        
+        # 1. Prepare user fields and resolve global identity
         effective_id = user_info.provider_user_id or user_info.provider_union_id or "unknown"
-        username = user_info.email.split("@")[0] if user_info.email else f"{self.provider_type}_{effective_id[:8]}"
-
-        # 1. Resolve global identity first
+        
         identity = await registration_service.find_or_create_identity(
             db,
             email=user_info.email,
@@ -289,12 +288,14 @@ class BaseAuthProvider(ABC):
             password=effective_id,
         )
 
-        # 2. Ensure unique username within tenant
-        from app.models.user import Identity as IdentityModel
+        # 2. Prepare Tenant user fields
+        username = user_info.email.split("@")[0] if user_info.email else f"{self.provider_type}_{effective_id[:8]}"
+
+        # Ensure unique username within tenant
         query = (
             select(User)
             .join(User.identity)
-            .where(IdentityModel.username == username)
+            .where(Identity.username == username)
         )
         if tenant_id:
             query = query.where(User.tenant_id == tenant_id)
@@ -729,7 +730,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
         # Check username uniqueness via Identity
         existing = await db.execute(
             select(User).join(User.identity).where(
-                IdentityModel.username == username,
+                Identity.username == username,
             )
         )
         if existing.scalar_one_or_none():

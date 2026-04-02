@@ -797,36 +797,83 @@ async def _inject_credentials(client: AgentBayClient, agent_id: uuid.UUID):
         logger.warning(f"[AgentBay] Cannot inject cookies — browser not initialized: {e}")
         return
 
-    # Build Node.js injection script and write to temp file
-    # Using a temp file avoids shell quoting issues with JSON in command args
+    # Build Node.js injection script.
+    # Use base64 encoding to write the script to the current working dir (not /tmp,
+    # which may lack write permissions in the Wuying browser sandbox).
+    #
+    # Cookies stored in DB were already sanitized at export time (sameSite title-cased,
+    # expires:-1 removed, domain without leading dot), so we only do a defensive
+    # re-sanitize here in case older records were stored before the fix.
+    import base64 as _base64
     cookies_json_str = json.dumps(all_cookies)
-    inject_script = f"""
-const {{ chromium }} = require('playwright');
-(async () => {{
-    try {{
+    inject_script = r"""
+const { chromium } = require('/usr/local/lib/node_modules/playwright');
+(async () => {
+    try {
         const browser = await chromium.connectOverCDP('http://localhost:9222');
         const context = browser.contexts()[0];
-        const cookies = {cookies_json_str};
-        await context.addCookies(cookies);
-        console.log('INJECT_OK:' + cookies.length + ' cookies injected');
-    }} catch (e) {{
+        const rawCookies = """ + cookies_json_str + r""";
+
+        // Defensive sanitize: normalize sameSite casing and strip invalid expires
+        const sameSiteMap = { none: 'None', lax: 'Lax', strict: 'Strict' };
+        const cookies = rawCookies.map(c => {
+            const out = { ...c };
+            if (out.sameSite != null) {
+                out.sameSite = sameSiteMap[String(out.sameSite).toLowerCase()] || 'Lax';
+            }
+            if (out.expires != null && out.expires <= 0) {
+                delete out.expires;
+            }
+            // Ensure domain has leading dot for subdomain matching
+            if (out.domain && !out.domain.startsWith('.')) {
+                out.domain = '.' + out.domain;
+            }
+            return out;
+        });
+
+        let injected = 0;
+        let failed = 0;
+        // Inject one at a time so a single bad cookie doesn't break the rest
+        for (const cookie of cookies) {
+            try {
+                await context.addCookies([cookie]);
+                injected++;
+            } catch (e) {
+                failed++;
+                if (failed <= 3) {
+                    // Log first few failures to aid debugging
+                    console.error('INJECT_SKIP:' + e.message + ' cookie=' + JSON.stringify(cookie).slice(0, 200));
+                }
+            }
+        }
+        console.log('INJECT_OK:' + injected + ' injected, ' + failed + ' skipped');
+        process.exit(0);
+    } catch (e) {
         console.error('INJECT_FAIL:' + e.message);
-    }}
-}})();
+        process.exit(1);
+    }
+})();
 """
 
+
     try:
-        # Write script to temp file inside the container
-        await asyncio.to_thread(
-            client._session.command.exec_command,
-            f"cat > /tmp/_inject_cookies.js << 'INJECT_EOF'\n{inject_script}\nINJECT_EOF"
+        # Write script via base64 decode to avoid shell quoting issues and /tmp permission errors
+        script_b64 = _base64.b64encode(inject_script.encode('utf-8')).decode('ascii')
+        write_result = await asyncio.to_thread(
+            client._session.command.exec,
+            f"echo '{script_b64}' | /usr/bin/base64 -d > tc_inject_cookies.js",
         )
-        # Execute the script
+        write_ok = getattr(write_result, 'success', False)
+        logger.info(f"[AgentBay] Cookie inject script write: success={write_ok}")
+
+        # Execute the injection script
         exec_result = await asyncio.to_thread(
-            client._session.command.exec_command,
-            "node /tmp/_inject_cookies.js",
+            client._session.command.exec,
+            "node tc_inject_cookies.js",
+            timeout_ms=15000,
         )
-        stdout = exec_result.output if hasattr(exec_result, 'output') else str(exec_result)
+        stdout = getattr(exec_result, 'stdout', '') or getattr(exec_result, 'output', '') or ''
+        stderr = getattr(exec_result, 'stderr', '') or ''
 
         if "INJECT_OK" in stdout:
             logger.info(f"[AgentBay] Cookie injection successful for agent {agent_id}: {stdout.strip()[:100]}")
@@ -842,6 +889,6 @@ const {{ chromium }} = require('playwright');
             except Exception as e:
                 logger.warning(f"[AgentBay] Failed to update last_injected_at: {e}")
         else:
-            logger.warning(f"[AgentBay] Cookie injection may have failed: {stdout[:200]}")
+            logger.warning(f"[AgentBay] Cookie injection may have failed: stdout={stdout[:200]}, stderr={stderr[:200]}")
     except Exception as e:
         logger.warning(f"[AgentBay] Cookie injection error: {e}")

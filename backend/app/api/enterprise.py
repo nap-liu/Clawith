@@ -36,7 +36,30 @@ from app.services.sso_service import sso_service
 router = APIRouter(prefix="/enterprise", tags=["enterprise"])
 
 
-# ─── LLM Model Pool ────────────────────────────────────
+# ─── Public: Check Email Exists ────────────────────────
+
+class CheckEmailRequest(BaseModel):
+    email: str
+
+
+@router.post("/check-email-exists")
+async def check_email_exists(
+    data: CheckEmailRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Public endpoint — check if an email address is already registered on this platform.
+
+    Used by the invitation flow to decide whether to show the login or register form.
+    Only returns a boolean; does not expose any user data.
+    """
+    from app.models.user import Identity
+    result = await db.execute(
+        select(Identity).where(Identity.email == data.email.strip().lower())
+    )
+    exists = result.scalar_one_or_none() is not None
+    return {"exists": exists}
+
+
 
 @router.get("/llm-providers")
 async def list_llm_providers(
@@ -1349,7 +1372,7 @@ async def invite_users(
         db.add(code)
         codes.append(code)
         
-        invite_url = f"{base_url}/login?code={code_str}"
+        invite_url = f"{base_url}/login?code={code_str}&email={email}"
         
         inviter_name = current_user.display_name or current_user.username
         

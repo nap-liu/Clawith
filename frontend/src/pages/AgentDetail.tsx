@@ -495,12 +495,11 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                                 return (
                                                                     <div 
                                                                         className="form-input" 
-                                                                        style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', background: 'var(--bg-tertiary)', borderStyle: 'dashed' }}
+                                                                        style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'text', background: 'var(--bg-tertiary)', borderColor: 'var(--border)', overflow: 'hidden' }}
                                                                         onClick={() => setFocusedField(field.key)}
                                                                     >
-                                                                        <span style={{ marginRight: '8px', fontSize: '14px' }}>🏢</span>
-                                                                        <span style={{ flex: 1, color: 'var(--text-secondary)' }}>{t('agent.tools.usingCompanyKey', 'Using company key ({{val}})', { val: globalVal })}</span>
-                                                                        <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('common.edit', 'Override')} ✎</span>
+                                                                        <span style={{ flex: 1, color: 'var(--text-tertiary)', fontSize: '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('agent.tools.usingCompanyKey', 'Using company key ({{val}})', { val: globalVal })}</span>
+                                                                        <span style={{ fontSize: '12px', color: 'var(--accent-primary)', flexShrink: 0, cursor: 'pointer' }}>{t('common.edit', 'Edit')}</span>
                                                                     </div>
                                                                 );
                                                             }
@@ -550,12 +549,11 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                                 return (
                                                                     <div 
                                                                         className="form-input" 
-                                                                        style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', background: 'var(--bg-tertiary)', borderStyle: 'dashed' }}
+                                                                        style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'text', background: 'var(--bg-tertiary)', borderColor: 'var(--border)', overflow: 'hidden' }}
                                                                         onClick={() => setFocusedField(field.key)}
                                                                     >
-                                                                        <span style={{ marginRight: '8px', fontSize: '14px' }}>🏢</span>
-                                                                        <span style={{ flex: 1, color: 'var(--text-secondary)' }}>{t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal })}</span>
-                                                                        <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('common.edit', 'Override')} ✎</span>
+                                                                        <span style={{ flex: 1, color: 'var(--text-tertiary)', fontSize: '13px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal })}</span>
+                                                                        <span style={{ fontSize: '12px', color: 'var(--accent-primary)', flexShrink: 0, cursor: 'pointer' }}>{t('common.edit', 'Edit')}</span>
                                                                     </div>
                                                                 );
                                                             }

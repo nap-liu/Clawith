@@ -394,15 +394,16 @@ class RegistrationService:
         """
         # First check invitation code
         if invitation_code:
-            from app.models.invitation import InvitationCode
+            from app.models.invitation_code import InvitationCode
             result = await db.execute(
                 select(InvitationCode).where(
                     InvitationCode.code == invitation_code,
-                    InvitationCode.uses_left > 0,
+                    InvitationCode.is_active == True,
+                    InvitationCode.tenant_id.is_not(None),
                 )
             )
             inv = result.scalar_one_or_none()
-            if inv:
+            if inv and inv.used_count < inv.max_uses:
                 # Get tenant from invitation
                 tenant_result = await db.execute(select(Tenant).where(Tenant.id == inv.tenant_id))
                 tenant = tenant_result.scalar_one_or_none()

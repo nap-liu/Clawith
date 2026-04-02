@@ -205,16 +205,24 @@ function SsoChannelSection({ idpType, existingProvider, tenant, t }: {
                         {t('enterprise.identity.ssoSubdomain', 'SSO Login URL')}
                     </label>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <input
-                            className="form-input"
-                            readOnly
-                            value={domain ? (domain.startsWith('http') ? domain : `https://${domain}`) : ''}
-                            placeholder={t('enterprise.identity.ssoUrlEmpty', '请先开启 SSO 以生成地址')}
-                            style={{ fontSize: '12px', flex: 1, maxWidth: '400px', background: 'var(--bg-primary)', cursor: 'default' }}
-                        />
+                        <div style={{
+                            flex: 1, maxWidth: '400px',
+                            padding: '8px 12px',
+                            background: 'var(--bg-elevated)',
+                            border: '1px solid var(--border-subtle)',
+                            borderRadius: '6px',
+                            fontSize: '12px',
+                            color: domain ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                            fontFamily: 'monospace',
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis'
+                        }}>
+                            {domain ? (domain.startsWith('http') ? domain : `https://${domain}`) : t('enterprise.identity.ssoUrlEmpty', '请先开启 SSO 以生成地址')}
+                        </div>
                         <LinearCopyButton
                             className="btn btn-ghost btn-sm"
-                            style={{ fontSize: '11px', width: 'auto', minWidth: '70px' }}
+                            style={{ fontSize: '11px', width: 'auto', minWidth: '70px', height: '33px' }}
                             disabled={!domain}
                             textToCopy={domain ? (domain.startsWith('http') ? domain : `https://${domain}`) : ''}
                             label={t('common.copy', 'Copy')}
@@ -230,16 +238,24 @@ function SsoChannelSection({ idpType, existingProvider, tenant, t }: {
                         {t('enterprise.identity.callbackUrl', 'Redirect URL (paste this in your app settings)')}
                     </label>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                        <input
-                            className="form-input"
-                            readOnly
-                            value={callbackUrl}
-                            placeholder={t('enterprise.identity.ssoUrlEmpty', '请先开启 SSO 以生成地址')}
-                            style={{ fontSize: '12px', flex: 1, maxWidth: '400px', background: 'var(--bg-primary)', cursor: 'default' }}
-                        />
+                        <div style={{
+                            flex: 1, maxWidth: '400px',
+                            padding: '8px 12px',
+                            background: 'var(--bg-elevated)',
+                            border: '1px solid var(--border-subtle)',
+                            borderRadius: '6px',
+                            fontSize: '12px',
+                            color: callbackUrl ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                            fontFamily: 'monospace',
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis'
+                        }}>
+                            {callbackUrl || t('enterprise.identity.ssoUrlEmpty', '请先开启 SSO 以生成地址')}
+                        </div>
                         <LinearCopyButton
                             className="btn btn-ghost btn-sm"
-                            style={{ fontSize: '11px', width: 'auto', minWidth: '70px' }}
+                            style={{ fontSize: '11px', width: 'auto', minWidth: '70px', height: '33px' }}
                             disabled={!callbackUrl}
                             textToCopy={callbackUrl}
                             label={t('common.copy', 'Copy')}
