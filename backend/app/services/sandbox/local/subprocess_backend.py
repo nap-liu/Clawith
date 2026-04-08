@@ -185,6 +185,11 @@ class SubprocessBackend(BaseSandboxBackend):
             safe_env["HOME"] = str(work_path)
             safe_env["PYTHONDONTWRITEBYTECODE"] = "1"
 
+            # Inject user context env vars if provided (resolved by cli_tool_executor)
+            extra_env = kwargs.get("extra_env")
+            if extra_env:
+                safe_env.update(extra_env)
+
             # Execute
             proc = await asyncio.create_subprocess_exec(
                 *cmd_prefix, str(script_path),

@@ -1983,8 +1983,13 @@ async def execute_tool(
         elif tool_name == "install_skill":
             result = await _install_skill(agent_id, ws, arguments)
         else:
-            # Try MCP tool execution
-            result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id)
+            # Try CLI tool execution first, then MCP
+            cli_result = await _try_execute_cli_tool(tool_name, arguments, agent_id=agent_id, user_id=user_id, ws=ws)
+            if cli_result is not None:
+                result = cli_result
+            else:
+                # Fall back to MCP tool execution
+                result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id)
 
         # Log tool call activity (skip noisy read operations)
         if tool_name not in ("list_files", "read_file", "read_document"):
@@ -8518,3 +8523,48 @@ async def _agentbay_computer_list_visible_apps(agent_id: Optional[uuid.UUID], ws
     except Exception as e:
         logger.exception(f"[AgentBay] Computer list_visible_apps failed")
         return f"List applications failed: {str(e)[:200]}"
+
+
+async def _try_execute_cli_tool(
+    tool_name: str,
+    arguments: dict,
+    agent_id: Optional[uuid.UUID] = None,
+    user_id: Optional[uuid.UUID] = None,
+    ws: Optional[Path] = None,
+) -> Optional[str]:
+    """Try to execute a CLI-type tool. Returns None if tool is not CLI type."""
+    try:
+        from app.models.tool import Tool, AgentTool
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(Tool).where(Tool.name == tool_name, Tool.type == "cli")
+            )
+            tool = result.scalar_one_or_none()
+
+            if not tool:
+                return None  # Not a CLI tool, let MCP handle it
+
+            # Load per-agent config override
+            agent_config = {}
+            if agent_id:
+                at_r = await db.execute(
+                    select(AgentTool).where(
+                        AgentTool.agent_id == agent_id,
+                        AgentTool.tool_id == tool.id,
+                    )
+                )
+                at = at_r.scalar_one_or_none()
+                agent_config = (at.config or {}) if at else {}
+
+        # Merge global + agent config
+        merged_config = {**(tool.config or {}), **agent_config}
+
+        from app.services.cli_tool_executor import execute_cli_tool
+
+        work_dir = str(ws) if ws else None
+        return await execute_cli_tool(merged_config, arguments, user_id=user_id, work_dir=work_dir)
+
+    except Exception as e:
+        logger.exception(f"[CLI Tool] Execution error for {tool_name}")
+        return f"❌ CLI tool error: {str(e)[:200]}"
