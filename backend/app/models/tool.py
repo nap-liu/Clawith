@@ -23,7 +23,7 @@ class Tool(Base):
     name: Mapped[str] = mapped_column(String(100), unique=True)  # "web_search", "list_files"
     display_name: Mapped[str] = mapped_column(String(200))  # "互联网搜索"
     description: Mapped[str] = mapped_column(Text, default="")
-    type: Mapped[str] = mapped_column(String(20), default="builtin")  # builtin | mcp
+    type: Mapped[str] = mapped_column(String(20), default="builtin")  # builtin | mcp | cli
     category: Mapped[str] = mapped_column(String(50), default="general")  # file, task, communication, search, custom
     icon: Mapped[str] = mapped_column(String(10), default="🔧")
 

@@ -185,26 +185,10 @@ class SubprocessBackend(BaseSandboxBackend):
             safe_env["HOME"] = str(work_path)
             safe_env["PYTHONDONTWRITEBYTECODE"] = "1"
 
-            # Inject current user context as platform-standard env vars
-            # Tools can read CLAWITH_USER_* to identify the conversation user
-            user_id = kwargs.get("user_id")
-            if user_id:
-                try:
-                    from app.core.database import async_session
-                    from app.models.user import User, Identity
-                    from sqlalchemy import select
-                    async with async_session() as db:
-                        result = await db.execute(
-                            select(Identity).where(Identity.user_id == user_id)
-                        )
-                        identity = result.scalar_one_or_none()
-                        if identity:
-                            if identity.phone:
-                                safe_env["CLAWITH_USER_PHONE"] = identity.phone
-                        # Also inject user_id
-                        safe_env["CLAWITH_USER_ID"] = str(user_id)
-                except Exception as e:
-                    logger.warning(f"[Sandbox] Failed to inject user context: {e}")
+            # Inject user context env vars if provided (resolved by cli_tool_executor)
+            extra_env = kwargs.get("extra_env")
+            if extra_env:
+                safe_env.update(extra_env)
 
             # Execute
             proc = await asyncio.create_subprocess_exec(
