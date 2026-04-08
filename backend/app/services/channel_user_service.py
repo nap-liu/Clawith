@@ -91,6 +91,7 @@ class ChannelUserService:
                 logger.debug(
                     f"[{channel_type}] Found user via linked OrgMember: {user.id}"
                 )
+                await self._enrich_user_from_extra_info(db, user, extra_info)
                 return user
 
         # Step 4: Try to find User by email/mobile from extra_info
@@ -111,8 +112,9 @@ class ChannelUserService:
                     f"[{channel_type}] Matched user by mobile: {user.id}"
                 )
 
-        # If found User by email/mobile, link OrgMember if exists (only for org-sync channels)
+        # If found User by email/mobile, enrich and link OrgMember
         if user:
+            await self._enrich_user_from_extra_info(db, user, extra_info)
             if channel_type in ("feishu", "dingtalk", "wecom"):
                 if org_member and not org_member.user_id:
                     # Existing shell OrgMember not yet linked → link it
@@ -296,6 +298,46 @@ class ChannelUserService:
             query = query.where(OrgMember.tenant_id == tenant_id)
         result = await db.execute(query.limit(1))
         return result.scalar_one_or_none()
+
+    async def _enrich_user_from_extra_info(
+        self,
+        db: AsyncSession,
+        user: User,
+        extra_info: dict[str, Any],
+    ) -> None:
+        """Enrich existing user with mobile/email/name from channel extra_info.
+
+        Only fills in fields that are currently empty on the user, to avoid
+        overwriting data the user may have set themselves.
+        """
+        from app.models.user import Identity
+
+        updated = False
+        name = extra_info.get("name")
+        mobile = extra_info.get("mobile")
+        email = extra_info.get("email")
+        avatar = extra_info.get("avatar_url")
+
+        if name and not user.display_name:
+            user.display_name = name
+            updated = True
+        if avatar and not user.avatar_url:
+            user.avatar_url = avatar
+            updated = True
+
+        # Enrich Identity-level fields (phone, email) if available
+        if user.identity_id and (mobile or email):
+            identity = await db.get(Identity, user.identity_id)
+            if identity:
+                if mobile and not identity.phone:
+                    identity.phone = mobile
+                    updated = True
+                if email and not identity.email:
+                    identity.email = email
+                    updated = True
+
+        if updated:
+            await db.flush()
 
     async def _create_channel_user(
         self,
