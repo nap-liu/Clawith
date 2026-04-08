@@ -1720,7 +1720,7 @@ async def _execute_tool_direct(
             return _write_file(ws, path, content, tenant_id=_agent_tenant_id)
         elif tool_name == "execute_code":
             logger.info(f"[DirectTool] Executing code with arguments: {arguments}")
-            return await _execute_code(agent_id, ws, arguments)
+            return await _execute_code(agent_id, ws, arguments, user_id=user_id)
         elif tool_name == "sql_execute":
             return await _sql_execute(arguments)
         elif tool_name == "web_search":
@@ -1864,7 +1864,7 @@ async def execute_tool(
             result = await _plaza_add_comment(agent_id, arguments)
         elif tool_name == "execute_code":
             logger.info(f"[DirectTool] Executing code with arguments: {arguments}")
-            result = await _execute_code(agent_id, ws, arguments)
+            result = await _execute_code(agent_id, ws, arguments, user_id=user_id)
         elif tool_name == "sql_execute":
             result = await _sql_execute(arguments)
         elif tool_name == "upload_image":
@@ -4516,7 +4516,7 @@ def _check_code_safety(language: str, code: str) -> str | None:
     return None
 
 
-async def _execute_code(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
+async def _execute_code(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict, user_id: Optional[uuid.UUID] = None) -> str:
     """Execute code using the configured sandbox backend."""
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
@@ -4556,6 +4556,7 @@ async def _execute_code(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict
             language=language,
             timeout=timeout,
             work_dir=str(work_dir),
+            user_id=user_id,
         )
 
         # Format result for user display
