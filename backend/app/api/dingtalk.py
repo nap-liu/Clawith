@@ -235,13 +235,43 @@ async def process_dingtalk_message(
             # P2P / single chat
             conv_id = f"dingtalk_p2p_{sender_staff_id}"
 
+        # Fetch user detail from DingTalk corp API for cross-channel matching
+        extra_info: dict = {"unionid": sender_staff_id}
+        try:
+            cfg_r = await db.execute(
+                _select(ChannelConfig).where(
+                    ChannelConfig.agent_id == agent_id,
+                    ChannelConfig.channel_type == "dingtalk",
+                )
+            )
+            dt_config = cfg_r.scalar_one_or_none()
+            if dt_config and dt_config.app_id and dt_config.app_secret:
+                from app.services.dingtalk_service import get_dingtalk_user_detail
+                user_detail = await get_dingtalk_user_detail(
+                    dt_config.app_id, dt_config.app_secret, sender_staff_id
+                )
+                if user_detail:
+                    dt_mobile = user_detail.get("mobile", "")
+                    dt_email = user_detail.get("email", "") or user_detail.get("org_email", "")
+                    dt_unionid = user_detail.get("unionid", "")
+                    dt_name = user_detail.get("name", "")
+                    extra_info = {
+                        "unionid": dt_unionid or sender_staff_id,
+                        "name": dt_name,
+                        "mobile": dt_mobile or None,
+                        "email": dt_email or None,
+                        "avatar_url": user_detail.get("avatar", ""),
+                    }
+        except Exception as e:
+            logger.warning(f"[DingTalk] Failed to fetch user detail for {sender_staff_id}: {e}")
+
         # Resolve channel user via unified service (uses OrgMember + SSO patterns)
         platform_user = await channel_user_service.resolve_channel_user(
             db=db,
             agent=agent_obj,
             channel_type="dingtalk",
             external_user_id=sender_staff_id,
-            extra_info={"unionid": sender_staff_id},
+            extra_info=extra_info,
         )
         platform_user_id = platform_user.id
 
