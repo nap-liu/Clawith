@@ -121,19 +121,19 @@ async def _resolve_user_context(user_id: uuid.UUID) -> dict:
     """Look up user info from DB for placeholder resolution."""
     try:
         from app.database import async_session
-        from app.models.user import Identity
-        from sqlalchemy import select
+        from sqlalchemy import text
 
         async with async_session() as db:
             result = await db.execute(
-                select(Identity).where(Identity.user_id == user_id)
+                text("SELECT i.phone, i.email FROM users u JOIN identities i ON u.identity_id = i.id WHERE u.id = :uid"),
+                {"uid": str(user_id)},
             )
-            identity = result.scalar_one_or_none()
+            row = result.first()
 
             return {
                 "user.id": str(user_id),
-                "user.phone": identity.phone if identity else None,
-                "user.email": None,  # extend as needed
+                "user.phone": row[0] if row else None,
+                "user.email": row[1] if row else None,
             }
     except Exception as e:
         logger.warning(f"[CLI Tool] Failed to resolve user context: {e}")
