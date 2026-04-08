@@ -120,7 +120,7 @@ async def execute_cli_tool(
 async def _resolve_user_context(user_id: uuid.UUID) -> dict:
     """Look up user info from DB for placeholder resolution."""
     try:
-        from app.core.database import async_session
+        from app.database import async_session
         from app.models.user import Identity
         from sqlalchemy import select
 
