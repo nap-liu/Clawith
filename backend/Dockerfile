@@ -33,6 +33,10 @@ COPY --from=deps /usr/local/bin/ /usr/local/bin/
 # Copy application code
 COPY . .
 
+# Copy svc CLI binary (excluded from .dockerignore, explicit copy)
+COPY svc /usr/local/bin/svc
+RUN chmod +x /usr/local/bin/svc
+
 RUN useradd --create-home clawith && \
     mkdir -p /data/agents && \
     chmod +x /app/entrypoint.sh && \
