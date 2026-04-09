@@ -532,7 +532,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_message_to_agent",
-            "description": "Send a message to a digital employee colleague. The recipient is another AI agent, not a human. Behaviour depends on msg_type: notify = fire-and-forget, returns immediately; consult = synchronous, waits for reply; task_delegate = async, returns immediately and you will be notified when they finish. Your relationships.md lists available digital employees under 'Digital Employee Colleagues'.",
+            "description": "Send a message to a digital employee colleague. The recipient is another AI agent, not a human. Choose msg_type based on intent: (1) notify — one-way announcement, no reply needed (e.g. 'meeting cancelled', 'status update'); (2) consult — quick question where you need an immediate synchronous answer; (3) task_delegate — you need the target to do work and report back results (e.g. 'summarize X', 'research Y', 'prepare Z'). IMPORTANT: When the user asks another agent to perform a task, use task_delegate, NOT notify. Your relationships.md lists available digital employees under 'Digital Employee Colleagues'.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -547,10 +547,10 @@ AGENT_TOOLS = [
                     "msg_type": {
                         "type": "string",
                         "enum": ["notify", "consult", "task_delegate"],
-                        "description": "Message type: notify = fire-and-forget notification (async, no reply expected, returns immediately); consult = synchronous question (waits for reply); task_delegate = delegate a task (async, returns immediately, you will be woken when the target completes). Defaults to notify.",
+                        "description": "Choose based on intent: notify = one-way announcement, no reply needed; consult = quick synchronous question; task_delegate = delegate work and expect results back. Use task_delegate whenever you need the other agent to DO work and return output.",
                     },
                 },
-                "required": ["agent_name", "message"],
+                "required": ["agent_name", "message", "msg_type"],
             },
         },
     },

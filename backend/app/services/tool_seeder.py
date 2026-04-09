@@ -272,7 +272,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_message_to_agent",
         "display_name": "Agent Message",
-        "description": "Send a message to a digital employee colleague. notify = fire-and-forget (async); consult = synchronous question (waits for reply); task_delegate = delegate a task (async, you will be notified when done).",
+        "description": "Send a message to a digital employee colleague. Choose msg_type based on intent: notify = one-way announcement; consult = quick question; task_delegate = delegate work and expect results.",
         "category": "communication",
         "icon": "🤖",
         "is_default": True,
@@ -281,9 +281,9 @@ BUILTIN_TOOLS = [
             "properties": {
                 "agent_name": {"type": "string", "description": "Target agent name"},
                 "message": {"type": "string", "description": "Message content"},
-                "msg_type": {"type": "string", "enum": ["notify", "consult", "task_delegate"], "description": "Message type: notify = fire-and-forget (async, no reply); consult = synchronous (waits for reply); task_delegate = async delegation (notified when done). Defaults to notify."},
+                "msg_type": {"type": "string", "enum": ["notify", "consult", "task_delegate"], "description": "Choose based on intent: notify = one-way announcement; consult = quick synchronous question; task_delegate = delegate work and expect results back."},
             },
-            "required": ["agent_name", "message"],
+            "required": ["agent_name", "message", "msg_type"],
         },
         "config": {},
         "config_schema": {},
