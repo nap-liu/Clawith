@@ -1,8 +1,14 @@
 """Add a2a_async_enabled column to tenants table.
 
-Revision ID: add_a2a_async_enabled
+Revision ID: f1a2b3c4d5e6
+Revises: d9cbd43b62e5
+Create Date: 2026-04-10 02:50:00.000000
 """
 from alembic import op
+
+
+revision = "f1a2b3c4d5e6"
+down_revision = "d9cbd43b62e5"
 
 
 def upgrade() -> None:
