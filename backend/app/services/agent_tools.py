@@ -2031,6 +2031,14 @@ async def _execute_tool_direct(
             return await _jina_search(arguments)
         elif tool_name == "exa_search":
             return await _exa_search(arguments, agent_id)
+        elif tool_name == "duckduckgo_search":
+            return await _duckduckgo_search_tool(arguments)
+        elif tool_name == "tavily_search":
+            return await _tavily_search_tool(arguments, agent_id)
+        elif tool_name == "google_search":
+            return await _google_search_tool(arguments, agent_id)
+        elif tool_name == "bing_search":
+            return await _bing_search_tool(arguments, agent_id)
         elif tool_name == "send_feishu_message":
             return await _send_feishu_message(agent_id, arguments)
         elif tool_name == "send_message_to_agent":
@@ -2191,8 +2199,14 @@ async def execute_tool(
             result = await _jina_search(arguments)
         elif tool_name == "exa_search":
             result = await _exa_search(arguments, agent_id)
+        elif tool_name == "duckduckgo_search":
+            result = await _duckduckgo_search_tool(arguments)
+        elif tool_name == "tavily_search":
+            result = await _tavily_search_tool(arguments, agent_id)
+        elif tool_name == "google_search":
+            result = await _google_search_tool(arguments, agent_id)
         elif tool_name == "bing_search":
-            result = await _jina_search(arguments)  # redirect legacy to jina
+            result = await _bing_search_tool(arguments, agent_id)
         elif tool_name == "jina_read":
             result = await _jina_read(arguments)
         elif tool_name == "read_webpage":
@@ -2708,6 +2722,72 @@ async def _exa_search(arguments: dict, agent_id: uuid.UUID | None = None) -> str
 
     except Exception as e:
         return f"❌ Exa search error: {str(e)[:300]}"
+
+
+
+# ── Standalone search engine tool wrappers ───────────────────────────────────
+# Each function reads its own tool config (agent > company > defaults) and
+# delegates to the existing private search implementations above.
+
+
+async def _duckduckgo_search_tool(arguments: dict) -> str:
+    """Standalone DuckDuckGo search tool (no API key required)."""
+    query = arguments.get("query", "").strip()
+    if not query:
+        return "Please provide search keywords"
+    max_results = min(arguments.get("max_results", 5), 10)
+    return await _search_duckduckgo(query, max_results)
+
+
+async def _tavily_search_tool(arguments: dict, agent_id: uuid.UUID | None = None) -> str:
+    """Standalone Tavily search tool (API key read from per-tool config)."""
+    query = arguments.get("query", "").strip()
+    if not query:
+        return "Please provide search keywords"
+    config = await _get_tool_config(agent_id, "tavily_search") or {}
+    api_key = config.get("api_key", "").strip()
+    if not api_key:
+        return "Tavily API key is required. Set it in the tool settings."
+    max_results = min(arguments.get("max_results", 5), 10)
+    try:
+        return await _search_tavily(query, api_key, max_results)
+    except Exception as e:
+        return f"Tavily search error: {str(e)[:200]}"
+
+
+async def _google_search_tool(arguments: dict, agent_id: uuid.UUID | None = None) -> str:
+    """Standalone Google Custom Search tool (API key read from per-tool config)."""
+    query = arguments.get("query", "").strip()
+    if not query:
+        return "Please provide search keywords"
+    config = await _get_tool_config(agent_id, "google_search") or {}
+    api_key = config.get("api_key", "").strip()
+    if not api_key:
+        return "Google Search API key is required (format: API_KEY:SEARCH_ENGINE_ID). Set it in the tool settings."
+    # Allow per-call language override; fall back to tool config, then default
+    language = arguments.get("language") or config.get("language", "en")
+    max_results = min(arguments.get("max_results", 5), 10)
+    try:
+        return await _search_google(query, api_key, max_results, language)
+    except Exception as e:
+        return f"Google search error: {str(e)[:200]}"
+
+
+async def _bing_search_tool(arguments: dict, agent_id: uuid.UUID | None = None) -> str:
+    """Standalone Bing Web Search tool (API key read from per-tool config)."""
+    query = arguments.get("query", "").strip()
+    if not query:
+        return "Please provide search keywords"
+    config = await _get_tool_config(agent_id, "bing_search") or {}
+    api_key = config.get("api_key", "").strip()
+    if not api_key:
+        return "Bing Search API key is required. Set it in the tool settings."
+    language = arguments.get("language") or config.get("language", "en-US")
+    max_results = min(arguments.get("max_results", 5), 10)
+    try:
+        return await _search_bing(query, api_key, max_results, language)
+    except Exception as e:
+        return f"Bing search error: {str(e)[:200]}"
 
 
 async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:

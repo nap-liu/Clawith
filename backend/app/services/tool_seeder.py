@@ -479,6 +479,136 @@ BUILTIN_TOOLS = [
             ]
         },
     },
+    # ── Standalone search engines (each engine as its own tool) ──────────────
+    # These complement web_search (which remains for backward compatibility).
+    # Each tool wraps a single engine so agents can pick the right one for the
+    # task without going through the unified engine-selector flow.
+    {
+        "name": "duckduckgo_search",
+        "display_name": "DuckDuckGo Search",
+        "description": "Search the internet using DuckDuckGo. Free, no API key required. Returns titles, URLs, and snippets.",
+        "category": "search",
+        "icon": "🦆",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search keywords"},
+                "max_results": {"type": "integer", "description": "Number of results to return (default 5, max 10)"},
+            },
+            "required": ["query"],
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
+        "name": "tavily_search",
+        "display_name": "Tavily Search",
+        "description": "AI-optimized web search using Tavily. Returns high-quality results with summaries. Requires a Tavily API key.",
+        "category": "search",
+        "icon": "🔍",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search keywords"},
+                "max_results": {"type": "integer", "description": "Number of results to return (default 5, max 10)"},
+            },
+            "required": ["query"],
+        },
+        "config": {},
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "api_key",
+                    "label": "Tavily API Key",
+                    "type": "password",
+                    "default": "",
+                    "placeholder": "tvly-xxxxxxxxxxxxxxxx (get one at tavily.com)",
+                },
+            ]
+        },
+    },
+    {
+        "name": "google_search",
+        "display_name": "Google Search",
+        "description": "Search using Google Custom Search JSON API. Returns titles, URLs, and snippets. Requires a Google API key and Custom Search Engine ID (format: API_KEY:CX_ID).",
+        "category": "search",
+        "icon": "🔍",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search keywords"},
+                "max_results": {"type": "integer", "description": "Number of results to return (default 5, max 10)"},
+                "language": {"type": "string", "description": "Search language code (e.g. 'en', 'zh')"},
+            },
+            "required": ["query"],
+        },
+        "config": {"language": "en"},
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "api_key",
+                    "label": "API Key & Search Engine ID",
+                    "type": "password",
+                    "default": "",
+                    "placeholder": "API_KEY:SEARCH_ENGINE_ID (get at console.cloud.google.com)",
+                },
+                {
+                    "key": "language",
+                    "label": "Search language",
+                    "type": "select",
+                    "options": [
+                        {"value": "en", "label": "English"},
+                        {"value": "zh-CN", "label": "Chinese"},
+                        {"value": "ja", "label": "Japanese"},
+                    ],
+                    "default": "en",
+                },
+            ]
+        },
+    },
+    {
+        "name": "bing_search",
+        "display_name": "Bing Search",
+        "description": "Search using Bing Web Search API. Returns titles, URLs, and snippets. Requires a Bing Search API key from Microsoft Azure.",
+        "category": "search",
+        "icon": "🔍",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search keywords"},
+                "max_results": {"type": "integer", "description": "Number of results to return (default 5, max 10)"},
+                "language": {"type": "string", "description": "Market language code (e.g. 'en-US', 'zh-CN')"},
+            },
+            "required": ["query"],
+        },
+        "config": {"language": "en-US"},
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "api_key",
+                    "label": "Bing Search API Key",
+                    "type": "password",
+                    "default": "",
+                    "placeholder": "Get from Azure Cognitive Services (Bing Search v7)",
+                },
+                {
+                    "key": "language",
+                    "label": "Market language",
+                    "type": "select",
+                    "options": [
+                        {"value": "en-US", "label": "English (US)"},
+                        {"value": "zh-CN", "label": "Chinese (Simplified)"},
+                        {"value": "ja-JP", "label": "Japanese"},
+                    ],
+                    "default": "en-US",
+                },
+            ]
+        },
+    },
     {
         "name": "plaza_get_new_posts",
         "display_name": "Plaza: Browse",
