@@ -12,10 +12,13 @@ from datetime import datetime, timezone
 from loguru import logger
 from sqlalchemy import select
 
+from app.config import get_settings
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.llm import LLMModel
 from app.models.task import Task, TaskLog
+
+settings = get_settings()
 
 
 async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
@@ -64,7 +67,7 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
             return
 
         model_result = await db.execute(
-            select(LLMModel).where(LLMModel.id == model_id)
+            select(LLMModel).where(LLMModel.id == model_id, LLMModel.tenant_id == agent.tenant_id)
         )
         model = model_result.scalar_one_or_none()
         if not model:
@@ -111,7 +114,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
         user_prompt += "\n\n请认真完成此任务，给出详细的执行结果。"
 
     # Step 4: Call LLM with tool loop
-    from app.services.llm_utils import create_llm_client, get_max_tokens, LLMMessage, LLMError
+    from app.services.llm_utils import create_llm_client, get_max_tokens, LLMMessage, LLMError, get_model_api_key
 
     messages = [
         LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt),
@@ -129,7 +132,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
     try:
         client = create_llm_client(
             provider=model.provider,
-            api_key=model.api_key_encrypted,
+            api_key=get_model_api_key(model),
             model=model.model,
             base_url=model.base_url,
             timeout=float(getattr(model, 'request_timeout', None) or 1200.0),

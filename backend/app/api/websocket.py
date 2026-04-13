@@ -131,7 +131,7 @@ async def call_llm(
         on_tool_call: Optional async callback(dict) for tool call status updates.
     """
     from app.services.agent_tools import AGENT_TOOLS, execute_tool, get_agent_tools_for_llm
-    from app.services.llm_utils import create_llm_client, get_max_tokens, LLMMessage, LLMError
+    from app.services.llm_utils import create_llm_client, get_max_tokens, LLMMessage, LLMError, get_model_api_key
 
     # ── Token limit check & config ──
     _max_tool_rounds = 50  # default
@@ -226,7 +226,7 @@ async def call_llm(
     try:
         client = create_llm_client(
             provider=model.provider,
-            api_key=model.api_key_encrypted,
+            api_key=get_model_api_key(model),
             model=model.model,
             base_url=model.base_url,
             timeout=float(getattr(model, 'request_timeout', None) or 120.0),

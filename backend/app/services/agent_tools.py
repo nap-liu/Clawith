@@ -4015,6 +4015,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 get_provider_base_url,
                 create_llm_client,
                 LLMMessage,
+                get_model_api_key,
             )
             from app.services.llm_client import LLMError
             from app.services.agent_tools import get_agent_tools_for_llm, execute_tool
@@ -4037,7 +4038,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
             llm_client = create_llm_client(
                 provider=target_model.provider,
-                api_key=target_model.api_key_encrypted,
+                api_key=get_model_api_key(target_model),
                 model=target_model.model,
                 base_url=base_url,
                 timeout=float(getattr(target_model, 'request_timeout', None) or 120.0),
