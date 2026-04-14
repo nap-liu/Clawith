@@ -70,7 +70,7 @@ async def get_dingtalk_user_detail(app_id: str, app_secret: str, userid: str) ->
                 return None
 
     result = await _user_detail_cache.get_or_set(cache_key, _fetch)
-    if result is None:
+    if not result:
         _user_detail_cache.invalidate(cache_key)
     return result
 

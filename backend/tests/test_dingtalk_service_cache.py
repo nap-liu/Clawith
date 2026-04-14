@@ -121,3 +121,24 @@ async def test_user_detail_cached_per_userid():
         for c in inst.post_calls if "user/get" in c[0]
     ]
     assert len(user_posts) == 2  # 2 distinct userids
+
+
+class _EmptyResultClient(_FakeClient):
+    async def post(self, url, params=None, json=None):
+        self.post_calls.append((url, params or {}, json or {}))
+        # DingTalk returns success but result field missing → _fetch coerces to {}
+        return _FakeResp({"errcode": 0})
+
+
+async def test_user_detail_empty_result_is_not_cached(monkeypatch):
+    monkeypatch.setattr(dingtalk_service.httpx, "AsyncClient", _EmptyResultClient)
+    r1 = await dingtalk_service.get_dingtalk_user_detail("APP", "SEC", "user-x")
+    r2 = await dingtalk_service.get_dingtalk_user_detail("APP", "SEC", "user-x")
+    assert r1 == {}
+    assert r2 == {}
+    user_posts = [
+        c for inst in _FakeClient.instances
+        for c in inst.post_calls if "user/get" in c[0]
+    ]
+    # Without the fix: only 1 POST (empty dict cached). With fix: 2 POSTs.
+    assert len(user_posts) == 2
