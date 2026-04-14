@@ -1378,6 +1378,7 @@ function AgentDetailInner() {
     const [settingsSaving, setSettingsSaving] = useState(false);
     const [settingsSaved, setSettingsSaved] = useState(false);
     const [settingsError, setSettingsError] = useState('');
+    const [avatarUploading, setAvatarUploading] = useState(false);
     const settingsInitRef = useRef(false);
 
     // Sync settings form from server data on load
@@ -4315,6 +4316,84 @@ function AgentDetailInner() {
                                         >
                                             {settingsSaving ? t('agent.settings.saving', 'Saving...') : t('agent.settings.save', 'Save')}
                                         </button>
+                                    </div>
+                                </div>
+
+                                {/* Avatar Upload */}
+                                <div className="card" style={{ marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '20px', padding: '16px' }}>
+                                    <div style={{
+                                        width: '64px', height: '64px', borderRadius: '50%', background: 'var(--bg-secondary)',
+                                        display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden',
+                                        flexShrink: 0, position: 'relative', border: '1px solid var(--border-subtle)'
+                                    }}>
+                                        {agent?.avatar_url ? (
+                                            <img src={agent.avatar_url.startsWith('/api') ? `${agent.avatar_url}${agent.avatar_url.includes('?') ? '&' : '?'}token=${token}` : agent.avatar_url} alt="Avatar" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                                        ) : (
+                                            <Bot size={32} color="var(--text-tertiary)" />
+                                        )}
+                                        {avatarUploading && (
+                                            <div style={{ position: 'absolute', inset: 0, background: 'rgba(var(--bg-primary-rgb), 0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                                <span className="spinner" style={{ width: '20px', height: '20px', borderTopColor: 'var(--text-primary)' }} />
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div style={{ flex: 1 }}>
+                                        <h4 style={{ margin: '0 0 4px 0', fontSize: '14px', fontWeight: 500 }}>{i18n.language?.startsWith('zh') ? '智能体头像' : 'Agent Avatar'}</h4>
+                                        <p style={{ margin: '0 0 10px 0', fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                            {i18n.language?.startsWith('zh') ? '上传自定义头像，推荐正方形图片（PNG, JPG 或 GIF），最大 5MB。' : 'Upload custom avatar. Recommended square image (PNG, JPG, GIF), max 5MB.'}
+                                        </p>
+                                        <div style={{ display: 'flex', gap: '10px' }}>
+                                            <label className="btn btn-secondary" style={{ padding: '4px 12px', fontSize: '12px', cursor: 'pointer', margin: 0 }}>
+                                                {avatarUploading ? (i18n.language?.startsWith('zh') ? '上传中...' : 'Uploading...') : (i18n.language?.startsWith('zh') ? '上传头像' : 'Upload Avatar')}
+                                                <input 
+                                                    type="file" 
+                                                    accept="image/*" 
+                                                    style={{ display: 'none' }} 
+                                                    disabled={avatarUploading}
+                                                    onChange={async (e) => {
+                                                        const file = e.target.files?.[0];
+                                                        if (!file || !id) return;
+                                                        if (file.size > 5 * 1024 * 1024) {
+                                                            alert(i18n.language?.startsWith('zh') ? '图片过大，请保持在 5MB 以内。' : 'Image too large, please keep under 5MB.');
+                                                            return;
+                                                        }
+                                                        setAvatarUploading(true);
+                                                        try {
+                                                            const res = await fileApi.upload(id, file, 'workspace/avatars');
+                                                            if (res && res.url) {
+                                                                await agentApi.update(id, { avatar_url: res.url } as any);
+                                                                queryClient.invalidateQueries({ queryKey: ['agent', id] });
+                                                            } else {
+                                                                alert('Upload failed: Invalid response format');
+                                                            }
+                                                        } catch (err: any) {
+                                                            alert('Upload failed: ' + err.message);
+                                                        } finally {
+                                                            setAvatarUploading(false);
+                                                            e.target.value = '';
+                                                        }
+                                                    }}
+                                                />
+                                            </label>
+                                            {agent?.avatar_url && (
+                                                <button className="btn btn-ghost" style={{ padding: '4px 12px', fontSize: '12px', color: 'var(--error)', margin: 0 }}
+                                                    onClick={async () => {
+                                                        if (confirm(i18n.language?.startsWith('zh') ? '确定移除此头像吗？' : 'Remove avatar?')) {
+                                                            setAvatarUploading(true);
+                                                            try {
+                                                                await agentApi.update(id!, { avatar_url: '' } as any);
+                                                                queryClient.invalidateQueries({ queryKey: ['agent', id] });
+                                                            } finally {
+                                                                setAvatarUploading(false);
+                                                            }
+                                                        }
+                                                    }}
+                                                    disabled={avatarUploading}
+                                                >
+                                                    {i18n.language?.startsWith('zh') ? '移除' : 'Remove'}
+                                                </button>
+                                            )}
+                                        </div>
                                     </div>
                                 </div>
 
