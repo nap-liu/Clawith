@@ -333,7 +333,7 @@ export default function Login() {
                     ) : (
                     <>
                     <div className="login-form-header">
-                        <div className="login-form-logo"><img src="/logo-black.png" className="login-logo-img" alt="" style={{ width: 28, height: 28, marginRight: 8, verticalAlign: 'middle' }} />{t('app.name', '数字员工平台')}</div>
+                        <div className="login-form-logo"><img src="/logo.png" className="login-logo-img" alt="" style={{ width: 28, height: 28, marginRight: 8, verticalAlign: 'middle' }} />{t('app.name', '数字员工平台')}</div>
                         <h2 className="login-form-title">
                             {isRegister ? t('auth.register') : t('auth.login')}
                         </h2>
