@@ -682,6 +682,8 @@ select:focus {
   overflow-x: clip;
   box-sizing: border-box;
   transition: all var(--transition-default);
+  display: flex;
+  flex-direction: column;
 }
 
 /* ─── Collapsed Sidebar Overrides ───────────────────── */

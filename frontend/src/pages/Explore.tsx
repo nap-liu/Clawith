@@ -123,14 +123,12 @@ function extractTags(text: string | undefined | null): string[] {
 const styles = `
     .explore-grid {
         display: grid;
-        grid-template-columns: repeat(3, 1fr);
-        gap: 16px;
-    }
-    @media (max-width: 1100px) {
-        .explore-grid { grid-template-columns: repeat(2, 1fr); }
-    }
-    @media (max-width: 700px) {
-        .explore-grid { grid-template-columns: 1fr; }
+        grid-template-columns: repeat(auto-fill, minmax(440px, 1fr));
+        gap: 24px;
+        max-width: 1440px;
+        margin: 0 auto;
+        padding-bottom: 40px;
+        width: 100%;
     }
     .explore-card {
         border: 1px solid var(--border-subtle);
@@ -238,9 +236,6 @@ function BotCard({ agent, creatorName, isChinese, onCardClick, onChatClick }: {
 
     // Build tags list
     const tags: string[] = [];
-    if (agent.agent_type) {
-        tags.push(agent.agent_type.toUpperCase());
-    }
     tags.push(...extractTags(agent.bio));
     // Limit to 3 tags max
     const displayTags = tags.slice(0, 3);
@@ -311,14 +306,15 @@ function BotCard({ agent, creatorName, isChinese, onCardClick, onChatClick }: {
 
             {/* Description */}
             <div style={{
-                fontSize: '13px', lineHeight: 1.6,
+                fontSize: '13px', lineHeight: '20px',
                 color: 'var(--text-secondary)',
                 marginBottom: displayTags.length > 0 ? '12px' : '16px',
                 overflow: 'hidden',
                 display: '-webkit-box',
-                WebkitLineClamp: 2,
+                WebkitLineClamp: 3,
                 WebkitBoxOrient: 'vertical' as const,
-                minHeight: '42px',
+                minHeight: '60px',
+                height: '60px',
             }}>
                 {description || (isChinese ? '暂无描述' : 'No description')}
             </div>
@@ -438,7 +434,7 @@ export default function Explore() {
     }, [agents]);
 
     return (
-        <div>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
             <style>{styles}</style>
 
             {/* ─── Hero Section ─── */}
