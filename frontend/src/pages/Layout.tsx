@@ -173,7 +173,7 @@ function VersionDisplay() {
 export default function Layout() {
     const { t, i18n } = useTranslation();
     const navigate = useNavigate();
-    const { user, logout } = useAuthStore();
+    const { user, logout, token } = useAuthStore();
     const queryClient = useQueryClient();
     const isChinese = i18n.language?.startsWith('zh');
     const [showAccountSettings, setShowAccountSettings] = useState(false);
@@ -360,7 +360,16 @@ export default function Layout() {
                                     title={agent.name}
                                 >
                                     <span className="sidebar-item-icon" style={{ position: 'relative' }}>
-                                        <span className={`agent-avatar${agent.agent_type === 'openclaw' ? ' openclaw' : ''}`}>{avatarChar}</span>
+                                        {agent.avatar_url ? (
+                                            <img
+                                                src={agent.avatar_url.startsWith('/api') ? `${agent.avatar_url}${agent.avatar_url.includes('?') ? '&' : '?'}token=${token}` : agent.avatar_url}
+                                                alt=""
+                                                className={`agent-avatar${agent.agent_type === 'openclaw' ? ' openclaw' : ''}`}
+                                                style={{ objectFit: 'cover' }}
+                                            />
+                                        ) : (
+                                            <span className={`agent-avatar${agent.agent_type === 'openclaw' ? ' openclaw' : ''}`}>{avatarChar}</span>
+                                        )}
                                         {agent.agent_type === 'openclaw' && (
                                             <span className="agent-avatar-link" style={{ display: 'flex' }}>
                                                 <IconArrowUpRight size={10} stroke={2.5} />

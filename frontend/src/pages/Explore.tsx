@@ -253,7 +253,15 @@ function BotCard({ agent, creatorName, isChinese, onCardClick, onChatClick }: {
                     color: '#fff', fontSize: '20px', fontWeight: 700,
                     flexShrink: 0, boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
                 }}>
-                    {firstChar}
+                    {agent.avatar_url ? (
+                        <img
+                            src={agent.avatar_url.startsWith('/api') ? `${agent.avatar_url}${agent.avatar_url.includes('?') ? '&' : '?'}token=${localStorage.getItem('token') || ''}` : agent.avatar_url}
+                            alt=""
+                            style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 'var(--radius-lg)' }}
+                        />
+                    ) : (
+                        firstChar
+                    )}
                 </div>
 
                 {/* Name + Author */}
