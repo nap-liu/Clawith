@@ -2185,7 +2185,13 @@ function AgentDetailInner() {
                 {/* Header */}
                 <div className="page-header">
                     <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-                        <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: 'var(--accent-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '24px' }}>{(Array.from(agent.name || 'A')[0] as string || 'A').toUpperCase()}</div>
+                        <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: 'var(--accent-subtle)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '24px', overflow: 'hidden' }}>
+                            {agent.avatar_url ? (
+                                <img src={agent.avatar_url.startsWith('/api') ? `${agent.avatar_url}${agent.avatar_url.includes('?') ? '&' : '?'}token=${token}` : agent.avatar_url} alt="Avatar" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                            ) : (
+                                (Array.from(agent.name || 'A')[0] as string || 'A').toUpperCase()
+                            )}
+                        </div>
                         <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
                             {canManage && editingName ? (
                                 <input
