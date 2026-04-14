@@ -1479,7 +1479,11 @@ function AgentDetailInner() {
         fetchMySessions(false, id).then((data: any) => {
             if (currentAgentIdRef.current !== id) return;
             setSessionsLoading(false);
-            if (data && data.length > 0) selectSession(data[0]);
+            if (data && data.length > 0) {
+                selectSession(data[0]);
+            } else {
+                createNewSession();
+            }
         });
     }, [id, token, activeTab]);
 
