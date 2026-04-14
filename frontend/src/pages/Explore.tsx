@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { agentApi } from '../services/api';
 import type { Agent } from '../types';
+import { Globe, Zap, Coffee, PauseCircle } from 'lucide-react';
 
 /* ────── Avatar Gradient Palette ────── */
 
@@ -66,11 +67,16 @@ const statusConfig: Record<string, { color: string; labelZh: string; labelEn: st
 /* ────── Category Tabs ────── */
 
 const CATEGORIES = [
-    { key: 'all', emoji: '🔮', labelZh: '全部', labelEn: 'All' },
-    { key: 'running', emoji: '⚡', labelZh: '运行中', labelEn: 'Running' },
-    { key: 'idle', emoji: '💤', labelZh: '空闲', labelEn: 'Idle' },
-    { key: 'stopped', emoji: '⏸', labelZh: '已停止', labelEn: 'Stopped' },
+    { key: 'all', icon: <Globe size={14} />, labelZh: '全部', labelEn: 'All' },
+    { key: 'running', icon: <Zap size={14} />, labelZh: '运行中', labelEn: 'Running' },
+    { key: 'idle', icon: <Coffee size={14} />, labelZh: '空闲', labelEn: 'Idle' },
+    { key: 'stopped', icon: <PauseCircle size={14} />, labelZh: '已停止', labelEn: 'Stopped' },
 ];
+
+const TAG_LABELS_ZH: Record<string, string> = {
+    NATIVE: '原生智能体',
+    OPENCLAW: '外部应用',
+};
 
 /* ────── Tag Colors ────── */
 
@@ -325,11 +331,12 @@ function BotCard({ agent, creatorName, isChinese, onCardClick, onChatClick }: {
                 }}>
                     {displayTags.map(tag => {
                         const tc = getTagColor(tag);
+                        const displayTag = isChinese && TAG_LABELS_ZH[tag.toUpperCase()] ? TAG_LABELS_ZH[tag.toUpperCase()] : tag;
                         return (
                             <span key={tag} className="explore-tag" style={{
                                 background: tc.bg, color: tc.color,
                             }}>
-                                #{tag}
+                                #{displayTag}
                             </span>
                         );
                     })}
@@ -353,7 +360,7 @@ function BotCard({ agent, creatorName, isChinese, onCardClick, onChatClick }: {
 
                 <button className="explore-chat-btn" onClick={onChatClick}>
                     <span style={{ display: 'flex' }}>{Icons.chat}</span>
-                    Chat
+                    {isChinese ? '对 话' : 'Chat'}
                 </button>
             </div>
         </div>
@@ -495,7 +502,7 @@ export default function Explore() {
                         className={`explore-tab ${category === cat.key ? 'active' : ''}`}
                         onClick={() => setCategory(cat.key)}
                     >
-                        <span>{cat.emoji}</span>
+                        <span style={{ display: 'flex', alignItems: 'center' }}>{cat.icon}</span>
                         {isChinese ? cat.labelZh : cat.labelEn}
                         <span style={{
                             fontSize: '11px',
@@ -562,7 +569,7 @@ export default function Explore() {
                             onCardClick={() => navigate(`/agents/${agent.id}`)}
                             onChatClick={(e) => {
                                 e.stopPropagation();
-                                navigate(`/agents/${agent.id}/chat`);
+                                navigate(`/agents/${agent.id}#chat`);
                             }}
                         />
                     ))}

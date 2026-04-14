@@ -135,7 +135,7 @@ export default function SSOEntry() {
 
     return (
         <div style={{ padding: '40px', textAlign: 'center' }}>
-            <h2>Login to Clawith</h2>
+            <h2>登录至 数字员工平台</h2>
             <p style={{ color: 'var(--text-secondary)', marginBottom: '30px' }}>Select your login method</p>
             
             <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
