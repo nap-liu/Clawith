@@ -31,3 +31,6 @@ _agents/
 
 # Internal docs
 docs/
+
+# Local worktrees
+.worktrees/
