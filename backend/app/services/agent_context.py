@@ -602,7 +602,7 @@ You have internet access through these tools — **use them proactively when you
             _platform_url = (await resolve_base_url(_db, request=None, tenant_id=_tid)).rstrip("/")
         platform_lines = [
             "\n## Platform Base URLs",
-            "You are running on the Clawith platform. Always use these URLs exactly -- never guess or invent domain names.",
+            f"You are running on the {settings.PLATFORM_NAME} platform. Always use these URLs exactly -- never guess or invent domain names.",
             "",
             "- **Platform base**: " + _platform_url,
             "- **Webhook**: " + _platform_url + "/api/webhooks/t/<token>  (replace <token> with actual trigger token)",

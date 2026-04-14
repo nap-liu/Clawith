@@ -49,6 +49,7 @@ class Settings(BaseSettings):
 
     # App
     APP_NAME: str = "Clawith"
+    PLATFORM_NAME: str = "Clawith"
     APP_VERSION: str = _read_version()
     DEBUG: bool = False
     SECRET_KEY: str = "change-me-in-production"
