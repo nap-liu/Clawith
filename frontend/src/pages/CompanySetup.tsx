@@ -126,7 +126,7 @@ export default function CompanySetup() {
 
             <div className="company-setup-container">
                 <div className="company-setup-header">
-                    <img src="/logo.png" alt="" style={{ width: 32, height: 32 }} />
+                    <img src="/logo-black.png" alt="" style={{ width: 32, height: 32 }} />
                     <h1>{t('companySetup.title', 'Set Up Your Workspace')}</h1>
                     <p className="company-setup-subtitle">
                         {t('companySetup.subtitle', 'Join an existing company or create your own to get started.')}

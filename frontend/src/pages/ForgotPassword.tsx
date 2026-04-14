@@ -57,7 +57,7 @@ export default function ForgotPassword() {
                 <div className="login-form-wrapper" style={{ maxWidth: '460px' }}>
                     <div className="login-form-header">
                         <div className="login-form-logo">
-                            <img src="/logo.png" className="login-logo-img" alt="" style={{ width: 28, height: 28, marginRight: 8, verticalAlign: 'middle' }} />
+                            <img src="/logo-black.png" className="login-logo-img" alt="" style={{ width: 28, height: 28, marginRight: 8, verticalAlign: 'middle' }} />
                             {t('app.name', '数字员工平台')}
                         </div>
                         <h2 className="login-form-title">{t('auth.forgotPasswordTitle', 'Forgot password')}</h2>
