@@ -4,6 +4,9 @@ from loguru import logger
 from sqlalchemy import select
 from app.database import async_session
 from app.models.tool import Tool
+from app.config import get_settings
+
+_settings = get_settings()
 
 # Builtin tool definitions — these map to the hardcoded AGENT_TOOLS
 BUILTIN_TOOLS = [
@@ -208,7 +211,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_web_message",
         "display_name": "Web Message",
-        "description": "Send a proactive message to a user on the Clawith web platform. The message appears in their chat history and is pushed in real-time if they are online.",
+        "description": f"Send a proactive message to a user on the {_settings.PLATFORM_NAME} web platform. The message appears in their chat history and is pushed in real-time if they are online.",
         "category": "communication",
         "icon": "🌐",
         "is_default": True,

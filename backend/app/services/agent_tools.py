@@ -422,7 +422,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_web_message",
-            "description": "Send a message to a user on the Clawith web platform. The message will appear in their web chat history and be pushed in real-time if they are online. Use this to proactively notify web users.",
+            "description": f"Send a message to a user on the {_settings.PLATFORM_NAME} web platform. The message will appear in their web chat history and be pushed in real-time if they are online. Use this to proactively notify web users.",
             "parameters": {
                 "type": "object",
                 "properties": {
