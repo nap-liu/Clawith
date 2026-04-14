@@ -1,14 +1,14 @@
 {
   "app": {
-    "name": "Clawith",
+    "name": "Digital Employee Platform",
     "tagline": "Enterprise Digital Employee Platform"
   },
   "login": {
     "hero": {
       "badge": "Open Source · Multi-Agent Collaboration",
-      "title": "Clawith",
+      "title": "Digital Employee Platform",
       "subtitle": "OpenClaw for Teams",
-      "description": "OpenClaw empowers individuals.<br>Clawith scales it to frontier organizations.",
+      "description": "OpenClaw empowers individuals.<br>The Digital Employee Platform scales it to frontier organizations.",
       "features": {
         "multiAgent": {
           "title": "Multi-Agent Crew",

@@ -1,14 +1,14 @@
 {
   "app": {
-    "name": "Clawith",
+    "name": "数字员工平台",
     "tagline": "企业数字员工平台"
   },
   "login": {
     "hero": {
       "badge": "开源 · 多智能体协作",
-      "title": "Clawith",
+      "title": "数字员工平台",
       "subtitle": "OpenClaw for Teams",
-      "description": "OpenClaw 赋能个人。<br>Clawith 将其扩展到前沿组织。",
+      "description": "OpenClaw 赋能个人。<br>数字员工平台将其扩展到前沿组织。",
       "features": {
         "multiAgent": {
           "title": "多智能体团队",
@@ -1160,7 +1160,7 @@
     "keyNote": "API Key 已嵌入在上方指令中。如需手动配置可单独保存。",
     "goToAgent": "前往 Agent 页面",
     "nativeTitle": "平台托管",
-    "nativeDesc": "在 Clawith 平台上运行的完整 Agent",
+    "nativeDesc": "在 数字员工平台 上运行的完整 Agent",
     "openclawTitle": "连接 OpenClaw",
     "openclawDesc": "连接你现有的 OpenClaw Agent",
     "basicTitle": "连接 OpenClaw Agent",
