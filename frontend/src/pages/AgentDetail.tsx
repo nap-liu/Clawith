@@ -2305,9 +2305,10 @@ function AgentDetailInner() {
                 {/* Tabs */}
                 <div className="tabs">
                     {TABS.filter(tab => {
-                        // 'use' access: hide settings and approvals tabs
-                        if ((agent as any)?.access_level === 'use') {
-                            if (tab === 'settings' || tab === 'approvals') return false;
+                        // Only admin or creator can see all tabs; others only get chat/status/relationships
+                        const isCreator = (agent as any)?.creator_id === currentUser?.id;
+                        if (!isAdmin && !isCreator) {
+                            return ['chat', 'status', 'relationships'].includes(tab);
                         }
                         // OpenClaw agents: only show status, chat, activityLog, settings
                         if ((agent as any)?.agent_type === 'openclaw') {
@@ -2501,11 +2502,13 @@ function AgentDetailInner() {
                             )}
 
                             {/* Quick Actions */}
+                            {(() => { const _isCreator = (agent as any)?.creator_id === currentUser?.id; return (
                             <div style={{ display: 'flex', gap: '10px', marginTop: '20px' }}>
                                 <button className="btn btn-secondary" onClick={() => setActiveTab('chat')}>{t('agent.actions.chat')}</button>
-                                {(agent as any)?.agent_type !== 'openclaw' && <button className="btn btn-secondary" onClick={() => setActiveTab('aware')}>{t('agent.tabs.aware')}</button>}
-                                <button className="btn btn-secondary" onClick={() => setActiveTab('settings')}>{t('agent.tabs.settings')}</button>
+                                {(isAdmin || _isCreator) && (agent as any)?.agent_type !== 'openclaw' && <button className="btn btn-secondary" onClick={() => setActiveTab('aware')}>{t('agent.tabs.aware')}</button>}
+                                {(isAdmin || _isCreator) && <button className="btn btn-secondary" onClick={() => setActiveTab('settings')}>{t('agent.tabs.settings')}</button>}
                             </div>
+                            ); })()}
                         </div>
                     );
                 })()}
