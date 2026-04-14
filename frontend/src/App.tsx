@@ -10,6 +10,7 @@ import CompanySetup from './pages/CompanySetup';
 import Layout from './pages/Layout';
 import Dashboard from './pages/Dashboard';
 import Plaza from './pages/Plaza';
+import Explore from './pages/Explore';
 import AgentDetail from './pages/AgentDetail';
 import AgentCreate from './pages/AgentCreate';
 import Chat from './pages/Chat';
@@ -147,7 +148,8 @@ export default function App() {
                 <Route path="/sso/entry" element={<SSOEntry />} />
                 <Route path="/setup-company" element={<CompanySetup />} />
                 <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
-                    <Route index element={<Navigate to="/plaza" replace />} />
+                    <Route index element={<Navigate to="/explore" replace />} />
+                    <Route path="explore" element={<Explore />} />
                     <Route path="dashboard" element={<Dashboard />} />
                     <Route path="plaza" element={<Plaza />} />
                     <Route path="agents/new" element={<AgentCreate />} />

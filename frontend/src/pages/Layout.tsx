@@ -24,7 +24,8 @@ import {
     IconPinnedOff,
     IconArrowUpRight,
     IconBuilding,
-    IconChevronUp
+    IconChevronUp,
+    IconApps,
 } from '@tabler/icons-react';
 import { useAppStore } from '../stores';
 
@@ -297,15 +298,11 @@ export default function Layout() {
 
 
                     <div className="sidebar-section">
-                        <NavLink to="/plaza" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                        <NavLink to="/explore" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-                                <IconBuildingMonument size={14} stroke={1.5} />
+                                <IconApps size={14} stroke={1.5} />
                             </span>
-                            <span className="sidebar-item-text">{t('nav.plaza', 'Plaza')}</span>
-                        </NavLink>
-                        <NavLink to="/dashboard" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
-                            <span className="sidebar-item-icon" style={{ display: 'flex' }}>{SidebarIcons.home}</span>
-                            <span className="sidebar-item-text">{t('nav.dashboard')}</span>
+                            <span className="sidebar-item-text">{t('nav.explore', '探索')}</span>
                         </NavLink>
                     </div>
                 </div>
