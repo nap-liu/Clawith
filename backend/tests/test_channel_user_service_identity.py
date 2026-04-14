@@ -123,3 +123,69 @@ async def test_find_org_member_deduplicates_candidate_ids(
     )
 
     assert captured["ids"] == ["staff-1"]  # 去重
+
+
+class _RecordingSession:
+    """Captures the SQL from db.execute without running it."""
+
+    def __init__(self):
+        self.last_stmt = None
+
+    async def execute(self, stmt):
+        self.last_stmt = stmt
+
+        class _R:
+            def scalar_one_or_none(self_inner):
+                return None
+
+        return _R()
+
+
+async def test_find_org_member_sql_dingtalk():
+    sess = _RecordingSession()
+    await channel_user_service._find_org_member(
+        sess, uuid.uuid4(), "dingtalk", ["staff-1", "UNION-1"]
+    )
+    sql = str(sess.last_stmt.compile(compile_kwargs={"literal_binds": True}))
+    # Isolate the WHERE clause so SELECT-column references don't pollute checks
+    where_clause = sql.split("WHERE", 1)[1]
+    # dingtalk: OR over unionid + external_id, NOT open_id IN (...)
+    assert "org_members.unionid IN" in where_clause
+    assert "org_members.external_id IN" in where_clause
+    assert "org_members.open_id IN" not in where_clause
+    assert "'staff-1'" in where_clause and "'UNION-1'" in where_clause
+
+
+async def test_find_org_member_sql_feishu():
+    sess = _RecordingSession()
+    await channel_user_service._find_org_member(
+        sess, uuid.uuid4(), "feishu", ["ou_x", "on_y"]
+    )
+    sql = str(sess.last_stmt.compile(compile_kwargs={"literal_binds": True}))
+    where_clause = sql.split("WHERE", 1)[1]
+    # feishu: OR over unionid + open_id + external_id
+    assert "org_members.unionid IN" in where_clause
+    assert "org_members.open_id IN" in where_clause
+    assert "org_members.external_id IN" in where_clause
+
+
+async def test_find_org_member_sql_wecom():
+    sess = _RecordingSession()
+    await channel_user_service._find_org_member(
+        sess, uuid.uuid4(), "wecom", ["userid-1"]
+    )
+    sql = str(sess.last_stmt.compile(compile_kwargs={"literal_binds": True}))
+    where_clause = sql.split("WHERE", 1)[1]
+    # wecom: external_id only, no unionid IN / open_id IN in WHERE
+    assert "org_members.external_id IN" in where_clause
+    assert "org_members.unionid IN" not in where_clause
+    assert "org_members.open_id IN" not in where_clause
+
+
+async def test_find_org_member_empty_ids_returns_none_without_execute():
+    sess = _RecordingSession()
+    result = await channel_user_service._find_org_member(
+        sess, uuid.uuid4(), "dingtalk", []
+    )
+    assert result is None
+    assert sess.last_stmt is None  # short-circuits, no execute

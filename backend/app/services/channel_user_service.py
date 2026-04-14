@@ -9,7 +9,7 @@ import uuid
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import hash_password
@@ -218,7 +218,6 @@ class ChannelUserService:
         if not candidate_ids:
             return None
         try:
-            from sqlalchemy import or_
             base = [OrgMember.provider_id == provider_id, OrgMember.status == "active"]
 
             if channel_type == "feishu":
