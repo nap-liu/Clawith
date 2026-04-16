@@ -9793,7 +9793,6 @@ async def _try_execute_cli_tool(
         from app.services.cli_tool_executor import CliExecutionAudit, execute_cli_tool
         from app.services.cli_tools.errors import CliToolError
         from app.services.cli_tools.storage import BinaryStorage
-        from app.services.sandbox.local.binary_runner import BinaryRunner
 
         # Keep the DB session open across execution so the audit_sink
         # can write its AuditLog row in the same unit of work. The
@@ -9834,7 +9833,9 @@ async def _try_execute_cli_tool(
                     audit_user_id = user.id
 
             storage = BinaryStorage(root=Path("/data/cli_binaries"))
-            runner = BinaryRunner(default_image="clawith-cli-sandbox:stable")
+            # No pre-picked runner — executor's factory honours the tool's
+            # `config.sandbox.backend` (docker vs bwrap). Hard-wiring docker
+            # here previously silently overrode that.
 
             async def _write_audit(audit: CliExecutionAudit) -> None:
                 # audit_user_id may be None for system-initiated agent
@@ -9861,7 +9862,6 @@ async def _try_execute_cli_tool(
                         params=arguments,
                         user_context=user_context,
                         storage=storage,
-                        runner=runner,
                         audit_sink=_write_audit,
                     )
                     await db.commit()

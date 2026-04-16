@@ -399,7 +399,19 @@ async def execute_cli_tool(
         # custom stacks) keep full control; the common path gets a
         # singleton chosen by tool config. The factory is cached so
         # this is a dict lookup after the first call.
-        effective_runner = runner if runner is not None else get_sandbox_backend(config.sandbox.backend)
+        if runner is not None:
+            effective_runner = runner
+        else:
+            try:
+                effective_runner = get_sandbox_backend(config.sandbox.backend)
+            except RuntimeError as exc:
+                # e.g. backend=bwrap on a host without bubblewrap installed.
+                # Don't silently fall back to docker — the operator picked
+                # bwrap intentionally.
+                raise CliToolError(
+                    CliToolErrorClass.SANDBOX_FAILED,
+                    f"sandbox backend {config.sandbox.backend!r} unavailable: {exc}",
+                ) from exc
 
         # Single stateless runner serves every tool — per-call overrides
         # travel with run() arguments, no per-tool instantiation.

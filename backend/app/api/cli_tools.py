@@ -555,10 +555,12 @@ async def test_run_cli_tool(
     from dataclasses import asdict
 
     from app.services.cli_tool_executor import CliExecutionAudit, execute_cli_tool
-    from app.services.sandbox.local.binary_runner import BinaryRunner
 
     storage = BinaryStorage(root=_STORAGE_ROOT)
-    runner = BinaryRunner(default_image="clawith-cli-sandbox:stable")
+    # Don't pre-pick a runner — executor's factory picks the backend
+    # based on `config.sandbox.backend` (docker vs bwrap). Hard-wiring a
+    # DockerSandboxBackend here would silently override the tool's
+    # chosen backend.
 
     synthetic_agent_id = uuid.uuid4()
 
@@ -608,7 +610,6 @@ async def test_run_cli_tool(
             params=body.params,
             user_context=user_context,
             storage=storage,
-            runner=runner,
             audit_sink=_write_audit,
         )
         await db.commit()  # persist the audit row alongside any other tx work
