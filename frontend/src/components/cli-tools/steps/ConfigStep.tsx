@@ -5,11 +5,22 @@ import type { CliTool, CliToolConfig } from '../types';
 import { EnvGrid } from '../EnvGrid';
 import { TestRunPanel } from '../TestRunPanel';
 
+const labelStyle: React.CSSProperties = {
+  display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px',
+};
+
+const hintStyle: React.CSSProperties = {
+  fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px',
+};
+
+const actionsRow: React.CSSProperties = {
+  display: 'flex', gap: '8px', marginTop: '4px',
+  justifyContent: 'flex-end',
+  borderTop: '1px solid var(--border-subtle)', paddingTop: '16px',
+};
+
 export function ConfigStep({
-  tool,
-  onUpdated,
-  onBack,
-  onDone,
+  tool, onUpdated, onBack, onDone,
 }: {
   tool: CliTool;
   onUpdated: (updated: CliTool) => void;
@@ -33,8 +44,6 @@ export function ConfigStep({
       if (!Array.isArray(parsedArgs)) throw new Error('args_template must be a JSON array');
       const parsedSchema = JSON.parse(paramsSchemaText);
 
-      // Env values equal to "***" mean "keep the stored value" — drop those
-      // so PATCH doesn't overwrite encrypted state with the mask literal.
       const cleanedEnv: Record<string, string> = {};
       for (const [k, v] of Object.entries(config.env_inject)) {
         if (v !== '***') cleanedEnv[k] = v;
@@ -46,7 +55,7 @@ export function ConfigStep({
       });
       onUpdated(updated);
       onDone();
-    } catch (e: unknown) {
+    } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
@@ -54,111 +63,101 @@ export function ConfigStep({
   };
 
   return (
-    <div className="wizard-body" style={{ padding: 12 }}>
-      <label style={{ display: 'block', marginBottom: 10 }}>
-        Args template (JSON array)
+    <>
+      <div>
+        <label style={labelStyle}>Args template (JSON array)</label>
         <textarea
           className="form-input"
           value={argsText}
           onChange={(e) => setArgsText(e.target.value)}
-          rows={3}
-          style={{ width: '100%', fontFamily: 'monospace' }}
+          rows={2}
+          style={{ fontFamily: 'monospace', resize: 'vertical' }}
         />
-        <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
-          Supported placeholders: {'{user.id}'} {'{user.phone}'} {'{user.email}'} {'{agent.id}'} {'{tenant.id}'} {'{params.xxx}'}
+        <div style={hintStyle}>
+          Placeholders: {'{user.id}'} {'{user.phone}'} {'{user.email}'} {'{agent.id}'} {'{tenant.id}'} {'{params.xxx}'}
         </div>
-      </label>
+      </div>
 
-      <div style={{ marginBottom: 10 }}>
-        <div style={{ fontWeight: 500, marginBottom: 4 }}>Env vars</div>
+      <div>
+        <label style={labelStyle}>Env vars</label>
         <EnvGrid env={config.env_inject} onChange={(env) => setConfig({ ...config, env_inject: env })} />
       </div>
 
-      <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
-        <label style={{ flex: 1 }}>
-          Timeout (s)
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px' }}>
+        <div>
+          <label style={labelStyle}>Timeout (s)</label>
           <input
-            className="form-input"
             type="number"
+            className="form-input"
             value={config.timeout_seconds}
             onChange={(e) => setConfig({ ...config, timeout_seconds: Number(e.target.value) || 30 })}
-            style={{ width: '100%' }}
           />
-        </label>
-        <label style={{ flex: 1 }}>
-          CPU
+        </div>
+        <div>
+          <label style={labelStyle}>CPU</label>
           <input
             className="form-input"
             value={config.sandbox.cpu_limit}
-            onChange={(e) =>
-              setConfig({ ...config, sandbox: { ...config.sandbox, cpu_limit: e.target.value } })
-            }
-            style={{ width: '100%' }}
+            onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, cpu_limit: e.target.value } })}
           />
-        </label>
-        <label style={{ flex: 1 }}>
-          Memory
+        </div>
+        <div>
+          <label style={labelStyle}>Memory</label>
           <input
             className="form-input"
             value={config.sandbox.memory_limit}
-            onChange={(e) =>
-              setConfig({ ...config, sandbox: { ...config.sandbox, memory_limit: e.target.value } })
-            }
-            style={{ width: '100%' }}
+            onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, memory_limit: e.target.value } })}
           />
+        </div>
+      </div>
+
+      <div>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={config.sandbox.network}
+            onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, network: e.target.checked } })}
+          />
+          Allow network
         </label>
+        <div style={hintStyle}>
+          {t('enterprise.cliTools.sandbox.networkHint', 'Enable only if the tool needs external APIs / downloads.')}
+        </div>
       </div>
 
-      <label style={{ display: 'block', marginBottom: 4 }}>
-        <input
-          type="checkbox"
-          checked={config.sandbox.network}
-          onChange={(e) =>
-            setConfig({ ...config, sandbox: { ...config.sandbox, network: e.target.checked } })
-          }
-        />{' '}
-        Allow network
-      </label>
-      <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 10 }}>
-        {t('enterprise.cliTools.sandbox.networkHint', 'Enable only if the tool needs to call external APIs or download resources.')}
-      </div>
-
-      <label style={{ display: 'block', marginBottom: 10 }}>
-        Sandbox image (leave blank to follow platform default)
+      <div>
+        <label style={labelStyle}>Sandbox image</label>
         <input
           className="form-input"
           value={config.sandbox.image ?? ''}
-          placeholder="clawith-cli-sandbox:stable (default)"
-          onChange={(e) =>
-            setConfig({
-              ...config,
-              sandbox: { ...config.sandbox, image: e.target.value.trim() || null },
-            })
-          }
-          style={{ width: '100%' }}
+          placeholder="(blank = follow platform default stable)"
+          onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, image: e.target.value.trim() || null } })}
         />
-      </label>
+      </div>
 
-      <label style={{ display: 'block', marginBottom: 10 }}>
-        Parameters schema (JSON Schema)
+      <div>
+        <label style={labelStyle}>Parameters schema (JSON Schema)</label>
         <textarea
           className="form-input"
           value={paramsSchemaText}
           onChange={(e) => setParamsSchemaText(e.target.value)}
-          rows={8}
-          style={{ width: '100%', fontFamily: 'monospace' }}
+          rows={6}
+          style={{ fontFamily: 'monospace', resize: 'vertical' }}
         />
-      </label>
+      </div>
 
       <TestRunPanel tool={tool} />
 
-      {error && <div style={{ color: '#ff3b30', marginTop: 8 }}>{error}</div>}
-      <div className="wizard-actions" style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
-        <button onClick={onBack}>Back</button>
+      {error && (
+        <div style={{ color: 'var(--danger, #ff3b30)', fontSize: '12px' }}>{error}</div>
+      )}
+
+      <div style={actionsRow}>
+        <button className="btn btn-secondary" onClick={onBack}>{t('common.back', 'Back')}</button>
         <button className="btn btn-primary" disabled={saving} onClick={save}>
-          {saving ? 'Saving…' : 'Save'}
+          {saving ? 'Saving…' : t('common.save', 'Save')}
         </button>
       </div>
-    </div>
+    </>
   );
 }

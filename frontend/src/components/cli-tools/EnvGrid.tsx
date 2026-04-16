@@ -17,57 +17,51 @@ export function EnvGrid({
     onChange(next);
   };
 
-  return (
-    <div className="env-grid" style={{ marginTop: 8 }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-        <thead>
-          <tr>
-            <th style={{ textAlign: 'left', padding: '4px 6px' }}>Name</th>
-            <th style={{ textAlign: 'left', padding: '4px 6px' }}>Value</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {Object.entries(env).map(([key, value]) => (
-            <tr key={key}>
-              <td style={{ padding: '4px 6px' }}><code>{key}</code></td>
-              <td style={{ padding: '4px 6px' }}>
-                <input
-                  className="form-input"
-                  value={value}
-                  onChange={(e) => setPair(key, e.target.value)}
-                  style={{ width: '100%' }}
-                />
-                {value === '***' && (
-                  <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
-                    (stored — type to replace)
-                  </div>
-                )}
-              </td>
-              <td style={{ padding: '4px 6px' }}>
-                <button onClick={() => remove(key)}>Remove</button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+  const entries = Object.entries(env);
 
-      <div className="env-add" style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+      {entries.length === 0 && (
+        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>No env vars.</div>
+      )}
+      {entries.map(([key, value]) => (
+        <div key={key} style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+          <code style={{ flex: '0 0 140px', fontSize: '12px', color: 'var(--text-secondary)' }}>{key}</code>
+          <input
+            className="form-input"
+            value={value}
+            onChange={(e) => setPair(key, e.target.value)}
+            style={{ flex: 1 }}
+            placeholder={value === '***' ? 'stored — type to replace' : ''}
+          />
+          <button
+            onClick={() => remove(key)}
+            style={{
+              background: 'none', border: 'none', cursor: 'pointer',
+              color: 'var(--text-tertiary)', fontSize: '14px', padding: '4px 8px',
+            }}
+            title="Remove"
+          >✕</button>
+        </div>
+      ))}
+      <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginTop: '4px' }}>
         <input
           className="form-input"
           placeholder="KEY"
           value={newKey}
           onChange={(e) => setNewKey(e.target.value.toUpperCase())}
-          style={{ flex: 1 }}
+          style={{ flex: '0 0 140px' }}
         />
         <input
           className="form-input"
           placeholder="value"
           value={newValue}
           onChange={(e) => setNewValue(e.target.value)}
-          style={{ flex: 2 }}
+          style={{ flex: 1 }}
         />
         <button
+          className="btn btn-secondary"
+          style={{ padding: '4px 10px', fontSize: '12px' }}
           disabled={!newKey || newKey in env}
           onClick={() => {
             setPair(newKey, newValue);

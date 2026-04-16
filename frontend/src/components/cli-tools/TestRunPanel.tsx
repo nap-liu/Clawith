@@ -2,6 +2,10 @@ import { useState } from 'react';
 import { cliToolsApi } from './api';
 import type { CliTool, TestRunResponse } from './types';
 
+const labelStyle: React.CSSProperties = {
+  display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px',
+};
+
 export function TestRunPanel({ tool }: { tool: CliTool }) {
   const [paramsText, setParamsText] = useState('{}');
   const [mockEnvText, setMockEnvText] = useState('{}');
@@ -21,7 +25,7 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
         mock_env: Object.keys(mock).length ? mock : undefined,
       });
       setResult(res);
-    } catch (e: unknown) {
+    } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setRunning(false);
@@ -29,88 +33,75 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
   };
 
   return (
-    <div
-      className="test-run-panel"
-      style={{
-        padding: 12,
-        border: '1px solid var(--border)',
-        borderRadius: 6,
-        marginTop: 12,
-      }}
-    >
-      <h4 style={{ margin: '0 0 8px' }}>🧪 Test Run</h4>
-      <label style={{ display: 'block', marginBottom: 8 }}>
-        Params (JSON)
-        <textarea
-          className="form-input"
-          value={paramsText}
-          onChange={(e) => setParamsText(e.target.value)}
-          rows={3}
-          style={{ width: '100%', fontFamily: 'monospace' }}
-        />
-      </label>
-      <label style={{ display: 'block', marginBottom: 8 }}>
-        Mock env (JSON; leave <code>{'{}'}</code> to use stored values)
-        <textarea
-          className="form-input"
-          value={mockEnvText}
-          onChange={(e) => setMockEnvText(e.target.value)}
-          rows={2}
-          style={{ width: '100%', fontFamily: 'monospace' }}
-        />
-      </label>
-      <button
-        className="btn btn-primary"
-        disabled={running || !tool.config.binary_sha256}
-        onClick={run}
-      >
-        {running ? 'Running…' : 'Run'}
-      </button>
+    <div className="card" style={{ padding: '12px' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+        <strong style={{ fontSize: '13px' }}>🧪 Test Run</strong>
+        <button
+          className="btn btn-primary"
+          style={{ padding: '4px 12px', fontSize: '12px' }}
+          disabled={running || !tool.config.binary_sha256}
+          onClick={run}
+        >
+          {running ? 'Running…' : 'Run'}
+        </button>
+      </div>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        <div>
+          <label style={labelStyle}>Params (JSON)</label>
+          <textarea
+            className="form-input"
+            value={paramsText}
+            onChange={(e) => setParamsText(e.target.value)}
+            rows={2}
+            style={{ fontFamily: 'monospace', resize: 'vertical' }}
+          />
+        </div>
+        <div>
+          <label style={labelStyle}>Mock env (JSON)</label>
+          <textarea
+            className="form-input"
+            value={mockEnvText}
+            onChange={(e) => setMockEnvText(e.target.value)}
+            rows={2}
+            style={{ fontFamily: 'monospace', resize: 'vertical' }}
+            placeholder="{} to use stored values"
+          />
+        </div>
+      </div>
+
       {!tool.config.binary_sha256 && (
-        <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>
+        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '6px' }}>
           Upload a binary first.
         </div>
       )}
 
       {err && (
-        <div style={{ color: '#ff3b30', marginTop: 8 }}>{err}</div>
+        <div style={{ color: 'var(--danger, #ff3b30)', fontSize: '12px', marginTop: '8px' }}>{err}</div>
       )}
+
       {result && (
-        <div style={{ marginTop: 10 }}>
-          <div>
-            exit_code: <code>{result.exit_code}</code> · duration: {result.duration_ms} ms
+        <div style={{ marginTop: '10px', fontSize: '12px' }}>
+          <div style={{ color: 'var(--text-secondary)' }}>
+            exit_code: <code>{result.exit_code}</code> · {result.duration_ms} ms
           </div>
           {result.error_class && (
-            <div style={{ color: '#ff3b30', marginTop: 4 }}>
+            <div style={{ color: 'var(--danger, #ff3b30)', marginTop: '4px' }}>
               [{result.error_class}] {result.error_message}
             </div>
           )}
           {result.stdout && (
-            <details open style={{ marginTop: 6 }}>
-              <summary>stdout</summary>
-              <pre
-                style={{
-                  background: 'var(--bg-secondary)',
-                  padding: 8,
-                  borderRadius: 4,
-                  overflow: 'auto',
-                }}
-              >
+            <details open style={{ marginTop: '6px' }}>
+              <summary style={{ cursor: 'pointer' }}>stdout</summary>
+              <pre style={{ background: 'var(--bg-secondary)', padding: '8px', borderRadius: '4px', overflow: 'auto', margin: '4px 0 0', fontSize: '11px' }}>
                 {result.stdout}
               </pre>
             </details>
           )}
           {result.stderr && (
-            <details style={{ marginTop: 6 }}>
-              <summary>stderr</summary>
-              <pre
-                style={{
-                  background: 'var(--bg-secondary)',
-                  padding: 8,
-                  borderRadius: 4,
-                  overflow: 'auto',
-                }}
-              >
+            <details style={{ marginTop: '6px' }}>
+              <summary style={{ cursor: 'pointer' }}>stderr</summary>
+              <pre style={{ background: 'var(--bg-secondary)', padding: '8px', borderRadius: '4px', overflow: 'auto', margin: '4px 0 0', fontSize: '11px' }}>
                 {result.stderr}
               </pre>
             </details>
