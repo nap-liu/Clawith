@@ -193,15 +193,15 @@ async def test_executor_reports_not_found_when_binary_missing():
 
 
 @pytest.mark.asyncio
-async def test_executor_renders_args_and_env_placeholders():
-    """Args and env template values are resolved through the whitelist renderer."""
+async def test_executor_resolves_args_and_env_placeholders():
+    """`$user.phone` / `$params.n` style tokens are resolved wholesale."""
     tenant = uuid.uuid4()
     tool = _tool(
         tenant_id=tenant,
         config={
             "binary_sha256": "a" * 64,
-            "args_template": ["--user={user.id}", "--n={params.n}"],
-            "env_inject": {"PHONE": "{user.phone}"},
+            "args_template": ["$user.id", "--flag", "$params.action"],
+            "env_inject": {"PHONE": "$user.phone", "LITERAL": "some-static-value"},
         },
     )
     agent = _agent(tenant)
@@ -221,10 +221,10 @@ async def test_executor_renders_args_and_env_placeholders():
     runner.__class__ = _CapturingRunner
 
     await execute_cli_tool(
-        tool=tool, agent=agent, params={"n": "42"},
+        tool=tool, agent=agent, params={"action": "ping"},
         user_context={"id": "u1", "phone": "13800000000", "email": "u@example.com"},
         storage=_mock_storage(), runner=runner,
     )
 
-    assert captured["args"] == ["--user=u1", "--n=42"]
-    assert captured["env"] == {"PHONE": "13800000000"}
+    assert captured["args"] == ["u1", "--flag", "ping"]
+    assert captured["env"] == {"PHONE": "13800000000", "LITERAL": "some-static-value"}

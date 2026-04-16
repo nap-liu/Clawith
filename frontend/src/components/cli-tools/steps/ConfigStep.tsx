@@ -57,14 +57,9 @@ export function ConfigStep({
       if (!Array.isArray(parsedArgs)) throw new Error('args_template must be a JSON array');
       const parsedSchema = JSON.parse(paramsSchemaText);
 
-      const cleanedEnv: Record<string, string> = {};
-      for (const [k, v] of Object.entries(config.env_inject)) {
-        if (v !== '***') cleanedEnv[k] = v;
-      }
-
       const updated = await cliToolsApi.update(tool.id, {
         parameters_schema: parsedSchema,
-        config: { ...config, args_template: parsedArgs, env_inject: cleanedEnv },
+        config: { ...config, args_template: parsedArgs },
       });
       onUpdated(updated);
       onDone();
@@ -89,9 +84,9 @@ export function ConfigStep({
           style={{ fontFamily: 'monospace', resize: 'vertical' }}
         />
         <div style={hintStyle}>
-          {k('argsHint', 'Placeholders:')} <code>{'{user.id}'}</code> <code>{'{user.phone}'}</code>{' '}
-          <code>{'{user.email}'}</code> <code>{'{agent.id}'}</code>{' '}
-          <code>{'{tenant.id}'}</code> <code>{'{params.xxx}'}</code>
+          {k('argsHint', 'Placeholders:')} <code>$user.id</code> <code>$user.phone</code>{' '}
+          <code>$user.email</code> <code>$agent.id</code>{' '}
+          <code>$tenant.id</code> <code>$params.xxx</code>
         </div>
       </div>
 

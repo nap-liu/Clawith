@@ -12,13 +12,8 @@ from typing import Any, Mapping
 
 import jsonschema
 
-from app.services.cli_tools.crypto import decrypt_env
 from app.services.cli_tools.errors import CliToolError, CliToolErrorClass
-from app.services.cli_tools.placeholders import (
-    InvalidPlaceholderError,
-    PlaceholderContext,
-    render,
-)
+from app.services.cli_tools.placeholders import PlaceholderContext, resolve
 from app.services.cli_tools.schema import CliToolConfig
 from app.services.cli_tools.storage import BinaryStorage
 from app.services.sandbox.local.binary_runner import BinaryRunner, BinaryRunResult
@@ -74,12 +69,8 @@ async def execute_cli_tool(
         params={k: str(v) for k, v in params.items()},
     )
 
-    try:
-        rendered_args = [render(a, ctx) for a in config.args_template]
-        decrypted_env = decrypt_env(dict(config.env_inject))
-        rendered_env = {k: render(v, ctx) for k, v in decrypted_env.items()}
-    except InvalidPlaceholderError as exc:
-        raise CliToolError(CliToolErrorClass.VALIDATION_ERROR, str(exc)) from exc
+    rendered_args = [resolve(a, ctx) for a in config.args_template]
+    rendered_env = {k: resolve(v, ctx) for k, v in config.env_inject.items()}
 
     tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"
     binary_path = storage.resolve(tenant_key, str(tool.id), config.binary_sha256)

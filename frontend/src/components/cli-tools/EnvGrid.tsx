@@ -37,7 +37,6 @@ export function EnvGrid({
             value={value}
             onChange={(e) => setPair(key, e.target.value)}
             style={{ flex: 1 }}
-            placeholder={value === '***' ? k('envStored', 'stored — type to replace') : ''}
           />
           <button
             onClick={() => remove(key)}

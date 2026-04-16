@@ -29,7 +29,6 @@ from app.database import get_db
 from app.models.audit import AuditLog
 from app.models.tool import Tool
 from app.models.user import User
-from app.services.cli_tools.crypto import encrypt_env, mask_env
 from app.services.cli_tools.errors import CliToolError
 from app.services.cli_tools.schema import CliToolConfig
 from app.services.cli_tools.storage import (
@@ -123,7 +122,6 @@ class TestRunResponse(BaseModel):
 
 def _to_out(tool: Tool) -> CliToolOut:
     cfg = dict(tool.config or {})
-    cfg["env_inject"] = mask_env(cfg.get("env_inject", {}))
     return CliToolOut(
         id=tool.id,
         name=tool.name,
@@ -164,10 +162,6 @@ async def create_cli_tool(
     else:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "org_admin required")
 
-    cfg_encrypted = body.config.model_copy(
-        update={"env_inject": encrypt_env(body.config.env_inject)}
-    )
-
     tool = Tool(
         id=uuid.uuid4(),
         name=body.name,
@@ -176,7 +170,7 @@ async def create_cli_tool(
         type="cli",
         source="admin",
         parameters_schema=body.parameters_schema,
-        config=cfg_encrypted.model_dump(mode="json"),
+        config=body.config.model_dump(mode="json"),
         tenant_id=effective_tenant,
         enabled=True,
     )
@@ -229,10 +223,8 @@ async def update_cli_tool(
         diff["enabled"] = [tool.enabled, body.is_active]
         tool.enabled = body.is_active
     if body.config is not None:
-        existing = CliToolConfig.model_validate(tool.config or {}).model_dump(mode="json")
+        existing = dict(tool.config or {})
         incoming = body.config.model_dump(mode="json")
-        # Re-encrypt env on update (body arrives as plaintext).
-        incoming["env_inject"] = encrypt_env(body.config.env_inject)
         # Preserve binary metadata unless the incoming body explicitly overrides.
         for preserved in ("binary_sha256", "binary_size", "binary_original_name", "binary_uploaded_at"):
             if incoming.get(preserved) is None:
@@ -333,7 +325,7 @@ async def test_run_cli_tool(
     original_config = dict(tool.config or {})
     if body.mock_env:
         patched_env = dict(original_config.get("env_inject", {}))
-        patched_env.update(encrypt_env(body.mock_env))
+        patched_env.update(body.mock_env)
         tool.config = {**original_config, "env_inject": patched_env}
 
     try:
