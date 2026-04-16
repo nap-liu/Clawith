@@ -63,3 +63,22 @@ def test_sandbox_config_rejects_unknown_fields():
     """extra='forbid' catches accidental typos (add-only schema rule)."""
     with pytest.raises(ValidationError):
         SandboxConfig.model_validate({"cpu_limit": "1.0", "typo_field": "oops"})
+
+
+def test_cli_tool_config_tolerates_legacy_keys():
+    """Pre-M1 rows stored `binary` (hardcoded host path) and `timeout`
+    (superseded by `timeout_seconds`). Reading must never break — we drop
+    the legacy keys silently and let the next write clean them up.
+    """
+    legacy = {
+        "binary": "/usr/local/bin/svc",
+        "timeout": 30,
+        "binary_sha256": "a" * 64,
+        "env_inject": {"SVC_USER_PHONE": "$user.phone"},
+    }
+    cfg = CliToolConfig.model_validate(legacy)
+    assert cfg.binary_sha256 == "a" * 64
+    assert cfg.env_inject == {"SVC_USER_PHONE": "$user.phone"}
+    assert cfg.timeout_seconds == 30  # default, untouched by legacy `timeout`
+    assert "binary" not in cfg.model_dump()
+    assert "timeout" not in cfg.model_dump()

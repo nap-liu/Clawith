@@ -28,9 +28,15 @@ class SandboxConfig(BaseModel):
 
 
 class CliToolConfig(BaseModel):
-    """Shape of Tool.config when Tool.type == 'cli'."""
+    """Shape of Tool.config when Tool.type == 'cli'.
 
-    model_config = ConfigDict(extra="forbid")
+    Legacy pre-M1 rows carry extra keys like `binary` (hardcoded host path)
+    and `timeout` (superseded by `timeout_seconds`). We ignore them instead
+    of failing validation — reading them as CliToolConfig must never break
+    — and drop them on the next write via `model_dump(exclude_unset=False)`.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     binary_sha256: Optional[str] = None
     binary_size: Optional[int] = Field(default=None, ge=0)
