@@ -192,6 +192,21 @@ class BinaryRunner:
             error=inner.error,
         )
 
+    # Baseline env every sandbox binary sees. The rootfs is read-only and
+    # nobody's HOME in /etc/passwd is `/nonexistent`, so any runtime that
+    # touches HOME (Bun, Node npm, pip, …) crashes with EROFS. Pointing
+    # HOME and XDG_* into the /tmp tmpfs makes those write attempts land
+    # somewhere writable — per-invocation, ephemeral.
+    _DEFAULT_ENV: dict[str, str] = {
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "XDG_CACHE_HOME": "/tmp/.cache",
+        "XDG_CONFIG_HOME": "/tmp/.config",
+        "XDG_DATA_HOME": "/tmp/.local/share",
+        "XDG_STATE_HOME": "/tmp/.local/state",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    }
+
     def _run_blocking(
         self,
         host_path: str,
@@ -200,10 +215,13 @@ class BinaryRunner:
         timeout_seconds: int,
     ) -> BinaryRunResult:
         """Synchronous docker-SDK invocation; called in a thread."""
+        # Tool-provided env wins over the baseline — operators can still
+        # override HOME / PATH if their binary needs something unusual.
+        merged_env = {**self._DEFAULT_ENV, **env}
         container = self._client.containers.create(
             image=self.image,
             command=["/binary", *args],
-            environment=env,
+            environment=merged_env,
             network_disabled=not self.network,
             read_only=True,
             tmpfs={"/tmp": f"rw,size={self.tmpfs_size},mode=1777"},

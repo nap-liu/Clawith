@@ -13,7 +13,7 @@ from typing import Any, Mapping
 import jsonschema
 
 from app.services.cli_tools.errors import CliToolError, CliToolErrorClass
-from app.services.cli_tools.placeholders import PlaceholderContext, resolve
+from app.services.cli_tools.placeholders import PlaceholderContext, resolve, resolve_args
 from app.services.cli_tools.schema import CliToolConfig
 from app.services.cli_tools.storage import BinaryStorage
 from app.services.sandbox.local.binary_runner import BinaryRunner, BinaryRunResult
@@ -62,14 +62,17 @@ async def execute_cli_tool(
         except jsonschema.ValidationError as exc:
             raise CliToolError(CliToolErrorClass.VALIDATION_ERROR, exc.message) from exc
 
+    # Preserve the native type of each param: a list-typed `$params.X`
+    # token expands into multiple argv entries, which is how multi-segment
+    # CLIs like `svc report list` or `git commit -m ...` are driven.
     ctx = PlaceholderContext(
         user=dict(user_context),
         agent={"id": str(agent.id)},
         tenant={"id": str(agent.tenant_id) if agent.tenant_id else ""},
-        params={k: str(v) for k, v in params.items()},
+        params=dict(params),
     )
 
-    rendered_args = [resolve(a, ctx) for a in config.args_template]
+    rendered_args = resolve_args(list(config.args_template), ctx)
     rendered_env = {k: resolve(v, ctx) for k, v in config.env_inject.items()}
 
     tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"

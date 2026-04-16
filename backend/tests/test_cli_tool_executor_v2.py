@@ -228,3 +228,55 @@ async def test_executor_resolves_args_and_env_placeholders():
 
     assert captured["args"] == ["u1", "--flag", "ping"]
     assert captured["env"] == {"PHONE": "13800000000", "LITERAL": "some-static-value"}
+
+
+@pytest.mark.asyncio
+async def test_executor_expands_list_params_into_argv():
+    """List params must expand in place so agents can drive multi-segment CLIs.
+
+    Regression: with scalar-only substitution, an agent calling
+    `svc` with `command="report list"` produced a single argv
+    `"report list"` that svc (Commander.js) rejects as
+    `unknown command 'report list'`. The fix is to let `$params.command`
+    resolve to a list and expand in-template.
+    """
+    tenant = uuid.uuid4()
+    tool = _tool(
+        tenant_id=tenant,
+        config={
+            "binary_sha256": "a" * 64,
+            # A single placeholder that becomes multiple argv entries.
+            "args_template": ["$params.command"],
+        },
+        parameters_schema={
+            "type": "object",
+            "properties": {
+                "command": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["command"],
+        },
+    )
+    agent = _agent(tenant)
+
+    captured = {}
+
+    class _CapturingRunner:
+        def __init__(self, image, **kwargs):
+            self.image = image
+
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
+
+    runner = MagicMock()
+    runner.image = "default"
+    runner.__class__ = _CapturingRunner
+
+    await execute_cli_tool(
+        tool=tool, agent=agent,
+        params={"command": ["report", "list", "--env", "dev"]},
+        user_context={"id": "u1", "phone": "13800000000", "email": ""},
+        storage=_mock_storage(), runner=runner,
+    )
+
+    assert captured["args"] == ["report", "list", "--env", "dev"]
