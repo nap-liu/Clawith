@@ -29,11 +29,10 @@ ss-nodes.json
 _agent/
 _agents/
 
-# Internal docs (generated artefacts etc.)
-docs/*
-# ...except design specs, which are tracked
-!docs/superpowers/
-!docs/cli-tools/
+# Internal docs (generated artefacts etc.) — design specs used to be
+# whitelisted; keep them out of the repo per the team convention.
+docs/
+.agents/rules/deploy.md
 
 # Local worktrees
 .worktrees/

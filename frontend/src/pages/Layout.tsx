@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
+import { Outlet, NavLink, useNavigate, useMatch } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Building2 } from 'lucide-react';
@@ -239,6 +239,9 @@ export default function Layout() {
     const { user, logout, setAuth, token } = useAuthStore();
     const queryClient = useQueryClient();
     const isChinese = i18n.language?.startsWith('zh');
+    // Detect chat page: needs fixed-height main-content for inner scroll to work
+    const isChatPage = !!useMatch('/agents/:id/chat');
+
     const [showAccountSettings, setShowAccountSettings] = useState(false);
     const [showAccountMenu, setShowAccountMenu] = useState(false);
     const [showLanguageSubmenu, setShowLanguageSubmenu] = useState(false);
@@ -540,7 +543,7 @@ export default function Layout() {
                         <button className="btn btn-ghost sidebar-collapse-btn" onClick={toggleSidebar} style={{
                             padding: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center',
                             marginLeft: 'auto', color: 'var(--text-tertiary)',
-                        }} title={isSidebarCollapsed ? "Expand Sidebar" : "Collapse Sidebar"}>
+                        }} title={isSidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}>
                             {isSidebarCollapsed ? SidebarIcons.expand : SidebarIcons.collapse}
                         </button>
                     </div>
@@ -695,7 +698,7 @@ export default function Layout() {
                         }}>
                             <button className="btn btn-ghost" onClick={toggleTheme} style={{
                                 padding: '4px 8px', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            }} title={theme === 'dark' ? 'Light Mode' : 'Dark Mode'}>
+                            }} title={theme === 'dark' ? t('common.lightMode') : t('common.darkMode')}>
                                 {theme === 'dark' ? SidebarIcons.sun : SidebarIcons.moon}
                             </button>
                             <button className="btn btn-ghost" onClick={() => { setShowNotifications(v => !v); if (!showNotifications) refetchNotifications(); }} style={{
@@ -1027,7 +1030,7 @@ export default function Layout() {
                 </div>
             )}
 
-            <main className="main-content">
+            <main className={`main-content${isChatPage ? ' chat-page' : ''}`}>
                 <Outlet />
             </main>
 
