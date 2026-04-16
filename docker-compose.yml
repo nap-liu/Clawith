@@ -54,6 +54,7 @@ services:
     volumes:
       - ./backend:/app
       - ./backend/agent_data:/data/agents
+      - cli_binaries:/data/cli_binaries
       - /var/run/docker.sock:/var/run/docker.sock
       - ./ss-nodes.json:/data/ss-nodes.json:ro
     depends_on:
@@ -82,6 +83,7 @@ services:
 volumes:
   pgdata:
   redisdata:
+  cli_binaries:
 
 
 networks:
