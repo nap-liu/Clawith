@@ -74,7 +74,7 @@ async def test_binary_runner_happy_path(tmp_path):
 
     with patch("app.services.sandbox.local.binary_runner.docker.from_env",
                return_value=_fake_docker_client(container)):
-        runner = BinaryRunner(image="clawith-cli-sandbox:local-test")
+        runner = BinaryRunner(default_image="clawith-cli-sandbox:local-test")
         result = await runner.run(
             binary_host_path=str(script),
             args=["hello", "world"],
@@ -100,15 +100,18 @@ async def test_binary_runner_passes_sandbox_flags_to_docker(tmp_path):
     client = _fake_docker_client(container)
 
     with patch("app.services.sandbox.local.binary_runner.docker.from_env", return_value=client):
-        runner = BinaryRunner(
-            image="clawith-cli-sandbox:local-test",
-            cpu_limit="0.5", memory_limit="256m", pids_limit=50, network=False,
-        )
+        runner = BinaryRunner(default_image="clawith-cli-sandbox:local-test")
+        # Per-call overrides now flow through run() — the runner itself
+        # keeps no sandbox config.
         await runner.run(
             binary_host_path=str(script),
             args=["--flag"],
             env={"K": "v"},
             timeout_seconds=10,
+            cpu_limit="0.5",
+            memory_limit="256m",
+            pids_limit=50,
+            network=False,
         )
 
     create_kwargs = client.containers.create.call_args.kwargs
@@ -140,8 +143,9 @@ async def test_binary_runner_network_enabled_sets_network_disabled_false(tmp_pat
     client = _fake_docker_client(container)
 
     with patch("app.services.sandbox.local.binary_runner.docker.from_env", return_value=client):
-        runner = BinaryRunner(image="img", network=True)
-        await runner.run(binary_host_path=str(script), args=[], env={}, timeout_seconds=5)
+        runner = BinaryRunner(default_image="img")
+        await runner.run(binary_host_path=str(script), args=[], env={},
+                         timeout_seconds=5, network=True)
 
     assert client.containers.create.call_args.kwargs["network_disabled"] is False
 
@@ -154,7 +158,7 @@ async def test_binary_runner_timeout(tmp_path):
 
     with patch("app.services.sandbox.local.binary_runner.docker.from_env",
                return_value=_fake_docker_client(container)):
-        runner = BinaryRunner(image="img")
+        runner = BinaryRunner(default_image="img")
         result = await runner.run(
             binary_host_path=str(script),
             args=[],
@@ -172,7 +176,7 @@ async def test_binary_runner_timeout(tmp_path):
 async def test_binary_runner_missing_binary_surfaces_sandbox_failure(tmp_path):
     """Non-existent host path → sandbox_failed=True, no docker call at all."""
     with patch("app.services.sandbox.local.binary_runner.docker.from_env", return_value=MagicMock()):
-        runner = BinaryRunner(image="img")
+        runner = BinaryRunner(default_image="img")
         result = await runner.run(
             binary_host_path=str(tmp_path / "does-not-exist"),
             args=[],
@@ -195,7 +199,7 @@ async def test_binary_runner_missing_image_surfaces_sandbox_failure(tmp_path):
     client.containers.create = MagicMock(side_effect=ImageNotFound("no such image"))
 
     with patch("app.services.sandbox.local.binary_runner.docker.from_env", return_value=client):
-        runner = BinaryRunner(image="missing:tag")
+        runner = BinaryRunner(default_image="missing:tag")
         result = await runner.run(
             binary_host_path=str(script),
             args=[],

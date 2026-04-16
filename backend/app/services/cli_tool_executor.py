@@ -104,20 +104,18 @@ async def execute_cli_tool(
             user_id=user_id,
         ))
 
-    # Build a per-execute runner with the tool's own sandbox overrides.
-    configured_runner = runner.__class__(
-        image=config.sandbox.image or runner.image,
-        cpu_limit=config.sandbox.cpu_limit,
-        memory_limit=config.sandbox.memory_limit,
-        network=config.sandbox.network,
-    )
-
-    result: BinaryRunResult = await configured_runner.run(
+    # Single stateless runner serves every tool — per-call overrides
+    # travel with run() arguments, no per-tool instantiation.
+    result: BinaryRunResult = await runner.run(
         binary_host_path=str(binary_path),
         args=rendered_args,
         env=rendered_env,
         timeout_seconds=config.timeout_seconds,
         home_host_path=home_host_path,
+        image=config.sandbox.image,
+        cpu_limit=config.sandbox.cpu_limit,
+        memory_limit=config.sandbox.memory_limit,
+        network=config.sandbox.network,
     )
 
     logger.info(

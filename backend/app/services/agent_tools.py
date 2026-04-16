@@ -8569,7 +8569,7 @@ async def _try_execute_cli_tool(
                     }
 
         storage = BinaryStorage(root=Path("/data/cli_binaries"))
-        runner = BinaryRunner(image="clawith-cli-sandbox:stable")
+        runner = BinaryRunner(default_image="clawith-cli-sandbox:stable")
 
         try:
             exec_result = await execute_cli_tool(

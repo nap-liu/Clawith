@@ -38,21 +38,16 @@ def _mock_storage(exists: bool = True) -> MagicMock:
 
 
 def _mock_runner(result: BinaryRunResult | None = None) -> MagicMock:
+    """Stub runner that records `run()` kwargs and returns a fixed result.
+
+    Matches the stateless BinaryRunner contract: no per-tool construction,
+    per-call params flow through `run()`.
+    """
     runner = MagicMock()
-    runner.image = "default-image"
+    runner.default_image = "default-image"
     runner.run = AsyncMock(return_value=result or BinaryRunResult(
         exit_code=0, stdout="ok", stderr="", duration_ms=12,
     ))
-    # make runner.__class__(...) callable with the same signature
-    class _RunnerClass:
-        def __init__(self, image, **kwargs):
-            self.image = image
-            self.kwargs = kwargs
-
-        async def run(self, **kwargs):
-            return result or BinaryRunResult(exit_code=0, stdout="ok", stderr="", duration_ms=12)
-
-    runner.__class__ = _RunnerClass
     return runner
 
 
@@ -208,17 +203,13 @@ async def test_executor_resolves_args_and_env_placeholders():
 
     captured = {}
 
-    class _CapturingRunner:
-        def __init__(self, image, **kwargs):
-            self.image = image
-
-        async def run(self, **kwargs):
-            captured.update(kwargs)
-            return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
+    async def _capture(**kwargs):
+        captured.update(kwargs)
+        return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
 
     runner = MagicMock()
-    runner.image = "default"
-    runner.__class__ = _CapturingRunner
+    runner.default_image = "default"
+    runner.run = _capture
 
     await execute_cli_tool(
         tool=tool, agent=agent, params={"action": "ping"},
@@ -248,17 +239,13 @@ async def test_executor_mounts_persistent_home_when_configured(tmp_path):
 
     captured = {}
 
-    class _CapturingRunner:
-        def __init__(self, image, **kwargs):
-            self.image = image
-
-        async def run(self, **kwargs):
-            captured.update(kwargs)
-            return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
+    async def _capture(**kwargs):
+        captured.update(kwargs)
+        return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
 
     runner = MagicMock()
-    runner.image = "default"
-    runner.__class__ = _CapturingRunner
+    runner.default_image = "default"
+    runner.run = _capture
 
     await execute_cli_tool(
         tool=tool, agent=agent, params={},
@@ -310,17 +297,13 @@ async def test_executor_no_home_mount_when_persistent_home_false():
 
     captured = {}
 
-    class _CapturingRunner:
-        def __init__(self, image, **kwargs):
-            self.image = image
-
-        async def run(self, **kwargs):
-            captured.update(kwargs)
-            return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
+    async def _capture(**kwargs):
+        captured.update(kwargs)
+        return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
 
     runner = MagicMock()
-    runner.image = "default"
-    runner.__class__ = _CapturingRunner
+    runner.default_image = "default"
+    runner.run = _capture
 
     await execute_cli_tool(
         tool=tool, agent=agent, params={},
@@ -361,17 +344,13 @@ async def test_executor_expands_list_params_into_argv():
 
     captured = {}
 
-    class _CapturingRunner:
-        def __init__(self, image, **kwargs):
-            self.image = image
-
-        async def run(self, **kwargs):
-            captured.update(kwargs)
-            return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
+    async def _capture(**kwargs):
+        captured.update(kwargs)
+        return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
 
     runner = MagicMock()
-    runner.image = "default"
-    runner.__class__ = _CapturingRunner
+    runner.default_image = "default"
+    runner.run = _capture
 
     await execute_cli_tool(
         tool=tool, agent=agent,

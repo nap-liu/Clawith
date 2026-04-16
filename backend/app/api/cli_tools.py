@@ -309,7 +309,7 @@ async def test_run_cli_tool(
     from app.services.sandbox.local.binary_runner import BinaryRunner
 
     storage = BinaryStorage(root=_STORAGE_ROOT)
-    runner = BinaryRunner(image="clawith-cli-sandbox:stable")
+    runner = BinaryRunner(default_image="clawith-cli-sandbox:stable")
 
     class _SyntheticAgent:
         id = uuid.uuid4()
