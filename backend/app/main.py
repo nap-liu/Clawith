@@ -1,5 +1,6 @@
 """Clawith Backend — FastAPI Application Entry Point."""
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -321,7 +322,17 @@ app.include_router(activity_router, prefix=settings.API_PREFIX)
 app.include_router(messages_router, prefix=settings.API_PREFIX)
 app.include_router(tenants_router, prefix=settings.API_PREFIX)
 app.include_router(schedules_router, prefix=settings.API_PREFIX)
-app.include_router(cli_tools_router, prefix=settings.API_PREFIX)  # must precede tools_router for path specificity
+# CLI tools kill switch: set CLAWITH_CLI_TOOLS_ENABLED=false in the env
+# to skip router registration entirely. Requests to /api/tools/cli/*
+# then fall through to a 404. Intended for emergency L2 rollback — a
+# backend restart (≈30s) is faster than any nginx / CDN rule push.
+if os.getenv("CLAWITH_CLI_TOOLS_ENABLED", "true").lower() != "false":
+    app.include_router(cli_tools_router, prefix=settings.API_PREFIX)  # must precede tools_router for path specificity
+else:
+    import logging
+    logging.getLogger(__name__).warning(
+        "CLAWITH_CLI_TOOLS_ENABLED=false — cli-tools router disabled"
+    )
 app.include_router(tools_router, prefix=settings.API_PREFIX)
 app.include_router(files_upload_router, prefix=settings.API_PREFIX)
 app.include_router(enterprise_kb_router, prefix=settings.API_PREFIX)
