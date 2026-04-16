@@ -17,6 +17,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.cli_tool_binary import CliToolBinaryVersion
 from app.models.tool import Tool
 from app.services.cli_tools.storage import BinaryStorage
 
@@ -45,6 +46,16 @@ async def gc_cli_binaries(
                 sha = binary_sub.get("sha256")
         if isinstance(sha, str) and len(sha) == 64:
             referenced.add(sha)
+
+    # Every version row in the retention window counts as referenced —
+    # orphan sweep must not delete a rollback target just because it's
+    # not the active version.
+    version_result = await db.execute(
+        select(CliToolBinaryVersion.sha256)
+    )
+    for sha_row in version_result.scalars().all():
+        if isinstance(sha_row, str) and len(sha_row) == 64:
+            referenced.add(sha_row)
 
     cutoff = time.time() - age_threshold_days * 86400
     to_delete: list[Path] = []

@@ -155,6 +155,33 @@ class BinaryStorage:
                 pass
         return count
 
+    def delete_version(self, tenant_key: str, tool_id: str, sha: str) -> int:
+        """Hard-delete a single ``<tenant>/<tool>/<sha>.bin``. Returns bytes freed.
+
+        Used by the version-history GC when a binary falls out of the
+        retention window (``MAX_RETAINED_VERSIONS``). Safe to call on a
+        missing file (returns 0) so callers don't need pre-existence
+        checks. Never raises for IO errors — a stuck file is logged and
+        picked up by the nightly orphan sweep.
+        """
+        target = self.root / tenant_key / tool_id / f"{sha}.bin"
+        try:
+            size = target.stat().st_size
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            size = 0
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            logger.warning(
+                "cli-tools.gc: failed to delete version binary %s: %s", target, exc
+            )
+            return 0
+        return size
+
     def delete_tool(self, tenant_key: str, tool_id: str) -> int:
         """Hard-delete the `<tenant>/<tool>/` subtree. Returns bytes freed.
 

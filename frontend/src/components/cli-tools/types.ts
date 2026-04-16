@@ -70,6 +70,18 @@ export interface CliTool {
   config: CliToolConfig;
 }
 
+export interface BinaryVersion {
+  id: string;
+  tool_id: string;
+  sha256: string;
+  size: number;
+  original_name: string;
+  uploaded_at: string;
+  uploaded_by_user_id: string | null;
+  is_current: boolean;
+  notes: string | null;
+}
+
 export interface TestRunRequest {
   params: Record<string, unknown>;
   mock_env?: Record<string, string>;

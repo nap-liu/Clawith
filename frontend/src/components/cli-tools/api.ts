@@ -1,6 +1,7 @@
 // API wrappers for the CLI-tools backend at /api/tools/cli.
 
 import type {
+  BinaryVersion,
   CliTool,
   RuntimeConfig,
   SandboxConfig,
@@ -71,6 +72,18 @@ export const cliToolsApi = {
     request<TestRunResponse>(`/api/tools/cli/${id}/test-run`, {
       method: 'POST',
       body: JSON.stringify(req),
+    }),
+
+  // Binary version history + rollback. The server owns retention (soft
+  // cap of 5 by default) so the client just lists whatever survived and
+  // lets the admin pick a rollback target.
+  listVersions: (toolId: string) =>
+    request<BinaryVersion[]>(`/api/tools/cli/${toolId}/versions`),
+
+  rollback: (toolId: string, versionId: string, notes?: string) =>
+    request<CliTool>(`/api/tools/cli/${toolId}/rollback`, {
+      method: 'POST',
+      body: JSON.stringify({ version_id: versionId, ...(notes ? { notes } : {}) }),
     }),
 
   // multipart — can't use the JSON request helper.

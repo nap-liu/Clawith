@@ -54,6 +54,7 @@ from app.services.cli_tools.storage import (
     MagicNumberError,
     SizeLimitExceededError,
 )
+from app.services.cli_tools import versioning as versioning_service
 
 logger = logging.getLogger(__name__)
 
@@ -418,21 +419,122 @@ async def upload_binary(
     except SizeLimitExceededError as exc:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, str(exc)) from exc
 
-    # The upload endpoint is the *only* place binary metadata gets
-    # written. Runtime/sandbox subtrees are left untouched.
-    existing = CliToolConfig.model_validate(tool.config or {})
-    tool.config = CliToolConfig(
-        binary=BinaryMetadata(
-            sha256=sha,
-            size=size,
-            original_name=file.filename or "uploaded.bin",
-            uploaded_at=datetime.now(timezone.utc),
-        ),
-        runtime=existing.runtime,
-        sandbox=existing.sandbox,
-    ).model_dump(mode="json")
+    # Delegate to the versioning service: it inserts a row, flips the
+    # previous current flag, rewrites tool.config.binary, and evicts
+    # anything past the retention cap (including the old ``.bin`` file).
+    await versioning_service.record_new_version(
+        db,
+        tool,
+        sha256=sha,
+        size=size,
+        original_name=file.filename or "uploaded.bin",
+        user_id=user.id,
+        binary_storage=storage,
+    )
 
     _audit(db, user, "cli_tool.upload_binary", tool, detail={"sha256": sha, "size": size})
+    await db.commit()
+    await db.refresh(tool)
+    return _to_out(tool)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Binary version history + rollback
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class BinaryVersionOut(BaseModel):
+    id: uuid.UUID
+    tool_id: uuid.UUID
+    sha256: str
+    size: int
+    original_name: str
+    uploaded_at: datetime
+    uploaded_by_user_id: Optional[uuid.UUID]
+    is_current: bool
+    notes: Optional[str] = None
+
+
+class RollbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version_id: uuid.UUID
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
+def _version_to_out(v) -> BinaryVersionOut:
+    return BinaryVersionOut(
+        id=v.id,
+        tool_id=v.tool_id,
+        sha256=v.sha256,
+        size=v.size,
+        original_name=v.original_name,
+        uploaded_at=v.uploaded_at,
+        uploaded_by_user_id=v.uploaded_by_user_id,
+        is_current=v.is_current,
+        notes=v.notes,
+    )
+
+
+@router.get("/{tool_id}/versions", response_model=list[BinaryVersionOut])
+async def list_binary_versions(
+    tool_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """List binary versions (newest first) for a CLI tool.
+
+    Tenant-scoped: org_admins only see their own tenant's tools;
+    platform_admins see everything. Members are blocked by ``_require_manage``.
+    """
+    tool = await db.get(Tool, tool_id)
+    if tool is None or tool.type != "cli":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "CLI tool not found")
+    _require_manage(user, tool)
+
+    rows = await versioning_service.list_versions(db, tool)
+    return [_version_to_out(v) for v in rows]
+
+
+@router.post("/{tool_id}/rollback", response_model=CliToolOut)
+async def rollback_binary_version(
+    tool_id: uuid.UUID,
+    body: RollbackRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Swap the current binary version to a previous upload.
+
+    Only flips flags; does not delete anything. The previously-current
+    version stays in history so the admin can roll forward again. The
+    same permission check as upload gates access (``_require_manage``).
+    """
+    tool = await db.get(Tool, tool_id)
+    if tool is None or tool.type != "cli":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "CLI tool not found")
+    _require_manage(user, tool)
+
+    # Capture the outgoing sha for the audit trail before we flip.
+    previous = CliToolConfig.model_validate(tool.config or {})
+    from_sha = previous.binary.sha256
+
+    try:
+        new_current = await versioning_service.rollback_to(db, tool, body.version_id)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    _audit(
+        db,
+        user,
+        "cli_tool.rollback",
+        tool,
+        detail={
+            "from_sha": from_sha,
+            "to_sha": new_current.sha256,
+            "version_id": str(new_current.id),
+            "notes": body.notes,
+        },
+    )
     await db.commit()
     await db.refresh(tool)
     return _to_out(tool)
