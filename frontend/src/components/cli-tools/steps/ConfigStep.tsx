@@ -208,7 +208,7 @@ export function ConfigStep({
                 .filter((h) => h.length > 0),
             })}
             rows={3}
-            placeholder="api.yeyecha.com&#10;registry.example.com"
+            placeholder="api.example.com&#10;registry.example.com"
             style={{ fontFamily: 'monospace', resize: 'vertical' }}
           />
           <div style={hintStyle}>

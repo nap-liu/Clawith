@@ -84,10 +84,10 @@ def test_empty_allowlist_means_all_allowed():
 def test_allowlist_accepts_valid_hostnames():
     cfg = SandboxConfig.model_validate({
         "network": True,
-        "egress_allowlist": ["api.yeyecha.com", "registry-1.example.com", "a.b"],
+        "egress_allowlist": ["api.example.com", "registry-1.example.com", "a.b"],
     })
     assert cfg.egress_allowlist == [
-        "api.yeyecha.com", "registry-1.example.com", "a.b",
+        "api.example.com", "registry-1.example.com", "a.b",
     ]
 
 
@@ -139,7 +139,7 @@ async def test_allowlist_passed_to_sandbox_env():
             "binary_sha256": "a" * 64,
             "sandbox": {
                 "network": True,
-                "egress_allowlist": ["api.yeyecha.com", "registry.example.com"],
+                "egress_allowlist": ["api.example.com", "registry.example.com"],
             },
         },
     )
@@ -156,7 +156,7 @@ async def test_allowlist_passed_to_sandbox_env():
     assert "CLAWITH_EGRESS_ALLOWLIST" in env
     # Comma-separated, preserves order, no whitespace around items — the
     # downstream CLI parses with a plain `.split(",")`.
-    assert env["CLAWITH_EGRESS_ALLOWLIST"] == "api.yeyecha.com,registry.example.com"
+    assert env["CLAWITH_EGRESS_ALLOWLIST"] == "api.example.com,registry.example.com"
 
 
 @pytest.mark.asyncio

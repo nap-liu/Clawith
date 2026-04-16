@@ -221,7 +221,7 @@ def test_accepts_post_m2_flat_shape_with_rate_limit_and_quota():
             "readonly_fs": True,
             "image": None,
             "backend": "bwrap",
-            "egress_allowlist": ["api.yeyecha.com"],
+            "egress_allowlist": ["api.example.com"],
         },
     }
     cfg = CliToolConfig.model_validate(flat)
@@ -230,7 +230,7 @@ def test_accepts_post_m2_flat_shape_with_rate_limit_and_quota():
     assert cfg.runtime.home_quota_mb == 2048
     assert cfg.runtime.persistent_home is True
     assert cfg.sandbox.backend == "bwrap"
-    assert cfg.sandbox.egress_allowlist == ["api.yeyecha.com"]
+    assert cfg.sandbox.egress_allowlist == ["api.example.com"]
 
     dumped = cfg.model_dump(mode="json")
     assert "rate_limit_per_minute" not in dumped

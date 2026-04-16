@@ -446,14 +446,14 @@ async def test_patch_sandbox_accepts_backend_and_egress_allowlist():
             "readonly_fs": True,
             "image": None,
             "backend": "bwrap",
-            "egress_allowlist": ["api.yeyecha.com", "registry.example.com"],
+            "egress_allowlist": ["api.example.com", "registry.example.com"],
         },
     })
     out = await update_cli_tool(tool_id=tool.id, body=body, db=db, user=user)
 
     assert out.config["sandbox"]["backend"] == "bwrap"
     assert out.config["sandbox"]["egress_allowlist"] == [
-        "api.yeyecha.com",
+        "api.example.com",
         "registry.example.com",
     ]
 
