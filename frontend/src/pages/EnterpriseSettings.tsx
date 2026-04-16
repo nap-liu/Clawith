@@ -862,7 +862,13 @@ function OrgTab({ tenant }: { tenant: any }) {
                             <div style={{ padding: '6px 10px', borderRadius: '4px', fontSize: '11px', background: syncResult.error || (syncResult.errors && syncResult.errors.length > 0) ? 'rgba(255,100,0,0.1)' : 'rgba(0,200,0,0.1)' }}>
                                 {syncResult.error
                                     ? t('enterprise.identity.syncError', { error: syncResult.error, defaultValue: 'Error: {{error}}' })
-                                    : t('enterprise.identity.syncComplete', { departments: syncResult.departments || 0, members: syncResult.members || 0, defaultValue: 'Sync complete: {{departments}} depts, {{members}} members synced.' })}
+                                    : t('enterprise.identity.syncComplete', {
+                                        departments: syncResult.departments || 0,
+                                        members: syncResult.members || 0,
+                                        users_created: syncResult.users_created || 0,
+                                        profiles_synced: syncResult.profiles_synced || 0,
+                                        defaultValue: 'Sync complete: {{departments}} depts · {{members}} members · {{users_created}} new users · {{profiles_synced}} synced',
+                                    })}
                                 {syncResult.errors && syncResult.errors.length > 0 && (
                                     <div style={{ marginTop: '4px', color: 'var(--color-warning, #f90)' }}>
                                         {`Warning: ${syncResult.errors[0]}`}

@@ -1552,7 +1552,7 @@
       "statusNotConfigured": "未配置",
       "syncDirectory": "同步通讯录",
       "syncSyncing": "同步中...",
-      "syncComplete": "同步完成：创建 {{users_created}} 个用户，同步 {{profiles_synced}} 个档案。",
+      "syncComplete": "同步完成：{{departments}} 部门 · {{members}} 成员 · 新建 {{users_created}} 用户 · 同步 {{profiles_synced}} 档案",
       "syncError": "错误：{{error}}",
       "deleteConfirmProvider": "确定要删除此配置吗？",
       "savedStatus": "已保存",

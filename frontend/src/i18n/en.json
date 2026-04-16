@@ -1386,7 +1386,7 @@
       "statusNotConfigured": "Not configured",
       "syncDirectory": "Sync Directory",
       "syncSyncing": "Syncing...",
-      "syncComplete": "Sync complete: {{users_created}} users created, {{profiles_synced}} profiles synced.",
+      "syncComplete": "Sync complete: {{departments}} depts · {{members}} members · {{users_created}} new users · {{profiles_synced}} profiles synced",
       "syncError": "Error: {{error}}",
       "deleteConfirmProvider": "Are you sure you want to delete this configuration?",
       "savedStatus": "Saved",
