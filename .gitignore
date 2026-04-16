@@ -33,6 +33,7 @@ _agents/
 docs/*
 # ...except design specs, which are tracked
 !docs/superpowers/
+!docs/cli-tools/
 
 # Local worktrees
 .worktrees/
