@@ -17,6 +17,12 @@ if [ "$(id -u)" = '0' ]; then
     if [ -d /data/cli_binaries ]; then
         chown -R clawith:clawith /data/cli_binaries
     fi
+    # CLI-tool sandbox needs to talk to the host docker daemon; the bind-
+    # mounted socket is 0660 root:root, so hand its group to clawith.
+    if [ -S /var/run/docker.sock ]; then
+        chgrp clawith /var/run/docker.sock 2>/dev/null || true
+        chmod 660 /var/run/docker.sock 2>/dev/null || true
+    fi
 
     echo "[entrypoint] Dropping privileges to 'clawith' and re-executing..."
     exec gosu clawith /bin/bash "$0" "$@"

@@ -8,19 +8,29 @@ and optionally no network.
 This is *not* a replacement for `DockerBackend.execute` (which runs
 source code in language-specific images). It is a focused runner for the
 narrow "execute this uploaded binary" use case.
+
+Docker-out-of-docker path translation
+-------------------------------------
+When the backend itself runs inside a container (compose / k8s), the path
+it sees for `/data/cli_binaries/...` is not the same path the host
+docker daemon sees. The daemon needs the path from *its* filesystem.
+`HostPathResolver` handles that: given the container path and the compose
+volume name backing `/data/cli_binaries`, it asks the daemon where the
+volume's `_data` lives and rewrites the prefix.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Mapping, Sequence
 
 import docker
-from docker.errors import APIError, ImageNotFound
+from docker.errors import APIError, ImageNotFound, NotFound
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +46,55 @@ class BinaryRunResult:
     timed_out: bool = False
     sandbox_failed: bool = False
     error: str = ""
+
+
+class HostPathResolver:
+    """Rewrite a container-visible path to its host-visible counterpart.
+
+    Configured with (container_root, volume_name). The first call inspects
+    the named docker volume to discover where its `_data` lives on the
+    host and caches that mountpoint for subsequent calls.
+
+    If the env isn't running docker-out-of-docker (no such volume, or the
+    path already lives on the host fs because compose used a bind mount),
+    `resolve()` returns the input unchanged.
+    """
+
+    def __init__(self, client, container_root: str, volume_name: str | None) -> None:
+        self._client = client
+        self._container_root = PurePosixPath(container_root)
+        self._volume_name = volume_name
+        self._host_root: PurePosixPath | None = None
+        self._probed = False
+
+    def _probe(self) -> None:
+        if self._probed:
+            return
+        self._probed = True
+        if not self._volume_name:
+            return
+        try:
+            vol = self._client.volumes.get(self._volume_name)
+        except NotFound:
+            logger.info("cli-tools volume %r not found; skipping path remap",
+                        self._volume_name)
+            return
+        mountpoint = vol.attrs.get("Mountpoint")
+        if mountpoint:
+            self._host_root = PurePosixPath(mountpoint)
+            logger.info("cli-tools host-path remap: %s -> %s",
+                        self._container_root, self._host_root)
+
+    def resolve(self, container_path: str) -> str:
+        self._probe()
+        if self._host_root is None:
+            return container_path
+        p = PurePosixPath(container_path)
+        try:
+            relative = p.relative_to(self._container_root)
+        except ValueError:
+            return container_path
+        return str(self._host_root / relative)
 
 
 class BinaryRunner:
@@ -58,6 +117,11 @@ class BinaryRunner:
         self.network = network
         self.tmpfs_size = tmpfs_size
         self._client = docker.from_env()
+        self._host_path_resolver = HostPathResolver(
+            client=self._client,
+            container_root=os.environ.get("CLI_BINARIES_ROOT", "/data/cli_binaries"),
+            volume_name=os.environ.get("CLI_BINARIES_VOLUME_NAME"),
+        )
 
     async def run(
         self,
@@ -75,22 +139,26 @@ class BinaryRunner:
             env: environment variables passed to the container.
             timeout_seconds: kill the container if it runs longer than this.
         """
-        host_path = Path(binary_host_path).resolve()
-        if not host_path.is_file():
+        container_path = Path(binary_host_path).resolve()
+        if not container_path.is_file():
             return BinaryRunResult(
                 exit_code=1,
                 stdout="",
                 stderr="",
                 duration_ms=0,
                 sandbox_failed=True,
-                error=f"binary not found on host: {host_path}",
+                error=f"binary not found on host: {container_path}",
             )
+
+        # The path the backend container sees is not the path the docker
+        # daemon sees when we're running docker-out-of-docker. Translate.
+        daemon_path = self._host_path_resolver.resolve(str(container_path))
 
         start = time.monotonic()
         try:
             inner = await asyncio.to_thread(
                 self._run_blocking,
-                str(host_path),
+                daemon_path,
                 list(args),
                 dict(env),
                 timeout_seconds,
