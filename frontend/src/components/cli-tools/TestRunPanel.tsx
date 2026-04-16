@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { cliToolsApi } from './api';
 import type { CliTool, TestRunResponse } from './types';
 
@@ -7,11 +8,14 @@ const labelStyle: React.CSSProperties = {
 };
 
 export function TestRunPanel({ tool }: { tool: CliTool }) {
+  const { t } = useTranslation();
   const [paramsText, setParamsText] = useState('{}');
   const [mockEnvText, setMockEnvText] = useState('{}');
   const [result, setResult] = useState<TestRunResponse | null>(null);
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  const k = (suffix: string, fb: string) => t(`enterprise.cliTools.testRun.${suffix}`, fb);
 
   const run = async () => {
     setErr(null);
@@ -35,20 +39,20 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
   return (
     <div className="card" style={{ padding: '12px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-        <strong style={{ fontSize: '13px' }}>🧪 Test Run</strong>
+        <strong style={{ fontSize: '13px' }}>🧪 {k('title', 'Test Run')}</strong>
         <button
           className="btn btn-primary"
           style={{ padding: '4px 12px', fontSize: '12px' }}
           disabled={running || !tool.config.binary_sha256}
           onClick={run}
         >
-          {running ? 'Running…' : 'Run'}
+          {running ? k('running', 'Running…') : k('run', 'Run')}
         </button>
       </div>
 
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
         <div>
-          <label style={labelStyle}>Params (JSON)</label>
+          <label style={labelStyle}>{k('paramsLabel', 'Params (JSON)')}</label>
           <textarea
             className="form-input"
             value={paramsText}
@@ -58,21 +62,21 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
           />
         </div>
         <div>
-          <label style={labelStyle}>Mock env (JSON)</label>
+          <label style={labelStyle}>{k('mockEnvLabel', 'Mock env (JSON)')}</label>
           <textarea
             className="form-input"
             value={mockEnvText}
             onChange={(e) => setMockEnvText(e.target.value)}
             rows={2}
             style={{ fontFamily: 'monospace', resize: 'vertical' }}
-            placeholder="{} to use stored values"
+            placeholder={k('mockEnvPlaceholder', '{} to use stored values')}
           />
         </div>
       </div>
 
       {!tool.config.binary_sha256 && (
         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '6px' }}>
-          Upload a binary first.
+          {k('needBinary', 'Upload a binary first.')}
         </div>
       )}
 
@@ -83,7 +87,7 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
       {result && (
         <div style={{ marginTop: '10px', fontSize: '12px' }}>
           <div style={{ color: 'var(--text-secondary)' }}>
-            exit_code: <code>{result.exit_code}</code> · {result.duration_ms} ms
+            {k('exitCode', 'exit_code')}: <code>{result.exit_code}</code> · {result.duration_ms} {k('duration', 'ms')}
           </div>
           {result.error_class && (
             <div style={{ color: 'var(--danger, #ff3b30)', marginTop: '4px' }}>
@@ -92,7 +96,7 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
           )}
           {result.stdout && (
             <details open style={{ marginTop: '6px' }}>
-              <summary style={{ cursor: 'pointer' }}>stdout</summary>
+              <summary style={{ cursor: 'pointer' }}>{k('stdout', 'stdout')}</summary>
               <pre style={{ background: 'var(--bg-secondary)', padding: '8px', borderRadius: '4px', overflow: 'auto', margin: '4px 0 0', fontSize: '11px' }}>
                 {result.stdout}
               </pre>
@@ -100,7 +104,7 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
           )}
           {result.stderr && (
             <details style={{ marginTop: '6px' }}>
-              <summary style={{ cursor: 'pointer' }}>stderr</summary>
+              <summary style={{ cursor: 'pointer' }}>{k('stderr', 'stderr')}</summary>
               <pre style={{ background: 'var(--bg-secondary)', padding: '8px', borderRadius: '4px', overflow: 'auto', margin: '4px 0 0', fontSize: '11px' }}>
                 {result.stderr}
               </pre>

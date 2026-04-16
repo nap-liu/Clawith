@@ -62,10 +62,12 @@ export function ConfigStep({
     }
   };
 
+  const k = (suffix: string, fb: string) => t(`enterprise.cliTools.wizard.${suffix}`, fb);
+
   return (
     <>
       <div>
-        <label style={labelStyle}>Args template (JSON array)</label>
+        <label style={labelStyle}>{k('fieldArgsTemplate', 'Args template (JSON array)')}</label>
         <textarea
           className="form-input"
           value={argsText}
@@ -74,18 +76,20 @@ export function ConfigStep({
           style={{ fontFamily: 'monospace', resize: 'vertical' }}
         />
         <div style={hintStyle}>
-          Placeholders: {'{user.id}'} {'{user.phone}'} {'{user.email}'} {'{agent.id}'} {'{tenant.id}'} {'{params.xxx}'}
+          {k('argsHint', 'Placeholders:')} <code>{'{user.id}'}</code> <code>{'{user.phone}'}</code>{' '}
+          <code>{'{user.email}'}</code> <code>{'{agent.id}'}</code>{' '}
+          <code>{'{tenant.id}'}</code> <code>{'{params.xxx}'}</code>
         </div>
       </div>
 
       <div>
-        <label style={labelStyle}>Env vars</label>
+        <label style={labelStyle}>{k('fieldEnvVars', 'Env vars')}</label>
         <EnvGrid env={config.env_inject} onChange={(env) => setConfig({ ...config, env_inject: env })} />
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px' }}>
         <div>
-          <label style={labelStyle}>Timeout (s)</label>
+          <label style={labelStyle}>{k('fieldTimeout', 'Timeout (s)')}</label>
           <input
             type="number"
             className="form-input"
@@ -94,7 +98,7 @@ export function ConfigStep({
           />
         </div>
         <div>
-          <label style={labelStyle}>CPU</label>
+          <label style={labelStyle}>{k('fieldCpu', 'CPU')}</label>
           <input
             className="form-input"
             value={config.sandbox.cpu_limit}
@@ -102,7 +106,7 @@ export function ConfigStep({
           />
         </div>
         <div>
-          <label style={labelStyle}>Memory</label>
+          <label style={labelStyle}>{k('fieldMemory', 'Memory')}</label>
           <input
             className="form-input"
             value={config.sandbox.memory_limit}
@@ -118,7 +122,7 @@ export function ConfigStep({
             checked={config.sandbox.network}
             onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, network: e.target.checked } })}
           />
-          Allow network
+          {k('fieldAllowNetwork', 'Allow network')}
         </label>
         <div style={hintStyle}>
           {t('enterprise.cliTools.sandbox.networkHint', 'Enable only if the tool needs external APIs / downloads.')}
@@ -126,17 +130,17 @@ export function ConfigStep({
       </div>
 
       <div>
-        <label style={labelStyle}>Sandbox image</label>
+        <label style={labelStyle}>{k('fieldSandboxImage', 'Sandbox image')}</label>
         <input
           className="form-input"
           value={config.sandbox.image ?? ''}
-          placeholder="(blank = follow platform default stable)"
+          placeholder={k('sandboxImagePlaceholder', '(blank = follow platform default stable)')}
           onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, image: e.target.value.trim() || null } })}
         />
       </div>
 
       <div>
-        <label style={labelStyle}>Parameters schema (JSON Schema)</label>
+        <label style={labelStyle}>{k('fieldParametersSchema', 'Parameters schema (JSON Schema)')}</label>
         <textarea
           className="form-input"
           value={paramsSchemaText}
@@ -155,7 +159,7 @@ export function ConfigStep({
       <div style={actionsRow}>
         <button className="btn btn-secondary" onClick={onBack}>{t('common.back', 'Back')}</button>
         <button className="btn btn-primary" disabled={saving} onClick={save}>
-          {saving ? 'Saving…' : t('common.save', 'Save')}
+          {saving ? t('common.saving', 'Saving…') : t('common.save', 'Save')}
         </button>
       </div>
     </>

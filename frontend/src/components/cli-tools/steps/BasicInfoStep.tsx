@@ -38,43 +38,49 @@ export function BasicInfoStep({
     }
   };
 
+  const k = (suffix: string, fb: string) => t(`enterprise.cliTools.wizard.${suffix}`, fb);
+
   return (
     <>
       <div>
-        <label style={labelStyle}>Name <span style={{ color: 'var(--danger, #ff3b30)' }}>*</span></label>
+        <label style={labelStyle}>
+          {k('fieldName', 'Name')} <span style={{ color: 'var(--danger, #ff3b30)' }}>*</span>
+        </label>
         <input
           className="form-input"
           value={name}
           onChange={(e) => setName(e.target.value)}
           disabled={!!tool?.id}
-          placeholder="unique_identifier_no_spaces"
+          placeholder={k('fieldNamePlaceholder', 'unique_identifier')}
         />
         {tool?.id && (
           <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-            Locked after creation.
+            {k('fieldNameLocked', 'Locked after creation.')}
           </div>
         )}
       </div>
 
       <div>
-        <label style={labelStyle}>Display name <span style={{ color: 'var(--danger, #ff3b30)' }}>*</span></label>
+        <label style={labelStyle}>
+          {k('fieldDisplayName', 'Display name')} <span style={{ color: 'var(--danger, #ff3b30)' }}>*</span>
+        </label>
         <input
           className="form-input"
           value={displayName}
           onChange={(e) => setDisplayName(e.target.value)}
-          placeholder="用户看到的名字"
+          placeholder={k('fieldDisplayNamePlaceholder', 'User-facing name')}
         />
       </div>
 
       <div>
-        <label style={labelStyle}>Description</label>
+        <label style={labelStyle}>{k('fieldDescription', 'Description')}</label>
         <textarea
           className="form-input"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           rows={3}
           style={{ resize: 'vertical' }}
-          placeholder="这个工具做什么,何时调用"
+          placeholder={k('fieldDescriptionPlaceholder', 'What this tool does and when to call it')}
         />
       </div>
 
@@ -89,7 +95,7 @@ export function BasicInfoStep({
           disabled={submitting || !name.trim() || !displayName.trim()}
           onClick={submit}
         >
-          {submitting ? 'Saving…' : t('common.next', 'Next')}
+          {submitting ? t('common.saving', 'Saving…') : t('common.next', 'Next')}
         </button>
       </div>
     </>

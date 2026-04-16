@@ -45,10 +45,12 @@ export function BinaryStep({
     }
   };
 
+  const k = (suffix: string, fb: string) => t(`enterprise.cliTools.wizard.${suffix}`, fb);
+
   return (
     <>
       <div>
-        <label style={labelStyle}>Binary</label>
+        <label style={labelStyle}>{k('fieldBinary', 'Binary')}</label>
         {sha ? (
           <div className="card" style={{ padding: '10px 12px', fontSize: '12px' }}>
             <div><strong>{tool.config.binary_original_name}</strong></div>
@@ -64,7 +66,7 @@ export function BinaryStep({
           </div>
         ) : (
           <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
-            No binary yet. Accepted: ELF / Mach-O / shebang script. Max 100 MB.
+            {k('binaryEmpty', 'No binary yet. Accepted: ELF / Mach-O / shebang script. Max 100 MB.')}
           </div>
         )}
       </div>
@@ -74,7 +76,11 @@ export function BinaryStep({
           className="btn btn-secondary"
           style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: uploading ? 'not-allowed' : 'pointer' }}
         >
-          {uploading ? '⏳ Uploading…' : sha ? '🔄 Replace' : '📤 Upload'}
+          {uploading
+            ? `⏳ ${k('btnUploading', 'Uploading…')}`
+            : sha
+              ? `🔄 ${k('btnReplace', 'Replace')}`
+              : `📤 ${k('btnUpload', 'Upload')}`}
           <input
             type="file"
             disabled={uploading}
