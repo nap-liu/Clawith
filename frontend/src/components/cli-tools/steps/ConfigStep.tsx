@@ -2,8 +2,21 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { cliToolsApi } from '../api';
 import type { CliTool, CliToolConfig } from '../types';
+import { defaultCliToolConfig } from '../types';
 import { EnvGrid } from '../EnvGrid';
 import { TestRunPanel } from '../TestRunPanel';
+
+function mergeWithDefaults(partial: Partial<CliToolConfig> | null | undefined): CliToolConfig {
+  const d = defaultCliToolConfig();
+  const c = partial ?? {};
+  return {
+    ...d,
+    ...c,
+    args_template: c.args_template ?? d.args_template,
+    env_inject: c.env_inject ?? d.env_inject,
+    sandbox: { ...d.sandbox, ...(c.sandbox ?? {}) },
+  };
+}
 
 const labelStyle: React.CSSProperties = {
   display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px',
@@ -28,10 +41,10 @@ export function ConfigStep({
   onDone: () => void;
 }) {
   const { t } = useTranslation();
-  const [config, setConfig] = useState<CliToolConfig>(tool.config);
-  const [argsText, setArgsText] = useState(JSON.stringify(tool.config.args_template));
+  const [config, setConfig] = useState<CliToolConfig>(() => mergeWithDefaults(tool.config));
+  const [argsText, setArgsText] = useState(() => JSON.stringify(mergeWithDefaults(tool.config).args_template));
   const [paramsSchemaText, setParamsSchemaText] = useState(
-    JSON.stringify(tool.parameters_schema, null, 2),
+    JSON.stringify(tool.parameters_schema || {}, null, 2),
   );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
