@@ -100,14 +100,36 @@ class AgentBayClient:
             self._browser_initialized = True
 
     async def browser_navigate(self, url: str, wait_for: str = "", screenshot: bool = False) -> dict:
-        """Navigate browser to URL using SDK."""
+        """Navigate browser to URL using SDK.
+
+        The AgentBay SDK default navigation timeout is ~60 s. We wrap the call
+        with a 40-second asyncio soft-timeout so callers receive an actionable
+        error quickly rather than hanging the whole agent loop. The underlying
+        SDK thread may continue briefly in the background but its result is
+        discarded — the browser will eventually settle on its own.
+        """
         if not self._session or self._image_type not in ("browser", "browser_latest"):
             await self.create_session("browser_latest")
 
         await self._ensure_browser_initialized()
 
-        # Navigate to URL
-        await asyncio.to_thread(self._session.browser.operator.navigate, url)
+        # Navigate to URL with a 40-second soft timeout.
+        # asyncio.wait_for cancels the coroutine wrapper; the blocking thread
+        # inside asyncio.to_thread keeps running until SDK returns, but we
+        # no longer block the agent loop waiting for it.
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._session.browser.operator.navigate, url),
+                timeout=40.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[AgentBay] navigate to {url!r} timed out after 40 s")
+            raise RuntimeError(
+                f"Navigation to '{url}' timed out (>40 s). "
+                "The browser may be busy or the page is unreachable. "
+                "Try calling agentbay_browser_screenshot to check the current "
+                "state, or retry the navigation."
+            )
 
         result = {"url": url, "success": True, "title": url}
 
@@ -615,14 +637,36 @@ async def get_agentbay_api_key_for_agent(agent_id: uuid.UUID, db=None) -> Option
             except Exception:
                 return config.app_secret
 
-        # 2) Fallback: check global Tool.config.api_key for any agentbay tool
+        # 2) Fallback: check global Tool.config.api_key for agentbay tools.
+        #
+        # Only agentbay_browser_navigate (the "primary" AgentBay tool) has a
+        # config_schema with an api_key field, so it is the only tool whose
+        # config is ever populated with a key via the Company Settings UI.
+        # We therefore query it first, then fall back to scanning all agentbay
+        # tools — this prevents a non-deterministic .limit(1) from returning a
+        # tool with an empty config (e.g. agentbay_computer_screenshot), which
+        # would silently return None even when a key IS configured.
         tool_result = await session.execute(
             select(Tool).where(
-                Tool.category == "agentbay",
+                Tool.name == "agentbay_browser_navigate",
                 Tool.enabled == True,
             ).limit(1)
         )
         tool = tool_result.scalar_one_or_none()
+
+        # Also scan all agentbay tools in case the key was stored differently
+        if not (tool and tool.config and tool.config.get("api_key")):
+            all_result = await session.execute(
+                select(Tool).where(
+                    Tool.category == "agentbay",
+                    Tool.enabled == True,
+                )
+            )
+            for candidate in all_result.scalars().all():
+                if candidate.config and candidate.config.get("api_key"):
+                    tool = candidate
+                    break
+
         if tool and tool.config and tool.config.get("api_key"):
             api_key = tool.config["api_key"]
             # Try to decrypt (global config is encrypted via _encrypt_sensitive_fields)
@@ -647,6 +691,9 @@ async def test_agentbay_channel(agent_id: uuid.UUID, current_user, db) -> dict:
     try:
         from agentbay import AgentBay, CreateSessionParams
         sdk = AgentBay(api_key=key)
+        # Using linux_latest instead of browser_latest. AgentBay tokens may be
+        # scoped/bound to specific instance types, and requesting browser_latest
+        # might trigger an 'InvalidParameter.Authorization' error for this key.
         result = await asyncio.to_thread(sdk.create, CreateSessionParams(image_id="linux_latest"))
         if result.success:
             if result.session:

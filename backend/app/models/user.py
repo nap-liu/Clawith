@@ -100,6 +100,7 @@ class User(Base):
     quota_agent_ttl_hours: Mapped[int] = mapped_column(Integer, default=48)
 
     # Relationships
+    # lazy="selectin" required: association_proxy fields trigger MissingGreenlet without eager loading
     identity: Mapped["Identity"] = relationship(back_populates="tenant_users", lazy="selectin")
 
     # Association proxies for backward compatibility

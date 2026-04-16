@@ -23,9 +23,9 @@ class UserQuotaUpdate(BaseModel):
 
 class UserOut(BaseModel):
     id: uuid.UUID
-    username: str
-    email: str
-    display_name: str
+    username: str | None = None
+    email: str | None = None
+    display_name: str | None = None
     primary_mobile: str | None = None
     role: str
     is_active: bool
@@ -39,7 +39,7 @@ class UserOut(BaseModel):
     agents_count: int = 0
     # Source info
     created_at: str | None = None
-    source: str = 'registered'  # 'registered' | 'feishu'
+    source: str = 'registered'  # 'registered' | 'feishu' | 'dingtalk' | 'wecom' | etc.
 
     model_config = {"from_attributes": True}
 
@@ -78,9 +78,9 @@ async def list_users(
 
         user_dict = {
             "id": u.id,
-            "username": u.username,
-            "email": u.email,
-            "display_name": u.display_name,
+            "username": u.username or u.email or f"{u.registration_source or 'user'}_{str(u.id)[:8]}",
+            "email": u.email or "",
+            "display_name": u.display_name or u.username or "",
             "primary_mobile": u.primary_mobile,
             "role": u.role,
             "is_active": u.is_active,

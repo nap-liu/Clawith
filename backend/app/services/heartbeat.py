@@ -129,6 +129,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         from app.database import async_session
         from app.models.agent import Agent
         from app.models.llm import LLMModel
+        from app.services.llm import get_model_api_key
 
         # ── Phase 1: Read all context from DB (short transaction) ──
         agent_name = ""
@@ -254,7 +255,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         full_instruction = heartbeat_instruction + recent_context + inbox_context
 
         # Call LLM with tools using unified client
-        from app.services.llm_utils import create_llm_client, get_max_tokens, LLMMessage, LLMError, get_model_api_key
+        from app.services.llm import create_llm_client, get_max_tokens, LLMMessage, LLMError, get_model_api_key
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
 
         try:
@@ -408,7 +409,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         logger.info(f"💓 Heartbeat for {agent_name}: {'OK' if is_ok else reply[:60]}")
 
     except Exception as e:
-        logger.error(f"Heartbeat error for agent {agent_id}: {e}", exc_info=True)
+        logger.exception(f"Heartbeat error for agent {agent_id}: {e}")
 
 
 async def _heartbeat_tick():
@@ -472,7 +473,7 @@ async def _heartbeat_tick():
                 await write_audit_log("heartbeat_tick", {"eligible_agents": len(agents), "triggered": triggered})
 
     except Exception as e:
-        logger.error(f"Heartbeat tick error: {e}", exc_info=True)
+        logger.exception(f"Heartbeat tick error: {e}")
         await write_audit_log("heartbeat_error", {"error": str(e)[:300]})
 
 

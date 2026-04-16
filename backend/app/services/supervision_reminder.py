@@ -105,7 +105,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
     """
     from app.models.llm import LLMModel
     from app.services.agent_context import build_agent_context
-    from app.services.llm_utils import (
+    from app.services.llm import (
         get_provider_base_url,
         create_llm_client,
         LLMMessage,
@@ -337,7 +337,7 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
             logger.info(f"📋 Supervision reminder for '{task.title}' -> {target_name}, sent={sent}")
 
     except Exception as e:
-        logger.error(f"Supervision reminder error for task {task.id}: {e}", exc_info=True)
+        logger.exception(f"Supervision reminder error for task {task.id}: {e}")
 
 
 async def _supervision_tick():
@@ -387,7 +387,7 @@ async def _supervision_tick():
                     logger.error(f"Error checking supervision task {task.id}: {e}")
 
     except Exception as e:
-        logger.error(f"Supervision tick error: {e}", exc_info=True)
+        logger.exception(f"Supervision tick error: {e}")
         await write_audit_log("supervision_error", {"error": str(e)[:300]})
 
 

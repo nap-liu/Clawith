@@ -11,7 +11,16 @@ function fetchAuth<T>(url: string, options?: RequestInit): Promise<T> {
     return fetch(`/api${url}`, {
         ...options,
         headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    }).then(r => r.json());
+    }).then(async r => {
+        if (r.status === 204) {
+            return undefined as T;
+        }
+        if (!r.ok) {
+            const error = await r.json().catch(() => ({ detail: `HTTP ${r.status}` }));
+            throw new Error(error.detail || `HTTP ${r.status}`);
+        }
+        return r.json() as Promise<T>;
+    });
 }
 
 // ─── Types ──────────────────────────────────────────────
@@ -228,9 +237,9 @@ const CHANNEL_REGISTRY: ChannelDef[] = [
 ];
 
 // ─── Feishu Permission JSON ─────────────────────────────
-const FEISHU_PERM_JSON = '{"scopes":{"tenant":["contact:contact.base:readonly","contact:user.base:readonly","contact:user.employee_id:readonly","contact:user.id:readonly","im:chat","im:message","im:message.group_at_msg:readonly","im:message.p2p_msg:readonly","im:message:send_as_bot","im:resource"],"user":[]}}';
+const FEISHU_PERM_BASIC_JSON = '{"scopes":{"tenant":["contact:contact.base:readonly","contact:user.base:readonly","contact:user.employee_id:readonly","contact:user.id:readonly","im:chat","im:message","im:message.group_at_msg:readonly","im:message.p2p_msg:readonly","im:message:send_as_bot","im:resource"],"user":[]}}';
 
-const FEISHU_PERM_DISPLAY = `{
+const FEISHU_PERM_BASIC_DISPLAY = `{
   "scopes": {
     "tenant": [
       "contact:contact.base:readonly",
@@ -248,6 +257,46 @@ const FEISHU_PERM_DISPLAY = `{
   }
 }`;
 
+const FEISHU_PERM_FULL_JSON = '{"scopes":{"tenant":["approval:approval","base:app:create","base:dashboard:create","base:field_group:create","bitable:app","bitable:app:readonly","board:whiteboard:node:create","calendar:calendar.event:create","calendar:calendar.event:delete","calendar:calendar.event:read","calendar:calendar.event:update","calendar:calendar.freebusy:readonly","calendar:calendar:readonly","contact:contact.base:readonly","contact:user.base:readonly","contact:user.employee_id:readonly","contact:user.id:readonly","docx:document","docx:document:create","drive:drive","im:chat","im:message","im:message.group_at_msg:readonly","im:message.p2p_msg:readonly","im:message:send_as_bot","im:resource","sheets:spreadsheet:create","slides:presentation:create","slides:presentation:write_only","wiki:wiki","wiki:wiki:readonly"],"user":[]}}';
+
+const FEISHU_PERM_FULL_DISPLAY = `{
+  "scopes": {
+    "tenant": [
+      "approval:approval",
+      "base:app:create",
+      "base:dashboard:create",
+      "base:field_group:create",
+      "bitable:app",
+      "bitable:app:readonly",
+      "board:whiteboard:node:create",
+      "calendar:calendar.event:create",
+      "calendar:calendar.event:delete",
+      "calendar:calendar.event:read",
+      "calendar:calendar.event:update",
+      "calendar:calendar.freebusy:readonly",
+      "calendar:calendar:readonly",
+      "contact:contact.base:readonly",
+      "contact:user.base:readonly",
+      "contact:user.employee_id:readonly",
+      "contact:user.id:readonly",
+      "docx:document",
+      "docx:document:create",
+      "drive:drive",
+      "im:chat",
+      "im:message",
+      "im:message.group_at_msg:readonly",
+      "im:message.p2p_msg:readonly",
+      "im:message:send_as_bot",
+      "im:resource",
+      "sheets:spreadsheet:create",
+      "slides:presentation:create",
+      "slides:presentation:write_only",
+      "wiki:wiki",
+      "wiki:wiki:readonly"
+    ],
+    "user": []
+  }
+}`;
 
 // CopyBtn is removed, using LinearCopyButton directly
 
@@ -255,6 +304,9 @@ const FEISHU_PERM_DISPLAY = `{
 export default function ChannelConfig({ mode, agentId, canManage = true, values, onChange }: ChannelConfigProps) {
     const { t } = useTranslation();
     const queryClient = useQueryClient();
+
+    // Feishu Permission Mode
+    const [feishuPermMode, setFeishuPermMode] = useState<'basic' | 'full'>('basic');
 
     // Collapsible state per channel
     const [openChannels, setOpenChannels] = useState<Record<string, boolean>>({});
@@ -285,6 +337,7 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
     // Atlassian test connection state
     const [atlassianTesting, setAtlassianTesting] = useState(false);
     const [atlassianTestResult, setAtlassianTestResult] = useState<{ ok: boolean; message?: string; tool_count?: number; error?: string } | null>(null);
+    const [actionFeedback, setActionFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
     // AgentBay test connection state
     const [agentbayTesting, setAgentbayTesting] = useState(false);
@@ -402,6 +455,16 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
             // Reset form
             setForms(prev => ({ ...prev, [ch.id]: {} }));
             setEditing(ch.id, false);
+            setActionFeedback({
+                type: 'success',
+                text: t('agent.settings.channel.saveSuccess', 'Channel configuration saved.'),
+            });
+        },
+        onError: (error: Error) => {
+            setActionFeedback({
+                type: 'error',
+                text: error.message || t('agent.settings.channel.saveFailed', 'Failed to save channel configuration.'),
+            });
         },
     });
 
@@ -419,6 +482,17 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
             keys.forEach(k => queryClient.invalidateQueries({ queryKey: k }));
             if (ch.id === 'atlassian') setAtlassianTestResult(null);
             if (ch.id === 'agentbay') setAgentbayTestResult(null);
+            setEditing(ch.id, false);
+            setActionFeedback({
+                type: 'success',
+                text: t('agent.settings.channel.disconnectSuccess', 'Channel disconnected.'),
+            });
+        },
+        onError: (error: Error) => {
+            setActionFeedback({
+                type: 'error',
+                text: error.message || t('agent.settings.channel.disconnectFailed', 'Failed to disconnect channel.'),
+            });
         },
     });
 
@@ -502,17 +576,39 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                 </ol>
                 {ch.showPermJson && (
                     <div style={{ margin: '8px 0', borderRadius: '6px', border: '1px solid var(--border-color)', overflow: 'hidden' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 10px', background: 'var(--bg-secondary)', borderBottom: '1px solid var(--border-color)' }}>
-                            <span style={{ fontSize: '10px', color: 'var(--text-secondary)', fontWeight: 500 }}>{t('channelGuide.feishuPermJson')}</span>
+                        {/* Segmented control header */}
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', background: 'var(--bg-secondary)', borderBottom: '1px solid var(--border-color)' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '2px', background: 'var(--bg-primary)', borderRadius: '5px', padding: '2px', border: '1px solid var(--border-color)' }}>
+                                {(['basic', 'full'] as const).map(mode => (
+                                    <button
+                                        key={mode}
+                                        type="button"
+                                        onClick={(e) => { e.preventDefault(); setFeishuPermMode(mode); }}
+                                        style={{
+                                            padding: '3px 10px', fontSize: '10px', borderRadius: '4px', cursor: 'pointer',
+                                            border: 'none', transition: 'all 0.15s ease',
+                                            background: feishuPermMode === mode ? 'var(--accent-primary, #5e6ad2)' : 'transparent',
+                                            color: feishuPermMode === mode ? '#fff' : 'var(--text-tertiary)',
+                                            fontWeight: 500,
+                                        }}>
+                                        {t(`channelGuide.feishuPerm${mode === 'basic' ? 'Basic' : 'Full'}`)}
+                                    </button>
+                                ))}
+                            </div>
                             <LinearCopyButton
-                                textToCopy={FEISHU_PERM_JSON}
-                                label={t('channelGuide.feishuPermCopy', 'Copy')}
-                                copiedLabel={t('channelGuide.feishuPermCopied', 'Copied')}
+                                textToCopy={feishuPermMode === 'basic' ? FEISHU_PERM_BASIC_JSON : FEISHU_PERM_FULL_JSON}
+                                label={t('channelGuide.feishuPermCopy')}
+                                copiedLabel={t('channelGuide.feishuPermCopied')}
                                 className=""
                                 style={{ fontSize: '10px', padding: '1px 7px', cursor: 'pointer', borderRadius: '3px', border: '1px solid var(--border-color)', background: 'var(--bg-primary)', color: 'var(--text-secondary)' }}
                             />
                         </div>
-                        <pre style={{ margin: 0, padding: '6px 10px', fontSize: '10px', fontFamily: 'var(--font-mono)', lineHeight: 1.5, background: 'var(--bg-primary)', color: 'var(--text-secondary)', overflowX: 'auto', userSelect: 'all' }}>{FEISHU_PERM_DISPLAY}</pre>
+                        {/* Description */}
+                        <div style={{ padding: '4px 10px', fontSize: '10px', color: 'var(--text-tertiary)', background: 'var(--bg-secondary)', borderBottom: '1px solid var(--border-color)' }}>
+                            {feishuPermMode === 'basic' ? t('channelGuide.feishuPermBasicDesc') : t('channelGuide.feishuPermFullDesc')}
+                        </div>
+                        {/* JSON code block */}
+                        <pre style={{ margin: 0, padding: '6px 10px', fontSize: '10px', fontFamily: 'var(--font-mono)', lineHeight: 1.5, background: 'var(--bg-primary)', color: 'var(--text-secondary)', overflowX: 'auto', userSelect: 'all', maxHeight: '200px', overflowY: 'auto' }}>{feishuPermMode === 'basic' ? FEISHU_PERM_BASIC_DISPLAY : FEISHU_PERM_FULL_DISPLAY}</pre>
                     </div>
                 )}
                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', background: 'var(--bg-secondary)', padding: '6px 10px', borderRadius: '6px' }}>
@@ -725,10 +821,27 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                                 {/* WeCom websocket status */}
                                 {ch.id === 'wecom' && configConnMode === 'websocket' && (
                                     <div style={{ background: 'var(--bg-secondary)', borderRadius: '6px', padding: '10px', fontSize: '12px', marginBottom: '12px' }}>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                            <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#07C160', display: 'inline-block' }}></span>
-                                            <span style={{ color: 'var(--text-secondary)' }}>Connected via WebSocket (No callback URL needed)</span>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
+                                            <span
+                                                style={{
+                                                    width: '6px',
+                                                    height: '6px',
+                                                    borderRadius: '50%',
+                                                    background: config.is_connected ? '#07C160' : '#F59E0B',
+                                                    display: 'inline-block',
+                                                }}
+                                            ></span>
+                                            <span style={{ color: 'var(--text-secondary)' }}>
+                                                {config.is_connected
+                                                    ? t('agent.settings.channel.websocketConnected', 'Connected via WebSocket (No callback URL needed)')
+                                                    : t('agent.settings.channel.websocketDisconnected', 'Configured for WebSocket, but currently disconnected')}
+                                            </span>
                                         </div>
+                                        {!config.is_connected && (
+                                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                                                {t('agent.settings.channel.websocketDisconnectedHint', 'Reconnect by saving the WeCom WebSocket configuration again.')}
+                                            </div>
+                                        )}
                                     </div>
                                 )}
 
@@ -985,6 +1098,21 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
         <div className="card" style={{ marginBottom: '12px' }}>
             <h4 style={{ marginBottom: '12px' }}>{t('agent.settings.channel.title')}</h4>
             <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '8px' }}>{t('agent.settings.channel.title')}</p>
+            {actionFeedback && (
+                <div
+                    style={{
+                        padding: '10px 14px',
+                        borderRadius: '8px',
+                        marginBottom: '12px',
+                        background: actionFeedback.type === 'success' ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)',
+                        border: `1px solid ${actionFeedback.type === 'success' ? 'rgba(16,185,129,0.25)' : 'rgba(239,68,68,0.25)'}`,
+                        fontSize: '12px',
+                        color: actionFeedback.type === 'success' ? 'rgb(5,150,105)' : 'rgb(220,38,38)',
+                    }}
+                >
+                    {actionFeedback.text}
+                </div>
+            )}
             <div style={{
                 padding: '10px 14px', borderRadius: '8px', marginBottom: '16px',
                 background: 'rgba(59,130,246,0.08)', border: '1px solid rgba(59,130,246,0.2)',

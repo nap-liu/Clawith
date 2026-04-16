@@ -31,6 +31,7 @@ _agents/
 
 # Internal docs
 docs/
+.agents/rules/deploy.md
 
 # Local worktrees
 .worktrees/
