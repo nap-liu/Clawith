@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import uuid
 from pathlib import Path
 
@@ -39,6 +40,21 @@ logger = logging.getLogger(__name__)
 
 _SANDBOX_UID = 65534
 _SANDBOX_GID = 65534
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Sum file sizes under `path`, tolerating missing entries / races."""
+    total = 0
+    try:
+        for entry in path.rglob("*"):
+            try:
+                if entry.is_file():
+                    total += entry.stat().st_size
+            except (FileNotFoundError, OSError):
+                continue
+    except (FileNotFoundError, OSError):
+        return 0
+    return total
 
 
 class StateStorage:
@@ -99,3 +115,137 @@ class StateStorage:
                 # which is easier to debug than a silent fix here.
                 logger.debug("cli-tools: chmod skipped for %s", path)
         return leaf
+
+    def _leaf_path(
+        self,
+        *,
+        tenant_id: str | uuid.UUID | None,
+        tool_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+    ) -> Path:
+        """Compute the `<tenant>/<tool>/<user>` path without creating it."""
+        tenant_segment = str(tenant_id) if tenant_id is not None else "_global"
+        return self._root / tenant_segment / str(tool_id) / str(user_id)
+
+    def get_home_usage_bytes(
+        self,
+        tenant_id: str | uuid.UUID | None,
+        tool_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+    ) -> int:
+        """Recursively sum file sizes under the per-(tool, user) HOME.
+
+        Returns 0 if the directory does not exist yet. No caching: most
+        HOMEs are small (config files, a token or two, a few MB of cache)
+        and `os.walk` over them is well under 1ms. Revisit if profiling
+        ever says otherwise.
+        """
+        leaf = self._leaf_path(tenant_id=tenant_id, tool_id=tool_id, user_id=user_id)
+        if not leaf.exists():
+            return 0
+        return _dir_size_bytes(leaf)
+
+    def check_quota(
+        self,
+        tenant_id: str | uuid.UUID | None,
+        tool_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+        limit_mb: int,
+    ) -> tuple[bool, int]:
+        """Check whether current HOME usage is within `limit_mb`.
+
+        Returns `(within_limit, current_bytes)`. `limit_mb == 0` short-
+        circuits to `(True, 0)` — the caller opted out of the check. The
+        comparison is `<=` so the limit is inclusive: a HOME sitting at
+        exactly `limit_mb * 1024 * 1024` bytes is still allowed to run.
+        """
+        if limit_mb == 0:
+            return True, 0
+        current = self.get_home_usage_bytes(tenant_id, tool_id, user_id)
+        within = current <= limit_mb * 1024 * 1024
+        return within, current
+
+    def clear_home(
+        self,
+        tenant_id: str | uuid.UUID | None,
+        tool_id: str | uuid.UUID,
+        user_id: str | uuid.UUID,
+    ) -> int:
+        """Hard-delete the `<tenant>/<tool>/<user>/` leaf. Returns bytes freed.
+
+        Used by the quota-reset admin endpoint. Tolerates a missing
+        directory (returns 0) and never raises: `ignore_errors=True`
+        mirrors the other delete_* helpers.
+        """
+        leaf = self._leaf_path(tenant_id=tenant_id, tool_id=tool_id, user_id=user_id)
+        if not leaf.exists():
+            return 0
+        freed = _dir_size_bytes(leaf)
+        shutil.rmtree(leaf, ignore_errors=True)
+        if leaf.exists():
+            logger.warning(
+                "cli-tools.quota: failed to fully remove %s (partial rmtree)", leaf
+            )
+        return freed
+
+    def delete_tool(
+        self,
+        tenant_id: str | uuid.UUID | None,
+        tool_id: str | uuid.UUID,
+    ) -> int:
+        """Hard-delete `<tenant>/<tool>/` subtree. Returns bytes freed.
+
+        Tolerates a missing directory (returns 0). Errors during rmtree are
+        swallowed (ignore_errors=True); a lingering directory afterwards is
+        logged as a warning so stale state can't silently outlive its Tool.
+        """
+        tenant_segment = str(tenant_id) if tenant_id is not None else "_global"
+        target = self._root / tenant_segment / str(tool_id)
+        if not target.exists():
+            return 0
+        freed = _dir_size_bytes(target)
+        shutil.rmtree(target, ignore_errors=True)
+        if target.exists():
+            logger.warning(
+                "cli-tools.gc: failed to fully remove %s (partial rmtree)", target
+            )
+        return freed
+
+    def delete_tenant(self, tenant_id: str | uuid.UUID) -> int:
+        """Hard-delete the entire `<tenant>/` subtree. Returns bytes freed."""
+        target = self._root / str(tenant_id)
+        if not target.exists():
+            return 0
+        freed = _dir_size_bytes(target)
+        shutil.rmtree(target, ignore_errors=True)
+        if target.exists():
+            logger.warning(
+                "cli-tools.gc: failed to fully remove %s (partial rmtree)", target
+            )
+        return freed
+
+    def delete_user(self, user_id: str | uuid.UUID) -> int:
+        """Hard-delete every `<tenant>/<tool>/<user>/` subdir for this user.
+
+        Walks all tenants/tools under the root. Returns bytes freed across
+        all matches. Only a function for now — no user-deletion endpoint
+        exists to hook it into; call from that endpoint once it ships.
+        """
+        user_segment = str(user_id)
+        if not self._root.exists():
+            return 0
+        total_freed = 0
+        # `<root>/<tenant>/<tool>/<user>` — glob matches only depth-3 dirs.
+        for candidate in self._root.glob(f"*/*/{user_segment}"):
+            if not candidate.is_dir():
+                continue
+            freed = _dir_size_bytes(candidate)
+            shutil.rmtree(candidate, ignore_errors=True)
+            if candidate.exists():
+                logger.warning(
+                    "cli-tools.gc: failed to fully remove %s (partial rmtree)",
+                    candidate,
+                )
+                continue
+            total_freed += freed
+        return total_freed

@@ -3,17 +3,21 @@
 Spec §5.4. Endpoints use the /tools/cli subpath to avoid colliding with the
 existing app/api/tools.py router at /tools.
 
-    GET    /api/tools/cli                      list
-    POST   /api/tools/cli                      create metadata
-    POST   /api/tools/cli/{id}/binary          upload binary
-    GET    /api/tools/cli/{id}                 detail (env masked)
-    PATCH  /api/tools/cli/{id}                 update metadata
-    DELETE /api/tools/cli/{id}                 delete
-    POST   /api/tools/cli/{id}/test-run        test-run
+    GET    /api/tools/cli                           list
+    POST   /api/tools/cli                           create metadata
+    POST   /api/tools/cli/{id}/binary               upload binary
+    GET    /api/tools/cli/{id}                      detail (env masked)
+    PATCH  /api/tools/cli/{id}                      update metadata
+    DELETE /api/tools/cli/{id}                      delete
+    POST   /api/tools/cli/{id}/test-run             test-run
+    GET    /api/tools/cli/{id}/home-usage?user_id=  per-user HOME usage
+    DELETE /api/tools/cli/{id}/home-cache?user_id=  clear per-user HOME
 """
 
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,11 +35,14 @@ from app.models.tool import Tool
 from app.models.user import User
 from app.services.cli_tools.errors import CliToolError
 from app.services.cli_tools.schema import CliToolConfig
+from app.services.cli_tools.state_storage import StateStorage
 from app.services.cli_tools.storage import (
     BinaryStorage,
     MagicNumberError,
     SizeLimitExceededError,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tools/cli", tags=["cli-tools"])
 
@@ -248,7 +255,87 @@ async def delete_cli_tool(
     if tool is None or tool.type != "cli":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "CLI tool not found")
     _require_manage(user, tool)
-    _audit(db, user, "cli_tool.delete", tool)
+
+    # Cascading filesystem GC: remove binary subtree + per-user state subtree
+    # BEFORE dropping the DB row, so that if the rmtree raises we bail out
+    # rather than leaving the row pointing at nothing. But each individual
+    # call swallows its own IO errors (shutil.rmtree(ignore_errors=True))
+    # because leaving a row pointing at missing files is still a worse
+    # outcome than leaving disk files with no owning row — the latter gets
+    # caught by the periodic gc_cli_binaries sweep.
+    tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"
+    binary_storage = BinaryStorage(root=_STORAGE_ROOT)
+    state_storage = StateStorage()
+
+    t0 = time.monotonic()
+    bin_path = str(binary_storage.root / tenant_key / str(tool.id))
+    try:
+        bin_freed = binary_storage.delete_tool(tenant_key, str(tool.id))
+    except Exception as exc:  # defensive: must never block DB delete
+        logger.warning("cli-tools.gc: binary cleanup failed for %s: %s", bin_path, exc)
+        bin_freed = 0
+    bin_ms = int((time.monotonic() - t0) * 1000)
+    logger.info(
+        "cli-tools.gc",
+        extra={
+            "operation": "tool",
+            "scope": "binary",
+            "path": bin_path,
+            "freed_bytes": bin_freed,
+            "duration_ms": bin_ms,
+        },
+    )
+
+    t1 = time.monotonic()
+    state_path = str(state_storage._root / tenant_key / str(tool.id))  # noqa: SLF001
+    try:
+        state_freed = state_storage.delete_tool(tool.tenant_id, tool.id)
+    except Exception as exc:
+        logger.warning("cli-tools.gc: state cleanup failed for %s: %s", state_path, exc)
+        state_freed = 0
+    state_ms = int((time.monotonic() - t1) * 1000)
+    logger.info(
+        "cli-tools.gc",
+        extra={
+            "operation": "tool",
+            "scope": "state",
+            "path": state_path,
+            "freed_bytes": state_freed,
+            "duration_ms": state_ms,
+        },
+    )
+
+    _audit(
+        db,
+        user,
+        "cli_tool.delete",
+        tool,
+        detail={
+            "gc": {
+                "binary_path": bin_path,
+                "binary_freed_bytes": bin_freed,
+                "binary_duration_ms": bin_ms,
+                "state_path": state_path,
+                "state_freed_bytes": state_freed,
+                "state_duration_ms": state_ms,
+            }
+        },
+    )
+    # Separate audit row for the cascading GC itself, keyed to resource_type=
+    # "cli_tool" per task spec (distinct from the cli_tool.delete row whose
+    # `_audit` helper hardcodes resource_type="tool").
+    db.add(AuditLog(
+        user_id=user.id,
+        action="gc.tool",
+        details={
+            "resource_type": "cli_tool",
+            "resource_id": str(tool.id),
+            "tenant_id": str(tool.tenant_id) if tool.tenant_id else None,
+            "binary_freed_bytes": bin_freed,
+            "state_freed_bytes": state_freed,
+            "duration_ms": bin_ms + state_ms,
+        },
+    ))
     await db.delete(tool)
     await db.commit()
 
@@ -305,14 +392,18 @@ async def test_run_cli_tool(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "CLI tool not found")
     _require_manage(user, tool)
 
-    from app.services.cli_tool_executor import execute_cli_tool
+    from dataclasses import asdict
+
+    from app.services.cli_tool_executor import CliExecutionAudit, execute_cli_tool
     from app.services.sandbox.local.binary_runner import BinaryRunner
 
     storage = BinaryStorage(root=_STORAGE_ROOT)
     runner = BinaryRunner(default_image="clawith-cli-sandbox:stable")
 
+    synthetic_agent_id = uuid.uuid4()
+
     class _SyntheticAgent:
-        id = uuid.uuid4()
+        id = synthetic_agent_id
         tenant_id = tool.tenant_id if tool.tenant_id is not None else user.tenant_id
 
     user_context = {
@@ -328,6 +419,22 @@ async def test_run_cli_tool(
         patched_env.update(body.mock_env)
         tool.config = {**original_config, "env_inject": patched_env}
 
+    async def _write_audit(audit: CliExecutionAudit) -> None:
+        # test-run is an admin-triggered exec. The real user's UUID is
+        # safe to attach to AuditLog.user_id (FK); the synthetic agent id
+        # is random-per-call, only useful via details['agent_id'].
+        db.add(AuditLog(
+            user_id=user.id,
+            agent_id=None,  # synthetic agent is not a real row
+            action="cli_tool.execute",
+            details={
+                "resource_type": "cli_tool_exec",
+                "resource_id": audit.tool_id,
+                "source": "test_run",
+                **asdict(audit),
+            },
+        ))
+
     try:
         result = await execute_cli_tool(
             tool=tool,
@@ -336,7 +443,9 @@ async def test_run_cli_tool(
             user_context=user_context,
             storage=storage,
             runner=runner,
+            audit_sink=_write_audit,
         )
+        await db.commit()  # persist the audit row alongside any other tx work
         return TestRunResponse(
             exit_code=result.exit_code,
             stdout=result.stdout,
@@ -344,6 +453,9 @@ async def test_run_cli_tool(
             duration_ms=result.duration_ms,
         )
     except CliToolError as exc:
+        # Audit sink already fired in the executor's finally; commit the
+        # row even on classified failure so compliance has a record.
+        await db.commit()
         return TestRunResponse(
             exit_code=-1,
             stdout="",
@@ -355,3 +467,98 @@ async def test_run_cli_tool(
     finally:
         # Never commit the mock-env patch.
         tool.config = original_config
+
+
+class HomeUsageOut(BaseModel):
+    user_id: uuid.UUID
+    bytes: int
+    mb: int
+    within_limit: bool
+    limit_mb: int
+
+
+@router.get("/{tool_id}/home-usage", response_model=HomeUsageOut)
+async def get_home_usage(
+    tool_id: uuid.UUID,
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Report HOME usage for one (tool, user). Admin-only.
+
+    Scoped to the tool's tenant: platform_admin everywhere, org_admin
+    only within their own tenant. No 'read-your-own' shortcut — this is
+    a cache diagnostic surface, not a user-facing feature.
+    """
+    tool = await db.get(Tool, tool_id)
+    if tool is None or tool.type != "cli":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "CLI tool not found")
+    _require_manage(user, tool)
+
+    config = CliToolConfig.model_validate(tool.config or {})
+    state_storage = StateStorage()
+    within, current = state_storage.check_quota(
+        tenant_id=tool.tenant_id,
+        tool_id=tool.id,
+        user_id=user_id,
+        limit_mb=config.home_quota_mb,
+    )
+    return HomeUsageOut(
+        user_id=user_id,
+        bytes=current,
+        mb=current // (1024 * 1024),
+        within_limit=within,
+        limit_mb=config.home_quota_mb,
+    )
+
+
+@router.delete("/{tool_id}/home-cache", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_home_cache(
+    tool_id: uuid.UUID,
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Hard-delete the per-(tool, user) HOME subtree. Admin-only.
+
+    Synchronous `rmtree` — typical HOMEs are small enough that blocking
+    the request is fine. Returns 204 even when the directory was already
+    missing (idempotent: caller's goal of 'gone' is met either way).
+    """
+    tool = await db.get(Tool, tool_id)
+    if tool is None or tool.type != "cli":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "CLI tool not found")
+    _require_manage(user, tool)
+
+    state_storage = StateStorage()
+    t0 = time.monotonic()
+    freed = state_storage.clear_home(
+        tenant_id=tool.tenant_id,
+        tool_id=tool.id,
+        user_id=user_id,
+    )
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    db.add(AuditLog(
+        user_id=user.id,
+        action="cli_tool.clear_home",
+        details={
+            "resource_type": "cli_tool",
+            "resource_id": str(tool.id),
+            "tenant_id": str(tool.tenant_id) if tool.tenant_id else None,
+            "target_user_id": str(user_id),
+            "freed_bytes": freed,
+            "duration_ms": duration_ms,
+        },
+    ))
+    await db.commit()
+    logger.info(
+        "cli-tools.quota",
+        extra={
+            "operation": "clear_home",
+            "tool_id": str(tool.id),
+            "target_user_id": str(user_id),
+            "freed_bytes": freed,
+            "duration_ms": duration_ms,
+        },
+    )

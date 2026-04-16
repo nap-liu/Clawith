@@ -9,12 +9,19 @@ import { TestRunPanel } from '../TestRunPanel';
 function mergeWithDefaults(partial: Partial<CliToolConfig> | null | undefined): CliToolConfig {
   const d = defaultCliToolConfig();
   const c = partial ?? {};
+  const mergedSandbox = { ...d.sandbox, ...(c.sandbox ?? {}) };
+  // Array fields inside nested sandbox need explicit default fallback —
+  // a stored config from before the egress_allowlist field existed will
+  // spread `undefined` and blow up the textarea join() below.
+  if (!Array.isArray(mergedSandbox.egress_allowlist)) {
+    mergedSandbox.egress_allowlist = [];
+  }
   return {
     ...d,
     ...c,
     args_template: c.args_template ?? d.args_template,
     env_inject: c.env_inject ?? d.env_inject,
-    sandbox: { ...d.sandbox, ...(c.sandbox ?? {}) },
+    sandbox: mergedSandbox,
   };
 }
 
@@ -124,6 +131,21 @@ export function ConfigStep({
       </div>
 
       <div>
+        <label style={labelStyle}>{k('fieldRateLimit', 'Calls per minute')}</label>
+        <input
+          type="number"
+          className="form-input"
+          min={0}
+          max={10000}
+          value={config.rate_limit_per_minute}
+          onChange={(e) => setConfig({ ...config, rate_limit_per_minute: Math.max(0, Number(e.target.value) || 0) })}
+        />
+        <div style={hintStyle}>
+          {k('rateLimitHint', '0 = unlimited. Protects against runaway agent loops.')}
+        </div>
+      </div>
+
+      <div>
         <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer' }}>
           <input
             type="checkbox"
@@ -137,6 +159,35 @@ export function ConfigStep({
         </div>
       </div>
 
+      {config.sandbox.network && (
+        <div>
+          <label style={labelStyle}>{k('fieldEgressAllowlist', 'Egress allowlist')}</label>
+          <textarea
+            className="form-input"
+            value={(config.sandbox.egress_allowlist ?? []).join('\n')}
+            onChange={(e) => setConfig({
+              ...config,
+              sandbox: {
+                ...config.sandbox,
+                // Split on any run of newline/whitespace, trim, drop empty —
+                // operator-friendly: pasted comma- or space-separated lists
+                // also work, and trailing blank lines never produce a "".
+                egress_allowlist: e.target.value
+                  .split(/[\s,]+/)
+                  .map((h) => h.trim())
+                  .filter((h) => h.length > 0),
+              },
+            })}
+            rows={3}
+            placeholder="api.yeyecha.com&#10;registry.example.com"
+            style={{ fontFamily: 'monospace', resize: 'vertical' }}
+          />
+          <div style={hintStyle}>
+            {k('egressAllowlistHint', 'One hostname per line. Empty = allow all (default). Current release: only forwarded to the tool via CLAWITH_EGRESS_ALLOWLIST env var — actual enforcement is a phase-2 infra PR.')}
+          </div>
+        </div>
+      )}
+
       <div>
         <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer' }}>
           <input
@@ -148,6 +199,22 @@ export function ConfigStep({
         </label>
         <div style={hintStyle}>
           {k('persistentHomeHint', 'Each (tool, user) keeps its own rw HOME across calls. Needed for tools that cache login tokens (svc, gh, kubectl). Off = ephemeral /tmp each run.')}
+        </div>
+      </div>
+
+      <div>
+        <label style={labelStyle}>{k('fieldHomeQuota', 'HOME quota (MB)')}</label>
+        <input
+          type="number"
+          className="form-input"
+          min={0}
+          max={100000}
+          value={config.home_quota_mb}
+          disabled={!config.persistent_home}
+          onChange={(e) => setConfig({ ...config, home_quota_mb: Math.max(0, Number(e.target.value) || 0) })}
+        />
+        <div style={hintStyle}>
+          {k('homeQuotaHint', 'Subsequent calls are rejected when exceeded. 0 = unlimited.')}
         </div>
       </div>
 

@@ -41,6 +41,7 @@ dependencies = [
     "pypinyin>=0.52.0",
     "Pillow>=10.0.0",
     "jsonschema>=4.21.0",
+    "prometheus-client>=0.20.0",
 ]
 
 [project.optional-dependencies]

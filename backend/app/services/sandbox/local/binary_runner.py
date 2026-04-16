@@ -139,12 +139,28 @@ _PERSISTENT_HOME_ENV: dict[str, str] = {
 }
 
 
-class BinaryRunner:
-    """Execute a mounted binary inside an ephemeral sandbox container.
+class DockerSandboxBackend:
+    """Execute a mounted binary inside an ephemeral docker sandbox container.
 
     Stateless per invocation. A single instance is meant to be reused for
     every tool execution — `run()` takes the per-call runtime overrides,
     there's no per-tool construction.
+
+    This is one implementation of the ``SandboxBackend`` protocol (see
+    ``app.services.sandbox.backend``). Docker gives strong isolation
+    (separate namespaces, read-only rootfs, cap-drop ALL, seccomp default)
+    at the cost of ~300ms container-create latency per call. For
+    lower-trust-but-fast workloads see ``BubblewrapBackend``.
+
+    Egress allowlist: when ``network=True`` and the tool config carries a
+    ``sandbox.egress_allowlist``, the executor injects the list into the
+    sandbox env as ``CLAWITH_EGRESS_ALLOWLIST`` (comma-separated). This
+    backend does NOT yet enforce the allowlist at the network layer — a
+    cooperative CLI can read the variable and self-restrict, but a
+    malicious or LLM-driven binary can still ``connect()`` anywhere the
+    docker bridge permits. Real enforcement (tinyproxy sidecar + ``--dns``
+    restricted resolver) is tracked in
+    ``docs/superpowers/TODO-egress-enforcement.md``.
     """
 
     def __init__(self, default_image: str) -> None:
@@ -343,3 +359,12 @@ class BinaryRunner:
             duration_ms=0,  # filled in by the async caller
             timed_out=timed_out,
         )
+
+
+# Backwards-compatible alias. Pre-M4 modules import `BinaryRunner`
+# directly (agent_tools.py, api/cli_tools.py, tests). Keep the name
+# working so those imports don't need a synchronized rename PR, but
+# all new code should prefer ``DockerSandboxBackend`` or — better —
+# use ``app.services.sandbox.factory.get_sandbox_backend`` to stay
+# implementation-agnostic.
+BinaryRunner = DockerSandboxBackend

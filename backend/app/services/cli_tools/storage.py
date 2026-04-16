@@ -10,11 +10,30 @@ literal "_global" for platform-scoped tools.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import shutil
 import stat
 import tempfile
 from pathlib import Path
 from typing import BinaryIO, Iterable, Iterator
+
+logger = logging.getLogger(__name__)
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Sum file sizes under `path`, tolerating missing entries / races."""
+    total = 0
+    try:
+        for entry in path.rglob("*"):
+            try:
+                if entry.is_file():
+                    total += entry.stat().st_size
+            except (FileNotFoundError, OSError):
+                continue
+    except (FileNotFoundError, OSError):
+        return 0
+    return total
 
 
 _ACCEPTED_MAGICS: tuple[bytes, ...] = (
@@ -135,3 +154,35 @@ class BinaryStorage:
             except FileNotFoundError:
                 pass
         return count
+
+    def delete_tool(self, tenant_key: str, tool_id: str) -> int:
+        """Hard-delete the `<tenant>/<tool>/` subtree. Returns bytes freed.
+
+        Tolerates a missing directory (returns 0). Never raises for IO errors
+        inside the tree; `shutil.rmtree(ignore_errors=True)` swallows those,
+        and we log a warning if the directory still exists afterwards so an
+        orphaned file can't silently outlive its Tool row.
+        """
+        target = self.root / tenant_key / tool_id
+        if not target.exists():
+            return 0
+        freed = _dir_size_bytes(target)
+        shutil.rmtree(target, ignore_errors=True)
+        if target.exists():
+            logger.warning(
+                "cli-tools.gc: failed to fully remove %s (partial rmtree)", target
+            )
+        return freed
+
+    def delete_tenant(self, tenant_key: str) -> int:
+        """Hard-delete the entire `<tenant>/` subtree. Returns bytes freed."""
+        target = self.root / tenant_key
+        if not target.exists():
+            return 0
+        freed = _dir_size_bytes(target)
+        shutil.rmtree(target, ignore_errors=True)
+        if target.exists():
+            logger.warning(
+                "cli-tools.gc: failed to fully remove %s (partial rmtree)", target
+            )
+        return freed

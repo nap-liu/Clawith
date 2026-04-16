@@ -293,6 +293,7 @@ from app.api.admin import router as admin_router
 from app.api.pages import router as pages_router, public_router as pages_public_router
 from app.api.agent_credentials import router as credentials_router
 from app.api.agentbay_control import router as agentbay_control_router
+from app.api.metrics import router as metrics_router
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
@@ -335,6 +336,10 @@ app.include_router(pages_router, prefix=settings.API_PREFIX)
 app.include_router(pages_public_router)  # Public endpoint for /p/{short_id}, no API prefix
 app.include_router(credentials_router, prefix=settings.API_PREFIX)
 app.include_router(agentbay_control_router, prefix=settings.API_PREFIX)
+# Prometheus scrape endpoint. Behind platform_admin — see app/api/metrics.py
+# for the rationale. Mounted under API_PREFIX so it shares the auth base
+# path with the rest of the admin surface.
+app.include_router(metrics_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])

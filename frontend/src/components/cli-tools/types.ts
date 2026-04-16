@@ -7,6 +7,11 @@ export interface SandboxConfig {
   network: boolean;
   readonly_fs: boolean;
   image: string | null;
+  // Hostnames the sandbox is permitted to reach when network=true.
+  // Empty = allow all (existing behavior). Non-empty = pass-through to
+  // the sandbox env as CLAWITH_EGRESS_ALLOWLIST. Not kernel-enforced
+  // yet — see docs/superpowers/TODO-egress-enforcement.md.
+  egress_allowlist: string[];
 }
 
 export interface CliToolConfig {
@@ -24,6 +29,12 @@ export interface CliToolConfig {
   // invocations — required for tools that cache login tokens (svc, gh,
   // kubectl). Default false: stateless tools get an ephemeral /tmp HOME.
   persistent_home: boolean;
+  // 0 = unlimited. Protects downstream services (reports, paid APIs)
+  // from an LLM-driven runaway loop that hammers the same tool.
+  rate_limit_per_minute: number;
+  // Soft disk quota for the persistent HOME. Next execute is rejected
+  // when usage exceeds this; admin must clear the cache. 0 = unlimited.
+  home_quota_mb: number;
   sandbox: SandboxConfig;
 }
 
@@ -63,12 +74,14 @@ export function defaultCliToolConfig(): CliToolConfig {
     env_inject: {},
     timeout_seconds: 30,
     persistent_home: false,
+    rate_limit_per_minute: 60,
     sandbox: {
       cpu_limit: '1.0',
       memory_limit: '512m',
       network: false,
       readonly_fs: true,
       image: null,
+      egress_allowlist: [],
     },
   };
 }
