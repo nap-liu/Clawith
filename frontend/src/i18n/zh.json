@@ -863,6 +863,26 @@
       "loading": "加载中...",
       "edit": "编辑"
     },
+    "cliTools": {
+      "filterLabel": "CLI 工具",
+      "addButton": "添加 CLI 工具",
+      "columnScope": "作用域",
+      "columnStatus": "状态",
+      "columnUpdated": "更新时间",
+      "scopeGlobal": "全局（所有租户）",
+      "scopeTenant": "租户",
+      "statusActive": "启用",
+      "statusDisabled": "已停用",
+      "wizard": {
+        "stepBasic": "基本信息",
+        "stepBinary": "二进制",
+        "stepConfig": "配置与测试",
+        "replaceWarning": "替换二进制将影响所有使用该工具的数字员工。新版本在下次执行时生效。"
+      },
+      "sandbox": {
+        "networkHint": "仅当工具需要调用外部 API 或下载资源时才勾选。"
+      }
+    },
     "org": {
       "feishuSync": "飞书通讯录同步配置",
       "appId": "App ID",

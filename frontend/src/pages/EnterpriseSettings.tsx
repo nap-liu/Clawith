@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { enterpriseApi, skillApi } from '../services/api';
 import PromptModal from '../components/PromptModal';
 import FileBrowser from '../components/FileBrowser';
+import { CliToolsSection } from '../components/cli-tools/CliToolsSection';
 import type { FileBrowserApi } from '../components/FileBrowser';
 import { saveAccentColor, getSavedAccentColor, resetAccentColor, PRESET_COLORS } from '../utils/theme';
 import UserManagement from './UserManagement';
@@ -1832,7 +1833,7 @@ export default function EnterpriseSettings() {
         general: t('agent.toolCategories.general'),
         agentbay: t('agent.toolCategories.agentbay', 'AgentBay'),
     };
-    const [toolsView, setToolsView] = useState<'global' | 'agent-installed'>('global');
+    const [toolsView, setToolsView] = useState<'global' | 'agent-installed' | 'cli'>('global');
     const [agentInstalledTools, setAgentInstalledTools] = useState<any[]>([]);
     const loadAllTools = async () => {
         const tid = selectedTenantId;
@@ -2582,7 +2583,7 @@ export default function EnterpriseSettings() {
                     <div>
                         {/* Sub-tab pills */}
                         <div style={{ display: 'flex', gap: '8px', marginBottom: '16px', borderBottom: '1px solid var(--border-subtle)', paddingBottom: '8px' }}>
-                            {([['global', t('enterprise.tools.globalTools')], ['agent-installed', t('enterprise.tools.agentInstalled')]] as const).map(([key, label]) => (
+                            {([['global', t('enterprise.tools.globalTools')], ['agent-installed', t('enterprise.tools.agentInstalled')], ['cli', t('enterprise.cliTools.filterLabel', 'CLI Tools')]] as const).map(([key, label]) => (
                                 <button key={key} onClick={() => { setToolsView(key as any); if (key === 'agent-installed') loadAgentInstalledTools(); }} style={{
                                     padding: '4px 14px', borderRadius: '12px', fontSize: '12px', fontWeight: 500, cursor: 'pointer', border: 'none',
                                     background: toolsView === key ? 'var(--accent-primary)' : 'var(--bg-tertiary)',
@@ -2590,6 +2591,9 @@ export default function EnterpriseSettings() {
                                 }}>{label}</button>
                             ))}
                         </div>
+
+                        {/* CLI Tools sub-view (managed by CliToolsSection) */}
+                        {toolsView === 'cli' && <CliToolsSection />}
 
                         {/* Agent-Installed Tools */}
                         {toolsView === 'agent-installed' && (

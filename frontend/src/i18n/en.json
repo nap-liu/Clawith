@@ -486,7 +486,28 @@
       "agentInstalled": "Agent Self-Installed Tools",
       "noInstalled": "No tools installed yet",
       "noCompany": "No company-configured tools",
-      "configured": "Configured"
+      "configured": "Configured",
+      "globalTools": "Global Tools"
+    },
+    "cliTools": {
+      "filterLabel": "CLI Tools",
+      "addButton": "Add CLI Tool",
+      "columnScope": "Scope",
+      "columnStatus": "Status",
+      "columnUpdated": "Updated",
+      "scopeGlobal": "Global (all tenants)",
+      "scopeTenant": "Tenant",
+      "statusActive": "Active",
+      "statusDisabled": "Disabled",
+      "wizard": {
+        "stepBasic": "Basic info",
+        "stepBinary": "Binary",
+        "stepConfig": "Configuration & test",
+        "replaceWarning": "Replacing the binary will affect every agent that uses this tool. The new version takes effect on the next execute."
+      },
+      "sandbox": {
+        "networkHint": "Enable only if the tool needs to call external APIs or download resources."
+      }
     },
     "toolCategories": {
       "file": "File Operations",
