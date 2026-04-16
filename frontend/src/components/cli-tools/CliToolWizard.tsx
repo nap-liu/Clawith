@@ -82,15 +82,20 @@ export function CliToolWizard({
           </button>
         </div>
 
-        {/* Step indicator */}
+        {/* Step indicator — clickable once the draft has been persisted
+            (i.e. opened in edit mode, or step 1 just submitted). Before
+            that, jumping forward is meaningless because there's nothing
+            to configure a binary/schema against. */}
         <div style={{ display: 'flex', gap: '4px', marginBottom: '16px', fontSize: '12px' }}>
           {labels.map((label, idx) => {
             const n = (idx + 1) as Step;
             const active = step === n;
             const done = step > n;
+            const jumpable = !!draft?.id;
             return (
               <div
                 key={label}
+                onClick={jumpable && !active ? () => setStep(n) : undefined}
                 style={{
                   flex: 1,
                   padding: '8px 6px',
@@ -103,6 +108,7 @@ export function CliToolWizard({
                   fontWeight: active ? 600 : 400,
                   border: !active && !done ? '1px dashed var(--border-subtle)' : '1px solid transparent',
                   userSelect: 'none',
+                  cursor: jumpable && !active ? 'pointer' : 'default',
                 }}
               >
                 {n}. {label}
