@@ -12,6 +12,14 @@ existing app/api/tools.py router at /tools.
     POST   /api/tools/cli/{id}/test-run             test-run
     GET    /api/tools/cli/{id}/home-usage?user_id=  per-user HOME usage
     DELETE /api/tools/cli/{id}/home-cache?user_id=  clear per-user HOME
+
+Security invariant: binary metadata (sha256, size, original_name,
+uploaded_at) is written **only** by the upload endpoint. The update
+endpoint's request schema forbids any `binary` or `config` key so admins
+cannot repoint the sandbox at a different on-disk blob via PATCH. That
+invariant is enforced at the Pydantic layer with ``extra="forbid"``, not
+inside the handler body — rejecting at parse time gives attackers zero
+surface.
 """
 
 from __future__ import annotations
@@ -24,7 +32,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,7 +42,12 @@ from app.models.audit import AuditLog
 from app.models.tool import Tool
 from app.models.user import User
 from app.services.cli_tools.errors import CliToolError
-from app.services.cli_tools.schema import CliToolConfig
+from app.services.cli_tools.schema import (
+    BinaryMetadata,
+    CliToolConfig,
+    RuntimeConfig,
+    SandboxConfig,
+)
 from app.services.cli_tools.state_storage import StateStorage
 from app.services.cli_tools.storage import (
     BinaryStorage,
@@ -85,19 +98,36 @@ def _audit(db: AsyncSession, user: User, action: str, tool: Tool, detail: dict |
 
 
 class CliToolCreate(BaseModel):
+    """Create body. Binary metadata is intentionally absent — uploads go
+    through POST /tools/cli/{id}/binary after creation."""
+
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(min_length=1, max_length=100)
     display_name: str = Field(min_length=1, max_length=200)
     description: str = ""
     parameters_schema: dict = Field(default_factory=dict)
-    config: CliToolConfig = Field(default_factory=CliToolConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     tenant_id: Optional[uuid.UUID] = None
 
 
 class CliToolUpdate(BaseModel):
+    """Patch body. Deliberately does not accept ``binary`` or ``config``.
+
+    ``extra="forbid"`` means any attempt to slip a ``binary`` (or a full
+    ``config``) dict through this endpoint fails at the parser level with
+    HTTP 422 — the sandbox's on-disk binary can only be changed by the
+    upload endpoint, which writes binary metadata itself and audits it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     display_name: Optional[str] = None
     description: Optional[str] = None
     parameters_schema: Optional[dict] = None
-    config: Optional[CliToolConfig] = None
+    runtime: Optional[RuntimeConfig] = None
+    sandbox: Optional[SandboxConfig] = None
     is_active: Optional[bool] = None
 
 
@@ -110,7 +140,7 @@ class CliToolOut(BaseModel):
     tenant_id: Optional[uuid.UUID]
     is_active: bool
     parameters_schema: dict
-    config: dict  # env_inject masked
+    config: dict  # nested shape: {"binary": ..., "runtime": ..., "sandbox": ...}
 
 
 class TestRunRequest(BaseModel):
@@ -128,7 +158,13 @@ class TestRunResponse(BaseModel):
 
 
 def _to_out(tool: Tool) -> CliToolOut:
-    cfg = dict(tool.config or {})
+    """Normalise stored config to the new nested shape for the response.
+
+    Reading through ``CliToolConfig.model_validate`` lifts any legacy
+    flat keys into their subtree so the API contract is stable even for
+    rows that haven't been written yet since the upgrade.
+    """
+    cfg = CliToolConfig.model_validate(tool.config or {}).model_dump(mode="json")
     return CliToolOut(
         id=tool.id,
         name=tool.name,
@@ -169,6 +205,13 @@ async def create_cli_tool(
     else:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "org_admin required")
 
+    # Binary metadata starts empty — upload endpoint fills it in.
+    initial_config = CliToolConfig(
+        binary=BinaryMetadata(),
+        runtime=body.runtime,
+        sandbox=body.sandbox,
+    ).model_dump(mode="json")
+
     tool = Tool(
         id=uuid.uuid4(),
         name=body.name,
@@ -177,7 +220,7 @@ async def create_cli_tool(
         type="cli",
         source="admin",
         parameters_schema=body.parameters_schema,
-        config=body.config.model_dump(mode="json"),
+        config=initial_config,
         tenant_id=effective_tenant,
         enabled=True,
     )
@@ -229,15 +272,23 @@ async def update_cli_tool(
     if body.is_active is not None:
         diff["enabled"] = [tool.enabled, body.is_active]
         tool.enabled = body.is_active
-    if body.config is not None:
-        existing = dict(tool.config or {})
-        incoming = body.config.model_dump(mode="json")
-        # Preserve binary metadata unless the incoming body explicitly overrides.
-        for preserved in ("binary_sha256", "binary_size", "binary_original_name", "binary_uploaded_at"):
-            if incoming.get(preserved) is None:
-                incoming[preserved] = existing.get(preserved)
-        tool.config = incoming
-        diff["config"] = "updated"
+
+    # Load existing config through the nested schema so legacy rows get
+    # normalised on first touch. Binary metadata stays whatever the DB
+    # had — neither the request body nor this handler touch it.
+    if body.runtime is not None or body.sandbox is not None:
+        existing = CliToolConfig.model_validate(tool.config or {})
+        new_runtime = body.runtime if body.runtime is not None else existing.runtime
+        new_sandbox = body.sandbox if body.sandbox is not None else existing.sandbox
+        tool.config = CliToolConfig(
+            binary=existing.binary,  # preserved; not exposed on PATCH
+            runtime=new_runtime,
+            sandbox=new_sandbox,
+        ).model_dump(mode="json")
+        if body.runtime is not None:
+            diff["runtime"] = "updated"
+        if body.sandbox is not None:
+            diff["sandbox"] = "updated"
 
     _audit(db, user, "cli_tool.update", tool, detail={"changes": list(diff.keys())})
     await db.commit()
@@ -367,12 +418,19 @@ async def upload_binary(
     except SizeLimitExceededError as exc:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, str(exc)) from exc
 
-    cfg = dict(tool.config or {})
-    cfg["binary_sha256"] = sha
-    cfg["binary_size"] = size
-    cfg["binary_original_name"] = file.filename or "uploaded.bin"
-    cfg["binary_uploaded_at"] = datetime.now(timezone.utc).isoformat()
-    tool.config = cfg
+    # The upload endpoint is the *only* place binary metadata gets
+    # written. Runtime/sandbox subtrees are left untouched.
+    existing = CliToolConfig.model_validate(tool.config or {})
+    tool.config = CliToolConfig(
+        binary=BinaryMetadata(
+            sha256=sha,
+            size=size,
+            original_name=file.filename or "uploaded.bin",
+            uploaded_at=datetime.now(timezone.utc),
+        ),
+        runtime=existing.runtime,
+        sandbox=existing.sandbox,
+    ).model_dump(mode="json")
 
     _audit(db, user, "cli_tool.upload_binary", tool, detail={"sha256": sha, "size": size})
     await db.commit()
@@ -415,9 +473,15 @@ async def test_run_cli_tool(
     # If mock_env supplied, temporarily replace those env keys. Never persist.
     original_config = dict(tool.config or {})
     if body.mock_env:
-        patched_env = dict(original_config.get("env_inject", {}))
-        patched_env.update(body.mock_env)
-        tool.config = {**original_config, "env_inject": patched_env}
+        normalised = CliToolConfig.model_validate(original_config)
+        patched_runtime = normalised.runtime.model_copy(update={
+            "env_inject": {**normalised.runtime.env_inject, **body.mock_env},
+        })
+        tool.config = CliToolConfig(
+            binary=normalised.binary,
+            runtime=patched_runtime,
+            sandbox=normalised.sandbox,
+        ).model_dump(mode="json")
 
     async def _write_audit(audit: CliExecutionAudit) -> None:
         # test-run is an admin-triggered exec. The real user's UUID is
@@ -501,14 +565,14 @@ async def get_home_usage(
         tenant_id=tool.tenant_id,
         tool_id=tool.id,
         user_id=user_id,
-        limit_mb=config.home_quota_mb,
+        limit_mb=config.runtime.home_quota_mb,
     )
     return HomeUsageOut(
         user_id=user_id,
         bytes=current,
         mb=current // (1024 * 1024),
         within_limit=within,
-        limit_mb=config.home_quota_mb,
+        limit_mb=config.runtime.home_quota_mb,
     )
 
 

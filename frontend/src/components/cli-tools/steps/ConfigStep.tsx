@@ -1,11 +1,21 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { cliToolsApi } from '../api';
-import type { CliTool, CliToolConfig } from '../types';
-import { defaultCliToolConfig } from '../types';
+import type { CliTool, CliToolConfig, RuntimeConfig, SandboxConfig } from '../types';
+import {
+  defaultCliToolConfig,
+  defaultRuntimeConfig,
+  defaultSandboxConfig,
+} from '../types';
 import { EnvGrid } from '../EnvGrid';
 import { TestRunPanel } from '../TestRunPanel';
 
+/**
+ * Merge a partial config with defaults so freshly-rendered forms always
+ * have every field defined. Legacy rows that still carry the pre-split
+ * flat shape get normalised by the backend, but during the rolling
+ * upgrade window we may briefly see partial nested shapes too.
+ */
 function mergeWithDefaults(partial: Partial<CliToolConfig> | null | undefined): CliToolConfig {
   const d = defaultCliToolConfig();
   const c = partial ?? {};
@@ -16,11 +26,15 @@ function mergeWithDefaults(partial: Partial<CliToolConfig> | null | undefined): 
   if (!Array.isArray(mergedSandbox.egress_allowlist)) {
     mergedSandbox.egress_allowlist = [];
   }
+  const mergedRuntime = {
+    ...d.runtime,
+    ...(c.runtime ?? {}),
+    args_template: c.runtime?.args_template ?? d.runtime.args_template,
+    env_inject: c.runtime?.env_inject ?? d.runtime.env_inject,
+  };
   return {
-    ...d,
-    ...c,
-    args_template: c.args_template ?? d.args_template,
-    env_inject: c.env_inject ?? d.env_inject,
+    binary: { ...d.binary, ...(c.binary ?? {}) },
+    runtime: mergedRuntime,
     sandbox: mergedSandbox,
   };
 }
@@ -49,12 +63,19 @@ export function ConfigStep({
 }) {
   const { t } = useTranslation();
   const [config, setConfig] = useState<CliToolConfig>(() => mergeWithDefaults(tool.config));
-  const [argsText, setArgsText] = useState(() => JSON.stringify(mergeWithDefaults(tool.config).args_template));
+  const [argsText, setArgsText] = useState(
+    () => JSON.stringify(mergeWithDefaults(tool.config).runtime.args_template),
+  );
   const [paramsSchemaText, setParamsSchemaText] = useState(
     JSON.stringify(tool.parameters_schema || {}, null, 2),
   );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const updateRuntime = (patch: Partial<RuntimeConfig>) =>
+    setConfig({ ...config, runtime: { ...config.runtime, ...patch } });
+  const updateSandbox = (patch: Partial<SandboxConfig>) =>
+    setConfig({ ...config, sandbox: { ...config.sandbox, ...patch } });
 
   const save = async () => {
     setError(null);
@@ -64,9 +85,21 @@ export function ConfigStep({
       if (!Array.isArray(parsedArgs)) throw new Error('args_template must be a JSON array');
       const parsedSchema = JSON.parse(paramsSchemaText);
 
+      // The update endpoint refuses any top-level `binary` or `config`
+      // key (extra=forbid) — we send only the two admin-editable
+      // subtrees. Binary metadata stays whatever the server already
+      // has for this tool.
+      const runtime: RuntimeConfig = {
+        ...defaultRuntimeConfig(),
+        ...config.runtime,
+        args_template: parsedArgs,
+      };
+      const sandbox: SandboxConfig = { ...defaultSandboxConfig(), ...config.sandbox };
+
       const updated = await cliToolsApi.update(tool.id, {
         parameters_schema: parsedSchema,
-        config: { ...config, args_template: parsedArgs },
+        runtime,
+        sandbox,
       });
       onUpdated(updated);
       onDone();
@@ -99,7 +132,7 @@ export function ConfigStep({
 
       <div>
         <label style={labelStyle}>{k('fieldEnvVars', 'Env vars')}</label>
-        <EnvGrid env={config.env_inject} onChange={(env) => setConfig({ ...config, env_inject: env })} />
+        <EnvGrid env={config.runtime.env_inject} onChange={(env) => updateRuntime({ env_inject: env })} />
       </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px' }}>
@@ -108,8 +141,8 @@ export function ConfigStep({
           <input
             type="number"
             className="form-input"
-            value={config.timeout_seconds}
-            onChange={(e) => setConfig({ ...config, timeout_seconds: Number(e.target.value) || 30 })}
+            value={config.runtime.timeout_seconds}
+            onChange={(e) => updateRuntime({ timeout_seconds: Number(e.target.value) || 30 })}
           />
         </div>
         <div>
@@ -117,7 +150,7 @@ export function ConfigStep({
           <input
             className="form-input"
             value={config.sandbox.cpu_limit}
-            onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, cpu_limit: e.target.value } })}
+            onChange={(e) => updateSandbox({ cpu_limit: e.target.value })}
           />
         </div>
         <div>
@@ -125,7 +158,7 @@ export function ConfigStep({
           <input
             className="form-input"
             value={config.sandbox.memory_limit}
-            onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, memory_limit: e.target.value } })}
+            onChange={(e) => updateSandbox({ memory_limit: e.target.value })}
           />
         </div>
       </div>
@@ -137,8 +170,8 @@ export function ConfigStep({
           className="form-input"
           min={0}
           max={10000}
-          value={config.rate_limit_per_minute}
-          onChange={(e) => setConfig({ ...config, rate_limit_per_minute: Math.max(0, Number(e.target.value) || 0) })}
+          value={config.runtime.rate_limit_per_minute}
+          onChange={(e) => updateRuntime({ rate_limit_per_minute: Math.max(0, Number(e.target.value) || 0) })}
         />
         <div style={hintStyle}>
           {k('rateLimitHint', '0 = unlimited. Protects against runaway agent loops.')}
@@ -150,7 +183,7 @@ export function ConfigStep({
           <input
             type="checkbox"
             checked={config.sandbox.network}
-            onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, network: e.target.checked } })}
+            onChange={(e) => updateSandbox({ network: e.target.checked })}
           />
           {k('fieldAllowNetwork', 'Allow network')}
         </label>
@@ -165,18 +198,14 @@ export function ConfigStep({
           <textarea
             className="form-input"
             value={(config.sandbox.egress_allowlist ?? []).join('\n')}
-            onChange={(e) => setConfig({
-              ...config,
-              sandbox: {
-                ...config.sandbox,
-                // Split on any run of newline/whitespace, trim, drop empty —
-                // operator-friendly: pasted comma- or space-separated lists
-                // also work, and trailing blank lines never produce a "".
-                egress_allowlist: e.target.value
-                  .split(/[\s,]+/)
-                  .map((h) => h.trim())
-                  .filter((h) => h.length > 0),
-              },
+            onChange={(e) => updateSandbox({
+              // Split on any run of newline/whitespace, trim, drop empty —
+              // operator-friendly: pasted comma- or space-separated lists
+              // also work, and trailing blank lines never produce a "".
+              egress_allowlist: e.target.value
+                .split(/[\s,]+/)
+                .map((h) => h.trim())
+                .filter((h) => h.length > 0),
             })}
             rows={3}
             placeholder="api.yeyecha.com&#10;registry.example.com"
@@ -192,8 +221,8 @@ export function ConfigStep({
         <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer' }}>
           <input
             type="checkbox"
-            checked={config.persistent_home}
-            onChange={(e) => setConfig({ ...config, persistent_home: e.target.checked })}
+            checked={config.runtime.persistent_home}
+            onChange={(e) => updateRuntime({ persistent_home: e.target.checked })}
           />
           {k('fieldPersistentHome', 'Persistent HOME per user')}
         </label>
@@ -209,9 +238,9 @@ export function ConfigStep({
           className="form-input"
           min={0}
           max={100000}
-          value={config.home_quota_mb}
-          disabled={!config.persistent_home}
-          onChange={(e) => setConfig({ ...config, home_quota_mb: Math.max(0, Number(e.target.value) || 0) })}
+          value={config.runtime.home_quota_mb}
+          disabled={!config.runtime.persistent_home}
+          onChange={(e) => updateRuntime({ home_quota_mb: Math.max(0, Number(e.target.value) || 0) })}
         />
         <div style={hintStyle}>
           {k('homeQuotaHint', 'Subsequent calls are rejected when exceeded. 0 = unlimited.')}
@@ -224,7 +253,7 @@ export function ConfigStep({
           className="form-input"
           value={config.sandbox.image ?? ''}
           placeholder={k('sandboxImagePlaceholder', '(blank = follow platform default stable)')}
-          onChange={(e) => setConfig({ ...config, sandbox: { ...config.sandbox, image: e.target.value.trim() || null } })}
+          onChange={(e) => updateSandbox({ image: e.target.value.trim() || null })}
         />
       </div>
 

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { CliTool } from './types';
-import { defaultCliToolConfig } from './types';
+import { defaultRuntimeConfig, defaultSandboxConfig } from './types';
 import { cliToolsApi } from './api';
 import { BasicInfoStep } from './steps/BasicInfoStep';
 import { BinaryStep } from './steps/BinaryStep';
@@ -20,16 +20,29 @@ export function CliToolWizard({
   const [step, setStep] = useState<Step>(1);
   const [draft, setDraft] = useState<CliTool | null>(tool);
 
+  // Basic-info submission carries only name / display_name / description.
+  // Binary metadata is never created-or-edited here; it appears later
+  // through the upload endpoint. Runtime + sandbox are seeded with the
+  // admin-editable defaults so the post-create row is immediately valid.
   const ensurePersisted = async (partial: Partial<CliTool>): Promise<CliTool> => {
     if (draft?.id) {
-      const updated = await cliToolsApi.update(draft.id, partial);
+      const updated = await cliToolsApi.update(draft.id, {
+        display_name: partial.display_name,
+        description: partial.description,
+      });
       setDraft(updated);
       return updated;
     }
+    if (!partial.name || !partial.display_name) {
+      throw new Error('name and display_name are required to create a CLI tool');
+    }
     const created = await cliToolsApi.create({
-      ...partial,
-      config: defaultCliToolConfig(),
+      name: partial.name,
+      display_name: partial.display_name,
+      description: partial.description ?? '',
       parameters_schema: {},
+      runtime: defaultRuntimeConfig(),
+      sandbox: defaultSandboxConfig(),
     });
     setDraft(created);
     return created;

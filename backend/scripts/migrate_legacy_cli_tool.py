@@ -23,7 +23,12 @@ from pathlib import Path
 
 from app.database import async_session
 from app.models.tool import Tool
-from app.services.cli_tools.schema import CliToolConfig
+from app.services.cli_tools.schema import (
+    BinaryMetadata,
+    CliToolConfig,
+    RuntimeConfig,
+    SandboxConfig,
+)
 from app.services.cli_tools.storage import BinaryStorage
 
 
@@ -53,15 +58,18 @@ async def _run(tool_id: str, source_path: str) -> None:
                 f.write(data)
             target.chmod(0o555)
 
-        old = tool.config or {}
+        # Round-trip the old shape through CliToolConfig so M1/M2 flat
+        # keys get lifted into the right subtree, then overwrite binary.
+        normalised = CliToolConfig.model_validate(tool.config or {})
         new = CliToolConfig(
-            binary_sha256=sha,
-            binary_size=len(data),
-            binary_original_name=src.name,
-            binary_uploaded_at=datetime.now(timezone.utc),
-            args_template=old.get("args_template", []),
-            env_inject=old.get("env_inject", {}),
-            timeout_seconds=old.get("timeout_seconds", 30),
+            binary=BinaryMetadata(
+                sha256=sha,
+                size=len(data),
+                original_name=src.name,
+                uploaded_at=datetime.now(timezone.utc),
+            ),
+            runtime=normalised.runtime or RuntimeConfig(),
+            sandbox=normalised.sandbox or SandboxConfig(),
         )
         tool.config = new.model_dump(mode="json")
         await db.commit()

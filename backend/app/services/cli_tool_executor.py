@@ -166,7 +166,7 @@ async def _check_rate_limit(
     fail-open: Redis outages log a warning and allow the call rather than
     breaking every CLI tool on the platform.
     """
-    if config.rate_limit_per_minute <= 0:
+    if config.runtime.rate_limit_per_minute <= 0:
         return
 
     limiter = rate_limiter
@@ -183,12 +183,12 @@ async def _check_rate_limit(
         tool.id,
         agent.id,
         user_id,
-        config.rate_limit_per_minute,
+        config.runtime.rate_limit_per_minute,
     )
     if not allowed:
         raise CliToolError(
             CliToolErrorClass.RATE_LIMITED,
-            f"rate limit exceeded: {count}/{config.rate_limit_per_minute} per minute",
+            f"rate limit exceeded: {count}/{config.runtime.rate_limit_per_minute} per minute",
         )
 
 
@@ -211,8 +211,8 @@ def _render_command(
         tenant={"id": str(agent.tenant_id) if agent.tenant_id else ""},
         params=dict(params),
     )
-    rendered_args = resolve_args(list(config.args_template), ctx)
-    rendered_env = {k: resolve(v, ctx) for k, v in config.env_inject.items()}
+    rendered_args = resolve_args(list(config.runtime.args_template), ctx)
+    rendered_env = {k: resolve(v, ctx) for k, v in config.runtime.env_inject.items()}
     return RenderedCommand(args=rendered_args, env=rendered_env)
 
 
@@ -230,15 +230,15 @@ def _prepare_paths(
     silently sharing a HOME across users would leak cached auth tokens.
     """
     tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"
-    binary_path = storage.resolve(tenant_key, str(tool.id), config.binary_sha256)
+    binary_path = storage.resolve(tenant_key, str(tool.id), config.binary.sha256)
     if not binary_path.is_file():
         raise CliToolError(
             CliToolErrorClass.NOT_FOUND,
-            f"binary {config.binary_sha256[:12]}... missing on disk",
+            f"binary {config.binary.sha256[:12]}... missing on disk",
         )
 
     home_host_path: str | None = None
-    if config.persistent_home:
+    if config.runtime.persistent_home:
         user_id = user_context.get("id") if user_context else None
         if not user_id:
             raise CliToolError(
@@ -259,19 +259,19 @@ def _prepare_paths(
         # accumulate. `os.walk` over a live HOME is sub-ms for typical
         # tool caches (tokens, a few config files) — we skip caching to
         # keep the code obvious; revisit if profiling says otherwise.
-        if config.home_quota_mb > 0:
+        if config.runtime.home_quota_mb > 0:
             within, current_bytes = store.check_quota(
                 tenant_id=tool.tenant_id,
                 tool_id=tool.id,
                 user_id=user_id,
-                limit_mb=config.home_quota_mb,
+                limit_mb=config.runtime.home_quota_mb,
             )
             if not within:
                 used_mb = current_bytes // (1024 * 1024)
                 raise CliToolError(
                     CliToolErrorClass.VALIDATION_ERROR,
                     f"home quota exceeded: {used_mb}MB used, "
-                    f"limit {config.home_quota_mb}MB. "
+                    f"limit {config.runtime.home_quota_mb}MB. "
                     f"Admin must clear the cache before new runs.",
                 )
 
@@ -357,8 +357,10 @@ async def execute_cli_tool(
         _check_access(tool, agent)
 
         # Add-only schema means older records tolerate default-filled fields.
+        # The model_validator accepts legacy flat + new nested, so older DB
+        # rows load without migration.
         config = CliToolConfig.model_validate(tool.config or {})
-        if not config.binary_sha256:
+        if not config.binary.sha256:
             raise CliToolError(CliToolErrorClass.NOT_FOUND, "tool has no binary uploaded yet")
 
         _validate_params(tool.parameters_schema, params)
@@ -405,7 +407,7 @@ async def execute_cli_tool(
             binary_host_path=paths.binary_path,
             args=cmd.args,
             env=cmd.env,
-            timeout_seconds=config.timeout_seconds,
+            timeout_seconds=config.runtime.timeout_seconds,
             home_host_path=paths.home_host_path,
             image=config.sandbox.image,
             cpu_limit=config.sandbox.cpu_limit,
@@ -421,7 +423,7 @@ async def execute_cli_tool(
                 "tool_name": tool_name_label,
                 "agent_id": str(agent.id),
                 "tenant_id": str(agent.tenant_id) if agent.tenant_id else None,
-                "binary_sha256": config.binary_sha256,
+                "binary_sha256": config.binary.sha256,
                 "duration_ms": result.duration_ms,
                 "exit_code": result.exit_code,
                 "timed_out": result.timed_out,

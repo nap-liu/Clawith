@@ -34,7 +34,15 @@ async def gc_cli_binaries(
     tools = result.scalars().all()
     referenced: set[str] = set()
     for tool in tools:
-        sha = (tool.config or {}).get("binary_sha256")
+        cfg = tool.config or {}
+        # Accept both the legacy M2 flat key and the new nested shape so
+        # the GC stays safe during a rolling upgrade (old rows and new
+        # rows coexist).
+        sha = cfg.get("binary_sha256")
+        if not (isinstance(sha, str) and len(sha) == 64):
+            binary_sub = cfg.get("binary")
+            if isinstance(binary_sub, dict):
+                sha = binary_sub.get("sha256")
         if isinstance(sha, str) and len(sha) == 64:
             referenced.add(sha)
 

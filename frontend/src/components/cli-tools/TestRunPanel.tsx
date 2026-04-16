@@ -43,7 +43,7 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
         <button
           className="btn btn-primary"
           style={{ padding: '4px 12px', fontSize: '12px' }}
-          disabled={running || !tool.config.binary_sha256}
+          disabled={running || !tool.config.binary.sha256}
           onClick={run}
         >
           {running ? k('running', 'Running…') : k('run', 'Run')}
@@ -74,7 +74,7 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
         </div>
       </div>
 
-      {!tool.config.binary_sha256 && (
+      {!tool.config.binary.sha256 && (
         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '6px' }}>
           {k('needBinary', 'Upload a binary first.')}
         </div>

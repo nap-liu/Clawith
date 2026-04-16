@@ -25,7 +25,7 @@ export function BinaryStep({
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const sha = tool.config.binary_sha256;
+  const sha = tool.config.binary.sha256;
 
   const upload = async (file: File) => {
     const warn = t(
@@ -53,11 +53,11 @@ export function BinaryStep({
         <label style={labelStyle}>{k('fieldBinary', 'Binary')}</label>
         {sha ? (
           <div className="card" style={{ padding: '10px 12px', fontSize: '12px' }}>
-            <div><strong>{tool.config.binary_original_name}</strong></div>
+            <div><strong>{tool.config.binary.original_name}</strong></div>
             <div style={{ color: 'var(--text-secondary)' }}>
-              {tool.config.binary_size?.toLocaleString()} bytes
-              {tool.config.binary_uploaded_at && (
-                <> · {new Date(tool.config.binary_uploaded_at).toLocaleString()}</>
+              {tool.config.binary.size?.toLocaleString()} bytes
+              {tool.config.binary.uploaded_at && (
+                <> · {new Date(tool.config.binary.uploaded_at).toLocaleString()}</>
               )}
             </div>
             <div style={{ color: 'var(--text-tertiary)', wordBreak: 'break-all', marginTop: '4px' }}>

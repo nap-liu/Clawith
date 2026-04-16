@@ -1,6 +1,35 @@
 // API wrappers for the CLI-tools backend at /api/tools/cli.
 
-import type { CliTool, TestRunRequest, TestRunResponse } from './types';
+import type {
+  CliTool,
+  RuntimeConfig,
+  SandboxConfig,
+  TestRunRequest,
+  TestRunResponse,
+} from './types';
+
+// Backend refuses any top-level `binary` or `config` key on create /
+// update (extra=forbid). Wire-level types here enumerate only the
+// admin-editable fields so TypeScript catches accidental regressions at
+// the call site.
+export interface CliToolCreateBody {
+  name: string;
+  display_name: string;
+  description?: string;
+  parameters_schema?: Record<string, unknown>;
+  runtime?: RuntimeConfig;
+  sandbox?: SandboxConfig;
+  tenant_id?: string | null;
+}
+
+export interface CliToolUpdateBody {
+  display_name?: string;
+  description?: string;
+  parameters_schema?: Record<string, unknown>;
+  runtime?: RuntimeConfig;
+  sandbox?: SandboxConfig;
+  is_active?: boolean;
+}
 
 function authHeader(): HeadersInit {
   const token = localStorage.getItem('token') || '';
@@ -29,10 +58,10 @@ export const cliToolsApi = {
 
   get: (id: string) => request<CliTool>(`/api/tools/cli/${id}`),
 
-  create: (body: Partial<CliTool>) =>
+  create: (body: CliToolCreateBody) =>
     request<CliTool>('/api/tools/cli', { method: 'POST', body: JSON.stringify(body) }),
 
-  update: (id: string, body: Partial<CliTool>) =>
+  update: (id: string, body: CliToolUpdateBody) =>
     request<CliTool>(`/api/tools/cli/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
 
   delete: (id: string) =>
