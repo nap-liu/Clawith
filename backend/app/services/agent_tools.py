@@ -8535,36 +8535,54 @@ async def _try_execute_cli_tool(
 ) -> Optional[str]:
     """Try to execute a CLI-type tool. Returns None if tool is not CLI type."""
     try:
-        from app.models.tool import Tool, AgentTool
+        from app.models.tool import Tool
+        from app.models.agent import Agent
+        from app.models.user import User
+        from app.services.cli_tool_executor import execute_cli_tool
+        from app.services.cli_tools.errors import CliToolError
+        from app.services.cli_tools.storage import BinaryStorage
+        from app.services.sandbox.local.binary_runner import BinaryRunner
 
         async with async_session() as db:
-            result = await db.execute(
+            tool = (await db.execute(
                 select(Tool).where(Tool.name == tool_name, Tool.type == "cli")
-            )
-            tool = result.scalar_one_or_none()
-
+            )).scalar_one_or_none()
             if not tool:
                 return None  # Not a CLI tool, let MCP handle it
 
-            # Load per-agent config override
-            agent_config = {}
-            if agent_id:
-                at_r = await db.execute(
-                    select(AgentTool).where(
-                        AgentTool.agent_id == agent_id,
-                        AgentTool.tool_id == tool.id,
-                    )
-                )
-                at = at_r.scalar_one_or_none()
-                agent_config = (at.config or {}) if at else {}
+            if not agent_id:
+                return "❌ CLI tool invocation requires an agent context"
+            agent = (await db.execute(
+                select(Agent).where(Agent.id == agent_id)
+            )).scalar_one_or_none()
+            if not agent:
+                return "❌ agent not found"
 
-        # Merge global + agent config
-        merged_config = {**(tool.config or {}), **agent_config}
+            user_context = {"id": "", "phone": "", "email": ""}
+            if user_id:
+                user = await db.get(User, user_id)
+                if user:
+                    user_context = {
+                        "id": str(user.id),
+                        "phone": str(user.primary_mobile or ""),
+                        "email": str(user.email or ""),
+                    }
 
-        from app.services.cli_tool_executor import execute_cli_tool
+        storage = BinaryStorage(root=Path("/data/cli_binaries"))
+        runner = BinaryRunner(image="clawith-cli-sandbox:stable")
 
-        work_dir = str(ws) if ws else None
-        return await execute_cli_tool(merged_config, arguments, user_id=user_id, work_dir=work_dir)
+        try:
+            exec_result = await execute_cli_tool(
+                tool=tool,
+                agent=agent,
+                params=arguments,
+                user_context=user_context,
+                storage=storage,
+                runner=runner,
+            )
+            return exec_result.stdout or "(no output)"
+        except CliToolError as exc:
+            return f"❌ [{exc.error_class.value}] {exc.message}"
 
     except Exception as e:
         logger.exception(f"[CLI Tool] Execution error for {tool_name}")

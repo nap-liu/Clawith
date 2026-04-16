@@ -1,148 +1,137 @@
-"""CLI tool executor for Clawith.
+"""Execute a CLI tool: tenant check -> schema -> placeholders -> binary runner.
 
-Executes registered CLI binaries as agent tools with platform-injected
-user context via environment variables.
-
-Tool config example:
-{
-    "binary": "/app/svc",
-    "env_inject": {
-        "SVC_USER_PHONE": "$user.phone",
-        "SVC_USER_ID": "$user.id"
-    },
-    "timeout": 30
-}
+This replaces the pre-M2 executor. The call site in `agent_tools.py` is
+updated to pass DB objects rather than raw dicts.
 """
 
-import asyncio
-import os
-import shlex
-import uuid
-from pathlib import Path
-from typing import Optional
+from __future__ import annotations
 
-from loguru import logger
+import logging
+from dataclasses import dataclass
+from typing import Any, Mapping
+
+import jsonschema
+
+from app.services.cli_tools.crypto import decrypt_env
+from app.services.cli_tools.errors import CliToolError, CliToolErrorClass
+from app.services.cli_tools.placeholders import (
+    InvalidPlaceholderError,
+    PlaceholderContext,
+    render,
+)
+from app.services.cli_tools.schema import CliToolConfig
+from app.services.cli_tools.storage import BinaryStorage
+from app.services.sandbox.local.binary_runner import BinaryRunner, BinaryRunResult
+
+logger = logging.getLogger(__name__)
 
 
-# Characters that could enable command injection
-_DANGEROUS_CHARS = [';', '|', '&', '`', '$(', '${', '\n', '\r']
+@dataclass
+class CliExecutionResult:
+    exit_code: int
+    stdout: str
+    stderr: str
+    duration_ms: int
 
 
 async def execute_cli_tool(
-    tool_config: dict,
-    arguments: dict,
-    user_id: Optional[uuid.UUID] = None,
-    work_dir: Optional[str] = None,
-) -> str:
-    """Execute a CLI tool with injected user context.
+    *,
+    tool: Any,
+    agent: Any,
+    params: Mapping[str, Any],
+    user_context: Mapping[str, str],
+    storage: BinaryStorage,
+    runner: BinaryRunner,
+) -> CliExecutionResult:
+    """Execute `tool` (a Tool ORM row) against `agent` (an Agent ORM row).
 
-    Args:
-        tool_config: Tool's config from DB (binary, env_inject, timeout)
-        arguments: Tool call arguments from agent (command string)
-        user_id: Current conversation user's ID
-        work_dir: Working directory for the process
+    Raises CliToolError with an explicit error_class on any validation,
+    permission, or execution failure.
     """
-    binary = tool_config.get("binary")
-    if not binary:
-        return "❌ CLI tool config missing 'binary' path"
+    if not tool.enabled:
+        raise CliToolError(CliToolErrorClass.PERMISSION_DENIED, "tool is disabled")
 
-    if not Path(binary).exists():
-        return f"❌ CLI binary not found: {binary}"
+    if tool.tenant_id is not None and tool.tenant_id != agent.tenant_id:
+        raise CliToolError(CliToolErrorClass.PERMISSION_DENIED, "tool not available to this tenant")
 
-    command = arguments.get("command", "").strip()
-    if not command:
-        return "❌ No command provided"
+    # Parse config — add-only schema means older records tolerate default-filled.
+    config = CliToolConfig.model_validate(tool.config or {})
 
-    timeout = tool_config.get("timeout", 30)
+    if not config.binary_sha256:
+        raise CliToolError(CliToolErrorClass.NOT_FOUND, "tool has no binary uploaded yet")
 
-    # 1. Security: reject dangerous characters
-    for char in _DANGEROUS_CHARS:
-        if char in command:
-            logger.warning(f"[CLI Tool] Blocked dangerous char in command: {repr(char)}")
-            return f"❌ Command contains unsafe character: {repr(char)}"
+    schema = dict(tool.parameters_schema or {})
+    if schema:
+        try:
+            jsonschema.validate(instance=dict(params), schema=schema)
+        except jsonschema.ValidationError as exc:
+            raise CliToolError(CliToolErrorClass.VALIDATION_ERROR, exc.message) from exc
 
-    # 2. Resolve env_inject placeholders
-    env_inject = tool_config.get("env_inject", {})
-    resolved_env = {}
-    if env_inject and user_id:
-        user_context = await _resolve_user_context(user_id)
-        for env_key, placeholder in env_inject.items():
-            value = _resolve_placeholder(placeholder, user_context)
-            if value is not None:
-                resolved_env[env_key] = str(value)
-                logger.debug(f"[CLI Tool] Injected env: {env_key}=***")
+    ctx = PlaceholderContext(
+        user=dict(user_context),
+        agent={"id": str(agent.id)},
+        tenant={"id": str(agent.tenant_id) if agent.tenant_id else ""},
+        params={k: str(v) for k, v in params.items()},
+    )
 
-    # 3. Build safe environment
-    safe_env = dict(os.environ)
-    if work_dir:
-        safe_env["HOME"] = work_dir
-    safe_env.update(resolved_env)
-
-    # 4. Parse command into args array (prevents shell injection)
     try:
-        args = shlex.split(command)
-    except ValueError as e:
-        return f"❌ Invalid command syntax: {e}"
+        rendered_args = [render(a, ctx) for a in config.args_template]
+        decrypted_env = decrypt_env(dict(config.env_inject))
+        rendered_env = {k: render(v, ctx) for k, v in decrypted_env.items()}
+    except InvalidPlaceholderError as exc:
+        raise CliToolError(CliToolErrorClass.VALIDATION_ERROR, str(exc)) from exc
 
-    logger.info(f"[CLI Tool] Executing: {binary} {' '.join(args[:5])}...")
-
-    # 5. Execute
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            binary, *args,
-            cwd=work_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=safe_env,
+    tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"
+    binary_path = storage.resolve(tenant_key, str(tool.id), config.binary_sha256)
+    if not binary_path.is_file():
+        raise CliToolError(
+            CliToolErrorClass.NOT_FOUND,
+            f"binary {config.binary_sha256[:12]}... missing on disk",
         )
 
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            return f"❌ Command timed out after {timeout}s"
+    # Build a per-execute runner with the tool's own sandbox overrides.
+    configured_runner = runner.__class__(
+        image=config.sandbox.image or runner.image,
+        cpu_limit=config.sandbox.cpu_limit,
+        memory_limit=config.sandbox.memory_limit,
+        network=config.sandbox.network,
+    )
 
-        output = stdout.decode("utf-8").strip()
-        if proc.returncode != 0 and not output:
-            error = stderr.decode("utf-8").strip()
-            return f"❌ Command failed (exit {proc.returncode}): {error[:500]}"
+    result: BinaryRunResult = await configured_runner.run(
+        binary_host_path=str(binary_path),
+        args=rendered_args,
+        env=rendered_env,
+        timeout_seconds=config.timeout_seconds,
+    )
 
-        return output
+    logger.info(
+        "cli_tool.executed",
+        extra={
+            "tool_id": str(tool.id),
+            "agent_id": str(agent.id),
+            "tenant_id": str(agent.tenant_id) if agent.tenant_id else None,
+            "binary_sha256": config.binary_sha256,
+            "duration_ms": result.duration_ms,
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "sandbox_failed": result.sandbox_failed,
+        },
+    )
 
-    except Exception as e:
-        logger.exception(f"[CLI Tool] Execution error")
-        return f"❌ Execution error: {str(e)[:200]}"
+    if result.sandbox_failed:
+        raise CliToolError(CliToolErrorClass.SANDBOX_FAILED, result.error)
+    if result.timed_out:
+        raise CliToolError(CliToolErrorClass.TIMEOUT, "binary exceeded timeout_seconds")
+    if result.exit_code != 0:
+        tail = result.stderr[-200:] if result.stderr else ""
+        raise CliToolError(
+            CliToolErrorClass.BINARY_FAILED,
+            f"exit={result.exit_code}; stderr={tail}",
+        )
 
-
-async def _resolve_user_context(user_id: uuid.UUID) -> dict:
-    """Look up user info from DB for placeholder resolution."""
-    try:
-        from app.database import async_session
-        from sqlalchemy import text
-
-        async with async_session() as db:
-            result = await db.execute(
-                text("SELECT i.phone, i.email FROM users u JOIN identities i ON u.identity_id = i.id WHERE u.id = :uid"),
-                {"uid": str(user_id)},
-            )
-            row = result.first()
-
-            return {
-                "user.id": str(user_id),
-                "user.phone": row[0] if row else None,
-                "user.email": row[1] if row else None,
-            }
-    except Exception as e:
-        logger.warning(f"[CLI Tool] Failed to resolve user context: {e}")
-        return {"user.id": str(user_id)}
-
-
-def _resolve_placeholder(placeholder: str, context: dict) -> Optional[str]:
-    """Resolve $user.phone style placeholders."""
-    if isinstance(placeholder, str) and placeholder.startswith("$"):
-        key = placeholder[1:]
-        return context.get(key)
-    return placeholder
+    return CliExecutionResult(
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        duration_ms=result.duration_ms,
+    )
