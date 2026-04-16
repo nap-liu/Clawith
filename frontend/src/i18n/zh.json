@@ -1382,6 +1382,10 @@
         "fieldAllowNetwork": "允许联网",
         "fieldEgressAllowlist": "出站白名单",
         "egressAllowlistHint": "每行一个主机名。留空表示允许全部(默认)。当前版本:仅透传给工具环境变量 CLAWITH_EGRESS_ALLOWLIST,不是内核级 enforcement——真正的限制(tinyproxy / nftables)留给下一阶段的 infra PR。",
+        "fieldSandboxBackend": "沙箱后端",
+        "backendDocker": "docker(默认,强隔离,冷启动 ~300ms)",
+        "backendBwrap": "bwrap(仅 Linux,~30ms — 隔离较弱,仅供可信工具使用)",
+        "sandboxBackendHint": "docker:独立命名空间 + 默认 seccomp,可移植;bwrap:共内核命名空间隔离,更快,需要 Linux 主机安装 bubblewrap。",
         "fieldSandboxImage": "沙箱镜像",
         "sandboxImagePlaceholder": "(留空则跟随平台默认 stable)",
         "fieldParametersSchema": "参数 Schema(JSON Schema)"

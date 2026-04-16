@@ -248,6 +248,21 @@ export function ConfigStep({
       </div>
 
       <div>
+        <label style={labelStyle}>{k('fieldSandboxBackend', 'Sandbox backend')}</label>
+        <select
+          className="form-input"
+          value={config.sandbox.backend}
+          onChange={(e) => updateSandbox({ backend: e.target.value as 'docker' | 'bwrap' })}
+        >
+          <option value="docker">{k('backendDocker', 'docker (default, strong isolation, ~300ms cold start)')}</option>
+          <option value="bwrap">{k('backendBwrap', 'bwrap (Linux only, ~30ms — lower isolation, trusted tools only)')}</option>
+        </select>
+        <div style={hintStyle}>
+          {k('sandboxBackendHint', 'docker: separate namespaces + seccomp default, portable. bwrap: same-kernel namespace isolation, faster; requires Linux host with bubblewrap installed.')}
+        </div>
+      </div>
+
+      <div>
         <label style={labelStyle}>{k('fieldSandboxImage', 'Sandbox image')}</label>
         <input
           className="form-input"
