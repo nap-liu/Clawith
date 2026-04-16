@@ -29,8 +29,10 @@ ss-nodes.json
 _agent/
 _agents/
 
-# Internal docs
-docs/
+# Internal docs (generated artefacts etc.)
+docs/*
+# ...except design specs, which are tracked
+!docs/superpowers/
 
 # Local worktrees
 .worktrees/
