@@ -18,6 +18,7 @@ class CliToolErrorClass(str, Enum):
     RESOURCE_LIMIT = "RESOURCE_LIMIT"
     BINARY_FAILED = "BINARY_FAILED"
     SANDBOX_FAILED = "SANDBOX_FAILED"
+    RATE_LIMITED = "RATE_LIMITED"
 
 
 @dataclass
