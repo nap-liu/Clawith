@@ -13,7 +13,11 @@ if [ "$(id -u)" = '0' ]; then
     echo "[entrypoint] Detected root user, fixing permissions..."
     # Ensure directories exist and are owned by clawith
     chown -R clawith:clawith ${AGENT_DATA_DIR}
-    
+    # CLI-tool binaries volume — docker creates it as root on first mount
+    if [ -d /data/cli_binaries ]; then
+        chown -R clawith:clawith /data/cli_binaries
+    fi
+
     echo "[entrypoint] Dropping privileges to 'clawith' and re-executing..."
     exec gosu clawith /bin/bash "$0" "$@"
 fi
