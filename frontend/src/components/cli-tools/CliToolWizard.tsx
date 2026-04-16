@@ -44,47 +44,46 @@ export function CliToolWizard({
 
   return (
     <div
-      className="modal-overlay"
       style={{
-        position: 'fixed',
-        inset: 0,
+        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
         background: 'rgba(0,0,0,0.5)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 1000,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        zIndex: 10000,
       }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
       <div
-        className="modal-content wide"
         style={{
           background: 'var(--bg-primary)',
-          borderRadius: 8,
-          width: 640,
+          borderRadius: '12px',
+          width: '640px',
+          maxWidth: '90vw',
           maxHeight: '90vh',
           overflow: 'auto',
+          border: '1px solid var(--border-subtle)',
+          boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
         }}
       >
         <div
-          className="wizard-tabs"
           style={{
             display: 'flex',
-            borderBottom: '1px solid var(--border)',
+            borderBottom: '1px solid var(--border-subtle)',
           }}
         >
           {labels.map((label, idx) => {
             const n = (idx + 1) as Step;
+            const active = step === n;
             return (
               <div
                 key={label}
-                className={`wizard-tab ${step === n ? 'active' : ''}`}
                 style={{
                   flex: 1,
-                  padding: 12,
+                  padding: '14px 12px',
                   textAlign: 'center',
-                  borderBottom: step === n ? '2px solid var(--accent-primary)' : 'none',
-                  color: step === n ? 'var(--accent-primary)' : 'var(--text-secondary)',
-                  fontWeight: step === n ? 600 : 400,
+                  fontSize: '13px',
+                  borderBottom: active ? '2px solid var(--accent-primary)' : '2px solid transparent',
+                  color: active ? 'var(--accent-primary)' : 'var(--text-secondary)',
+                  fontWeight: active ? 600 : 400,
                 }}
               >
                 {n}. {label}
