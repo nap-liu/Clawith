@@ -56,10 +56,14 @@ services:
       # this volume on first use to learn where `_data` lives, then
       # rewrites the prefix before calling the daemon.
       CLI_BINARIES_VOLUME_NAME: ${COMPOSE_PROJECT_NAME:-clawith}_cli_binaries
+      # Per-(tool,user) persistent HOME for stateful CLIs (login tokens,
+      # caches). Same DooD path-remap rule as cli_binaries.
+      CLI_STATE_VOLUME_NAME: ${COMPOSE_PROJECT_NAME:-clawith}_cli_tool_state
     volumes:
       - ./backend:/app
       - ./backend/agent_data:/data/agents
       - cli_binaries:/data/cli_binaries
+      - cli_tool_state:/data/cli_state
       - /var/run/docker.sock:/var/run/docker.sock
       - ./ss-nodes.json:/data/ss-nodes.json:ro
     depends_on:
@@ -89,6 +93,7 @@ volumes:
   pgdata:
   redisdata:
   cli_binaries:
+  cli_tool_state:
 
 
 networks:

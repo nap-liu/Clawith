@@ -47,6 +47,13 @@ class CliToolConfig(BaseModel):
     env_inject: dict[str, str] = Field(default_factory=dict)
     timeout_seconds: int = Field(default=30, gt=0, le=600)
 
+    # Per-(tenant,tool,user) persistent HOME. When true, the sandbox HOME
+    # is a rw bind mount surviving across runs — needed for login tokens
+    # and caches (svc, gh, kubectl). When false, HOME is /tmp tmpfs and
+    # everything is wiped each run. Off by default: most CLIs are
+    # stateless and don't deserve disk.
+    persistent_home: bool = False
+
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
 
     @field_validator("binary_sha256")

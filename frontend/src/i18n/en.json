@@ -525,6 +525,8 @@
         "envValuePlaceholder": "value",
         "envAdd": "Add",
         "envRemove": "Remove",
+        "fieldPersistentHome": "Persistent HOME per user",
+        "persistentHomeHint": "Each (tool, user) keeps its own rw HOME across calls. Needed for tools that cache login tokens (svc, gh, kubectl). Off = ephemeral /tmp each run.",
         "fieldTimeout": "Timeout (s)",
         "fieldCpu": "CPU",
         "fieldMemory": "Memory",

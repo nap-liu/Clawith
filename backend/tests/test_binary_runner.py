@@ -114,7 +114,12 @@ async def test_binary_runner_passes_sandbox_flags_to_docker(tmp_path):
     create_kwargs = client.containers.create.call_args.kwargs
     assert create_kwargs["image"] == "clawith-cli-sandbox:local-test"
     assert create_kwargs["command"] == ["/binary", "--flag"]
-    assert create_kwargs["environment"] == {"K": "v"}
+    # Tool-provided env is layered on top of the baseline HOME/XDG/PATH
+    # defaults (see BinaryRunner._DEFAULT_ENV); only the tool key needs
+    # to be asserted here.
+    assert create_kwargs["environment"]["K"] == "v"
+    assert create_kwargs["environment"]["HOME"] == "/tmp"
+    assert "PATH" in create_kwargs["environment"]
     assert create_kwargs["network_disabled"] is True
     assert create_kwargs["read_only"] is True
     assert create_kwargs["user"] == "65534:65534"

@@ -15,10 +15,15 @@ export interface CliToolConfig {
   binary_original_name: string | null;
   binary_uploaded_at: string | null;
   args_template: string[];
-  // Values returned by the backend are redacted to "***"; on save the
-  // frontend sends plaintext and the backend encrypts.
+  // Plaintext — values are literal text the operator typed or a single
+  // `$user.phone`-style placeholder that the executor resolves at
+  // runtime. No masking.
   env_inject: Record<string, string>;
   timeout_seconds: number;
+  // When true, each (tool, user) pair keeps its own rw HOME across
+  // invocations — required for tools that cache login tokens (svc, gh,
+  // kubectl). Default false: stateless tools get an ephemeral /tmp HOME.
+  persistent_home: boolean;
   sandbox: SandboxConfig;
 }
 
@@ -57,6 +62,7 @@ export function defaultCliToolConfig(): CliToolConfig {
     args_template: [],
     env_inject: {},
     timeout_seconds: 30,
+    persistent_home: false,
     sandbox: {
       cpu_limit: '1.0',
       memory_limit: '512m',

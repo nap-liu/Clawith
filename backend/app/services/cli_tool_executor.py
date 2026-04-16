@@ -15,6 +15,7 @@ import jsonschema
 from app.services.cli_tools.errors import CliToolError, CliToolErrorClass
 from app.services.cli_tools.placeholders import PlaceholderContext, resolve, resolve_args
 from app.services.cli_tools.schema import CliToolConfig
+from app.services.cli_tools.state_storage import StateStorage
 from app.services.cli_tools.storage import BinaryStorage
 from app.services.sandbox.local.binary_runner import BinaryRunner, BinaryRunResult
 
@@ -37,6 +38,7 @@ async def execute_cli_tool(
     user_context: Mapping[str, str],
     storage: BinaryStorage,
     runner: BinaryRunner,
+    state_storage: StateStorage | None = None,
 ) -> CliExecutionResult:
     """Execute `tool` (a Tool ORM row) against `agent` (an Agent ORM row).
 
@@ -83,6 +85,25 @@ async def execute_cli_tool(
             f"binary {config.binary_sha256[:12]}... missing on disk",
         )
 
+    # Persistent HOME: (tenant, tool, user) scoped rw directory. Required
+    # for svc-style tools that cache login tokens. Without a user_id we
+    # refuse rather than silently letting everyone share a HOME — that
+    # would be a data-leak vector for any tool relying on cached auth.
+    home_host_path: str | None = None
+    if config.persistent_home:
+        user_id = user_context.get("id") if user_context else None
+        if not user_id:
+            raise CliToolError(
+                CliToolErrorClass.VALIDATION_ERROR,
+                "tool requires persistent HOME but no user_id is available in the request context",
+            )
+        store = state_storage or StateStorage()
+        home_host_path = str(store.ensure_home(
+            tenant_id=tool.tenant_id,
+            tool_id=tool.id,
+            user_id=user_id,
+        ))
+
     # Build a per-execute runner with the tool's own sandbox overrides.
     configured_runner = runner.__class__(
         image=config.sandbox.image or runner.image,
@@ -96,6 +117,7 @@ async def execute_cli_tool(
         args=rendered_args,
         env=rendered_env,
         timeout_seconds=config.timeout_seconds,
+        home_host_path=home_host_path,
     )
 
     logger.info(

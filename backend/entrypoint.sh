@@ -17,6 +17,20 @@ if [ "$(id -u)" = '0' ]; then
     if [ -d /data/cli_binaries ]; then
         chown -R clawith:clawith /data/cli_binaries
     fi
+    # CLI-tool persistent-HOME state. Two containers need to share this
+    # tree: backend (uid 1000 'clawith') mkdirs subtrees; sandbox (uid
+    # 65534 'nobody') reads+writes inside them. We align them through a
+    # shared group:
+    #   1. Add clawith to gid 65534 (nogroup) so mkdir-from-backend can
+    #      create dirs the sandbox can traverse.
+    #   2. chown /data/cli_state to 1000:65534 and set mode 2775 — setgid
+    #      makes new subdirs inherit gid 65534, giving the sandbox group
+    #      rwx on every leaf without any further chown calls.
+    if [ -d /data/cli_state ]; then
+        usermod -aG 65534 clawith 2>/dev/null || true
+        chown clawith:65534 /data/cli_state
+        chmod 2775 /data/cli_state
+    fi
     # CLI-tool sandbox needs to talk to the host docker daemon; the bind-
     # mounted socket is 0660 root:root, so hand its group to clawith.
     if [ -S /var/run/docker.sock ]; then

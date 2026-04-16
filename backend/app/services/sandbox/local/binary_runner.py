@@ -49,52 +49,59 @@ class BinaryRunResult:
 
 
 class HostPathResolver:
-    """Rewrite a container-visible path to its host-visible counterpart.
+    """Rewrite container-visible paths to their host-visible counterparts.
 
-    Configured with (container_root, volume_name). The first call inspects
-    the named docker volume to discover where its `_data` lives on the
-    host and caches that mountpoint for subsequent calls.
+    Configured with a set of (container_root, volume_name) mappings. On
+    first use, each mapping's named docker volume is inspected to
+    discover where its `_data` lives on the host and that mountpoint is
+    cached.
 
-    If the env isn't running docker-out-of-docker (no such volume, or the
-    path already lives on the host fs because compose used a bind mount),
-    `resolve()` returns the input unchanged.
+    `resolve(path)` tries each mapping; a path under an unmapped or
+    unresolvable root is returned unchanged (works for bind mounts, k8s
+    PVs, or non-container dev envs).
     """
 
-    def __init__(self, client, container_root: str, volume_name: str | None) -> None:
+    def __init__(self, client, mappings: dict[str, str | None]) -> None:
         self._client = client
-        self._container_root = PurePosixPath(container_root)
-        self._volume_name = volume_name
-        self._host_root: PurePosixPath | None = None
-        self._probed = False
+        # Longest-prefix-first so a deeper mount wins over a shallower one.
+        self._mappings: list[tuple[PurePosixPath, str | None]] = sorted(
+            ((PurePosixPath(root), vol) for root, vol in mappings.items()),
+            key=lambda m: len(str(m[0])),
+            reverse=True,
+        )
+        self._host_roots: dict[PurePosixPath, PurePosixPath | None] = {}
 
-    def _probe(self) -> None:
-        if self._probed:
-            return
-        self._probed = True
-        if not self._volume_name:
-            return
-        try:
-            vol = self._client.volumes.get(self._volume_name)
-        except NotFound:
-            logger.info("cli-tools volume %r not found; skipping path remap",
-                        self._volume_name)
-            return
-        mountpoint = vol.attrs.get("Mountpoint")
-        if mountpoint:
-            self._host_root = PurePosixPath(mountpoint)
-            logger.info("cli-tools host-path remap: %s -> %s",
-                        self._container_root, self._host_root)
+    def _host_root_for(self, container_root: PurePosixPath,
+                       volume_name: str | None) -> PurePosixPath | None:
+        if container_root in self._host_roots:
+            return self._host_roots[container_root]
+        host_root: PurePosixPath | None = None
+        if volume_name:
+            try:
+                vol = self._client.volumes.get(volume_name)
+                mountpoint = vol.attrs.get("Mountpoint")
+                if mountpoint:
+                    host_root = PurePosixPath(mountpoint)
+                    logger.info("cli-tools host-path remap: %s -> %s",
+                                container_root, host_root)
+            except NotFound:
+                logger.info("cli-tools volume %r not found; skipping remap",
+                            volume_name)
+        self._host_roots[container_root] = host_root
+        return host_root
 
     def resolve(self, container_path: str) -> str:
-        self._probe()
-        if self._host_root is None:
-            return container_path
         p = PurePosixPath(container_path)
-        try:
-            relative = p.relative_to(self._container_root)
-        except ValueError:
-            return container_path
-        return str(self._host_root / relative)
+        for container_root, volume_name in self._mappings:
+            try:
+                relative = p.relative_to(container_root)
+            except ValueError:
+                continue
+            host_root = self._host_root_for(container_root, volume_name)
+            if host_root is None:
+                return container_path
+            return str(host_root / relative)
+        return container_path
 
 
 class BinaryRunner:
@@ -119,8 +126,12 @@ class BinaryRunner:
         self._client = docker.from_env()
         self._host_path_resolver = HostPathResolver(
             client=self._client,
-            container_root=os.environ.get("CLI_BINARIES_ROOT", "/data/cli_binaries"),
-            volume_name=os.environ.get("CLI_BINARIES_VOLUME_NAME"),
+            mappings={
+                os.environ.get("CLI_BINARIES_ROOT", "/data/cli_binaries"):
+                    os.environ.get("CLI_BINARIES_VOLUME_NAME"),
+                os.environ.get("CLI_STATE_ROOT", "/data/cli_state"):
+                    os.environ.get("CLI_STATE_VOLUME_NAME"),
+            },
         )
 
     async def run(
@@ -129,6 +140,7 @@ class BinaryRunner:
         args: Sequence[str],
         env: Mapping[str, str],
         timeout_seconds: int = 30,
+        home_host_path: str | None = None,
     ) -> BinaryRunResult:
         """Execute `binary_host_path` inside a one-shot sandbox container.
 
@@ -138,6 +150,10 @@ class BinaryRunner:
             args: arguments passed to the binary.
             env: environment variables passed to the container.
             timeout_seconds: kill the container if it runs longer than this.
+            home_host_path: absolute path on the host to a per-(tool,user)
+                directory that will be mounted rw at /home/sandbox and
+                used as HOME. Persists across runs. Omit for stateless
+                tools — they get an ephemeral /tmp HOME.
         """
         container_path = Path(binary_host_path).resolve()
         if not container_path.is_file():
@@ -153,6 +169,11 @@ class BinaryRunner:
         # The path the backend container sees is not the path the docker
         # daemon sees when we're running docker-out-of-docker. Translate.
         daemon_path = self._host_path_resolver.resolve(str(container_path))
+        daemon_home = (
+            self._host_path_resolver.resolve(home_host_path)
+            if home_host_path
+            else None
+        )
 
         start = time.monotonic()
         try:
@@ -162,6 +183,7 @@ class BinaryRunner:
                 list(args),
                 dict(env),
                 timeout_seconds,
+                daemon_home,
             )
         except ImageNotFound as exc:
             return BinaryRunResult(
@@ -196,7 +218,8 @@ class BinaryRunner:
     # nobody's HOME in /etc/passwd is `/nonexistent`, so any runtime that
     # touches HOME (Bun, Node npm, pip, …) crashes with EROFS. Pointing
     # HOME and XDG_* into the /tmp tmpfs makes those write attempts land
-    # somewhere writable — per-invocation, ephemeral.
+    # somewhere writable — per-invocation, ephemeral. Stateful tools
+    # override HOME via `home_mount` (see _run_blocking).
     _DEFAULT_ENV: dict[str, str] = {
         "HOME": "/tmp",
         "TMPDIR": "/tmp",
@@ -207,17 +230,43 @@ class BinaryRunner:
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     }
 
+    # When a persistent HOME is bind-mounted, it replaces the tmpfs
+    # defaults. XDG_* also move under the persistent root so caches and
+    # config land in the same place the tool thinks is "home".
+    _PERSISTENT_HOME_ENV: dict[str, str] = {
+        "HOME": "/home/sandbox",
+        "XDG_CACHE_HOME": "/home/sandbox/.cache",
+        "XDG_CONFIG_HOME": "/home/sandbox/.config",
+        "XDG_DATA_HOME": "/home/sandbox/.local/share",
+        "XDG_STATE_HOME": "/home/sandbox/.local/state",
+    }
+
     def _run_blocking(
         self,
         host_path: str,
         args: list[str],
         env: dict[str, str],
         timeout_seconds: int,
+        home_host_path: str | None = None,
     ) -> BinaryRunResult:
         """Synchronous docker-SDK invocation; called in a thread."""
-        # Tool-provided env wins over the baseline — operators can still
-        # override HOME / PATH if their binary needs something unusual.
-        merged_env = {**self._DEFAULT_ENV, **env}
+        # Layer: defaults < persistent-home defaults (if any) < tool env.
+        # Operators always win — if they pin HOME somewhere unusual,
+        # that's their call.
+        merged_env: dict[str, str] = {**self._DEFAULT_ENV}
+        if home_host_path:
+            merged_env.update(self._PERSISTENT_HOME_ENV)
+        merged_env.update(env)
+
+        volumes: dict[str, dict[str, str]] = {
+            host_path: {"bind": "/binary", "mode": "ro"},
+        }
+        if home_host_path:
+            # rw so the tool can write login tokens / caches; no-new-
+            # privileges + cap-drop are still in force so this can't be
+            # used to escape the sandbox.
+            volumes[home_host_path] = {"bind": "/home/sandbox", "mode": "rw"}
+
         container = self._client.containers.create(
             image=self.image,
             command=["/binary", *args],
@@ -231,7 +280,7 @@ class BinaryRunner:
             user="65534:65534",
             security_opt=["no-new-privileges"],
             cap_drop=["ALL"],
-            volumes={host_path: {"bind": "/binary", "mode": "ro"}},
+            volumes=volumes,
         )
 
         timed_out = False

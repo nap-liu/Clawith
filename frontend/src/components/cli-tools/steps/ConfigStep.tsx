@@ -138,6 +138,20 @@ export function ConfigStep({
       </div>
 
       <div>
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={config.persistent_home}
+            onChange={(e) => setConfig({ ...config, persistent_home: e.target.checked })}
+          />
+          {k('fieldPersistentHome', 'Persistent HOME per user')}
+        </label>
+        <div style={hintStyle}>
+          {k('persistentHomeHint', 'Each (tool, user) keeps its own rw HOME across calls. Needed for tools that cache login tokens (svc, gh, kubectl). Off = ephemeral /tmp each run.')}
+        </div>
+      </div>
+
+      <div>
         <label style={labelStyle}>{k('fieldSandboxImage', 'Sandbox image')}</label>
         <input
           className="form-input"

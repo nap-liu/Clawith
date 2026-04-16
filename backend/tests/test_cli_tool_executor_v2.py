@@ -231,6 +231,107 @@ async def test_executor_resolves_args_and_env_placeholders():
 
 
 @pytest.mark.asyncio
+async def test_executor_mounts_persistent_home_when_configured(tmp_path):
+    """persistent_home=True must bind-mount the per-(tool,user) dir."""
+    from app.services.cli_tools.state_storage import StateStorage
+
+    tenant = uuid.uuid4()
+    tool = _tool(
+        tenant_id=tenant,
+        config={
+            "binary_sha256": "a" * 64,
+            "persistent_home": True,
+        },
+    )
+    agent = _agent(tenant)
+    state = StateStorage(root=tmp_path)
+
+    captured = {}
+
+    class _CapturingRunner:
+        def __init__(self, image, **kwargs):
+            self.image = image
+
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
+
+    runner = MagicMock()
+    runner.image = "default"
+    runner.__class__ = _CapturingRunner
+
+    await execute_cli_tool(
+        tool=tool, agent=agent, params={},
+        user_context={"id": "user-42", "phone": "", "email": ""},
+        storage=_mock_storage(), runner=runner, state_storage=state,
+    )
+
+    # The runner got a path pointing at the per-(tool,user) subtree, and
+    # the directory actually exists on disk.
+    home_path = captured["home_host_path"]
+    assert home_path is not None
+    assert str(tool.id) in home_path
+    assert "user-42" in home_path
+    assert (tmp_path / str(tenant) / str(tool.id) / "user-42").is_dir()
+
+
+@pytest.mark.asyncio
+async def test_executor_refuses_persistent_home_without_user():
+    """Missing user_id with persistent_home=True must not silently share a HOME."""
+    tenant = uuid.uuid4()
+    tool = _tool(
+        tenant_id=tenant,
+        config={
+            "binary_sha256": "a" * 64,
+            "persistent_home": True,
+        },
+    )
+    agent = _agent(tenant)
+
+    with pytest.raises(CliToolError) as exc_info:
+        await execute_cli_tool(
+            tool=tool, agent=agent, params={},
+            user_context={"id": "", "phone": "", "email": ""},
+            storage=_mock_storage(), runner=_mock_runner(),
+        )
+    assert exc_info.value.error_class is CliToolErrorClass.VALIDATION_ERROR
+    assert "user_id" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_executor_no_home_mount_when_persistent_home_false():
+    """Stateless tools must not get a bind mount (saves disk + simplifies the default)."""
+    tenant = uuid.uuid4()
+    tool = _tool(
+        tenant_id=tenant,
+        config={"binary_sha256": "a" * 64},  # persistent_home defaults to False
+    )
+    agent = _agent(tenant)
+
+    captured = {}
+
+    class _CapturingRunner:
+        def __init__(self, image, **kwargs):
+            self.image = image
+
+        async def run(self, **kwargs):
+            captured.update(kwargs)
+            return BinaryRunResult(exit_code=0, stdout="", stderr="", duration_ms=1)
+
+    runner = MagicMock()
+    runner.image = "default"
+    runner.__class__ = _CapturingRunner
+
+    await execute_cli_tool(
+        tool=tool, agent=agent, params={},
+        user_context={"id": "u1", "phone": "", "email": ""},
+        storage=_mock_storage(), runner=runner,
+    )
+
+    assert captured["home_host_path"] is None
+
+
+@pytest.mark.asyncio
 async def test_executor_expands_list_params_into_argv():
     """List params must expand in place so agents can drive multi-segment CLIs.
 

@@ -899,6 +899,8 @@
         "envValuePlaceholder": "值",
         "envAdd": "添加",
         "envRemove": "移除",
+        "fieldPersistentHome": "按用户持久化 HOME",
+        "persistentHomeHint": "同一个(工具, 用户)在多次调用之间保留同一个可读写 HOME 目录。适合需要缓存登录态/token 的工具(svc、gh、kubectl 等)。关闭时每次调用用临时 /tmp,结束即丢弃。",
         "fieldTimeout": "超时(秒)",
         "fieldCpu": "CPU",
         "fieldMemory": "内存",
