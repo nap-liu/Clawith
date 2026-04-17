@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
+import sys
 import time
 from typing import Mapping, Sequence
 
@@ -28,6 +30,60 @@ logger = logging.getLogger(__name__)
 # consumers (UI, audit log) see the same size envelope.
 _MAX_STDOUT = 1 << 20  # 1 MiB
 _MAX_STDERR = 64 * 1024  # 64 KiB
+
+
+def _parse_cpu_limit(raw: str) -> int | None:
+    """Parse the tool's cpu_limit string into a CPU-seconds budget.
+
+    Subprocess mode cannot enforce the per-core quota semantics docker's
+    ``--cpus`` had. We reinterpret ``cpu_limit`` as a *total CPU-seconds
+    budget* for a single invocation (RLIMIT_CPU takes whole seconds,
+    rounded up to at least 1):
+
+    - ``"0.5"`` → 1s (ceil; RLIMIT_CPU minimum is 1)
+    - ``"1"`` / ``"1.0"`` → 1s
+    - ``"2"`` → 2s
+    - ``"2.5"`` → 3s
+
+    Callers treat ``None`` as "no limit".
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(1, math.ceil(v))
+
+
+def _parse_memory_limit(raw: str) -> int | None:
+    """Parse '256m' / '1g' / '512M' → bytes.
+
+    Returns None on parse failure → callers treat as "no limit".
+    """
+    if not raw:
+        return None
+    try:
+        unit = raw[-1].lower()
+        amount = float(raw[:-1]) if unit in "kmg" else float(raw)
+    except (TypeError, ValueError):
+        return None
+    multiplier = {"k": 1024, "m": 1024**2, "g": 1024**3}.get(unit, 1)
+    return int(amount * multiplier)
+
+
+def _make_preexec(cpu_seconds: int | None, mem_bytes: int | None):
+    """Build the preexec_fn that applies rlimits + process-group creation.
+
+    Linux-only rlimit path; on other POSIX platforms only os.setsid runs.
+    """
+    def _preexec():
+        os.setsid()
+        if sys.platform == "linux":
+            import resource  # local import: non-Linux POSIX has it too, but keep the platform guard tight
+            if cpu_seconds is not None:
+                resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+            if mem_bytes is not None:
+                resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+    return _preexec
 
 
 class SubprocessBinaryBackend:
@@ -46,7 +102,7 @@ class SubprocessBinaryBackend:
         memory_limit: str,
         network: bool,
     ) -> BinaryRunResult:
-        del image, cpu_limit, memory_limit, network
+        del image, network  # subprocess mode ignores these (no isolation to toggle)
         start = time.monotonic()
 
         # If caller supplied a persistent HOME, use it as cwd and set
@@ -59,6 +115,10 @@ class SubprocessBinaryBackend:
             # must not override it. Otherwise $HOME and cwd could desync.
             child_env["HOME"] = home_host_path
 
+        cpu_seconds = _parse_cpu_limit(cpu_limit) if sys.platform == "linux" else None
+        mem_bytes = _parse_memory_limit(memory_limit) if sys.platform == "linux" else None
+        preexec = _make_preexec(cpu_seconds, mem_bytes) if os.name == "posix" else None
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 binary_host_path,
@@ -67,7 +127,7 @@ class SubprocessBinaryBackend:
                 cwd=cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                preexec_fn=os.setsid if os.name == "posix" else None,
+                preexec_fn=preexec,
             )
         except FileNotFoundError as exc:
             return BinaryRunResult(

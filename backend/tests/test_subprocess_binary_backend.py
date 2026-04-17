@@ -243,3 +243,30 @@ async def test_run_truncates_huge_stdout(tmp_path):
     # child streamed 'a\n' pairs (yes(1) appends newlines), so the truncated
     # output must be exactly the 'a\n' pattern from the start.
     assert result.stdout == "a\n" * (1 << 19)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="rlimit is Linux-specific")
+@pytest.mark.asyncio
+async def test_run_enforces_cpu_rlimit_on_linux(tmp_path):
+    """CPU quota '1' means rlimit RLIMIT_CPU=1s → busy loop dies within ~2s."""
+    binary = _make_binary(tmp_path, """\
+        #!/bin/sh
+        # Busy loop
+        awk 'BEGIN{for(;;);}'
+    """)
+    backend = SubprocessBinaryBackend()
+    result = await backend.run(
+        binary_host_path=str(binary),
+        args=[],
+        env={},
+        timeout_seconds=10,
+        home_host_path=None,
+        image=None,
+        cpu_limit="1",
+        memory_limit="256m",
+        network=True,
+    )
+    # Child is SIGXCPU-killed at ~1s of CPU, well before timeout_seconds=10
+    assert result.duration_ms < 5000
+    assert result.timed_out is False
+    assert result.exit_code != 0
