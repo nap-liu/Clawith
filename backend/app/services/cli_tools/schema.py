@@ -119,10 +119,11 @@ class SandboxConfig(BaseModel):
 
     # Which sandbox implementation executes this tool. "docker" is the
     # secure-but-slow default (full container, ~300ms cold start).
-    # "bwrap" trades isolation for ~10x faster starts; only enable after
-    # the tool author has reviewed the trade-offs in BubblewrapBackend's
-    # docstring. New fields must default to the pre-upgrade behaviour —
-    # existing configs must keep getting docker.
+    # "bwrap" was a bubblewrap-based lighter-weight alternative that
+    # has been removed; the literal is kept here for backward config
+    # compatibility and will be normalised / dropped in a later pass.
+    # New fields must default to the pre-upgrade behaviour — existing
+    # configs must keep getting docker.
     backend: Literal["docker", "bwrap"] = "docker"
 
     egress_allowlist: list[str] = Field(

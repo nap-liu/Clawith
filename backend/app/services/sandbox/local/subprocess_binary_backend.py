@@ -1,6 +1,6 @@
 """Run a host-side binary directly as a subprocess.
 
-Unlike the removed DockerSandboxBackend / BubblewrapBackend, this
+Unlike the removed container-based sandbox backends, this
 backend provides *no isolation*: the child inherits the backend
 process's filesystem, network, and (by default) capabilities. Linux
 applies soft rlimits for cpu/memory; macOS has no equivalent and
