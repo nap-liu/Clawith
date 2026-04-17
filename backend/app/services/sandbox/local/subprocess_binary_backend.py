@@ -79,7 +79,14 @@ class SubprocessBinaryBackend:
             timed_out = True
             try:
                 os.killpg(os.getpgid(proc.pid), 9)
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
+                # Child already exited between timeout and killpg; nothing
+                # to kill, but we still need to drain the pipes below.
+                pass
+            except PermissionError:
+                # e.g. child changed uid and we can't signal its group.
+                # Fall back to the direct kill, which may also fail but
+                # gives us one more chance.
                 proc.kill()
             stdout_b, stderr_b = await proc.communicate()
 

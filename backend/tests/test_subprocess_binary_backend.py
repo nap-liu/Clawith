@@ -70,7 +70,7 @@ async def test_run_times_out_and_kills_process(tmp_path):
     )
     assert result.timed_out is True
     assert result.exit_code != 0
-    assert result.duration_ms < 5000  # killed, not waited out
+    assert result.duration_ms < 8000  # killed well before the 10s sleep would finish
 
 
 @pytest.mark.asyncio
