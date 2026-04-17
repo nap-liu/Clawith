@@ -1,0 +1,78 @@
+"""Run a host-side binary directly as a subprocess.
+
+Unlike the removed DockerSandboxBackend / BubblewrapBackend, this
+backend provides *no isolation*: the child inherits the backend
+process's filesystem, network, and (by default) capabilities. Linux
+applies soft rlimits for cpu/memory; macOS has no equivalent and
+ignores those parameters.
+
+This backend is only appropriate when the uploaded binaries are
+trusted (reviewed / whitelisted). A hostile binary can read every
+file the backend can read and connect to any host the backend can
+reach.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from typing import Mapping, Sequence
+
+from app.services.sandbox.backend import BinaryRunResult
+
+logger = logging.getLogger(__name__)
+
+# Output caps. Matches the old DockerSandboxBackend so downstream
+# consumers (UI, audit log) see the same size envelope.
+_MAX_STDOUT = 1 << 20  # 1 MiB
+_MAX_STDERR = 64 * 1024  # 64 KiB
+
+
+class SubprocessBinaryBackend:
+    """Stateless subprocess-based binary runner."""
+
+    async def run(
+        self,
+        binary_host_path: str,
+        args: Sequence[str],
+        env: Mapping[str, str],
+        *,
+        timeout_seconds: int,
+        home_host_path: str | None,
+        image: str | None,
+        cpu_limit: str,
+        memory_limit: str,
+        network: bool,
+    ) -> BinaryRunResult:
+        del image, cpu_limit, memory_limit, network  # ignored in subprocess mode
+        start = time.monotonic()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                binary_host_path,
+                *args,
+                env=dict(env),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_b, stderr_b = await proc.communicate()
+        except FileNotFoundError as exc:
+            return BinaryRunResult(
+                exit_code=127,
+                stdout="",
+                stderr="",
+                duration_ms=int((time.monotonic() - start) * 1000),
+                sandbox_failed=True,
+                error=f"binary not found: {exc}",
+            )
+
+        return BinaryRunResult(
+            exit_code=proc.returncode or 0,
+            stdout=stdout_b[:_MAX_STDOUT].decode("utf-8", errors="replace"),
+            stderr=stderr_b[:_MAX_STDERR].decode("utf-8", errors="replace"),
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+
+
+__all__ = ["SubprocessBinaryBackend"]
