@@ -32,9 +32,8 @@ from app.services.cli_tools.rate_limiter import RateLimiter
 from app.services.cli_tools.schema import CliToolConfig
 from app.services.cli_tools.state_storage import StateStorage
 from app.services.cli_tools.storage import BinaryStorage
-from app.services.sandbox.backend import SandboxBackend
+from app.services.sandbox.backend import BinaryRunResult, SandboxBackend
 from app.services.sandbox.factory import get_sandbox_backend
-from app.services.sandbox.backend import BinaryRunResult
 
 logger = logging.getLogger(__name__)
 
@@ -377,41 +376,12 @@ async def execute_cli_tool(
         # tool-supplied env var.
         cmd.env["CLAWITH_TRACE_ID"] = trace_id
 
-        # Egress allowlist pass-through. When a non-empty list is set we
-        # expose the hostnames to the sandboxed binary as a comma-separated
-        # `CLAWITH_EGRESS_ALLOWLIST` env var.
-        #
-        # IMPORTANT: this is *pass-through only*, not kernel-level
-        # enforcement. A cooperative CLI can read this variable and stay
-        # within bounds; a hostile or LLM-controlled binary can still
-        # `connect()` anywhere the backend permits. Real enforcement
-        # (tinyproxy sidecar + nftables) is tracked in
-        # docs/superpowers/TODO-egress-enforcement.md. The schema field
-        # is the stable integration point — when enforcement lands it
-        # will consume the same list with no schema change.
-        if config.sandbox.egress_allowlist:
-            cmd.env["CLAWITH_EGRESS_ALLOWLIST"] = ",".join(
-                config.sandbox.egress_allowlist
-            )
         paths = _prepare_paths(config, tool, user_context, storage, state_storage)
 
         # Pick the sandbox backend. Callers that pass `runner` (tests,
-        # custom stacks) keep full control; the common path gets a
-        # singleton chosen by tool config. The factory is cached so
-        # this is a dict lookup after the first call.
-        if runner is not None:
-            effective_runner = runner
-        else:
-            try:
-                effective_runner = get_sandbox_backend(config.sandbox.backend)
-            except RuntimeError as exc:
-                # e.g. backend=bwrap on a host without bubblewrap installed.
-                # Don't silently fall back to docker — the operator picked
-                # bwrap intentionally.
-                raise CliToolError(
-                    CliToolErrorClass.SANDBOX_FAILED,
-                    f"sandbox backend {config.sandbox.backend!r} unavailable: {exc}",
-                ) from exc
+        # custom stacks) keep full control; the common path gets the
+        # cached subprocess singleton.
+        effective_runner = runner if runner is not None else get_sandbox_backend()
 
         # Single stateless runner serves every tool — per-call overrides
         # travel with run() arguments, no per-tool instantiation.
@@ -421,10 +391,10 @@ async def execute_cli_tool(
             env=cmd.env,
             timeout_seconds=config.runtime.timeout_seconds,
             home_host_path=paths.home_host_path,
-            image=config.sandbox.image,
+            image=None,
             cpu_limit=config.sandbox.cpu_limit,
             memory_limit=config.sandbox.memory_limit,
-            network=config.sandbox.network,
+            network=True,  # subprocess mode: network is always available
         )
 
         logger.info(

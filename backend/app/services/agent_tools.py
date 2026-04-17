@@ -9833,9 +9833,8 @@ async def _try_execute_cli_tool(
                     audit_user_id = user.id
 
             storage = BinaryStorage(root=Path("/data/cli_binaries"))
-            # No pre-picked runner — executor's factory honours the tool's
-            # `config.sandbox.backend` (docker vs bwrap). Hard-wiring docker
-            # here previously silently overrode that.
+            # No pre-picked runner — executor's factory returns the cached
+            # subprocess singleton.
 
             async def _write_audit(audit: CliExecutionAudit) -> None:
                 # audit_user_id may be None for system-initiated agent

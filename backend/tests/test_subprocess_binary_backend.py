@@ -270,3 +270,37 @@ async def test_run_enforces_cpu_rlimit_on_linux(tmp_path):
     assert result.duration_ms < 5000
     assert result.timed_out is False
     assert result.exit_code != 0
+
+
+# --- Task 8 parser edge cases -------------------------------------------------
+
+from app.services.sandbox.local.subprocess_binary_backend import (
+    _parse_cpu_limit,
+    _parse_memory_limit,
+)
+
+
+def test_parse_cpu_limit_edge_cases():
+    assert _parse_cpu_limit("0.5") == 1
+    assert _parse_cpu_limit("1") == 1
+    assert _parse_cpu_limit("1.0") == 1
+    assert _parse_cpu_limit("2") == 2
+    assert _parse_cpu_limit("2.5") == 3
+    assert _parse_cpu_limit("0") is None
+    assert _parse_cpu_limit("-1") is None
+    assert _parse_cpu_limit("") is None
+    assert _parse_cpu_limit("abc") is None
+
+
+def test_parse_memory_limit_edge_cases(caplog):
+    import logging as _logging
+    caplog.set_level(_logging.WARNING)
+    assert _parse_memory_limit("256m") == 256 * 1024 * 1024
+    assert _parse_memory_limit("1g") == 1024 ** 3
+    assert _parse_memory_limit("512K") == 512 * 1024
+    # Unit-less digit string: warns and returns None
+    assert _parse_memory_limit("256") is None
+    assert any("missing unit" in rec.message for rec in caplog.records)
+    assert _parse_memory_limit("") is None
+    assert _parse_memory_limit("abc") is None
+    assert _parse_memory_limit("badm") is None  # garbage before unit

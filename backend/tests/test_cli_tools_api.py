@@ -180,7 +180,12 @@ def test_update_body_rejects_flat_binary_sha256_key():
 
 
 def test_update_body_accepts_runtime_and_sandbox():
-    """Legitimate admin updates still work."""
+    """Legitimate admin updates still work.
+
+    Legacy sandbox fields (network/readonly_fs/image) are silently
+    dropped on read — exercised here to pin the compat behaviour for
+    PATCH bodies coming from old UIs / scripts.
+    """
     body = CliToolUpdate.model_validate({
         "runtime": {
             "args_template": ["--x"],
@@ -200,6 +205,7 @@ def test_update_body_accepts_runtime_and_sandbox():
     assert body.runtime.timeout_seconds == 60
     assert body.sandbox is not None
     assert body.sandbox.cpu_limit == "2"
+    assert body.sandbox.memory_limit == "1g"
 
 
 def test_create_body_rejects_binary_subtree():
@@ -431,9 +437,12 @@ async def test_patch_runtime_accepts_post_m2_fields():
 
 
 @pytest.mark.asyncio
-async def test_patch_sandbox_accepts_backend_and_egress_allowlist():
-    """Post-M2 sandbox additions (backend, egress_allowlist) also flow
-    through PATCH untouched."""
+async def test_patch_sandbox_silently_drops_legacy_fields():
+    """v4 dropped backend/network/readonly_fs/image/egress_allowlist from
+    SandboxConfig. Old UIs / scripts that still POST these fields must not
+    break — the schema validator silently strips them before validation so
+    extra='forbid' doesn't reject genuine legacy payloads. Only
+    cpu_limit / memory_limit survive to the stored row."""
     tool = _make_tool()
     db = FakeDB(tool=tool)
     user = _platform_admin()
@@ -451,11 +460,10 @@ async def test_patch_sandbox_accepts_backend_and_egress_allowlist():
     })
     out = await update_cli_tool(tool_id=tool.id, body=body, db=db, user=user)
 
-    assert out.config["sandbox"]["backend"] == "bwrap"
-    assert out.config["sandbox"]["egress_allowlist"] == [
-        "api.example.com",
-        "registry.example.com",
-    ]
+    # Only the two kept fields survive.
+    assert set(out.config["sandbox"].keys()) == {"cpu_limit", "memory_limit"}
+    assert out.config["sandbox"]["cpu_limit"] == "1.0"
+    assert out.config["sandbox"]["memory_limit"] == "512m"
 
 
 @pytest.mark.asyncio
@@ -494,7 +502,10 @@ async def test_read_of_post_m2_flat_config_normalises_and_preserves_values():
     assert out.config["runtime"]["rate_limit_per_minute"] == 42
     assert out.config["runtime"]["home_quota_mb"] == 777
     assert out.config["runtime"]["persistent_home"] is True
-    assert out.config["sandbox"]["egress_allowlist"] == ["api.example.com"]
+    # v4-dropped legacy sandbox fields are stripped on normalisation.
+    assert "egress_allowlist" not in out.config["sandbox"]
+    assert "backend" not in out.config["sandbox"]
+    assert "network" not in out.config["sandbox"]
 
 
 # ─────────────────────────────────────────────────────────────────────────

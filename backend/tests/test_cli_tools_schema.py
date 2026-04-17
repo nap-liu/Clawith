@@ -40,12 +40,11 @@ def test_cli_tool_config_minimal_defaults():
     assert cfg.runtime.home_quota_mb == 500
     assert cfg.sandbox.cpu_limit == "1.0"
     assert cfg.sandbox.memory_limit == "512m"
-    assert cfg.sandbox.network is False
-    assert cfg.sandbox.readonly_fs is True
-    assert cfg.sandbox.image is None
-    # dda8c9e sandbox additions: docker default + empty egress list.
-    assert cfg.sandbox.backend == "docker"
-    assert cfg.sandbox.egress_allowlist == []
+    # v4 dropped backend/network/readonly_fs/image/egress_allowlist —
+    # only cpu_limit and memory_limit remain on SandboxConfig.
+    assert not hasattr(cfg.sandbox, "network")
+    assert not hasattr(cfg.sandbox, "backend")
+    assert not hasattr(cfg.sandbox, "egress_allowlist")
 
 
 def test_cli_tool_config_dump_is_always_nested():
@@ -62,7 +61,12 @@ def test_cli_tool_config_dump_is_always_nested():
 
 
 def test_cli_tool_config_accepts_new_nested_shape():
-    """The primary input shape flows through unchanged."""
+    """The primary input shape flows through unchanged.
+
+    Legacy sandbox keys (backend/network/readonly_fs/image/egress_allowlist)
+    are silently dropped — see test_cli_tools_schema_legacy_sandbox.py for
+    the dedicated legacy-compat coverage.
+    """
     raw = {
         "binary": {
             "sha256": "a" * 64,
@@ -81,11 +85,6 @@ def test_cli_tool_config_accepts_new_nested_shape():
         "sandbox": {
             "cpu_limit": "0.5",
             "memory_limit": "256m",
-            "network": True,
-            "readonly_fs": True,
-            "image": "pinned-tag",
-            "backend": "bwrap",
-            "egress_allowlist": ["api.example.com"],
         },
     }
     cfg = CliToolConfig.model_validate(raw)
@@ -94,9 +93,8 @@ def test_cli_tool_config_accepts_new_nested_shape():
     assert cfg.runtime.persistent_home is True
     assert cfg.runtime.rate_limit_per_minute == 90
     assert cfg.runtime.home_quota_mb == 1024
-    assert cfg.sandbox.image == "pinned-tag"
-    assert cfg.sandbox.backend == "bwrap"
-    assert cfg.sandbox.egress_allowlist == ["api.example.com"]
+    assert cfg.sandbox.cpu_limit == "0.5"
+    assert cfg.sandbox.memory_limit == "256m"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -145,16 +143,6 @@ def test_binary_metadata_rejects_unknown_fields():
         BinaryMetadata.model_validate({"sha256": None, "surprise": 1})
 
 
-def test_sandbox_rejects_bad_egress_hostname():
-    """Hostname regex rejects shell metacharacters / whitespace."""
-    with pytest.raises(ValidationError):
-        SandboxConfig.model_validate({"egress_allowlist": ["bad host.com"]})
-    with pytest.raises(ValidationError):
-        SandboxConfig.model_validate({"egress_allowlist": ["UPPER.com"]})
-    with pytest.raises(ValidationError):
-        SandboxConfig.model_validate({"egress_allowlist": [""]})
-
-
 # ─────────────────────────────────────────────────────────────────────────
 # Legacy flat shape adapters
 # ─────────────────────────────────────────────────────────────────────────
@@ -177,6 +165,7 @@ def test_accepts_m2_flat_shape():
         "sandbox": {
             "cpu_limit": "0.5",
             "memory_limit": "256m",
+            # Legacy fields (network/readonly_fs/image) — silently dropped on read.
             "network": True,
             "readonly_fs": True,
             "image": None,
@@ -191,7 +180,8 @@ def test_accepts_m2_flat_shape():
     assert cfg.runtime.env_inject == {"SVC_USER_PHONE": "$user.phone"}
     assert cfg.runtime.timeout_seconds == 45
     assert cfg.runtime.persistent_home is True
-    assert cfg.sandbox.network is True
+    assert cfg.sandbox.cpu_limit == "0.5"
+    assert cfg.sandbox.memory_limit == "256m"
 
     # Dump produces only the new nested keys — no leftover flat keys.
     dumped = cfg.model_dump(mode="json")
@@ -217,6 +207,7 @@ def test_accepts_post_m2_flat_shape_with_rate_limit_and_quota():
         "sandbox": {
             "cpu_limit": "1.0",
             "memory_limit": "512m",
+            # v4-dropped legacy keys — still accepted on read so rows load.
             "network": True,
             "readonly_fs": True,
             "image": None,
@@ -229,8 +220,9 @@ def test_accepts_post_m2_flat_shape_with_rate_limit_and_quota():
     assert cfg.runtime.rate_limit_per_minute == 120
     assert cfg.runtime.home_quota_mb == 2048
     assert cfg.runtime.persistent_home is True
-    assert cfg.sandbox.backend == "bwrap"
-    assert cfg.sandbox.egress_allowlist == ["api.example.com"]
+    # Legacy sandbox fields dropped on read.
+    assert not hasattr(cfg.sandbox, "backend")
+    assert not hasattr(cfg.sandbox, "egress_allowlist")
 
     dumped = cfg.model_dump(mode="json")
     assert "rate_limit_per_minute" not in dumped

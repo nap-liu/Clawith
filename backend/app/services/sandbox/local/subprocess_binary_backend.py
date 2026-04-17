@@ -44,6 +44,8 @@ def _parse_cpu_limit(raw: str) -> int | None:
     - ``"1"`` / ``"1.0"`` → 1s
     - ``"2"`` → 2s
     - ``"2.5"`` → 3s
+    - ``"0"`` / ``""`` / negative → None (no limit; symmetric with
+      _parse_memory_limit)
 
     Callers treat ``None`` as "no limit".
     """
@@ -51,22 +53,36 @@ def _parse_cpu_limit(raw: str) -> int | None:
         v = float(raw)
     except (TypeError, ValueError):
         return None
+    if v <= 0:
+        return None
     return max(1, math.ceil(v))
 
 
 def _parse_memory_limit(raw: str) -> int | None:
     """Parse '256m' / '1g' / '512M' → bytes.
 
-    Returns None on parse failure → callers treat as "no limit".
+    Requires an explicit unit suffix (k/m/g). Unit-less strings like
+    '256' are rejected with a warning because they almost always mean
+    "256 MB" (docker muscle memory) — treating them as 256 bytes would
+    OOM the child before it started.
+
+    Returns None on parse failure or missing unit → callers treat as
+    "no limit".
     """
     if not raw:
         return None
+    unit = raw[-1].lower()
+    if unit not in "kmg":
+        logger.warning(
+            "memory_limit=%r missing unit (k/m/g); treating as no limit",
+            raw,
+        )
+        return None
     try:
-        unit = raw[-1].lower()
-        amount = float(raw[:-1]) if unit in "kmg" else float(raw)
+        amount = float(raw[:-1])
     except (TypeError, ValueError):
         return None
-    multiplier = {"k": 1024, "m": 1024**2, "g": 1024**3}.get(unit, 1)
+    multiplier = {"k": 1024, "m": 1024**2, "g": 1024**3}[unit]
     return int(amount * multiplier)
 
 

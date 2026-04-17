@@ -8,8 +8,9 @@ Three-layer model (security-driven split):
   at the wrong on-disk blob.
 - ``RuntimeConfig`` — admin-editable runtime policy (argv template, env
   vars, timeout, persistent HOME toggle, rate limit, HOME quota).
-- ``SandboxConfig`` — admin-editable sandbox policy (cpu/memory/network/
-  readonly_fs/image, sandbox backend, egress allowlist).
+- ``SandboxConfig`` — admin-editable subprocess-runner overrides
+  (cpu_limit, memory_limit). Legacy pre-v4 fields (backend, network,
+  readonly_fs, image, egress_allowlist) are silently dropped on read.
 
 Add-only evolution rule (see spec §11.1): never rename or remove fields.
 New fields must have a default that preserves pre-upgrade behaviour.
@@ -36,18 +37,11 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-
-# Hostname charset: lowercase letters, digits, dot, dash. No spaces, no
-# control chars, no shell metacharacters — the value flows into the
-# sandbox env (`CLAWITH_EGRESS_ALLOWLIST`) and in Phase 2 into a tinyproxy
-# config / nftables rule, so we refuse anything that could break either.
-# IDN hostnames must be punycoded by the caller before reaching us.
-_HOSTNAME_RE = re.compile(r"^[a-z0-9.-]+$")
 
 
 class BinaryMetadata(BaseModel):
@@ -107,65 +101,32 @@ class RuntimeConfig(BaseModel):
 
 
 class SandboxConfig(BaseModel):
-    """Per-tool sandbox overrides. `image=None` means follow the platform :stable alias."""
+    """Per-tool subprocess-runner overrides.
+
+    Only parameters the subprocess backend actually uses are kept. The
+    pre-v4 fields (backend, network, readonly_fs, image, egress_allowlist)
+    are silently dropped on read — see _drop_legacy_sandbox_fields below.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     cpu_limit: str = "1.0"
     memory_limit: str = "512m"
-    network: bool = False
-    readonly_fs: bool = True
-    image: Optional[str] = None
 
-    # Which sandbox implementation executes this tool. "docker" is the
-    # secure-but-slow default (full container, ~300ms cold start).
-    # "bwrap" was a bubblewrap-based lighter-weight alternative that
-    # has been removed; the literal is kept here for backward config
-    # compatibility and will be normalised / dropped in a later pass.
-    # New fields must default to the pre-upgrade behaviour — existing
-    # configs must keep getting docker.
-    backend: Literal["docker", "bwrap"] = "docker"
-
-    egress_allowlist: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Hostnames the sandbox is allowed to reach when network=True. "
-            "Empty list + network=True means allow all (existing behavior). "
-            "Non-empty list enforces: all other DNS lookups and TCP connect "
-            "attempts fail. Applies to the `docker` backend via --dns and a "
-            "tinyproxy container; `bwrap` backend uses nftables."
-        ),
-    )
-
-    @field_validator("egress_allowlist")
+    @model_validator(mode="before")
     @classmethod
-    def _check_allowlist(cls, v: list[str]) -> list[str]:
-        """Defence-in-depth: only allow hostname-safe characters.
+    def _drop_legacy_sandbox_fields(cls, data: Any) -> Any:
+        """Older rows carry backend/network/readonly_fs/image/egress_allowlist.
 
-        Values flow into a process environment variable and (phase 2) into
-        a tinyproxy config file and nftables rules. Rejecting anything
-        with whitespace, NUL, slashes or shell metacharacters closes off
-        the obvious prompt-injection → env-var-smuggling → rule-injection
-        chain.
+        Silently strip them so legacy configs keep loading without
+        migration. Dropping is safe: the subprocess backend ignores all
+        five. We keep extra='forbid' afterwards so genuine typos still
+        surface on new writes.
         """
-        cleaned: list[str] = []
-        for entry in v:
-            if not isinstance(entry, str):
-                raise ValueError("egress_allowlist entries must be strings")
-            # Explicit empty-string / whitespace check before the regex
-            # so the error message is useful for operators.
-            if not entry or entry != entry.strip():
-                raise ValueError(
-                    "egress_allowlist entries must be non-empty and not "
-                    "contain leading/trailing whitespace"
-                )
-            if not _HOSTNAME_RE.match(entry):
-                raise ValueError(
-                    f"egress_allowlist entry {entry!r} must match "
-                    f"[a-z0-9.-]+ (lowercase hostname chars only)"
-                )
-            cleaned.append(entry)
-        return cleaned
+        if not isinstance(data, dict):
+            return data
+        legacy = {"backend", "network", "readonly_fs", "image", "egress_allowlist"}
+        return {k: v for k, v in data.items() if k not in legacy}
 
 
 # Fields that historically lived at the top level of Tool.config (M2 and

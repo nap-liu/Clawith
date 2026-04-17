@@ -685,17 +685,16 @@ class TestClassifyFailure:
 
 
 # ---------------------------------------------------------------------------
-# Backend selection — executor pulls a backend from the factory when the
-# caller didn't inject one. Covers `SandboxConfig.backend` ∈ {docker, bwrap}.
+# Backend selection — executor asks the factory for the cached subprocess
+# singleton when the caller didn't inject a runner. The legacy
+# `sandbox.backend` config key is silently dropped (v4), so the factory is
+# invoked with no arguments regardless of what legacy rows still carry.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_executor_selects_backend_from_config(monkeypatch):
-    """When no runner is passed, the executor asks the factory using
-    the `sandbox.backend` key from the tool's config. Default value is
-    "docker" (safe); explicit "bwrap" flips to the fast path.
-    """
+async def test_executor_asks_factory_when_no_runner(monkeypatch):
+    """When no runner is passed, the executor calls get_sandbox_backend()."""
     from app.services.sandbox.backend import BinaryRunResult as _BRR
     import app.services.cli_tool_executor as mod
 
@@ -707,34 +706,35 @@ async def test_executor_selects_backend_from_config(monkeypatch):
     fake_runner = MagicMock()
     fake_runner.run = _fake_run
 
-    calls: list[str] = []
+    calls: list[tuple] = []
 
-    def _fake_factory(name: str):
-        calls.append(name)
+    def _fake_factory(*args, **kwargs):
+        calls.append((args, kwargs))
         return fake_runner
 
     monkeypatch.setattr(mod, "get_sandbox_backend", _fake_factory)
 
-    # Default config → docker.
+    # Default config — factory must be called exactly once with no args.
     tool_default = _tool(tenant_id=tenant, config={"binary_sha256": "a" * 64})
     await execute_cli_tool(
         tool=tool_default, agent=_agent(tenant), params={},
         user_context={"id": "u1", "phone": "", "email": ""},
         storage=_mock_storage(),
     )
-    assert calls == ["docker"]
+    assert calls == [((), {})]
 
-    # Explicit bwrap.
-    tool_bwrap = _tool(
+    # Legacy config carrying dropped sandbox.backend — still works, legacy
+    # key is silently stripped and the factory is still called with no args.
+    tool_legacy = _tool(
         tenant_id=tenant,
         config={"binary_sha256": "a" * 64, "sandbox": {"backend": "bwrap"}},
     )
     await execute_cli_tool(
-        tool=tool_bwrap, agent=_agent(tenant), params={},
+        tool=tool_legacy, agent=_agent(tenant), params={},
         user_context={"id": "u2", "phone": "", "email": ""},
         storage=_mock_storage(),
     )
-    assert calls == ["docker", "bwrap"]
+    assert calls == [((), {}), ((), {})]
 
 
 @pytest.mark.asyncio
@@ -751,8 +751,8 @@ async def test_executor_honours_explicit_runner_over_factory(monkeypatch):
     agent = _agent(tenant)
 
     factory_called = []
-    def _fake_factory(name: str):
-        factory_called.append(name)
+    def _fake_factory(*args, **kwargs):
+        factory_called.append((args, kwargs))
         raise AssertionError("factory should NOT be called when runner is explicit")
     monkeypatch.setattr(mod, "get_sandbox_backend", _fake_factory)
 

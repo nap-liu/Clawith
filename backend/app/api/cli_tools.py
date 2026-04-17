@@ -557,10 +557,8 @@ async def test_run_cli_tool(
     from app.services.cli_tool_executor import CliExecutionAudit, execute_cli_tool
 
     storage = BinaryStorage(root=_STORAGE_ROOT)
-    # Don't pre-pick a runner — executor's factory picks the backend
-    # based on `config.sandbox.backend` (docker vs bwrap). Hard-wiring a
-    # DockerSandboxBackend here would silently override the tool's
-    # chosen backend.
+    # Don't pre-pick a runner — executor's factory returns the cached
+    # subprocess singleton.
 
     synthetic_agent_id = uuid.uuid4()
 
