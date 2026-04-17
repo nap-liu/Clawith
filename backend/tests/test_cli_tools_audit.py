@@ -30,7 +30,7 @@ from app.services.cli_tool_executor import (
     execute_cli_tool,
 )
 from app.services.cli_tools.errors import CliToolError, CliToolErrorClass
-from app.services.sandbox.local.binary_runner import BinaryRunResult
+from app.services.sandbox.backend import BinaryRunResult
 
 
 # ── Fixtures mirror test_cli_tools_metrics / test_cli_tool_executor_v2 ──

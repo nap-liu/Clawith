@@ -28,7 +28,7 @@ from app.services.cli_tools.metrics import (
     cli_tool_execution_duration_seconds,
     cli_tool_executions_total,
 )
-from app.services.sandbox.local.binary_runner import BinaryRunResult
+from app.services.sandbox.backend import BinaryRunResult
 
 
 # ── Metric-reading helpers ──────────────────────────────────────────────

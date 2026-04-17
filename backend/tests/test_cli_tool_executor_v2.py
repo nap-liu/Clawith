@@ -19,7 +19,7 @@ from app.services.cli_tool_executor import (
 )
 from app.services.cli_tools.errors import CliToolError, CliToolErrorClass
 from app.services.cli_tools.schema import CliToolConfig
-from app.services.sandbox.local.binary_runner import BinaryRunResult
+from app.services.sandbox.backend import BinaryRunResult
 
 
 def _tool(*, tenant_id, config, parameters_schema=None, enabled=True):
@@ -696,7 +696,7 @@ async def test_executor_selects_backend_from_config(monkeypatch):
     the `sandbox.backend` key from the tool's config. Default value is
     "docker" (safe); explicit "bwrap" flips to the fast path.
     """
-    from app.services.sandbox.local.binary_runner import BinaryRunResult as _BRR
+    from app.services.sandbox.backend import BinaryRunResult as _BRR
     import app.services.cli_tool_executor as mod
 
     tenant = uuid.uuid4()

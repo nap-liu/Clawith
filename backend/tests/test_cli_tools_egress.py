@@ -22,7 +22,7 @@ from pydantic import ValidationError
 
 from app.services.cli_tool_executor import execute_cli_tool
 from app.services.cli_tools.schema import CliToolConfig, SandboxConfig
-from app.services.sandbox.local.binary_runner import BinaryRunResult
+from app.services.sandbox.backend import BinaryRunResult
 
 
 # ─── helpers (match the style in test_cli_tool_executor_v2.py) ──────────

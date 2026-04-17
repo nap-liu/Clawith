@@ -34,7 +34,7 @@ from app.services.cli_tools.state_storage import StateStorage
 from app.services.cli_tools.storage import BinaryStorage
 from app.services.sandbox.backend import SandboxBackend
 from app.services.sandbox.factory import get_sandbox_backend
-from app.services.sandbox.local.binary_runner import BinaryRunResult
+from app.services.sandbox.backend import BinaryRunResult
 
 logger = logging.getLogger(__name__)
 
