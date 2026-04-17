@@ -141,3 +141,73 @@ async def test_run_env_does_not_inherit_parent(tmp_path):
         assert result.stdout == "absent"
     finally:
         os.environ.pop("CLAWITH_LEAK_MARKER", None)
+
+
+@pytest.mark.asyncio
+async def test_run_with_home_sets_cwd_and_home_env(tmp_path):
+    home = tmp_path / "persistent_home"
+    home.mkdir()
+    binary = _make_binary(tmp_path, """\
+        #!/bin/sh
+        pwd
+        echo "$HOME"
+    """)
+    backend = SubprocessBinaryBackend()
+    result = await backend.run(
+        binary_host_path=str(binary),
+        args=[],
+        env={},
+        timeout_seconds=5,
+        home_host_path=str(home),
+        image=None,
+        cpu_limit="1.0",
+        memory_limit="256m",
+        network=True,
+    )
+    lines = result.stdout.strip().splitlines()
+    assert lines[0] == str(home)  # pwd
+    assert lines[1] == str(home)  # $HOME
+
+
+@pytest.mark.asyncio
+async def test_run_without_home_uses_process_cwd(tmp_path):
+    binary = _make_binary(tmp_path, """\
+        #!/bin/sh
+        echo "${HOME:-NO_HOME}"
+    """)
+    backend = SubprocessBinaryBackend()
+    result = await backend.run(
+        binary_host_path=str(binary),
+        args=[],
+        env={},
+        timeout_seconds=5,
+        home_host_path=None,
+        image=None,
+        cpu_limit="1.0",
+        memory_limit="256m",
+        network=True,
+    )
+    # No HOME passed — child sees literal default from the shell fallback.
+    assert result.stdout.strip() == "NO_HOME"
+
+
+@pytest.mark.asyncio
+async def test_run_truncates_huge_stdout(tmp_path):
+    binary = _make_binary(tmp_path, """\
+        #!/bin/sh
+        # 2 MiB of 'a'
+        yes a | head -c 2097152
+    """)
+    backend = SubprocessBinaryBackend()
+    result = await backend.run(
+        binary_host_path=str(binary),
+        args=[],
+        env={},
+        timeout_seconds=10,
+        home_host_path=None,
+        image=None,
+        cpu_limit="1.0",
+        memory_limit="256m",
+        network=True,
+    )
+    assert len(result.stdout) == 1 << 20  # truncated to 1 MiB

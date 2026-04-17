@@ -48,16 +48,23 @@ class SubprocessBinaryBackend:
     ) -> BinaryRunResult:
         del image, cpu_limit, memory_limit, network
         start = time.monotonic()
+
+        # If caller supplied a persistent HOME, use it as cwd and set
+        # $HOME so tools like gh / kubectl write their state there.
+        child_env = dict(env)
+        cwd: str | None = None
+        if home_host_path is not None:
+            cwd = home_host_path
+            child_env.setdefault("HOME", home_host_path)
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 binary_host_path,
                 *args,
-                env=dict(env),
+                env=child_env,
+                cwd=cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                # Put the child in its own process group so `killpg` reaps
-                # grandchildren too. Without this, a binary that forks a
-                # long-running helper leaves the helper alive after timeout.
                 preexec_fn=os.setsid if os.name == "posix" else None,
             )
         except FileNotFoundError as exc:
