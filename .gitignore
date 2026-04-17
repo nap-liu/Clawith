@@ -29,7 +29,8 @@ ss-nodes.json
 _agent/
 _agents/
 
-# Internal docs
+# Internal docs (generated artefacts etc.) — design specs used to be
+# whitelisted; keep them out of the repo per the team convention.
 docs/
 .agents/rules/deploy.md
 

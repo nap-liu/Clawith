@@ -1,5 +1,6 @@
 """Clawith Backend — FastAPI Application Entry Point."""
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -215,12 +216,15 @@ async def lifespan(app: FastAPI):
                 import traceback
                 traceback.print_exception(type(exc), exc, exc.__traceback__)
 
+        from app.services.cli_tools.gc_scheduler import cli_tools_gc_loop
+
         for name, coro in [
             ("trigger_daemon", start_trigger_daemon()),
             ("feishu_ws", feishu_ws_manager.start_all()),
             ("dingtalk_stream", dingtalk_stream_manager.start_all()),
             ("wecom_stream", wecom_stream_manager.start_all()),
             ("discord_gw", discord_gateway_manager.start_all()),
+            ("cli_tools_gc", cli_tools_gc_loop()),
         ]:
             task = asyncio.create_task(coro, name=name)
             task.add_done_callback(_bg_task_error)
@@ -280,6 +284,7 @@ from app.api.messages import router as messages_router
 from app.api.tenants import router as tenants_router
 from app.api.schedules import router as schedules_router
 from app.api.tools import router as tools_router
+from app.api.cli_tools import router as cli_tools_router
 from app.api.plaza import router as plaza_router
 from app.api.skills import router as skills_router
 from app.api.users import router as users_router
@@ -300,6 +305,7 @@ from app.api.admin import router as admin_router
 from app.api.pages import router as pages_router, public_router as pages_public_router
 from app.api.agent_credentials import router as credentials_router
 from app.api.agentbay_control import router as agentbay_control_router
+from app.api.metrics import router as metrics_router
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
@@ -316,6 +322,17 @@ app.include_router(activity_router, prefix=settings.API_PREFIX)
 app.include_router(messages_router, prefix=settings.API_PREFIX)
 app.include_router(tenants_router, prefix=settings.API_PREFIX)
 app.include_router(schedules_router, prefix=settings.API_PREFIX)
+# CLI tools kill switch: set CLAWITH_CLI_TOOLS_ENABLED=false in the env
+# to skip router registration entirely. Requests to /api/tools/cli/*
+# then fall through to a 404. Intended for emergency L2 rollback — a
+# backend restart (≈30s) is faster than any nginx / CDN rule push.
+if os.getenv("CLAWITH_CLI_TOOLS_ENABLED", "true").lower() != "false":
+    app.include_router(cli_tools_router, prefix=settings.API_PREFIX)  # must precede tools_router for path specificity
+else:
+    import logging
+    logging.getLogger(__name__).warning(
+        "CLAWITH_CLI_TOOLS_ENABLED=false — cli-tools router disabled"
+    )
 app.include_router(tools_router, prefix=settings.API_PREFIX)
 app.include_router(files_upload_router, prefix=settings.API_PREFIX)
 app.include_router(enterprise_kb_router, prefix=settings.API_PREFIX)
@@ -341,6 +358,10 @@ app.include_router(pages_router, prefix=settings.API_PREFIX)
 app.include_router(pages_public_router)  # Public endpoint for /p/{short_id}, no API prefix
 app.include_router(credentials_router, prefix=settings.API_PREFIX)
 app.include_router(agentbay_control_router, prefix=settings.API_PREFIX)
+# Prometheus scrape endpoint. Behind platform_admin — see app/api/metrics.py
+# for the rationale. Mounted under API_PREFIX so it shares the auth base
+# path with the rest of the admin surface.
+app.include_router(metrics_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])

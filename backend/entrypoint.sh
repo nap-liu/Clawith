@@ -13,7 +13,21 @@ if [ "$(id -u)" = '0' ]; then
     echo "[entrypoint] Detected root user, fixing permissions..."
     # Ensure directories exist and are owned by clawith
     chown -R clawith:clawith ${AGENT_DATA_DIR}
-    
+    # CLI-tool binaries volume — docker creates it as root on first mount.
+    if [ -d /data/cli_binaries ]; then
+        chown -R clawith:clawith /data/cli_binaries
+    fi
+    # CLI-tool persistent-HOME state. The subprocess backend runs as
+    # clawith (single UID). Older installs ran a docker/bwrap sandbox as
+    # `nobody` (uid 65534) and left directories here owned by nobody —
+    # after the switch to subprocess-only those files become unreadable
+    # to clawith. Reclaim any non-clawith files on startup; find+chown
+    # is a no-op once converged.
+    if [ -d /data/cli_state ]; then
+        find /data/cli_state \! -user clawith -exec chown clawith:clawith {} +
+        chmod 0755 /data/cli_state
+    fi
+
     echo "[entrypoint] Dropping privileges to 'clawith' and re-executing..."
     exec gosu clawith /bin/bash "$0" "$@"
 fi
