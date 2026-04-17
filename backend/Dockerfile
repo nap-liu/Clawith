@@ -22,8 +22,11 @@ RUN if [ -n "$CLAWITH_PIP_INDEX_URL" ] && [ -n "$CLAWITH_PIP_TRUSTED_HOST" ]; th
 FROM python:3.12-slim AS production
 
 WORKDIR /app
+# bubblewrap: required for the fast-path BubblewrapBackend (Linux-only);
+# the backend gracefully degrades to docker when bwrap is missing, but
+# we want the fast path available by default in production images.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libpq5 curl shadowsocks-libev gosu && \
+    apt-get install -y --no-install-recommends libpq5 curl shadowsocks-libev gosu bubblewrap && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from deps stage

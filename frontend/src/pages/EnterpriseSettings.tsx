@@ -5,6 +5,8 @@ import { enterpriseApi, skillApi } from '../services/api';
 import { useAuthStore } from '../stores';
 import PromptModal from '../components/PromptModal';
 import FileBrowser from '../components/FileBrowser';
+import { CliToolWizard } from '../components/cli-tools/CliToolWizard';
+import type { CliTool } from '../components/cli-tools/types';
 import type { FileBrowserApi } from '../components/FileBrowser';
 import { saveAccentColor, getSavedAccentColor, resetAccentColor, PRESET_COLORS } from '../utils/theme';
 import UserManagement from './UserManagement';
@@ -1948,6 +1950,8 @@ export default function EnterpriseSettings() {
         agentbay: t('agent.toolCategories.agentbay', 'AgentBay'),
     };
     const [toolsView, setToolsView] = useState<'global' | 'agent-installed'>('global');
+    const [showCliWizard, setShowCliWizard] = useState(false);
+    const [editingCliTool, setEditingCliTool] = useState<CliTool | null>(null);
     const [agentInstalledTools, setAgentInstalledTools] = useState<any[]>([]);
     const loadAllTools = async () => {
         const tid = selectedTenantId;
@@ -2834,7 +2838,10 @@ export default function EnterpriseSettings() {
                         {toolsView === 'global' && <>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                                 <h3>{t('enterprise.tools.title')}</h3>
-                                <button className="btn btn-primary" onClick={() => setShowAddMCP(true)}>+ {t('enterprise.tools.addMcpServer')}</button>
+                                <div style={{ display: 'flex', gap: '8px' }}>
+                                    <button className="btn btn-secondary" onClick={() => { setEditingCliTool(null); setShowCliWizard(true); }}>+ {t('enterprise.cliTools.addButton', 'Add CLI Tool')}</button>
+                                    <button className="btn btn-primary" onClick={() => setShowAddMCP(true)}>+ {t('enterprise.tools.addMcpServer')}</button>
+                                </div>
                             </div>
 
                             {showAddMCP && (
@@ -3222,8 +3229,14 @@ export default function EnterpriseSettings() {
                                                                             <div style={{ minWidth: 0 }}>
                                                                                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                                                                                     <span style={{ fontWeight: 500, fontSize: '13px' }}>{tool.display_name}</span>
-                                                                                    <span style={{ fontSize: '10px', background: tool.type === 'mcp' ? 'var(--primary)' : 'var(--bg-tertiary)', color: tool.type === 'mcp' ? '#fff' : 'var(--text-secondary)', borderRadius: '4px', padding: '1px 5px' }}>
-                                                                                        {tool.type === 'mcp' ? 'MCP' : 'Built-in'}
+                                                                                    <span style={{
+                                                                                        fontSize: '10px',
+                                                                                        background: tool.type === 'mcp' ? 'var(--primary)' : tool.type === 'cli' ? 'var(--accent-color, #6366f1)' : 'var(--bg-tertiary)',
+                                                                                        color: tool.type === 'mcp' || tool.type === 'cli' ? '#fff' : 'var(--text-secondary)',
+                                                                                        borderRadius: '4px',
+                                                                                        padding: '1px 5px',
+                                                                                    }}>
+                                                                                        {tool.type === 'mcp' ? 'MCP' : tool.type === 'cli' ? 'CLI' : 'Built-in'}
                                                                                     </span>
                                                                                     {tool.is_default && <span style={{ fontSize: '10px', background: 'rgba(0,200,100,0.15)', color: 'var(--success)', borderRadius: '4px', padding: '1px 5px' }}>Default</span>}
                                                                                     {tool.config && Object.keys(tool.config).length > 0 && (
@@ -3258,6 +3271,21 @@ export default function EnterpriseSettings() {
                                                                                     }}
                                                                                 >
                                                                                     ⚙️ {t('enterprise.tools.configure')}
+                                                                                </button>
+                                                                            )}
+
+                                                                            {/* Edit CLI tool */}
+                                                                            {tool.type === 'cli' && (
+                                                                                <button
+                                                                                    className="btn btn-secondary"
+                                                                                    style={{ padding: '4px 8px', fontSize: '11px' }}
+                                                                                    onClick={async () => {
+                                                                                        const full = await fetchJson<CliTool>(`/tools/cli/${tool.id}`);
+                                                                                        setEditingCliTool(full);
+                                                                                        setShowCliWizard(true);
+                                                                                    }}
+                                                                                >
+                                                                                    ⚙️ {t('common.edit', 'Edit')}
                                                                                 </button>
                                                                             )}
 
@@ -3511,6 +3539,18 @@ export default function EnterpriseSettings() {
                                 </div>
                             )}
                         </>}
+
+                        {/* CLI Tool wizard (create or edit) */}
+                        {showCliWizard && (
+                            <CliToolWizard
+                                tool={editingCliTool}
+                                onClose={() => {
+                                    setShowCliWizard(false);
+                                    setEditingCliTool(null);
+                                    loadAllTools();
+                                }}
+                            />
+                        )}
                     </div>
                 )}
 

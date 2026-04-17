@@ -9784,34 +9784,99 @@ async def _try_execute_cli_tool(
 ) -> Optional[str]:
     """Try to execute a CLI-type tool. Returns None if tool is not CLI type."""
     try:
-        from app.models.tool import Tool, AgentTool
+        from dataclasses import asdict
 
+        from app.models.audit import AuditLog
+        from app.models.tool import Tool
+        from app.models.agent import Agent
+        from app.models.user import User
+        from app.services.cli_tool_executor import CliExecutionAudit, execute_cli_tool
+        from app.services.cli_tools.errors import CliToolError
+        from app.services.cli_tools.storage import BinaryStorage
+
+        # Keep the DB session open across execution so the audit_sink
+        # can write its AuditLog row in the same unit of work. The
+        # session is intentionally local to this call; agent dispatch
+        # doesn't have a request-scoped session to reuse.
         async with async_session() as db:
-            result = await db.execute(
+            tool = (await db.execute(
                 select(Tool).where(Tool.name == tool_name, Tool.type == "cli")
-            )
-            tool = result.scalar_one_or_none()
-
+            )).scalar_one_or_none()
             if not tool:
                 return None
 
-            agent_config = {}
-            if agent_id:
-                at_r = await db.execute(
-                    select(AgentTool).where(
-                        AgentTool.agent_id == agent_id,
-                        AgentTool.tool_id == tool.id,
+            # Keep HEAD: the full rewrite supersedes the old
+            # `execute_cli_tool(merged_config, arguments, user_id, work_dir)`
+            # signature entirely. `AgentTool.config` per-agent override
+            # and `work_dir` are features we intentionally removed when
+            # moving to the typed executor — if we want them back, they
+            # belong in a follow-up PR on top of the new signature, not
+            # here.
+            if not agent_id:
+                return "❌ CLI tool invocation requires an agent context"
+            agent = (await db.execute(
+                select(Agent).where(Agent.id == agent_id)
+            )).scalar_one_or_none()
+            if not agent:
+                return "❌ agent not found"
+
+            user_context = {"id": "", "phone": "", "email": ""}
+            audit_user_id: Optional[uuid.UUID] = None
+            if user_id:
+                user = await db.get(User, user_id)
+                if user:
+                    user_context = {
+                        "id": str(user.id),
+                        "phone": str(user.primary_mobile or ""),
+                        "email": str(user.email or ""),
+                    }
+                    audit_user_id = user.id
+
+            storage = BinaryStorage(root=Path("/data/cli_binaries"))
+            # No pre-picked runner — executor's factory honours the tool's
+            # `config.sandbox.backend` (docker vs bwrap). Hard-wiring docker
+            # here previously silently overrode that.
+
+            async def _write_audit(audit: CliExecutionAudit) -> None:
+                # audit_user_id may be None for system-initiated agent
+                # loops without an attributable end-user. AuditLog.user_id
+                # is nullable; we still preserve details['user_id']=None
+                # (populated by the executor) for completeness.
+                db.add(AuditLog(
+                    user_id=audit_user_id,
+                    agent_id=agent.id,
+                    action="cli_tool.execute",
+                    details={
+                        "resource_type": "cli_tool_exec",
+                        "resource_id": audit.tool_id,
+                        "source": "agent",
+                        **asdict(audit),
+                    },
+                ))
+
+            try:
+                try:
+                    exec_result = await execute_cli_tool(
+                        tool=tool,
+                        agent=agent,
+                        params=arguments,
+                        user_context=user_context,
+                        storage=storage,
+                        audit_sink=_write_audit,
                     )
-                )
-                at = at_r.scalar_one_or_none()
-                agent_config = (at.config or {}) if at else {}
-
-        merged_config = {**(tool.config or {}), **agent_config}
-
-        from app.services.cli_tool_executor import execute_cli_tool
-
-        work_dir = str(ws) if ws else None
-        return await execute_cli_tool(merged_config, arguments, user_id=user_id, work_dir=work_dir)
+                    await db.commit()
+                    return exec_result.stdout or "(no output)"
+                except CliToolError as exc:
+                    # Audit sink already ran in the executor's finally.
+                    # Commit the row so compliance has a record of the
+                    # failed attempt too.
+                    await db.commit()
+                    return f"❌ [{exc.error_class.value}] {exc.message}"
+            except Exception:
+                # Any further DB/commit error: rollback and re-raise
+                # into the outer catch so the user sees a consistent msg.
+                await db.rollback()
+                raise
 
     except Exception as e:
         logger.exception(f"[CLI Tool] Execution error for {tool_name}")

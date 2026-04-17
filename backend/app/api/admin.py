@@ -749,6 +749,59 @@ async def delete_company(
 
     # 3.7 Delete the tenant itself
     await db.delete(tenant)
+
+    # 3.8 Cascading filesystem GC for CLI-tools data owned by this tenant.
+    # Hard delete: admins who want to recover can just re-upload binaries,
+    # and state is only login tokens / cache (users just re-login). Errors
+    # here are logged but non-fatal — worse to block tenant deletion than
+    # to leave orphaned files that the periodic sweep will catch.
+    import time as _time
+    from pathlib import Path as _Path
+    from app.models.audit import AuditLog as _AuditLog
+    from app.services.cli_tools.state_storage import StateStorage as _StateStorage
+    from app.services.cli_tools.storage import BinaryStorage as _BinaryStorage
+
+    tenant_key = str(company_id)
+    _binary_storage = _BinaryStorage(root=_Path("/data/cli_binaries"))
+    _state_storage = _StateStorage()
+
+    _t0 = _time.monotonic()
+    _bin_path = str(_binary_storage.root / tenant_key)
+    try:
+        _bin_freed = _binary_storage.delete_tenant(tenant_key)
+    except Exception as _exc:
+        logger.warning(f"cli-tools.gc: tenant binary cleanup failed for {_bin_path}: {_exc}")
+        _bin_freed = 0
+    _bin_ms = int((_time.monotonic() - _t0) * 1000)
+    logger.info(
+        f"cli-tools.gc operation=tenant scope=binary path={_bin_path} "
+        f"freed_bytes={_bin_freed} duration_ms={_bin_ms}"
+    )
+
+    _t1 = _time.monotonic()
+    _state_path = str(_state_storage._root / tenant_key)
+    try:
+        _state_freed = _state_storage.delete_tenant(tenant_key)
+    except Exception as _exc:
+        logger.warning(f"cli-tools.gc: tenant state cleanup failed for {_state_path}: {_exc}")
+        _state_freed = 0
+    _state_ms = int((_time.monotonic() - _t1) * 1000)
+    logger.info(
+        f"cli-tools.gc operation=tenant scope=state path={_state_path} "
+        f"freed_bytes={_state_freed} duration_ms={_state_ms}"
+    )
+
+    db.add(_AuditLog(
+        user_id=current_user.id,
+        action="gc.tenant",
+        details={
+            "resource_type": "cli_tool",
+            "tenant_id": tenant_key,
+            "binary_freed_bytes": _bin_freed,
+            "state_freed_bytes": _state_freed,
+            "duration_ms": _bin_ms + _state_ms,
+        },
+    ))
     await db.flush()
 
     return None

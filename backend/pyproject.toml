@@ -41,6 +41,8 @@ dependencies = [
     "pypinyin>=0.52.0",
     "anyascii>=0.3.2",
     "Pillow>=10.0.0",
+    "jsonschema>=4.21.0",
+    "prometheus-client>=0.20.0",
 ]
 
 [project.optional-dependencies]
@@ -60,6 +62,9 @@ line-length = 120
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "integration: marks tests that require a real docker daemon (deselect with '-m \"not integration\"')",
+]
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
