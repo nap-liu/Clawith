@@ -46,7 +46,7 @@ class SubprocessBinaryBackend:
         memory_limit: str,
         network: bool,
     ) -> BinaryRunResult:
-        del image, cpu_limit, memory_limit, network  # ignored in subprocess mode
+        del image, cpu_limit, memory_limit, network
         start = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -55,8 +55,11 @@ class SubprocessBinaryBackend:
                 env=dict(env),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Put the child in its own process group so `killpg` reaps
+                # grandchildren too. Without this, a binary that forks a
+                # long-running helper leaves the helper alive after timeout.
+                preexec_fn=os.setsid if os.name == "posix" else None,
             )
-            stdout_b, stderr_b = await proc.communicate()
         except FileNotFoundError as exc:
             return BinaryRunResult(
                 exit_code=127,
@@ -67,11 +70,25 @@ class SubprocessBinaryBackend:
                 error=f"binary not found: {exc}",
             )
 
+        timed_out = False
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            stdout_b, stderr_b = await proc.communicate()
+
         return BinaryRunResult(
-            exit_code=proc.returncode or 0,
+            exit_code=proc.returncode if proc.returncode is not None else -1,
             stdout=stdout_b[:_MAX_STDOUT].decode("utf-8", errors="replace"),
             stderr=stderr_b[:_MAX_STDERR].decode("utf-8", errors="replace"),
             duration_ms=int((time.monotonic() - start) * 1000),
+            timed_out=timed_out,
         )
 
 
