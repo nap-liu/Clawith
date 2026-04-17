@@ -165,12 +165,14 @@ async def test_run_with_home_sets_cwd_and_home_env(tmp_path):
         network=True,
     )
     lines = result.stdout.strip().splitlines()
-    assert lines[0] == str(home)  # pwd
-    assert lines[1] == str(home)  # $HOME
+    # macOS: pwd may return the resolved path (/var → /private/var).
+    assert os.path.realpath(lines[0]) == os.path.realpath(str(home))
+    # $HOME is echoed verbatim as we set it.
+    assert lines[1] == str(home)
 
 
 @pytest.mark.asyncio
-async def test_run_without_home_uses_process_cwd(tmp_path):
+async def test_run_without_home_does_not_set_home_env(tmp_path):
     binary = _make_binary(tmp_path, """\
         #!/bin/sh
         echo "${HOME:-NO_HOME}"
@@ -192,6 +194,30 @@ async def test_run_without_home_uses_process_cwd(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_without_home_inherits_parent_cwd(tmp_path, monkeypatch):
+    """When home_host_path is None, the child inherits the parent's cwd."""
+    monkeypatch.chdir(tmp_path)
+    binary = _make_binary(tmp_path, """\
+        #!/bin/sh
+        pwd
+    """)
+    backend = SubprocessBinaryBackend()
+    result = await backend.run(
+        binary_host_path=str(binary),
+        args=[],
+        env={},
+        timeout_seconds=5,
+        home_host_path=None,
+        image=None,
+        cpu_limit="1.0",
+        memory_limit="256m",
+        network=True,
+    )
+    # pwd resolves symlinks on macOS (/var → /private/var), so use realpath.
+    assert os.path.realpath(result.stdout.strip()) == os.path.realpath(str(tmp_path))
+
+
+@pytest.mark.asyncio
 async def test_run_truncates_huge_stdout(tmp_path):
     binary = _make_binary(tmp_path, """\
         #!/bin/sh
@@ -210,4 +236,10 @@ async def test_run_truncates_huge_stdout(tmp_path):
         memory_limit="256m",
         network=True,
     )
+    assert result.exit_code == 0
+    assert result.timed_out is False
     assert len(result.stdout) == 1 << 20  # truncated to 1 MiB
+    # Confirm we kept the *prefix* (not a suffix or a middle slice): the
+    # child streamed 'a\n' pairs (yes(1) appends newlines), so the truncated
+    # output must be exactly the 'a\n' pattern from the start.
+    assert result.stdout == "a\n" * (1 << 19)

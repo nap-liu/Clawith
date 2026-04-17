@@ -55,7 +55,9 @@ class SubprocessBinaryBackend:
         cwd: str | None = None
         if home_host_path is not None:
             cwd = home_host_path
-            child_env.setdefault("HOME", home_host_path)
+            # home_host_path is the infrastructure contract; tool-config env
+            # must not override it. Otherwise $HOME and cwd could desync.
+            child_env["HOME"] = home_host_path
 
         try:
             proc = await asyncio.create_subprocess_exec(
