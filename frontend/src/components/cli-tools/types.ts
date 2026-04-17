@@ -38,18 +38,6 @@ export interface RuntimeConfig {
 export interface SandboxConfig {
   cpu_limit: string;
   memory_limit: string;
-  network: boolean;
-  readonly_fs: boolean;
-  image: string | null;
-  // Which sandbox implementation to use. "docker" is the secure default;
-  // "bwrap" trades isolation for ~10x faster starts. Must default to
-  // "docker" so existing rows preserve pre-upgrade behaviour.
-  backend: 'docker' | 'bwrap';
-  // Hostnames the sandbox is permitted to reach when network=true.
-  // Empty = allow all (existing behavior). Non-empty = pass-through to
-  // the sandbox env as CLAWITH_EGRESS_ALLOWLIST. Not kernel-enforced
-  // yet — see docs/superpowers/TODO-egress-enforcement.md.
-  egress_allowlist: string[];
 }
 
 export interface CliToolConfig {
@@ -120,11 +108,6 @@ export function defaultSandboxConfig(): SandboxConfig {
   return {
     cpu_limit: '1.0',
     memory_limit: '512m',
-    network: false,
-    readonly_fs: true,
-    image: null,
-    backend: 'docker',
-    egress_allowlist: [],
   };
 }
 

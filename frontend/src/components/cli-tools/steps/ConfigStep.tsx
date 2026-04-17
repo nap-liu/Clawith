@@ -20,12 +20,6 @@ function mergeWithDefaults(partial: Partial<CliToolConfig> | null | undefined): 
   const d = defaultCliToolConfig();
   const c = partial ?? {};
   const mergedSandbox = { ...d.sandbox, ...(c.sandbox ?? {}) };
-  // Array fields inside nested sandbox need explicit default fallback —
-  // a stored config from before the egress_allowlist field existed will
-  // spread `undefined` and blow up the textarea join() below.
-  if (!Array.isArray(mergedSandbox.egress_allowlist)) {
-    mergedSandbox.egress_allowlist = [];
-  }
   const mergedRuntime = {
     ...d.runtime,
     ...(c.runtime ?? {}),
@@ -182,45 +176,6 @@ export function ConfigStep({
         <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer' }}>
           <input
             type="checkbox"
-            checked={config.sandbox.network}
-            onChange={(e) => updateSandbox({ network: e.target.checked })}
-          />
-          {k('fieldAllowNetwork', 'Allow network')}
-        </label>
-        <div style={hintStyle}>
-          {t('enterprise.cliTools.sandbox.networkHint', 'Enable only if the tool needs external APIs / downloads.')}
-        </div>
-      </div>
-
-      {config.sandbox.network && (
-        <div>
-          <label style={labelStyle}>{k('fieldEgressAllowlist', 'Egress allowlist')}</label>
-          <textarea
-            className="form-input"
-            value={(config.sandbox.egress_allowlist ?? []).join('\n')}
-            onChange={(e) => updateSandbox({
-              // Split on any run of newline/whitespace, trim, drop empty —
-              // operator-friendly: pasted comma- or space-separated lists
-              // also work, and trailing blank lines never produce a "".
-              egress_allowlist: e.target.value
-                .split(/[\s,]+/)
-                .map((h) => h.trim())
-                .filter((h) => h.length > 0),
-            })}
-            rows={3}
-            placeholder="api.example.com&#10;registry.example.com"
-            style={{ fontFamily: 'monospace', resize: 'vertical' }}
-          />
-          <div style={hintStyle}>
-            {k('egressAllowlistHint', 'One hostname per line. Empty = allow all (default). Current release: only forwarded to the tool via CLAWITH_EGRESS_ALLOWLIST env var — actual enforcement is a phase-2 infra PR.')}
-          </div>
-        </div>
-      )}
-
-      <div>
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', fontSize: '13px', cursor: 'pointer' }}>
-          <input
-            type="checkbox"
             checked={config.runtime.persistent_home}
             onChange={(e) => updateRuntime({ persistent_home: e.target.checked })}
           />
@@ -245,31 +200,6 @@ export function ConfigStep({
         <div style={hintStyle}>
           {k('homeQuotaHint', 'Subsequent calls are rejected when exceeded. 0 = unlimited.')}
         </div>
-      </div>
-
-      <div>
-        <label style={labelStyle}>{k('fieldSandboxBackend', 'Sandbox backend')}</label>
-        <select
-          className="form-input"
-          value={config.sandbox.backend}
-          onChange={(e) => updateSandbox({ backend: e.target.value as 'docker' | 'bwrap' })}
-        >
-          <option value="docker">{k('backendDocker', 'docker (default, strong isolation, ~300ms cold start)')}</option>
-          <option value="bwrap">{k('backendBwrap', 'bwrap (Linux only, ~30ms — lower isolation, trusted tools only)')}</option>
-        </select>
-        <div style={hintStyle}>
-          {k('sandboxBackendHint', 'docker: separate namespaces + seccomp default, portable. bwrap: same-kernel namespace isolation, faster; requires Linux host with bubblewrap installed.')}
-        </div>
-      </div>
-
-      <div>
-        <label style={labelStyle}>{k('fieldSandboxImage', 'Sandbox image')}</label>
-        <input
-          className="form-input"
-          value={config.sandbox.image ?? ''}
-          placeholder={k('sandboxImagePlaceholder', '(blank = follow platform default stable)')}
-          onChange={(e) => updateSandbox({ image: e.target.value.trim() || null })}
-        />
       </div>
 
       <div>
