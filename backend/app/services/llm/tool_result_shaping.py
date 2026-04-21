@@ -7,6 +7,9 @@ causes `HTTP 400: Range of input length should be [1, 983616]`.
 
 This module applies a head+tail truncation with an explicit marker so the
 LLM can see that truncation happened and ask for more if needed.
+
+A degenerate budget (``max_chars <= 0``) returns an empty string, with
+``was_truncated=True`` iff the input was non-empty.
 """
 from __future__ import annotations
 
@@ -17,8 +20,17 @@ def shape_tool_result(result, max_chars: int) -> tuple[str, bool]:
     Strategy for oversized results: keep ~60% head and ~30% tail, with a
     marker in between describing how much was dropped. Total output stays
     within max_chars plus a small marker overhead (~120 chars).
+
+    Edge case: if ``max_chars <= 0`` the budget is degenerate — there is no
+    room for any content (nor for the marker itself), so an empty string is
+    returned, with ``was_truncated=True`` iff the input was non-empty.
     """
     s = str(result) if not isinstance(result, str) else result
+    if max_chars <= 0:
+        # Degenerate budget — treat as "drop everything", no marker (it would
+        # exceed max_chars itself). was_truncated reflects whether any content
+        # was actually dropped.
+        return "", len(s) > 0
     if len(s) <= max_chars:
         return s, False
 

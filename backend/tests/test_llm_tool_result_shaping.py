@@ -28,12 +28,36 @@ def test_oversized_result_is_truncated_with_marker():
     assert out.endswith("C")
 
 
-def test_marker_reports_dropped_byte_count():
+def test_marker_reports_dropped_char_count():
     s = "A" * 10_000
     out, truncated = shape_tool_result(s, max_chars=1000)
     assert truncated is True
     # The marker should contain the number of dropped characters
     assert "9" in out  # ~9000 dropped
+
+
+def test_zero_budget_returns_empty():
+    """max_chars=0 is a degenerate budget; return empty string and
+    report truncation when any content was dropped."""
+    out, truncated = shape_tool_result("hello", 0)
+    assert out == ""
+    assert truncated is True
+
+
+def test_zero_budget_with_empty_input():
+    """Empty input under a zero budget is still not truncation."""
+    out, truncated = shape_tool_result("", 0)
+    assert out == ""
+    assert truncated is False
+
+
+def test_negative_budget_degenerates_gracefully():
+    """Negative max_chars should not silently produce garbage.
+    Regression: prior regex-free slicing produced overlapping slices
+    with a lying marker (output longer than input)."""
+    out, truncated = shape_tool_result("hello world", -5)
+    assert out == ""
+    assert truncated is True
 
 
 def test_output_length_respects_budget():
