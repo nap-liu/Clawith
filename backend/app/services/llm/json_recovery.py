@@ -25,11 +25,7 @@ Repair methods reported back to callers:
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
-
-# Control characters that are illegal unescaped in a JSON string
-_UNESCAPED_CONTROL_RE = re.compile(r'(?<!\\)[\x00-\x1f]')
 
 
 def _strip_trailing_commas(s: str) -> str:
