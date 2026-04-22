@@ -160,6 +160,103 @@ BUILTIN_TOOLS = [
         "config": {},
         "config_schema": {},
     },
+    {
+        "name": "read_image",
+        "display_name": "Read Image",
+        "description": (
+            "Read an image via a vision LLM: transcribe text or describe content. "
+            "Admin-configurable; disabled by default."
+        ),
+        "category": "document",
+        "icon": "👁️",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "image_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 6,
+                    "description": (
+                        "要识别的图片列表：workspace 相对路径 / http(s) URL / base64 data URL。"
+                    ),
+                }
+            },
+            "required": ["image_paths"],
+        },
+        "config": {
+            "model_id": None,
+            "fallback_model_id": None,
+            "input_modes": {
+                "workspace_path": {"enabled": True},
+                "url": {
+                    "enabled": False,
+                    "allowlist": [],
+                    "fetch_timeout_seconds": 10,
+                    "max_redirects": 3,
+                },
+                "base64": {"enabled": False, "max_bytes": 1048576},
+            },
+            "max_images_per_call": 6,
+            "max_image_bytes_per_file": 5242880,
+            "image_compression": {"max_width": 1920, "jpeg_quality": 85},
+            "vision_call_timeout_seconds": 90,
+            "vision_max_output_tokens": 4096,
+        },
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "model_id",
+                    "label": "视觉模型",
+                    "type": "llm_model_picker",
+                    "filter": {"supports_vision": True},
+                    "required": True,
+                    "help": "选择一个已启用 supports_vision 的 LLM 模型",
+                },
+                {
+                    "key": "input_modes.url.enabled",
+                    "label": "允许 URL 输入",
+                    "type": "boolean",
+                    "default": False,
+                },
+                {
+                    "key": "input_modes.url.allowlist",
+                    "label": "URL 允许列表",
+                    "type": "string_list",
+                    "visible_when": "input_modes.url.enabled == true",
+                    "help": "domain glob, e.g. *.cdn.example.com",
+                },
+                {
+                    "key": "input_modes.base64.enabled",
+                    "label": "允许 base64 输入",
+                    "type": "boolean",
+                    "default": False,
+                },
+                {
+                    "key": "input_modes.base64.max_bytes",
+                    "label": "base64 单图上限（字节）",
+                    "type": "number",
+                    "default": 1048576,
+                    "visible_when": "input_modes.base64.enabled == true",
+                },
+                {
+                    "key": "max_images_per_call",
+                    "label": "单次最多图片数",
+                    "type": "number",
+                    "default": 6,
+                    "min": 1,
+                    "max": 10,
+                },
+                {
+                    "key": "max_image_bytes_per_file",
+                    "label": "单图大小上限（字节）",
+                    "type": "number",
+                    "default": 5242880,
+                },
+            ]
+        },
+    },
     # --- Aware trigger management tools ---
     {
         "name": "set_trigger",
