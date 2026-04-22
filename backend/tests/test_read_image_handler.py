@@ -212,3 +212,22 @@ async def test_recursion_defense_rejects_agent_id_none(tmp_path):
     result = await handle_read_image(None, {"image_paths": ["img.jpg"]})
     assert result.startswith("❌")
     assert "递归" in result or "recursion" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_base64_input_does_not_leak_into_sanitized_args(agent_id, jpeg_bytes):
+    """After a handler call with base64 input, sanitize_tool_args on the
+    original arguments dict must scrub the payload.
+    """
+    import base64 as b64
+    from app.utils.sanitize import sanitize_tool_args
+
+    payload = b64.b64encode(jpeg_bytes).decode("ascii")
+    data_url = f"data:image/jpeg;base64,{payload}"
+    raw_args = {"image_paths": [data_url, "workspace/ok.jpg"]}
+
+    sanitized = sanitize_tool_args(raw_args)
+    # Base64 item gets redacted; non-base64 passes through.
+    assert sanitized["image_paths"][0].startswith("[base64 image")
+    assert "data:image/" not in sanitized["image_paths"][0]
+    assert sanitized["image_paths"][1] == "workspace/ok.jpg"
