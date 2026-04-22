@@ -217,20 +217,20 @@ BUILTIN_TOOLS = [
                 {
                     "key": "input_modes.url.enabled",
                     "label": "允许 URL 输入",
-                    "type": "boolean",
+                    "type": "checkbox",
                     "default": False,
                 },
                 {
                     "key": "input_modes.url.allowlist",
-                    "label": "URL 允许列表",
-                    "type": "string_list",
-                    "visible_when": "input_modes.url.enabled == true",
-                    "help": "domain glob, e.g. *.cdn.example.com",
+                    "label": "URL 允许列表（每行一条 domain glob）",
+                    "type": "textarea",
+                    "depends_on": {"input_modes.url.enabled": [True]},
+                    "help": "例如：*.cdn.example.com，每行一条。即使在列表内，解析到私网 IP 仍会被拒绝。",
                 },
                 {
                     "key": "input_modes.base64.enabled",
                     "label": "允许 base64 输入",
-                    "type": "boolean",
+                    "type": "checkbox",
                     "default": False,
                 },
                 {
@@ -238,7 +238,7 @@ BUILTIN_TOOLS = [
                     "label": "base64 单图上限（字节）",
                     "type": "number",
                     "default": 1048576,
-                    "visible_when": "input_modes.base64.enabled == true",
+                    "depends_on": {"input_modes.base64.enabled": [True]},
                 },
                 {
                     "key": "max_images_per_call",
