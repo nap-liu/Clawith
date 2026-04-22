@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import fnmatch
 import ipaddress
 import re as _re
@@ -406,6 +407,93 @@ async def _load_url(
         return LoadError(input_index, url, "图片解码失败", "B")
 
     return LoadedImage(display_ref=final_url, data_url=data_url)
+
+
+# ─── Config merge (tightening-only) ──────────────────────────────────────────
+
+def _merged(tool_val, agent_val, *, shrink_to):
+    """Combine two values using a shrink-to function ('min' for bounds,
+    'intersect' for lists, 'and' for booleans)."""
+    if agent_val is None:
+        return tool_val
+    if tool_val is None:
+        return agent_val
+    return shrink_to(tool_val, agent_val)
+
+
+def _deep_merge(tool: dict, agent: dict | None, spec: dict) -> dict:
+    """Walk the spec, applying per-key shrink rules from it.
+    spec[key] = 'min' | 'intersect' | 'and' | 'prefer_agent'.
+
+    Keys NOT in spec are tool-precedence: they survive from the deep-copied
+    tool config, and any matching values in agent are IGNORED. If a new
+    tightenable key is added to DEFAULT_CONFIG, it MUST also be added to
+    _MERGE_SPEC — otherwise agent overrides silently won't take effect.
+    This is a fail-closed default for a security-sensitive merge.
+    """
+    out = copy.deepcopy(tool)
+    if agent is None:
+        return out
+    for k, rule in spec.items():
+        if k not in agent:
+            continue
+        a = agent[k]
+        t = out.get(k)
+        if rule == "min":
+            out[k] = _merged(t, a, shrink_to=min)
+        elif rule == "intersect":
+            if isinstance(t, list) and isinstance(a, list):
+                out[k] = [item for item in t if item in a]
+            else:
+                out[k] = a if t is None else t
+        elif rule == "and":
+            # Fail-closed: treat missing (None) as False on either side.
+            # Preserves tightening — agent cannot enable a mode tool hasn't enabled.
+            out[k] = bool(t) and bool(a)
+        elif rule == "prefer_agent":
+            out[k] = a
+    return out
+
+
+_MERGE_SPEC = {
+    "top": {
+        "max_images_per_call": "min",
+        "max_image_bytes_per_file": "min",
+        "model_id": "prefer_agent",
+        "fallback_model_id": "prefer_agent",
+        "vision_call_timeout_seconds": "min",
+        "vision_max_output_tokens": "min",
+    },
+    "url": {
+        "enabled": "and",
+        "allowlist": "intersect",
+        "fetch_timeout_seconds": "min",
+        "max_redirects": "min",
+    },
+    "base64": {
+        "enabled": "and",
+        "max_bytes": "min",
+    },
+    "workspace_path": {
+        "enabled": "and",
+    },
+}
+
+
+def merge_config(tool_config: dict, agent_config: dict | None) -> dict:
+    """Produce an effective config from tool-global + agent override.
+
+    Tightening-only: agent can never loosen tool constraints. See
+    spec §5 "AgentTool.config override rules".
+    """
+    merged = _deep_merge(tool_config, agent_config, _MERGE_SPEC["top"])
+    for mode in ("url", "base64", "workspace_path"):
+        t_mode = (tool_config.get("input_modes") or {}).get(mode, {})
+        a_mode = ((agent_config or {}).get("input_modes") or {}).get(mode)
+        merged.setdefault("input_modes", {})[mode] = _deep_merge(
+            t_mode, a_mode, _MERGE_SPEC[mode]
+        )
+    return merged
 
 
 # ─── Top-level entry ─────────────────────────────────────────────────────────

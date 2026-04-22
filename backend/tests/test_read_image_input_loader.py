@@ -389,3 +389,82 @@ async def test_url_redirect_to_private_ip_rejected(monkeypatch, workspace):
     result = await load(["https://cdn.example.com/x.jpg"], workspace, cfg)
     assert result.short_circuit is not None
     assert result.short_circuit.category == "A"
+
+
+# ─── Config merge (tightening-only) ──────────────────────────────────────────
+
+from app.services.tools.read_image.input_loader import merge_config
+
+
+def test_merge_config_tightens_max_images_when_agent_lower():
+    tool = {"max_images_per_call": 6}
+    agent = {"max_images_per_call": 3}
+    merged = merge_config(tool, agent)
+    assert merged["max_images_per_call"] == 3
+
+
+def test_merge_config_ignores_looser_agent_value():
+    tool = {"max_images_per_call": 6}
+    agent = {"max_images_per_call": 10}
+    merged = merge_config(tool, agent)
+    assert merged["max_images_per_call"] == 6  # tool is the upper bound
+
+
+def test_merge_config_intersects_url_allowlist():
+    tool = {"input_modes": {"url": {"allowlist": ["*.a.com", "*.b.com"]}}}
+    agent = {"input_modes": {"url": {"allowlist": ["*.b.com", "*.c.com"]}}}
+    merged = merge_config(tool, agent)
+    assert merged["input_modes"]["url"]["allowlist"] == ["*.b.com"]
+
+
+def test_merge_config_agent_can_disable_mode_tool_has_on():
+    tool = {"input_modes": {"url": {"enabled": True}}}
+    agent = {"input_modes": {"url": {"enabled": False}}}
+    merged = merge_config(tool, agent)
+    assert merged["input_modes"]["url"]["enabled"] is False
+
+
+def test_merge_config_agent_cannot_enable_mode_tool_has_off():
+    tool = {"input_modes": {"url": {"enabled": False}}}
+    agent = {"input_modes": {"url": {"enabled": True}}}
+    merged = merge_config(tool, agent)
+    assert merged["input_modes"]["url"]["enabled"] is False
+
+
+def test_merge_config_model_id_uses_agent_value_when_set():
+    """model_id is a choice not a bound — agent precedence applies."""
+    tool = {"model_id": "tool-uuid"}
+    agent = {"model_id": "agent-uuid"}
+    merged = merge_config(tool, agent)
+    assert merged["model_id"] == "agent-uuid"
+
+
+def test_merge_config_no_agent_returns_tool():
+    tool = {"max_images_per_call": 6}
+    merged = merge_config(tool, None)
+    assert merged["max_images_per_call"] == 6
+
+
+def test_merge_config_missing_tool_enabled_fails_closed():
+    """Tightening invariant: if tool config omits url.enabled entirely,
+    agent cannot open the mode. Missing is treated as disabled."""
+    tool = {"input_modes": {"url": {}}}
+    agent = {"input_modes": {"url": {"enabled": True}}}
+    merged = merge_config(tool, agent)
+    assert merged["input_modes"]["url"]["enabled"] is False
+
+
+def test_merge_config_tightens_base64_max_bytes():
+    """Numeric bound for base64 mode also takes min."""
+    tool = {"input_modes": {"base64": {"max_bytes": 2_000_000}}}
+    agent = {"input_modes": {"base64": {"max_bytes": 500_000}}}
+    merged = merge_config(tool, agent)
+    assert merged["input_modes"]["base64"]["max_bytes"] == 500_000
+
+
+def test_merge_config_base64_max_bytes_agent_looser_ignored():
+    """Reverse direction: agent asking for higher limit is ignored."""
+    tool = {"input_modes": {"base64": {"max_bytes": 500_000}}}
+    agent = {"input_modes": {"base64": {"max_bytes": 2_000_000}}}
+    merged = merge_config(tool, agent)
+    assert merged["input_modes"]["base64"]["max_bytes"] == 500_000
