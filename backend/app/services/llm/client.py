@@ -1772,6 +1772,10 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
             "qwen-long": 16384,
             "qwen-turbo": 8192,
             "qwen-max": 8192,
+            # Qwen3.x "plus" lines support 32k output; default 8192 truncates
+            # long write_file tool_calls mid-JSON and bricks the round.
+            "qwen3.5-plus": 32768,
+            "qwen3.6-plus": 32768,
         },
     ),
     "minimax": ProviderSpec(
