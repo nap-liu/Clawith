@@ -143,3 +143,96 @@ async def test_mime_sniff_accepts_png(workspace, png_bytes):
     (workspace / "x.png").write_bytes(png_bytes)
     result = await load(["x.png"], workspace, DEFAULT_CONFIG)
     assert isinstance(result.items[0], LoadedImage)
+
+
+# ─── Base64 mode ─────────────────────────────────────────────────────────────
+
+def _b64_config(enabled=True, max_bytes=1048576) -> dict:
+    import copy
+    c = copy.deepcopy(DEFAULT_CONFIG)
+    c["input_modes"]["base64"]["enabled"] = enabled
+    c["input_modes"]["base64"]["max_bytes"] = max_bytes
+    return c
+
+
+def _make_data_url(mime: str, raw: bytes) -> str:
+    import base64 as b64
+    return f"data:image/{mime};base64," + b64.b64encode(raw).decode("ascii")
+
+
+@pytest.mark.asyncio
+async def test_base64_disabled_is_category_A(workspace, jpeg_bytes):
+    url = _make_data_url("jpeg", jpeg_bytes)
+    result = await load([url], workspace, _b64_config(enabled=False))
+    assert result.short_circuit is not None
+    assert result.short_circuit.category == "A"
+    assert "base64" in result.short_circuit.reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_base64_happy_path_jpeg(workspace, jpeg_bytes):
+    url = _make_data_url("jpeg", jpeg_bytes)
+    result = await load([url], workspace, _b64_config())
+    assert result.short_circuit is None
+    assert isinstance(result.items[0], LoadedImage)
+    # Display ref must NOT contain the base64 payload
+    assert "base64" in result.items[0].display_ref.lower() or "[base64" in result.items[0].display_ref
+    assert "AAAA" not in result.items[0].display_ref  # no payload leak
+
+
+@pytest.mark.asyncio
+async def test_non_data_prefix_routes_to_workspace_path(workspace):
+    """A string not starting with 'data:' / 'http(s)://' routes to workspace-path.
+    Workspace-path treats 'notadatauri:...' as a (nonexistent) filename and returns
+    a category-B "文件不存在或不可读" per-item error, NOT a short-circuit.
+    """
+    result = await load(["notadatauri:image/jpeg;base64,AAAA"], workspace, _b64_config())
+    assert result.short_circuit is None
+    assert len(result.items) == 1
+    assert isinstance(result.items[0], LoadError)
+    assert result.items[0].category == "B"
+
+
+@pytest.mark.asyncio
+async def test_data_prefix_with_wrong_mime_is_category_B_malformed(workspace):
+    """A 'data:' URI that doesn't match the strict image prefix regex
+    routes to base64 mode and fails the format check as category B."""
+    result = await load(["data:text/plain;base64,SGVsbG8="], workspace, _b64_config())
+    assert result.short_circuit is None
+    assert len(result.items) == 1
+    assert isinstance(result.items[0], LoadError)
+    assert result.items[0].category == "B"
+    assert "格式" in result.items[0].reason or "prefix" in result.items[0].reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_base64_oversize_before_decode_is_category_B(workspace):
+    huge = "A" * 20_000_000  # base64 size way over 1 MB cap
+    url = "data:image/jpeg;base64," + huge
+    result = await load([url], workspace, _b64_config(max_bytes=1_000_000))
+    # Must fail without attempting decode
+    assert result.short_circuit is None  # category B, not A
+    assert isinstance(result.items[0], LoadError)
+    assert result.items[0].category == "B"
+    assert "size" in result.items[0].reason.lower() or "超" in result.items[0].reason
+
+
+@pytest.mark.asyncio
+async def test_base64_fake_image_bytes_is_category_B(workspace):
+    # Valid base64 of ZIP magic bytes — decodes fine, mime sniff rejects
+    import base64 as b64
+    raw = b"PK\x03\x04" + b"\x00" * 16
+    url = "data:image/jpeg;base64," + b64.b64encode(raw).decode("ascii")
+    result = await load([url], workspace, _b64_config())
+    assert result.short_circuit is None
+    assert isinstance(result.items[0], LoadError)
+    assert result.items[0].category == "B"
+
+
+@pytest.mark.asyncio
+async def test_base64_display_ref_never_contains_payload(workspace, jpeg_bytes):
+    url = _make_data_url("jpeg", jpeg_bytes)
+    result = await load([url], workspace, _b64_config())
+    item = result.items[0]
+    # Regardless of success or failure, the display_ref must not contain the payload
+    assert "base64," not in item.display_ref
