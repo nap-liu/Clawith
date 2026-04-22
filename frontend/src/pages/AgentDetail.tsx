@@ -18,6 +18,7 @@ import { Settings, X, Wrench, Bot, Zap, Check, CheckCircle, XCircle, FileText, B
 import { useAuthStore } from '../stores';
 import { copyToClipboard } from '../utils/clipboard';
 import { formatFileSize } from '../utils/formatFileSize';
+import { getByPath, setByPath } from '../utils/configPath';
 import { IconPaperclip, IconSend } from '@tabler/icons-react';
 import { useDropZone } from '../hooks/useDropZone';
 
@@ -62,6 +63,12 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
     // Global (company-level) config for the currently open modal — used to show
     // lock hints and prevent agent from overriding company-set fields.
     const [configGlobalData, setConfigGlobalData] = useState<Record<string, any>>({});
+
+    // LLM models — needed by the llm_model_picker widget (e.g. for read_image).
+    const { data: llmModels = [] } = useQuery<any[]>({
+        queryKey: ['llm-models'],
+        queryFn: () => enterpriseApi.llmModels(),
+    });
 
     const CATEGORY_CONFIG_SCHEMAS: Record<string, any> = {
         agentbay: {
@@ -438,10 +445,11 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                                     {fields
                                         .filter((field: any) => {
-                                            // Handle depends_on: hide fields unless dependency is met
+                                            // Handle depends_on: hide fields unless dependency is met.
+                                            // Supports dotted keys for nested configs (e.g. input_modes.url.enabled).
                                             if (!field.depends_on) return true;
                                             return Object.entries(field.depends_on).every(([depKey, depVals]: [string, any]) =>
-                                                (depVals as string[]).includes(configData[depKey] ?? '')
+                                                (depVals as any[]).includes(getByPath(configData, depKey) ?? '')
                                             );
                                         })
                                         .map((field: any) => {
@@ -449,53 +457,76 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                             const userFromStore = useAuthStore.getState().user;
                                             const currentUserRole = userFromStore?.role;
                                             const isReadOnly = field.read_only_for_roles?.includes(currentUserRole);
+                                            // Dotted-path aware read/write helpers
+                                            const curValue = getByPath(configData, field.key);
+                                            const updateValue = (v: any) => setConfigData(p => setByPath(p, field.key, v));
+                                            const globalVal = getByPath(configTool?.global_config, field.key) ?? getByPath(configGlobalData, field.key);
                                             return (
                                                 <div key={field.key}>
                                                     <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>
                                                         {field.label}
                                                         {isReadOnly && <span style={{ fontWeight: 400, color: 'var(--text-tertiary)', marginLeft: '4px' }}>(Admin only)</span>}
                                                         {/* Show company-configured value as a hint in the label */}
-                                                        {(() => {
-                                                            const globalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
-                                                            if (!globalVal) return null;
-                                                            return (
-                                                                <span style={{ fontWeight: 400, color: 'var(--accent-primary)', marginLeft: '4px', fontSize: '11px' }}>
-                                                                    (company: {String(globalVal).slice(0, 20)}{String(globalVal).length > 20 ? '\u2026' : ''})
-                                                                </span>
-                                                            );
-                                                        })()}
+                                                        {globalVal !== undefined && globalVal !== null && globalVal !== '' && (
+                                                            <span style={{ fontWeight: 400, color: 'var(--accent-primary)', marginLeft: '4px', fontSize: '11px' }}>
+                                                                (company: {String(globalVal).slice(0, 20)}{String(globalVal).length > 20 ? '\u2026' : ''})
+                                                            </span>
+                                                        )}
                                                     </label>
                                                     {field.type === 'checkbox' ? (
                                                         <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>
                                                             <input
                                                                 type="checkbox"
-                                                                checked={configData[field.key] ?? field.default ?? false}
+                                                                checked={curValue ?? field.default ?? false}
                                                                 disabled={isReadOnly}
-                                                                onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.checked }))}
+                                                                onChange={e => updateValue(e.target.checked)}
                                                                 style={{ opacity: 0, width: 0, height: 0 }}
                                                             />
                                                             <span style={{
                                                                 position: 'absolute', inset: 0,
-                                                                background: (configData[field.key] ?? field.default) ? 'var(--accent-primary)' : 'var(--bg-tertiary)',
+                                                                background: (curValue ?? field.default) ? 'var(--accent-primary)' : 'var(--bg-tertiary)',
                                                                 borderRadius: '11px', transition: 'background 0.2s', opacity: isReadOnly ? 0.6 : 1,
                                                             }}>
                                                                 <span style={{
-                                                                    position: 'absolute', left: (configData[field.key] ?? field.default) ? '20px' : '2px', top: '2px',
+                                                                    position: 'absolute', left: (curValue ?? field.default) ? '20px' : '2px', top: '2px',
                                                                     width: '18px', height: '18px', background: '#fff',
                                                                     borderRadius: '50%', transition: 'left 0.2s',
                                                                 }} />
                                                             </span>
                                                         </label>
+                                                    ) : field.type === 'llm_model_picker' ? (
+                                                        <select className="form-input" value={curValue ?? ''} onChange={e => updateValue(e.target.value || null)} disabled={isReadOnly}>
+                                                            <option value="">{globalVal ? t('agent.tools.usingCompanyModel', 'Using company model') : (field.placeholder || '— 请选择 —')}</option>
+                                                            {(llmModels || [])
+                                                                .filter((m: any) => {
+                                                                    if (!field.filter) return true;
+                                                                    return Object.entries(field.filter).every(([k, v]) => (m as any)[k] === v);
+                                                                })
+                                                                .filter((m: any) => m.enabled !== false || m.id === curValue)
+                                                                .map((m: any) => (
+                                                                    <option key={m.id} value={m.id}>
+                                                                        {m.label || m.model} ({m.provider})
+                                                                    </option>
+                                                                ))}
+                                                        </select>
+                                                    ) : field.type === 'textarea' ? (
+                                                        <textarea className="form-input" rows={4}
+                                                            value={Array.isArray(curValue) ? curValue.join('\n') : (curValue ?? '')}
+                                                            placeholder={field.placeholder || ''}
+                                                            disabled={isReadOnly}
+                                                            onChange={e => {
+                                                                const lines = e.target.value.split('\n').map(s => s.trim()).filter(Boolean);
+                                                                updateValue(lines);
+                                                            }}
+                                                        />
                                                     ) : field.type === 'password' ? (
                                                         <>
                                                         {(() => {
-                                                            const globalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
-                                                            const isUsingGlobal = globalVal && !configData[field.key];
-                                                            
+                                                            const isUsingGlobal = globalVal && !curValue;
                                                             if (isUsingGlobal && focusedField !== field.key) {
                                                                 return (
-                                                                    <div 
-                                                                        className="form-input" 
+                                                                    <div
+                                                                        className="form-input"
                                                                         style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'text', background: 'var(--bg-tertiary)', borderColor: 'var(--border)', overflow: 'hidden' }}
                                                                         onClick={() => setFocusedField(field.key)}
                                                                     >
@@ -504,16 +535,13 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                                     </div>
                                                                 );
                                                             }
-
                                                             return (
                                                                 <input type="password" autoComplete="new-password" className="form-input"
                                                                     autoFocus={focusedField === field.key}
-                                                                    value={configData[field.key] ?? ''}
+                                                                    value={curValue ?? ''}
                                                                     placeholder={globalVal ? t('agent.tools.usingCompanyKey', 'Using company key ({{val}})', { val: globalVal }) : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
-                                                                    onBlur={(e) => {
-                                                                        if (!e.target.value) setFocusedField(null);
-                                                                    }}
-                                                                    onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                                    onBlur={(e) => { if (!e.target.value) setFocusedField(null); }}
+                                                                    onChange={e => updateValue(e.target.value)} />
                                                             );
                                                         })()}
                                                         {/* Per-provider help text for auth_code */}
@@ -531,25 +559,22 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                                 </div>
                                                             );
                                                         })()}
-
                                                         </>
                                                     ) : field.type === 'select' ? (
-                                                        <select className="form-input" value={configData[field.key] ?? field.default ?? ''}
-                                                            onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}>
+                                                        <select className="form-input" value={curValue ?? field.default ?? ''} onChange={e => updateValue(e.target.value)} disabled={isReadOnly}>
                                                             {(field.options || []).map((o: any) => <option key={o.value} value={o.value}>{o.label}</option>)}
                                                         </select>
                                                     ) : field.type === 'number' ? (
-                                                        <input type="number" className="form-input" value={configData[field.key] ?? field.default ?? ''} placeholder={field.placeholder || ''} min={field.min} max={field.max} onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value ? Number(e.target.value) : '' }))} />
+                                                        <input type="number" className="form-input" value={curValue ?? field.default ?? ''} placeholder={field.placeholder || ''} min={field.min} max={field.max} disabled={isReadOnly}
+                                                            onChange={e => updateValue(e.target.value ? Number(e.target.value) : '')} />
                                                     ) : (
                                                         <>
                                                         {(() => {
-                                                            const globalVal = configTool?.global_config?.[field.key] ?? configGlobalData?.[field.key];
-                                                            const isUsingGlobal = globalVal && !configData[field.key];
-                                                            
+                                                            const isUsingGlobal = globalVal && !curValue;
                                                             if (isUsingGlobal && focusedField !== field.key) {
                                                                 return (
-                                                                    <div 
-                                                                        className="form-input" 
+                                                                    <div
+                                                                        className="form-input"
                                                                         style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'text', background: 'var(--bg-tertiary)', borderColor: 'var(--border)', overflow: 'hidden' }}
                                                                         onClick={() => setFocusedField(field.key)}
                                                                     >
@@ -558,19 +583,19 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                                                                     </div>
                                                                 );
                                                             }
-
                                                             return (
                                                                 <input type="text" className="form-input"
                                                                     autoFocus={focusedField === field.key}
-                                                                    value={configData[field.key] ?? ''}
+                                                                    value={curValue ?? ''}
                                                                     placeholder={globalVal ? t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal }) : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
-                                                                    onBlur={(e) => {
-                                                                        if (!e.target.value) setFocusedField(null);
-                                                                    }}
-                                                                    onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                                    onBlur={(e) => { if (!e.target.value) setFocusedField(null); }}
+                                                                    onChange={e => updateValue(e.target.value)} />
                                                             );
                                                         })()}
                                                         </>
+                                                    )}
+                                                    {field.help && (
+                                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{field.help}</div>
                                                     )}
                                                 </div>
                                             );

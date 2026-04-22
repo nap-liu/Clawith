@@ -12,6 +12,8 @@ import { saveAccentColor, getSavedAccentColor, resetAccentColor, PRESET_COLORS }
 import UserManagement from './UserManagement';
 import InvitationCodes from './InvitationCodes';
 import LinearCopyButton from '../components/LinearCopyButton';
+import { getByPath, setByPath } from '../utils/configPath';
+
 // API helpers for enterprise endpoints
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
     const token = localStorage.getItem('token');
@@ -2019,10 +2021,12 @@ export default function EnterpriseSettings() {
     });
 
     // ─── LLM Models
+    // No `enabled` gate: the model list is needed by (1) the LLM settings tab,
+    // and (2) the per-tool config modal's llm_model_picker widget. Lightweight
+    // query, cached by react-query — always-on is cheaper than refetching.
     const { data: models = [] } = useQuery({
         queryKey: ['llm-models', selectedTenantId],
         queryFn: () => fetchJson<LLMModel[]>(`/enterprise/llm-models${selectedTenantId ? `?tenant_id=${selectedTenantId}` : ''}`),
-        enabled: activeTab === 'llm',
     });
     const [showAddModel, setShowAddModel] = useState(false);
     const [editingModelId, setEditingModelId] = useState<string | null>(null);
@@ -3417,13 +3421,16 @@ export default function EnterpriseSettings() {
                                             </div>
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                                                 {(tool.config_schema.fields || []).map((field: any) => {
-                                                    // Check depends_on
+                                                    // Check depends_on — supports dotted keys for nested configs
                                                     if (field.depends_on) {
                                                         const visible = Object.entries(field.depends_on).every(([k, vals]: [string, any]) =>
-                                                            vals.includes(editingConfig[k])
+                                                            vals.includes(getByPath(editingConfig, k))
                                                         );
                                                         if (!visible) return null;
                                                     }
+                                                    // Dotted-path aware read helper
+                                                    const curValue = getByPath(editingConfig, field.key);
+                                                    const updateValue = (v: any) => setEditingConfig(p => setByPath(p, field.key, v));
                                                     return (
                                                         <div key={field.key}>
                                                             <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>{field.label}</label>
@@ -3431,37 +3438,68 @@ export default function EnterpriseSettings() {
                                                                 <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer' }}>
                                                                     <input
                                                                         type="checkbox"
-                                                                        checked={editingConfig[field.key] ?? field.default ?? false}
-                                                                        onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.checked }))}
+                                                                        checked={curValue ?? field.default ?? false}
+                                                                        onChange={e => updateValue(e.target.checked)}
                                                                         style={{ opacity: 0, width: 0, height: 0 }}
                                                                     />
                                                                     <span style={{
                                                                         position: 'absolute', inset: 0,
-                                                                        background: (editingConfig[field.key] ?? field.default) ? 'var(--accent-primary)' : 'var(--bg-tertiary)',
+                                                                        background: (curValue ?? field.default) ? 'var(--accent-primary)' : 'var(--bg-tertiary)',
                                                                         borderRadius: '11px', transition: 'background 0.2s',
                                                                     }}>
                                                                         <span style={{
-                                                                            position: 'absolute', left: (editingConfig[field.key] ?? field.default) ? '20px' : '2px', top: '2px',
+                                                                            position: 'absolute', left: (curValue ?? field.default) ? '20px' : '2px', top: '2px',
                                                                             width: '18px', height: '18px', background: '#fff',
                                                                             borderRadius: '50%', transition: 'left 0.2s',
                                                                         }} />
                                                                     </span>
                                                                 </label>
                                                             ) : field.type === 'select' ? (
-                                                                <select className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))}>
+                                                                <select className="form-input" value={curValue ?? field.default ?? ''} onChange={e => updateValue(e.target.value)}>
                                                                     {(field.options || []).map((opt: any) => (
                                                                         <option key={opt.value} value={opt.value}>{opt.label}</option>
                                                                     ))}
                                                                 </select>
+                                                            ) : field.type === 'llm_model_picker' ? (
+                                                                <select className="form-input" value={curValue ?? ''} onChange={e => updateValue(e.target.value || null)}>
+                                                                    <option value="">{field.placeholder || '— 请选择 —'}</option>
+                                                                    {(models || [])
+                                                                        .filter((m: any) => {
+                                                                            // Apply filter from schema, e.g. {supports_vision: true}
+                                                                            if (!field.filter) return true;
+                                                                            return Object.entries(field.filter).every(([k, v]) => (m as any)[k] === v);
+                                                                        })
+                                                                        .filter((m: any) => m.enabled !== false)
+                                                                        .map((m: any) => (
+                                                                            <option key={m.id} value={m.id}>
+                                                                                {m.label || m.model} ({m.provider})
+                                                                            </option>
+                                                                        ))}
+                                                                </select>
+                                                            ) : field.type === 'textarea' ? (
+                                                                <textarea
+                                                                    className="form-input"
+                                                                    rows={4}
+                                                                    value={Array.isArray(curValue) ? curValue.join('\n') : (curValue ?? '')}
+                                                                    placeholder={field.placeholder || ''}
+                                                                    onChange={e => {
+                                                                        // Convert newline-separated text back to array, dropping blank lines
+                                                                        const lines = e.target.value.split('\n').map(s => s.trim()).filter(Boolean);
+                                                                        updateValue(lines);
+                                                                    }}
+                                                                />
                                                             ) : field.type === 'number' ? (
-                                                                <input type="number" className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} min={field.min} max={field.max}
-                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: Number(e.target.value) }))} />
+                                                                <input type="number" className="form-input" value={curValue ?? field.default ?? ''} min={field.min} max={field.max}
+                                                                    onChange={e => updateValue(Number(e.target.value))} />
                                                             ) : field.type === 'password' ? (
-                                                                <input type="password" autoComplete="new-password" className="form-input" value={editingConfig[field.key] ?? ''} placeholder={field.placeholder || ''}
-                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                                <input type="password" autoComplete="new-password" className="form-input" value={curValue ?? ''} placeholder={field.placeholder || ''}
+                                                                    onChange={e => updateValue(e.target.value)} />
                                                             ) : (
-                                                                <input type="text" className="form-input" value={editingConfig[field.key] ?? field.default ?? ''} placeholder={field.placeholder || ''}
-                                                                    onChange={e => setEditingConfig(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                                <input type="text" className="form-input" value={curValue ?? field.default ?? ''} placeholder={field.placeholder || ''}
+                                                                    onChange={e => updateValue(e.target.value)} />
+                                                            )}
+                                                            {field.help && (
+                                                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{field.help}</div>
                                                             )}
                                                         </div>
                                                     );
