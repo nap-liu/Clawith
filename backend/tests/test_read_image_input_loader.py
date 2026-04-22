@@ -236,3 +236,156 @@ async def test_base64_display_ref_never_contains_payload(workspace, jpeg_bytes):
     item = result.items[0]
     # Regardless of success or failure, the display_ref must not contain the payload
     assert "base64," not in item.display_ref
+
+
+# ─── URL mode ────────────────────────────────────────────────────────────────
+
+def _url_config(allowlist=None) -> dict:
+    import copy
+    c = copy.deepcopy(DEFAULT_CONFIG)
+    c["input_modes"]["url"]["enabled"] = True
+    c["input_modes"]["url"]["allowlist"] = allowlist or ["*.example.com"]
+    return c
+
+
+@pytest.mark.asyncio
+async def test_url_disabled_is_category_A(workspace):
+    result = await load(
+        ["https://cdn.example.com/x.jpg"], workspace, DEFAULT_CONFIG
+    )
+    assert result.short_circuit is not None
+    assert result.short_circuit.category == "A"
+    assert "url" in result.short_circuit.reason.lower() or "URL" in result.short_circuit.reason
+
+
+@pytest.mark.asyncio
+async def test_url_non_http_scheme_is_category_A(workspace):
+    cfg = _url_config(allowlist=["*"])
+    for bad in [
+        "file:///etc/passwd",
+        "gopher://attacker/",
+        "ftp://example.com/x.jpg",
+    ]:
+        result = await load([bad], workspace, cfg)
+        assert result.short_circuit is not None, f"expected refusal for {bad}"
+        assert result.short_circuit.category == "A"
+
+
+@pytest.mark.asyncio
+async def test_url_empty_allowlist_denies_all(workspace):
+    cfg = _url_config(allowlist=[])
+    result = await load(["https://cdn.example.com/x.jpg"], workspace, cfg)
+    assert result.short_circuit is not None
+    assert result.short_circuit.category == "A"
+
+
+@pytest.mark.asyncio
+async def test_url_allowlist_miss_is_category_A(workspace):
+    cfg = _url_config(allowlist=["*.allowed.example"])
+    result = await load(["https://attacker.example/x.jpg"], workspace, cfg)
+    assert result.short_circuit is not None
+    assert result.short_circuit.category == "A"
+
+
+@pytest.mark.asyncio
+async def test_url_private_ip_is_rejected(monkeypatch, workspace):
+    """Even with allowlist hit, private-IP DNS resolution → refusal."""
+    from app.services.tools.read_image import input_loader
+
+    async def fake_resolve(host):
+        return ["10.0.0.5"]
+
+    monkeypatch.setattr(input_loader, "_resolve_host", fake_resolve)
+    cfg = _url_config(allowlist=["*.example.com"])
+    result = await load(["https://internal.example.com/x.jpg"], workspace, cfg)
+    assert result.short_circuit is not None
+    assert result.short_circuit.category == "A"
+    assert "private" in result.short_circuit.reason.lower() or "内网" in result.short_circuit.reason
+
+
+@pytest.mark.asyncio
+async def test_url_loopback_rejected(monkeypatch, workspace):
+    from app.services.tools.read_image import input_loader
+
+    async def fake_resolve(host):
+        return ["127.0.0.1"]
+
+    monkeypatch.setattr(input_loader, "_resolve_host", fake_resolve)
+    cfg = _url_config(allowlist=["*"])
+    result = await load(["https://any.example.com/x.jpg"], workspace, cfg)
+    assert result.short_circuit is not None
+    assert result.short_circuit.category == "A"
+
+
+@pytest.mark.asyncio
+async def test_url_link_local_rejected(monkeypatch, workspace):
+    from app.services.tools.read_image import input_loader
+
+    async def fake_resolve(host):
+        return ["169.254.169.254"]  # EC2 IMDS
+
+    monkeypatch.setattr(input_loader, "_resolve_host", fake_resolve)
+    cfg = _url_config(allowlist=["*"])
+    result = await load(["https://metadata.example/x"], workspace, cfg)
+    assert result.short_circuit is not None
+    assert result.short_circuit.category == "A"
+
+
+@pytest.mark.asyncio
+async def test_url_happy_path_fetch(monkeypatch, workspace, jpeg_bytes):
+    from app.services.tools.read_image import input_loader
+
+    async def fake_resolve(host):
+        return ["93.184.216.34"]  # example.com, public
+
+    async def fake_fetch(url, config):
+        return (jpeg_bytes, url)
+
+    monkeypatch.setattr(input_loader, "_resolve_host", fake_resolve)
+    monkeypatch.setattr(input_loader, "_fetch_with_revalidation", fake_fetch)
+
+    cfg = _url_config(allowlist=["*.example.com"])
+    result = await load(["https://cdn.example.com/x.jpg"], workspace, cfg)
+    assert result.short_circuit is None
+    assert isinstance(result.items[0], LoadedImage)
+    assert result.items[0].display_ref == "https://cdn.example.com/x.jpg"
+
+
+def test_verify_true_is_hardcoded_in_input_loader():
+    """Source-scan lock: input_loader must hardcode httpx verify=True.
+
+    This test catches a whole class of "someone disabled TLS verification
+    to support an internal self-signed cert" regressions. If that need
+    ever arises, it must land as a spec/ADR change, not a one-line flip.
+    """
+    import inspect
+    from app.services.tools.read_image import input_loader
+
+    src = inspect.getsource(input_loader)
+    assert "verify=True" in src, "input_loader must hardcode verify=True"
+    assert "verify=False" not in src, (
+        "verify=False is never acceptable for read_image; "
+        "see spec §5 Security 2 (HTTPS verification is mandatory)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_url_redirect_to_private_ip_rejected(monkeypatch, workspace):
+    """Verify we revalidate Location headers at each redirect hop."""
+    from app.services.tools.read_image import input_loader
+
+    async def fake_resolve(host):
+        if host == "cdn.example.com":
+            return ["93.184.216.34"]
+        return ["10.0.0.5"]
+
+    async def fake_fetch(url, config):
+        raise input_loader._RedirectToPrivateIP("Location resolved to private IP")
+
+    monkeypatch.setattr(input_loader, "_resolve_host", fake_resolve)
+    monkeypatch.setattr(input_loader, "_fetch_with_revalidation", fake_fetch)
+
+    cfg = _url_config(allowlist=["*.example.com"])
+    result = await load(["https://cdn.example.com/x.jpg"], workspace, cfg)
+    assert result.short_circuit is not None
+    assert result.short_circuit.category == "A"
