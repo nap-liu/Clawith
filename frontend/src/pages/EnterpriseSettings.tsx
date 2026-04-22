@@ -12,28 +12,7 @@ import { saveAccentColor, getSavedAccentColor, resetAccentColor, PRESET_COLORS }
 import UserManagement from './UserManagement';
 import InvitationCodes from './InvitationCodes';
 import LinearCopyButton from '../components/LinearCopyButton';
-// ─── Dotted-path helpers for nested config read/write ─────────────────────
-// Tools like read_image store config nested (input_modes.url.enabled); the
-// config_schema.fields use dotted keys to address these. These helpers let
-// the form render against nested configs without flattening the backend.
-function getByPath<T = any>(obj: any, path: string): T | undefined {
-    if (!obj || !path) return undefined;
-    return path.split('.').reduce<any>((acc, k) => (acc == null ? acc : acc[k]), obj);
-}
-function setByPath(obj: any, path: string, value: any): any {
-    // Returns a NEW object tree with the path set (for React state immutability).
-    if (!path) return obj;
-    const parts = path.split('.');
-    const next = { ...(obj || {}) };
-    let cur: any = next;
-    for (let i = 0; i < parts.length - 1; i++) {
-        const k = parts[i];
-        cur[k] = { ...(cur[k] || {}) };
-        cur = cur[k];
-    }
-    cur[parts[parts.length - 1]] = value;
-    return next;
-}
+import { getByPath, setByPath } from '../utils/configPath';
 
 // API helpers for enterprise endpoints
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
