@@ -4,6 +4,28 @@ import re
 from copy import deepcopy
 from urllib.parse import urlparse, urlunparse
 
+# Data-URL for inline images — redacted to prevent base64 payload pollution
+# in audit logs, WebSocket broadcasts, and session history.
+_DATA_IMAGE_URI_RE = re.compile(
+    r"^data:image/(jpeg|png|webp|gif);base64,",
+    re.IGNORECASE,
+)
+
+
+def _redact_if_base64_image(value):
+    """If `value` is a data:image/*;base64,… URI, return a placeholder.
+    Otherwise return the value unchanged. Safe on non-strings.
+    """
+    if not isinstance(value, str):
+        return value
+    if not _DATA_IMAGE_URI_RE.match(value):
+        return value
+    # Approximate decoded size without actually decoding.
+    header, _, payload = value.partition(",")
+    size_kb = max(1, (len(payload) * 3 // 4) // 1024)
+    return f"[base64 image, {size_kb} KB]"
+
+
 # Field names whose values should be completely hidden (replaced with "******")
 SENSITIVE_FIELD_NAMES = {
     "password", "secret", "token", "api_key", "apikey", "api_secret",
@@ -38,6 +60,13 @@ def sanitize_tool_args(args: dict | None) -> dict | None:
         # Fully mask values that look like connection URIs regardless of field name
         if isinstance(sanitized[key], str) and _looks_like_connection_uri(sanitized[key]):
             sanitized[key] = "******"
+
+        # Redact base64 image data URIs (strings and list items)
+        val = sanitized[key]
+        if isinstance(val, str):
+            sanitized[key] = _redact_if_base64_image(val)
+        elif isinstance(val, list):
+            sanitized[key] = [_redact_if_base64_image(item) for item in val]
 
     # Special case: hide content when writing to secrets.md
     path_val = sanitized.get("path", "") or ""
