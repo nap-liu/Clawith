@@ -449,6 +449,9 @@ async def call_llm(
         logger.info(f"[LLM] Round {round_i+1}: {len(response.tool_calls)} tool call(s)")
 
         # Add assistant message with tool calls
+        # NB: tc["function"] is shared by reference with _canonicalize_tc_arguments's
+        # in-place canonicalization — must stay as a reference (no deepcopy), or
+        # history entries will carry the pre-repair malformed arguments.
         api_messages.append(LLMMessage(
             role="assistant",
             content=response.content or None,
@@ -779,9 +782,12 @@ async def call_agent_llm_with_tools(
                     if agent_id and _accumulated_tokens > 0:
                         await record_token_usage(agent_id, _accumulated_tokens)
                     await client.close()
-                    return response.content or "[Empty response]", True
+                    return response.content or "[Empty response]", True, tool_executed
 
                 # Execute tool calls
+                # NB: tc["function"] is shared by reference with _canonicalize_tc_arguments's
+                # in-place canonicalization — must stay as a reference (no deepcopy), or
+                # history entries will carry the pre-repair malformed arguments.
                 api_messages.append(LLMMessage(
                     role="assistant",
                     content=response.content or None,
