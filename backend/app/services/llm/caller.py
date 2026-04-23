@@ -209,10 +209,17 @@ async def _process_tool_call(
     raw_args = fn.get("arguments", "{}")
     logger.info(f"[LLM] Calling tool: {tool_name}({json.dumps(raw_args, ensure_ascii=False)[:100]})")
 
-    try:
-        args = json.loads(raw_args) if raw_args else {}
-    except json.JSONDecodeError:
-        args = {}
+    from app.services.llm.json_recovery import canonicalize_tool_arguments
+    args, canonical_args, repair_method = canonicalize_tool_arguments(raw_args)
+    # Overwrite tc.function.arguments with canonical JSON so later LLM rounds
+    # receive a history entry guaranteed to pass DashScope's JSON validator.
+    fn["arguments"] = canonical_args
+    if repair_method != "clean":
+        logger.warning(
+            f"[LLM] tool_call args repaired: tool={tool_name} method={repair_method} "
+            f"orig_len={len(raw_args)} canonical_len={len(canonical_args)} "
+            f"session={session_id}"
+        )
 
     # Guard: check if tool requires arguments
     should_execute, error_msg = _check_tool_requires_args(tool_name, args)
@@ -268,6 +275,20 @@ async def _process_tool_call(
         except Exception:
             pass
     
+    # Shape oversized tool results to protect conversation context budget.
+    # Only applies to plain-string content — vision content arrays are left alone.
+    from app.services.llm.tool_result_shaping import shape_tool_result
+    TOOL_RESULT_MAX_CHARS = 20_000
+    if isinstance(tool_content, str):
+        shaped, was_truncated = shape_tool_result(tool_content, TOOL_RESULT_MAX_CHARS)
+        if was_truncated:
+            logger.warning(
+                f"[LLM] tool_result truncated: tool={tool_name} "
+                f"orig_len={len(tool_content)} shaped_len={len(shaped)} "
+                f"session={session_id}"
+            )
+        tool_content = shaped
+
     api_messages.append(LLMMessage(
         role="tool",
         tool_call_id=tc["id"],
