@@ -28,7 +28,7 @@ from app.services.token_tracker import record_token_usage, extract_usage_tokens,
 from .client import LLMError
 from .failover import classify_error, FailoverErrorType
 from .json_recovery import canonicalize_tool_arguments
-from .tool_result_shaping import shape_tool_result
+from .tool_output_store import finalize_tool_output
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
 if TYPE_CHECKING:
@@ -40,10 +40,6 @@ TOOLS_REQUIRING_ARGS = frozenset({
     "write_file", "read_file", "delete_file", "read_document",
     "send_message_to_agent", "send_feishu_message", "send_email"
 })
-
-# Cap for any single tool-result entry sent into LLM history.
-# Phase 1 uses a constant; Phase 2 will make this per-agent configurable.
-TOOL_RESULT_MAX_CHARS = 20_000
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -220,26 +216,6 @@ def _canonicalize_tc_arguments(tc: dict, session_id: str) -> dict[str, Any]:
     return args
 
 
-def _shape_tool_content_for_context(tool_content, tool_name: str, session_id: str):
-    """Return tool_content capped at TOOL_RESULT_MAX_CHARS (string content only).
-
-    Vision content is always a list[dict] per vision_inject.try_inject_screenshot_vision —
-    we pass those through unchanged to preserve base64 image data.
-    """
-    # Invariant: vision content is always a list[dict]; see vision_inject.try_inject_screenshot_vision.
-    if not isinstance(tool_content, str):
-        return tool_content
-    shaped, was_truncated = shape_tool_result(tool_content, TOOL_RESULT_MAX_CHARS)
-    if was_truncated:
-        dropped = len(tool_content) - len(shaped)
-        logger.warning(
-            f"[LLM] tool_result truncated: tool={tool_name} "
-            f"orig_len={len(tool_content)} new_len={len(shaped)} "
-            f"dropped={dropped} session={session_id}"
-        )
-    return shaped
-
-
 async def _process_tool_call(
     tc: dict,
     api_messages: list,
@@ -283,8 +259,21 @@ async def _process_tool_call(
     )
     logger.debug(f"[LLM] Tool result: {result[:100]}")
 
-    # ── Vision injection for screenshot tools ──
-    tool_content: str | list = str(result)
+    # Materialize oversize output and produce the canonical llm_view string.
+    # This is the single shape point — DB, WS live stream, historical replay
+    # all consume this string, keeping the messages sequence append-only.
+    llm_view = finalize_tool_output(
+        result,
+        tool_name=tool_name,
+        agent_id=agent_id,
+        session_id=session_id,
+        tool_call_id=tc["id"],
+    )
+
+    # Vision injection is a one-shot enhancement for the current turn only.
+    # Historical replay sees the string llm_view; only this round gets the
+    # richer image payload.
+    tool_content: str | list = llm_view
     if supports_vision and agent_id:
         try:
             from app.services.vision_inject import try_inject_screenshot_vision
@@ -298,20 +287,20 @@ async def _process_tool_call(
         except Exception as e:
             logger.warning(f"[LLM] Vision injection failed for {tool_name}: {e}")
 
-    # Notify client about tool call result
+    # Notify client (for WS live stream and DB persistence) with the
+    # llm_view — never the raw result. Three-way consistency: DB view,
+    # LLM replay view, and the value the frontend receives all match.
     if on_tool_call:
         try:
             await on_tool_call({
                 "name": tool_name,
                 "args": args,
                 "status": "done",
-                "result": result,
+                "result": llm_view,
                 "reasoning_content": full_reasoning_content
             })
         except Exception:
             pass
-    
-    tool_content = _shape_tool_content_for_context(tool_content, tool_name, session_id)
 
     api_messages.append(LLMMessage(
         role="tool",

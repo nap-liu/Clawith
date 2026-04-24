@@ -310,13 +310,15 @@ async def websocket_chat(
                 if tc_data.get("reasoning_content"):
                     asst_msg["reasoning_content"] = tc_data["reasoning_content"]
                 conversation.append(asst_msg)
-                # Tool result message.
+                # Tool result message. tc_result is already the canonical
+                # llm_view produced by finalize_tool_output when the tool
+                # was executed — append-only, never re-shaped here.
                 from app.services.vision_inject import sanitize_history_tool_result
                 sanitized_result = sanitize_history_tool_result(str(tc_result))
                 conversation.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
-                    "content": sanitized_result[:500],
+                    "content": sanitized_result,
                 })
             except Exception:
                 continue  # Skip malformed tool_call records
@@ -495,7 +497,12 @@ async def websocket_chat(
                                             "name": data.get("name", ""),
                                             "args": sanitize_tool_args(data.get("args")),
                                             "status": "done",
-                                            "result": (data.get("result") or "")[:500],
+                                            # data["result"] is the llm_view from
+                                            # tool_output_store.finalize_tool_output —
+                                            # already bounded (inline if under the
+                                            # tool's budget, else a <persisted-output>
+                                            # block pointing at the workspace file).
+                                            "result": data.get("result") or "",
                                             "reasoning_content": data.get("reasoning_content"),
                                         }),
                                         conversation_id=conv_id,
