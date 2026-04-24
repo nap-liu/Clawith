@@ -883,7 +883,11 @@
       "department": "Department",
       "departmentDesc": "Only selected department members can use",
       "selfOnly": "Self Only",
-      "selfOnlyDesc": "Only the creator can use"
+      "selfOnlyDesc": "Only the creator can use",
+      "specificUsers": "Specific Users",
+      "specificUsersDesc": "Select specific people from your company",
+      "searchUsers": "Search users...",
+      "noUsersFound": "No users found"
     },
     "step5": {
       "title": "Feishu Bot Configuration (Optional)",
