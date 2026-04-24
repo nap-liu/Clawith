@@ -5679,6 +5679,7 @@ function AgentDetailInner() {
                                                             .map((member: any) => {
                                                                 const isChecked = permEditUserIds.includes(member.id);
                                                                 const parts = [member.display_name];
+                                                                if (member.email) parts.push(member.email);
                                                                 if (member.department_path) parts.push(member.department_path);
                                                                 if (member.title) parts.push(member.title);
                                                                 return (
