@@ -188,6 +188,82 @@ def _convert_messages_for_vision(
     return new_messages
 
 
+def _inject_first_hop_context(
+    api_messages: list,
+    dynamic_prompt: str | None,
+    *,
+    inject: bool,
+) -> list:
+    """Return a copy of ``api_messages`` with dynamic context wrapped around
+    the last ``user`` message — only when ``inject`` is True.
+
+    Layout after injection:
+        last_user.content = f"<context>\\n{dynamic_prompt}\\n</context>\\n\\n{original}"
+
+    Why a wrapper instead of a separate message?
+    - Keeps message count stable (Qwen/DashScope prefix cache is byte-level).
+    - Keeps append-only history: we never mutate ``api_messages`` in place;
+      only the dispatched copy carries the wrapper.
+
+    When there is no ``user`` message in history, or dynamic_prompt is empty,
+    or inject is False, we return a shallow list copy unchanged. The caller
+    must pass ``inject=True`` only on the first hop of the tool loop — on
+    continuation rounds the tail is assistant/tool messages and wrapping would
+    have no valid target anyway.
+
+    The returned list contains fresh ``LLMMessage`` instances for any message
+    we modify, so the caller's ``api_messages`` stays byte-identical for the
+    next round's cache prefix.
+    """
+    out = list(api_messages)
+    if not inject or not dynamic_prompt:
+        return out
+
+    # Find the last role="user" index
+    last_user_idx = -1
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].role == "user":
+            last_user_idx = i
+            break
+    if last_user_idx < 0:
+        return out
+
+    original = out[last_user_idx]
+    original_content = original.content
+    # If content is a vision list, wrap the trailing text part (vision_convert
+    # already places text after images); if there's no text part, append one.
+    if isinstance(original_content, list):
+        new_parts = [dict(p) for p in original_content]
+        text_idx = -1
+        for i in range(len(new_parts) - 1, -1, -1):
+            if new_parts[i].get("type") == "text":
+                text_idx = i
+                break
+        wrapper_prefix = f"<context>\n{dynamic_prompt}\n</context>\n\n"
+        if text_idx >= 0:
+            existing_text = new_parts[text_idx].get("text", "")
+            new_parts[text_idx] = {
+                "type": "text",
+                "text": f"{wrapper_prefix}{existing_text}",
+            }
+        else:
+            new_parts.append({"type": "text", "text": wrapper_prefix.rstrip()})
+        new_content: str | list = new_parts
+    else:
+        base = original_content or ""
+        new_content = f"<context>\n{dynamic_prompt}\n</context>\n\n{base}"
+
+    out[last_user_idx] = LLMMessage(
+        role=original.role,
+        content=new_content,
+        tool_calls=original.tool_calls,
+        tool_call_id=original.tool_call_id,
+        reasoning_content=original.reasoning_content,
+        reasoning_signature=original.reasoning_signature,
+    )
+    return out
+
+
 def _check_tool_requires_args(tool_name: str, args: dict) -> tuple[bool, str]:
     """Check if tool requires arguments and return (should_execute, result_or_error)."""
     if not args and tool_name in TOOLS_REQUIRING_ARGS:
@@ -345,11 +421,24 @@ async def call_llm(
     # Look up current user's display name so the agent knows who it's talking to
     static_prompt, dynamic_prompt = await build_agent_context(agent_id, agent_name, role_description, current_user_name=_user_name)
 
-    # Load tools dynamically from DB
+    # Load tools dynamically from DB.
+    # Sort by function.name so Anthropic's tools[-1] cache_control lands on a
+    # stable tool block across calls — any iteration order churn from the DB
+    # layer would otherwise invalidate the tools prefix cache every request.
     tools_for_llm = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
+    if tools_for_llm:
+        tools_for_llm = sorted(
+            tools_for_llm,
+            key=lambda t: t.get("function", {}).get("name", ""),
+        )
 
-    # Convert messages to LLMMessage format
-    api_messages = [LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt)]
+    # Convert messages to LLMMessage format.
+    # IMPORTANT (context-v2 / P1-A): system holds ONLY the static prompt so the
+    # system prefix stays byte-identical across calls — Anthropic prompt cache
+    # and Qwen/DashScope automatic prefix cache need this to hit. Dynamic bits
+    # (current time, memory, focus, round warnings) are injected into the
+    # last-user-message on the "first hop" below, so history stays append-only.
+    api_messages = [LLMMessage(role="system", content=static_prompt)]
     for msg in messages:
         api_messages.append(LLMMessage(
             role=msg.get("role", "user"),
@@ -378,7 +467,13 @@ async def call_llm(
 
     # Tool-calling loop
     for round_i in range(_max_tool_rounds):
-        # Dynamic tool-call limit warning
+        # Dynamic tool-call limit warning.
+        # NB (context-v2): these warnings stay as plain appended user messages.
+        # That keeps api_messages append-only — once appended at round N, the
+        # warning sits in a fixed historical position for every later send, so
+        # the prefix cache before it is not invalidated. Do NOT fold round
+        # warnings into the per-round <context> block: that would mutate the
+        # last user message mid-loop and break cache hits.
         _warn_threshold_80 = int(_max_tool_rounds * 0.8)
         _warn_threshold_96 = _max_tool_rounds - 2
         if round_i == _warn_threshold_80:
@@ -396,10 +491,21 @@ async def call_llm(
                 content=f"🚨 仅剩 2 轮工具调用。请立即保存进度到 focus.md 并设置续接触发器。",
             ))
 
+        # Build the "dispatch" view of api_messages sent this round.
+        # Only on round 0 (the first hop) do we wrap the last user message in a
+        # <context>…</context> prefix carrying dynamic_prompt (current time,
+        # memory, focus, …). Subsequent rounds are tool-calling continuations
+        # whose trailing items are assistant/tool messages — the LLM already
+        # has the context from round 0 in its own cached prefix, and we don't
+        # want to mutate the original history (breaks append-only + cache).
+        dispatch_messages = _inject_first_hop_context(
+            api_messages, dynamic_prompt, inject=(round_i == 0),
+        )
+
         try:
             # Use streaming API for real-time responses
             response = await client.stream(
-                messages=api_messages,
+                messages=dispatch_messages,
                 tools=tools_for_llm if tools_for_llm else None,
                 temperature=model.temperature,
                 max_tokens=max_tokens,

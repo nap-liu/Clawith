@@ -1436,6 +1436,7 @@ class AnthropicClient(LLMClient):
                         "text": msg.content,
                         "cache_control": {"type": "ephemeral"}
                     })
+                # NOTE: no longer expected to be populated after context-v2 P1; kept for backward compat
                 if msg.dynamic_content:
                     system_blocks.append({
                         "type": "text",
@@ -1446,19 +1447,25 @@ class AnthropicClient(LLMClient):
                 if formatted:
                     anthropic_messages.append(formatted)
 
-        # In Anthropic prompt caching, we also want to cache_control the last user message
-        # So we add cache_control to the very last message in the history if it's a user message
-        if anthropic_messages and anthropic_messages[-1]["role"] == "user":
-            user_msg = anthropic_messages[-1]
-            if isinstance(user_msg["content"], list) and user_msg["content"]:
-                # Ensure the last block of the user message has cache_control
-                user_msg["content"][-1]["cache_control"] = {"type": "ephemeral"}
-            elif isinstance(user_msg["content"], str):
-                user_msg["content"] = [
+        # Prompt-cache breakpoint on messages:
+        # The last message is the current turn (contains volatile <context> + user input),
+        # so caching it would write a cache entry that never hits. Instead, place the
+        # cache_control on the tail of the stable prefix — that is, messages[-2] — which
+        # covers everything the next turn will share (history + static system + tools).
+        # On the first turn (len < 2) there is no stable prefix to cache yet, so skip.
+        if len(anthropic_messages) >= 2:
+            prefix_msg = anthropic_messages[-2]
+            prefix_content = prefix_msg.get("content")
+            if isinstance(prefix_content, list) and prefix_content:
+                # For tool_result blocks, cache_control goes on the tool_result block itself
+                # (at the top level), NOT nested inside its own .content list.
+                prefix_content[-1]["cache_control"] = {"type": "ephemeral"}
+            elif isinstance(prefix_content, str):
+                prefix_msg["content"] = [
                     {
                         "type": "text",
-                        "text": user_msg["content"],
-                        "cache_control": {"type": "ephemeral"}
+                        "text": prefix_content,
+                        "cache_control": {"type": "ephemeral"},
                     }
                 ]
 
