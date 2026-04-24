@@ -8,6 +8,7 @@ import type { FileBrowserApi } from '../components/FileBrowser';
 import FileBrowser from '../components/FileBrowser';
 import ChannelConfig from '../components/ChannelConfig';
 import MarkdownRenderer from '../components/MarkdownRenderer';
+import PersistedOutputCard from '../components/PersistedOutputCard';
 import PromptModal from '../components/PromptModal';
 import OpenClawSettings from './OpenClawSettings';
 import AgentBayLivePanel, { LivePreviewState } from '../components/AgentBayLivePanel';
@@ -19,6 +20,7 @@ import { useAuthStore } from '../stores';
 import { copyToClipboard } from '../utils/clipboard';
 import { formatFileSize } from '../utils/formatFileSize';
 import { getByPath, setByPath } from '../utils/configPath';
+import { parsePersistedOutput } from '../utils/persistedOutput';
 import { IconPaperclip, IconSend } from '@tabler/icons-react';
 import { useDropZone } from '../hooks/useDropZone';
 
@@ -3618,6 +3620,7 @@ function AgentDetailInner() {
                                                                                 const tResult = msg.toolResult || '';
                                                                                 const argsStr = typeof tArgs === 'string' ? tArgs : JSON.stringify(tArgs || {}, null, 2);
                                                                                 const resultStr = typeof tResult === 'string' ? tResult : JSON.stringify(tResult, null, 2);
+                                                                                const persisted = resultStr ? parsePersistedOutput(resultStr) : null;
                                                                                 const hasDetail = argsStr.length > 60 || resultStr;
                                                                                 const Tag = hasDetail ? 'details' : 'div';
                                                                                 const HeaderTag = hasDetail ? 'summary' : 'div';
@@ -3645,20 +3648,36 @@ function AgentDetailInner() {
                                                                                             </span>
                                                                                         </HeaderTag>
                                                                                         {hasDetail && (
-                                                                                            <div style={{
-                                                                                                padding: '8px 10px', borderTop: '1px solid var(--border-subtle)',
-                                                                                                fontFamily: 'monospace', fontSize: '10px', lineHeight: 1.5,
-                                                                                                whiteSpace: 'pre-wrap', maxHeight: '200px', overflow: 'auto',
-                                                                                                color: 'var(--text-secondary)',
-                                                                                            }}>
-                                                                                                {argsStr}
-                                                                                                {resultStr && (
-                                                                                                    <>
-                                                                                                        <div style={{ borderTop: '1px dashed var(--border-subtle)', margin: '6px 0', opacity: 0.5 }} />
-                                                                                                        <span style={{ color: 'var(--text-tertiary)' }}>→ </span>{resultStr.substring(0, 500)}
-                                                                                                    </>
-                                                                                                )}
-                                                                                            </div>
+                                                                                            persisted && id ? (
+                                                                                                <div style={{ borderTop: '1px solid var(--border-subtle)' }}>
+                                                                                                    <div style={{
+                                                                                                        padding: '8px 10px',
+                                                                                                        fontFamily: 'monospace', fontSize: '10px', lineHeight: 1.5,
+                                                                                                        whiteSpace: 'pre-wrap', maxHeight: '120px', overflow: 'auto',
+                                                                                                        color: 'var(--text-secondary)',
+                                                                                                    }}>
+                                                                                                        {argsStr}
+                                                                                                    </div>
+                                                                                                    <div style={{ padding: '0 10px 8px 10px' }}>
+                                                                                                        <PersistedOutputCard agentId={id} parsed={persisted} />
+                                                                                                    </div>
+                                                                                                </div>
+                                                                                            ) : (
+                                                                                                <div style={{
+                                                                                                    padding: '8px 10px', borderTop: '1px solid var(--border-subtle)',
+                                                                                                    fontFamily: 'monospace', fontSize: '10px', lineHeight: 1.5,
+                                                                                                    whiteSpace: 'pre-wrap', maxHeight: '200px', overflow: 'auto',
+                                                                                                    color: 'var(--text-secondary)',
+                                                                                                }}>
+                                                                                                    {argsStr}
+                                                                                                    {resultStr && (
+                                                                                                        <>
+                                                                                                            <div style={{ borderTop: '1px dashed var(--border-subtle)', margin: '6px 0', opacity: 0.5 }} />
+                                                                                                            <span style={{ color: 'var(--text-tertiary)' }}>→ </span>{resultStr.substring(0, 500)}
+                                                                                                        </>
+                                                                                                    )}
+                                                                                                </div>
+                                                                                            )
                                                                                         )}
                                                                                     </Tag>
                                                                                 );
@@ -3668,6 +3687,28 @@ function AgentDetailInner() {
                                                                                 const tResult = msg.toolResult || msg.content || '';
                                                                                 const resultStr = typeof tResult === 'string' ? tResult : JSON.stringify(tResult, null, 2);
                                                                                 if (!resultStr) return null;
+                                                                                const persisted = parsePersistedOutput(resultStr);
+                                                                                if (persisted && id) {
+                                                                                    return (
+                                                                                        <div key={mi} style={{ borderRadius: '6px', background: 'var(--bg-secondary)', overflow: 'hidden' }}>
+                                                                                            <div style={{
+                                                                                                padding: '5px 10px',
+                                                                                                fontSize: '11px',
+                                                                                                display: 'flex', alignItems: 'center', gap: '8px',
+                                                                                            }}>
+                                                                                                <span style={{
+                                                                                                    fontWeight: 600, fontSize: '10px', color: 'var(--text-primary)',
+                                                                                                    padding: '1px 6px', borderRadius: '3px',
+                                                                                                    background: 'var(--bg-tertiary, rgba(0,0,0,0.06))',
+                                                                                                    flexShrink: 0, fontFamily: 'monospace',
+                                                                                                }}>{tName}</span>
+                                                                                            </div>
+                                                                                            <div style={{ padding: '0 10px 8px 10px' }}>
+                                                                                                <PersistedOutputCard agentId={id} parsed={persisted} />
+                                                                                            </div>
+                                                                                        </div>
+                                                                                    );
+                                                                                }
                                                                                 return (
                                                                                     <details key={mi} style={{ borderRadius: '6px', background: 'var(--bg-secondary)', overflow: 'hidden' }}>
                                                                                         <summary style={{
