@@ -500,6 +500,8 @@
         "companyWideDesc": "All users in the organization can use this agent",
         "onlyMe": "Only Me",
         "onlyMeDesc": "Only the creator can use this agent",
+"specificUsers": "Specific users",
+"specificUsersDesc": "Select specific people from your company",
         "defaultAccess": "Default Access Level",
         "useAccess": "Use",
         "useAccessDesc": "Task, Chat, Tools, Skills, Workspace",

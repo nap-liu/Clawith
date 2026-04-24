@@ -531,6 +531,8 @@
         "companyWideDesc": "组织中的所有用户都可以使用此数字员工",
         "onlyMe": "仅我可见",
         "onlyMeDesc": "只有创建者可以使用此数字员工",
+        "specificUsers": "指定用户",
+        "specificUsersDesc": "从公司成员中选择特定人员",
         "defaultAccess": "默认访问级别",
         "useAccess": "使用",
         "useAccessDesc": "任务、聊天、工具、技能、工作区",
