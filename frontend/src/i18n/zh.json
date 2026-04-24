@@ -930,6 +930,7 @@
       "specificUsersDesc": "从公司成员中选择特定人员",
       "searchUsers": "搜索用户...",
       "noUsersFound": "未找到匹配的用户",
+      "selectedCount": "已选择 {{count}} 人",
       "accessLevel": "默认访问级别",
       "useLevel": "使用",
       "useDesc": "可以使用任务、聊天、工具、技能、工作区",

@@ -45,7 +45,11 @@ async def list_users(
     rows = result.all()
 
     out = []
+    seen: set[uuid.UUID] = set()
     for user, dept_path in rows:
+        if user.id in seen:
+            continue
+        seen.add(user.id)
         data = UserOut.model_validate(user).model_dump()
         data["department_path"] = dept_path
         out.append(data)

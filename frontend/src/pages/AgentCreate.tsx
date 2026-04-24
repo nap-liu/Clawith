@@ -143,6 +143,13 @@ export default function AgentCreate() {
         }
     }, [currentUser]);
 
+    useEffect(() => {
+        if (form.permission_scope_type !== 'specific') {
+            setPermissionSelectedUserIds([]);
+            setUserSearchQuery('');
+        }
+    }, [form.permission_scope_type]);
+
     const createMutation = useMutation({
         mutationFn: async (data: any) => {
             const agent = await agentApi.create(data);
@@ -860,7 +867,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                                 </div>
                                 {permissionSelectedUserIds.length > 0 && (
                                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '8px' }}>
-                                        已选择 {permissionSelectedUserIds.length} 人
+                                        {t('wizard.step4.selectedCount', { count: permissionSelectedUserIds.length })}
                                     </div>
                                 )}
                             </div>

@@ -887,7 +887,8 @@
       "specificUsers": "Specific Users",
       "specificUsersDesc": "Select specific people from your company",
       "searchUsers": "Search users...",
-      "noUsersFound": "No users found"
+      "noUsersFound": "No users found",
+      "selectedCount": "{{count}} users selected"
     },
     "step5": {
       "title": "Feishu Bot Configuration (Optional)",
