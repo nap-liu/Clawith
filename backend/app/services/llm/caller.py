@@ -42,6 +42,46 @@ TOOLS_REQUIRING_ARGS = frozenset({
 })
 
 
+# ─── P4: max_output_tokens recovery (Claude-Code-aligned) ─────────────────────
+# When a provider truncates the response because the output hit its per-call
+# token cap (`finish_reason == "length"` for OpenAI-compat / Gemini, or
+# `"max_tokens"` for Anthropic), we *do not* surface an error. Instead we push
+# the partial text into history as an assistant message, append a terse
+# "continue" user prompt (verbatim from Claude Code), and re-stream. Up to
+# MAX_OUTPUT_TOKENS_RECOVERY_LIMIT resume attempts per call; after that we
+# surface a clear error so the failover layer can decide what to do.
+MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
+
+# Claude Code's exact prompt text for the resume nudge. Keep verbatim so we
+# inherit its tuned tone — short, no recap, no apology.
+RESUME_PROMPT = (
+    "Output token limit hit. Resume directly — no apology, no recap of what "
+    "you were doing. Pick up mid-thought if that is where the cut happened. "
+    "Break remaining work into smaller pieces."
+)
+
+# Finish-reason strings that mean "output cap reached mid-response" across
+# providers. Gemini's _normalize_finish_reason maps MAX_TOKENS → "length";
+# OpenAI-compat natively emits "length"; Anthropic's stream() keeps the raw
+# "max_tokens" string (end_turn/tool_use are normalized but max_tokens is
+# not). We accept all three spellings to be defensive across provider code
+# paths (and to tolerate any future Gemini fallback where the raw label slips
+# through unnormalized).
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "MAX_TOKENS"})
+
+
+def _response_was_truncated_by_length(response) -> bool:
+    """True iff the LLM ran out of output tokens mid-response.
+
+    Uses LLMResponse.finish_reason — which each provider client already
+    populates. See _TRUNCATED_FINISH_REASONS for the recognised strings.
+    """
+    reason = getattr(response, "finish_reason", None)
+    if not reason:
+        return False
+    return reason in _TRUNCATED_FINISH_REASONS
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Failover Guard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -465,6 +505,11 @@ async def call_llm(
     max_tokens = get_max_tokens(model.provider, model.model, getattr(model, 'max_output_tokens', None))
     _accumulated_tokens = 0
 
+    # P4: per-call resume counter for max_output_tokens truncation.
+    # Bounded across the whole call so a runaway agent cannot turn a long
+    # tool loop into 50×3 redundant resumes on a misconfigured cap.
+    max_output_recoveries = 0
+
     # Tool-calling loop
     for round_i in range(_max_tool_rounds):
         # Dynamic tool-call limit warning.
@@ -512,6 +557,79 @@ async def call_llm(
                 on_chunk=on_chunk,
                 on_thinking=on_thinking,
             )
+
+            # ── P4: max_output_tokens recovery ────────────────────────────
+            # If the response was cut off because we hit the per-call output
+            # cap, push the partial text into history as an assistant turn,
+            # nudge the model to "continue", and re-stream. Accumulate the
+            # partial pieces so the final ``response.content`` returned to
+            # the caller is the complete concatenation — downstream DB
+            # persistence and tool-calling handling stay unchanged.
+            accumulated_partials: list[str] = []
+            recovery_count_this_round = 0
+            while (
+                _response_was_truncated_by_length(response)
+                and max_output_recoveries < MAX_OUTPUT_TOKENS_RECOVERY_LIMIT
+            ):
+                max_output_recoveries += 1
+                recovery_count_this_round += 1
+                partial_text = response.content or ""
+                accumulated_partials.append(partial_text)
+                # Transient scaffolding so the next stream call has a clear
+                # "here is what you just said, now continue" context. We pop
+                # these back off once the recovery loop succeeds so the final
+                # assistant turn lands as a single clean message.
+                api_messages.append(LLMMessage(
+                    role="assistant",
+                    content=partial_text,
+                ))
+                api_messages.append(LLMMessage(
+                    role="user",
+                    content=RESUME_PROMPT,
+                ))
+                logger.info(
+                    f"[LLM] max_output_tokens hit; resume attempt "
+                    f"{max_output_recoveries}/{MAX_OUTPUT_TOKENS_RECOVERY_LIMIT} "
+                    f"(round {round_i+1}, this-round {recovery_count_this_round})"
+                )
+
+                # Re-build dispatch view. Dynamic <context> injection is a
+                # FIRST-hop-only nudge — do not re-inject on resumes.
+                dispatch_messages = _inject_first_hop_context(
+                    api_messages, dynamic_prompt, inject=False,
+                )
+                response = await client.stream(
+                    messages=dispatch_messages,
+                    tools=tools_for_llm if tools_for_llm else None,
+                    temperature=model.temperature,
+                    max_tokens=max_tokens,
+                    on_chunk=on_chunk,
+                    on_thinking=on_thinking,
+                )
+
+            # Still truncated after exhausting the resume budget — surface
+            # a clear error. The failover layer will see a [LLM Error] and
+            # can decide whether to try the fallback model (which may have
+            # a larger output cap).
+            if _response_was_truncated_by_length(response):
+                logger.error(
+                    f"[LLM] Output token limit not recoverable after "
+                    f"{MAX_OUTPUT_TOKENS_RECOVERY_LIMIT} resume attempts"
+                )
+                if agent_id and _accumulated_tokens > 0:
+                    await record_token_usage(agent_id, _accumulated_tokens)
+                await client.close()
+                return "[LLM Error] Output token limit exceeded after 3 resume attempts"
+
+            # Recovery succeeded (or never happened). If we accumulated any
+            # partials, stitch them onto the final content and pop the
+            # transient (partial_assistant, resume_user) pairs so history
+            # keeps its "one logical turn = one message" shape.
+            if recovery_count_this_round:
+                full_content = "".join(accumulated_partials) + (response.content or "")
+                # Each recovery appended exactly 2 messages.
+                del api_messages[-(2 * recovery_count_this_round):]
+                response.content = full_content
         except LLMError as e:
             logger.error(f"[LLM] LLMError: provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')} {e}")
             if agent_id and _accumulated_tokens > 0:
