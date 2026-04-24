@@ -99,6 +99,14 @@ async def main():
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS sso_enabled BOOLEAN DEFAULT FALSE",
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS sso_domain VARCHAR(255)",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_tenants_sso_domain ON tenants(sso_domain) WHERE sso_domain IS NOT NULL",
+        # LLM model pool — temperature / max_output_tokens columns
+        "ALTER TABLE llm_models ADD COLUMN IF NOT EXISTS temperature FLOAT",
+        "ALTER TABLE llm_models ADD COLUMN IF NOT EXISTS max_output_tokens INTEGER",
+        "ALTER TABLE llm_models ADD COLUMN IF NOT EXISTS request_timeout INTEGER",
+        # Notification agent routing
+        "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS agent_id UUID",
+        "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sender_name VARCHAR(100)",
+        "CREATE INDEX IF NOT EXISTS ix_notifications_agent_id ON notifications(agent_id)",
     ]
 
     from sqlalchemy import text
