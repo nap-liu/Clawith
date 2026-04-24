@@ -5530,8 +5530,10 @@ function AgentDetailInner() {
                                             });
                                             queryClient.invalidateQueries({ queryKey: ['agent-permissions', id] });
                                             queryClient.invalidateQueries({ queryKey: ['agent', id] });
+                                            showToast(t('agent.settings.saved', 'Saved'));
                                         } catch (e) {
                                             console.error('Failed to update permissions', e);
+                                            showToast(t('common.error', 'Failed'), 'error');
                                         }
                                     };
 
