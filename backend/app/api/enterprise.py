@@ -971,7 +971,7 @@ async def create_oauth2_provider(
         is_active=data.is_active,
         sso_login_enabled=data.sso_login_enabled,
         config=config_dict,
-        tenant_id=uuid.UUID(tid) if tid else None,
+        tenant_id=tid if isinstance(tid, uuid.UUID) else uuid.UUID(tid) if tid else None,
     )
     db.add(provider)
     await db.commit()
