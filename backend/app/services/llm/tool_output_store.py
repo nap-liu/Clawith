@@ -130,6 +130,48 @@ def _render_persisted(
     )
 
 
+def _materialize_to_file(
+    result: str,
+    *,
+    tool_name: str,
+    agent_id,
+    session_id: str,
+    tool_call_id: str,
+) -> str:
+    """Write ``result`` to the agent workspace and return the llm_view.
+
+    Shared internal helper. Raises on any failure (missing agent_id,
+    unwritable filesystem, …); the two public entrypoints
+    (:func:`finalize_tool_output`, :func:`force_materialize_tool_output`)
+    decide how to recover.
+    """
+    if not agent_id:
+        raise ValueError("missing agent_id")
+    store_dir = _store_dir(agent_id, session_id)
+    store_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = "json" if _looks_like_json(result) else "txt"
+    tc_id = _sanitize(tool_call_id) or uuid.uuid4().hex[:12]
+    filename = f"{_sanitize(tool_name)}_{tc_id}.{ext}"
+    full_path = store_dir / filename
+
+    full_path.write_text(result, encoding="utf-8")
+
+    rel_path = f".tool_results/{_sanitize(session_id or 'nosession')}/{filename}"
+    preview = result[:PREVIEW_CHARS]
+    view = _render_persisted(
+        tool_name=tool_name,
+        rel_path=rel_path,
+        size_bytes=len(result),
+        preview=preview,
+    )
+    logger.info(
+        f"[tool_output_store] materialized tool={tool_name} "
+        f"size={len(result)} path={rel_path}"
+    )
+    return view
+
+
 def finalize_tool_output(
     result,
     *,
@@ -162,31 +204,13 @@ def finalize_tool_output(
         return result
 
     try:
-        if not agent_id:
-            raise ValueError("missing agent_id")
-        store_dir = _store_dir(agent_id, session_id)
-        store_dir.mkdir(parents=True, exist_ok=True)
-
-        ext = "json" if _looks_like_json(result) else "txt"
-        tc_id = _sanitize(tool_call_id) or uuid.uuid4().hex[:12]
-        filename = f"{_sanitize(tool_name)}_{tc_id}.{ext}"
-        full_path = store_dir / filename
-
-        full_path.write_text(result, encoding="utf-8")
-
-        rel_path = f".tool_results/{_sanitize(session_id or 'nosession')}/{filename}"
-        preview = result[:PREVIEW_CHARS]
-        view = _render_persisted(
+        return _materialize_to_file(
+            result,
             tool_name=tool_name,
-            rel_path=rel_path,
-            size_bytes=len(result),
-            preview=preview,
+            agent_id=agent_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
         )
-        logger.info(
-            f"[tool_output_store] materialized tool={tool_name} "
-            f"size={len(result)} path={rel_path}"
-        )
-        return view
     except Exception as exc:
         logger.warning(
             f"[tool_output_store] materialize failed tool={tool_name} "
@@ -194,3 +218,208 @@ def finalize_tool_output(
         )
         shaped, _ = shape_tool_result(result, int(budget))
         return shaped
+
+
+def force_materialize_tool_output(
+    result: str,
+    *,
+    tool_name: str,
+    agent_id,
+    session_id: str,
+    tool_call_id: str,
+) -> str:
+    """Always materialize to disk regardless of tool budget.
+
+    Unlike :func:`finalize_tool_output` which checks per-tool budget
+    first, this is the escape hatch used by the message-level enforcer
+    when the sum of multiple in-budget results blows past the message
+    cap.
+
+    Same storage layout, same ``<persisted-output>`` render format. On
+    failure (disk error, missing agent_id), falls back to inline
+    :func:`shape_tool_result` bounded at the per-tool budget — we never
+    silently drop a tool result.
+    """
+    if not isinstance(result, str):
+        return result
+
+    if not result:
+        return _render_empty(tool_name)
+
+    try:
+        return _materialize_to_file(
+            result,
+            tool_name=tool_name,
+            agent_id=agent_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"[tool_output_store] force_materialize failed tool={tool_name} "
+            f"err={type(exc).__name__}: {exc}; falling back to inline shape"
+        )
+        budget = budget_for(tool_name)
+        bound = int(budget) if budget != float("inf") else 50_000
+        shaped, _ = shape_tool_result(result, bound)
+        return shaped
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Message-level (cross-tool) budget enforcement
+# ─────────────────────────────────────────────────────────────────────────────
+
+MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 120_000
+
+
+def _tool_message_size(msg) -> int:
+    """Character size a tool message contributes to the message-level budget.
+
+    Only string content counts. Vision list[dict] payloads are excluded
+    (base64 image bytes have their own transport cost and are not
+    re-materializable into text files anyway).
+    """
+    if getattr(msg, "role", None) != "tool":
+        return 0
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        return len(content)
+    return 0
+
+
+def _tool_name_for_call_id(api_messages, tool_idx: int, tool_call_id: str) -> str:
+    """Look up the tool name for a tool message by scanning backwards.
+
+    Walks ``api_messages[:tool_idx]`` in reverse until an assistant
+    message carrying ``tool_calls`` containing ``tool_call_id`` is
+    found. Returns ``"unknown"`` when no match (e.g. pathological
+    history with a tool message unpaired from its assistant).
+    """
+    if not tool_call_id:
+        return "unknown"
+    for i in range(tool_idx - 1, -1, -1):
+        m = api_messages[i]
+        if getattr(m, "role", None) != "assistant":
+            continue
+        tcs = getattr(m, "tool_calls", None) or []
+        for tc in tcs:
+            if tc.get("id") == tool_call_id:
+                fn = tc.get("function") or {}
+                name = fn.get("name")
+                if name:
+                    return name
+        # Stop at the first assistant message scanned — tool messages
+        # always follow their own round's assistant.
+        break
+    return "unknown"
+
+
+def enforce_message_budget(
+    api_messages: list,
+    *,
+    fresh_start_idx: int,
+    agent_id,
+    session_id: str,
+    max_chars: int = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS,
+) -> None:
+    """Keep the total tool-message char count across ``api_messages`` under
+    ``max_chars`` by force-materializing the largest fresh inline tool
+    messages until we are within budget.
+
+    Strategy:
+      1. Sum ``len(content)`` across *all* tool messages with string
+         content (budget is a global ceiling on the current dispatch).
+      2. While over budget, pick the LARGEST fresh (index >=
+         ``fresh_start_idx``) tool message whose content is a plain
+         string AND does not already contain a ``<persisted-output>``
+         block, force-materialize it, and replace the ``LLMMessage`` in
+         place (new instance — no in-place attribute mutation).
+      3. Stop when we are under budget OR no more candidates exist.
+
+    Append-only invariant: ``api_messages[:fresh_start_idx]`` is NEVER
+    mutated. Those are historical messages — changing them would
+    invalidate the prefix cache. If we run out of fresh candidates while
+    still over budget, we log a warning and return.
+
+    Vision list-content tool messages are excluded from both the size
+    calculation and the materialization candidate pool.
+    """
+    def _total() -> int:
+        return sum(_tool_message_size(m) for m in api_messages)
+
+    total = _total()
+    if total <= max_chars:
+        return
+
+    # Build (size, index) list over fresh inline tool candidates.
+    def _fresh_candidates() -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        for i in range(fresh_start_idx, len(api_messages)):
+            m = api_messages[i]
+            if getattr(m, "role", None) != "tool":
+                continue
+            c = getattr(m, "content", None)
+            if not isinstance(c, str):
+                continue
+            if PERSISTED_OPEN in c:
+                continue
+            out.append((len(c), i))
+        # Largest first.
+        out.sort(key=lambda t: t[0], reverse=True)
+        return out
+
+    # LLMMessage import is local to avoid a cycle at module import time.
+    from .client import LLMMessage
+
+    while total > max_chars:
+        candidates = _fresh_candidates()
+        if not candidates:
+            logger.warning(
+                f"[tool_output_store] message budget still exceeded after "
+                f"exhausting fresh candidates: total={total} cap={max_chars} "
+                f"fresh_start_idx={fresh_start_idx}"
+            )
+            return
+
+        _, idx = candidates[0]
+        orig = api_messages[idx]
+        content_str = orig.content  # guaranteed str by candidate filter
+        tool_call_id = getattr(orig, "tool_call_id", "") or ""
+        tool_name = _tool_name_for_call_id(api_messages, idx, tool_call_id)
+
+        new_content = force_materialize_tool_output(
+            content_str,
+            tool_name=tool_name,
+            agent_id=agent_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+        )
+
+        # Replace with a fresh LLMMessage — never mutate the existing
+        # instance. Even though this entry is "fresh" for this round,
+        # mutation would be a landmine if callers ever reorder the
+        # assignment.
+        api_messages[idx] = LLMMessage(
+            role=orig.role,
+            content=new_content,
+            tool_calls=orig.tool_calls,
+            tool_call_id=orig.tool_call_id,
+            reasoning_content=orig.reasoning_content,
+            reasoning_signature=orig.reasoning_signature,
+        )
+
+        new_total = _total()
+        logger.info(
+            f"[tool_output_store] message budget: materialized fresh idx={idx} "
+            f"tool={tool_name} shrink={len(content_str)}->{len(new_content)} "
+            f"total={total}->{new_total} cap={max_chars}"
+        )
+        # Forward progress guard: if total did not decrease, bail to
+        # avoid a tight loop on a pathological materialize output.
+        if new_total >= total:
+            logger.warning(
+                f"[tool_output_store] message budget: no progress after "
+                f"materialize idx={idx}; stopping"
+            )
+            return
+        total = new_total

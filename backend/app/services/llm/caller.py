@@ -28,7 +28,7 @@ from app.services.token_tracker import record_token_usage, extract_usage_tokens,
 from .client import LLMError
 from .failover import classify_error, FailoverErrorType
 from .json_recovery import canonicalize_tool_arguments
-from .tool_output_store import finalize_tool_output
+from .tool_output_store import enforce_message_budget, finalize_tool_output
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
 if TYPE_CHECKING:
@@ -543,6 +543,13 @@ async def call_llm(
         # Execute tool calls
         logger.info(f"[LLM] Round {round_i+1}: {len(response.tool_calls)} tool call(s)")
 
+        # Remember where this round's appended entries begin. The
+        # message-level budget enforcer operates only on items at or
+        # beyond this index — historical messages (already sent as
+        # prefix bytes in prior rounds) must stay byte-identical so
+        # Anthropic / Qwen / DashScope prefix caches keep hitting.
+        fresh_start = len(api_messages)
+
         # Add assistant message with tool calls
         # NB: tc["function"] is shared by reference with _canonicalize_tc_arguments's
         # in-place canonicalization — must stay as a reference (no deepcopy), or
@@ -577,6 +584,17 @@ async def call_llm(
                     content=tool_error,
                     tool_call_id=tc.get("id", ""),
                 ))
+
+        # P2: A single round can produce many in-budget tool results whose
+        # sum blows past the message-level cap (e.g. 3 × 30 KB RAGFlow
+        # queries). Enforce the ceiling now, after every tool message for
+        # this round is appended but before the next client.stream call.
+        enforce_message_budget(
+            api_messages,
+            fresh_start_idx=fresh_start,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
 
     # Record tokens even on "too many rounds" exit
     if agent_id and _accumulated_tokens > 0:
