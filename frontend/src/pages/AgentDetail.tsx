@@ -2670,6 +2670,22 @@ function AgentDetailInner() {
         enabled: !!id && activeTab === 'settings',
     });
 
+    const { data: members = [] } = useQuery({
+        queryKey: ['org-members-perm'],
+        queryFn: enterpriseApi.listMembers,
+        enabled: activeTab === 'settings',
+    });
+
+    const [permEditScope, setPermEditScope] = useState<string | null>(null);
+    const [permEditUserIds, setPermEditUserIds] = useState<string[]>([]);
+    const [permUserSearch, setPermUserSearch] = useState('');
+
+    useEffect(() => {
+        if (permData && activeTab === 'settings') {
+            setPermEditUserIds(permData?.scope_ids || []);
+        }
+    }, [permData, activeTab]);
+
     // ─── Soul editor ─────────────────────────────────────
     const [soulEditing, setSoulEditing] = useState(false);
     const [soulDraft, setSoulDraft] = useState('');
@@ -5538,39 +5554,61 @@ function AgentDetailInner() {
                                 {(() => {
                                     const scopeLabels: Record<string, React.ReactNode> = {
                                         company: <><Building2 size={14} style={{display:'inline',verticalAlign:'middle',marginRight:'4px'}} />{t('agent.settings.perm.companyWide', 'Company-wide')}</>,
+                                        specific: <><User size={14} style={{display:'inline',verticalAlign:'middle',marginRight:'4px'}} />{t('agent.settings.perm.specificUsers', 'Specific users')}</>,
                                         user: <><User size={14} style={{display:'inline',verticalAlign:'middle',marginRight:'4px'}} />{t('agent.settings.perm.onlyMe', 'Only Me')}</>,
                                     };
 
-                                    const handleScopeChange = async (newScope: string) => {
+                                    const savePermissions = async (scopeType: string, scopeIds: string[], accessLevel?: string) => {
                                         try {
                                             await fetchAuth(`/agents/${id}/permissions`, {
                                                 method: 'PUT',
                                                 headers: { 'Content-Type': 'application/json' },
-                                                body: JSON.stringify({ scope_type: newScope, scope_ids: [], access_level: permData?.access_level || 'use' }),
+                                                body: JSON.stringify({
+                                                    scope_type: scopeType,
+                                                    scope_ids: scopeIds,
+                                                    access_level: accessLevel ?? permData?.access_level ?? 'use',
+                                                }),
                                             });
                                             queryClient.invalidateQueries({ queryKey: ['agent-permissions', id] });
                                             queryClient.invalidateQueries({ queryKey: ['agent', id] });
+                                            showToast(t('agent.settings.saved', 'Saved'));
                                         } catch (e) {
                                             console.error('Failed to update permissions', e);
+                                            showToast(t('common.error', 'Failed'), 'error');
                                         }
+                                    };
+
+                                    const handleScopeChange = async (newScope: string) => {
+                                        if (newScope === 'specific') {
+                                            // 防止在数据加载完成前清空状态
+                                            if (!permData) return;
+                                            setPermEditScope('specific');
+                                            setPermUserSearch('');
+                                            setPermEditUserIds(permData?.scope_ids || []);
+                                            return;
+                                        }
+                                        setPermEditScope(null);
+                                        setPermEditUserIds([]);
+                                        setPermUserSearch('');
+                                        await savePermissions(newScope, []);
+                                    };
+
+                                    const handleSaveSpecific = async () => {
+                                        if (permEditUserIds.length === 0) return;
+                                        await savePermissions('user', permEditUserIds);
+                                        setPermEditScope(null);
                                     };
 
                                     const handleAccessLevelChange = async (newLevel: string) => {
-                                        try {
-                                            await fetchAuth(`/agents/${id}/permissions`, {
-                                                method: 'PUT',
-                                                headers: { 'Content-Type': 'application/json' },
-                                                body: JSON.stringify({ scope_type: permData?.scope_type || 'company', scope_ids: permData?.scope_ids || [], access_level: newLevel }),
-                                            });
-                                            queryClient.invalidateQueries({ queryKey: ['agent-permissions', id] });
-                                            queryClient.invalidateQueries({ queryKey: ['agent', id] });
-                                        } catch (e) {
-                                            console.error('Failed to update access level', e);
-                                        }
+                                        const ids = currentScope === 'specific'
+                                            ? (permData?.scope_ids ?? [])
+                                            : [];
+                                        await savePermissions(currentScope === 'specific' ? 'user' : currentScope, ids, newLevel);
                                     };
 
                                     const isOwner = permData?.is_owner ?? false;
-                                    const currentScope = permData?.scope_type || 'company';
+                                    const resolvedScope = permData?.scope_type === 'user' && (permData?.scope_ids?.length ?? 0) > 0 ? 'specific' : (permData?.scope_type || 'company');
+                                    const currentScope = permEditScope || resolvedScope;
                                     const currentAccessLevel = permData?.access_level || 'use';
 
                                     return (
@@ -5582,7 +5620,7 @@ function AgentDetailInner() {
 
                                             {/* Scope Selection */}
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '16px' }}>
-                                                {(['company', 'user'] as const).map((scope) => (
+                                                {(['company', 'specific', 'user'] as const).map((scope) => (
                                                     <label
                                                         key={scope}
                                                         style={{
@@ -5614,6 +5652,7 @@ function AgentDetailInner() {
                                                             <div style={{ fontWeight: 500, fontSize: '13px' }}>{scopeLabels[scope]}</div>
                                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
                                                                 {scope === 'company' && t('agent.settings.perm.companyWideDesc', 'All users in the organization can use this agent')}
+                                                                {scope === 'specific' && t('agent.settings.perm.specificUsersDesc', 'Select specific people from your company')}
                                                                 {scope === 'user' && t('agent.settings.perm.onlyMeDesc', 'Only the creator can use this agent')}
                                                             </div>
                                                         </div>
@@ -5658,10 +5697,66 @@ function AgentDetailInner() {
                                                 </div>
                                             )}
 
-                                            {currentScope !== 'company' && permData?.scope_names?.length > 0 && (
-                                                <div style={{ marginTop: '12px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-                                                    <span style={{ fontWeight: 500 }}>{t('agent.settings.perm.currentAccess', 'Current access')}:</span>{' '}
-                                                    {permData.scope_names.map((s: any) => s.name).join(', ')}
+                                            {currentScope === 'specific' && isOwner && (
+                                                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}>
+                                                    <input
+                                                        type="text"
+                                                        className="form-input"
+                                                        placeholder={t('wizard.step4.searchUsers', '搜索用户...')}
+                                                        value={permUserSearch}
+                                                        onChange={(e) => setPermUserSearch(e.target.value)}
+                                                        style={{ marginBottom: '12px', fontSize: '13px' }}
+                                                    />
+                                                    {(members as any[]).length === 0 && (
+                                                        <div style={{ padding: '8px', background: 'var(--bg-elevated)', borderRadius: '6px', fontSize: '12px', color: 'var(--text-tertiary)', textAlign: 'center' }}>
+                                                            {t('enterprise.org.noMembers', '暂无公司成员')}
+                                                        </div>
+                                                    )}
+                                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '200px', overflowY: 'auto' }}>
+                                                        {(members as any[])
+                                                            .filter((m: any) => {
+                                                                if (!permUserSearch) return true;
+                                                                const q = permUserSearch.toLowerCase();
+                                                                return (m.display_name || '').toLowerCase().includes(q) ||
+                                                                    (m.title || '').toLowerCase().includes(q) ||
+                                                                    (m.department_path || '').toLowerCase().includes(q);
+                                                            })
+                                                            .map((member: any) => {
+                                                                const isChecked = permEditUserIds.includes(member.id);
+                                                                const parts = [member.display_name];
+                                                                if (member.email) parts.push(member.email);
+                                                                if (member.department_path) parts.push(member.department_path);
+                                                                if (member.title) parts.push(member.title);
+                                                                return (
+                                                                    <label key={member.id} style={{
+                                                                        display: 'flex', alignItems: 'center', gap: '8px', padding: '8px',
+                                                                        background: isChecked ? 'rgba(99,102,241,0.06)' : 'transparent',
+                                                                        border: `1px solid ${isChecked ? 'var(--accent-primary)' : 'var(--border-subtle)'}`,
+                                                                        borderRadius: '6px', cursor: 'pointer',
+                                                                    }}>
+                                                                        <input type="checkbox" checked={isChecked}
+                                                                            onChange={() => {
+                                                                                setPermEditUserIds(prev =>
+                                                                                    prev.includes(member.id) ? prev.filter((id: string) => id !== member.id) : [...prev, member.id]
+                                                                                );
+                                                                            }}
+                                                                        />
+                                                                        <span style={{ fontSize: '12px' }}>{parts.join(' · ')}</span>
+                                                                    </label>
+                                                                );
+                                                            })}
+                                                    </div>
+                                                    <div style={{ marginTop: '8px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '8px' }}>
+                                                        {permEditUserIds.length > 0 && (
+                                                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                                                                {t('wizard.step4.selectedCount', { count: permEditUserIds.length })}
+                                                            </span>
+                                                        )}
+                                                        <button className="btn btn-primary" onClick={handleSaveSpecific}
+                                                            style={{ padding: '4px 16px', fontSize: '12px', height: '28px' }}>
+                                                            {t('common.save', '保存')}
+                                                        </button>
+                                                    </div>
                                                 </div>
                                             )}
 

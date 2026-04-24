@@ -725,7 +725,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
         self.user_info_url = self.config.get("user_info_url") or f"{base}/userinfo"
 
         # 字段映射配置（用户自定义）
-        self.field_mapping = self.config.get("field_mapping", {})
+        self.field_mapping = self.config.get("field_mapping") or {}
 
         # 标准 OIDC 字段 fallback 顺序
         self.FIELD_DEFAULTS = {
@@ -787,9 +787,11 @@ class OAuth2AuthProvider(BaseAuthProvider):
             )
             resp_data = resp.json()
             
-            # 特殊格式: {"status": 0, "data": {...}}
-            # 标准 OIDC 格式: 直接返回 flat object
-            if "data" in resp_data and isinstance(resp_data["data"], dict):
+            # Handle case where userinfo returns None or empty
+            if not resp_data:
+                logger.warning(f"OAuth2 userinfo returned empty/null for {self.provider_type}")
+                info = {}
+            elif "data" in resp_data and isinstance(resp_data["data"], dict):
                 info = resp_data["data"]
             else:
                 info = resp_data

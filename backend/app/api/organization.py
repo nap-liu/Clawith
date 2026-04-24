@@ -25,8 +25,11 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
 ):
     """List users, optionally filtered by tenant."""
+    from app.models.org import OrgMember
+
     query = (
-        select(User)
+        select(User, OrgMember.department_path)
+        .outerjoin(OrgMember, User.id == OrgMember.user_id)
         .options(selectinload(User.identity))
         .where(User.is_active == True)
     )
@@ -39,7 +42,18 @@ async def list_users(
 
     query = query.order_by(User.display_name)
     result = await db.execute(query)
-    return [UserOut.model_validate(u) for u in result.scalars().all()]
+    rows = result.all()
+
+    out = []
+    seen: set[uuid.UUID] = set()
+    for user, dept_path in rows:
+        if user.id in seen:
+            continue
+        seen.add(user.id)
+        data = UserOut.model_validate(user).model_dump()
+        data["department_path"] = dept_path
+        out.append(data)
+    return out
 
 
 @router.patch("/users/{user_id}", response_model=UserOut)

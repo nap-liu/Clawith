@@ -6,6 +6,7 @@ import { Eye, Settings } from 'lucide-react';
 import { agentApi, channelApi, enterpriseApi, skillApi } from '../services/api';
 import ChannelConfig from '../components/ChannelConfig';
 import LinearCopyButton from '../components/LinearCopyButton';
+import { useAuthStore } from '../stores';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
 
@@ -73,6 +74,21 @@ export default function AgentCreate() {
     // Current company (tenant) selection from layout sidebar
     const [currentTenant] = useState<string | null>(() => localStorage.getItem('current_tenant_id'));
 
+    // Current user for permission defaults
+    const { user: currentUser } = useAuthStore();
+
+    // Selected user IDs for "specific users" permission mode
+    const [permissionSelectedUserIds, setPermissionSelectedUserIds] = useState<string[]>([]);
+
+    // User search filter
+    const [userSearchQuery, setUserSearchQuery] = useState('');
+
+    // Fetch org members for user selection
+    const { data: members = [] } = useQuery({
+        queryKey: ['org-members'],
+        queryFn: enterpriseApi.listMembers,
+    });
+
     const [form, setForm] = useState({
         name: '',
         role_description: '',
@@ -119,6 +135,20 @@ export default function AgentCreate() {
             }
         }
     }, [globalSkills]);
+
+    useEffect(() => {
+        const uid = currentUser?.id;
+        if (uid && permissionSelectedUserIds.length === 0 && !permissionSelectedUserIds.includes(uid)) {
+            setPermissionSelectedUserIds([uid]);
+        }
+    }, [currentUser]);
+
+    useEffect(() => {
+        if (form.permission_scope_type !== 'specific') {
+            setPermissionSelectedUserIds([]);
+            setUserSearchQuery('');
+        }
+    }, [form.permission_scope_type]);
 
     const createMutation = useMutation({
         mutationFn: async (data: any) => {
@@ -260,7 +290,10 @@ export default function AgentCreate() {
             primary_model_id: agentType === 'native' ? (form.primary_model_id || undefined) : undefined,
             fallback_model_id: agentType === 'native' ? (form.fallback_model_id || undefined) : undefined,
             template_id: form.template_id || undefined,
-            permission_scope_type: form.permission_scope_type,
+            permission_scope_type: form.permission_scope_type === 'specific' ? 'user' : form.permission_scope_type,
+            permission_scope_ids: form.permission_scope_type === 'specific'
+                ? (permissionSelectedUserIds.length > 0 ? permissionSelectedUserIds : (currentUser?.id ? [currentUser.id] : []))
+                : [],
             max_tokens_per_day: form.max_tokens_per_day ? Number(form.max_tokens_per_day) : undefined,
             max_tokens_per_month: form.max_tokens_per_month ? Number(form.max_tokens_per_month) : undefined,
             skill_ids: agentType === 'native' ? form.skill_ids : [],
@@ -482,6 +515,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                         <div style={{ display: 'flex', gap: '8px' }}>
                             {[
                                 { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
+                                { value: 'specific', label: t('wizard.step4.specificUsers'), desc: t('wizard.step4.specificUsersDesc') },
                                 { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
                             ].map((scope) => (
                                 <label key={scope.value} style={{
@@ -761,6 +795,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '20px' }}>
                             {[
                                 { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
+                                { value: 'specific', label: t('wizard.step4.specificUsers'), desc: t('wizard.step4.specificUsersDesc') },
                                 { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
                             ].map((scope) => (
                                 <label key={scope.value} style={{
@@ -779,6 +814,65 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                                 </label>
                             ))}
                         </div>
+
+                        {form.permission_scope_type === 'specific' && (
+                            <div style={{ marginBottom: '20px' }}>
+                                <input
+                                    type="text"
+                                    className="form-input"
+                                    placeholder={t('wizard.step4.searchUsers', '搜索用户...')}
+                                    value={userSearchQuery}
+                                    onChange={(e) => setUserSearchQuery(e.target.value)}
+                                    style={{ marginBottom: '12px', fontSize: '13px' }}
+                                />
+                                {(members as any[]).length === 0 && (
+                                    <div style={{ padding: '12px', background: 'var(--bg-elevated)', borderRadius: '8px', fontSize: '13px', color: 'var(--text-tertiary)', textAlign: 'center' }}>
+                                        {t('enterprise.org.noMembers', '暂无公司成员')}
+                                    </div>
+                                )}
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '240px', overflowY: 'auto' }}>
+                                    {(members as any[])
+                                        .filter((m: any) => {
+                                            if (!userSearchQuery) return true;
+                                            const q = userSearchQuery.toLowerCase();
+                                            return (m.display_name || '').toLowerCase().includes(q) ||
+                                                (m.title || '').toLowerCase().includes(q) ||
+                                                (m.department_path || '').toLowerCase().includes(q);
+                                        })
+                                        .map((member: any) => {
+                                            const isChecked = permissionSelectedUserIds.includes(member.id);
+                                            const parts = [member.display_name];
+                                            if (member.email) parts.push(member.email);
+                                            if (member.department_path) parts.push(member.department_path);
+                                            if (member.title) parts.push(member.title);
+                                            return (
+                                                <label key={member.id} style={{
+                                                    display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 12px',
+                                                    background: isChecked ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
+                                                    border: `1px solid ${isChecked ? 'var(--accent-primary)' : 'var(--border-default)'}`,
+                                                    borderRadius: '8px', cursor: 'pointer',
+                                                }}>
+                                                    <input type="checkbox" checked={isChecked}
+                                                        onChange={(e) => {
+                                                            if (e.target.checked) {
+                                                                setPermissionSelectedUserIds(prev => prev.includes(member.id) ? prev : [...prev, member.id]);
+                                                            } else {
+                                                                setPermissionSelectedUserIds(prev => prev.filter((id: string) => id !== member.id));
+                                                            }
+                                                        }}
+                                                    />
+                                                    <span style={{ fontSize: '13px' }}>{parts.join(' · ')}</span>
+                                                </label>
+                                            );
+                                        })}
+                                </div>
+                                {permissionSelectedUserIds.length > 0 && (
+                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '8px' }}>
+                                        {t('wizard.step4.selectedCount', { count: permissionSelectedUserIds.length })}
+                                    </div>
+                                )}
+                            </div>
+                        )}
 
                         {/* Access Level — only for company scope */}
                         {form.permission_scope_type === 'company' && (

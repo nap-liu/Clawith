@@ -350,6 +350,10 @@ export const enterpriseApi = {
         return request<any[]>(`/enterprise/llm-models${tid ? `?tenant_id=${tid}` : ''}`);
     },
     templates: () => request<any[]>('/agents/templates'),
+    listMembers: () => {
+        const tid = localStorage.getItem('current_tenant_id');
+        return request<any[]>(`/org/users${tid ? `?tenant_id=${tid}` : ''}`);
+    },
 
     // Enterprise Knowledge Base
     kbFiles: (path: string = '') =>
