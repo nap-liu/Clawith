@@ -17,6 +17,7 @@ venv/
 *.db
 .DS_Store
 .gstack/
+docker-compose.override.yml
 # Runtime agent data
 backend/data/
 backend/agent_data/
