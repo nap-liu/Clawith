@@ -183,12 +183,12 @@ async def oauth2_callback(
     if not auth_provider:
         return HTMLResponse("Auth failed: OAuth2 provider not configured")
 
-        # 3. 换 token → 获取用户信息 → 查找/创建用户
-        try:
-            token_data = await auth_provider.exchange_code_for_token(code)
-            if not token_data:
-                raise Exception("Empty response from token exchange")
-            access_token = token_data.get("access_token")
+    # 3. 换 token → 获取用户信息 → 查找/创建用户
+    try:
+        token_data = await auth_provider.exchange_code_for_token(code)
+        if not token_data:
+            raise Exception("Empty response from token exchange")
+        access_token = token_data.get("access_token")
         if not access_token:
             logger.error(f"OAuth2 token exchange failed: {token_data}")
             return HTMLResponse("Auth failed: Token exchange error")
