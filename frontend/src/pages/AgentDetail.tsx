@@ -5537,9 +5537,11 @@ function AgentDetailInner() {
 
                                     const handleScopeChange = async (newScope: string) => {
                                         if (newScope === 'specific') {
+                                            // 防止在数据加载完成前清空状态
+                                            if (!permData) return;
                                             setPermEditScope('specific');
-                                            setPermEditUserIds(permData?.scope_ids?.length ? permData.scope_ids : []);
                                             setPermUserSearch('');
+                                            setPermEditUserIds(permData?.scope_ids || []);
                                             return;
                                         }
                                         setPermEditScope(null);
@@ -5549,8 +5551,8 @@ function AgentDetailInner() {
                                     };
 
                                     const handleSaveSpecific = async () => {
-                                        const ids = permEditUserIds.length > 0 ? permEditUserIds : (currentUser?.id ? [currentUser.id] : []);
-                                        await savePermissions('user', ids);
+                                        if (permEditUserIds.length === 0) return;
+                                        await savePermissions('user', permEditUserIds);
                                         setPermEditScope(null);
                                     };
 
