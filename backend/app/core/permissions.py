@@ -27,11 +27,11 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
-    # Platform admins can access everything with manage
-    if user.role == "platform_admin":
+    # Admins can access everything with manage
+    if user.role in ("platform_admin", "org_admin"):
         return agent, "manage"
 
-    # Tenant isolation: non-platform-admin users can only access agents in their own tenant
+    # Tenant isolation: non-admin users can only access agents in their own tenant
     if agent.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to this agent")
 
