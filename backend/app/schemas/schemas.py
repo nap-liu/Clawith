@@ -149,6 +149,7 @@ class UserOut(BaseModel):
     role: str
     tenant_id: uuid.UUID | None = None
     title: str | None = None
+    department_path: str | None = None
     primary_mobile: str | None = None
     registration_source: str | None = None
     is_active: bool
