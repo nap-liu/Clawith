@@ -248,7 +248,16 @@ async def import_mcp_from_smithery(
     and stores the deploymentUrl for runtime execution via Smithery Connect.
     If config contains 'smithery_api_key', it's stored per-agent for future use.
     """
-    config = dict(config) if config else {}  # mutable copy
+    # Defensive: tolerate config passed as JSON string (some LLM tool-calling
+    # paths stringify object args). Anything that doesn't look dict-shaped
+    # gets dropped instead of blowing up at `dict(config)`.
+    if isinstance(config, str):
+        try:
+            import json as _json
+            config = _json.loads(config) if config else {}
+        except Exception:
+            config = {}
+    config = dict(config) if isinstance(config, dict) else {}
 
     # Extract smithery_api_key from config (user-provided) or fallback to stored
     api_key = config.pop("smithery_api_key", None) or await _get_smithery_api_key(agent_id)
@@ -551,12 +560,17 @@ async def import_mcp_direct(
     agent_id: uuid.UUID,
     server_name: str | None = None,
     api_key: str | None = None,
+    headers: dict | None = None,
 ) -> str:
     """Import an MCP server by directly connecting to its HTTP/SSE endpoint.
 
     This bypasses Smithery entirely — useful for self-hosted or third-party
     MCP servers that provide their own public endpoint.
+
+    `headers` accepts the standard `mcpServers.<name>.headers` dict and is
+    persisted in AgentTool.config so the runtime call path can replay them.
     """
+    import re as _re
     from app.services.mcp_client import MCPClient
 
     # Build URL with apiKey if provided
@@ -566,22 +580,36 @@ async def import_mcp_direct(
     elif api_key:
         full_url = f"{mcp_url}?apiKey={api_key}"
 
-    display_name = server_name or mcp_url.split("//")[-1].split("/")[0].split(":")[0]
-    safe_name = display_name.replace(".", "_").replace("/", "_").replace(":", "_").replace("-", "_")
+    # Derive display + safe_name from a hostname-like value. Even when the
+    # caller passes a full URL as `server_name` we strip it down so the final
+    # tool name fits Tool.name's varchar(100) constraint.
+    candidate = (server_name or "").strip()
+    looks_like_url_or_path = (
+        candidate.startswith("http://")
+        or candidate.startswith("https://")
+        or "/" in candidate
+        or len(candidate) > 60
+    )
+    if not candidate or looks_like_url_or_path:
+        candidate = mcp_url.split("//")[-1].split("/")[0].split(":")[0]
+    display_name = candidate[:60] or "mcp-server"
+    safe_name = _re.sub(r"[^A-Za-z0-9]+", "_", display_name).strip("_")[:40] or "mcp_server"
 
     # Try to list tools from the endpoint
     tools_discovered = []
     try:
-        client = MCPClient(full_url)
+        client = MCPClient(full_url, headers=headers)
         tools_discovered = await client.list_tools()
         logger.info(f"[DirectImport] Got {len(tools_discovered)} tools from {mcp_url}")
     except Exception as e:
         logger.error(f"[DirectImport] Could not list tools from {mcp_url}: {e}")
 
     # Config to store in AgentTool
-    agent_tool_config = {}
+    agent_tool_config: dict = {}
     if api_key:
         agent_tool_config["api_key"] = api_key
+    if isinstance(headers, dict) and headers:
+        agent_tool_config["headers"] = headers
 
     async with async_session() as db:
         imported_tools = []
@@ -605,7 +633,9 @@ async def import_mcp_direct(
 
         if tools_discovered:
             for mcp_tool in tools_discovered:
-                tool_name = f"mcp_{safe_name}_{mcp_tool['name']}"
+                # Tool.name is varchar(100) — cap defensively in case the MCP
+                # server returns very long tool names.
+                tool_name = f"mcp_{safe_name}_{mcp_tool['name']}"[:100]
                 tool_display = f"{display_name}: {mcp_tool['name']}"
 
                 existing_r = await db.execute(select(Tool).where(Tool.name == tool_name))

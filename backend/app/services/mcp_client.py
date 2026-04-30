@@ -22,7 +22,12 @@ class MCPClient:
     Auto-detects the transport mode on first request.
     """
 
-    def __init__(self, server_url: str, api_key: str | None = None):
+    def __init__(
+        self,
+        server_url: str,
+        api_key: str | None = None,
+        headers: dict | None = None,
+    ):
         # Extract apiKey from URL query params and move to Authorization header
         parsed = urlparse(server_url)
         qs = parse_qs(parsed.query, keep_blank_values=True)
@@ -34,6 +39,10 @@ class MCPClient:
         # Rebuild URL without apiKey in query string
         remaining_qs = urlencode({k: v[0] for k, v in qs.items()}) if qs else ""
         self.server_url = urlunparse(parsed._replace(query=remaining_qs)).rstrip("/")
+
+        # Extra headers passed by the caller — e.g. from `mcpServers.<name>.headers`.
+        # Applied on top of Auth so callers can override Authorization if needed.
+        self.extra_headers: dict = dict(headers) if isinstance(headers, dict) else {}
 
         # Transport state
         self._transport: str | None = None  # "streamable" or "sse"
@@ -50,6 +59,8 @@ class MCPClient:
             h["Authorization"] = f"Bearer {self.api_key}"
         if self._session_id:
             h["Mcp-Session-Id"] = self._session_id
+        if self.extra_headers:
+            h.update(self.extra_headers)
         return h
 
     def _parse_response(self, resp: httpx.Response) -> dict:
@@ -140,6 +151,8 @@ class MCPClient:
         headers = {"Accept": "text/event-stream"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.extra_headers:
+            headers.update(self.extra_headers)
 
         messages_url = None
 
@@ -187,6 +200,9 @@ class MCPClient:
         if self.api_key:
             headers_sse["Authorization"] = f"Bearer {self.api_key}"
             headers_post["Authorization"] = f"Bearer {self.api_key}"
+        if self.extra_headers:
+            headers_sse.update(self.extra_headers)
+            headers_post.update(self.extra_headers)
 
         body: dict = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
 

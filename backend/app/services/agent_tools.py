@@ -3185,7 +3185,8 @@ async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> s
                 direct_api_key = await get_atlassian_api_key_for_agent(agent_id)
             except Exception:
                 pass
-        client = MCPClient(mcp_url, api_key=direct_api_key)
+        direct_headers = merged_config.get("headers") if isinstance(merged_config.get("headers"), dict) else None
+        client = MCPClient(mcp_url, api_key=direct_api_key, headers=direct_headers)
         return await client.call_tool(mcp_name, arguments)
 
     except Exception as e:
@@ -5835,25 +5836,79 @@ async def _discover_resources(arguments: dict) -> str:
 
 
 async def _import_mcp_server(agent_id: uuid.UUID, arguments: dict) -> str:
-    """Import an MCP server — either from Smithery or by direct URL."""
-    config = arguments.get("config") or {}
-    reauthorize = arguments.get("reauthorize", False)
-    mcp_url = config.pop("mcp_url", None) if isinstance(config, dict) else None
+    """Import an MCP server.
 
-    if mcp_url:
-        # Direct URL import — bypass Smithery
-        from app.services.resource_discovery import import_mcp_direct
-        server_name = arguments.get("server_id") or config.pop("server_name", None)
-        api_key = config.pop("api_key", None)
-        return await import_mcp_direct(mcp_url, agent_id, server_name, api_key)
+    Direct import (no third-party account required) is the primary path; the
+    Smithery registry path is only used when the caller explicitly passes a
+    `server_id` that resolves on Smithery.
 
-    # Smithery import
-    server_id = arguments.get("server_id", "")
-    if not server_id:
-        return "❌ Please provide a server_id (e.g. 'github'). Use discover_resources first to find available servers."
+    Accepted shapes (any of):
+      • mcp_url   = "https://..."                                     bare URL
+      • mcp_config = {"url": "...", "headers": {...}}                 single-server spec
+      • mcp_config = {"mcpServers": {"<name>": {...}}}                standard MCP config
+      • mcp_config = "<JSON-stringified version of any of the above>"
+      • config = "<same as mcp_config>"                               legacy field name
+      • server_id = "@anthropic/brave-search"                         Smithery (advanced)
+    """
+    import json as _json
+    from app.services.mcp_config_parser import parse_mcp_input
 
-    from app.services.resource_discovery import import_mcp_from_smithery
-    return await import_mcp_from_smithery(server_id, agent_id, config or None, reauthorize=reauthorize)
+    reauthorize = bool(arguments.get("reauthorize", False))
+
+    # Sniff every plausible direct-import field
+    parsed = None
+    for field in ("mcp_url", "mcp_config", "config", "url"):
+        candidate = arguments.get(field)
+        parsed = parse_mcp_input(candidate)
+        if parsed:
+            break
+
+    if parsed:
+        if parsed.get("error") and not parsed.get("url"):
+            return f"❌ {parsed['error']}"
+        if parsed.get("url"):
+            from app.services.resource_discovery import import_mcp_direct
+            server_name = (
+                arguments.get("server_name")
+                or parsed.get("name")
+                or arguments.get("server_id")
+            )
+            api_key = arguments.get("api_key") or parsed.get("api_key")
+            headers = parsed.get("headers")
+            warning = parsed.get("_warning")
+            result = await import_mcp_direct(
+                mcp_url=parsed["url"],
+                agent_id=agent_id,
+                server_name=server_name,
+                api_key=api_key,
+                headers=headers,
+            )
+            if warning:
+                result = f"ℹ️ {warning}\n\n{result}"
+            return result
+
+    # Smithery path — opt-in, only when caller explicitly provided server_id
+    server_id = (arguments.get("server_id") or "").strip()
+    if server_id:
+        # Legacy callers may still pass `config` as JSON string; normalize before forwarding.
+        smithery_config = arguments.get("config")
+        if isinstance(smithery_config, str):
+            try:
+                smithery_config = _json.loads(smithery_config) if smithery_config else None
+            except _json.JSONDecodeError:
+                smithery_config = None
+        if smithery_config is not None and not isinstance(smithery_config, dict):
+            smithery_config = None
+        from app.services.resource_discovery import import_mcp_from_smithery
+        return await import_mcp_from_smithery(server_id, agent_id, smithery_config, reauthorize=reauthorize)
+
+    return (
+        "❌ Provide one of:\n"
+        "• `mcp_url`: full http/https endpoint of the MCP server, e.g. "
+        "`https://mcp-gw.dingtalk.com/server/<id>?key=<token>`\n"
+        "• `mcp_config`: standard `mcpServers` JSON config (object or JSON string)\n"
+        "• `server_id`: Smithery registry ID (advanced — only if you want to discover via the Smithery registry)"
+    )
 
 
 # ─── Trigger Management Handlers (Aware Engine) ────────────────────
