@@ -280,6 +280,70 @@ class OpenAICompatibleClient(LLMClient):
             url = url[: -len("/chat/completions")]
         return url
 
+    def _is_dashscope_channel(self) -> bool:
+        """Whether this client targets DashScope's OpenAI-compatible endpoint.
+
+        Detected by base_url, not by model name — every model hosted on
+        DashScope (qwen-plus, qwen-flash, qwen3.6-max, third-party
+        models mirrored there, …) goes through the same cache-control
+        protocol. Other OpenAI-compatible providers (OpenAI, DeepSeek
+        direct, etc.) keep the plain string-content shape.
+        """
+        return "dashscope" in (self.base_url or "").lower()
+
+    def _apply_dashscope_cache_markers(self, messages_payload: list[dict]) -> None:
+        """Annotate the stable prefix with explicit cache breakpoints.
+
+        DashScope's 显式缓存 (https://help.aliyun.com/zh/model-studio/context-cache)
+        requires `cache_control: {"type": "ephemeral"}` on a content
+        block, and the cached segment is the request prefix up to that
+        block. Within the 5-minute TTL these breakpoints land
+        deterministic hits — the cache_creation_input_tokens / cached_tokens
+        fields show up in `usage.prompt_tokens_details`.
+
+        We place at most 2 markers (DashScope's per-request limit is 4):
+
+        * **system message** — the stable prompt prefix; system_prompt
+          is byte-stable for a given agent, so this caches the whole
+          base prompt (typically 4–5K tokens, well above the 1024-token
+          minimum cache block).
+        * **messages[-2]** — tail of the stable history; messages[-1]
+          is the dynamic last user/assistant turn that should NOT be
+          cached. We only mark when the second-to-last message is a
+          user/assistant text turn — tool messages and assistant
+          tool-call turns get skipped to avoid breaking DashScope's
+          per-role content shape rules; the system marker still locks
+          in the large prefix in those cases.
+
+        Mutates `messages_payload` in place.
+        """
+        if not messages_payload:
+            return
+
+        def _mark(msg: dict) -> None:
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                msg["content"] = [{
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            elif isinstance(content, list):
+                for block in reversed(content):
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        block["cache_control"] = {"type": "ephemeral"}
+                        break
+
+        if messages_payload[0].get("role") == "system":
+            _mark(messages_payload[0])
+
+        # Skip the messages[-2] marker for short conversations (no
+        # stable history to cache) and for non-text tail roles.
+        if len(messages_payload) >= 3:
+            tail = messages_payload[-2]
+            if tail.get("role") in ("user", "assistant") and not tail.get("tool_calls"):
+                _mark(tail)
+
     def _build_payload(
         self,
         messages: list[LLMMessage],
@@ -291,6 +355,8 @@ class OpenAICompatibleClient(LLMClient):
     ) -> dict[str, Any]:
         """Build request payload."""
         messages_payload = [m.to_openai_format() for m in messages]
+        if self._is_dashscope_channel():
+            self._apply_dashscope_cache_markers(messages_payload)
         logger.debug(f"[LLM-Debug] OpenAICompatibleClient payload messages for model {self.model}: {json.dumps(messages_payload, indent=2, ensure_ascii=False)}")
         payload: dict[str, Any] = {
             "model": self.model,
