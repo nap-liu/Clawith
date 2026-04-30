@@ -16,6 +16,7 @@ from app.models.user import User  # noqa: F401
 from app.models.agent import Agent, AgentPermission, AgentTemplate  # noqa: F401
 from app.models.task import Task, TaskLog  # noqa: F401
 from app.models.channel_config import ChannelConfig  # noqa: F401
+from app.models.channel_type_default import ChannelTypeDefault  # noqa: F401
 from app.models.llm import LLMModel  # noqa: F401
 from app.models.audit import AuditLog, ApprovalRequest, ChatMessage, EnterpriseInfo  # noqa: F401
 from app.models.skill import Skill, SkillFile  # noqa: F401

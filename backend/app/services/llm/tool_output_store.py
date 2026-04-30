@@ -270,6 +270,20 @@ def force_materialize_tool_output(
 # ─────────────────────────────────────────────────────────────────────────────
 
 MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 120_000
+MSG_BUDGET_ENV_OVERRIDE = "CLAWITH_MSG_TOOL_BUDGET"
+
+
+def _message_budget(default: int = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS) -> int:
+    """Return the per-message tool-result char budget, honoring env override."""
+    override = os.environ.get(MSG_BUDGET_ENV_OVERRIDE)
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            logger.warning(
+                f"[tool_output_store] invalid {MSG_BUDGET_ENV_OVERRIDE}={override!r}, ignoring"
+            )
+    return default
 
 
 def _tool_message_size(msg) -> int:
@@ -320,7 +334,7 @@ def enforce_message_budget(
     fresh_start_idx: int,
     agent_id,
     session_id: str,
-    max_chars: int = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS,
+    max_chars: int | None = None,
 ) -> None:
     """Keep the total tool-message char count across ``api_messages`` under
     ``max_chars`` by force-materializing the largest fresh inline tool
@@ -344,6 +358,9 @@ def enforce_message_budget(
     Vision list-content tool messages are excluded from both the size
     calculation and the materialization candidate pool.
     """
+    if max_chars is None:
+        max_chars = _message_budget()
+
     def _total() -> int:
         return sum(_tool_message_size(m) for m in api_messages)
 
