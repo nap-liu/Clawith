@@ -28,6 +28,18 @@ class LLMModel(Base):
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
     request_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Request timeout in seconds, default 120
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Per-model output token limit override
+    # Total prompt-token capacity of this model (used by auto-compaction trigger).
+    # Backfilled with 32_000 by the migration; admins should adjust per model
+    # (qwen-plus / qwen3.5-plus = 131_072, claude-opus = 200_000, …).
+    context_window: Mapped[int] = mapped_column(Integer, nullable=False, default=32000)
+    # Auto-compaction tunables — see app/services/llm/compactor.py.
+    # `compact_trigger_ratio` is the fraction of `context_window` at which
+    # post-round compaction fires; `keep_recent_turns` keeps that many
+    # trailing rounds intact; `compact_summary_max_tokens` caps the
+    # compaction LLM's output.
+    compact_trigger_ratio: Mapped[float] = mapped_column(Float, nullable=False, default=0.85)
+    keep_recent_turns: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
+    compact_summary_max_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=2000)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
