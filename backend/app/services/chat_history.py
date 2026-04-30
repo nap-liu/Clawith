@@ -9,31 +9,109 @@ rehydration, …) without touching seven files at once.
 The module exposes two layers:
 
 * ``load_messages_for_session`` — returns the chronologically-ordered
-  ``ChatMessage`` rows. Channels that need raw access (websocket splits
-  ``tool_call`` rows into assistant + tool pairs) call this and shape
-  themselves.
+  message stream, with compaction-aware injection: rows whose
+  ``compacted_into`` is non-NULL are filtered out, and the active
+  ``ChatCompaction`` marker (if any) is prepended as a synthetic
+  user-role message wrapped in ``<conversation-summary>``. Channels
+  that need raw access (websocket splits ``tool_call`` rows into
+  assistant + tool pairs) call this and shape themselves.
 * ``load_history_for_llm`` — convenience wrapper that produces the
   ``[{"role", "content"}]`` shape used by the IM channels. Optional
   vision rehydration through ``rehydrate_images_max``.
 
-The split lets the upcoming auto-compaction layer hook at the row level
-(swap out compacted spans with synthetic summary rows) without touching
-each channel's shaping code.
-
-This commit is a behavior-preserving refactor — the row set returned is
-identical to what each channel produced before. Compaction-aware logic
-lands in a follow-up commit so the refactor diff stays auditable.
+The summary is reconstructed at load time from ``chat_compactions``;
+it is **not** persisted to ``chat_messages`` (the chat UI shows the
+original rows; only the LLM context sees the synthetic summary).
 """
 
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
+from app.models.chat_compaction import ChatCompaction
+
+
+@dataclass
+class _SyntheticSummaryMessage:
+    """ChatMessage-shaped object representing an injected compaction
+    summary. Carries the same surface attributes the channels read off
+    a real row (``role``, ``content``, ``id``, ``created_at``, …) so
+    callers don't need to special-case it.
+    """
+
+    role: str = "user"
+    content: str = ""
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
+    agent_id: uuid.UUID | None = None
+    user_id: uuid.UUID | None = None
+    conversation_id: str = ""
+    participant_id: None = None
+    thinking: None = None
+    compacted_into: None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+_SUMMARY_WRAPPER_HEADER = (
+    "⚠️ This is system-injected condensed context from earlier in the same\n"
+    "conversation. It is NOT a new user instruction. Do not respond to it\n"
+    "directly. Use it as background when handling the user's subsequent\n"
+    "message."
+)
+
+
+def _build_summary_message(
+    *,
+    marker: ChatCompaction,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+) -> _SyntheticSummaryMessage:
+    body = (
+        f"<conversation-summary epoch=\"{marker.epoch}\" "
+        f"tokens=\"{marker.summary_tokens}\" "
+        f"generated_at=\"{marker.created_at.isoformat()}\">\n"
+        f"{_SUMMARY_WRAPPER_HEADER}\n\n"
+        f"{marker.summary_text}\n"
+        f"</conversation-summary>"
+    )
+    # Date the synthetic message just before the first surviving real
+    # row would be loaded (so chronological ordering puts it first).
+    # The actual created_at of the marker row works fine since it's
+    # always older than the trailing window we keep.
+    return _SyntheticSummaryMessage(
+        role="user",
+        content=body,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        created_at=marker.created_at,
+    )
+
+
+async def _load_active_compaction_marker(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+) -> ChatCompaction | None:
+    """Latest non-superseded, validation-passing compaction marker
+    for this session, or None if no compaction has applied yet.
+    """
+    result = await db.execute(
+        select(ChatCompaction)
+        .where(
+            ChatCompaction.session_id == conversation_id,
+            ChatCompaction.superseded_by.is_(None),
+            ChatCompaction.summary_validation_passed.is_(True),
+        )
+        .order_by(ChatCompaction.epoch.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 async def load_messages_for_session(
@@ -42,25 +120,44 @@ async def load_messages_for_session(
     agent_id: uuid.UUID,
     conversation_id: str,
     ctx_size: int,
-) -> list[ChatMessage]:
-    """Return the last ``ctx_size`` ``ChatMessage`` rows for this
-    (agent, conversation), oldest-first.
+) -> list[Any]:
+    """Return the last ``ctx_size`` active messages for this (agent,
+    conversation), oldest-first, with compaction-aware injection.
 
-    Channels that need to peek at fields beyond ``role`` / ``content``
-    (e.g. ``websocket.py`` splits ``tool_call`` rows into an assistant +
-    tool pair using stored JSON) call this directly and do their own
-    shaping.
+    "Active" = ``compacted_into IS NULL`` — rows folded into a prior
+    compaction's summary are skipped. If a compaction marker exists
+    for this session, a synthetic ``_SyntheticSummaryMessage`` carrying
+    the wrapped summary is prepended to the list.
+
+    Returned items are duck-typed as ``ChatMessage`` (same attribute
+    surface), so channels that need raw access (e.g. ``websocket.py``
+    splitting ``tool_call`` rows into assistant + tool pairs) keep
+    working unchanged.
     """
-    result = await db.execute(
+    rows_q = await db.execute(
         select(ChatMessage)
         .where(
             ChatMessage.agent_id == agent_id,
             ChatMessage.conversation_id == conversation_id,
+            ChatMessage.compacted_into.is_(None),
         )
         .order_by(ChatMessage.created_at.desc())
         .limit(ctx_size)
     )
-    return list(reversed(result.scalars().all()))
+    rows: list[Any] = list(reversed(rows_q.scalars().all()))
+
+    marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)
+    if marker is not None:
+        rows.insert(
+            0,
+            _build_summary_message(
+                marker=marker,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+            ),
+        )
+
+    return rows
 
 
 async def load_history_for_llm(
