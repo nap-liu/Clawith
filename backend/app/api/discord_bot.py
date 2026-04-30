@@ -329,13 +329,13 @@ async def discord_interaction_webhook(
                 session_conv_id = str(sess.id)
 
                 # Load history from session
-                history_r = await bg_db.execute(
-                    select(ChatMessage)
-                    .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-                    .order_by(ChatMessage.created_at.desc())
-                    .limit(ctx_size)
+                from app.services.chat_history import load_history_for_llm
+                history = await load_history_for_llm(
+                    bg_db,
+                    agent_id=agent_id,
+                    conversation_id=session_conv_id,
+                    ctx_size=ctx_size,
                 )
-                history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
 
                 # Save user message
                 bg_db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))

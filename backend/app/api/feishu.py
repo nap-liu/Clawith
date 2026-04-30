@@ -542,14 +542,13 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             )
             _pre_sess = _pre_sess_r.scalar_one_or_none()
             _history_conv_id = str(_pre_sess.id) if _pre_sess else conv_id
-            history_result = await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == _history_conv_id)
-                .order_by(ChatMessage.created_at.desc())
-                .limit(ctx_size)
+            from app.services.chat_history import load_history_for_llm
+            history = await load_history_for_llm(
+                db,
+                agent_id=agent_id,
+                conversation_id=_history_conv_id,
+                ctx_size=ctx_size,
             )
-            history_msgs = history_result.scalars().all()
-            history = [{"role": m.role, "content": m.content} for m in reversed(history_msgs)]
 
             # --- Resolve Feishu sender identity & find/create platform user ---
             import uuid as _uuid
@@ -1047,13 +1046,13 @@ async def _handle_feishu_file(db, agent_id, config, message, sender_open_id, cha
         # Load conversation history for LLM context
         from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
         ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
-        _hist_r = await db.execute(
-            _select(ChatMessage)
-            .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(ctx_size)
+        from app.services.chat_history import load_history_for_llm as _load_hist_llm
+        _history = await _load_hist_llm(
+            db,
+            agent_id=agent_id,
+            conversation_id=session_conv_id,
+            ctx_size=ctx_size,
         )
-        _history = [{"role": m.role, "content": m.content} for m in reversed(_hist_r.scalars().all())]
 
         await db.commit()
 

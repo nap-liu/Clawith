@@ -61,6 +61,15 @@ class ChatMessage(Base):
     participant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("participants.id"), nullable=True)
     # Model thinking process
     thinking: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set when this row has been folded into a compaction summary. Loaders
+    # that respect compaction skip rows where this is non-NULL and inject
+    # the compaction's summary_text in their place. Original rows stay in
+    # the table for audit and any future "expand" feature.
+    compacted_into: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chat_compactions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 

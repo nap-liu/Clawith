@@ -714,6 +714,43 @@ async def call_llm(
             session_id=session_id,
         )
 
+        # Auto-compaction hook (P5).
+        # When this round's prompt_tokens crosses the per-model
+        # `compact_trigger_ratio` (default 0.85 of context_window), kick
+        # off a structured-summary compaction so the NEXT call_llm
+        # invocation loads a slimmer history. We deliberately do NOT
+        # mutate `api_messages` in place — the in-memory list still
+        # carries the long prefix for the remainder of this round, and
+        # the channel's next history load through chat_history's
+        # compaction-aware path picks up the new shape transparently.
+        # 15% safety margin in the current request is enough to cover
+        # the ~2 additional tool rounds that may follow before the
+        # tool loop exits.
+        if agent_id and session_id:
+            last_prompt_tokens = None
+            if response and response.usage:
+                last_prompt_tokens = response.usage.get("prompt_tokens")
+            if last_prompt_tokens:
+                try:
+                    from app.services.llm.compactor import maybe_compact
+                    compaction_result = await maybe_compact(
+                        agent_id=agent_id,
+                        conversation_id=session_id,
+                        model=model,
+                        last_prompt_tokens=last_prompt_tokens,
+                    )
+                    if compaction_result.progress_notice and on_chunk:
+                        await on_chunk(f"\n\n{compaction_result.progress_notice}\n\n")
+                except Exception as compact_exc:
+                    # Compaction is opportunistic — never let its
+                    # failure abort the live conversation. The session
+                    # falls back to ctx_size truncation on the next
+                    # call_llm if context keeps growing.
+                    logger.warning(
+                        f"[LLM] auto-compaction hook failed (non-fatal): "
+                        f"{type(compact_exc).__name__}: {compact_exc}"
+                    )
+
     # Record tokens even on "too many rounds" exit
     if agent_id and _accumulated_tokens > 0:
         await record_token_usage(agent_id, _accumulated_tokens)
