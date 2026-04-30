@@ -616,7 +616,15 @@ async def _do_compact(
             created_at=datetime.now(timezone.utc),
         )
 
-        async with db.begin():
+        # SQLAlchemy AsyncSession autobegins a transaction on first
+        # query, so an explicit `async with db.begin()` would raise
+        # "A transaction is already begun". We rely on the autobegun
+        # transaction and commit/rollback explicitly. The whole block
+        # of writes lands atomically — any exception propagates up
+        # to the caller's try/except in maybe_compact, which doesn't
+        # commit, so the session closes with the transaction rolled
+        # back.
+        try:
             db.add(compaction)
             await db.flush()
 
@@ -636,6 +644,11 @@ async def _do_compact(
                         .where(ChatCompaction.id == prior_marker_id)
                         .values(superseded_by=compaction.id)
                     )
+
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
         if not passed:
             logger.warning(
@@ -674,13 +687,27 @@ async def _do_compact(
             f"compacted_rows={len(span_rows)} summary_tokens={summary_tokens} "
             f"recall={recall:.2f}"
         )
+        savings = trigger_prompt_tokens - summary_tokens
+        if savings > 0:
+            notice = (
+                f"🗜 已整理 {len(span_rows)} 条历史消息（epoch={new_epoch}），"
+                f"节省约 {savings} tokens"
+            )
+        else:
+            # Synthetic / small-context test scenarios can produce summaries
+            # larger than the trigger threshold itself; in real use the
+            # ratio is heavily positive. Don't surface a negative number to
+            # the user — it's confusing and not actionable.
+            notice = (
+                f"🗜 已整理 {len(span_rows)} 条历史消息（epoch={new_epoch}）"
+            )
         return CompactionResult(
             triggered=True,
             summary_id=compaction.id,
             epoch=new_epoch,
             summary_tokens=summary_tokens,
             trigger_prompt_tokens=trigger_prompt_tokens,
-            progress_notice=f"🗜 已整理 {len(span_rows)} 条历史消息（epoch={new_epoch}），节省约 {trigger_prompt_tokens - summary_tokens} tokens",
+            progress_notice=notice,
         )
 
 
