@@ -362,7 +362,14 @@ def serialize_span_for_summary(rows: list[ChatMessage]) -> str:
 
 
 _UUID_LIKE_RE = re.compile(r"\b[a-f0-9]{32}\b|\b[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}\b")
-_PATH_RE = re.compile(r"(?:^|\s)((?:/|\./|\.\./|[A-Za-z]:\\|workspace/|memory/|skills/)[^\s'\"<>]+)")
+# Path regex: stops on whitespace, quotes, brackets, **and** common
+# trailing sentence punctuation (.,;:!?) when followed by whitespace or
+# end-of-string — `workspace/draft.md,` should match `workspace/draft.md`,
+# not include the comma. Otherwise recall comparison breaks because
+# the summary writes the path without the trailing punctuation.
+_PATH_RE = re.compile(
+    r"(?:^|\s)((?:/|\./|\.\./|[A-Za-z]:\\|workspace/|memory/|skills/)[^\s'\"<>]*?)(?=[\s,;:!?]|$)"
+)
 _HEADING_RE = re.compile(r"^#{2,3}\s", re.MULTILINE)
 
 
