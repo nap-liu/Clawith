@@ -527,18 +527,15 @@ async def process_dingtalk_message(
         )
         session_conv_id = str(sess.id)
 
-        # Load history
-        history_r = await db.execute(
-            _select(ChatMessage)
-            .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(ctx_size)
+        # Load history (with vision rehydration so multi-turn LLM keeps prior images visible)
+        from app.services.chat_history import load_history_for_llm
+        history = await load_history_for_llm(
+            db,
+            agent_id=agent_id,
+            conversation_id=session_conv_id,
+            ctx_size=ctx_size,
+            rehydrate_images_max=3,
         )
-        history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
-
-        # Re-hydrate historical images for multi-turn LLM context
-        from app.services.image_context import rehydrate_image_messages
-        history = rehydrate_image_messages(history, agent_id, max_images=3)
 
         # Save user message — use display-friendly format for DB (no base64)
         # Build saved_content: [file:name] prefix for each saved file + clean text

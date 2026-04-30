@@ -258,13 +258,13 @@ async def websocket_chat(
                     logger.info(f"[WS] Created default session {conv_id}")
 
             try:
-                history_result = await db.execute(
-                    select(ChatMessage)
-                    .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == conv_id)
-                    .order_by(ChatMessage.created_at.desc())
-                    .limit(ctx_size)
+                from app.services.chat_history import load_messages_for_session
+                history_messages = await load_messages_for_session(
+                    db,
+                    agent_id=agent_id,
+                    conversation_id=conv_id,
+                    ctx_size=ctx_size,
                 )
-                history_messages = list(reversed(history_result.scalars().all()))
                 logger.info(f"[WS] Loaded {len(history_messages)} history messages for session {conv_id}")
             except Exception as e:
                 logger.warning(f"[WS] History load failed (non-fatal): {e}")

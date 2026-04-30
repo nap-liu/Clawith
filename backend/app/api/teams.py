@@ -471,13 +471,13 @@ async def teams_event_webhook(
             group_name=activity.get("conversation", {}).get("name") or (f"Teams Group {conversation_id[:8]}" if _is_group_teams else None),
         )
         session_conv_id = str(sess.id)
-        history_r = await db.execute(
-            select(ChatMessage)
-            .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(ctx_size)
+        from app.services.chat_history import load_history_for_llm
+        history = await load_history_for_llm(
+            db,
+            agent_id=agent_id,
+            conversation_id=session_conv_id,
+            ctx_size=ctx_size,
         )
-        history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
 
         # Save user message
         db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
