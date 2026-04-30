@@ -1093,17 +1093,41 @@ BUILTIN_TOOLS = [
     {
         "name": "import_mcp_server",
         "display_name": "Import MCP Server",
-        "description": "Import an MCP server from Smithery registry into the platform. The server's tools become available for use. Use discover_resources first to find the server ID.",
+        "description": (
+            "Import an MCP server. Direct import is the primary path and requires no third-party account: "
+            "pass `mcp_url` (a single http/https endpoint) OR `mcp_config` (the standard `mcpServers` JSON config). "
+            "Use `server_id` only when you specifically want to discover via the Smithery registry."
+        ),
         "category": "discovery",
         "icon": "📥",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "server_id": {"type": "string", "description": "Smithery server ID, e.g. '@anthropic/brave-search' or '@anthropic/fetch'"},
-                "config": {"type": "object", "description": "Optional server configuration (e.g. API keys required by the server)"},
+                "mcp_url": {
+                    "type": "string",
+                    "description": "MCP server URL (http/https). Example: 'https://mcp-gw.dingtalk.com/server/<id>?key=<token>'.",
+                },
+                "mcp_config": {
+                    "description": "Standard MCP `mcpServers` JSON config — accepts either an object or a JSON-stringified object. Example: {\"mcpServers\": {\"my\": {\"url\": \"https://...\", \"headers\": {\"Authorization\": \"Bearer xxx\"}}}}.",
+                },
+                "server_name": {
+                    "type": "string",
+                    "description": "Optional display name; auto-derived from the URL host when omitted.",
+                },
+                "api_key": {
+                    "type": "string",
+                    "description": "Optional bearer token for `mcp_url`. Sent as Authorization header at runtime.",
+                },
+                "server_id": {
+                    "type": "string",
+                    "description": "Smithery registry ID, e.g. '@anthropic/brave-search'. Optional — only when importing via Smithery.",
+                },
+                "config": {
+                    "type": "object",
+                    "description": "Legacy: server-specific config when going through Smithery. Prefer `mcp_config` for direct import.",
+                },
             },
-            "required": ["server_id"],
         },
         "config": {"smithery_api_key": "", "modelscope_api_token": ""},
         "config_schema": {
