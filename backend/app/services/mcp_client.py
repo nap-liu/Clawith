@@ -49,6 +49,14 @@ class MCPClient:
         self._session_id: str | None = None
         self._sse_messages_url: str | None = None  # POST endpoint for SSE transport
 
+        # Captured from the server's `initialize` response (top-level
+        # `result.instructions`). Per MCP spec this string is meant to be
+        # injected into the LLM system prompt so the model knows how to
+        # use the server's tools. Populated lazily on first request that
+        # triggers the handshake; stays None if the server omits it.
+        self.server_instructions: str | None = None
+        self.server_info: dict | None = None
+
     def _headers(self) -> dict:
         """Build request headers with proper MCP and auth headers."""
         h = {
@@ -76,6 +84,20 @@ class MCPClient:
             return self._parse_sse_response(resp.text)
         else:
             return resp.json()
+
+    def _capture_init_metadata(self, data) -> None:
+        """Pull `serverInfo` and `instructions` out of an MCP initialize result."""
+        if not isinstance(data, dict):
+            return
+        result = data.get("result")
+        if not isinstance(result, dict):
+            return
+        info = result.get("serverInfo")
+        if isinstance(info, dict):
+            self.server_info = info
+        instr = result.get("instructions")
+        if isinstance(instr, str) and instr.strip():
+            self.server_instructions = instr.strip()
 
     def _parse_sse_response(self, text: str) -> dict:
         """Extract the last JSON-RPC result from an SSE stream."""
@@ -112,7 +134,8 @@ class MCPClient:
                 headers=self._headers(),
             )
             if resp.status_code == 200:
-                self._parse_response(resp)  # captures Mcp-Session-Id if present
+                init_data = self._parse_response(resp)  # captures Mcp-Session-Id if present
+                self._capture_init_metadata(init_data)
             # Send initialized notification (required by MCP spec before other requests)
             await client.post(
                 self.server_url,
@@ -274,6 +297,12 @@ class MCPClient:
                                 parsed_data = json.loads(data)
                                 # Match our request ID
                                 if isinstance(parsed_data, dict) and parsed_data.get("id") in (0, 1):
+                                    if parsed_data.get("id") == 0:
+                                        # Initialize response — capture
+                                        # serverInfo + instructions for the
+                                        # caller before it gets overwritten
+                                        # by the actual request response.
+                                        self._capture_init_metadata(parsed_data)
                                     result = parsed_data
                                     if parsed_data.get("id") == 1:
                                         break  # Got our actual request response

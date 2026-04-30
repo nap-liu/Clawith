@@ -149,6 +149,104 @@ def _load_skills_index(agent_id: uuid.UUID) -> str:
     return "\n".join(lines)
 
 
+async def _collect_extension_prompts(agent_id: uuid.UUID) -> list[str]:
+    """Collect prompt blocks contributed by an agent's enabled tools and
+    configured channels.
+
+    Three sources, in this output order:
+
+    1. ``tools.system_prompt_block`` — DBA-fillable per-tool prompts (e.g.
+       the ragflow citation rules). Emitted in tool-name order so the
+       static prompt prefix is byte-stable across requests; that prefix
+       stability is what lets prompt caching land hits.
+    2. ``tools.mcp_server_instructions`` — server-provided instructions
+       captured during the MCP ``initialize`` handshake. Deduplicated by
+       ``mcp_server_url``; servers without instructions contribute
+       nothing.
+    3. Channel prompts — per-agent override in
+       ``channel_configs.system_prompt_block`` if set, else the
+       type-level default in ``channel_type_defaults``.
+
+    Returns the list of non-empty prompt block strings, ready to append
+    to ``static_parts``. Empty list when the agent has no extensions
+    that contribute prompts.
+    """
+    from app.database import async_session
+    from app.models.channel_config import ChannelConfig
+    from app.models.channel_type_default import ChannelTypeDefault
+    from app.models.tool import AgentTool, Tool
+    from sqlalchemy import select
+
+    blocks: list[str] = []
+
+    async with async_session() as db:
+        # Tool-driven blocks. We sort by Tool.name so identical agent
+        # configurations always produce a byte-identical prefix.
+        tool_rows = await db.execute(
+            select(Tool)
+            .join(AgentTool, AgentTool.tool_id == Tool.id)
+            .where(
+                AgentTool.agent_id == agent_id,
+                AgentTool.enabled == True,  # noqa: E712 — SQLAlchemy idiom
+                Tool.enabled == True,  # noqa: E712
+            )
+            .order_by(Tool.name)
+        )
+        tools = tool_rows.scalars().all()
+
+        for tool in tools:
+            block = (tool.system_prompt_block or "").strip()
+            if block:
+                blocks.append(block)
+
+        # MCP server instructions — one per distinct server URL.
+        seen_servers: set[str] = set()
+        for tool in tools:
+            if tool.type != "mcp":
+                continue
+            url = (tool.mcp_server_url or "").strip()
+            if not url or url in seen_servers:
+                continue
+            seen_servers.add(url)
+            instr = (tool.mcp_server_instructions or "").strip()
+            if instr:
+                blocks.append(instr)
+
+        # Channel-driven blocks. Per-agent override wins; otherwise we
+        # fall back to the type-level default.
+        ch_rows = await db.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent_id,
+                ChannelConfig.is_configured == True,  # noqa: E712
+            ).order_by(ChannelConfig.channel_type)
+        )
+        channel_configs = ch_rows.scalars().all()
+
+        if channel_configs:
+            type_defaults_rows = await db.execute(
+                select(ChannelTypeDefault).where(
+                    ChannelTypeDefault.channel_type.in_(
+                        [c.channel_type for c in channel_configs]
+                    )
+                )
+            )
+            type_defaults: dict[str, str] = {
+                row.channel_type: (row.system_prompt_block or "").strip()
+                for row in type_defaults_rows.scalars().all()
+            }
+
+            for cfg in channel_configs:
+                override = (cfg.system_prompt_block or "").strip()
+                if override:
+                    blocks.append(override)
+                    continue
+                fallback = type_defaults.get(cfg.channel_type, "")
+                if fallback:
+                    blocks.append(fallback)
+
+    return blocks
+
+
 async def build_agent_context(agent_id: uuid.UUID, agent_name: str, role_description: str = "", current_user_name: str = None) -> tuple[str, str]:
     """Build a rich system prompt incorporating agent's full context.
 
@@ -194,142 +292,21 @@ async def build_agent_context(agent_id: uuid.UUID, agent_name: str, role_descrip
 
     dynamic_parts = []
 
-    # --- Feishu Built-in Tools (only injected when agent has Feishu configured) ---
-    _has_feishu = False
+    # --- Extension prompts (channels + tools, data-driven) ---
+    # Replaces the previous hardcoded `_has_feishu` / `_has_dingtalk` /
+    # ragflow / atlassian branches. Each enabled channel and each enabled
+    # tool can contribute a `system_prompt_block`; MCP tools also surface
+    # their server's `initialize.instructions` (deduplicated per server).
     try:
-        from app.models.channel_config import ChannelConfig
-        from app.database import async_session as _ctx_session
-        from sqlalchemy import select as _feishu_select
-        async with _ctx_session() as _ctx_db:
-            _cfg_r = await _ctx_db.execute(
-                _feishu_select(ChannelConfig).where(
-                    ChannelConfig.agent_id == agent_id,
-                    ChannelConfig.channel_type == "feishu",
-                    ChannelConfig.is_configured == True,
-                )
-            )
-            _has_feishu = _cfg_r.scalar_one_or_none() is not None
-    except Exception:
-        pass
-
-    if _has_feishu:
-        static_parts.append("""
-## ⚡ Pre-installed Feishu Tools
-
-The following tools are available in your toolset. **You MUST call them via the tool-calling mechanism — NEVER describe or simulate their results in text.**
-
-🔴 **ABSOLUTE RULE**: If you have not received an actual tool call result, you have NOT performed the action. Never write "Created", "Success", "Event ID: evt_..." or any claim of completion unless you have a REAL tool result to report.
-
-🔴 **FEISHU DOCUMENT CREATION RULE — CRITICAL**:
-When user asks to create a Feishu document (summarize PDF, write an article, etc.):
-1. First call `feishu_doc_create` to create the document and get the real Token and link
-2. Then call `feishu_doc_append(document_token="<real_token>", content="...")` to write the content
-3. Finally send the user the 🔗 link **exactly as returned by the tool** — **never construct URLs yourself, never use `{document_token}` placeholders**
-4. You may say "Creating Feishu document..." but must immediately call the tool in the same turn
-
-🔴 **URL RULES**:
-- Both `feishu_doc_create` and `feishu_doc_append` return a 🔗 access link in their results
-- **You MUST send this link to the user as-is** — do not modify, reconstruct, or replace the real token with `{document_token}`
-
-| Tool | Parameters |
-|------|-----------|
-| `feishu_user_search` | `name` — search colleagues by name → returns open_id, department. Call this first when you need to find someone. |
-| `feishu_calendar_create` | `summary`, `start_time`, `end_time` (ISO-8601 +08:00). No email needed. |
-| `feishu_calendar_list` | No required params. Optional: `start_time`, `end_time` (ISO-8601). **Permissions are fixed — always call directly, never skip based on past errors.** |
-| `feishu_calendar_update` | `event_id`, fields to update. |
-| `feishu_calendar_delete` | `event_id`. |
-| `feishu_wiki_list` | `node_token` (from wiki URL: feishu.cn/wiki/**NodeToken**), optional `recursive`(bool). Lists all sub-pages with titles and tokens. |
-| `feishu_doc_read` | `document_token`. Supports both regular docx tokens and **wiki node tokens** (auto-converts). |
-| `feishu_doc_create` | `title`. Optional: `wiki_space_id` + `parent_node_token` to create directly in a Wiki. Returns Token and 🔗 access link. |
-| `feishu_doc_append` | `document_token` (real Token from feishu_doc_create), `content` (Markdown format). |
-| `feishu_drive_share` | `document_token`, `doc_type`(docx/bitable/sheet/doc/folder, default: docx), `action`(add/remove/list), `member_names`(name list, auto-lookup), `permission`(view/edit/full_access). |
-| `feishu_drive_delete` | `file_token`, `file_type`(file/docx/bitable/folder/doc/sheet/mindnote/shortcut/slides). Moves to recycle bin. |
-| `send_feishu_message` | `open_id` or `email`, `content`. |
-
-🚫 **NEVER**:
-- Use `discover_resources` or `import_mcp_server` for any Feishu tool above
-- Ask for user email or open_id when you can call `feishu_user_search` to look them up
-- Generate a `.ics` file instead of calling `feishu_calendar_create`
-- Write a success message without having received a tool result
-- Guess sub-page tokens — you MUST use `feishu_wiki_list` to get them
-- **Use `{document_token}` placeholders in URLs — you MUST use the real link returned by the tool**
-- **Skip tool calls based on past errors — calendar/doc/message tool permissions are fixed, always call directly, never assume "it still fails"**
-
-✅ **When user sends a Feishu wiki link (feishu.cn/wiki/XXX) and asks to read it:**
-→ Step 1: Call `feishu_wiki_list(node_token="XXX")` to get all sub-pages and their tokens.
-→ Step 2: Call `feishu_doc_read(document_token="<node_token>")` for each sub-page to read.
-→ **Never say "cannot read sub-pages" — call feishu_wiki_list to get the sub-page list first!**
-
-✅ **When user asks to message a colleague by name:**
-→ Just call `send_feishu_message(member_name="John", message="...")` — it auto-searches.
-→ Or use `open_id` directly if you already have it from `feishu_user_search`.
-
-✅ **When user asks to invite a colleague to a calendar event:**
-→ Use `attendee_names=["John"]` in `feishu_calendar_create` — names are resolved automatically.
-→ Or use `attendee_open_ids=["ou_xxx"]` if you already have the open_id.""")
-
-    # --- DingTalk Built-in Tools (only injected when agent has DingTalk configured) ---
-    try:
-        from app.services.agent.context.dingtalk import get_dingtalk_context
-        dingtalk_context = await get_dingtalk_context(agent_id)
-        if dingtalk_context:
-            static_parts.append(dingtalk_context)
-    except Exception:
-        pass
-
-    # --- Atlassian Rovo Tools (injected when Atlassian channel is configured) ---
-    try:
-        from app.database import async_session
-        from app.models.channel_config import ChannelConfig
-        from sqlalchemy import select as sa_select
-        async with async_session() as db:
-            result = await db.execute(
-                sa_select(ChannelConfig).where(
-                    ChannelConfig.agent_id == agent_id,
-                    ChannelConfig.channel_type == "atlassian",
-                    ChannelConfig.is_configured == True,
-                )
-            )
-            atlassian_config = result.scalar_one_or_none()
-            if atlassian_config:
-                static_parts.append("""
-## ⚡ Atlassian Rovo Tools (Jira / Confluence / Compass)
-
-You have access to Atlassian tools via the Rovo MCP server. **Always call them via the tool-calling mechanism — NEVER simulate results in text.**
-
-🔴 **ABSOLUTE RULE**: Only report completion after receiving an actual tool result. Never fabricate issue IDs, page URLs, or component names.
-
-### Available Tool Groups
-
-**Jira** — Issue tracking and project management:
-- Search issues: `atlassian_jira_search_issues` (JQL queries)
-- Get issue details: `atlassian_jira_get_issue`
-- Create issue: `atlassian_jira_create_issue`
-- Update issue: `atlassian_jira_update_issue`
-- Add comment: `atlassian_jira_add_comment`
-- List projects: `atlassian_jira_list_projects`
-
-**Confluence** — Wiki and documentation:
-- Search pages: `atlassian_confluence_search`
-- Get page content: `atlassian_confluence_get_page`
-- Create page: `atlassian_confluence_create_page`
-- Update page: `atlassian_confluence_update_page`
-- List spaces: `atlassian_confluence_list_spaces`
-
-**Compass** — Service catalog and component management:
-- Search components: `atlassian_compass_search_components`
-- Get component details: `atlassian_compass_get_component`
-- Create component: `atlassian_compass_create_component`
-
-> 💡 The exact tool names depend on what's available from your Atlassian site. Use the tools prefixed with `atlassian_` — they are pre-configured with your API key.
-> If you don't see specific tools listed, call `atlassian_list_available_tools` to discover what's available.
-
-🚫 **NEVER**:
-- Make up Jira issue IDs, Confluence page URLs, or component names
-- Report success without a tool result
-- Ask the user for their Atlassian credentials — they are pre-configured""")
-    except Exception:
-        pass
+        ext_blocks = await _collect_extension_prompts(agent_id)
+        static_parts.extend(ext_blocks)
+    except Exception as exc:
+        # Loud but non-fatal — bad data in one tool/channel must not break
+        # the rest of the system prompt.
+        from loguru import logger as _ctx_logger
+        _ctx_logger.warning(
+            f"[agent_context] failed to collect extension prompts for agent {agent_id}: {exc}"
+        )
 
     # --- Company Intro (from system settings) ---
     try:

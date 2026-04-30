@@ -597,10 +597,19 @@ async def import_mcp_direct(
 
     # Try to list tools from the endpoint
     tools_discovered = []
+    server_instructions: str | None = None
     try:
         client = MCPClient(full_url, headers=headers)
         tools_discovered = await client.list_tools()
-        logger.info(f"[DirectImport] Got {len(tools_discovered)} tools from {mcp_url}")
+        # `list_tools` triggers the MCP `initialize` handshake under the hood,
+        # which populates `client.server_instructions` if the server provided
+        # one. Persisted on each tool row so the agent collector can inject
+        # it into the system prompt without re-handshaking on every request.
+        server_instructions = client.server_instructions
+        logger.info(
+            f"[DirectImport] Got {len(tools_discovered)} tools from {mcp_url}"
+            + (f" with server instructions ({len(server_instructions)} chars)" if server_instructions else "")
+        )
     except Exception as e:
         logger.error(f"[DirectImport] Could not list tools from {mcp_url}: {e}")
 
@@ -642,6 +651,8 @@ async def import_mcp_direct(
                 existing_tool = existing_r.scalar_one_or_none()
                 if existing_tool:
                     existing_tool.mcp_server_url = mcp_url
+                    if server_instructions:
+                        existing_tool.mcp_server_instructions = server_instructions
                     await _ensure_agent_tool(existing_tool.id)
                     imported_tools.append(f"⏭️ {tool_display} (already imported)")
                     continue
@@ -657,6 +668,7 @@ async def import_mcp_direct(
                     mcp_server_url=mcp_url,
                     mcp_server_name=display_name,
                     mcp_tool_name=mcp_tool["name"],
+                    mcp_server_instructions=server_instructions,
                     enabled=True,
                     is_default=False,
                     source="agent",
@@ -671,6 +683,8 @@ async def import_mcp_direct(
             existing_tool = existing_r.scalar_one_or_none()
             if existing_tool:
                 existing_tool.mcp_server_url = mcp_url
+                if server_instructions:
+                    existing_tool.mcp_server_instructions = server_instructions
                 await _ensure_agent_tool(existing_tool.id)
                 return f"⏭️ {display_name} is already imported."
 
@@ -684,6 +698,7 @@ async def import_mcp_direct(
                 parameters_schema={"type": "object", "properties": {}},
                 mcp_server_url=mcp_url,
                 mcp_server_name=display_name,
+                mcp_server_instructions=server_instructions,
                 enabled=True,
                 is_default=False,
                 source="agent",

@@ -36,6 +36,10 @@ class ChannelConfig(Base):
     is_connected: Mapped[bool] = mapped_column(default=False)
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Per-agent override for the channel's system-prompt block.
+    # Falls back to channel_type_defaults.system_prompt_block when NULL.
+    system_prompt_block: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Additional config as JSON for extensibility
     extra_config: Mapped[dict] = mapped_column(JSON, default={})
 

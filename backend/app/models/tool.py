@@ -39,6 +39,14 @@ class Tool(Base):
     mcp_server_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     mcp_tool_name: Mapped[str | None] = mapped_column(String(200), nullable=True)  # tool name on the MCP server
 
+    # Prompt blocks injected into the agent's system prompt when this tool is enabled.
+    # `system_prompt_block` is DBA-fillable per tool; `mcp_server_instructions` is the
+    # last-seen `instructions` field from the MCP server's `initialize` response (one
+    # logical value per server, replicated across that server's tool rows — collector
+    # deduplicates by `mcp_server_url`).
+    system_prompt_block: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mcp_server_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # global toggle
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)  # auto-assigned to new agents
     source: Mapped[str] = mapped_column(String(20), default="builtin")  # "builtin" | "admin" | "agent"
