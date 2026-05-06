@@ -71,6 +71,15 @@ class DingTalkTokenManager:
                 logger.error(f"[DingTalk Token] Error getting token: {e}")
                 return None
 
+    async def get_corp_token(self, app_key: str, app_secret: str) -> Optional[str]:
+        """Get corp access_token via oapi.dingtalk.com/gettoken (GET).
+
+        Used for corp API calls like /topapi/v2/user/get.
+        Shares the same cache since the token works for both APIs.
+        """
+        # The v1.0 OAuth2 token also works for corp APIs, so reuse it
+        return await self.get_token(app_key, app_secret)
+
 
 # Global singleton
 dingtalk_token_manager = DingTalkTokenManager()

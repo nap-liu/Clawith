@@ -1,6 +1,6 @@
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuthStore } from './stores';
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useLayoutEffect, useState, useRef } from 'react';
 import { authApi } from './services/api';
 import { X } from 'lucide-react';
 import Login from './pages/Login';
@@ -19,6 +19,7 @@ import EnterpriseSettings from './pages/EnterpriseSettings';
 import InvitationCodes from './pages/InvitationCodes';
 import AdminCompanies from './pages/AdminCompanies';
 import SSOEntry from './pages/SSOEntry';
+import OKR from './pages/OKR';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
@@ -34,8 +35,14 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 }
 
 /* ─── Notification Bar ─── */
+type NotificationBarConfig = { enabled: boolean; text: string };
+type NotificationBarUpdateEvent = CustomEvent<NotificationBarConfig>;
+
+const notificationBarClass = 'has-notification-bar';
+const notificationBarDismissKey = (text: string) => `notification_bar_dismissed_${btoa(encodeURIComponent(text))}`;
+
 function NotificationBar() {
-    const [config, setConfig] = useState<{ enabled: boolean; text: string } | null>(null);
+    const [config, setConfig] = useState<NotificationBarConfig | null>(null);
     const [dismissed, setDismissed] = useState(false);
     
     const textRef = useRef<HTMLSpanElement>(null);
@@ -49,23 +56,38 @@ function NotificationBar() {
             .catch(() => { });
     }, []);
 
+    useEffect(() => {
+        const handleUpdate = (event: Event) => {
+            const next = (event as NotificationBarUpdateEvent).detail;
+            if (!next) return;
+            setConfig(next);
+            setDismissed(false);
+            if (!next.enabled || !next.text) {
+                document.body.classList.remove(notificationBarClass);
+            }
+        };
+
+        window.addEventListener('notification-bar-updated', handleUpdate);
+        return () => window.removeEventListener('notification-bar-updated', handleUpdate);
+    }, []);
+
     // Check sessionStorage for dismissal (keyed by text so new messages re-show)
     useEffect(() => {
         if (config?.text) {
-            const key = `notification_bar_dismissed_${btoa(encodeURIComponent(config.text))}`;
+            const key = notificationBarDismissKey(config.text);
             if (sessionStorage.getItem(key)) setDismissed(true);
         }
     }, [config?.text]);
 
     // Manage body class: add when visible, remove when hidden or dismissed
     const isVisible = !!config?.enabled && !!config?.text && !dismissed;
-    useEffect(() => {
+    useLayoutEffect(() => {
         if (isVisible) {
-            document.body.classList.add('has-notification-bar');
+            document.body.classList.add(notificationBarClass);
         } else {
-            document.body.classList.remove('has-notification-bar');
+            document.body.classList.remove(notificationBarClass);
         }
-        return () => { document.body.classList.remove('has-notification-bar'); };
+        return () => { document.body.classList.remove(notificationBarClass); };
     }, [isVisible]);
 
     // Dynamic marquee if text is too wide
@@ -89,8 +111,9 @@ function NotificationBar() {
     if (!isVisible) return null;
 
     const handleDismiss = () => {
-        const key = `notification_bar_dismissed_${btoa(encodeURIComponent(config!.text))}`;
+        const key = notificationBarDismissKey(config!.text);
         sessionStorage.setItem(key, '1');
+        document.body.classList.remove(notificationBarClass);
         setDismissed(true);
     };
 
@@ -192,6 +215,7 @@ export default function App() {
                     <Route path="agents/:id" element={<AgentDetail />} />
                     <Route path="messages" element={<Messages />} />
                     <Route path="enterprise" element={<EnterpriseSettings />} />
+                    <Route path="okr" element={<OKR />} />
                     <Route path="invitations" element={<InvitationCodes />} />
                     <Route path="admin/platform-settings" element={<AdminCompanies />} />
                 </Route>

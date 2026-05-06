@@ -110,7 +110,7 @@ async def configure_dingtalk_channel(
         existing.is_configured = True
         existing.extra_config = {**existing.extra_config, "connection_mode": conn_mode, "agent_id": dingtalk_agent_id}
         await db.flush()
-        
+
         # Restart Stream client if in websocket mode
         if conn_mode == "websocket":
             from app.services.dingtalk_stream import dingtalk_stream_manager
@@ -121,7 +121,7 @@ async def configure_dingtalk_channel(
             from app.services.dingtalk_stream import dingtalk_stream_manager
             import asyncio
             asyncio.create_task(dingtalk_stream_manager.stop_client(agent_id))
-            
+
         return ChannelConfigOut.model_validate(existing)
 
     config = ChannelConfig(
@@ -283,11 +283,16 @@ async def process_dingtalk_message(
     from app.api.feishu import _call_agent_llm
 
     async with async_session() as db:
+        sender_staff_id = (sender_staff_id or "").strip()
+
         # Load agent
         agent_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
         agent_obj = agent_r.scalar_one_or_none()
         if not agent_obj:
             logger.warning(f"[DingTalk] Agent {agent_id} not found")
+            return
+        if not sender_staff_id:
+            logger.warning("[DingTalk] Skip message attribution because sender_staff_id is empty")
             return
         creator_id = agent_obj.creator_id
         from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE

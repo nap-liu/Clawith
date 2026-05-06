@@ -104,6 +104,7 @@ class TenantChoice(BaseModel):
     tenant_id: uuid.UUID | None
     tenant_name: str
     tenant_slug: str
+    logo_url: str | None = None
 
 
 class MultiTenantResponse(BaseModel):
@@ -147,6 +148,7 @@ class UserOut(BaseModel):
     display_name: str
     avatar_url: str | None = None
     role: str
+    is_platform_admin: bool = False
     tenant_id: uuid.UUID | None = None
     title: str | None = None
     department_path: str | None = None
@@ -249,6 +251,12 @@ class AgentOut(BaseModel):
     tokens_used_today: int
     tokens_used_month: int
     tokens_used_total: int = 0
+    cache_read_tokens_today: int = 0
+    cache_read_tokens_month: int = 0
+    cache_read_tokens_total: int = 0
+    cache_creation_tokens_today: int = 0
+    cache_creation_tokens_month: int = 0
+    cache_creation_tokens_total: int = 0
     max_tokens_per_day: int | None = None
     max_tokens_per_month: int | None = None
     context_window_size: int = 100
@@ -263,12 +271,20 @@ class AgentOut(BaseModel):
     timezone: str | None = None
     expires_at: datetime | None = None
     is_expired: bool = False
+    is_system: bool = False
     llm_calls_today: int = 0
-    max_llm_calls_per_day: int = 100
+    max_llm_calls_per_day: int = 1000
     agent_type: str = "native"
     openclaw_last_seen: datetime | None = None
+    unread_count: int = 0
     has_api_key: bool = False
     api_key_hash: str | None = None
+    # True when the current viewer already has an onboarding row for this
+    # agent. Computed per-request by the API layer from the junction table;
+    # not an ORM attribute, so callers must set it explicitly. Defaults to
+    # True so list endpoints that don't care about onboarding don't leak
+    # stale "needs onboarding" UI to users they shouldn't prompt.
+    onboarded_for_me: bool = True
     created_at: datetime
     last_active_at: datetime | None = None
 
@@ -433,6 +449,7 @@ class ChannelConfigOut(BaseModel):
     app_id: str | None = None
     app_secret: str | None = None
     encrypt_key: str | None = None
+    verification_token: str | None = None
     is_configured: bool
     is_connected: bool
     last_tested_at: datetime | None = None

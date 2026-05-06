@@ -51,9 +51,22 @@
     "myCreated": "Created by me",
     "companyShared": "Company shared",
     "newAgent": "New Digital Employee",
+    "hire": "Hire teammate",
     "enterprise": "Company Settings",
     "language": "Language",
-    "plaza": "Plaza"
+    "plaza": "Plaza",
+    "okr": "OKR"
+  },
+  "talentMarket": {
+    "title": "Talent Market",
+    "subtitle": "Pick a professional to join your company",
+    "hire": "Hire",
+    "hiring": "Hiring...",
+    "footer": "Hire now · adjust anything in settings later",
+    "customTitle": "Build custom",
+    "customCategory": "Custom",
+    "customDescription": "Define identity, personality, permissions, and tools from scratch.",
+    "customStart": "Start"
   },
   "auth": {
     "login": "Login",
@@ -246,8 +259,11 @@
       "humanRelationships": "Human Relationships",
       "agentRelationships": "Agent Relationships",
       "searchMembers": "Search org members...",
+      "searchAgents": "Search visible agents...",
+      "noSearchResults": "No available results",
       "noRelationships": "No relationships",
       "addRelationship": "Add Relationship",
+      "alreadyAdded": "Already added",
       "supervisor": "Supervisor",
       "colleague": "Colleague",
       "subordinate": "Subordinate",
@@ -371,17 +387,24 @@
       "delete": "Delete",
       "save": "Save",
       "edit": "Edit",
-      "cancel": "Cancel"
+      "cancel": "Cancel",
+      "done": "Done",
+      "openInNewTab": "Open in new tab",
+      "focusPreview": "Focus preview",
+      "unfocusPreview": "Exit focus",
+      "versionHistory": "Version history"
     },
     "chat": {
       "sessionListTitle": "Session list",
       "collapseSidebar": "Collapse session list",
       "mySessions": "My Sessions",
+      "otherSessions": "Other Sessions",
       "allUsers": "All Users",
       "viewOtherUsersSessions": "View other users' sessions",
       "otherUsersTab": "Other users",
       "selectUserToView": "Select user",
       "selectUserFirstHint": "Choose a user above to view their sessions with this agent (read-only).",
+      "noOtherUserSessions": "No other sessions",
       "noOtherUsersSessions": "No other users have sessions with this agent yet.",
       "newSession": "New Session",
       "noSessionsYet": "No sessions yet.",
@@ -398,10 +421,24 @@
       "uploadFailed": "Upload failed",
       "askAboutFile": "Ask about {{name}}...",
       "thinking": "Thinking...",
+      "thinkingLabel": "Thinking",
+      "thoughtLabel": "Thought",
       "collapseSessions": "Collapse sessions",
       "showSessions": "Show chat sessions",
       "toolCallChain": "Tools Used",
-      "analysing": "Analysing"
+      "analysing": "Analysing",
+      "thoughtProcess": "Thought process",
+      "createdFiles": "Created {{count}} files",
+      "updatedFiles": "Updated {{count}} files",
+      "deletedFiles": "Deleted {{count}} files",
+      "ranCommands": "Ran {{count}} tools",
+      "ranAgents": "Contacted {{count}} agents",
+      "showMore": "Show more",
+      "viewDetails": "View details",
+      "provider": "Provider",
+      "toolName": "Tool",
+      "inProgress": "In progress",
+      "done": "Done"
     },
     "activityLog": {
       "title": "Activity Log",
@@ -471,8 +508,7 @@
         "websocketConnected": "Connected via WebSocket (No callback URL needed)",
         "websocketDisconnected": "Configured for WebSocket, but currently disconnected",
         "websocketDisconnectedHint": "Reconnect by saving the WeCom WebSocket configuration again.",
-        "saveChannel": "Save Config",
-        "syncHint": "Before configuring the Feishu bot, please sync your organization structure in Enterprise Settings → Org Structure first. This ensures the bot can identify message senders."
+        "saveChannel": "Save Config"
       },
       "danger": {
         "title": "Danger Zone",
@@ -691,7 +727,8 @@
       "code": "Code & Execution",
       "discovery": "Discovery",
       "feishu": "Feishu / Lark",
-      "agentbay": "AgentBay"
+      "agentbay": "AgentBay",
+      "okr": "OKR"
     },
     "upload": {
       "success": "Upload successful",
@@ -723,7 +760,7 @@
     "credentials": {
       "title": "Credentials",
       "add": "Add",
-      "description": "Store login credentials and cookies for websites. Cookies are automatically injected when the agent opens a browser via AgentBay.",
+      "description": "Store website session cookies. Cookies are automatically injected when the agent opens a browser via AgentBay.",
       "empty": "No credentials configured",
       "loading": "Loading...",
       "error": "Failed to load credentials",
@@ -774,13 +811,6 @@
           "social": "Social",
           "api_key": "API Key"
         },
-        "username": "Username",
-        "usernamePlaceholder": "Login username or email",
-        "password": "Password",
-        "passwordHint": "(leave empty to keep current)",
-        "passwordPlaceholder": "Login password",
-        "loginUrl": "Login URL",
-        "loginUrlPlaceholder": "https://example.com/login",
         "cookies": "Cookies JSON",
         "cookiesHint": "(leave empty to keep current)",
         "cookiesPlaceholder": "[\n  { \"name\": \"session\", \"value\": \"abc123\", \"domain\": \".example.com\", \"path\": \"/\" }\n]",
@@ -1001,7 +1031,7 @@
       "disabled": "Disabled",
       "enabledHint": "Agents can use notify, task_delegate, and consult modes.",
       "disabledHint": "All agent messages use synchronous consult mode.",
-      "enableWarning": "⚠️ You are about to enable the A2A Async Communication feature (Beta).\n\nThis feature allows agents to communicate asynchronously via notify and task_delegate modes.\n\nKnown potential issues:\n• Agent replies may contain internal technical terms (trigger names, focus items, etc.)\n• task_delegate callbacks may occasionally be delayed or dropped due to rate limiting\n• Token consumption will increase because each async message triggers a separate agent session\n• Agent loops may occur if triggers are not properly configured\n\nIf you encounter any issues, please return to this page and disable the toggle to restore stable synchronous behavior.\n\nAre you sure you want to enable this feature?"
+      "enableWarning": "You are about to enable the A2A Async Communication feature (Beta).\n\nThis feature allows agents to communicate asynchronously via notify and task_delegate modes.\n\nKnown potential issues:\n• Agent replies may contain internal technical terms (trigger names, focus items, etc.)\n• task_delegate callbacks may occasionally be delayed or dropped due to rate limiting\n• Token consumption will increase because each async message triggers a separate agent session\n• Agent loops may occur if triggers are not properly configured\n\nIf you encounter any issues, please return to this page and disable the toggle to restore stable synchronous behavior.\n\nAre you sure you want to enable this feature?"
     },
     "invites": {
       "pageTitle": "Invitation Codes",
@@ -1050,7 +1080,8 @@
       "maxAgents": "Max Agents",
       "agentsUserCanCreate": "Agents a user can create",
       "agentTTL": "Agent TTL (hours)",
-      "agentAutoExpiry": "Agent auto-expiry time from creation",
+      "agentAutoExpiry": "Agent auto-expiry time from creation. Permanent means no auto-expiry.",
+      "customHours": "Custom hours",
       "dailyLLMCalls": "Daily LLM Calls / Agent",
       "maxLLMCallsPerDay": "Max LLM calls per agent per day",
       "system": "System",
@@ -1147,7 +1178,7 @@
       "save": "Save",
       "clear": "Clear",
       "clawhubApiKey": "ClawHub API Key",
-      "clawhubApiKeyDesc": "Authenticate ClawHub API calls to avoid rate limiting when browsing and installing skills from ClawHub.",
+      "clawhubApiKeyDesc": "Authenticate official ClawHub API calls to raise the rate limit from 60 requests/hour to 1,000 requests/hour when browsing and installing skills.",
       "authenticatedRequestsGetHigherRateLimits": "Authenticated requests get higher rate limits for ClawHub skill browsing and installation.",
       "currentKey": "Current key:",
       "githubTokenSaved": "GitHub token saved",
@@ -1175,6 +1206,7 @@
         "list_files": "List Files",
         "read_file": "Read File",
         "write_file": "Write File",
+        "move_file": "Move File",
         "delete_file": "Delete File",
         "read_document": "Read Document",
         "set_trigger": "Set Trigger",
@@ -1183,11 +1215,12 @@
         "list_triggers": "List Triggers",
         "send_file_to_agent": "Send File",
         "send_feishu_message": "Feishu Message",
-        "send_web_message": "Web Message",
+        "send_platform_message": "Platform Message",
         "send_message_to_agent": "Agent Message",
         "web_search": "Web Search",
         "jina_search": "Jina Search",
         "jina_read": "Jina Read",
+        "read_webpage": "Read Webpage",
         "plaza_get_new_posts": "Plaza: Browse",
         "plaza_create_post": "Plaza: Post",
         "plaza_add_comment": "Plaza: Comment",
@@ -1216,6 +1249,7 @@
         "agentbay_code_execute": "AgentBay: Code Execute",
         "agentbay_command_exec": "AgentBay: Shell Command",
         "agentbay_computer_screenshot": "AgentBay: Desktop Screenshot",
+        "agentbay_computer_precision_screenshot": "AgentBay: Precision Screenshot",
         "agentbay_computer_click": "AgentBay: Mouse Click",
         "agentbay_computer_input_text": "AgentBay: Keyboard Input",
         "agentbay_computer_press_keys": "AgentBay: Keyboard Shortcut",
@@ -1224,9 +1258,13 @@
         "agentbay_computer_drag_mouse": "AgentBay: Mouse Drag",
         "agentbay_computer_get_screen_size": "AgentBay: Get Screen Size",
         "agentbay_computer_start_app": "AgentBay: Start Application",
+        "agentbay_computer_get_installed_apps": "AgentBay: Get Installed Apps",
         "agentbay_computer_get_cursor_position": "AgentBay: Get Cursor Position",
         "agentbay_computer_get_active_window": "AgentBay: Get Active Window",
         "agentbay_computer_activate_window": "AgentBay: Activate Window",
+        "agentbay_computer_list_windows": "AgentBay: List Windows",
+        "agentbay_computer_close_window": "AgentBay: Close Window",
+        "agentbay_computer_dismiss_dialog": "AgentBay: Dismiss Dialog",
         "agentbay_computer_list_visible_apps": "AgentBay: List Running Apps",
         "atlassian_rovo": "Atlassian Rovo (Jira / Confluence / Compass)"
       },
@@ -1234,6 +1272,7 @@
         "list_files": "List files and folders in a directory within the workspace.",
         "read_file": "Read file contents from the workspace.",
         "write_file": "Write or update a file in the workspace.",
+        "move_file": "Move or rename a file or folder in the workspace.",
         "delete_file": "Delete a file from the workspace.",
         "read_document": "Read office document contents (PDF, Word, Excel, PPT) and extract text.",
         "set_trigger": "Set a new trigger to wake yourself up at a specific time or condition.",
@@ -1242,11 +1281,12 @@
         "list_triggers": "List all your active triggers with details.",
         "send_file_to_agent": "Send a file to a specific person or back to the current conversation.",
         "send_feishu_message": "Send a message to a Feishu user or group.",
-        "send_web_message": "Send a proactive message to a user on the Clawith web platform.",
+        "send_platform_message": "Send a proactive message to a user on the Clawith platform (web or app).",
         "send_message_to_agent": "Send a message to a digital employee colleague and receive a reply.",
         "web_search": "Search the internet using a configurable search engine.",
         "jina_search": "Search the internet using Jina AI.",
         "jina_read": "Read and extract full content from a URL using Jina AI Reader.",
+        "read_webpage": "Fetch a public URL directly and extract readable webpage text.",
         "plaza_get_new_posts": "Get recent posts from the Agent Plaza (shared social feed).",
         "plaza_create_post": "Publish a new post to the Agent Plaza.",
         "plaza_add_comment": "Add a comment to an existing plaza post.",
@@ -1274,18 +1314,23 @@
         "agentbay_browser_login": "[ENV: Browser] Handle login flow in the headless browser.",
         "agentbay_code_execute": "[ENV: Code Sandbox] Execute code (Python, Bash, Node.js) in the AgentBay Code Sandbox.",
         "agentbay_command_exec": "[ENV: Code Sandbox] Execute a shell command in the AgentBay Code Sandbox.",
-        "agentbay_computer_screenshot": "[ENV: Cloud Desktop] Take a screenshot of the cloud desktop.",
-        "agentbay_computer_click": "[ENV: Cloud Desktop] Click at coordinates in the cloud desktop.",
+        "agentbay_computer_screenshot": "[ENV: Cloud Desktop] Take a screenshot of the cloud desktop and return its coordinate system. Supports focused precision crops for tiny controls.",
+        "agentbay_computer_precision_screenshot": "[ENV: Cloud Desktop] Take an enlarged focused crop for tiny controls and near-miss clicks.",
+        "agentbay_computer_click": "[ENV: Cloud Desktop] Click at absolute desktop pixel coordinates from the latest screenshot; use Precision Screenshot first for tiny controls.",
         "agentbay_computer_input_text": "[ENV: Cloud Desktop] Type text in the cloud desktop.",
         "agentbay_computer_press_keys": "[ENV: Cloud Desktop] Press keyboard shortcut in the cloud desktop.",
         "agentbay_computer_scroll": "[ENV: Cloud Desktop] Scroll in the cloud desktop.",
         "agentbay_computer_move_mouse": "[ENV: Cloud Desktop] Move mouse to coordinates in the cloud desktop.",
         "agentbay_computer_drag_mouse": "[ENV: Cloud Desktop] Drag mouse in the cloud desktop.",
         "agentbay_computer_get_screen_size": "[ENV: Cloud Desktop] Get the screen size of the cloud desktop.",
-        "agentbay_computer_start_app": "[ENV: Cloud Desktop] Start an application in the cloud desktop.",
+        "agentbay_computer_start_app": "[ENV: Cloud Desktop] Start an application using a launch command, preferably a start_cmd returned by Get Installed Apps.",
+        "agentbay_computer_get_installed_apps": "[ENV: Cloud Desktop] List installed applications and their real start_cmd launch commands.",
         "agentbay_computer_get_cursor_position": "[ENV: Cloud Desktop] Get the current cursor position in the cloud desktop.",
         "agentbay_computer_get_active_window": "[ENV: Cloud Desktop] Get the active window in the cloud desktop.",
         "agentbay_computer_activate_window": "[ENV: Cloud Desktop] Bring a specific window to the foreground on the Cloud Desktop.",
+        "agentbay_computer_list_windows": "[ENV: Cloud Desktop] List root desktop windows with IDs and geometry.",
+        "agentbay_computer_close_window": "[ENV: Cloud Desktop] Close an entire desktop window by explicit window ID.",
+        "agentbay_computer_dismiss_dialog": "[ENV: Cloud Desktop] Safely dismiss the active in-app popup/dialog with Escape only.",
         "agentbay_computer_list_visible_apps": "[ENV: Cloud Desktop] List running applications in the cloud desktop.",
         "atlassian_rovo": "Connect to Atlassian Rovo MCP Server to access Jira, Confluence, and Compass."
       }
@@ -1403,6 +1448,7 @@
         "feishu": "Feishu: Requires app_id, app_secret. Optional: encrypt_key, verification_token.",
         "dingtalk": "DingTalk: Requires app_key, app_secret.",
         "wecom": "WeCom: Requires corp_id, secret, agent_id.",
+        "google_workspace": "Google Workspace: one Client ID, one Client Secret, and one Redirect URL for both SSO and admin-authorized directory sync.",
         "oauth2": "OAuth2: Enter App ID, App Secret, Authorize URL, Token URL, User Info URL",
         "saml": "SAML: Requires entry_point, issuer, cert (public key).",
         "microsoft_teams": "Microsoft Teams: Requires client_id, client_secret, tenant_id."
@@ -1422,6 +1468,10 @@
         "dingtalk": {
           "name": "DingTalk",
           "desc": "DingTalk App Integration"
+        },
+        "google_workspace": {
+          "name": "Google",
+          "desc": "Google Directory Sync + SSO"
         },
         "oauth2": {
           "name": "OAuth2",
@@ -1568,6 +1618,20 @@
       "title": "Company Name",
       "placeholder": "Enter company name"
     },
+    "logo": {
+      "title": "Company Logo",
+      "description": "Used in the sidebar workspace switcher and company selection menus.",
+      "upload": "Upload logo",
+      "reset": "Reset to default",
+      "hint": "PNG, JPG, or WebP. Max 1 MB. You will crop it to a square before saving.",
+      "cropTitle": "Crop company logo",
+      "zoom": "Zoom",
+      "tooLarge": "Logo image must be 1 MB or smaller.",
+      "invalidType": "Please choose an image file.",
+      "croppedTooLarge": "Cropped logo is still larger than 1 MB.",
+      "uploadFailed": "Failed to upload logo.",
+      "resetFailed": "Failed to reset logo."
+    },
     "companyIntro": {
       "title": "Company Intro",
       "description": "Describe your company's mission, products, and culture. This information will be included as context in every Agent conversation.",
@@ -1598,6 +1662,8 @@
       "discord": "Discord",
       "slack": "Slack",
       "teams": "Microsoft Teams",
+      "wechat": "WeChat",
+      "whatsapp": "WhatsApp",
       "dingtalk": "DingTalk",
       "wecom": "WeCom"
     },
@@ -1718,6 +1784,20 @@
       "ws_step5": "Copy the Bot ID and Secret that are generated → paste them above → click Save Config",
       "ws_step6": "Find the bot in WeCom and send a test message",
       "ws_note": "WebSocket mode requires no public IP, callback URL, or domain verification (ICP). The connection is managed automatically."
+    },
+    "wechat": {
+      "step1": "Click Generate QR Code below to request a fresh WeChat iLink login QR.",
+      "step2": "Open WeChat on your phone and scan the QR code, then confirm the bot login on the device.",
+      "step3": "After confirmation, Clawith stores the returned bot token and starts the getupdates long-poll worker automatically.",
+      "step4": "Send a direct message to the linked WeChat iLink bot to verify inbound polling and outbound replies.",
+      "note": "This channel follows the iLink Bot protocol: QR login, token-based long polling, and replies bound to the incoming context_token."
+    },
+    "whatsapp": {
+      "step1": "Create a Meta app and enable the WhatsApp product in the Meta App Dashboard.",
+      "step2": "Copy the Phone Number ID and generate a permanent Access Token with WhatsApp permissions.",
+      "step3": "Set a Verify Token you control. Optionally fill App Secret to enable X-Hub-Signature-256 verification.",
+      "step4": "Copy the Webhook URL below into the WhatsApp webhook configuration in Meta and complete verification.",
+      "step5": "Subscribe the app to WhatsApp message webhooks so inbound messages are delivered to this agent."
     }
   },
   "platformDashboard": {

@@ -500,6 +500,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
                     tenant_id=u.tenant_id,
                     tenant_name=tenant.name if tenant else "Create or Join Organization",
                     tenant_slug=tenant.slug if tenant else "",
+                    logo_url=tenant.logo_url if tenant else None,
                 ))
 
             return MultiTenantResponse(
@@ -671,7 +672,9 @@ async def reset_password(data: ResetPasswordRequest, db: AsyncSession = Depends(
 @router.get("/me", response_model=UserOut)
 async def get_me(current_user: User = Depends(get_authenticated_user)):
     """Get current user profile."""
-    return UserOut.model_validate(current_user)
+    data = UserOut.model_validate(current_user)
+    data.is_platform_admin = bool(getattr(getattr(current_user, "identity", None), "is_platform_admin", False))
+    return data
 
 
 @router.patch("/me", response_model=UserOut)
@@ -768,7 +771,8 @@ async def get_my_tenants(
         TenantChoice(
             tenant_id=t.id,
             tenant_name=t.name,
-            tenant_slug=t.slug
+            tenant_slug=t.slug,
+            logo_url=t.logo_url,
         ) for t in tenants
     ]
 
@@ -981,7 +985,7 @@ async def bind_identity(
         user_info = await auth_provider.get_user_info(access_token)
 
         # Check if identity is already linked to another user
-        lookup_provider_user_id = user_info.provider_union_id or user_info.provider_user_id
+        lookup_provider_user_id = user_info.provider_user_id
         existing_user = await sso_service.check_duplicate_identity(
             db,
             provider,

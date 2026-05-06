@@ -1,10 +1,18 @@
 import { useState, useEffect } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { Bot, Brain, Building2, Globe, AlertTriangle } from 'lucide-react';
 import { useAuthStore } from '../stores';
 import { authApi, tenantApi, fetchJson } from '../services/api';
 import type { TokenResponse } from '../types';
+import {
+    IconAlertTriangle,
+    IconArrowRight,
+    IconBuildingCommunity,
+    IconCheck,
+    IconDatabase,
+    IconLanguage,
+    IconUsersGroup,
+} from '@tabler/icons-react';
 
 export default function Login() {
     const { t, i18n } = useTranslation();
@@ -263,7 +271,7 @@ export default function Login() {
         feishu: { label: 'Feishu', icon: '/feishu.png' },
         dingtalk: { label: 'DingTalk', icon: '/dingtalk.png' },
         wecom: { label: 'WeCom', icon: '/wecom.png' },
-        oauth2: { label: 'SSO', icon: '' },
+        google_workspace: { label: 'Google', icon: '/google.svg' },
     };
 
     return (
@@ -283,21 +291,21 @@ export default function Login() {
                     <p className="login-hero-desc" dangerouslySetInnerHTML={{ __html: t('login.hero.description') }} />
                     <div className="login-hero-features">
                         <div className="login-hero-feature">
-                            <span className="login-hero-feature-icon"><Bot size={20} /></span>
+                            <span className="login-hero-feature-icon"><IconUsersGroup size={20} stroke={1.8} /></span>
                             <div>
                                 <div className="login-hero-feature-title">{t('login.hero.features.multiAgent.title')}</div>
                                 <div className="login-hero-feature-desc">{t('login.hero.features.multiAgent.description')}</div>
                             </div>
                         </div>
                         <div className="login-hero-feature">
-                            <span className="login-hero-feature-icon"><Brain size={20} /></span>
+                            <span className="login-hero-feature-icon"><IconDatabase size={20} stroke={1.8} /></span>
                             <div>
                                 <div className="login-hero-feature-title">{t('login.hero.features.persistentMemory.title')}</div>
                                 <div className="login-hero-feature-desc">{t('login.hero.features.persistentMemory.description')}</div>
                             </div>
                         </div>
                         <div className="login-hero-feature">
-                            <span className="login-hero-feature-icon"><Building2 size={20} /></span>
+                            <span className="login-hero-feature-icon"><IconBuildingCommunity size={20} stroke={1.8} /></span>
                             <div>
                                 <div className="login-hero-feature-title">{t('login.hero.features.agentPlaza.title')}</div>
                                 <div className="login-hero-feature-desc">{t('login.hero.features.agentPlaza.description')}</div>
@@ -309,19 +317,16 @@ export default function Login() {
 
             {/* ── Right: Form Panel ── */}
             <div className="login-form-panel">
-                {/* Language Switcher */}
-                <div style={{
-                    position: 'absolute', top: '16px', right: '16px',
-                    cursor: 'pointer', fontSize: '13px', color: 'var(--text-secondary)',
-                    display: 'flex', alignItems: 'center', gap: '4px',
-                    padding: '6px 12px', borderRadius: '8px',
-                    background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
-                    zIndex: 101,
-                }} onClick={toggleLang}>
-                    <Globe size={14} />
-                </div>
-
                 <div className="login-form-wrapper">
+                    <button
+                        type="button"
+                        className="login-language-switcher"
+                        onClick={toggleLang}
+                        aria-label={t('common.switchLanguage', 'Switch language')}
+                        title={t('common.switchLanguage', 'Switch language')}
+                    >
+                        <span className="login-language-switcher-icon" aria-hidden="true"><IconLanguage size={16} stroke={1.8} /></span>
+                    </button>
                     {checkingEmail ? (
                         // While resolving invitation email, show a minimal loading indicator
                         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '200px', gap: '16px' }}>
@@ -333,7 +338,7 @@ export default function Login() {
                     ) : (
                     <>
                     <div className="login-form-header">
-                        <div className="login-form-logo"><img src="/logo-black.png" className="login-logo-img" alt="" style={{ width: 28, height: 28, marginRight: 8, verticalAlign: 'middle' }} />{t('app.name', '数字员工平台')}</div>
+                        <div className="login-form-logo"><img src="/logo-black.png" className="login-logo-img" alt="" style={{ width: 28, height: 28, marginRight: 8, verticalAlign: 'middle' }} />Clawith</div>
                         <h2 className="login-form-title">
                             {isRegister ? t('auth.register') : t('auth.login')}
                         </h2>
@@ -344,7 +349,7 @@ export default function Login() {
 
                     {error && (
                         <div className="login-error">
-                            <span><AlertTriangle size={14} /></span> {error}
+                            <IconAlertTriangle size={16} stroke={1.8} /> {error}
                         </div>
                     )}
 
@@ -361,13 +366,25 @@ export default function Login() {
                             gap: '8px',
                             border: '1px solid rgba(34, 197, 94, 0.2)',
                         }}>
-                            <span>✓</span> {successMessage}
+                            <IconCheck size={16} stroke={1.8} /> {successMessage}
                         </div>
                     )}
 
                     {tenant && tenant.sso_enabled && !isRegister && (
                         <div style={{ marginBottom: '24px' }}>
-                            {/* SSO 提示框已隐藏 - 2026-03-31 */}
+                            <div style={{
+                                padding: '16px', borderRadius: '12px', background: 'rgba(59,130,246,0.08)',
+                                border: '1px solid rgba(59,130,246,0.15)', marginBottom: '16px',
+                                textAlign: 'center'
+                            }}>
+                                <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--accent-primary)', marginBottom: '4px' }}>
+                                    {tenant.name}
+                                </div>
+                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                                    {t('auth.ssoNotice', 'Enterprise SSO is enabled for this domain.')}
+                                </div>
+                            </div>
+
                             {ssoLoading && (
                                 <div style={{ textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>
                                     {t('auth.ssoLoading', 'Loading SSO providers...')}
@@ -377,7 +394,7 @@ export default function Login() {
                             {!ssoLoading && ssoProviders.length > 0 && (
                                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px' }}>
                                     {ssoProviders.map(p => {
-                                        const baseMeta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' }; const meta = { ...baseMeta, label: p.name || baseMeta.label };
+                                        const meta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' };
                                         return (
                                             <button
                                                 key={p.provider_type}
@@ -394,7 +411,7 @@ export default function Login() {
                                                 onClick={() => window.location.href = p.url}
                                             >
                                                 {meta.icon ? (
-                                                    <img src={meta.icon} alt={meta.label} width={18} height={18} style={{ borderRadius: '4px' }} />
+                                                    <img src={meta.icon} alt={meta.label} width={18} height={18} />
                                                 ) : (
                                                     <span style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--bg-tertiary)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 10 }}>
                                                         {(meta.label || '').slice(0, 1).toUpperCase()}
@@ -465,7 +482,7 @@ export default function Login() {
                             ) : (
                                 <>
                                     {isRegister ? t('auth.register') : t('auth.login')}
-                                    <span style={{ marginLeft: '6px' }}>→</span>
+                                    <IconArrowRight size={17} stroke={1.9} style={{ marginLeft: '6px' }} />
                                 </>
                             )}
                         </button>

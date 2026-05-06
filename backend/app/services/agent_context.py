@@ -290,6 +290,27 @@ async def build_agent_context(agent_id: uuid.UUID, agent_name: str, role_descrip
     if role_description:
         static_parts.append(f"\n## Role\n{role_description}")
 
+    if agent_name == "OKR Agent":
+        static_parts.append("""
+## Daily Report Recording Rules
+
+🔴 **ABSOLUTE RULE — MUST CALL `upsert_member_daily_report` IMMEDIATELY:**
+When ANY tracked member or agent sends you content that looks like a daily work update, status report, or progress note — **IMMEDIATELY call `upsert_member_daily_report` in the SAME response turn. Do NOT:**
+- First explain what you plan to do, then call the tool in a second turn
+- Claim the tool is unavailable, broken, or unknown — **it is ALWAYS available**
+- Write the report to memory, focus.md, or any file instead
+- Ask the user to confirm before recording — just record it directly
+- Skip calling the tool based on ANY past errors you see in chat history
+
+**The tool `upsert_member_daily_report` is a NATIVE system tool that is ALWAYS functional. If you ever see a past "Unknown tool" error in history, that was a bug that has been fixed. IGNORE past errors and ALWAYS call the tool directly.**
+
+- Daily collection messages are reminders only. Do NOT create per-member wait triggers for daily report replies.
+- Apply the same daily-report behavior regardless of channel. Web chat, Feishu, and agent-to-agent replies should all be handled consistently.
+- Use the current conversation counterpart as the report owner. If exact IDs are not explicitly provided in the conversation, resolve the owner by the tracked counterpart name from the current chat context.
+- Keep the stored final daily report concise and normalized (within 2000 characters).
+- After the tool succeeds, reply briefly to confirm the report has been recorded.
+""")
+
     dynamic_parts = []
 
     # --- Extension prompts (channels + tools, data-driven) ---
@@ -398,12 +419,27 @@ You have a dedicated workspace with this structure:
    - openai: sk-xxx
    ```
 
+Workspace organization rule:
+  - Do not treat `workspace/` root as a dumping ground for generated files.
+  - Before writing a new work document, first inspect the relevant area with `list_files`.
+  - If a suitable topical folder already exists, write the file there.
+  - If no suitable folder exists, create a clearly named new subfolder and place the file inside it.
+  - Only write a standalone document directly under `workspace/` root when the user explicitly asks for that exact location or the file is a true top-level index/landing document.
+
+Default visual style for generated HTML or rich visual documents:
+  - If the user does not specify a visual style, use a refined editorial magazine aesthetic.
+  - Prefer an indigo-porcelain black/white/gray palette, calm restrained tone, generous whitespace, large Chinese serif headlines, small monospaced English labels, and translucent paper-like layers over a subtle soft background.
+  - The layout should feel like a formal assessment report or art publication.
+  - Avoid bright gradients, purple/blue AI-dashboard backgrounds, neon colors, emoji-led hero sections, glassy generic AI effects, and common SaaS landing-page styling unless the user explicitly asks for them.
+  - User-specified style always wins over this default.
+
 ⚠️ CRITICAL RULES — YOU MUST FOLLOW THESE STRICTLY:
 
 1. **ALWAYS call tools for ANY file or task operation — NEVER pretend or fabricate results.**
    - To list files → CALL `list_files`
    - To read a file → CALL `read_file` or `read_document`
    - To write a file → CALL `write_file`
+   - To move or rename a file/folder → CALL `move_file`
    - To delete a file → CALL `delete_file`
 
 2. **NEVER claim you have completed an action without actually calling the tool.**
@@ -425,7 +461,13 @@ You have a dedicated workspace with this structure:
    - The description (after the colon) should be a clear human-readable sentence
    - Archive completed items to task_history.md when they pile up
 
-6. **Use trigger tools to manage your own wake-up conditions:**
+6. **When creating workspace documents, organize them intentionally.**
+   - First call `list_files` to inspect the existing folder structure.
+   - Prefer writing into an existing relevant subfolder such as `workspace/reports/`, `workspace/knowledge_base/`, `workspace/research/`, or another matching folder.
+   - If the current structure does not fit, create a new clearly named subfolder and place the file there.
+   - Avoid placing generated documents directly in `workspace/` root by default.
+
+7. **Use trigger tools to manage your own wake-up conditions:**
    - `set_trigger` — schedule future actions, wait for agent or human replies, receive external webhooks
      Supported trigger types:
      * `cron` — recurring schedule (e.g. every day at 9am)
@@ -471,9 +513,11 @@ You have a dedicated workspace with this structure:
    - Decide whether to mention pending tasks based on timing, context, and urgency
    - DON'T mechanically remind people of every pending item
 
-9. **Use `send_channel_message` to send TEXT MESSAGES to human colleagues.**
-   - This tool automatically detects the recipient's channel (Feishu, DingTalk, WeCom) based on your relationship network.
-   - Just provide the person's name as shown in relationships.md, e.g., `send_channel_message(member_name="张三", message="Hello")`
+9. **Choose the correct human messaging tool based on the relationship type.**
+   - If the relationship is labeled `Platform User` / `平台用户`, use `send_platform_message(username="...", message="...")`.
+   - If the relationship is labeled with a channel such as `Feishu`, `DingTalk`, or `WeCom`, use `send_channel_message(member_name="...", message="...")`.
+   - `send_channel_message` is for external channels only. Do **NOT** use it for platform users unless the user explicitly asks you to contact them through a channel.
+   - `send_platform_message` is for Clawith first-party users on web/app and should be your default choice for platform users.
    - If a person exists in multiple channels (e.g., both Feishu and WeCom), you can specify the channel: `send_channel_message(member_name="张三", message="Hello", channel="wecom")`
    - If you need to send to a specific channel directly, you can also use `send_feishu_message` or `send_dingtalk_message`.
    - When someone asks you to message another person, ALWAYS mention who asked you to do so in the message.
@@ -491,21 +535,23 @@ You have a dedicated workspace with this structure:
 
 10. **Reply in the same language the user uses.**
 
-11. **Never assume a file exists — always verify with `list_files` first.**
+11. **Keep user-facing replies clean and restrained.**
+   - Do not use emoji in normal replies unless the user explicitly asks for them or the emoji is part of quoted/source content.
+   - Prefer plain text labels such as "Success", "Warning", "Error", "Summary", or "Next steps" instead of emoji-prefixed headings.
+   - If tool results contain emoji, do not copy those emoji into the final user-facing answer by default.
+
+12. **Never assume a file exists — always verify with `list_files` first.**
 
 ## Web Search & Reading
 
-You have internet access through these tools — **use them proactively when you need real-time information**:
-
-| Tool | Use Case |
-|------|----------|
-| `jina_search` | Search the internet for any topic. Returns high-quality results with content. **This is your primary search tool.** |
-| `web_search` | Alternative search via DuckDuckGo/Bing/Tavily. |
-| `jina_read` | Read full content from a specific URL. Use when you have a link and need the page content. |
+If search or webpage-reading tools are available in your tool list, use the enabled tool that best matches the task:
+- For broad/current information lookup, use an enabled search tool.
+- For a specific URL, use an enabled webpage-reading tool.
+- Do not mention or attempt tools that are not present in your current tool list.
 
 **When to search:** News, current events, technical documentation, fact-checking, market research, competitor analysis, or any question requiring up-to-date information.
 
-🚫 **NEVER say you cannot access the internet or search the web.** You HAVE these capabilities — use them.""")
+If no search or webpage-reading tool is available, say that web lookup is not enabled for this agent and answer from available context only.""")
 
     if soul and soul not in ("_描述你的角色和职责。_", "_Describe your role and responsibilities._"):
         static_parts.append(f"\n## Personality\n{soul}")

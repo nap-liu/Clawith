@@ -97,7 +97,7 @@ class User(Base):
     quota_messages_used: Mapped[int] = mapped_column(Integer, default=0)
     quota_period_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     quota_max_agents: Mapped[int] = mapped_column(Integer, default=2)
-    quota_agent_ttl_hours: Mapped[int] = mapped_column(Integer, default=48)
+    quota_agent_ttl_hours: Mapped[int] = mapped_column(Integer, default=0)
 
     # Relationships
     # lazy="selectin" required: association_proxy fields trigger MissingGreenlet without eager loading

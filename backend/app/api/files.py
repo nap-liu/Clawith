@@ -1,12 +1,16 @@
 """File management API routes for agent workspaces."""
 
+import base64
+import csv
+import io
+import mimetypes
 import os
 import uuid
 from pathlib import Path
 
 import aiofiles
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
@@ -15,6 +19,17 @@ from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.user import User
+from app.models.workspace import WorkspaceFileRevision
+from app.services.workspace_collaboration import (
+    acquire_edit_lock,
+    content_hash,
+    list_revisions,
+    read_text_if_exists,
+    record_revision,
+    release_edit_lock,
+    write_workspace_file,
+)
+from app.services.workspace_paths import WorkspacePathError, resolve_agent_visible_path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +56,17 @@ class FileContent(BaseModel):
 
 class FileWrite(BaseModel):
     content: str
+    autosave: bool = False
+    session_id: str | None = None
+
+
+class FileLockBody(BaseModel):
+    path: str
+    session_id: str | None = None
+
+
+class RestoreRevisionBody(BaseModel):
+    revision_id: uuid.UUID
 
 
 def _agent_base_dir(agent_id: uuid.UUID) -> Path:
@@ -54,6 +80,20 @@ def _safe_path(agent_id: uuid.UUID, rel_path: str) -> Path:
     if not str(full).startswith(str(base.resolve())):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Path traversal not allowed")
     return full
+
+
+def _visible_path(agent_id: uuid.UUID, rel_path: str, tenant_id: uuid.UUID | None) -> tuple[Path, Path, bool]:
+    """Resolve an agent-visible path, including virtual enterprise_info/."""
+    try:
+        resolved = resolve_agent_visible_path(
+            _agent_base_dir(agent_id),
+            rel_path,
+            workspace_root=Path(settings.AGENT_DATA_DIR),
+            tenant_id=str(tenant_id) if tenant_id else None,
+        )
+    except WorkspacePathError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    return resolved.path, resolved.relative_root, resolved.is_enterprise
 
 
 @router.get("/", response_model=list[FileInfo])
@@ -74,7 +114,18 @@ async def list_files(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Path is not a directory")
 
     items = []
-    base_abs = _agent_base_dir(agent_id).resolve()
+    base_abs = base_abs.resolve()
+    if not path and current_user.tenant_id:
+        enterprise_root = (Path(settings.AGENT_DATA_DIR) / f"enterprise_info_{current_user.tenant_id}").resolve()
+        enterprise_root.mkdir(parents=True, exist_ok=True)
+        items.append(FileInfo(
+            name="enterprise_info",
+            path="enterprise_info",
+            is_dir=True,
+            size=0,
+            modified_at=str(enterprise_root.stat().st_mtime),
+            url=None,
+        ))
     for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name)):
         if entry.name == '.gitkeep':
             continue
@@ -82,6 +133,8 @@ async def list_files(
         if entry.name in CREATOR_ONLY_FILES and not is_creator:
             continue
         rel = str(entry.resolve().relative_to(base_abs))
+        if is_enterprise:
+            rel = f"enterprise_info/{rel}" if rel != "." else "enterprise_info"
         stat = entry.stat()
         items.append(FileInfo(
             name=entry.name,
@@ -122,11 +175,226 @@ async def read_file(
         return FileContent(path=path, content=f"[二进制文件: {target.name}, {target.stat().st_size} bytes]")
 
 
+def _file_kind(path: str) -> str:
+    ext = Path(path).suffix.lower()
+    if ext in {".md", ".markdown"}:
+        return "markdown"
+    if ext == ".csv":
+        return "csv"
+    if ext in {".html", ".htm"}:
+        return "html"
+    if ext == ".pdf":
+        return "pdf"
+    if ext in {".xlsx", ".xls"}:
+        return "xlsx"
+    if ext in {".docx", ".doc"}:
+        return "docx"
+    if ext in {".pptx", ".ppt"}:
+        return "pptx"
+    if ext in {".txt", ".log", ".json"}:
+        return "text"
+    if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}:
+        return "image"
+    return "binary"
+
+
+def _find_companion_text_preview(target: Path) -> Path | None:
+    for suffix in (".md", ".txt"):
+        candidate = target.with_suffix(suffix)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _extract_document_text(target: Path, kind: str) -> str:
+    """Best-effort rich document text extraction for lightweight previews."""
+    try:
+        if kind == "xlsx":
+            from openpyxl import load_workbook
+
+            wb = load_workbook(target, read_only=True, data_only=True)
+            sheets: list[str] = []
+            for ws in wb.worksheets[:5]:
+                rows = []
+                for row in ws.iter_rows(max_row=80, max_col=20, values_only=True):
+                    rows.append("\t".join("" if cell is None else str(cell) for cell in row))
+                sheets.append(f"Sheet: {ws.title}\n" + "\n".join(rows))
+            return "\n\n".join(sheets)
+        if kind == "docx":
+            from docx import Document
+
+            doc = Document(str(target))
+            return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        if kind == "pptx":
+            from pptx import Presentation
+
+            prs = Presentation(str(target))
+            slides = []
+            for idx, slide in enumerate(prs.slides, start=1):
+                texts = []
+                for shape in slide.shapes:
+                    if hasattr(shape, "text") and shape.text.strip():
+                        texts.append(shape.text.strip())
+                slides.append(f"Slide {idx}\n" + "\n".join(texts))
+            return "\n\n".join(slides)
+    except ImportError as exc:
+        return f"Missing preview dependency: {exc}"
+    except Exception as exc:
+        return f"Preview extraction failed: {str(exc)[:200]}"
+    return ""
+
+
+def _detect_csv_delimiter(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()][:10]
+    if not lines:
+        return ","
+    candidates = [",", "，", ";", "\t", "|"]
+    scores = {
+        candidate: sum(line.count(candidate) for line in lines)
+        for candidate in candidates
+    }
+    return max(scores, key=scores.get) if any(scores.values()) else ","
+
+
+def _parse_csv_rows(text: str) -> list[list[str]]:
+    delimiter = _detect_csv_delimiter(text)
+    rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+    normalized: list[list[str]] = []
+    for row in rows[:500]:
+        values = list(row)
+        while values and not str(values[-1] or "").strip():
+            values.pop()
+        if values:
+            normalized.append(values)
+    return normalized
+
+
+@router.get("/preview")
+async def preview_file(
+    agent_id: uuid.UUID,
+    path: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return a browser-friendly preview payload for Workspace files."""
+    await check_agent_access(db, current_user, agent_id)
+    target, _, _ = _visible_path(agent_id, path, current_user.tenant_id)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    kind = _file_kind(path)
+    mime_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    download_url = f"/api/agents/{agent_id}/files/download?path={path}"
+
+    if kind in {"markdown", "html", "text"}:
+        content = await read_text_if_exists(target)
+        return {
+            "path": path,
+            "kind": kind,
+            "mime_type": mime_type,
+            "content": content or "",
+            "content_hash": content_hash(content or ""),
+            "download_url": download_url,
+        }
+    if kind == "csv":
+        content = await read_text_if_exists(target) or ""
+        rows = _parse_csv_rows(content)
+        return {
+            "path": path,
+            "kind": kind,
+            "mime_type": mime_type,
+            "content": content,
+            "content_hash": content_hash(content),
+            "rows": rows[:500],
+            "download_url": download_url,
+        }
+    if kind == "pdf":
+        return {
+            "path": path,
+            "kind": kind,
+            "mime_type": mime_type,
+            "url": download_url,
+            "download_url": download_url,
+        }
+    if kind == "xlsx":
+        try:
+            from openpyxl import load_workbook
+
+            wb = load_workbook(target, read_only=True, data_only=True)
+            sheets = []
+            for ws in wb.worksheets[:5]:
+                rows = []
+                for row in ws.iter_rows(max_row=120, max_col=30, values_only=True):
+                    values = ["" if cell is None else str(cell) for cell in row]
+                    while values and not str(values[-1] or "").strip():
+                        values.pop()
+                    if any(value.strip() for value in values):
+                        rows.append(values)
+                sheets.append({
+                    "title": ws.title,
+                    "rows": rows,
+                })
+            wb.close()
+            return {
+                "path": path,
+                "kind": kind,
+                "mime_type": mime_type,
+                "text": _extract_document_text(target, kind),
+                "sheets": sheets,
+                "download_url": download_url,
+            }
+        except Exception as exc:
+            return {
+                "path": path,
+                "kind": kind,
+                "mime_type": mime_type,
+                "text": f"Preview extraction failed: {str(exc)[:200]}",
+                "download_url": download_url,
+            }
+    if kind in {"docx", "pptx"}:
+        extracted_text = _extract_document_text(target, kind)
+        companion = _find_companion_text_preview(target)
+        companion_content = await read_text_if_exists(companion) if companion is not None else None
+        return {
+            "path": path,
+            "kind": kind,
+            "mime_type": mime_type,
+            "text": companion_content or extracted_text,
+            "companion_path": str(companion.resolve().relative_to(_agent_base_dir(agent_id).resolve())) if companion is not None and not path.startswith("enterprise_info") else None,
+            "download_url": download_url,
+        }
+
+    companion = _find_companion_text_preview(target)
+    if companion is not None:
+        content = await read_text_if_exists(companion)
+        return {
+            "path": path,
+            "kind": "text",
+            "mime_type": "text/markdown" if companion.suffix.lower() == ".md" else "text/plain",
+            "content": content or "",
+            "content_hash": content_hash(content or ""),
+            "companion_path": str(companion.resolve().relative_to(_agent_base_dir(agent_id).resolve())) if not path.startswith("enterprise_info") else None,
+            "download_url": download_url,
+        }
+
+    raw = target.read_bytes()
+    encoded = base64.b64encode(raw[:1024 * 1024]).decode("ascii")
+    return {
+        "path": path,
+        "kind": kind,
+        "mime_type": mime_type,
+        "size": target.stat().st_size,
+        "base64_sample": encoded,
+        "download_url": download_url,
+    }
+
+
 @router.get("/download")
 async def download_file(
     agent_id: uuid.UUID,
     path: str,
     token: str = "",
+    inline: bool = False,
     credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False)),
     db: AsyncSession = Depends(get_db),
 ):
@@ -164,7 +432,11 @@ async def download_file(
     target = _safe_path(agent_id, path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
-    return FileResponse(path=str(target), filename=target.name)
+    return FileResponse(
+        path=str(target),
+        filename=target.name,
+        content_disposition_type="inline" if inline else "attachment",
+    )
 
 
 @router.put("/content")
@@ -183,11 +455,126 @@ async def write_file(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
     target = _safe_path(agent_id, path)
 
+    result = await write_workspace_file(
+        db,
+        agent_id=agent_id,
+        base_dir=_agent_base_dir(agent_id),
+        path=path,
+        content=data.content,
+        actor_type="user",
+        actor_id=current_user.id,
+        operation="autosave" if data.autosave else "write",
+        session_id=data.session_id,
+        enforce_human_lock=False,
+        merge_user_autosave=data.autosave,
+    )
+    if not result.ok:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.message)
+    await db.commit()
+    return {"status": "ok", "path": result.path, "revision_id": result.revision_id}
+
+
+@router.post("/locks")
+async def lock_file(
+    agent_id: uuid.UUID,
+    data: FileLockBody,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Acquire or refresh a short-lived human editing lock for a file."""
+    await check_agent_access(db, current_user, agent_id)
+    lock = await acquire_edit_lock(
+        db,
+        agent_id=agent_id,
+        path=data.path,
+        user_id=current_user.id,
+        session_id=data.session_id,
+    )
+    await db.commit()
+    return {"status": "ok", "path": lock.path, "expires_at": lock.expires_at.isoformat()}
+
+
+@router.delete("/locks")
+async def unlock_file(
+    agent_id: uuid.UUID,
+    path: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Release the current user's edit lock for a file."""
+    await check_agent_access(db, current_user, agent_id)
+    await release_edit_lock(db, agent_id=agent_id, path=path, user_id=current_user.id)
+    await db.commit()
+    return {"status": "ok", "path": path}
+
+
+@router.get("/revisions")
+async def get_file_revisions(
+    agent_id: uuid.UUID,
+    path: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List version history for the currently opened Workspace file."""
+    await check_agent_access(db, current_user, agent_id)
+    if path.startswith("enterprise_info"):
+        return []
+    revisions = await list_revisions(db, agent_id=agent_id, path=path)
+    return [
+        {
+            "id": str(rev.id),
+            "path": rev.path,
+            "operation": rev.operation,
+            "actor_type": rev.actor_type,
+            "actor_id": str(rev.actor_id) if rev.actor_id else None,
+            "session_id": rev.session_id,
+            "before_content": rev.before_content,
+            "after_content": rev.after_content,
+            "created_at": rev.created_at.isoformat() if rev.created_at else None,
+            "updated_at": rev.updated_at.isoformat() if rev.updated_at else None,
+        }
+        for rev in revisions
+    ]
+
+
+@router.post("/restore")
+async def restore_file_revision(
+    agent_id: uuid.UUID,
+    data: RestoreRevisionBody,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Restore a file to a previous revision's after-content."""
+    await check_agent_access(db, current_user, agent_id)
+    result = await db.execute(
+        select(WorkspaceFileRevision).where(
+            WorkspaceFileRevision.id == data.revision_id,
+            WorkspaceFileRevision.agent_id == agent_id,
+        )
+    )
+    revision = result.scalar_one_or_none()
+    if not revision:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision not found")
+    if revision.after_content is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot restore an empty/deleted revision")
+
+    target = _safe_path(agent_id, revision.path)
+    before = await read_text_if_exists(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     async with aiofiles.open(target, "w", encoding="utf-8") as f:
-        await f.write(data.content)
-
-    return {"status": "ok", "path": path}
+        await f.write(revision.after_content)
+    restored = await record_revision(
+        db,
+        agent_id=agent_id,
+        path=revision.path,
+        operation="restore",
+        actor_type="user",
+        actor_id=current_user.id,
+        before_content=before,
+        after_content=revision.after_content,
+    )
+    await db.commit()
+    return {"status": "ok", "path": revision.path, "revision_id": str(restored.id) if restored else None}
 
 
 @router.delete("/content")
@@ -278,6 +665,7 @@ from fastapi import File as FastFile, UploadFile as UploadFileType
 
 
 upload_router = APIRouter(prefix="/agents/{agent_id}/files", tags=["files"])
+DEFAULT_UPLOAD_DIR = "workspace/uploads"
 
 
 @upload_router.post("/upload")
@@ -291,12 +679,16 @@ async def upload_file_to_workspace(
     """Upload a binary file to agent workspace."""
     await check_agent_access(db, current_user, agent_id)
 
+    normalized_path = (path or "").strip().strip("/")
+    if not normalized_path or normalized_path == ".":
+        normalized_path = DEFAULT_UPLOAD_DIR
+
     # Validate path prefix
-    if not path.startswith(("workspace/", "skills/")):
-        raise HTTPException(status_code=400, detail="只能上传到 workspace/ 或 skills/ 目录")
+    if normalized_path not in {"workspace", "skills"} and not normalized_path.startswith(("workspace/", "skills/")):
+        raise HTTPException(status_code=400, detail="右侧根目录视图是 agent 根目录；上传文件时请放到 workspace/ 或 skills/ 目录下")
 
     base = _agent_base_dir(agent_id)
-    target_dir = (base / path).resolve()
+    target_dir = (base / normalized_path).resolve()
     if not str(target_dir).startswith(str(base.resolve())):
         raise HTTPException(status_code=403, detail="Path traversal not allowed")
 
@@ -320,8 +712,8 @@ async def upload_file_to_workspace(
 
     return {
         "status": "ok",
-        "path": f"{path}/{filename}",
-        "url": f"/api/agents/{agent_id}/files/download?path={path}/{filename}",
+        "path": f"{normalized_path}/{filename}",
+        "url": f"/api/agents/{agent_id}/files/download?path={normalized_path}/{filename}",
         "filename": filename,
         "size": len(content),
         "extracted_text_path": extracted_path,
@@ -515,37 +907,25 @@ async def agent_import_from_clawhub(
     await check_agent_access(db, current_user, agent_id)
 
     from app.api.skills import (
-        CLAWHUB_BASE, _fetch_github_directory, _parse_skill_md_frontmatter, _get_github_token,
+        _fetch_clawhub_skill_archive, _fetch_clawhub_skill_meta, _get_clawhub_key,
     )
-    import httpx
 
     slug = body.slug
+    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
+    api_key = await _get_clawhub_key(tenant_id)
 
     # 1. Fetch metadata from ClawHub
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(f"{CLAWHUB_BASE}/v1/skills/{slug}")
-            if resp.status_code == 429:
-                raise HTTPException(429, "ClawHub rate limit exceeded. Please wait and try again.")
-            if resp.status_code != 200:
-                raise HTTPException(502, f"ClawHub API error: {resp.status_code}")
-            meta = resp.json()
+        meta, meta_base = await _fetch_clawhub_skill_meta(slug, api_key=api_key)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(502, f"Failed to connect to ClawHub: {e}")
 
     skill_info = meta.get("skill", {})
-    owner_info = meta.get("owner", {})
-    handle = owner_info.get("handle", "").lower()
-    if not handle:
-        raise HTTPException(400, "Could not determine skill owner from ClawHub metadata")
 
-    # 2. Fetch files from GitHub
-    github_path = f"skills/{handle}/{slug}"
-    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
-    token = await _get_github_token(tenant_id)
-    files = await _fetch_github_directory("openclaw", "skills", github_path, "main", token)
+    # 2. Fetch files from the ClawHub archive
+    files, _ = await _fetch_clawhub_skill_archive(slug, api_key=api_key, preferred_base=meta_base)
 
     # 3. Write to agent workspace: skills/<slug>/
     base = _agent_base_dir(agent_id)

@@ -1,93 +1,31 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Eye, Settings } from 'lucide-react';
-import { agentApi, channelApi, enterpriseApi, skillApi } from '../services/api';
+import { IconEye, IconSettings, IconTools } from '@tabler/icons-react';
+import { agentApi, channelApi, enterpriseApi, skillApi, tenantApi } from '../services/api';
 import ChannelConfig from '../components/ChannelConfig';
 import LinearCopyButton from '../components/LinearCopyButton';
-import { useAuthStore } from '../stores';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
-
-/**
- * Generic parser for soul_template markdown format.
- * Extracts content from sections by header names (## Header Name).
- * 
- * @param soulTemplate - The markdown template string
- * @param sectionNames - Array of section names to extract (e.g., ['Personality', 'Boundaries'])
- * @returns Object with extracted section contents (lowercase keys)
- * 
- * @example
- * const sections = parseSoulTemplate(markdown, ['Personality', 'Boundaries', 'Identity']);
- * // Returns: { personality: '...', boundaries: '...', identity: '...' }
- */
-function parseSoulTemplate(soulTemplate: string, sectionNames: string[] = []): Record<string, string> {
-    if (!soulTemplate) {
-        const empty: Record<string, string> = {};
-        sectionNames.forEach(name => {
-            empty[name.toLowerCase()] = '';
-        });
-        return empty;
-    }
-
-    const result: Record<string, string> = {};
-    
-    // Initialize all requested sections as empty
-    sectionNames.forEach(name => {
-        result[name.toLowerCase()] = '';
-    });
-
-    // Split by markdown ## headers
-    const sections = soulTemplate.split(/^##\s+/m);
-
-    for (let i = 0; i < sections.length; i++) {
-        const section = sections[i].trim();
-        const firstLineEnd = section.indexOf('\n');
-        const headerName = firstLineEnd > 0 ? section.slice(0, firstLineEnd).trim() : section.trim();
-        const content = firstLineEnd > 0 ? section.slice(firstLineEnd + 1).trim() : '';
-
-        // If this header matches one of our requested sections
-        const matchedSection = sectionNames.find(name => 
-            name.toLowerCase() === headerName.toLowerCase()
-        );
-        
-        if (matchedSection) {
-            result[matchedSection.toLowerCase()] = content;
-        }
-    }
-
-    return result;
-}
 
 export default function AgentCreate() {
     const { t } = useTranslation();
     const navigate = useNavigate();
+    const location = useLocation();
     const queryClient = useQueryClient();
     const [step, setStep] = useState(0);
     const [error, setError] = useState('');
     const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
-    const [agentType, setAgentType] = useState<'native' | 'openclaw'>('native');
+    const [agentType, setAgentType] = useState<'native' | 'openclaw'>(() => {
+        const params = new URLSearchParams(location.search);
+        return params.get('type') === 'openclaw' ? 'openclaw' : 'native';
+    });
     // Clear field error when user edits a field
     const clearFieldError = (field: string) => setFieldErrors(prev => { const n = { ...prev }; delete n[field]; return n; });
     const [createdApiKey, setCreatedApiKey] = useState('');
     // Current company (tenant) selection from layout sidebar
     const [currentTenant] = useState<string | null>(() => localStorage.getItem('current_tenant_id'));
-
-    // Current user for permission defaults
-    const { user: currentUser } = useAuthStore();
-
-    // Selected user IDs for "specific users" permission mode
-    const [permissionSelectedUserIds, setPermissionSelectedUserIds] = useState<string[]>([]);
-
-    // User search filter
-    const [userSearchQuery, setUserSearchQuery] = useState('');
-
-    // Fetch org members for user selection
-    const { data: members = [] } = useQuery({
-        queryKey: ['org-members'],
-        queryFn: enterpriseApi.listMembers,
-    });
 
     const [form, setForm] = useState({
         name: '',
@@ -98,7 +36,6 @@ export default function AgentCreate() {
         fallback_model_id: '' as string,
         permission_scope_type: 'company',
         permission_access_level: 'use',
-        template_id: '' as string,
         max_tokens_per_day: '',
         max_tokens_per_month: '',
         skill_ids: [] as string[],
@@ -111,11 +48,21 @@ export default function AgentCreate() {
         queryFn: enterpriseApi.llmModels,
     });
 
-    // Fetch templates
-    const { data: templates = [] } = useQuery({
-        queryKey: ['templates'],
-        queryFn: enterpriseApi.templates,
+    // Tenant default model — used to preselect the model step so the open-source
+    // default ("hire and go") path needs no clicks. User can override.
+    const { data: myTenant } = useQuery({
+        queryKey: ['tenant', 'me'],
+        queryFn: () => tenantApi.me(),
+        staleTime: 5 * 60 * 1000,
     });
+    useEffect(() => {
+        if (!myTenant?.default_model_id) return;
+        const enabledModels = (models as any[]).filter((m: any) => m.enabled);
+        const exists = enabledModels.some((m: any) => m.id === myTenant.default_model_id);
+        if (exists) {
+            setForm(prev => prev.primary_model_id ? prev : { ...prev, primary_model_id: myTenant.default_model_id! });
+        }
+    }, [myTenant?.default_model_id, models]);
 
     // Fetch global skills for step 3
     const { data: globalSkills = [] } = useQuery({
@@ -135,20 +82,6 @@ export default function AgentCreate() {
             }
         }
     }, [globalSkills]);
-
-    useEffect(() => {
-        const uid = currentUser?.id;
-        if (uid && permissionSelectedUserIds.length === 0 && !permissionSelectedUserIds.includes(uid)) {
-            setPermissionSelectedUserIds([uid]);
-        }
-    }, [currentUser]);
-
-    useEffect(() => {
-        if (form.permission_scope_type !== 'specific') {
-            setPermissionSelectedUserIds([]);
-            setUserSearchQuery('');
-        }
-    }, [form.permission_scope_type]);
 
     const createMutation = useMutation({
         mutationFn: async (data: any) => {
@@ -289,11 +222,7 @@ export default function AgentCreate() {
             boundaries: agentType === 'native' ? form.boundaries : undefined,
             primary_model_id: agentType === 'native' ? (form.primary_model_id || undefined) : undefined,
             fallback_model_id: agentType === 'native' ? (form.fallback_model_id || undefined) : undefined,
-            template_id: form.template_id || undefined,
-            permission_scope_type: form.permission_scope_type === 'specific' ? 'user' : form.permission_scope_type,
-            permission_scope_ids: form.permission_scope_type === 'specific'
-                ? (permissionSelectedUserIds.length > 0 ? permissionSelectedUserIds : (currentUser?.id ? [currentUser.id] : []))
-                : [],
+            permission_scope_type: form.permission_scope_type,
             max_tokens_per_day: form.max_tokens_per_day ? Number(form.max_tokens_per_day) : undefined,
             max_tokens_per_month: form.max_tokens_per_month ? Number(form.max_tokens_per_month) : undefined,
             skill_ids: agentType === 'native' ? form.skill_ids : [],
@@ -515,7 +444,6 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                         <div style={{ display: 'flex', gap: '8px' }}>
                             {[
                                 { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
-                                { value: 'specific', label: t('wizard.step4.specificUsers'), desc: t('wizard.step4.specificUsersDesc') },
                                 { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
                             ].map((scope) => (
                                 <label key={scope.value} style={{
@@ -583,77 +511,6 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                 {step === 0 && (
                     <div>
                         <h3 style={{ marginBottom: '20px', fontWeight: 600, fontSize: '15px' }}>{t('wizard.step1.title')}</h3>
-
-                        {/* Template selector */}
-                        {templates.length > 0 && (
-                            <div className="form-group">
-                                <label className="form-label">{t('wizard.step1.selectTemplate')}</label>
-                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px' }}>
-                                    <div
-                                        onClick={() => setForm({ ...form, template_id: '' })}
-                                        style={{
-                                            padding: '12px', borderRadius: '8px', cursor: 'pointer', textAlign: 'center',
-                                            border: `1px solid ${!form.template_id ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-                                            background: !form.template_id ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
-                                        }}
-                                    >
-                                        <div style={{ fontSize: '13px', fontWeight: 500, color: 'var(--text-secondary)' }}>{t('wizard.step1.custom')}</div>
-                                        <div style={{ fontSize: '12px', marginTop: '4px' }}>{t('wizard.step1.custom')}</div>
-                                    </div>
-                                    {templates.map((tmpl: any) => (
-                                        <div
-                                            key={tmpl.id}
-                                            onClick={() => {
-                                                // Parse soul_template to extract personality and boundaries
-                                                const sections = parseSoulTemplate(tmpl.soul_template, ['Personality', 'Boundaries']);
-                                                setForm({
-                                                    ...form,
-                                                    template_id: tmpl.id,
-                                                    role_description: tmpl.description,
-                                                    personality: sections.personality || '',
-                                                    boundaries: sections.boundaries || '',
-                                                });
-                                            }}
-                                            style={{
-                                                padding: '12px', borderRadius: '8px', cursor: 'pointer', textAlign: 'center',
-                                                border: `1px solid ${form.template_id === tmpl.id ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-                                                background: form.template_id === tmpl.id ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
-                                            }}
-                                        >
-                                            <div style={{ fontSize: '13px', fontWeight: 500, color: 'var(--text-secondary)' }}>{tmpl.icon || tmpl.name?.[0] || '·'}</div>
-                                            <div style={{ fontSize: '12px', marginTop: '4px' }}>{String(t(`wizard.templates.${tmpl.name}`, tmpl.name))}</div>
-                                        </div>
-                                    ))}
-                                </div>
-
-                                {/* JSON Import */}
-                                <div style={{ marginTop: '8px' }}>
-                                    <label className="btn btn-ghost" style={{ fontSize: '12px', cursor: 'pointer', color: 'var(--text-tertiary)' }}>
-                                        ↑ {t('wizard.step1.importFromJson')}
-                                        <input type="file" accept=".json" style={{ display: 'none' }} onChange={e => {
-                                            const file = e.target.files?.[0];
-                                            if (!file) return;
-                                            const reader = new FileReader();
-                                            reader.onload = ev => {
-                                                try {
-                                                    const data = JSON.parse(ev.target?.result as string);
-                                                    setForm(prev => ({
-                                                        ...prev,
-                                                        name: data.name || prev.name,
-                                                        role_description: data.role_description || data.description || prev.role_description,
-                                                        template_id: '',
-                                                    }));
-                                                } catch {
-                                                    alert('Invalid JSON file');
-                                                }
-                                            };
-                                            reader.readAsText(file);
-                                            e.target.value = '';
-                                        }} />
-                                    </label>
-                                </div>
-                            </div>
-                        )}
 
                         <div className="form-group">
                             <label className="form-label">{t('agent.fields.name')} <span style={{ color: 'var(--error)' }}>*</span></label>
@@ -769,7 +626,9 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                                                 }
                                             }}
                                         />
-                                        <div style={{ fontSize: '18px' }}>{skill.icon}</div>
+                                        <div style={{ fontSize: '18px', display: 'flex', color: 'var(--text-tertiary)' }}>
+                                            {/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(skill.icon || '') ? <IconTools size={18} stroke={1.8} /> : (skill.icon || <IconTools size={18} stroke={1.8} />)}
+                                        </div>
                                         <div style={{ flex: 1 }}>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                                                 <span style={{ fontWeight: 500, fontSize: '13px' }}>{skill.name}</span>
@@ -795,7 +654,6 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '20px' }}>
                             {[
                                 { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
-                                { value: 'specific', label: t('wizard.step4.specificUsers'), desc: t('wizard.step4.specificUsersDesc') },
                                 { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
                             ].map((scope) => (
                                 <label key={scope.value} style={{
@@ -815,65 +673,6 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                             ))}
                         </div>
 
-                        {form.permission_scope_type === 'specific' && (
-                            <div style={{ marginBottom: '20px' }}>
-                                <input
-                                    type="text"
-                                    className="form-input"
-                                    placeholder={t('wizard.step4.searchUsers', '搜索用户...')}
-                                    value={userSearchQuery}
-                                    onChange={(e) => setUserSearchQuery(e.target.value)}
-                                    style={{ marginBottom: '12px', fontSize: '13px' }}
-                                />
-                                {(members as any[]).length === 0 && (
-                                    <div style={{ padding: '12px', background: 'var(--bg-elevated)', borderRadius: '8px', fontSize: '13px', color: 'var(--text-tertiary)', textAlign: 'center' }}>
-                                        {t('enterprise.org.noMembers', '暂无公司成员')}
-                                    </div>
-                                )}
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '240px', overflowY: 'auto' }}>
-                                    {(members as any[])
-                                        .filter((m: any) => {
-                                            if (!userSearchQuery) return true;
-                                            const q = userSearchQuery.toLowerCase();
-                                            return (m.display_name || '').toLowerCase().includes(q) ||
-                                                (m.title || '').toLowerCase().includes(q) ||
-                                                (m.department_path || '').toLowerCase().includes(q);
-                                        })
-                                        .map((member: any) => {
-                                            const isChecked = permissionSelectedUserIds.includes(member.id);
-                                            const parts = [member.display_name];
-                                            if (member.email) parts.push(member.email);
-                                            if (member.department_path) parts.push(member.department_path);
-                                            if (member.title) parts.push(member.title);
-                                            return (
-                                                <label key={member.id} style={{
-                                                    display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 12px',
-                                                    background: isChecked ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
-                                                    border: `1px solid ${isChecked ? 'var(--accent-primary)' : 'var(--border-default)'}`,
-                                                    borderRadius: '8px', cursor: 'pointer',
-                                                }}>
-                                                    <input type="checkbox" checked={isChecked}
-                                                        onChange={(e) => {
-                                                            if (e.target.checked) {
-                                                                setPermissionSelectedUserIds(prev => prev.includes(member.id) ? prev : [...prev, member.id]);
-                                                            } else {
-                                                                setPermissionSelectedUserIds(prev => prev.filter((id: string) => id !== member.id));
-                                                            }
-                                                        }}
-                                                    />
-                                                    <span style={{ fontSize: '13px' }}>{parts.join(' · ')}</span>
-                                                </label>
-                                            );
-                                        })}
-                                </div>
-                                {permissionSelectedUserIds.length > 0 && (
-                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '8px' }}>
-                                        {t('wizard.step4.selectedCount', { count: permissionSelectedUserIds.length })}
-                                    </div>
-                                )}
-                            </div>
-                        )}
-
                         {/* Access Level — only for company scope */}
                         {form.permission_scope_type === 'company' && (
                             <div>
@@ -881,10 +680,10 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                                     {t('wizard.step4.accessLevel', 'Default Access Level')}
                                 </label>
                                 <div style={{ display: 'flex', gap: '8px' }}>
-                                    {([
-                                        { value: 'use', icon: <Eye size={14} />, label: t('wizard.step4.useLevel', 'Use'), desc: t('wizard.step4.useDesc', 'Can use Task, Chat, Tools, Skills, Workspace') },
-                                        { value: 'manage', icon: <Settings size={14} />, label: t('wizard.step4.manageLevel', 'Manage'), desc: t('wizard.step4.manageDesc', 'Full access including Settings, Mind, Relationships') },
-                                    ] as const).map((lvl) => (
+                                    {[
+                                        { value: 'use', icon: <IconEye size={14} stroke={1.8} />, label: t('wizard.step4.useLevel', 'Use'), desc: t('wizard.step4.useDesc', 'Can use Task, Chat, Tools, Skills, Workspace') },
+                                        { value: 'manage', icon: <IconSettings size={14} stroke={1.8} />, label: t('wizard.step4.manageLevel', 'Manage'), desc: t('wizard.step4.manageDesc', 'Full access including Settings, Mind, Relationships') },
+                                    ].map((lvl) => (
                                         <label key={lvl.value} style={{
                                             flex: 1, display: 'flex', alignItems: 'flex-start', gap: '10px', padding: '12px',
                                             background: form.permission_access_level === lvl.value ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
@@ -894,7 +693,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                                             <input type="radio" name="access_level" checked={form.permission_access_level === lvl.value}
                                                 onChange={() => setForm({ ...form, permission_access_level: lvl.value })} style={{ marginTop: '2px' }} />
                                             <div>
-                                                <div style={{ fontWeight: 500, fontSize: '13px' }}>{lvl.icon} {lvl.label}</div>
+                                                <div style={{ fontWeight: 500, fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px' }}>{lvl.icon} {lvl.label}</div>
                                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{lvl.desc}</div>
                                             </div>
                                         </label>

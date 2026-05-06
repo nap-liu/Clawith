@@ -7,6 +7,7 @@ import { IconFilter } from '@tabler/icons-react';
 import { ShieldCheck } from 'lucide-react';
 import PlatformDashboard from './PlatformDashboard';
 import LinearCopyButton from '../components/LinearCopyButton';
+import { useDialog } from '../components/Dialog/DialogProvider';
 // Helper for authenticated JSON fetch
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
     const token = localStorage.getItem('token');
@@ -48,8 +49,10 @@ export default function AdminCompanies() {
     const user = useAuthStore((s) => s.user);
     const [activeTab, setActiveTab] = useState<'dashboard' | 'platform' | 'companies'>('dashboard');
 
-    // Guard: only platform_admin
-    if (user?.role !== 'platform_admin') {
+    const canAccessPlatformSettings = user?.role === 'platform_admin' || !!(user as any)?.is_platform_admin;
+
+    // Guard: platform admins keep access across tenant contexts.
+    if (!canAccessPlatformSettings) {
         return (
             <div style={{ padding: '60px', textAlign: 'center', color: 'var(--text-tertiary)' }}>
                 {t('common.noPermission', 'You do not have permission to access this page.')}
@@ -214,19 +217,40 @@ function PlatformTab() {
         setSettingsLoading(false);
     };
 
-    const saveNotificationBar = async () => {
+    const saveNotificationBar = async (nextEnabled = nbEnabled, nextText = nbText) => {
         setNbSaving(true);
         try {
             const token = localStorage.getItem('token');
-            await fetch('/api/enterprise/system-settings/notification_bar', {
+            const res = await fetch('/api/enterprise/system-settings/notification_bar', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-                body: JSON.stringify({ value: { enabled: nbEnabled, text: nbText } }),
+                body: JSON.stringify({ value: { enabled: nextEnabled, text: nextText } }),
             });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({ detail: res.statusText }));
+                throw new Error(err.detail || res.statusText);
+            }
+            setNbEnabled(nextEnabled);
+            setNbText(nextText);
+            window.dispatchEvent(new CustomEvent('notification-bar-updated', {
+                detail: { enabled: nextEnabled, text: nextText },
+            }));
             setNbSaved(true);
             setTimeout(() => setNbSaved(false), 2000);
-        } catch { }
-        setNbSaving(false);
+            return true;
+        } catch (e: any) {
+            showToast(e.message || t('common.saveFailed', 'Save failed'), 'error');
+            return false;
+        } finally {
+            setNbSaving(false);
+        }
+    };
+
+    const handleNotificationBarToggle = async (nextEnabled: boolean) => {
+        const previousEnabled = nbEnabled;
+        setNbEnabled(nextEnabled);
+        const saved = await saveNotificationBar(nextEnabled, nbText);
+        if (!saved) setNbEnabled(previousEnabled);
     };
 
     const savePublicUrl = async () => {
@@ -371,8 +395,8 @@ function PlatformTab() {
                             {t('enterprise.notificationBar.description', 'Display a notification bar at the top of the page, visible to all users.')}
                         </div>
                     </div>
-                    <label style={switchStyle(nbEnabled)}>
-                        <input type="checkbox" checked={nbEnabled} onChange={e => setNbEnabled(e.target.checked)}
+                    <label style={switchStyle(nbEnabled, nbSaving)}>
+                        <input type="checkbox" checked={nbEnabled} onChange={e => handleNotificationBarToggle(e.target.checked)} disabled={nbSaving}
                             style={{ opacity: 0, width: 0, height: 0 }} />
                         <span style={switchTrack(nbEnabled)}>
                             <span style={switchThumb(nbEnabled)} />
@@ -396,7 +420,7 @@ function PlatformTab() {
                         />
                     </div>
                     <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                        <button className="btn btn-primary" onClick={saveNotificationBar} disabled={nbSaving}>
+                        <button className="btn btn-primary" onClick={() => saveNotificationBar()} disabled={nbSaving}>
                             {nbSaving ? t('common.loading') : t('common.save', 'Save')}
                         </button>
                         {nbSaved && <span style={{ color: 'var(--success)', fontSize: '12px' }}>{t('enterprise.config.saved', 'Saved')}</span>}
@@ -690,6 +714,7 @@ function PlatformTab() {
 // ─── Companies Tab ─────────────────────────────────
 function CompaniesTab() {
     const { t } = useTranslation();
+    const dialog = useDialog();
     const [companies, setCompanies] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
@@ -842,7 +867,10 @@ function CompaniesTab() {
 
     const handleToggle = async (id: string, currentlyActive: boolean) => {
         const action = currentlyActive ? 'disable' : 'enable';
-        if (currentlyActive && !confirm(t('admin.confirmDisable', 'Disable this company? All users and agents will be paused.'))) return;
+        if (currentlyActive) {
+            const ok = await dialog.confirm(t('admin.confirmDisable', 'Disable this company? All users and agents will be paused.'), { title: '禁用公司', danger: true, confirmLabel: '禁用' });
+            if (!ok) return;
+        }
         try {
             await adminApi.toggleCompany(id);
             loadCompanies();
