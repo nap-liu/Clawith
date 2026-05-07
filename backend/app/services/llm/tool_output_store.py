@@ -36,14 +36,21 @@ PERSISTED_CLOSE = "</persisted-output>"
 PREVIEW_CHARS = 2_000
 
 TOOL_OUTPUT_MAX_CHARS: dict[str, int | float] = {
-    "execute_code": 30_000,
-    "run_command": 30_000,
-    "bash": 30_000,
-    "grep": 20_000,
-    "search_files": 20_000,
+    # Sized for ~128K-token models (qwen3.5-plus, qwen-max-latest). Common
+    # report payloads (svc report query, search results, JSON dumps) sit
+    # in the 60–95 KB range; the previous 50 KB / 30 KB buckets pushed
+    # them through persisted-output → read_file → re-persisted loops.
+    # Doubled across the board so the typical query lands inline in one
+    # tool call. Truly oversized output (the long tail) still gets
+    # materialized to disk.
+    "execute_code": 60_000,
+    "run_command": 60_000,
+    "bash": 60_000,
+    "grep": 40_000,
+    "search_files": 40_000,
     "read_file": float("inf"),
-    "list_files": 50_000,
-    "_default": 50_000,
+    "list_files": 100_000,
+    "_default": 100_000,
 }
 
 ENV_OVERRIDE = "CLAWITH_TOOL_OUTPUT_MAX_CHARS"
@@ -269,7 +276,7 @@ def force_materialize_tool_output(
 # Message-level (cross-tool) budget enforcement
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 120_000
+MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 240_000
 MSG_BUDGET_ENV_OVERRIDE = "CLAWITH_MSG_TOOL_BUDGET"
 
 

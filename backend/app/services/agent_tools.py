@@ -3943,9 +3943,21 @@ async def _smithery_auto_recover(api_key: str, mcp_url: str, namespace: str, con
 
 
 def _normalize_tool_rel_path(rel_path: str) -> str:
+    """Normalize a relative path for tool I/O.
+
+    `.lstrip("./")` is a charset strip (any leading '.' or '/' chars), not a
+    string strip. That accidentally erased the leading dot of hidden
+    directories like `.tool_results/` — the very directory persisted-output
+    writes into. Result: every read_file targeting a persisted-output file
+    looked up the wrong path and returned "File not found", trapping the
+    agent in a retry loop. Fix: strip only the literal "./" prefix (one or
+    more), then strip leading slashes. `..` traversal is still neutralized
+    by the startswith(root) check in `_resolve_tool_source_path`.
+    """
     normalized = unicodedata.normalize("NFC", (rel_path or "").strip()).replace("\\", "/")
-    normalized = re.sub(r"/+", "/", normalized).lstrip("./")
-    return normalized
+    normalized = re.sub(r"/+", "/", normalized)
+    normalized = re.sub(r"^(\./)+", "", normalized)
+    return normalized.lstrip("/")
 
 
 def _collapse_filename_for_match(name: str) -> str:
