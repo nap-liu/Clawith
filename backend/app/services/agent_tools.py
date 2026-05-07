@@ -2004,8 +2004,14 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
 
             visible_clauses = [Tool.source == "builtin"]
+            # Platform-level admin tools (tenant_id IS NULL) are visible to all tenants;
+            # tenant-scoped admin tools only to their own tenant.
             if agent_tenant_id:
-                visible_clauses.append((Tool.source == "admin") & (Tool.tenant_id == agent_tenant_id))
+                visible_clauses.append((Tool.source == "admin") & (
+                    (Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None))
+                ))
+            else:
+                visible_clauses.append((Tool.source == "admin") & (Tool.tenant_id.is_(None)))
             if assigned_tool_ids:
                 visible_clauses.append((Tool.source == "agent") & Tool.id.in_(assigned_tool_ids))
 

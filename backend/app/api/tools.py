@@ -51,8 +51,14 @@ def _agent_visible_tool_clause(agent_tenant_id: uuid.UUID | None, assignments: d
     - agent-installed tools are visible only when explicitly assigned
     """
     clauses = [Tool.source == "builtin"]
+    # Platform-level admin tools (tenant_id IS NULL) are visible to all tenants;
+    # tenant-scoped admin tools are restricted to their own tenant.
     if agent_tenant_id:
-        clauses.append((Tool.source == "admin") & (Tool.tenant_id == agent_tenant_id))
+        clauses.append((Tool.source == "admin") & (
+            (Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None))
+        ))
+    else:
+        clauses.append((Tool.source == "admin") & (Tool.tenant_id.is_(None)))
 
     assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
     if assigned_tool_ids:
@@ -70,6 +76,9 @@ def _tool_record_visible_to_agent(
     if tool.source == "builtin":
         return True
     if tool.source == "admin":
+        # Platform-level admin tool (tenant_id IS NULL) visible to all tenants.
+        if tool.tenant_id is None:
+            return True
         return bool(agent_tenant_id and tool.tenant_id == agent_tenant_id)
     if tool.source == "agent":
         return str(tool.id) in assignments
