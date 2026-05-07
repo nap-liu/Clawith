@@ -210,7 +210,9 @@ class AgentUserOnboarding(Base):
     onboarded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False,
     )
-    phase: Mapped[str] = mapped_column(String(32), default="completed", nullable=False)
+    phase: Mapped[str] = mapped_column(
+        String(32), default="completed", server_default="completed", nullable=False,
+    )
 
 
 # Import for relationship resolution
