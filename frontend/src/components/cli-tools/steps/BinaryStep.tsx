@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { cliToolsApi } from '../api';
 import type { BinaryVersion, CliTool } from '../types';
@@ -33,6 +33,7 @@ export function BinaryStep({
   const [versions, setVersions] = useState<BinaryVersion[] | null>(null);
   const [versionsOpen, setVersionsOpen] = useState(false);
   const [rollingBack, setRollingBack] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const sha = tool.config.binary.sha256;
 
@@ -118,8 +119,11 @@ export function BinaryStep({
       </div>
 
       <div>
-        <label
+        <button
+          type="button"
           className="btn btn-secondary"
+          disabled={uploading}
+          onClick={() => fileInputRef.current?.click()}
           style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: uploading ? 'not-allowed' : 'pointer' }}
         >
           {uploading
@@ -127,17 +131,18 @@ export function BinaryStep({
             : sha
               ? `🔄 ${k('btnReplace', 'Replace')}`
               : `📤 ${k('btnUpload', 'Upload')}`}
-          <input
-            type="file"
-            disabled={uploading}
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) upload(f);
-              e.target.value = '';
-            }}
-            style={{ display: 'none' }}
-          />
-        </label>
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          disabled={uploading}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) upload(f);
+            e.target.value = '';
+          }}
+          style={{ position: 'absolute', left: '-9999px', width: '1px', height: '1px', opacity: 0 }}
+        />
       </div>
 
       {/* Version history — only meaningful once there's a binary. */}
