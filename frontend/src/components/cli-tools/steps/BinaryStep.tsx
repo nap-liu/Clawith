@@ -118,20 +118,13 @@ export function BinaryStep({
         )}
       </div>
 
-      <div>
+      <div style={{ position: 'relative', display: 'inline-block' }}>
         <button
           type="button"
           className="btn btn-secondary"
           disabled={uploading}
-          onClick={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            const input = fileInputRef.current;
-            // eslint-disable-next-line no-console
-            console.log('[BinaryStep] replace clicked, input ref:', input, 'disabled:', input?.disabled);
-            input?.click();
-          }}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: uploading ? 'not-allowed' : 'pointer' }}
+          tabIndex={-1}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: uploading ? 'not-allowed' : 'pointer', pointerEvents: 'none' }}
         >
           {uploading
             ? `⏳ ${k('btnUploading', 'Uploading…')}`
@@ -147,7 +140,16 @@ export function BinaryStep({
             if (f) upload(f);
             e.target.value = '';
           }}
-          style={{ position: 'absolute', left: '-9999px', width: '1px', height: '1px', opacity: 0 }}
+          disabled={uploading}
+          aria-label={sha ? k('btnReplace', 'Replace') : k('btnUpload', 'Upload')}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            opacity: 0,
+            cursor: uploading ? 'not-allowed' : 'pointer',
+          }}
         />
       </div>
 
