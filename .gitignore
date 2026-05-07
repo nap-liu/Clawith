@@ -40,3 +40,8 @@ docs/
 
 # Local worktrees
 .worktrees/
+
+# replay (prod data, never commit)
+replay-data/
+replay-panic.sh
+docker-compose.replay.yml
