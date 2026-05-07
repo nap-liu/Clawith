@@ -1114,6 +1114,7 @@ async def update_oauth2_provider(
 
     await db.commit()
     await db.refresh(provider)
+    from app.services.auth_registry import auth_provider_registry
     auth_provider_registry._clear_cache(provider.provider_type)
     return _identity_provider_response(provider)
 

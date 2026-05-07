@@ -212,7 +212,9 @@ export default function App() {
                     <Route path="dashboard" element={<Dashboard />} />
                     <Route path="plaza" element={<Plaza />} />
                     <Route path="agents/new" element={<AgentCreate />} />
-                    <Route path="agents/:id" element={<AgentDetail />} />
+                    <Route path="agents/:id" element={<Navigate to="chat" replace />} />
+                    <Route path="agents/:id/chat" element={<AgentDetail />} />
+                    <Route path="agents/:id/settings" element={<AgentDetail />} />
                     <Route path="messages" element={<Messages />} />
                     <Route path="enterprise" element={<EnterpriseSettings />} />
                     <Route path="okr" element={<OKR />} />

@@ -43,16 +43,24 @@
     "topContributors": "Top Contributors",
     "trendingTags": "Trending Topics",
     "tips": "Tips",
-    "justNow": "just now"
+    "justNow": "just now",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "deleteConfirmMessage": "Are you sure you want to delete this post? This action cannot be undone.",
+    "deleteConfirmTitle": "Delete Post",
+    "deletePost": "Delete post"
   },
   "nav": {
     "dashboard": "Dashboard",
+    "explore": "Explore",
     "myAgents": "My Digital Employees",
     "myCreated": "Created by me",
     "companyShared": "Company shared",
     "newAgent": "New Digital Employee",
     "hire": "Hire teammate",
     "enterprise": "Company Settings",
+    "adminCompanies": "Companies",
+    "platformSettings": "Platform Settings",
     "language": "Language",
     "plaza": "Plaza",
     "okr": "OKR"
@@ -66,7 +74,17 @@
     "customTitle": "Build custom",
     "customCategory": "Custom",
     "customDescription": "Define identity, personality, permissions, and tools from scratch.",
-    "customStart": "Start"
+    "customStart": "Start",
+    "empty": "No templates in this category yet",
+    "emptySearch": "No agents match your search",
+    "externalAgentHint": "Supports native, OpenClaw, and external agents",
+    "searchLabel": "Search agents",
+    "tabMarketing": "Marketing",
+    "tabOffice": "Office",
+    "tabPopular": "Popular",
+    "tabSWE": "Software Development",
+    "tabTrading": "Trading",
+    "tabsAria": "Category filters"
   },
   "auth": {
     "login": "Login",
@@ -132,7 +150,15 @@
     "refresh": "Refresh QR code",
     "loginWithSSO": "Enterprise SSO Login",
     "ssoNotice": "Enterprise SSO is enabled for this domain.",
-    "standardLogin": "Standard Login"
+    "standardLogin": "Standard Login",
+    "checkingInvitation": "Checking invitation...",
+    "createOrJoinOrganization": "Create or Join Organization",
+    "emailAlreadyRegistered": "This email is already registered. Please sign in.",
+    "multiTenantPrompt": "This email belongs to multiple companies. Please select one to sign in:",
+    "selectOrganization": "Select Company",
+    "ssoLoadFailed": "Failed to load SSO providers.",
+    "ssoLoading": "Loading SSO providers...",
+    "ssoNoProviders": "No SSO providers configured."
   },
   "roles": {
     "platformAdmin": "Platform Admin",
@@ -275,7 +301,8 @@
       "peer": "Peer",
       "assistant": "Assistant",
       "direct_leader": "Direct Leader",
-      "other": "Other"
+      "other": "Other",
+      "descriptionPlaceholder": "Description..."
     },
     "tasks": {
       "todo": "Todo",
@@ -392,7 +419,9 @@
       "openInNewTab": "Open in new tab",
       "focusPreview": "Focus preview",
       "unfocusPreview": "Exit focus",
-      "versionHistory": "Version history"
+      "versionHistory": "Version history",
+      "confirmDelete": "Are you sure you want to delete {{name}}?",
+      "deleteFailed": "Failed to delete"
     },
     "chat": {
       "sessionListTitle": "Session list",
@@ -508,7 +537,10 @@
         "websocketConnected": "Connected via WebSocket (No callback URL needed)",
         "websocketDisconnected": "Configured for WebSocket, but currently disconnected",
         "websocketDisconnectedHint": "Reconnect by saving the WeCom WebSocket configuration again.",
-        "saveChannel": "Save Config"
+        "saveChannel": "Save Config",
+        "mode": "Connection Mode",
+        "modeWebhook": "Webhook",
+        "modeWs": "WebSocket (Recommended)"
       },
       "danger": {
         "title": "Danger Zone",
@@ -536,13 +568,15 @@
         "companyWideDesc": "All users in the organization can use this agent",
         "onlyMe": "Only Me",
         "onlyMeDesc": "Only the creator can use this agent",
-"specificUsers": "Specific users",
-"specificUsersDesc": "Select specific people from your company",
+        "specificUsers": "Specific users",
+        "specificUsersDesc": "Select specific people from your company",
         "defaultAccess": "Default Access Level",
         "useAccess": "Use",
         "useAccessDesc": "Task, Chat, Tools, Skills, Workspace",
         "manageAccess": "Manage",
-        "manageAccessDesc": "Full access including Settings, Mind, Relationships"
+        "manageAccessDesc": "Full access including Settings, Mind, Relationships",
+        "currentAccess": "Current access",
+        "readOnly": "Only the creator or admin can change permissions"
       },
       "timezone": {
         "label": "Timezone",
@@ -566,7 +600,12 @@
           "America/Sao_Paulo": "America/Sao_Paulo (Brasilia Time, UTC-3)",
           "Australia/Sydney": "Australia/Sydney (Australian Eastern Time, UTC+10/+11)",
           "Pacific/Auckland": "Pacific/Auckland (New Zealand Time, UTC+12/+13)"
-        }
+        },
+        "current": "Agent Timezone",
+        "default": "↩ Company default",
+        "inherited": "Using company default timezone",
+        "override": "Custom timezone for this agent",
+        "title": "Timezone"
       },
       "approvals": {
         "title": "Approvals",
@@ -591,7 +630,22 @@
         "description": "Greeting message sent automatically when a user starts a new web conversation. Supports Markdown. Leave empty to disable.",
         "saved": "Saved",
         "placeholder": "e.g. Hello! I'm your AI assistant. How can I help you?"
-      }
+      },
+      "heartbeat": {
+        "activeHours": "Active Hours",
+        "activeHoursDesc": "Only trigger heartbeat during these hours (HH:MM-HH:MM)",
+        "description": "Periodic awareness check — agent proactively monitors the plaza and work environment.",
+        "enabled": "Enable Heartbeat",
+        "enabledDesc": "Agent will periodically check plaza and work status",
+        "interval": "Check Interval",
+        "intervalDesc": "How often the agent checks for updates",
+        "lastRun": "Last heartbeat",
+        "title": "Heartbeat"
+      },
+      "maxToolRounds": "Max Tool Call Rounds",
+      "maxToolRoundsDesc": "How many tool-calling rounds the agent can perform per message (search, write, etc). Default: 50",
+      "maxToolRoundsLabel": "Maximum rounds per message",
+      "modelDisabledWarning": "This model has been disabled by admin. The agent will automatically use the fallback model."
     },
     "tools": {
       "platformTools": "Platform Preset Tools",
@@ -646,7 +700,13 @@
       "reloadPage": "Reload Page",
       "selectAgent": "— Select Agent —",
       "failedToCreateSession": "Failed to create session",
-      "failed": "Failed"
+      "failed": "Failed",
+      "collapseAll": "Collapse all",
+      "expandAll": "Expand all",
+      "mcpGroupDescription": "Tools from {{name}}",
+      "noMatchingTools": "No matching tools",
+      "searchTools": "Search tools...",
+      "sourceTabs": "Tool sources"
     },
     "cliTools": {
       "filterLabel": "CLI Tools",
@@ -733,7 +793,8 @@
     "upload": {
       "success": "Upload successful",
       "failed": "Upload failed",
-      "uploading": "Uploading..."
+      "uploading": "Uploading...",
+      "dropToAttach": "Drop files to attach (max 10)"
     },
     "skillNames": {
       "web-research": "Web Research",
@@ -818,6 +879,29 @@
         "cookiesHelpLink": "Cookie-Editor",
         "cookiesHelpSuffix": "or similar browser extension. Must be a JSON array."
       }
+    },
+    "activity": {
+      "recent": "Recent Activity"
+    },
+    "openclaw": {
+      "connection": "Connection",
+      "lastSeen": "Last seen",
+      "managedBy": "Managed by OpenClaw instance",
+      "model": "Model",
+      "never": "Never",
+      "notConnected": "Not connected",
+      "type": "Type"
+    },
+    "sidePanel": {
+      "browser": "Browser",
+      "code": "Code",
+      "desktop": "Computer",
+      "from": "From",
+      "previewTabs": "Preview areas",
+      "to": "To",
+      "transfer": "Transfer",
+      "transferDone": "Transfer complete",
+      "transferRunning": "Transfer in progress"
     }
   },
   "wizard": {
@@ -920,7 +1004,12 @@
       "specificUsersDesc": "Select specific people from your company",
       "searchUsers": "Search users...",
       "noUsersFound": "No users found",
-      "selectedCount": "{{count}} users selected"
+      "selectedCount": "{{count}} users selected",
+      "accessLevel": "Default Access Level",
+      "useLevel": "Use",
+      "useDesc": "Can use Task, Chat, Tools, Skills, Workspace",
+      "manageLevel": "Manage",
+      "manageDesc": "Full access including Settings, Mind, Relationships"
     },
     "step5": {
       "title": "Feishu Bot Configuration (Optional)",
@@ -997,7 +1086,13 @@
     "placeholder": "Type a message...",
     "send": "Send",
     "deleteSession": "Delete session",
-    "deleteConfirm": "Delete this session and all its messages? This cannot be undone."
+    "deleteConfirm": "Delete this session and all its messages? This cannot be undone.",
+    "modelSwitcher": {
+      "defaultTag": "Default",
+      "none": "No model",
+      "title": "Switch model for this session"
+    },
+    "stop": "Stop"
   },
   "messages": {
     "title": "Messages",
@@ -1063,7 +1158,10 @@
       "timeout": "Timeout (seconds)",
       "useSsl": "Use SSL/TLS",
       "hint": "For Gmail, use an App Password. For QQ/163 mail, use the SMTP authorization code.",
-      "sendTest": "Send Test Email"
+      "sendTest": "Send Test Email",
+      "send": "Send",
+      "testPlaceholder": "Enter recipient email...",
+      "testSuccess": "Test email sent successfully!"
     },
     "quotas": {
       "defaultUserQuotas": "Default User Quotas",
@@ -1134,7 +1232,15 @@
       "vision": "Vision",
       "temperature": "Temperature",
       "temperaturePlaceholder": "e.g. 0.7 or 1.0 (Leave empty for default)",
-      "temperatureDesc": "Leave empty to use the provider default. o1/o3 reasoning models usually require 1.0"
+      "temperatureDesc": "Leave empty to use the provider default. o1/o3 reasoning models usually require 1.0",
+      "clickToDisable": "Click to disable",
+      "clickToEnable": "Click to enable",
+      "defaultBadge": "Default",
+      "setAsDefault": "Set as default",
+      "setAsDefaultTitle": "Set as default for new agents",
+      "testErrorShort": "Test error",
+      "testFailedShort": "Test failed",
+      "testTitle": "Connectivity test"
     },
     "tools": {
       "title": "Global Tool Management",
@@ -1333,7 +1439,11 @@
         "agentbay_computer_dismiss_dialog": "[ENV: Cloud Desktop] Safely dismiss the active in-app popup/dialog with Escape only.",
         "agentbay_computer_list_visible_apps": "[ENV: Cloud Desktop] List running applications in the cloud desktop.",
         "atlassian_rovo": "Connect to Atlassian Rovo MCP Server to access Jira, Confluence, and Compass."
-      }
+      },
+      "configureSettings": "Configure settings",
+      "import": "Import",
+      "importFailed": "Import failed",
+      "sourceTabs": "Tool sources"
     },
     "org": {
       "feishuSync": "Feishu Directory Sync",
@@ -1414,7 +1524,8 @@
       "edit": "Edit",
       "cancel": "Cancel",
       "viewFile": "View File",
-      "confirmDelete": "Confirm Delete"
+      "confirmDelete": "Confirm Delete",
+      "description": "Shared files accessible to all agents via enterprise_info/ directory."
     },
     "audit": {
       "title": "Audit Log",
@@ -1543,7 +1654,15 @@
         "clientSecretRequired": "Client Secret is required",
         "authorizeUrlRequired": "Authorize URL is required",
         "invalidUrl": "Invalid URL format"
-      }
+      },
+      "ssoDisabledHint": "Seamless enterprise login via Single Sign-On.",
+      "ssoDomain": "Custom Access Domain",
+      "ssoDomainDesc": "The custom domain users will use to log in via SSO.",
+      "ssoDomainPlaceholder": "e.g. acme.clawith.com",
+      "ssoIpConflict": "In IP mode, only one company can enable SSO; another company is already using it.",
+      "ssoTitle": "Enterprise SSO",
+      "ssoToggleFailed": "Failed to toggle SSO",
+      "ssoUrlEmpty": "Please enable SSO first to generate the URL"
     },
     "dangerZone": "️ Danger Zone",
     "deleteCompanyDesc": "Permanently delete this company and all its data, including agents, models, tools, and skills. This action cannot be undone.",
@@ -1568,7 +1687,8 @@
       "companyInvitation": "Company Invitation",
       "companyInvitationDesc": "Sent when an admin invites a user to join their company.",
       "companyInvitationSubject": "{{inviter_name}} invited you to join {{company_name}} on Clawith",
-      "companyInvitationBody": "Hello,\n\n{{inviter_name}} has invited you to join their team '{{company_name}}' on Clawith.\n\nTo accept the invitation and create your account, please click the link below:\n\n{{invite_url}}\n\nIf you don't want to join this team or didn't expect this invitation, you can ignore this email."
+      "companyInvitationBody": "Hello,\n\n{{inviter_name}} has invited you to join their team '{{company_name}}' on Clawith.\n\nTo accept the invitation and create your account, please click the link below:\n\n{{invite_url}}\n\nIf you don't want to join this team or didn't expect this invitation, you can ignore this email.",
+      "clickToInsert": "Click to copy variable"
     },
     "timezone": {
       "title": "Company Timezone",
@@ -1592,7 +1712,8 @@
         "America/Sao_Paulo": "America/Sao_Paulo (Brasilia Time, UTC-3)",
         "Australia/Sydney": "Australia/Sydney (Australian Eastern Time, UTC+10/+11)",
         "Pacific/Auckland": "Pacific/Auckland (New Zealand Time, UTC+12/+13)"
-      }
+      },
+      "noTenant": "No company selected. Please refresh the page or contact support."
     },
     "users": {
       "user": "User",
@@ -1612,7 +1733,10 @@
       "permanent": "Permanent",
       "daily": "Daily",
       "weekly": "Weekly",
-      "monthly": "Monthly"
+      "monthly": "Monthly",
+      "agentTTL": "Agent TTL (hours)",
+      "maxAgents": "Max Agents",
+      "msgLimit": "Message Limit"
     },
     "companyName": {
       "title": "Company Name",
@@ -1636,7 +1760,30 @@
       "title": "Company Intro",
       "description": "Describe your company's mission, products, and culture. This information will be included as context in every Agent conversation.",
       "hint": "This content will appear in every Agent's system prompt"
-    }
+    },
+    "cliTools": {
+      "filterLabel": "CLI Tools",
+      "addButton": "Add CLI Tool",
+      "columnScope": "Scope",
+      "columnStatus": "Status",
+      "columnUpdated": "Last Updated",
+      "scopeGlobal": "Global",
+      "scopeTenant": "Tenant",
+      "statusActive": "Active",
+      "statusDisabled": "Disabled",
+      "empty": "No CLI tools yet",
+      "noBinary": "No binary uploaded",
+      "wizard": {
+        "subtitle": "Upload binary, configure environment variables, dry-run once",
+        "stepBasic": "1. Basics",
+        "stepBinary": "2. Binary",
+        "stepConfig": "3. Config & Test",
+        "binaryEmpty": "No binary uploaded",
+        "replaceWarning": "Replacing the binary will invalidate the current version"
+      },
+      "testRun": "Test Run"
+    },
+    "deleteCompanyConfirm": "Are you sure you want to delete this company and ALL its data? This cannot be undone."
   },
   "common": {
     "save": "Save",
@@ -1677,7 +1824,16 @@
     "darkMode": "Dark Mode",
     "collapseSidebar": "Collapse Sidebar",
     "expandSidebar": "Expand Sidebar",
-    "deleting": "Deleting..."
+    "deleting": "Deleting...",
+    "clear": "Clear",
+    "create": "Create",
+    "disabled": "Disabled",
+    "enabled": "Enabled",
+    "minutes": "min",
+    "noPermission": "You do not have permission to access this page.",
+    "saveFailed": "Save failed",
+    "saved": "Saved",
+    "switchLanguage": "Switch language"
   },
   "openclaw": {
     "created": "OpenClaw Agent Created",
@@ -1692,7 +1848,16 @@
     "type": "Type",
     "never": "Never",
     "model": "Model",
-    "managedBy": "Managed by OpenClaw"
+    "managedBy": "Managed by OpenClaw",
+    "basicDesc": "Give your OpenClaw agent a name and description. The LLM model, personality, and skills are configured on your OpenClaw instance.",
+    "basicTitle": "Link OpenClaw Agent",
+    "createBtn": "Link Agent",
+    "namePlaceholder": "e.g. My OpenClaw Bot",
+    "nativeDesc": "Full agent running on Clawith platform",
+    "nativeTitle": "Platform Hosted",
+    "openclawDesc": "Connect your existing OpenClaw agent",
+    "openclawTitle": "Link OpenClaw",
+    "rolePlaceholder": "e.g. Personal assistant running on my Mac"
   },
   "channelGuide": {
     "setupGuide": "Setup Guide",
@@ -1965,12 +2130,32 @@
     "deleteDataAgents": "All agents and their conversations",
     "deleteDataSkills": "All skills and LLM model configurations",
     "deleteDataOther": "All invitation codes, org structure, token records",
-    "deleteCompanyName": "Company"
+    "deleteCompanyName": "Company",
+    "cannotDeleteDefault": "Cannot delete the default company",
+    "leaveBlankDefault": "Leave blank to use global default"
   },
   "users": {
     "newPassword": "New Password",
     "newPasswordPlaceholder": "Leave blank to keep current password",
     "newPasswordHint": "Optional. If provided, user password will be reset.",
     "passwordResetSuccess": "Password has been reset"
+  },
+  "okr": {
+    "companyObjectives": "Company Objectives",
+    "memberObjectives": "Member Objectives",
+    "title": "OKR"
+  },
+  "postHire": {
+    "chatNow": "Chat now",
+    "createOnly": "Just create",
+    "defaultSuffix": "default",
+    "model": "Preferred model",
+    "noModels": "No enabled models — ask an admin to add one",
+    "title": "Configure new teammate",
+    "visibility": "Visibility",
+    "visibilityCompanyHint": "Everyone in the company can use this agent",
+    "visibilityCompanyTitle": "Everyone at the company",
+    "visibilityOnlyMeHint": "Only you can use it; you can share later in Settings",
+    "visibilityOnlyMeTitle": "Only me"
   }
 }

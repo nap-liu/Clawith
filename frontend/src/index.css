@@ -1512,6 +1512,14 @@ select:focus {
   padding: 0;
 }
 
+/* Override take-theirs AgentDetail's inline `margin: '0 8px 8px'` on the
+   chat shell so chat-page visual edge matches the 32px (--space-8) padding
+   used by every other .main-content variant (enterprise / agent-settings /
+   plaza / etc.). */
+.main-content.chat-page .agent-chat-shell {
+  margin: 0 var(--space-8) var(--space-8) !important;
+}
+
 .main-content.agent-settings-page {
   padding-top: 8px;
 }

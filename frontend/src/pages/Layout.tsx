@@ -29,6 +29,7 @@ import {
     IconBuilding,
     IconChevronUp,
     IconChevronRight,
+    IconChevronDown,
     IconCheck,
     IconApps,
 } from '@tabler/icons-react';
@@ -740,6 +741,29 @@ export default function Layout() {
                         }} title={isSidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}>
                             {isSidebarCollapsed ? SidebarIcons.expand : SidebarIcons.collapse}
                         </button>
+                    </div>
+
+                    {/* Tenant switcher: avatar + current tenant name + chevron;
+                        click toggles the popover (which is positioned `fixed` via CSS). */}
+                    <div className="sidebar-workspace-row" ref={tenantSwitcherRef}>
+                        <button
+                            type="button"
+                            className={`workspace-switcher-trigger${showTenantMenu ? ' open' : ''}`}
+                            onClick={() => {
+                                if (showTenantMenu) {
+                                    setShowTenantMenu(false);
+                                    return;
+                                }
+                                openTenantModal();
+                            }}
+                            title={isChinese ? '切换企业' : 'Switch Organization'}
+                        >
+                            <span className={`workspace-switcher-avatar tone-${currentTenantAvatarTone}`}>
+                                {currentTenantLogoUrl ? <img src={currentTenantLogoUrl} alt="" /> : currentTenantInitial}
+                            </span>
+                            <span className="workspace-switcher-name">{currentTenantName}</span>
+                            <IconChevronDown className="workspace-switcher-chevron" size={15} stroke={1.7} />
+                        </button>
 
                         {showTenantMenu && (
                             <div className="tenant-switcher-popover">
@@ -989,6 +1013,12 @@ export default function Layout() {
                                         <IconUser size={15} stroke={1.5} />
                                         <span>{isChinese ? '账户设置' : 'Account Settings'}</span>
                                     </button>
+                                    {user && ['platform_admin', 'org_admin'].includes(user.role) && (
+                                        <button className="account-dropdown-item" onClick={() => { navigate('/enterprise'); setShowAccountMenu(false); }}>
+                                            <IconBuilding size={15} stroke={1.5} />
+                                            <span>{t('nav.enterprise', isChinese ? '公司设置' : 'Company Settings')}</span>
+                                        </button>
+                                    )}
                                     {canAccessPlatformSettings && (
                                         <button className="account-dropdown-item" onClick={() => { navigate('/admin/platform-settings'); setShowAccountMenu(false); }}>
                                             <IconSettings size={15} stroke={1.5} />

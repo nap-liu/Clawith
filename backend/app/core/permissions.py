@@ -40,11 +40,22 @@ def build_visible_agents_query(
     )
 
     if user.role in ("platform_admin", "org_admin"):
+        # Admins see: own creations + non-private agents + agents explicitly
+        # granted to them via user-scope permission. Without the explicit-grant
+        # branch, "specific users" sharing fails to show the agent in the
+        # admin's list — the agent is `private_user_only` from upstream's
+        # perspective, but the admin IS one of the targeted users.
+        explicit_user_grant_ids = (
+            select(AgentPermission.agent_id)
+            .where(AgentPermission.scope_type == "user")
+            .where(AgentPermission.scope_id == user.id)
+        )
         return stmt.where(
             Agent.tenant_id == target_tenant_id,
             or_(
                 Agent.creator_id == user.id,
                 Agent.id.not_in(private_user_only_ids),
+                Agent.id.in_(explicit_user_grant_ids),
             ),
         )
 

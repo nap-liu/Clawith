@@ -488,6 +488,7 @@ async def _process_wecom_kf_event(agent_id: uuid.UUID, config_obj: ChannelConfig
             if not access_token:
                 return
 
+            async with httpx.AsyncClient(timeout=10) as client:
                 current_cursor = token
                 has_more = 1
                 current_ts = int(time.time())

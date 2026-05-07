@@ -374,14 +374,9 @@ async def seed_default_agents(tenant_id=None, creator_id=None, db=None):
         if _owns_session:
             await db.commit()
         logger.info(f"[AgentSeeder] Created default agents: Morty ({morty.id}), Meeseeks ({meeseeks.id})")
-
-    # Write seed marker AFTER a successful commit so a failed seed can be retried
-    seed_marker.parent.mkdir(parents=True, exist_ok=True)
-    seed_marker.write_text(
-        f"seeded\nmorty={morty.id}\nmeeseeks={meeseeks.id}\n",
-        encoding="utf-8",
-    )
-    logger.info(f"[AgentSeeder] Wrote seed marker to {seed_marker}")
+    # NOTE: legacy file-based `.seeded` marker (upstream) was removed: this fork
+    # seeds per-tenant and uses the DB existence check above for idempotency, so
+    # a single global marker file would block any new tenant from being seeded.
 
 
 async def seed_okr_agent():

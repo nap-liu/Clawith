@@ -27,6 +27,7 @@
   },
   "nav": {
     "dashboard": "仪表盘",
+    "explore": "探索",
     "myAgents": "我的数字员工",
     "myCreated": "我创建的",
     "companyShared": "公司共用",
@@ -48,7 +49,17 @@
     "customTitle": "自建 Agent",
     "customCategory": "自定义",
     "customDescription": "从零开始定义身份、性格、权限和工具，完全按你的需求打造。",
-    "customStart": "开始"
+    "customStart": "开始",
+    "empty": "这个分类下还没有模板",
+    "emptySearch": "没有匹配的 Agent",
+    "externalAgentHint": "支持 Native、OpenClaw 等外部 Agent",
+    "searchLabel": "搜索 Agent",
+    "tabMarketing": "营销",
+    "tabOffice": "办公通用",
+    "tabPopular": "热门推荐",
+    "tabSWE": "软件开发",
+    "tabTrading": "交易投资",
+    "tabsAria": "分类筛选"
   },
   "plaza": {
     "title": "智能体广场",
@@ -139,7 +150,15 @@
     "refresh": "刷新二维码",
     "loginWithSSO": "使用企业 SSO 登录",
     "ssoNotice": "此域名已启用企业单点登录 (SSO)。",
-    "standardLogin": "标准登录"
+    "standardLogin": "标准登录",
+    "checkingInvitation": "正在检查邀请...",
+    "createOrJoinOrganization": "创建或加入组织",
+    "emailAlreadyRegistered": "该邮箱已注册,请直接登录",
+    "multiTenantPrompt": "该邮箱对应多个公司,请选择要登录的公司:",
+    "selectOrganization": "选择公司",
+    "ssoLoadFailed": "加载 SSO 提供商失败",
+    "ssoLoading": "正在加载 SSO 提供商...",
+    "ssoNoProviders": "未配置 SSO 提供商"
   },
   "roles": {
     "platformAdmin": "超级管理员",
@@ -282,7 +301,8 @@
       "peer": "同事",
       "assistant": "助理",
       "direct_leader": "直属领导",
-      "other": "其他"
+      "other": "其他",
+      "descriptionPlaceholder": "描述..."
     },
     "tasks": {
       "todo": "待办",
@@ -399,7 +419,9 @@
       "openInNewTab": "在新标签页打开",
       "focusPreview": "聚焦预览",
       "unfocusPreview": "退出聚焦",
-      "versionHistory": "历史版本"
+      "versionHistory": "历史版本",
+      "confirmDelete": "确定删除 {{name}}?",
+      "deleteFailed": "删除失败"
     },
     "chat": {
       "sessionListTitle": "会话列表",
@@ -520,7 +542,10 @@
         "websocketConnected": "已通过 WebSocket 连接（无需回调 URL）",
         "websocketDisconnected": "已配置为 WebSocket，但当前未连接",
         "websocketDisconnectedHint": "重新保存一次企业微信 WebSocket 配置即可重新连接。",
-        "saveChannel": "保存配置"
+        "saveChannel": "保存配置",
+        "mode": "连接方式",
+        "modeWebhook": "Webhook",
+        "modeWs": "WebSocket(推荐)"
       },
       "danger": {
         "title": "危险操作",
@@ -573,7 +598,9 @@
         "useAccess": "使用",
         "useAccessDesc": "任务、聊天、工具、技能、工作区",
         "manageAccess": "管理",
-        "manageAccessDesc": "完全访问权限，包括设置、思维、关系"
+        "manageAccessDesc": "完全访问权限，包括设置、思维、关系",
+        "currentAccess": "当前授权",
+        "readOnly": "只有创建者或管理员可以修改权限"
       },
       "tools": {
         "platformTools": "平台预置工具",
@@ -673,7 +700,8 @@
         "description": "当用户在网页端发起新对话时，Agent 会自动发送的欢迎语。支持 Markdown 语法。留空则不发送。",
         "saved": "已保存",
         "placeholder": "例如：你好！我是你的 AI 助手，有什么可以帮你的吗？"
-      }
+      },
+      "modelDisabledWarning": "该模型已被管理员禁用,数字员工将自动使用备用模型。"
     },
     "tools": {
       "platformTools": "平台预置工具",
@@ -727,7 +755,13 @@
       "reloadPage": "重新加载页面",
       "selectAgent": "— 选择数字员工 —",
       "failedToCreateSession": "创建会话失败",
-      "failed": "失败"
+      "failed": "失败",
+      "collapseAll": "全部收起",
+      "expandAll": "全部展开",
+      "mcpGroupDescription": "来自 {{name}} 的工具",
+      "noMatchingTools": "未找到匹配的工具",
+      "searchTools": "搜索工具...",
+      "sourceTabs": "工具来源"
     },
     "toolCategories": {
       "file": "文件操作",
@@ -748,7 +782,8 @@
     "upload": {
       "success": "上传成功",
       "failed": "上传失败",
-      "uploading": "上传中..."
+      "uploading": "上传中...",
+      "dropToAttach": "拖放文件以附加(最多 10 个)"
     },
     "skillNames": {
       "web-research": "网络研究",
@@ -833,6 +868,29 @@
         "cookiesHelpLink": "Cookie-Editor",
         "cookiesHelpSuffix": "或类似浏览器扩展导出的 Cookie。必须是 JSON 数组格式。"
       }
+    },
+    "activity": {
+      "recent": "近期活动"
+    },
+    "openclaw": {
+      "connection": "连接信息",
+      "lastSeen": "最后在线",
+      "managedBy": "由 OpenClaw 实例管理",
+      "model": "模型",
+      "never": "从未连接",
+      "notConnected": "未连接",
+      "type": "类型"
+    },
+    "sidePanel": {
+      "browser": "浏览器",
+      "code": "代码",
+      "desktop": "电脑桌面",
+      "from": "来源",
+      "previewTabs": "预览区域",
+      "to": "目标",
+      "transfer": "传输",
+      "transferDone": "传输完成",
+      "transferRunning": "传输中"
     }
   },
   "wizard": {
@@ -1017,7 +1075,13 @@
     "placeholder": "输入消息...",
     "send": "发送",
     "deleteSession": "删除会话",
-    "deleteConfirm": "确定删除这个会话及其所有消息？此操作无法撤销。"
+    "deleteConfirm": "确定删除这个会话及其所有消息？此操作无法撤销。",
+    "modelSwitcher": {
+      "defaultTag": "默认",
+      "none": "无模型",
+      "title": "为本次会话切换模型"
+    },
+    "stop": "停止"
   },
   "messages": {
     "title": "消息中心",
@@ -1054,7 +1118,8 @@
         "America/Sao_Paulo": "美洲/圣保罗 (巴西利亚时间, UTC-3)",
         "Australia/Sydney": "澳大利亚/悉尼 (澳大利亚东部时间, UTC+10/+11)",
         "Pacific/Auckland": "太平洋/奥克兰 (新西兰时间, UTC+12/+13)"
-      }
+      },
+      "noTenant": "未选择公司,请刷新页面或联系支持。"
     },
     "systemEmail": {
       "title": "系统邮件配置",
@@ -1068,7 +1133,10 @@
       "timeout": "超时时间（秒）",
       "useSsl": "使用 SSL/TLS",
       "hint": "对于 Gmail，请使用应用密码。对于 QQ/163 邮箱，请使用 SMTP 授权码。",
-      "sendTest": "发送测试邮件"
+      "sendTest": "发送测试邮件",
+      "send": "发送",
+      "testPlaceholder": "输入收件人邮箱...",
+      "testSuccess": "测试邮件发送成功!"
     },
     "quotas": {
       "defaultUserQuotas": "默认用户配额",
@@ -1181,7 +1249,15 @@
       "vision": "视觉",
       "temperature": "模型温度",
       "temperaturePlaceholder": "例如 0.7 或 1.0（留空使用默认值）",
-      "temperatureDesc": "留空使用提供商默认值。o1/o3 推理模型通常需要 1.0"
+      "temperatureDesc": "留空使用提供商默认值。o1/o3 推理模型通常需要 1.0",
+      "clickToDisable": "点击禁用",
+      "clickToEnable": "点击启用",
+      "defaultBadge": "默认",
+      "setAsDefault": "设为默认",
+      "setAsDefaultTitle": "设为新数字员工默认模型",
+      "testErrorShort": "连通性测试出错",
+      "testFailedShort": "连通性测试失败",
+      "testTitle": "连通性测试"
     },
     "tools": {
       "title": "全局工具管理",
@@ -1380,7 +1456,11 @@
         "agentbay_computer_dismiss_dialog": "[ENV: Cloud Desktop] 仅通过 Escape 安全关闭当前应用内弹窗或对话框。",
         "agentbay_computer_list_visible_apps": "[ENV: Cloud Desktop] 列出云桌面中正在运行的应用程序。",
         "atlassian_rovo": "连接到 Atlassian Rovo MCP 服务器以访问 Jira、Confluence 和 Compass。"
-      }
+      },
+      "configureSettings": "配置设置",
+      "import": "导入",
+      "importFailed": "导入失败",
+      "sourceTabs": "工具来源"
     },
     "cliTools": {
       "filterLabel": "CLI 工具",
@@ -1446,7 +1526,9 @@
         "duration": "毫秒",
         "stdout": "stdout",
         "stderr": "stderr"
-      }
+      },
+      "empty": "暂无 CLI 工具",
+      "noBinary": "未上传二进制"
     },
     "org": {
       "feishuSync": "飞书通讯录同步配置",
@@ -1594,7 +1676,8 @@
       "companyInvitation": "公司邀请",
       "companyInvitationDesc": "管理员邀请用户加入公司时发送。",
       "companyInvitationSubject": "{{inviter_name}} 邀请您加入 {{company_name}} 的 Clawith 团队",
-      "companyInvitationBody": "您好，\n\n{{inviter_name}} 邀请您加入他们在 Clawith 的团队\"{{company_name}}\"。\n\n要接受邀请并创建您的账号，请点击以下链接：\n\n{{invite_url}}\n\n如果您不想加入此团队或没有预期此邀请，可以忽略此邮件。"
+      "companyInvitationBody": "您好，\n\n{{inviter_name}} 邀请您加入他们在 Clawith 的团队\"{{company_name}}\"。\n\n要接受邀请并创建您的账号，请点击以下链接：\n\n{{invite_url}}\n\n如果您不想加入此团队或没有预期此邀请，可以忽略此邮件。",
+      "clickToInsert": "点击复制变量"
     },
     "users": {
       "user": "用户",
@@ -1614,7 +1697,10 @@
       "permanent": "永久",
       "daily": "每天",
       "weekly": "每周",
-      "monthly": "每月"
+      "monthly": "每月",
+      "agentTTL": "员工存活时长(h)",
+      "maxAgents": "最多数字员工",
+      "msgLimit": "消息限额"
     },
     "identity": {
       "title": "组织架构同步",
@@ -1723,8 +1809,17 @@
         "clientSecretRequired": "Client Secret 是必填项",
         "authorizeUrlRequired": "授权地址是必填项",
         "invalidUrl": "URL 格式不正确"
-      }
-    }
+      },
+      "ssoDisabledHint": "通过单点登录实现无缝企业登录。",
+      "ssoDomain": "自定义访问域名",
+      "ssoDomainDesc": "用户用于通过 SSO 登录的自定义域名。",
+      "ssoDomainPlaceholder": "例如 acme.clawith.com",
+      "ssoIpConflict": "IP 模式下只能有一个企业开启 SSO,当前已有其他企业占用。",
+      "ssoTitle": "企业单点登录",
+      "ssoToggleFailed": "切换 SSO 失败",
+      "ssoUrlEmpty": "请先开启 SSO 以生成地址"
+    },
+    "deleteCompanyConfirm": "确定要删除该公司及其所有数据吗?此操作不可撤销。"
   },
   "common": {
     "create": "创建",
@@ -1767,7 +1862,14 @@
     "darkMode": "深色模式",
     "collapseSidebar": "折叠侧边栏",
     "expandSidebar": "展开侧边栏",
-    "deleting": "删除中..."
+    "deleting": "删除中...",
+    "clear": "清空",
+    "disabled": "已禁用",
+    "enabled": "已启用",
+    "minutes": "分钟",
+    "saveFailed": "保存失败",
+    "saved": "已保存",
+    "switchLanguage": "切换语言"
   },
   "admin": {
     "title": "公司管理",
@@ -1846,7 +1948,9 @@
     "deleteDataAgents": "所有数字员工及其对话记录",
     "deleteDataSkills": "所有技能和 LLM 模型配置",
     "deleteDataOther": "所有邀请码、组织架构、Token 记录",
-    "deleteCompanyName": "公司"
+    "deleteCompanyName": "公司",
+    "cannotDeleteDefault": "无法删除默认公司",
+    "leaveBlankDefault": "留空使用全局默认值"
   },
   "companySetup": {
     "title": "设置你的公司",
@@ -2098,5 +2202,23 @@
     "newPasswordPlaceholder": "留空则不修改密码",
     "newPasswordHint": "可选。填写后将重置用户密码。",
     "passwordResetSuccess": "密码已重置"
+  },
+  "okr": {
+    "companyObjectives": "公司目标",
+    "memberObjectives": "成员目标",
+    "title": "OKR"
+  },
+  "postHire": {
+    "chatNow": "立即对话",
+    "createOnly": "仅创建",
+    "defaultSuffix": "默认",
+    "model": "首选模型",
+    "noModels": "暂无可用模型,请管理员先添加",
+    "title": "配置新成员",
+    "visibility": "可见权限",
+    "visibilityCompanyHint": "全公司都能使用这个数字员工",
+    "visibilityCompanyTitle": "公司所有人",
+    "visibilityOnlyMeHint": "只有你能使用,可以之后在设置里分享",
+    "visibilityOnlyMeTitle": "仅自己"
   }
 }

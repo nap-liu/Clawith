@@ -8,6 +8,7 @@ import { useDialog } from '../components/Dialog/DialogProvider';
 import { useToast } from '../components/Toast/ToastProvider';
 import type { FileBrowserApi } from '../components/FileBrowser';
 import FileBrowser from '../components/FileBrowser';
+import UserMultiSelect from '../components/UserMultiSelect';
 import ChannelConfig from '../components/ChannelConfig';
 import MarkdownRenderer from '../components/MarkdownRenderer';
 import PromptModal from '../components/PromptModal';
@@ -4186,6 +4187,21 @@ function AgentDetailInner() {
         enabled: !!id && activeTab === 'settings',
     });
 
+    // Org members for "specific users" permission scope (port from fork's
+    // 4-24 batch: feat 设置页面增加指定用户权限选项)
+    const { data: members = [] } = useQuery({
+        queryKey: ['org-members-perm'],
+        queryFn: enterpriseApi.listMembers,
+        enabled: activeTab === 'settings',
+    });
+    const [permEditScope, setPermEditScope] = useState<string | null>(null);
+    const [permEditUserIds, setPermEditUserIds] = useState<string[]>([]);
+    useEffect(() => {
+        if (permData && activeTab === 'settings') {
+            setPermEditUserIds(permData?.scope_ids || []);
+        }
+    }, [permData, activeTab]);
+
     // ─── Soul editor ─────────────────────────────────────
     const [soulEditing, setSoulEditing] = useState(false);
     const [soulDraft, setSoulDraft] = useState('');
@@ -7304,15 +7320,20 @@ function AgentDetailInner() {
                                 {(() => {
                                     const scopeLabels: Record<string, React.ReactNode> = {
                                         company: <><IconBuilding size={14} stroke={1.8} /> {t('agent.settings.perm.companyWide', 'Company-wide')}</>,
+                                        specific: <><IconUser size={14} stroke={1.8} /> {t('agent.settings.perm.specificUsers', 'Specific users')}</>,
                                         user: <><IconUser size={14} stroke={1.8} /> {t('agent.settings.perm.onlyMe', 'Only Me')}</>,
                                     };
 
-                                    const handleScopeChange = async (newScope: string) => {
+                                    const savePermissions = async (scopeType: string, scopeIds: string[], accessLevel?: string) => {
                                         try {
                                             await fetchAuth(`/agents/${id}/permissions`, {
                                                 method: 'PUT',
                                                 headers: { 'Content-Type': 'application/json' },
-                                                body: JSON.stringify({ scope_type: newScope, scope_ids: [], access_level: permData?.access_level || 'use' }),
+                                                body: JSON.stringify({
+                                                    scope_type: scopeType,
+                                                    scope_ids: scopeIds,
+                                                    access_level: accessLevel ?? permData?.access_level ?? 'use',
+                                                }),
                                             });
                                             queryClient.invalidateQueries({ queryKey: ['agent-permissions', id] });
                                             queryClient.invalidateQueries({ queryKey: ['agent', id] });
@@ -7321,23 +7342,46 @@ function AgentDetailInner() {
                                         }
                                     };
 
-                                    const handleAccessLevelChange = async (newLevel: string) => {
-                                        try {
-                                            await fetchAuth(`/agents/${id}/permissions`, {
-                                                method: 'PUT',
-                                                headers: { 'Content-Type': 'application/json' },
-                                                body: JSON.stringify({ scope_type: permData?.scope_type || 'company', scope_ids: permData?.scope_ids || [], access_level: newLevel }),
-                                            });
-                                            queryClient.invalidateQueries({ queryKey: ['agent-permissions', id] });
-                                            queryClient.invalidateQueries({ queryKey: ['agent', id] });
-                                        } catch (e) {
-                                            console.error('Failed to update access level', e);
+                                    const canManagePermissions = permData?.can_manage ?? canManage;
+                                    // Backend `update_agent_permissions` (agents.py:603-606) auto-fills
+                                    // scope_ids with [creator_id] when frontend sends scope_ids=[] for
+                                    // scope_type='user'. So GET returns scope_ids=[creator_id] for both
+                                    // "Only Me" and "Specific users (just self)" — we treat the
+                                    // creator-only case as "Only Me" so radios stay clickable.
+                                    const creatorId = (agent as any)?.creator_id;
+                                    const scopeIdsLen = permData?.scope_ids?.length ?? 0;
+                                    const onlyCreatorScope = scopeIdsLen === 0
+                                        || (scopeIdsLen === 1 && permData?.scope_ids?.[0] === creatorId);
+                                    const resolvedScope = permData?.scope_type === 'user' && !onlyCreatorScope
+                                        ? 'specific'
+                                        : (permData?.scope_type || 'company');
+                                    const currentScope = permEditScope || resolvedScope;
+                                    const currentAccessLevel = permData?.access_level || 'use';
+
+                                    const handleScopeChange = async (newScope: string) => {
+                                        if (newScope === 'specific') {
+                                            setPermEditScope('specific');
+                                            setPermEditUserIds(permData?.scope_ids?.length ? permData.scope_ids : []);
+                                            return;
                                         }
+                                        setPermEditScope(null);
+                                        setPermEditUserIds([]);
+                                        await savePermissions(newScope, []);
                                     };
 
-                                    const canManagePermissions = permData?.can_manage ?? canManage;
-                                    const currentScope = permData?.scope_type || 'company';
-                                    const currentAccessLevel = permData?.access_level || 'use';
+                                    const handleSaveSpecific = async () => {
+                                        const me = useAuthStore.getState().user;
+                                        const ids = permEditUserIds.length > 0 ? permEditUserIds : (me?.id ? [me.id] : []);
+                                        await savePermissions('user', ids);
+                                        setPermEditScope(null);
+                                    };
+
+                                    const handleAccessLevelChange = async (newLevel: string) => {
+                                        const ids = currentScope === 'specific'
+                                            ? (permData?.scope_ids ?? [])
+                                            : [];
+                                        await savePermissions(currentScope === 'specific' ? 'user' : currentScope, ids, newLevel);
+                                    };
 
                                     return (
                                         <div className="card" style={{ marginBottom: '12px' }}>
@@ -7348,7 +7392,7 @@ function AgentDetailInner() {
 
                                             {/* Scope Selection */}
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '16px' }}>
-                                                {(['company', 'user'] as const).map((scope) => (
+                                                {(['company', 'specific', 'user'] as const).map((scope) => (
                                                     <label
                                                         key={scope}
                                                         style={{
@@ -7380,6 +7424,7 @@ function AgentDetailInner() {
                                                             <div style={{ fontWeight: 500, fontSize: '13px', display: 'flex', alignItems: 'center', gap: '5px' }}>{scopeLabels[scope]}</div>
                                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
                                                                 {scope === 'company' && t('agent.settings.perm.companyWideDesc', 'All users in the organization can use this agent')}
+                                                                {scope === 'specific' && t('agent.settings.perm.specificUsersDesc', 'Select specific people from your company')}
                                                                 {scope === 'user' && t('agent.settings.perm.onlyMeDesc', 'Only the creator can use this agent')}
                                                             </div>
                                                         </div>
@@ -7424,7 +7469,30 @@ function AgentDetailInner() {
                                                 </div>
                                             )}
 
-                                            {currentScope !== 'company' && permData?.scope_names?.length > 0 && (
+                                            {currentScope === 'specific' && canManagePermissions && (
+                                                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}>
+                                                    <UserMultiSelect
+                                                        members={members as any[]}
+                                                        selectedIds={permEditUserIds}
+                                                        onSelectionChange={setPermEditUserIds}
+                                                        listMaxHeight={200}
+                                                        showSelectedCount={false}
+                                                    />
+                                                    <div style={{ marginTop: '8px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '8px' }}>
+                                                        {permEditUserIds.length > 0 && (
+                                                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                                                                {t('wizard.step4.selectedCount', { count: permEditUserIds.length })}
+                                                            </span>
+                                                        )}
+                                                        <button className="btn btn-primary" onClick={handleSaveSpecific}
+                                                            style={{ padding: '4px 16px', fontSize: '12px', height: '28px' }}>
+                                                            {t('common.save', '保存')}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {currentScope === 'user' && permData?.scope_names?.length > 0 && (
                                                 <div style={{ marginTop: '12px', fontSize: '12px', color: 'var(--text-secondary)' }}>
                                                     <span style={{ fontWeight: 500 }}>{t('agent.settings.perm.currentAccess', 'Current access')}:</span>{' '}
                                                     {permData.scope_names.map((s: any) => s.name).join(', ')}

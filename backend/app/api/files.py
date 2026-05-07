@@ -107,6 +107,13 @@ async def list_files(
     agent, _access = await check_agent_access(db, current_user, agent_id)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     target = _safe_path(agent_id, path)
+    # Fork uses _safe_path (single Path), but git auto-merge brought in
+    # references to `base_abs` and `is_enterprise` from upstream's _visible_path
+    # tuple. Synthesize them here so the rest of the function works.
+    # base_abs MUST be the agent root (not target) so `entry.relative_to(base_abs)`
+    # below preserves the sub-path when listing non-root directories.
+    base_abs = _agent_base_dir(agent_id).resolve()
+    is_enterprise = False
 
     if not target.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path not found")
@@ -114,7 +121,6 @@ async def list_files(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Path is not a directory")
 
     items = []
-    base_abs = base_abs.resolve()
     if not path and current_user.tenant_id:
         enterprise_root = (Path(settings.AGENT_DATA_DIR) / f"enterprise_info_{current_user.tenant_id}").resolve()
         enterprise_root.mkdir(parents=True, exist_ok=True)

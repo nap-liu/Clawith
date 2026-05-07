@@ -325,6 +325,78 @@ def _check_tool_requires_args(tool_name: str, args: dict) -> tuple[bool, str]:
     return True, ""
 
 
+# ─── Upstream-imported helpers ────────────────────────────────────────────────
+# Restored after the take-ours conflict resolution dropped them: the call sites
+# (_process_tool_call, the tool execution loops at ~700 and ~1100) were merged
+# from upstream and still reference these symbols, so the definitions must
+# coexist with the fork's _canonicalize_tc_arguments / _shape_tool_content_for_context.
+
+def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict] | None, str | None]:
+    """Return OpenAI-compatible tool calls, or a retry instruction if args are invalid."""
+    sanitized: list[dict] = []
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        tool_name = fn.get("name") or ""
+        raw_args = fn.get("arguments", "{}")
+
+        if raw_args is None or raw_args == "":
+            args_str = "{}"
+        elif isinstance(raw_args, str):
+            try:
+                json.loads(raw_args)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "[LLM] Invalid tool arguments JSON for {}: {} at pos {}",
+                    tool_name or "<unknown>",
+                    exc.msg,
+                    exc.pos,
+                )
+                return None, (
+                    "Your previous tool call arguments were not valid JSON. "
+                    f"The affected tool was `{tool_name or 'unknown'}`. "
+                    "Retry the tool call now with `function.arguments` as one valid JSON object string. "
+                    "Escape all quotes and newlines inside long HTML, CSS, JavaScript, or markdown content. "
+                    "Do not explain; only retry with a valid tool call."
+                )
+            args_str = raw_args
+        elif isinstance(raw_args, (dict, list)):
+            args_str = json.dumps(raw_args, ensure_ascii=False)
+        else:
+            return None, (
+                "Your previous tool call arguments had an unsupported type. "
+                f"The affected tool was `{tool_name or 'unknown'}`. "
+                "Retry the tool call with `function.arguments` as one valid JSON object string."
+            )
+
+        sanitized.append({
+            "id": tc.get("id", ""),
+            "type": tc.get("type") or "function",
+            "function": {
+                "name": tool_name,
+                "arguments": args_str,
+            },
+        })
+
+    return sanitized, None
+
+
+def _allowed_tool_names(tools_for_llm: list[dict] | None) -> set[str]:
+    names: set[str] = set()
+    for tool in tools_for_llm or []:
+        name = ((tool.get("function") or {}).get("name") or "").strip()
+        if name:
+            names.add(name)
+    return names
+
+
+def _tool_not_enabled_message(tool_name: str) -> str:
+    return (
+        f"Tool `{tool_name}` is not enabled for this agent. "
+        "Do not call it again. Use only the tools currently available to you, "
+        "or explain that the required capability is not enabled."
+    )
+
+
 def _canonicalize_tc_arguments(tc: dict, session_id: str) -> dict[str, Any]:
     """Canonicalize ``tc['function']['arguments']`` in place and return the parsed dict.
 
@@ -512,6 +584,11 @@ async def call_llm(
             tools_for_llm,
             key=lambda t: t.get("function", {}).get("name", ""),
         )
+    # Required by _process_tool_call's `tool_name not in allowed_tool_names`
+    # guard. Restored after the take-ours conflict resolution dropped the
+    # upstream line that computed this in call_llm (call_agent_llm_with_tools
+    # already has its own copy at ~L1121).
+    allowed_tool_names = _allowed_tool_names(tools_for_llm)
 
     # Convert messages to LLMMessage format.
     # IMPORTANT (context-v2 / P1-A): system holds ONLY the static prompt so the
@@ -658,8 +735,8 @@ async def call_llm(
                     f"[LLM] Output token limit not recoverable after "
                     f"{MAX_OUTPUT_TOKENS_RECOVERY_LIMIT} resume attempts"
                 )
-                if agent_id and _accumulated_tokens > 0:
-                    await record_token_usage(agent_id, _accumulated_tokens)
+                if agent_id and _accumulated_usage.total_tokens > 0:
+                    await record_token_usage(agent_id, _accumulated_usage)
                 await client.close()
                 return "[LLM Error] Output token limit exceeded after 3 resume attempts"
 
@@ -1093,6 +1170,13 @@ async def call_agent_llm_with_tools(
                     return response.content or "[Empty response]", True, tool_executed
 
                 # Execute tool calls
+                # Sanitize first — invalid tool args become a retry user message
+                # (mirrors the streaming path's behavior in the main _try_model).
+                sanitized_tool_calls, retry_instruction = _sanitize_tool_calls_for_context(response.tool_calls)
+                if retry_instruction:
+                    api_messages.append(LLMMessage(role="user", content=retry_instruction))
+                    continue
+
                 # NB: tc["function"] is shared by reference with _canonicalize_tc_arguments's
                 # in-place canonicalization — must stay as a reference (no deepcopy), or
                 # history entries will carry the pre-repair malformed arguments.
@@ -1103,22 +1187,28 @@ async def call_agent_llm_with_tools(
                     reasoning_content=response.reasoning_content,
                 ))
 
-                for tc in response.tool_calls:
+                for tc in sanitized_tool_calls or []:
                     args = _canonicalize_tc_arguments(tc, session_id)
                     tool_name = tc["function"]["name"]
 
                     tool_executed = True
-                    result = await execute_tool(
-                        tool_name, args,
-                        agent_id=agent_id,
-                        user_id=agent.creator_id,
-                        session_id=session_id,
-                    )
-                    shaped_content = _shape_tool_content_for_context(str(result), tool_name, session_id)
+                    if tool_name not in allowed_tool_names:
+                        logger.warning(
+                            f"[call_agent_llm_with_tools] Blocked disabled tool call: "
+                            f"{tool_name} agent_id={agent_id}"
+                        )
+                        result = _tool_not_enabled_message(tool_name)
+                    else:
+                        result = await execute_tool(
+                            tool_name, args,
+                            agent_id=agent_id,
+                            user_id=agent.creator_id,
+                            session_id=session_id,
+                        )
                     api_messages.append(LLMMessage(
                         role="tool",
                         tool_call_id=tc["id"],
-                        content=shaped_content,
+                        content=str(result),
                     ))
 
             if agent_id and _accumulated_usage.total_tokens > 0:

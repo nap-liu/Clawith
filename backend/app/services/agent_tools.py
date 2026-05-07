@@ -5060,8 +5060,10 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                         receive_id_type="user_id",
                     )
                     if resp.get("code") == 0:
-                        # Save to history session
-                        await _save_outgoing_to_feishu_session(direct_user_id)
+                        # NOTE: history-session save is intentionally skipped on the
+                        # direct user_id path — _save_outgoing_to_feishu_session
+                        # depends on `target_member` (resolved below in the
+                        # member_name branch) and cannot be invoked here.
                         return f"✅ 消息已发送（user_id: {direct_user_id}）"
                     return f"❌ 发送失败：{resp.get('msg')} (code {resp.get('code')})"
                 except FeishuAPIError as user_id_err:

@@ -10,6 +10,7 @@ import { saveAccentColor, getSavedAccentColor, resetAccentColor, PRESET_COLORS }
 import UserManagement from './UserManagement';
 import InvitationCodes from './InvitationCodes';
 import LinearCopyButton from '../components/LinearCopyButton';
+import { CliToolsSection } from '../components/cli-tools/CliToolsSection';
 import { useDialog } from '../components/Dialog/DialogProvider';
 import { useToast } from '../components/Toast/ToastProvider';
 import { buildCompanyRegions, type CompanyRegion } from '../utils/companyRegions';
@@ -4014,6 +4015,10 @@ export default function EnterpriseSettings() {
                         )}
 
                         {toolsView === 'global' && <>
+                            {/* Fork's CLI tools admin (binary uploads + per-tool wizard).
+                                Self-contained section, sits above MCP servers. */}
+                            <CliToolsSection />
+
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                                 <h3>{t('enterprise.tools.title')}</h3>
                                 <button className="btn btn-primary" onClick={() => setShowAddMCP(true)}>+ {t('enterprise.tools.addMcpServer')}</button>

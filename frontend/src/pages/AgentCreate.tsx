@@ -6,6 +6,8 @@ import { IconEye, IconSettings, IconTools } from '@tabler/icons-react';
 import { agentApi, channelApi, enterpriseApi, skillApi, tenantApi } from '../services/api';
 import ChannelConfig from '../components/ChannelConfig';
 import LinearCopyButton from '../components/LinearCopyButton';
+import UserMultiSelect from '../components/UserMultiSelect';
+import { useAuthStore } from '../stores';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
 
@@ -26,6 +28,18 @@ export default function AgentCreate() {
     const [createdApiKey, setCreatedApiKey] = useState('');
     // Current company (tenant) selection from layout sidebar
     const [currentTenant] = useState<string | null>(() => localStorage.getItem('current_tenant_id'));
+
+    // Current user for permission defaults
+    const { user: currentUser } = useAuthStore();
+
+    // Selected user IDs for "specific users" permission mode
+    const [permissionSelectedUserIds, setPermissionSelectedUserIds] = useState<string[]>([]);
+
+    // Fetch org members for user selection
+    const { data: members = [] } = useQuery({
+        queryKey: ['org-members'],
+        queryFn: enterpriseApi.listMembers,
+    });
 
     const [form, setForm] = useState({
         name: '',
@@ -82,6 +96,22 @@ export default function AgentCreate() {
             }
         }
     }, [globalSkills]);
+
+    // Pre-select self when user enters "specific users" mode for the first time
+    useEffect(() => {
+        const uid = currentUser?.id;
+        if (uid && permissionSelectedUserIds.length === 0 && !permissionSelectedUserIds.includes(uid)) {
+            setPermissionSelectedUserIds([uid]);
+        }
+    }, [currentUser]);
+
+    // Reset selected users when leaving 'specific' scope. Search query is
+    // owned by the unmounted UserMultiSelect, so it auto-resets.
+    useEffect(() => {
+        if (form.permission_scope_type !== 'specific') {
+            setPermissionSelectedUserIds([]);
+        }
+    }, [form.permission_scope_type]);
 
     const createMutation = useMutation({
         mutationFn: async (data: any) => {
@@ -222,7 +252,10 @@ export default function AgentCreate() {
             boundaries: agentType === 'native' ? form.boundaries : undefined,
             primary_model_id: agentType === 'native' ? (form.primary_model_id || undefined) : undefined,
             fallback_model_id: agentType === 'native' ? (form.fallback_model_id || undefined) : undefined,
-            permission_scope_type: form.permission_scope_type,
+            permission_scope_type: form.permission_scope_type === 'specific' ? 'user' : form.permission_scope_type,
+            permission_scope_ids: form.permission_scope_type === 'specific'
+                ? (permissionSelectedUserIds.length > 0 ? permissionSelectedUserIds : (currentUser?.id ? [currentUser.id] : []))
+                : [],
             max_tokens_per_day: form.max_tokens_per_day ? Number(form.max_tokens_per_day) : undefined,
             max_tokens_per_month: form.max_tokens_per_month ? Number(form.max_tokens_per_month) : undefined,
             skill_ids: agentType === 'native' ? form.skill_ids : [],
@@ -444,6 +477,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                         <div style={{ display: 'flex', gap: '8px' }}>
                             {[
                                 { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
+                                { value: 'specific', label: t('wizard.step4.specificUsers'), desc: t('wizard.step4.specificUsersDesc') },
                                 { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
                             ].map((scope) => (
                                 <label key={scope.value} style={{
@@ -654,6 +688,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '20px' }}>
                             {[
                                 { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
+                                { value: 'specific', label: t('wizard.step4.specificUsers'), desc: t('wizard.step4.specificUsersDesc') },
                                 { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
                             ].map((scope) => (
                                 <label key={scope.value} style={{
@@ -672,6 +707,16 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                                 </label>
                             ))}
                         </div>
+
+                        {/* Specific users — multi-select via shared UserMultiSelect */}
+                        {form.permission_scope_type === 'specific' && (
+                            <UserMultiSelect
+                                style={{ marginBottom: '20px' }}
+                                members={members as any[]}
+                                selectedIds={permissionSelectedUserIds}
+                                onSelectionChange={setPermissionSelectedUserIds}
+                            />
+                        )}
 
                         {/* Access Level — only for company scope */}
                         {form.permission_scope_type === 'company' && (

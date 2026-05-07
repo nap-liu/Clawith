@@ -830,6 +830,7 @@ async def list_objectives(
 async def create_objective(body: ObjectiveCreate, user=Depends(get_current_user)):
     """Create a new Objective."""
     from app.models.org import OrgMember
+    from app.models.user import User
 
     if not _is_okr_admin(user):
         raise _dashboard_write_forbidden()

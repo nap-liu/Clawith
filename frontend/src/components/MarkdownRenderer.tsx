@@ -57,7 +57,9 @@ function autolinkBareUrls(html: string): string {
 function renderInline(text: string): string {
     const tokens: string[] = [];
     const stash = (html: string) => {
-        const key = `@@__MD_TOKEN_${tokens.length}__@@`;
+        // Token must NOT contain `__` (line 83 would turn it into <strong>) or
+        // single `_` (line 86 italic). Stick to letters + digits inside `@@…@@`.
+        const key = `@@MDTKN${tokens.length}@@`;
         tokens.push(html);
         return key;
     };
@@ -89,7 +91,7 @@ function renderInline(text: string): string {
 
     working = autolinkBareUrls(working);
     tokens.forEach((html, i) => {
-        working = working.replace(new RegExp(`@@__MD_TOKEN_${i}__@@`, 'g'), html);
+        working = working.replace(new RegExp(`@@MDTKN${i}@@`, 'g'), html);
     });
     return working;
 }
