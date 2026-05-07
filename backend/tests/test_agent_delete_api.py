@@ -8,7 +8,6 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api import agents as agents_api
 from app.models.agent import Agent
-from app.models.user import User
 
 
 class _NestedTransaction:
@@ -120,7 +119,7 @@ def make_user(**overrides):
         "is_active": True,
     }
     values.update(overrides)
-    return User(**values)
+    return SimpleNamespace(**values)
 
 
 def make_agent(creator_id: uuid.UUID, **overrides):

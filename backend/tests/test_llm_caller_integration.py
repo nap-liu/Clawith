@@ -56,6 +56,7 @@ async def test_process_tool_call_canonicalizes_malformed_arguments():
             supports_vision=False,
             on_tool_call=None,
             full_reasoning_content="",
+            allowed_tool_names={"read_file", "write_file"},
         )
 
     # CRITICAL: arguments on the tc object must now be valid JSON
@@ -105,6 +106,7 @@ async def test_process_tool_call_materializes_oversized_result(tmp_workspace):
             supports_vision=False,
             on_tool_call=fake_on_tool_call,
             full_reasoning_content="",
+            allowed_tool_names={"grep", "read_file", "write_file"},
         )
 
     # ------ 断言 1：on_tool_call 收到的 result 是 persisted-output 块 ------
@@ -157,6 +159,7 @@ async def test_process_tool_call_clean_arguments_pass_through_unchanged_semantic
             tc=tc, api_messages=api_messages,
             agent_id="agent-1", user_id="user-1", session_id="sess-1",
             supports_vision=False, on_tool_call=None, full_reasoning_content="",
+            allowed_tool_names={"read_file"},
         )
 
     # Semantic equivalence (key order / spacing may differ)
