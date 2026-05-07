@@ -113,6 +113,15 @@ async def _evict_oldest_past_cap(
 
     evicted_shas: list[str] = []
     tenant_key = _tenant_key(tool)
+    # Compute sha multiplicity: a single .bin can be referenced by
+    # multiple rows (re-uploading the same binary, or rolling back to it).
+    # Disk file must only be deleted when its last row is gone — otherwise
+    # the surviving row (potentially the current one) points at a missing
+    # file and the next execute fails with NOT_FOUND.
+    sha_refcount: dict[str, int] = {}
+    for r in rows:
+        sha_refcount[r.sha256] = sha_refcount.get(r.sha256, 0) + 1
+
     for victim in rows[MAX_RETAINED_VERSIONS:]:
         if victim.is_current:
             # Pathological: current row somehow fell off the retention
@@ -127,7 +136,9 @@ async def _evict_oldest_past_cap(
             continue
         evicted_shas.append(victim.sha256)
         await db.delete(victim)
-        if binary_storage is not None:
+        sha_refcount[victim.sha256] -= 1
+        # Only remove the on-disk .bin once no surviving row references it.
+        if binary_storage is not None and sha_refcount[victim.sha256] <= 0:
             binary_storage.delete_version(tenant_key, str(tool.id), victim.sha256)
 
     if evicted_shas:
