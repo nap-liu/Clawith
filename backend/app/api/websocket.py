@@ -842,7 +842,6 @@ async def websocket_chat(
 
                     # Listen for abort while LLM is running
                     aborted = False
-                    queued_messages: list[dict] = []
                     while not llm_task.done():
                         try:
                             msg = await _aio.wait_for(
@@ -853,9 +852,8 @@ async def websocket_chat(
                                 llm_task.cancel()
                                 aborted = True
                                 break
-                            else:
-                                # Queue non-abort messages for later
-                                queued_messages.append(msg)
+                            # Non-abort messages during generation are ignored;
+                            # the client should wait for `done` before sending next.
                         except _aio.TimeoutError:
                             continue
                         except WebSocketDisconnect:
@@ -970,11 +968,6 @@ async def websocket_chat(
 
             # Final 'done' packet
             await websocket.send_json({"type": "done", "role": "assistant", "content": assistant_response})
-
-            # Re-process any queued messages (if user sent something during generation)
-            for qm in queued_messages:
-                # In a real implementation, you might want to push these back to the main loop
-                pass
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Client disconnected: {user_id}")
