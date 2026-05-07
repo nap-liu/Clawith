@@ -123,7 +123,14 @@ export function BinaryStep({
           type="button"
           className="btn btn-secondary"
           disabled={uploading}
-          onClick={() => fileInputRef.current?.click()}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const input = fileInputRef.current;
+            // eslint-disable-next-line no-console
+            console.log('[BinaryStep] replace clicked, input ref:', input, 'disabled:', input?.disabled);
+            input?.click();
+          }}
           style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', cursor: uploading ? 'not-allowed' : 'pointer' }}
         >
           {uploading
@@ -135,7 +142,6 @@ export function BinaryStep({
         <input
           ref={fileInputRef}
           type="file"
-          disabled={uploading}
           onChange={(e) => {
             const f = e.target.files?.[0];
             if (f) upload(f);
