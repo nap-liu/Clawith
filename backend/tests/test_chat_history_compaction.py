@@ -21,7 +21,7 @@ from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
 from app.models.participant import Participant  # noqa: F401
 from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction
-from app.database import async_session
+from app.database import async_session, engine
 from app.services.chat_history import (
     _SyntheticSummaryMessage,
     load_messages_for_session,
@@ -29,6 +29,21 @@ from app.services.chat_history import (
 
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+async def _isolate_async_engine_between_tests():
+    """Dispose the global async engine before each test.
+
+    Each pytest-asyncio test gets a fresh event loop, but the module-level
+    asyncpg connection pool keeps connections that were bound to the previous
+    loop. Reusing one of those connections raises
+    `cannot perform operation: another operation is in progress`.
+    Disposing forces a fresh pool inside the current loop.
+    """
+    await engine.dispose()
+    yield
+    await engine.dispose()
 
 
 # NOTE on running these:

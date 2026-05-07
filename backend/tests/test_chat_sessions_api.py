@@ -71,12 +71,14 @@ async def test_org_admin_can_list_all_sessions(monkeypatch):
         peer_agent_id=None,
         is_group=False,
         group_name=None,
+        is_primary=False,
     )
     db = RecordingDB(
         responses=[
             DummyResult([agent]),
             DummyResult([session]),
-            DummyResult([(str(session.id), 3)]),
+            DummyResult([(str(session.id), 3)]),  # message_counts
+            DummyResult([]),  # unread_counts (empty)
             DummyResult([(owner_id, "Alice")]),
         ]
     )
@@ -119,12 +121,14 @@ async def test_creator_can_list_all_sessions(monkeypatch):
         peer_agent_id=None,
         is_group=False,
         group_name=None,
+        is_primary=False,
     )
     db = RecordingDB(
         responses=[
             DummyResult([agent]),
             DummyResult([session]),
-            DummyResult([(str(session.id), 2)]),
+            DummyResult([(str(session.id), 2)]),  # message_counts
+            DummyResult([]),  # unread_counts
             DummyResult([(other_user_id, "Bob")]),
         ]
     )

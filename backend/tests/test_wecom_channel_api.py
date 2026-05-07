@@ -6,7 +6,6 @@ import pytest
 
 from app.api import wecom as wecom_api
 from app.models.channel_config import ChannelConfig
-from app.models.user import User
 
 
 class DummyResult:
@@ -39,18 +38,40 @@ class RecordingDB:
 
 
 def make_user(**overrides):
+    """Build a User-like SimpleNamespace.
+
+    The real User model now stores email/username/password_hash on a linked
+    Identity row via association_proxy, which makes constructing a real User
+    impossible without a session. The handler code only reads scalar
+    attributes (id, role, tenant_id, etc.), so SimpleNamespace is enough.
+    """
+    identity_id = uuid.uuid4()
+    identity = SimpleNamespace(
+        id=identity_id,
+        username=overrides.pop("username", "alice"),
+        email=overrides.pop("email", "alice@example.com"),
+        password_hash=overrides.pop("password_hash", "old-hash"),
+        is_active=True,
+        is_platform_admin=False,
+        email_verified=True,
+        phone=None,
+    )
     values = {
         "id": uuid.uuid4(),
-        "username": "alice",
-        "email": "alice@example.com",
-        "password_hash": "old-hash",
+        "identity_id": identity_id,
         "display_name": "Alice",
         "role": "member",
         "tenant_id": uuid.uuid4(),
         "is_active": True,
+        "identity": identity,
+        "email": identity.email,
+        "username": identity.username,
+        "password_hash": identity.password_hash,
+        "email_verified": identity.email_verified,
+        "primary_mobile": identity.phone,
     }
     values.update(overrides)
-    return User(**values)
+    return SimpleNamespace(**values)
 
 
 def make_channel(agent_id: uuid.UUID, *, connection_mode: str = "websocket") -> ChannelConfig:
@@ -81,7 +102,7 @@ async def test_get_wecom_channel_reports_runtime_websocket_status(monkeypatch):
             return {str(agent_id): True}
 
     monkeypatch.setattr(wecom_api, "check_agent_access", fake_check_agent_access)
-    monkeypatch.setattr("app.services.wecom_stream.wecom_stream_manager", FakeManager())
+    monkeypatch.setattr(wecom_api, "wecom_stream_manager", FakeManager())
 
     result = await wecom_api.get_wecom_channel(
         agent_id=agent_id,
