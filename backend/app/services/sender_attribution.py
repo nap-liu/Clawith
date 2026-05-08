@@ -32,11 +32,19 @@ def wrap_with_sender(
 
     Format::
 
-        <sender id="<uuid>">display name</sender>
+        <sender id="<user_id>">display name</sender>
         {content}
 
-    If ``user_id`` is None we return the content unchanged — we never lie
-    about a sender. Callers must decide their own fallback (typically:
+    ``user_id`` MUST be the platform ``User.id`` (the ``users`` table primary
+    key UUID). This id is allocated once when the user first registers and
+    is **stable across sessions, channels, and devices** for the same person.
+    Callers must not pass session-scoped, request-scoped, or freshly-generated
+    UUIDs here — the agent will use this id to invoke tools like
+    ``send_platform_message`` and approval routing, and those calls require
+    the id to map to a real platform user.
+
+    If ``user_id`` is ``None`` we return the content unchanged — we never
+    fabricate a sender. Callers must decide their own fallback (typically:
     skip wrapping for system / tool / orphan messages).
     """
     if user_id is None:

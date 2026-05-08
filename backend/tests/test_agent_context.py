@@ -114,3 +114,23 @@ async def test_no_user_name_no_current_conversation_either_mode():
             is_group=is_group,
         )
         assert "## Current Conversation" not in dynamic_p
+
+
+async def test_static_message_sender_tag_section_documents_stable_user_id():
+    """The Message Sender Tag section must tell the LLM the `id` is the
+    platform's stable user identifier (not a session-scoped UUID), so the
+    model can safely feed it into tool calls."""
+    agent_id = await _seed_basic_agent()
+    static_p, _ = await build_agent_context(
+        agent_id,
+        "Test Agent",
+        "role",
+        current_user_name=None,
+        is_group=False,
+    )
+    # The section is present
+    assert "## Message Sender Tag (Group Chat)" in static_p
+    # The id stability invariant must be stated explicitly
+    assert "stable user identifier" in static_p
+    assert "across sessions" in static_p
+    assert "NOT a session-scoped" in static_p or "not a session-scoped" in static_p.lower()
