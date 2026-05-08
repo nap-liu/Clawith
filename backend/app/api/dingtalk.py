@@ -540,6 +540,7 @@ async def process_dingtalk_message(
             conversation_id=session_conv_id,
             ctx_size=ctx_size,
             rehydrate_images_max=3,
+            is_group=(conversation_type == "2"),
         )
 
         # Save user message — use display-friendly format for DB (no base64)
@@ -660,11 +661,26 @@ async def process_dingtalk_message(
 
             _cfs_token = _cfs.set(_dingtalk_file_sender)
 
+        from app.services.sender_attribution import wrap_with_sender
+
+        # Group chats get a platform-injected <sender> prefix (spec §4.0/§4.1).
+        # DingTalk P2P had no prefix before this iteration and we keep it that
+        # way — agent_context's "## Current Conversation" handles the single-
+        # speaker session-level identity.
+        llm_user_text = user_text
+        if conversation_type == "2":
+            llm_user_text = wrap_with_sender(
+                user_text,
+                platform_user_id,
+                sender_nick or platform_user.display_name,
+            )
+
         # Call LLM
         try:
             reply_text = await _call_agent_llm(
-                db, agent_id, user_text,
+                db, agent_id, llm_user_text,
                 history=history, user_id=platform_user_id,
+                is_group=(conversation_type == "2"),
             )
         finally:
             # Reset ContextVar
