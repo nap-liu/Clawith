@@ -19,9 +19,11 @@ def build_visible_agents_query(
 ):
     """Build a query for agents visible to the current user.
 
-    Visibility defaults to "same company + creator/self-permitted/company-wide".
-    Company admins can see all non-private agents in their tenant. Private
-    user-only agents stay hidden unless the admin created them.
+    Admins (platform_admin, org_admin) see every agent in the target tenant
+    unconditionally — including agents shared as ``specific users`` even when
+    the admin isn't on the recipient list. Owners need to manage what they
+    own, full stop. Non-admins see: own creations + company-shared agents
+    + agents explicitly granted to them.
     """
     stmt = select(Agent)
 
@@ -29,35 +31,8 @@ def build_visible_agents_query(
     if target_tenant_id is None:
         return stmt.where(false())
 
-    public_or_shared_ids = (
-        select(AgentPermission.agent_id)
-        .where(AgentPermission.scope_type != "user")
-    )
-    private_user_only_ids = (
-        select(AgentPermission.agent_id)
-        .where(AgentPermission.scope_type == "user")
-        .where(AgentPermission.agent_id.not_in(public_or_shared_ids))
-    )
-
     if user.role in ("platform_admin", "org_admin"):
-        # Admins see: own creations + non-private agents + agents explicitly
-        # granted to them via user-scope permission. Without the explicit-grant
-        # branch, "specific users" sharing fails to show the agent in the
-        # admin's list — the agent is `private_user_only` from upstream's
-        # perspective, but the admin IS one of the targeted users.
-        explicit_user_grant_ids = (
-            select(AgentPermission.agent_id)
-            .where(AgentPermission.scope_type == "user")
-            .where(AgentPermission.scope_id == user.id)
-        )
-        return stmt.where(
-            Agent.tenant_id == target_tenant_id,
-            or_(
-                Agent.creator_id == user.id,
-                Agent.id.not_in(private_user_only_ids),
-                Agent.id.in_(explicit_user_grant_ids),
-            ),
-        )
+        return stmt.where(Agent.tenant_id == target_tenant_id)
 
     permitted_ids = (
         select(AgentPermission.agent_id)
