@@ -73,9 +73,9 @@ def _build_summary_message(
     conversation_id: str,
 ) -> _SyntheticSummaryMessage:
     body = (
-        f"<conversation-summary epoch=\"{marker.epoch}\" "
-        f"tokens=\"{marker.summary_tokens}\" "
-        f"generated_at=\"{marker.created_at.isoformat()}\">\n"
+        f'<conversation-summary epoch="{marker.epoch}" '
+        f'tokens="{marker.summary_tokens}" '
+        f'generated_at="{marker.created_at.isoformat()}">\n'
         f"{_SUMMARY_WRAPPER_HEADER}\n\n"
         f"{marker.summary_text}\n"
         f"</conversation-summary>"
@@ -112,6 +112,20 @@ async def _load_active_compaction_marker(
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def _batch_load_display_names(
+    db: AsyncSession,
+    user_ids: set[uuid.UUID],
+) -> dict[uuid.UUID, str]:
+    """Batch lookup display_name for a set of user ids. Missing ids are
+    absent from the result dict (caller decides fallback)."""
+    if not user_ids:
+        return {}
+    from app.models.user import User as _UserModel
+
+    rows = await db.execute(select(_UserModel.id, _UserModel.display_name).where(_UserModel.id.in_(user_ids)))
+    return {row.id: row.display_name for row in rows.all()}
 
 
 async def load_messages_for_session(
@@ -167,6 +181,7 @@ async def load_history_for_llm(
     conversation_id: str,
     ctx_size: int,
     rehydrate_images_max: int | None = None,
+    is_group: bool = False,
 ) -> list[dict[str, Any]]:
     """Return ``[{"role", "content"}]`` history ready to feed an LLM call.
 
@@ -191,16 +206,42 @@ async def load_history_for_llm(
         conversation_id=conversation_id,
         ctx_size=ctx_size,
     )
-    history: list[dict[str, Any]] = [
-        {"role": m.role, "content": m.content} for m in rows
-    ]
+
+    if is_group:
+        from app.services.sender_attribution import wrap_with_sender
+
+        try:
+            user_ids = {m.user_id for m in rows if m.role == "user" and m.user_id is not None}
+            name_map = await _batch_load_display_names(db, user_ids)
+        except Exception as e:
+            from loguru import logger as _lg
+
+            _lg.warning(f"[chat_history] display_name batch lookup failed, falling back to anonymous history: {e}")
+            name_map = {}
+
+        history: list[dict[str, Any]] = []
+        for m in rows:
+            if m.role == "user" and m.user_id is not None:
+                history.append(
+                    {
+                        "role": "user",
+                        "content": wrap_with_sender(
+                            m.content,
+                            m.user_id,
+                            name_map.get(m.user_id),
+                        ),
+                    }
+                )
+            else:
+                history.append({"role": m.role, "content": m.content})
+    else:
+        history = [{"role": m.role, "content": m.content} for m in rows]
 
     if rehydrate_images_max is not None:
         # Lazy import: image_context pulls in vision deps that not all
         # deployments need. Only loaded when a vision-capable channel asks.
         from app.services.image_context import rehydrate_image_messages
-        history = rehydrate_image_messages(
-            history, agent_id, max_images=rehydrate_images_max
-        )
+
+        history = rehydrate_image_messages(history, agent_id, max_images=rehydrate_images_max)
 
     return history
