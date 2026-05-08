@@ -1391,6 +1391,7 @@ async def _handle_feishu_file(
             agent_id=agent_id,
             conversation_id=session_conv_id,
             ctx_size=ctx_size,
+            is_group=(chat_type == "group"),
         )
 
         await db.commit()
@@ -1486,12 +1487,30 @@ async def _handle_feishu_file(
         if _patch_msg_id:
             _img_heartbeat_task = asyncio.create_task(_img_heartbeat())
 
+        # Group chats get a platform-injected <sender> prefix (spec §4.0/§4.1).
+        # P2P keeps the legacy `[发送者: name]` plain prefix unchanged.
+        # The image markers in user_msg_content are inside the prefix's content
+        # body — image_context.rehydrate_image_messages uses re.search and is
+        # position-agnostic, so wrap order doesn't break vision rehydration.
+        from app.services.sender_attribution import wrap_with_sender
+
+        llm_user_msg_content = user_msg_content
+        if chat_type == "group":
+            llm_user_msg_content = wrap_with_sender(
+                user_msg_content,
+                platform_user_id,
+                sender_name or platform_user.display_name,
+            )
+        elif sender_name:
+            llm_user_msg_content = f"[发送者: {sender_name}] {user_msg_content}"
+
         # Call LLM with image marker — vision models will parse it
         async with _async_session() as _db_img:
             try:
                 reply_text = await _call_agent_llm(
-                    _db_img, agent_id, user_msg_content, history=_history,
+                    _db_img, agent_id, llm_user_msg_content, history=_history,
                     user_id=platform_user_id, session_id=session_conv_id, on_chunk=_img_on_chunk,
+                    is_group=(chat_type == "group"),
                 )
             finally:
                 _img_llm_done = True
