@@ -926,6 +926,12 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
 
             _reply_target = chat_id if chat_type == "group" and chat_id else sender_open_id
             _rid_type = "chat_id" if chat_type == "group" and chat_id else "open_id"
+            # Quote the user's original message in groups so the agent's reply
+            # threads under it in the Feishu client (Phase 2 #3). Outside group
+            # chats we don't need quoting — P2P already has a single thread.
+            _reply_to_user_msg_id = (
+                message.get("message_id") or "" if chat_type == "group" else ""
+            )
 
             _stream_buffer: list[str] = []
             _thinking_buffer: list[str] = []
@@ -980,6 +986,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     _json.dumps(_init_card),
                     receive_id_type=_rid_type,
                     stage="stream_init_card",
+                    reply_to_message_id=_reply_to_user_msg_id or None,
                 )
                 _patch_msg_id = _init_resp.get("data", {}).get("message_id")
             except Exception as e:
@@ -1442,6 +1449,9 @@ async def _handle_feishu_file(
         _reply_to = chat_id if chat_type == "group" else sender_open_id
         _rid_type = "chat_id" if chat_type == "group" else "open_id"
         _agent_name = agent_obj.name if agent_obj else "AI"
+        # Quote the user's image message in groups so the agent's reply card
+        # threads under it (Phase 2 #3 — image path mirror of the text path).
+        _img_reply_to_user_msg_id = message_id if chat_type == "group" else ""
         _init_card = {
             "config": {"update_multi": True},
             "header": {"template": "blue", "title": {"content": "识别图片中...", "tag": "plain_text"}},
@@ -1451,7 +1461,8 @@ async def _handle_feishu_file(
         try:
             _init_resp = await feishu_service.send_message(
                 config.app_id, config.app_secret, _reply_to, "interactive",
-                _json_card_img.dumps(_init_card), receive_id_type=_rid_type, stage="image_stream_init_card"
+                _json_card_img.dumps(_init_card), receive_id_type=_rid_type, stage="image_stream_init_card",
+                reply_to_message_id=_img_reply_to_user_msg_id or None,
             )
             _patch_msg_id = _init_resp.get("data", {}).get("message_id")
         except Exception as _e_init:
