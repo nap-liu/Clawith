@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
+from unittest.mock import patch
 
 # Import the full model graph so FK references resolve at table-mapping time.
 from app.models.user import Identity, User  # noqa: F401
@@ -259,3 +260,34 @@ async def test_load_history_group_unknown_user_falls_back():
     user_msgs = [m for m in history if m["role"] == "user"]
     assert user_msgs[0]["content"].startswith(f'<sender id="{u_alice.id}">Alice</sender>\n')
     assert user_msgs[1]["content"].startswith(f'<sender id="{ghost_uid}">Unknown</sender>\n')
+
+
+async def test_load_history_group_lookup_failure_falls_back_to_anonymous():
+    """If the display_name batch lookup raises, the loader logs a warning
+    and returns history WITHOUT sender wrapping (spec §4.5)."""
+    agent_id = uuid.uuid4()
+    u_alice, u_bob = await _seed_two_users()
+    conv_id = await _seed_group_history(agent_id, u_alice, u_bob)
+
+    with patch(
+        "app.services.chat_history._batch_load_display_names",
+        side_effect=RuntimeError("simulated DB outage"),
+    ):
+        async with async_session() as db:
+            history = await load_history_for_llm(
+                db,
+                agent_id=agent_id,
+                conversation_id=conv_id,
+                ctx_size=50,
+                is_group=True,
+            )
+
+    user_msgs = [m for m in history if m["role"] == "user"]
+    assert len(user_msgs) == 2
+    # Crucial: fallback must be UNWRAPPED — no <sender> prefix at all.
+    for m in user_msgs:
+        assert not m["content"].startswith("<sender")
+        assert "<sender" not in m["content"]
+    # Original content preserved
+    assert user_msgs[0]["content"] == "昨天的报告写好了吗？"
+    assert user_msgs[1]["content"] == "帮我订下午3点会议室"

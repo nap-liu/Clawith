@@ -31,11 +31,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction
+from app.models.user import User
+from app.services.sender_attribution import wrap_with_sender
 
 
 @dataclass
@@ -122,9 +125,8 @@ async def _batch_load_display_names(
     absent from the result dict (caller decides fallback)."""
     if not user_ids:
         return {}
-    from app.models.user import User as _UserModel
 
-    rows = await db.execute(select(_UserModel.id, _UserModel.display_name).where(_UserModel.id.in_(user_ids)))
+    rows = await db.execute(select(User.id, User.display_name).where(User.id.in_(user_ids)))
     return {row.id: row.display_name for row in rows.all()}
 
 
@@ -208,32 +210,25 @@ async def load_history_for_llm(
     )
 
     if is_group:
-        from app.services.sender_attribution import wrap_with_sender
-
+        # Collect user_ids first (this comprehension is pure attribute access — cannot raise)
+        user_ids = {m.user_id for m in rows if m.role == "user" and m.user_id is not None}
         try:
-            user_ids = {m.user_id for m in rows if m.role == "user" and m.user_id is not None}
             name_map = await _batch_load_display_names(db, user_ids)
         except Exception as e:
-            from loguru import logger as _lg
-
-            _lg.warning(f"[chat_history] display_name batch lookup failed, falling back to anonymous history: {e}")
-            name_map = {}
-
-        history: list[dict[str, Any]] = []
-        for m in rows:
-            if m.role == "user" and m.user_id is not None:
-                history.append(
-                    {
-                        "role": "user",
-                        "content": wrap_with_sender(
-                            m.content,
-                            m.user_id,
-                            name_map.get(m.user_id),
-                        ),
-                    }
-                )
-            else:
-                history.append({"role": m.role, "content": m.content})
+            logger.warning(f"[chat_history] display_name batch lookup failed, falling back to anonymous history: {e}")
+            history = [{"role": m.role, "content": m.content} for m in rows]
+        else:
+            history = [
+                {
+                    "role": m.role,
+                    "content": (
+                        wrap_with_sender(m.content, m.user_id, name_map.get(m.user_id))
+                        if m.role == "user" and m.user_id is not None
+                        else m.content
+                    ),
+                }
+                for m in rows
+            ]
     else:
         history = [{"role": m.role, "content": m.content} for m in rows]
 
