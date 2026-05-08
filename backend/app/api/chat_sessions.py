@@ -419,8 +419,11 @@ async def get_session_messages(
     # For group sessions, batch-resolve User.display_name for every distinct
     # m.user_id seen on user-role messages — agent (assistant) messages don't
     # need a sender label here (the UI shows the agent's own avatar/name).
+    # Use getattr defensively: existing tests mock `session` as a SimpleNamespace
+    # that may not carry every ChatSession column.
+    _is_group = bool(getattr(session, "is_group", False))
     user_name_cache: dict = {}
-    if session.is_group:
+    if _is_group:
         user_ids_seen = {m.user_id for m in messages if m.role == "user" and m.user_id is not None}
         if user_ids_seen:
             u_rows = await db.execute(
@@ -435,7 +438,7 @@ async def get_session_messages(
         # render a per-message avatar / name label (otherwise every user
         # message looks like it came from the logged-in viewer).
         sender_user_id = None
-        if session.is_group and m.role == "user" and m.user_id is not None:
+        if _is_group and m.role == "user" and m.user_id is not None:
             sender_user_id = str(m.user_id)
             if not sender_name:
                 sender_name = user_name_cache.get(sender_user_id)
