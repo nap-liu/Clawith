@@ -662,6 +662,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 agent_id=agent_id,
                 conversation_id=_history_conv_id,
                 ctx_size=ctx_size,
+                is_group=(chat_type == "group"),
             )
 
             # --- Resolve Feishu sender identity & find/create platform user ---
@@ -805,9 +806,20 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             await db.commit()
 
 
-            # Prepend sender identity so the agent knows who is talking
+            # Build the message we'll send to the LLM. Group chats get a
+            # platform-injected <sender> prefix (see spec §4.0/§4.1); P2P keeps
+            # the legacy `[发送者: ...]` plain prefix (its history is single-
+            # speaker so message-level tagging would be redundant).
+            from app.services.sender_attribution import wrap_with_sender
+
             llm_user_text = user_text
-            if sender_name:
+            if chat_type == "group":
+                llm_user_text = wrap_with_sender(
+                    user_text,
+                    platform_user_id,
+                    sender_name or platform_user.display_name,
+                )
+            elif sender_name:
                 llm_user_text = f"[发送者: {sender_name}] {user_text}"
 
             # ── Inject recent uploaded file context ──────────────────────────
@@ -1046,6 +1058,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     on_chunk=_ws_on_chunk,
                     on_thinking=_ws_on_thinking,
                     on_tool_call=_ws_on_tool_call,
+                    is_group=(chat_type == "group"),
                 )
             finally:
                 _llm_done = True
