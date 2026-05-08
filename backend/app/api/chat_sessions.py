@@ -403,7 +403,11 @@ async def get_session_messages(
         session.last_read_at_by_user = datetime.now(tz.utc)
         await db.commit()
 
-    # Resolve sender names for agent sessions
+    # Resolve sender names. Two flows:
+    # - Agent (A2A) sessions: sender = Participant.display_name keyed by m.participant_id
+    # - Group chat sessions: sender = User.display_name keyed by m.user_id (so group
+    #   chat web UI can label each user message with the actual speaker — multiple
+    #   real humans share the same session and need to be visually distinguished).
     sender_cache: dict = {}
     if session.source_channel == "agent":
         from app.models.participant import Participant
@@ -412,9 +416,29 @@ async def get_session_messages(
                 p_r = await db.execute(select(Participant.display_name).where(Participant.id == m.participant_id))
                 sender_cache[str(m.participant_id)] = p_r.scalar_one_or_none() or "Unknown"
 
+    # For group sessions, batch-resolve User.display_name for every distinct
+    # m.user_id seen on user-role messages — agent (assistant) messages don't
+    # need a sender label here (the UI shows the agent's own avatar/name).
+    user_name_cache: dict = {}
+    if session.is_group:
+        user_ids_seen = {m.user_id for m in messages if m.role == "user" and m.user_id is not None}
+        if user_ids_seen:
+            u_rows = await db.execute(
+                select(User.id, User.display_name).where(User.id.in_(user_ids_seen))
+            )
+            user_name_cache = {str(uid): (name or "Unknown") for uid, name in u_rows.all()}
+
     out = []
     for m in messages:
         sender_name = sender_cache.get(str(m.participant_id)) if m.participant_id else None
+        # Group-chat user messages: surface the speaker so the web UI can
+        # render a per-message avatar / name label (otherwise every user
+        # message looks like it came from the logged-in viewer).
+        sender_user_id = None
+        if session.is_group and m.role == "user" and m.user_id is not None:
+            sender_user_id = str(m.user_id)
+            if not sender_name:
+                sender_name = user_name_cache.get(sender_user_id)
 
         if m.role == "tool_call":
             import json
@@ -431,6 +455,8 @@ async def get_session_messages(
                 pass
             if sender_name:
                 entry["sender_name"] = sender_name
+            if sender_user_id:
+                entry["sender_user_id"] = sender_user_id
             out.append(entry)
             continue
 
@@ -451,6 +477,8 @@ async def get_session_messages(
                 entry["sender_name"] = sender_name
             if m.participant_id:
                 entry["participant_id"] = str(m.participant_id)
+            if sender_user_id:
+                entry["sender_user_id"] = sender_user_id
             out.append(entry)
 
     return out

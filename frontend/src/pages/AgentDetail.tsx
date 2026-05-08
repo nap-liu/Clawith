@@ -6211,18 +6211,31 @@ function AgentDetailInner() {
                                                 // For A2A sessions, determine which participant is "this agent" (left side)
                                                 // Use agent.name matching against sender_name from messages
                                                 const isA2A = activeSession.source_channel === 'agent' || activeSession.participant_type === 'agent';
+                                                const isGroupChat = !isA2A && !!activeSession.is_group;
                                                 const isHumanReadonly = !isA2A && !activeSession.is_group;
                                                 const thisAgentName = (agent as any)?.name;
                                                 // Find this agent's participant_id from loaded messages
                                                 const thisAgentPid = isA2A && thisAgentName
                                                     ? historyMsgs.find((m: any) => m.sender_name === thisAgentName)?.participant_id
                                                     : null;
+                                                const viewerId = currentUser?.id != null ? String(currentUser.id) : null;
                                                 return historyMsgs.map((m: any, i: number) => {
-                                                    // Determine if this message is from "this agent" (left) or peer (right)
-                                                    // Actually, "this agent" should be on the RIGHT (like 'me'), and peer on the LEFT
-                                                    const isLeft = isA2A && thisAgentPid
-                                                        ? m.participant_id !== thisAgentPid
-                                                        : m.role === 'assistant';
+                                                    // Determine if this message is from "this agent" (left) or peer (right).
+                                                    // Group chat: assistant always left; user msgs are RIGHT only when sent
+                                                    // by the logged-in viewer themself, otherwise LEFT (so each distinct
+                                                    // human speaker gets their own avatar/name label).
+                                                    let isLeft: boolean;
+                                                    if (isA2A && thisAgentPid) {
+                                                        isLeft = m.participant_id !== thisAgentPid;
+                                                    } else if (isGroupChat) {
+                                                        if (m.role === 'assistant') {
+                                                            isLeft = true;
+                                                        } else {
+                                                            isLeft = !(viewerId && m.sender_user_id && m.sender_user_id === viewerId);
+                                                        }
+                                                    } else {
+                                                        isLeft = m.role === 'assistant';
+                                                    }
                                                     if (m.role === 'tool_call') {
                                                         const tName = m.toolName || (() => { try { return JSON.parse(m.content || '{}').name; } catch { return 'tool'; } })();
                                                         const tArgs = m.toolArgs || (() => { try { return JSON.parse(m.content || '{}').args; } catch { return {}; } })();
@@ -6260,9 +6273,25 @@ function AgentDetailInner() {
                                                                 i={i}
                                                                 isLeft={isLeft}
                                                                 t={t}
-                                                                senderLabel={isHumanReadonly ? (isLeft ? ((agent as any)?.name || 'Agent') : (activeSession.username || 'User')) : undefined}
-                                                                avatarText={isHumanReadonly ? (isLeft ? (((agent as any)?.name || 'Agent')[0]) : ((activeSession.username || 'User')[0])) : undefined}
-                                                                forceSenderLabel={isHumanReadonly}
+                                                                senderLabel={
+                                                                    isHumanReadonly
+                                                                        ? (isLeft ? ((agent as any)?.name || 'Agent') : (activeSession.username || 'User'))
+                                                                        : isGroupChat
+                                                                            ? (m.role === 'assistant'
+                                                                                ? ((agent as any)?.name || 'Agent')
+                                                                                : (m.sender_name || 'User'))
+                                                                            : undefined
+                                                                }
+                                                                avatarText={
+                                                                    isHumanReadonly
+                                                                        ? (isLeft ? (((agent as any)?.name || 'Agent')[0]) : ((activeSession.username || 'User')[0]))
+                                                                        : isGroupChat
+                                                                            ? (m.role === 'assistant'
+                                                                                ? ((((agent as any)?.name || 'Agent')[0]) || 'A')
+                                                                                : ((m.sender_name && m.sender_name[0]) || 'U'))
+                                                                            : undefined
+                                                                }
+                                                                forceSenderLabel={isHumanReadonly || isGroupChat}
                                                             />
                                                         </React.Fragment>
                                                     );
