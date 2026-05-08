@@ -2705,6 +2705,13 @@ function AgentDetailInner() {
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
+                // Group-chat per-message attribution (Phase 2 #1): when the
+                // backend resolved a real sender, surface it through the
+                // shape so the renderer can label the bubble. parseChatMsg
+                // happens to drop unknown keys, so we need to pre-pack them.
+                ...(m.sender_name && { sender_name: m.sender_name }),
+                ...(m.sender_user_id && { sender_user_id: m.sender_user_id }),
+                ...(m.participant_id && { participant_id: m.participant_id }),
             }));
 
             if (writable) {
