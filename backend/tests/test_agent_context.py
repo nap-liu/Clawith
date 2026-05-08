@@ -72,6 +72,10 @@ async def test_p2p_includes_current_conversation():
     )
     assert "## Current Conversation" in dynamic_p
     assert "Alice" in dynamic_p
+    # The Message Sender Tag rules block is unconditional — it must be in
+    # static_parts even for P2P (regression guard against someone making
+    # the rules-block injection conditional on is_group).
+    assert "## Message Sender Tag (Group Chat)" in static_p
 
 
 async def test_group_excludes_current_conversation():
