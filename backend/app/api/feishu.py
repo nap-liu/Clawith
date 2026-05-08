@@ -1582,6 +1582,7 @@ async def _call_agent_llm(
     on_chunk=None,
     on_thinking=None,
     on_tool_call=None,
+    is_group: bool = False,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
     
@@ -1656,6 +1657,7 @@ async def _call_agent_llm(
                 on_chunk=on_chunk,
                 on_thinking=on_thinking,
                 on_tool_call=on_tool_call,
+                is_group=is_group,
             ),
             timeout=_timeout,
         )
@@ -1683,6 +1685,7 @@ async def _call_agent_llm(
                         on_chunk=on_chunk,
                         on_thinking=on_thinking,
                         on_tool_call=on_tool_call,
+                        is_group=is_group,
                     ),
                     timeout=_fb_timeout,
                 )
@@ -1721,6 +1724,7 @@ async def _call_agent_llm(
                         on_chunk=on_chunk,
                         on_thinking=on_thinking,
                         on_tool_call=on_tool_call,
+                        is_group=is_group,
                     ),
                     timeout=_fb_timeout,
                 )
