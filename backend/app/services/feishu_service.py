@@ -410,6 +410,35 @@ class FeishuService:
             data = self._parse_api_response(resp, stage=stage, message_id=message_id)
             return data
 
+    async def get_chat_info(self, app_id: str, app_secret: str, chat_id: str) -> dict | None:
+        """Fetch group chat metadata (name, description, member count) via the
+        Open Platform ``im/v1/chats/{chat_id}`` endpoint. Returns None on failure
+        so callers can fall back to a placeholder group name without surfacing
+        the error to the user. Requires ``im:chat:readonly`` permission.
+        """
+        if not chat_id:
+            return None
+        try:
+            token = await self.get_tenant_access_token(app_id, app_secret)
+            if not token:
+                return None
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                data = resp.json()
+                if data.get("code") != 0:
+                    logger.warning(
+                        f"[Feishu] get_chat_info failed for {chat_id}: "
+                        f"code={data.get('code')} msg={data.get('msg')}"
+                    )
+                    return None
+                return data.get("data") or None
+        except Exception as e:
+            logger.warning(f"[Feishu] get_chat_info exception for {chat_id}: {e}")
+            return None
+
     async def resolve_open_id(self, app_id: str, app_secret: str,
                                email: str | None = None, mobile: str | None = None) -> str | None:
         """Resolve a user's open_id for a specific app using email or mobile.

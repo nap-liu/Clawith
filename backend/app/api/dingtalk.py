@@ -257,6 +257,7 @@ async def process_dingtalk_message(
     sender_nick: str = "",
     message_id: str = "",
     sender_id: str = "",
+    conversation_title: str = "",
 ):
     """Process an incoming DingTalk bot message and reply via session webhook.
 
@@ -521,6 +522,16 @@ async def process_dingtalk_message(
                 })
             return
 
+        # Use the real DingTalk group title when the stream event provides one;
+        # fall back to a conversation_id-based placeholder otherwise.
+        _dt_group_name = None
+        if conversation_type == "2":
+            _dt_group_name = (
+                conversation_title.strip()
+                if conversation_title and conversation_title.strip()
+                else f"DingTalk Group {conversation_id[:12]}"
+            )
+
         # Find or create session
         sess = await find_or_create_channel_session(
             db=db,
@@ -530,11 +541,7 @@ async def process_dingtalk_message(
             source_channel="dingtalk",
             first_message_title=user_text,
             is_group=(conversation_type == "2"),
-            group_name=(
-                f"DingTalk Group {conversation_id[:12]}"
-                if conversation_type == "2"
-                else None
-            ),
+            group_name=_dt_group_name,
         )
         session_conv_id = str(sess.id)
 

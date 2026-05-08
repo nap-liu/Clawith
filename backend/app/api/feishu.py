@@ -788,6 +788,26 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             # ── Find-or-create a ChatSession via external_conv_id (DB-based, no cache needed) ──
             from datetime import datetime as _dt, timezone as _tz
             _is_group = (chat_type == "group")
+
+            # For group chats, fetch the real chat title from Feishu so the
+            # session shows e.g. "产品讨论组" instead of "Feishu Group ou_xxx".
+            # API failure falls back to the conversation_id-based placeholder
+            # so a chat-info hiccup never blocks message processing.
+            _fs_group_name = None
+            if _is_group:
+                try:
+                    _chat_info = await feishu_service.get_chat_info(
+                        config.app_id, config.app_secret, chat_id,
+                    )
+                    _real_name = (_chat_info or {}).get("name") if _chat_info else None
+                    _fs_group_name = (
+                        _real_name.strip() if _real_name and _real_name.strip()
+                        else f"Feishu Group {chat_id[:12]}"
+                    )
+                except Exception as _gci_err:
+                    logger.warning(f"[Feishu] chat-info lookup failed: {_gci_err}")
+                    _fs_group_name = f"Feishu Group {chat_id[:12]}"
+
             _sess = await find_or_create_channel_session(
                 db=db,
                 agent_id=agent_id,
@@ -796,7 +816,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 source_channel="feishu",
                 first_message_title=user_text,
                 is_group=_is_group,
-                group_name=f"Feishu Group {chat_id[:8]}" if _is_group else None,
+                group_name=_fs_group_name,
             )
             session_conv_id = str(_sess.id)
 
@@ -1360,12 +1380,30 @@ async def _handle_feishu_file(
             _ag_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
             _ag_obj = _ag_r.scalar_one_or_none()
             _file_user_id = _ag_obj.creator_id if _ag_obj else platform_user_id
+
+        # Resolve real Feishu group title (mirror of the text path) so file
+        # uploads in a new group also land under a recognizable session title.
+        _fs_file_group_name = None
+        if _is_group_file:
+            try:
+                _chat_info = await feishu_service.get_chat_info(
+                    config.app_id, config.app_secret, chat_id,
+                )
+                _real_name = (_chat_info or {}).get("name") if _chat_info else None
+                _fs_file_group_name = (
+                    _real_name.strip() if _real_name and _real_name.strip()
+                    else f"Feishu Group {chat_id[:12]}"
+                )
+            except Exception as _gci_err:
+                logger.warning(f"[Feishu] chat-info lookup failed (file path): {_gci_err}")
+                _fs_file_group_name = f"Feishu Group {chat_id[:12]}"
+
         _sess = await find_or_create_channel_session(
             db=db, agent_id=agent_id, user_id=_file_user_id,
             external_conv_id=conv_id, source_channel="feishu",
             first_message_title=f"[文件] {filename}",
             is_group=_is_group_file,
-            group_name=f"Feishu Group {chat_id[:8]}" if _is_group_file else None,
+            group_name=_fs_file_group_name,
         )
         session_conv_id = str(_sess.id)
 
