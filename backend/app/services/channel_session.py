@@ -59,6 +59,17 @@ async def find_or_create_channel_session(
         if not session.is_group and session.user_id != user_id:
             session.user_id = user_id
 
+        # Upgrade legacy rows that were created before is_group was passed
+        # by the channel entry. Idempotent: when callers correctly mark a
+        # session as group, the existing row gets retroactively flagged
+        # and gains a group_name + title (downstream UI / listing surfaces
+        # rely on session.is_group being accurate).
+        if is_group and not session.is_group:
+            session.is_group = True
+            if group_name:
+                session.group_name = group_name
+                session.title = group_name[:40]
+
         # For group sessions: update group_name if it changed
         if session.is_group and group_name and session.group_name != group_name:
             session.group_name = group_name

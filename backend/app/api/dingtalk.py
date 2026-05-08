@@ -531,7 +531,7 @@ async def process_dingtalk_message(
             first_message_title=user_text,
             is_group=(conversation_type == "2"),
             group_name=(
-                f"DingTalk Group {conversation_id[:8]}"
+                f"DingTalk Group {conversation_id[:12]}"
                 if conversation_type == "2"
                 else None
             ),
