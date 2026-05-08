@@ -529,6 +529,12 @@ async def process_dingtalk_message(
             external_conv_id=conv_id,
             source_channel="dingtalk",
             first_message_title=user_text,
+            is_group=(conversation_type == "2"),
+            group_name=(
+                f"DingTalk Group {conversation_id[:8]}"
+                if conversation_type == "2"
+                else None
+            ),
         )
         session_conv_id = str(sess.id)
 
