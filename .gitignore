@@ -45,3 +45,25 @@ docs/
 replay-data/
 replay-panic.sh
 docker-compose.replay.yml
+
+# Prod data — never commit (added 2026-05-08 after release-20260508-9efeba2)
+# Path-limited to repo root so test fixtures / frontend assets stay tracked.
+/baseline-*
+/prod-*.dump
+/prod-snapshot-*.tar.gz
+/final.*
+/replay-*.dump
+/replay-*.tar.gz
+
+# Browser session caches (Playwright/Chrome devtools — may carry session tokens,
+# screenshots of prod UI, or response bodies with real user data).
+.playwright-mcp/
+.chrome-devtools-mcp/
+
+# Debugging residue at repo root only (frontend/public/, tests/fixtures/ stay tracked).
+/*.png
+/*.jpeg
+/snap-*.yml
+/.last-release-tag
+/.local-cleanup-*.sh
+/.merge-conflicts.txt
