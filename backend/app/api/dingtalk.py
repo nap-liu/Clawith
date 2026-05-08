@@ -1,6 +1,37 @@
 """DingTalk Channel API routes.
 
 Provides Config CRUD and message handling for DingTalk bots using Stream mode.
+
+Known limitation — quoted reply (Phase 2 #3, 2026-05-08):
+    DingTalk's robot APIs do NOT expose a "reply to a specific message" /
+    "quote message" capability. We confirmed this directly from the
+    official docs:
+
+      https://open.dingtalk.com/document/dingstart/robot-reply-and-send-messages
+        > "机器人回复消息本质上就是机器人发送消息的过程。因此本文中,
+        >  回复消息和发送消息具有相同的含义。"
+        (Robot "reply" is literally a synonym for "send"; there is no
+         thread/quote semantics.)
+
+      https://open.dingtalk.com/document/development/the-robot-sends-a-group-message
+        Body schema: {msgParam, msgKey, openConversationId, robotCode,
+                      coolAppCode}. No quoteMessageId / parentMessageId /
+        replyTo field of any kind.
+
+    All msgKey templates (sampleText / sampleMarkdown / sampleActionCard /
+    etc., enumerated at /document/dingstart/types-of-messages-sent-by-robots)
+    likewise carry no quote-related field.
+
+    Workaround possibilities considered and rejected:
+      - markdown `> blockquote` to *visually* echo the user's text:
+        rejected because it looks like a real quoted reply but does not
+        link back to the source message in the DingTalk UI, which is
+        actively misleading.
+
+    Feishu's quoted reply ships in feishu_service.send_message via the
+    POST /open-apis/im/v1/messages/{message_id}/reply endpoint — see that
+    function's docstring. Until DingTalk OpenAPI gains an equivalent,
+    DingTalk replies stay plain.
 """
 
 import uuid
