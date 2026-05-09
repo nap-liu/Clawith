@@ -22,14 +22,12 @@ gets its own fixture scope:
   - test_new_path_ignores_unlinked_tools — env flag NOT set
   - test_legacy_path_reads_unlinked_tools — env flag IS set
 
-A shared module-level agent_id (set during collection) would race between
-async setups; instead we create a single agent in a session-scoped fixture
-so both tests share the same seeded row.
+Each test seeds its own fresh agent (unique uuid suffix) so there is no
+shared fixture state and no cross-loop event-loop hazard.
 """
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
@@ -57,12 +55,18 @@ async def _isolate():
     await engine.dispose()
 
 
-@pytest.fixture(scope="module")
-async def seeded_agent_id() -> uuid.UUID:
-    """Seed a single Identity → User → Agent + Tool(mcp_server_id=None) chain.
+# ---------------------------------------------------------------------------
+# Helper (free async function, NOT a fixture)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_agent_with_mcp_tool(prompt_block: str) -> uuid.UUID:
+    """Seed a fresh Identity → User → Agent + Tool(mcp_server_id=None) chain.
 
     The tool has system_prompt_block set but mcp_server_id IS NULL, which
     represents the *unmigrated* state: only the legacy collector sees it.
+
+    Returns the new agent's UUID.
     """
     suffix = uuid.uuid4().hex[:6]
     async with async_session() as db:
@@ -92,7 +96,7 @@ async def seeded_agent_id() -> uuid.UUID:
             display_name="t",
             type="mcp",
             mcp_server_url=f"https://test.example/{suffix}",
-            system_prompt_block="LEGACY-BLOCK",
+            system_prompt_block=prompt_block,
             mcp_server_id=None,  # not linked to mcp_servers → new path ignores it
         )
         db.add(tool)
@@ -109,21 +113,24 @@ async def seeded_agent_id() -> uuid.UUID:
 # ---------------------------------------------------------------------------
 
 
-async def test_new_path_ignores_unlinked_tools(seeded_agent_id: uuid.UUID):
+async def test_new_path_ignores_unlinked_tools(monkeypatch):
     """Default (new) path: tool with mcp_server_id=NULL is NOT surfaced.
 
     The new collector joins against mcp_servers via Tool.mcp_server_id; when
     that column is NULL the tool contributes no MCP prompt block.
     """
-    # Make sure the flag is NOT set for this test.
-    os.environ.pop("MCP_USE_LEGACY_COLLECTOR", None)
+    # Ensure the flag is absent, then immediately bust the lru_cache so
+    # get_settings() re-reads from the current environment.
+    monkeypatch.delenv("MCP_USE_LEGACY_COLLECTOR", raising=False)
 
     from app.config import get_settings
     from app.services.agent_context import _collect_extension_prompts
 
-    get_settings.cache_clear()
+    get_settings.cache_clear()  # right after env mutation, before any settings read
+
+    agent_id = await _seed_agent_with_mcp_tool("LEGACY-BLOCK")
     try:
-        blocks = await _collect_extension_prompts(seeded_agent_id)
+        blocks = await _collect_extension_prompts(agent_id)
     finally:
         get_settings.cache_clear()
 
@@ -133,7 +140,7 @@ async def test_new_path_ignores_unlinked_tools(seeded_agent_id: uuid.UUID):
     )
 
 
-async def test_legacy_path_reads_unlinked_tools(seeded_agent_id: uuid.UUID, monkeypatch):
+async def test_legacy_path_reads_unlinked_tools(monkeypatch):
     """Legacy path (MCP_USE_LEGACY_COLLECTOR=1): reads tools.system_prompt_block directly.
 
     Even though mcp_server_id is NULL the legacy collector reads the column
@@ -144,9 +151,11 @@ async def test_legacy_path_reads_unlinked_tools(seeded_agent_id: uuid.UUID, monk
     from app.config import get_settings
     from app.services.agent_context import _collect_extension_prompts
 
-    get_settings.cache_clear()
+    get_settings.cache_clear()  # right after env mutation, before any settings read
+
+    agent_id = await _seed_agent_with_mcp_tool("LEGACY-BLOCK")
     try:
-        blocks = await _collect_extension_prompts(seeded_agent_id)
+        blocks = await _collect_extension_prompts(agent_id)
     finally:
         get_settings.cache_clear()
 
