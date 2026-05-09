@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import cast, select, func, String
+from sqlalchemy import and_, cast, func, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access
@@ -195,13 +195,35 @@ async def list_sessions(
         return out
 
     else:  # scope == "mine"
+        # Group membership signal: at least one user-role message authored by
+        # the current user in this session. Mirrors P2P/group-chat client UX —
+        # if you have spoken in the group, the conversation surfaces in your
+        # own session list (you don't need admin scope=all to see it).
+        group_membership = (
+            select(ChatMessage.id)
+            .where(
+                ChatMessage.conversation_id == cast(ChatSession.id, String),
+                ChatMessage.role == "user",
+                ChatMessage.user_id == current_user.id,
+            )
+            .correlate(ChatSession)
+            .exists()
+        )
         result = await db.execute(
             select(ChatSession)
             .where(
                 ChatSession.agent_id == agent_id,
-                ChatSession.user_id == current_user.id,
-                ChatSession.is_group == False,  # Group sessions are not "mine"
                 ChatSession.source_channel.notin_(["agent", "trigger"]),  # Exclude agent-to-agent and reflection sessions
+                or_(
+                    and_(
+                        ChatSession.is_group == False,
+                        ChatSession.user_id == current_user.id,
+                    ),
+                    and_(
+                        ChatSession.is_group == True,
+                        group_membership,
+                    ),
+                ),
             )
             .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
         )
@@ -232,6 +254,7 @@ async def list_sessions(
                 .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
                 .where(
                     ChatSession.id.in_(session_uuid_ids),
+                    ChatSession.is_group == False,  # group last_read_at is shared; per-user unread undefined
                     ChatMessage.role.in_(["assistant", "system", "tool_call"]),
                     ChatMessage.created_at > func.coalesce(
                         ChatSession.last_read_at_by_user,
@@ -254,6 +277,7 @@ async def list_sessions(
                 id=str(session.id),
                 agent_id=str(session.agent_id),
                 user_id=str(session.user_id),
+                username=(session.group_name or session.title) if session.is_group else None,
                 source_channel=session.source_channel,
                 title=session.title,
                 created_at=session.created_at.isoformat(),
@@ -261,6 +285,9 @@ async def list_sessions(
                 message_count=count,
                 unread_count=unread_counts.get(str(session.id), 0),
                 is_primary=bool(session.is_primary),
+                participant_type="group" if session.is_group else "user",
+                is_group=bool(session.is_group),
+                group_name=session.group_name,
             ))
         return out
 
