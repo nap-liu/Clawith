@@ -662,6 +662,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 agent_id=agent_id,
                 conversation_id=_history_conv_id,
                 ctx_size=ctx_size,
+                is_group=(chat_type == "group"),
             )
 
             # --- Resolve Feishu sender identity & find/create platform user ---
@@ -787,6 +788,26 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             # ── Find-or-create a ChatSession via external_conv_id (DB-based, no cache needed) ──
             from datetime import datetime as _dt, timezone as _tz
             _is_group = (chat_type == "group")
+
+            # For group chats, fetch the real chat title from Feishu so the
+            # session shows e.g. "产品讨论组" instead of "Feishu Group ou_xxx".
+            # API failure falls back to the conversation_id-based placeholder
+            # so a chat-info hiccup never blocks message processing.
+            _fs_group_name = None
+            if _is_group:
+                try:
+                    _chat_info = await feishu_service.get_chat_info(
+                        config.app_id, config.app_secret, chat_id,
+                    )
+                    _real_name = (_chat_info or {}).get("name") if _chat_info else None
+                    _fs_group_name = (
+                        _real_name.strip() if _real_name and _real_name.strip()
+                        else f"Feishu Group {chat_id[:12]}"
+                    )
+                except Exception as _gci_err:
+                    logger.warning(f"[Feishu] chat-info lookup failed: {_gci_err}")
+                    _fs_group_name = f"Feishu Group {chat_id[:12]}"
+
             _sess = await find_or_create_channel_session(
                 db=db,
                 agent_id=agent_id,
@@ -795,7 +816,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 source_channel="feishu",
                 first_message_title=user_text,
                 is_group=_is_group,
-                group_name=f"Feishu Group {chat_id[:8]}" if _is_group else None,
+                group_name=_fs_group_name,
             )
             session_conv_id = str(_sess.id)
 
@@ -805,9 +826,20 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             await db.commit()
 
 
-            # Prepend sender identity so the agent knows who is talking
+            # Build the message we'll send to the LLM. Group chats get a
+            # platform-injected <sender> prefix (see spec §4.0/§4.1); P2P keeps
+            # the legacy `[发送者: ...]` plain prefix (its history is single-
+            # speaker so message-level tagging would be redundant).
+            from app.services.sender_attribution import wrap_with_sender
+
             llm_user_text = user_text
-            if sender_name:
+            if chat_type == "group":
+                llm_user_text = wrap_with_sender(
+                    user_text,
+                    platform_user_id,
+                    sender_name or platform_user.display_name,
+                )
+            elif sender_name:
                 llm_user_text = f"[发送者: {sender_name}] {user_text}"
 
             # ── Inject recent uploaded file context ──────────────────────────
@@ -894,6 +926,12 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
 
             _reply_target = chat_id if chat_type == "group" and chat_id else sender_open_id
             _rid_type = "chat_id" if chat_type == "group" and chat_id else "open_id"
+            # Quote the user's original message in groups so the agent's reply
+            # threads under it in the Feishu client (Phase 2 #3). Outside group
+            # chats we don't need quoting — P2P already has a single thread.
+            _reply_to_user_msg_id = (
+                message.get("message_id") or "" if chat_type == "group" else ""
+            )
 
             _stream_buffer: list[str] = []
             _thinking_buffer: list[str] = []
@@ -948,6 +986,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     _json.dumps(_init_card),
                     receive_id_type=_rid_type,
                     stage="stream_init_card",
+                    reply_to_message_id=_reply_to_user_msg_id or None,
                 )
                 _patch_msg_id = _init_resp.get("data", {}).get("message_id")
             except Exception as e:
@@ -1046,6 +1085,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     on_chunk=_ws_on_chunk,
                     on_thinking=_ws_on_thinking,
                     on_tool_call=_ws_on_tool_call,
+                    is_group=(chat_type == "group"),
                 )
             finally:
                 _llm_done = True
@@ -1347,12 +1387,30 @@ async def _handle_feishu_file(
             _ag_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
             _ag_obj = _ag_r.scalar_one_or_none()
             _file_user_id = _ag_obj.creator_id if _ag_obj else platform_user_id
+
+        # Resolve real Feishu group title (mirror of the text path) so file
+        # uploads in a new group also land under a recognizable session title.
+        _fs_file_group_name = None
+        if _is_group_file:
+            try:
+                _chat_info = await feishu_service.get_chat_info(
+                    config.app_id, config.app_secret, chat_id,
+                )
+                _real_name = (_chat_info or {}).get("name") if _chat_info else None
+                _fs_file_group_name = (
+                    _real_name.strip() if _real_name and _real_name.strip()
+                    else f"Feishu Group {chat_id[:12]}"
+                )
+            except Exception as _gci_err:
+                logger.warning(f"[Feishu] chat-info lookup failed (file path): {_gci_err}")
+                _fs_file_group_name = f"Feishu Group {chat_id[:12]}"
+
         _sess = await find_or_create_channel_session(
             db=db, agent_id=agent_id, user_id=_file_user_id,
             external_conv_id=conv_id, source_channel="feishu",
             first_message_title=f"[文件] {filename}",
             is_group=_is_group_file,
-            group_name=f"Feishu Group {chat_id[:8]}" if _is_group_file else None,
+            group_name=_fs_file_group_name,
         )
         session_conv_id = str(_sess.id)
 
@@ -1378,6 +1436,7 @@ async def _handle_feishu_file(
             agent_id=agent_id,
             conversation_id=session_conv_id,
             ctx_size=ctx_size,
+            is_group=(chat_type == "group"),
         )
 
         await db.commit()
@@ -1390,6 +1449,9 @@ async def _handle_feishu_file(
         _reply_to = chat_id if chat_type == "group" else sender_open_id
         _rid_type = "chat_id" if chat_type == "group" else "open_id"
         _agent_name = agent_obj.name if agent_obj else "AI"
+        # Quote the user's image message in groups so the agent's reply card
+        # threads under it (Phase 2 #3 — image path mirror of the text path).
+        _img_reply_to_user_msg_id = message_id if chat_type == "group" else ""
         _init_card = {
             "config": {"update_multi": True},
             "header": {"template": "blue", "title": {"content": "识别图片中...", "tag": "plain_text"}},
@@ -1399,7 +1461,8 @@ async def _handle_feishu_file(
         try:
             _init_resp = await feishu_service.send_message(
                 config.app_id, config.app_secret, _reply_to, "interactive",
-                _json_card_img.dumps(_init_card), receive_id_type=_rid_type, stage="image_stream_init_card"
+                _json_card_img.dumps(_init_card), receive_id_type=_rid_type, stage="image_stream_init_card",
+                reply_to_message_id=_img_reply_to_user_msg_id or None,
             )
             _patch_msg_id = _init_resp.get("data", {}).get("message_id")
         except Exception as _e_init:
@@ -1473,12 +1536,30 @@ async def _handle_feishu_file(
         if _patch_msg_id:
             _img_heartbeat_task = asyncio.create_task(_img_heartbeat())
 
+        # Group chats get a platform-injected <sender> prefix (spec §4.0/§4.1).
+        # P2P keeps the legacy `[发送者: name]` plain prefix unchanged.
+        # The image markers in user_msg_content are inside the prefix's content
+        # body — image_context.rehydrate_image_messages uses re.search and is
+        # position-agnostic, so wrap order doesn't break vision rehydration.
+        from app.services.sender_attribution import wrap_with_sender
+
+        llm_user_msg_content = user_msg_content
+        if chat_type == "group":
+            llm_user_msg_content = wrap_with_sender(
+                user_msg_content,
+                platform_user_id,
+                sender_name or platform_user.display_name,
+            )
+        elif sender_name:
+            llm_user_msg_content = f"[发送者: {sender_name}] {user_msg_content}"
+
         # Call LLM with image marker — vision models will parse it
         async with _async_session() as _db_img:
             try:
                 reply_text = await _call_agent_llm(
-                    _db_img, agent_id, user_msg_content, history=_history,
+                    _db_img, agent_id, llm_user_msg_content, history=_history,
                     user_id=platform_user_id, session_id=session_conv_id, on_chunk=_img_on_chunk,
+                    is_group=(chat_type == "group"),
                 )
             finally:
                 _img_llm_done = True
@@ -1582,6 +1663,7 @@ async def _call_agent_llm(
     on_chunk=None,
     on_thinking=None,
     on_tool_call=None,
+    is_group: bool = False,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
     
@@ -1656,6 +1738,7 @@ async def _call_agent_llm(
                 on_chunk=on_chunk,
                 on_thinking=on_thinking,
                 on_tool_call=on_tool_call,
+                is_group=is_group,
             ),
             timeout=_timeout,
         )
@@ -1683,6 +1766,7 @@ async def _call_agent_llm(
                         on_chunk=on_chunk,
                         on_thinking=on_thinking,
                         on_tool_call=on_tool_call,
+                        is_group=is_group,
                     ),
                     timeout=_fb_timeout,
                 )
@@ -1721,6 +1805,7 @@ async def _call_agent_llm(
                         on_chunk=on_chunk,
                         on_thinking=on_thinking,
                         on_tool_call=on_tool_call,
+                        is_group=is_group,
                     ),
                     timeout=_fb_timeout,
                 )

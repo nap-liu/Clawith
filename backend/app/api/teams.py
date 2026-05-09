@@ -477,6 +477,7 @@ async def teams_event_webhook(
             agent_id=agent_id,
             conversation_id=session_conv_id,
             ctx_size=ctx_size,
+            is_group=False,  # group-chat sender wrap not enabled for Teams yet
         )
 
         # Save user message

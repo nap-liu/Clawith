@@ -598,6 +598,7 @@ async def _process_wecom_text(
             agent_id=agent_id,
             conversation_id=session_conv_id,
             ctx_size=ctx_size,
+            is_group=False,  # group-chat sender wrap not enabled for WeCom yet
         )
 
         # Save user message

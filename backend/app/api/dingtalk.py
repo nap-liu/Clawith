@@ -1,6 +1,37 @@
 """DingTalk Channel API routes.
 
 Provides Config CRUD and message handling for DingTalk bots using Stream mode.
+
+Known limitation — quoted reply (Phase 2 #3, 2026-05-08):
+    DingTalk's robot APIs do NOT expose a "reply to a specific message" /
+    "quote message" capability. We confirmed this directly from the
+    official docs:
+
+      https://open.dingtalk.com/document/dingstart/robot-reply-and-send-messages
+        > "机器人回复消息本质上就是机器人发送消息的过程。因此本文中,
+        >  回复消息和发送消息具有相同的含义。"
+        (Robot "reply" is literally a synonym for "send"; there is no
+         thread/quote semantics.)
+
+      https://open.dingtalk.com/document/development/the-robot-sends-a-group-message
+        Body schema: {msgParam, msgKey, openConversationId, robotCode,
+                      coolAppCode}. No quoteMessageId / parentMessageId /
+        replyTo field of any kind.
+
+    All msgKey templates (sampleText / sampleMarkdown / sampleActionCard /
+    etc., enumerated at /document/dingstart/types-of-messages-sent-by-robots)
+    likewise carry no quote-related field.
+
+    Workaround possibilities considered and rejected:
+      - markdown `> blockquote` to *visually* echo the user's text:
+        rejected because it looks like a real quoted reply but does not
+        link back to the source message in the DingTalk UI, which is
+        actively misleading.
+
+    Feishu's quoted reply ships in feishu_service.send_message via the
+    POST /open-apis/im/v1/messages/{message_id}/reply endpoint — see that
+    function's docstring. Until DingTalk OpenAPI gains an equivalent,
+    DingTalk replies stay plain.
 """
 
 import uuid
@@ -257,6 +288,7 @@ async def process_dingtalk_message(
     sender_nick: str = "",
     message_id: str = "",
     sender_id: str = "",
+    conversation_title: str = "",
 ):
     """Process an incoming DingTalk bot message and reply via session webhook.
 
@@ -521,6 +553,16 @@ async def process_dingtalk_message(
                 })
             return
 
+        # Use the real DingTalk group title when the stream event provides one;
+        # fall back to a conversation_id-based placeholder otherwise.
+        _dt_group_name = None
+        if conversation_type == "2":
+            _dt_group_name = (
+                conversation_title.strip()
+                if conversation_title and conversation_title.strip()
+                else f"DingTalk Group {conversation_id[:12]}"
+            )
+
         # Find or create session
         sess = await find_or_create_channel_session(
             db=db,
@@ -529,6 +571,8 @@ async def process_dingtalk_message(
             external_conv_id=conv_id,
             source_channel="dingtalk",
             first_message_title=user_text,
+            is_group=(conversation_type == "2"),
+            group_name=_dt_group_name,
         )
         session_conv_id = str(sess.id)
 
@@ -540,6 +584,7 @@ async def process_dingtalk_message(
             conversation_id=session_conv_id,
             ctx_size=ctx_size,
             rehydrate_images_max=3,
+            is_group=(conversation_type == "2"),
         )
 
         # Save user message — use display-friendly format for DB (no base64)
@@ -660,11 +705,26 @@ async def process_dingtalk_message(
 
             _cfs_token = _cfs.set(_dingtalk_file_sender)
 
+        from app.services.sender_attribution import wrap_with_sender
+
+        # Group chats get a platform-injected <sender> prefix (spec §4.0/§4.1).
+        # DingTalk P2P had no prefix before this iteration and we keep it that
+        # way — agent_context's "## Current Conversation" handles the single-
+        # speaker session-level identity.
+        llm_user_text = user_text
+        if conversation_type == "2":
+            llm_user_text = wrap_with_sender(
+                user_text,
+                platform_user_id,
+                sender_nick or platform_user.display_name,
+            )
+
         # Call LLM
         try:
             reply_text = await _call_agent_llm(
-                db, agent_id, user_text,
+                db, agent_id, llm_user_text,
                 history=history, user_id=platform_user_id,
+                is_group=(conversation_type == "2"),
             )
         finally:
             # Reset ContextVar

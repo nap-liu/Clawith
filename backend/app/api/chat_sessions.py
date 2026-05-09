@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import cast, select, func, String
+from sqlalchemy import and_, cast, func, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access
@@ -195,13 +195,35 @@ async def list_sessions(
         return out
 
     else:  # scope == "mine"
+        # Group membership signal: at least one user-role message authored by
+        # the current user in this session. Mirrors P2P/group-chat client UX —
+        # if you have spoken in the group, the conversation surfaces in your
+        # own session list (you don't need admin scope=all to see it).
+        group_membership = (
+            select(ChatMessage.id)
+            .where(
+                ChatMessage.conversation_id == cast(ChatSession.id, String),
+                ChatMessage.role == "user",
+                ChatMessage.user_id == current_user.id,
+            )
+            .correlate(ChatSession)
+            .exists()
+        )
         result = await db.execute(
             select(ChatSession)
             .where(
                 ChatSession.agent_id == agent_id,
-                ChatSession.user_id == current_user.id,
-                ChatSession.is_group == False,  # Group sessions are not "mine"
                 ChatSession.source_channel.notin_(["agent", "trigger"]),  # Exclude agent-to-agent and reflection sessions
+                or_(
+                    and_(
+                        ChatSession.is_group == False,
+                        ChatSession.user_id == current_user.id,
+                    ),
+                    and_(
+                        ChatSession.is_group == True,
+                        group_membership,
+                    ),
+                ),
             )
             .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
         )
@@ -232,6 +254,7 @@ async def list_sessions(
                 .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
                 .where(
                     ChatSession.id.in_(session_uuid_ids),
+                    ChatSession.is_group == False,  # group last_read_at is shared; per-user unread undefined
                     ChatMessage.role.in_(["assistant", "system", "tool_call"]),
                     ChatMessage.created_at > func.coalesce(
                         ChatSession.last_read_at_by_user,
@@ -254,6 +277,7 @@ async def list_sessions(
                 id=str(session.id),
                 agent_id=str(session.agent_id),
                 user_id=str(session.user_id),
+                username=(session.group_name or session.title) if session.is_group else None,
                 source_channel=session.source_channel,
                 title=session.title,
                 created_at=session.created_at.isoformat(),
@@ -261,6 +285,9 @@ async def list_sessions(
                 message_count=count,
                 unread_count=unread_counts.get(str(session.id), 0),
                 is_primary=bool(session.is_primary),
+                participant_type="group" if session.is_group else "user",
+                is_group=bool(session.is_group),
+                group_name=session.group_name,
             ))
         return out
 
@@ -377,9 +404,28 @@ async def get_session_messages(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Permission: session owner, agent creator, or admin.
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
-        raise HTTPException(status_code=403, detail="Not authorized to view this session")
+    # Permission:
+    # - non-group: session owner OR admin/creator
+    # - group: same, plus any user with user-role messages in the session
+    #   (mirrors scope=mine membership rule — if you spoke in the group, you
+    #   can read its history; silent observers and non-members stay blocked).
+    is_owner = str(session.user_id) == str(current_user.id)
+    is_privileged = _can_view_all_agent_chat_sessions(current_user, agent)
+    if not (is_owner or is_privileged):
+        is_group_member = False
+        if bool(getattr(session, "is_group", False)):
+            member_r = await db.execute(
+                select(ChatMessage.id)
+                .where(
+                    ChatMessage.conversation_id == str(session_id),
+                    ChatMessage.role == "user",
+                    ChatMessage.user_id == current_user.id,
+                )
+                .limit(1)
+            )
+            is_group_member = member_r.scalar_one_or_none() is not None
+        if not is_group_member:
+            raise HTTPException(status_code=403, detail="Not authorized to view this session")
 
     # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
     # Query the latest 500 messages (subquery in DESC, then reverse for display order)
@@ -403,7 +449,11 @@ async def get_session_messages(
         session.last_read_at_by_user = datetime.now(tz.utc)
         await db.commit()
 
-    # Resolve sender names for agent sessions
+    # Resolve sender names. Two flows:
+    # - Agent (A2A) sessions: sender = Participant.display_name keyed by m.participant_id
+    # - Group chat sessions: sender = User.display_name keyed by m.user_id (so group
+    #   chat web UI can label each user message with the actual speaker — multiple
+    #   real humans share the same session and need to be visually distinguished).
     sender_cache: dict = {}
     if session.source_channel == "agent":
         from app.models.participant import Participant
@@ -412,9 +462,32 @@ async def get_session_messages(
                 p_r = await db.execute(select(Participant.display_name).where(Participant.id == m.participant_id))
                 sender_cache[str(m.participant_id)] = p_r.scalar_one_or_none() or "Unknown"
 
+    # For group sessions, batch-resolve User.display_name for every distinct
+    # m.user_id seen on user-role messages — agent (assistant) messages don't
+    # need a sender label here (the UI shows the agent's own avatar/name).
+    # Use getattr defensively: existing tests mock `session` as a SimpleNamespace
+    # that may not carry every ChatSession column.
+    _is_group = bool(getattr(session, "is_group", False))
+    user_name_cache: dict = {}
+    if _is_group:
+        user_ids_seen = {m.user_id for m in messages if m.role == "user" and m.user_id is not None}
+        if user_ids_seen:
+            u_rows = await db.execute(
+                select(User.id, User.display_name).where(User.id.in_(user_ids_seen))
+            )
+            user_name_cache = {str(uid): (name or "Unknown") for uid, name in u_rows.all()}
+
     out = []
     for m in messages:
         sender_name = sender_cache.get(str(m.participant_id)) if m.participant_id else None
+        # Group-chat user messages: surface the speaker so the web UI can
+        # render a per-message avatar / name label (otherwise every user
+        # message looks like it came from the logged-in viewer).
+        sender_user_id = None
+        if _is_group and m.role == "user" and m.user_id is not None:
+            sender_user_id = str(m.user_id)
+            if not sender_name:
+                sender_name = user_name_cache.get(sender_user_id)
 
         if m.role == "tool_call":
             import json
@@ -431,6 +504,8 @@ async def get_session_messages(
                 pass
             if sender_name:
                 entry["sender_name"] = sender_name
+            if sender_user_id:
+                entry["sender_user_id"] = sender_user_id
             out.append(entry)
             continue
 
@@ -451,6 +526,8 @@ async def get_session_messages(
                 entry["sender_name"] = sender_name
             if m.participant_id:
                 entry["participant_id"] = str(m.participant_id)
+            if sender_user_id:
+                entry["sender_user_id"] = sender_user_id
             out.append(entry)
 
     return out

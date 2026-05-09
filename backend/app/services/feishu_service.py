@@ -353,24 +353,58 @@ class FeishuService:
         content: str,
         receive_id_type: str = "open_id",
         stage: str = "send_message",
+        reply_to_message_id: str | None = None,
     ) -> dict:
         """Send a message via a specific Feishu bot (per-agent credentials).
 
         Args:
             app_id: The Feishu app's App ID (per-agent)
             app_secret: The Feishu app's App Secret (per-agent)
-            receive_id: Target user's open_id
+            receive_id: Target user's open_id (ignored when reply_to_message_id is set —
+                Feishu's reply endpoint inherits the original chat from the parent msg).
             msg_type: "text", "interactive", etc.
             content: JSON string of message content
             receive_id_type: "open_id" or "chat_id"
+            reply_to_message_id: When non-empty, send the message as a quoted reply to
+                this Feishu message_id via ``POST /im/v1/messages/{message_id}/reply``
+                so it renders as an in-thread reply in the user's Feishu client. Falls
+                back transparently to a plain send if the reply endpoint fails (e.g.
+                parent message expired, app missing reply permission), so a reply
+                glitch never silently drops the agent's response.
         """
-        # Get app access token for this specific agent's bot
         async with httpx.AsyncClient() as client:
             token_resp = await client.post(FEISHU_APP_TOKEN_URL, json={
                 "app_id": app_id,
                 "app_secret": app_secret,
             })
             app_token = token_resp.json().get("app_access_token", "")
+            headers = {"Authorization": f"Bearer {app_token}"}
+
+            if reply_to_message_id:
+                try:
+                    reply_resp = await client.post(
+                        f"https://open.feishu.cn/open-apis/im/v1/messages/{reply_to_message_id}/reply",
+                        json={
+                            "msg_type": msg_type,
+                            "content": content,
+                        },
+                        headers=headers,
+                    )
+                    reply_data = self._parse_api_response(reply_resp, stage=f"{stage}_reply")
+                    if reply_data.get("code") == 0:
+                        return reply_data
+                    logger.warning(
+                        f"[Feishu] reply to {reply_to_message_id} returned "
+                        f"non-zero code={reply_data.get('code')}; falling back to plain send"
+                    )
+                except Exception as _reply_err:
+                    # Reply endpoint can fail for legitimate reasons (parent
+                    # message expired, app missing reply permission, …). Don't
+                    # let a quoting glitch silently drop the agent's response.
+                    logger.warning(
+                        f"[Feishu] reply to {reply_to_message_id} raised, "
+                        f"falling back to plain send: {_reply_err}"
+                    )
 
             resp = await client.post(
                 f"{FEISHU_SEND_MSG_URL}?receive_id_type={receive_id_type}",
@@ -379,7 +413,7 @@ class FeishuService:
                     "msg_type": msg_type,
                     "content": content,
                 },
-                headers={"Authorization": f"Bearer {app_token}"},
+                headers=headers,
             )
             data = self._parse_api_response(resp, stage=stage)
             return data
@@ -409,6 +443,35 @@ class FeishuService:
             )
             data = self._parse_api_response(resp, stage=stage, message_id=message_id)
             return data
+
+    async def get_chat_info(self, app_id: str, app_secret: str, chat_id: str) -> dict | None:
+        """Fetch group chat metadata (name, description, member count) via the
+        Open Platform ``im/v1/chats/{chat_id}`` endpoint. Returns None on failure
+        so callers can fall back to a placeholder group name without surfacing
+        the error to the user. Requires ``im:chat:readonly`` permission.
+        """
+        if not chat_id:
+            return None
+        try:
+            token = await self.get_tenant_access_token(app_id, app_secret)
+            if not token:
+                return None
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                data = resp.json()
+                if data.get("code") != 0:
+                    logger.warning(
+                        f"[Feishu] get_chat_info failed for {chat_id}: "
+                        f"code={data.get('code')} msg={data.get('msg')}"
+                    )
+                    return None
+                return data.get("data") or None
+        except Exception as e:
+            logger.warning(f"[Feishu] get_chat_info exception for {chat_id}: {e}")
+            return None
 
     async def resolve_open_id(self, app_id: str, app_secret: str,
                                email: str | None = None, mobile: str | None = None) -> str | None:

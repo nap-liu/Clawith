@@ -502,6 +502,7 @@ class DingTalkStreamManager:
                     message_id = incoming.message_id or ""
                     conversation_id = incoming.conversation_id or ""
                     conversation_type = incoming.conversation_type or "1"
+                    conversation_title = (incoming.conversation_title or "").strip()
                     session_webhook = incoming.session_webhook or ""
 
                     logger.info(
@@ -537,6 +538,7 @@ class DingTalkStreamManager:
                                     sender_nick=sender_nick,
                                     message_id=message_id,
                                     sender_id=sender_id,
+                                    conversation_title=conversation_title,
                                 ))
                             # Fire-and-forget: ACK immediately, do not wait for LLM
                         else:
@@ -565,6 +567,7 @@ class DingTalkStreamManager:
                                     sender_nick=sender_nick,
                                     message_id=message_id,
                                     sender_id=sender_id,
+                                    conversation_title=conversation_title,
                                 ))
                             # Fire-and-forget: ACK immediately, do not wait for LLM
                         else:
@@ -590,6 +593,7 @@ class DingTalkStreamManager:
                 sender_nick: str = "",
                 message_id: str = "",
                 sender_id: str = "",
+                conversation_title: str = "",
             ):
                 """Download media, then dispatch to process_dingtalk_message."""
                 from app.api.dingtalk import process_dingtalk_message
@@ -617,6 +621,7 @@ class DingTalkStreamManager:
                     sender_nick=sender_nick,
                     message_id=message_id,
                     sender_id=sender_id,
+                    conversation_title=conversation_title,
                 )
 
         while not stop_event.is_set() and retries <= MAX_RETRIES:
