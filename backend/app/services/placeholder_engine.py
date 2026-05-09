@@ -7,6 +7,7 @@ and prompt-block text. CLI tools migrate to this engine in P4.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -44,3 +45,44 @@ class PlaceholderContext:
         if not isinstance(bucket, dict):
             return None
         return bucket.get(field_name)
+
+
+def _stringify(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def render(
+    template: str,
+    ctx: PlaceholderContext,
+    allowed_roots: frozenset[str] = ALL_ROOTS,
+    *,
+    on_unknown: Literal["raise", "keep_literal"] = "raise",
+) -> str:
+    """Replace every ``${root.field}`` in *template* using *ctx*.
+
+    * ``root`` not in ``allowed_roots`` → DisallowedPlaceholderError
+    * ``root.field`` resolves to None and ``on_unknown='raise'`` →
+      UnknownPlaceholderError
+    * ``on_unknown='keep_literal'`` → unresolved tokens stay as
+      literal ``${root.field}`` in the output
+    """
+
+    def repl(m: re.Match[str]) -> str:
+        root, field_name = m.group(1), m.group(2)
+        if root not in allowed_roots:
+            raise DisallowedPlaceholderError(
+                f"placeholder root '{root}' not allowed here "
+                f"(allowed: {sorted(allowed_roots)})"
+            )
+        value = ctx.lookup(root, field_name)
+        if value is None:
+            if on_unknown == "raise":
+                raise UnknownPlaceholderError(f"placeholder ${{{root}.{field_name}}} unresolved")
+            return m.group(0)  # keep literal
+        return _stringify(value)
+
+    return _TOKEN_RE.sub(repl, template)
