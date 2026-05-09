@@ -30,7 +30,9 @@ class MCPServer(Base):
     instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
     instructions_captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class MCPServerOverride(Base):
@@ -49,7 +51,9 @@ class MCPServerOverride(Base):
     credential_template: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_modified_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
     __table_args__ = (
         UniqueConstraint("mcp_server_id", "scope_type", "scope_id", name="uq_mcp_override_server_scope"),

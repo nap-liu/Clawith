@@ -384,7 +384,7 @@ async def build_agent_context(
         relationships = "\n".join(relationships.split("\n")[1:]).strip()
 
     # --- Compose static and dynamic system prompt blocks ---
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime, timezone as _tz  # noqa: F401
     from app.services.timezone_utils import get_agent_timezone, now_in_timezone
 
     agent_tz_name = await get_agent_timezone(agent_id)
@@ -720,7 +720,7 @@ Strict rules:
             result = await db.execute(
                 sa_select(AgentTrigger).where(
                     AgentTrigger.agent_id == agent_id,
-                    AgentTrigger.is_enabled == True,
+                    AgentTrigger.is_enabled == True,  # noqa: E712
                 )
             )
             triggers = result.scalars().all()

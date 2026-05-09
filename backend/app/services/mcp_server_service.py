@@ -42,9 +42,7 @@ def compose_runtime_config(
     layers = (server, tenant_override, agent_override)
 
     prompt_blocks = [
-        layer.system_prompt_block
-        for layer in layers
-        if layer is not None and (layer.system_prompt_block or "").strip()
+        layer.system_prompt_block for layer in layers if layer is not None and (layer.system_prompt_block or "").strip()
     ]
 
     url_template = _override_pick(
@@ -52,11 +50,14 @@ def compose_runtime_config(
         tenant_override.url_template if tenant_override else None,
         server.base_url_template,
     )
-    headers_template = _override_pick(
-        agent_override.headers_template if agent_override else None,
-        tenant_override.headers_template if tenant_override else None,
-        server.headers_template,
-    ) or {}
+    headers_template = (
+        _override_pick(
+            agent_override.headers_template if agent_override else None,
+            tenant_override.headers_template if tenant_override else None,
+            server.headers_template,
+        )
+        or {}
+    )
     credential_template = _override_pick(
         agent_override.credential_template if agent_override else None,
         tenant_override.credential_template if tenant_override else None,

@@ -75,8 +75,7 @@ def render(
         root, field_name = m.group(1), m.group(2)
         if root not in allowed_roots:
             raise DisallowedPlaceholderError(
-                f"placeholder root '{root}' not allowed here "
-                f"(allowed: {sorted(allowed_roots)})"
+                f"placeholder root '{root}' not allowed here (allowed: {sorted(allowed_roots)})"
             )
         value = ctx.lookup(root, field_name)
         if value is None:
@@ -97,8 +96,7 @@ def render_dict(
 ) -> dict[str, Any]:
     """Render every string value in *data*. Non-strings pass through."""
     return {
-        k: render(v, ctx, allowed_roots, on_unknown=on_unknown) if isinstance(v, str) else v
-        for k, v in data.items()
+        k: render(v, ctx, allowed_roots, on_unknown=on_unknown) if isinstance(v, str) else v for k, v in data.items()
     }
 
 
