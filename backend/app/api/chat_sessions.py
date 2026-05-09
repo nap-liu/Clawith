@@ -404,9 +404,28 @@ async def get_session_messages(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Permission: session owner, agent creator, or admin.
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
-        raise HTTPException(status_code=403, detail="Not authorized to view this session")
+    # Permission:
+    # - non-group: session owner OR admin/creator
+    # - group: same, plus any user with user-role messages in the session
+    #   (mirrors scope=mine membership rule — if you spoke in the group, you
+    #   can read its history; silent observers and non-members stay blocked).
+    is_owner = str(session.user_id) == str(current_user.id)
+    is_privileged = _can_view_all_agent_chat_sessions(current_user, agent)
+    if not (is_owner or is_privileged):
+        is_group_member = False
+        if bool(getattr(session, "is_group", False)):
+            member_r = await db.execute(
+                select(ChatMessage.id)
+                .where(
+                    ChatMessage.conversation_id == str(session_id),
+                    ChatMessage.role == "user",
+                    ChatMessage.user_id == current_user.id,
+                )
+                .limit(1)
+            )
+            is_group_member = member_r.scalar_one_or_none() is not None
+        if not is_group_member:
+            raise HTTPException(status_code=403, detail="Not authorized to view this session")
 
     # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
     # Query the latest 500 messages (subquery in DESC, then reverse for display order)

@@ -157,6 +157,139 @@ async def test_group_messages_api_returns_sender_user_id_and_sender_name():
     assert all("sender_user_id" not in m for m in assistant_msgs)
 
 
+async def test_group_member_non_owner_can_read_group_messages(monkeypatch):
+    """A regular group member (not session.user_id, not admin) must be allowed to read
+    the group's messages — every speaker in the group has equal read access. Bypasses
+    the unrelated check_agent_access gate to keep the test focused on the per-session
+    permission rewrite."""
+    from datetime import datetime, timedelta, timezone
+    from app.api.chat_sessions import get_session_messages
+    from app.api import chat_sessions as chat_sessions_mod
+
+    run = uuid.uuid4().hex[:8]
+    owner = await _seed_user(f"gm_owner_{run}", "Owner")  # session.user_id anchor
+    alice = await _seed_user(f"gm_alice_{run}", "Alice")  # non-owner, non-admin member
+
+    agent_id = await _seed_agent(owner.id)
+    sess_id = await _seed_group_session(agent_id, owner.id, f"dingtalk_group_{run}")
+
+    now = datetime.now(timezone.utc)
+    await _insert_messages_bypass_fk([
+        {"id": uuid.uuid4(), "agent_id": agent_id, "user_id": alice.id,
+         "role": "user", "content": "alice spoke", "conv_id": str(sess_id),
+         "created_at": now - timedelta(seconds=200)},
+        {"id": uuid.uuid4(), "agent_id": agent_id, "user_id": alice.id,
+         "role": "assistant", "content": "agent reply to alice", "conv_id": str(sess_id),
+         "created_at": now - timedelta(seconds=100)},
+    ])
+
+    async def _fake_check_agent_access(_db, _user, _agent_id):
+        from types import SimpleNamespace
+        return SimpleNamespace(id=_agent_id, creator_id=owner.id), "use"
+
+    monkeypatch.setattr(chat_sessions_mod, "check_agent_access", _fake_check_agent_access)
+
+    async with async_session() as db:
+        out = await get_session_messages(
+            agent_id=agent_id, session_id=sess_id,
+            current_user=alice, db=db,
+        )
+
+    user_msgs = [m for m in out if m["role"] == "user"]
+    assert len(user_msgs) == 1
+    assert user_msgs[0]["sender_user_id"] == str(alice.id)
+    assert user_msgs[0]["sender_name"] == "Alice"
+
+
+async def test_group_non_member_non_admin_is_forbidden(monkeypatch):
+    """A user who never spoke in the group AND is neither owner nor admin must get 403."""
+    from datetime import datetime, timezone
+    from fastapi import HTTPException
+    from app.api.chat_sessions import get_session_messages
+    from app.api import chat_sessions as chat_sessions_mod
+
+    run = uuid.uuid4().hex[:8]
+    owner = await _seed_user(f"nm_owner_{run}", "Owner")
+    alice = await _seed_user(f"nm_alice_{run}", "Alice")  # spoke in group
+    bob = await _seed_user(f"nm_bob_{run}", "Bob")        # never spoke
+
+    agent_id = await _seed_agent(owner.id)
+    sess_id = await _seed_group_session(agent_id, owner.id, f"dingtalk_group_{run}")
+
+    now = datetime.now(timezone.utc)
+    await _insert_messages_bypass_fk([
+        {"id": uuid.uuid4(), "agent_id": agent_id, "user_id": alice.id,
+         "role": "user", "content": "alice msg", "conv_id": str(sess_id),
+         "created_at": now},
+    ])
+
+    async def _fake_check_agent_access(_db, _user, _agent_id):
+        from types import SimpleNamespace
+        return SimpleNamespace(id=_agent_id, creator_id=owner.id), "use"
+
+    monkeypatch.setattr(chat_sessions_mod, "check_agent_access", _fake_check_agent_access)
+
+    with pytest.raises(HTTPException) as exc:
+        async with async_session() as db:
+            await get_session_messages(
+                agent_id=agent_id, session_id=sess_id,
+                current_user=bob, db=db,
+            )
+    assert exc.value.status_code == 403
+
+
+async def test_p2p_non_owner_non_admin_still_forbidden(monkeypatch):
+    """Regression: P2P sessions remain owner-only for non-admins. The new group-membership
+    branch must not relax P2P's strict owner check."""
+    from datetime import datetime, timezone
+    from fastapi import HTTPException
+    from app.api.chat_sessions import get_session_messages
+    from app.api import chat_sessions as chat_sessions_mod
+
+    run = uuid.uuid4().hex[:8]
+    owner = await _seed_user(f"p2p_owner_{run}", "Owner")
+    other = await _seed_user(f"p2p_other_{run}", "Other")  # non-owner, non-admin
+
+    agent_id = await _seed_agent(owner.id)
+
+    conv_id = f"web_{run}"
+    async with async_session() as db:
+        sess = ChatSession(
+            agent_id=agent_id,
+            user_id=owner.id,
+            title="P2P regress",
+            source_channel="web",
+            external_conv_id=conv_id,
+            is_group=False,
+        )
+        db.add(sess)
+        await db.commit()
+        await db.refresh(sess)
+        sess_id = sess.id
+
+    # Note: even if "other" had a row in this conversation_id, P2P is not a group
+    # so the new is_group_member branch won't trigger — the strict owner check stays.
+    await _insert_messages_bypass_fk([
+        {"id": uuid.uuid4(), "agent_id": agent_id, "user_id": other.id,
+         "role": "user", "content": "other tried to crash the gate",
+         "conv_id": str(sess_id), "created_at": datetime.now(timezone.utc)},
+    ])
+
+    async def _fake_check_agent_access(_db, _user, _agent_id):
+        from types import SimpleNamespace
+        return SimpleNamespace(id=_agent_id, creator_id=owner.id), "use"
+
+    monkeypatch.setattr(chat_sessions_mod, "check_agent_access", _fake_check_agent_access)
+
+    with pytest.raises(HTTPException) as exc:
+        async with async_session() as db:
+            await get_session_messages(
+                agent_id=agent_id, session_id=sess_id,
+                current_user=other, db=db,
+            )
+    assert exc.value.status_code == 403
+
+
 async def test_p2p_messages_api_does_not_add_sender_user_id_field():
     """For non-group sessions get_session_messages must NOT add sender_user_id /
     sender_name on user messages — preserve byte-identical legacy behavior."""
