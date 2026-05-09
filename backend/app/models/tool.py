@@ -51,6 +51,12 @@ class Tool(Base):
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)  # auto-assigned to new agents
     source: Mapped[str] = mapped_column(String(20), default="builtin")  # "builtin" | "admin" | "agent"
 
+    mcp_server_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("mcp_servers.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
