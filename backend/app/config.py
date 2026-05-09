@@ -109,6 +109,9 @@ class Settings(BaseSettings):
     EXA_API_KEY: str = ""
 
 
+    # Feature flags
+    MCP_USE_LEGACY_COLLECTOR: bool = False
+
     # Sandbox configuration
     SANDBOX_TYPE: SandboxType = SandboxType.SUBPROCESS
     SANDBOX_API_KEY: str = ""
