@@ -63,3 +63,26 @@ def test_render_value_is_stringified():
     assert render("${tenant.id}", ctx) == "42"
     # lists become JSON strings (matches CLI convention)
     assert render("${tenant.items}", ctx) == "[1, 2]"
+
+
+def test_render_dict_handles_nested_strings():
+    from app.services.placeholder_engine import render_dict
+    ctx = PlaceholderContext(user={"id": "u1"}, agent={"name": "Alice"})
+    out = render_dict(
+        {"X-User": "${user.id}", "X-Agent": "${agent.name}", "static": "x"},
+        ctx,
+    )
+    assert out == {"X-User": "u1", "X-Agent": "Alice", "static": "x"}
+
+
+def test_render_dict_passes_through_non_strings():
+    from app.services.placeholder_engine import render_dict
+    out = render_dict({"k": 1, "b": True, "n": None}, PlaceholderContext())
+    assert out == {"k": 1, "b": True, "n": None}
+
+
+def test_detect_used_roots_finds_distinct_roots():
+    from app.services.placeholder_engine import detect_used_roots
+    text = "X ${user.id} ${agent.name} ${user.email}"
+    assert detect_used_roots(text) == {"user", "agent"}
+    assert detect_used_roots("none here") == set()

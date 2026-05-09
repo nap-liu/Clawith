@@ -86,3 +86,22 @@ def render(
         return _stringify(value)
 
     return _TOKEN_RE.sub(repl, template)
+
+
+def render_dict(
+    data: dict[str, Any],
+    ctx: PlaceholderContext,
+    allowed_roots: frozenset[str] = ALL_ROOTS,
+    *,
+    on_unknown: Literal["raise", "keep_literal"] = "raise",
+) -> dict[str, Any]:
+    """Render every string value in *data*. Non-strings pass through."""
+    return {
+        k: render(v, ctx, allowed_roots, on_unknown=on_unknown) if isinstance(v, str) else v
+        for k, v in data.items()
+    }
+
+
+def detect_used_roots(template: str) -> set[str]:
+    """Static scan: return set of root names appearing in *template*."""
+    return {m.group(1) for m in _TOKEN_RE.finditer(template)}
