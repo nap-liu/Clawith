@@ -1,6 +1,7 @@
 """Smoke + invariants test for MCPServer / MCPServerOverride."""
 import uuid
 import pytest
+from sqlalchemy import select
 from app.database import async_session, engine
 from app.models.mcp_server import MCPServer, MCPServerOverride
 
@@ -53,6 +54,5 @@ async def test_override_cascade_on_server_delete():
         await db.delete(srv)
         await db.commit()
 
-        from sqlalchemy import select
         result = await db.execute(select(MCPServerOverride).where(MCPServerOverride.id == ovr_id))
         assert result.scalar_one_or_none() is None

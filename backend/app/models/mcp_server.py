@@ -9,7 +9,7 @@ into ``mcp_servers``; per-tenant and per-agent overrides live in
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -50,3 +50,8 @@ class MCPServerOverride(Base):
     last_modified_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("mcp_server_id", "scope_type", "scope_id", name="uq_mcp_override_server_scope"),
+        CheckConstraint("scope_type IN ('tenant', 'agent')", name="ck_mcp_override_scope_type"),
+    )

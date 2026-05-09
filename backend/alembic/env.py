@@ -19,6 +19,7 @@ from app.models.channel_config import ChannelConfig  # noqa: F401
 from app.models.channel_type_default import ChannelTypeDefault  # noqa: F401
 from app.models.chat_compaction import ChatCompaction  # noqa: F401
 from app.models.llm import LLMModel  # noqa: F401
+from app.models.mcp_server import MCPServer, MCPServerOverride  # noqa: F401
 from app.models.audit import AuditLog, ApprovalRequest, ChatMessage, EnterpriseInfo  # noqa: F401
 from app.models.skill import Skill, SkillFile  # noqa: F401
 from app.models.chat_session import ChatSession  # noqa: F401
