@@ -5,12 +5,6 @@ import type { MCPServerOverride, MCPServerOverridePutPayload } from '../../types
 
 interface Props {
   serverId: string;
-  /**
-   * Restrict view:
-   * - { scope_type: 'agent'; scope_id }   — show only that agent's overrides + add button
-   * - { scope_type: 'tenant'; tenant_only: true } — show only tenant overrides (used in modal 高级)
-   * - undefined — show both tenant + agent (no longer used after P4)
-   */
   lockedScope?:
     | { scope_type: 'agent'; scope_id: string }
     | { scope_type: 'tenant'; tenant_only: true };
@@ -18,11 +12,11 @@ interface Props {
 
 export function OverrideMatrix({ serverId, lockedScope }: Props) {
   const queryClient = useQueryClient();
-  const [editing, setEditing] = useState<{
-    scope_type: 'tenant' | 'agent';
-    scope_id: string;
-    system_prompt_block: string;
-  } | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const [addingScope, setAddingScope] = useState<'tenant' | 'agent' | null>(null);
+  const [newScopeId, setNewScopeId] = useState('');
+  const [newPrompt, setNewPrompt] = useState('');
 
   const agentScopeId = lockedScope?.scope_type === 'agent' ? lockedScope.scope_id : undefined;
 
@@ -38,7 +32,10 @@ export function OverrideMatrix({ serverId, lockedScope }: Props) {
         : mcpOverridesApi.putAgent(serverId, input.scope_id, input.payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['mcp-overrides', serverId] });
-      setEditing(null);
+      setEditingId(null);
+      setAddingScope(null);
+      setNewScopeId('');
+      setNewPrompt('');
     },
   });
 
@@ -47,153 +44,134 @@ export function OverrideMatrix({ serverId, lockedScope }: Props) {
       input.scope_type === 'tenant'
         ? mcpOverridesApi.deleteTenant(serverId, input.scope_id)
         : mcpOverridesApi.deleteAgent(serverId, input.scope_id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['mcp-overrides', serverId] });
-    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['mcp-overrides', serverId] }),
   });
 
-  if (isLoading) return <div className="p-4 text-gray-500">加载中…</div>;
+  if (isLoading) {
+    return <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', padding: '12px 0' }}>加载中…</div>;
+  }
 
-  const isTenantOnly = lockedScope?.scope_type === 'tenant' && (lockedScope as { scope_type: 'tenant'; tenant_only: true }).tenant_only;
   const isAgentLocked = lockedScope?.scope_type === 'agent';
+  const isTenantOnly = lockedScope?.scope_type === 'tenant';
 
-  const visibleTenant = isAgentLocked ? [] : overrides?.tenant || [];
+  const visibleTenant = isAgentLocked ? [] : (overrides?.tenant || []);
   const visibleAgent = isAgentLocked
     ? (overrides?.agent || []).filter(o => o.scope_id === agentScopeId)
     : isTenantOnly
-      ? []
-      : overrides?.agent || [];
+    ? []
+    : (overrides?.agent || []);
 
-  return (
-    <div className="p-4 space-y-6">
-      {!isAgentLocked && (
-        <Section title="租户级 Override" rows={visibleTenant} scope_type="tenant"
-          onEdit={(o) => setEditing({ scope_type: 'tenant', scope_id: o.scope_id,
-                                      system_prompt_block: o.system_prompt_block || '' })}
-          onDelete={(o) => deleteMut.mutate({ scope_type: 'tenant', scope_id: o.scope_id })}
-          addNew={isTenantOnly ? (() => setEditing({
-            scope_type: 'tenant', scope_id: '_current_tenant_', system_prompt_block: '',
-          })) : undefined}
-          emptyHint={isTenantOnly ? '暂无租户级 override，点击添加。' : '暂无 override'}
-        />
-      )}
-      {!isTenantOnly && (
-        <Section title={isAgentLocked ? '当前 Agent 的 Override' : 'Agent 级 Override'}
-          rows={visibleAgent} scope_type="agent"
-          onEdit={(o) => setEditing({ scope_type: 'agent', scope_id: o.scope_id,
-                                      system_prompt_block: o.system_prompt_block || '' })}
-          onDelete={(o) => deleteMut.mutate({ scope_type: 'agent', scope_id: o.scope_id })}
-          addNew={isAgentLocked ? (() => setEditing({
-            scope_type: 'agent', scope_id: agentScopeId!, system_prompt_block: '',
-          })) : undefined}
-          emptyHint={isAgentLocked ? '该 agent 暂无 override，下方点击添加。' : '暂无 override'}
-        />
-      )}
+  const showTenant = !isAgentLocked;
+  const showAgent = !isTenantOnly;
+  // "add tenant" UI only appears for platform-admin (no lockedScope) — tenant_only mode hides it
+  const showAddTenant = showTenant && !lockedScope;
+  const showAddAgent = isAgentLocked && visibleAgent.length === 0;
 
-      {editing && (
-        <EditOverrideDialog
-          scope_type={editing.scope_type}
-          scope_id={editing.scope_id}
-          initial={editing.system_prompt_block}
-          onCancel={() => setEditing(null)}
-          onSubmit={(v) => upsertMut.mutate({
-            scope_type: editing.scope_type, scope_id: editing.scope_id,
-            payload: { system_prompt_block: v },
-          })}
-          saving={upsertMut.isPending}
-        />
-      )}
-    </div>
-  );
-}
-
-function Section(props: {
-  title: string;
-  rows: MCPServerOverride[];
-  scope_type: 'tenant' | 'agent';
-  onEdit: (o: MCPServerOverride) => void;
-  onDelete: (o: MCPServerOverride) => void;
-  addNew?: () => void;
-  emptyHint?: string;
-}) {
-  return (
-    <div>
-      <div className="flex items-center justify-between mb-2">
-        <h4 className="font-medium">{props.title}</h4>
-        {props.addNew && (
-          <button onClick={props.addNew} className="text-sm text-blue-600 hover:underline">
-            + 添加
-          </button>
+  const renderRow = (o: MCPServerOverride) => {
+    const isEditing = editingId === o.id;
+    return (
+      <div key={o.id} style={{
+        padding: '10px 12px',
+        borderBottom: '1px solid var(--border-subtle)',
+        background: isEditing ? 'var(--bg-elevated)' : 'transparent',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: isEditing ? '8px' : '0' }}>
+          <code style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{o.scope_id.slice(0, 8)}…</code>
+          {!isEditing && (
+            <span style={{ flex: 1, fontSize: '12px', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {(o.system_prompt_block || '').slice(0, 80) || <span style={{ fontStyle: 'italic', color: 'var(--text-tertiary)' }}>(空)</span>}
+            </span>
+          )}
+          {!isEditing && (
+            <>
+              <button className="btn btn-ghost btn-sm" onClick={() => { setEditingId(o.id); setEditValue(o.system_prompt_block || ''); }}>
+                编辑
+              </button>
+              <button className="btn btn-ghost btn-sm" style={{ color: 'var(--error)' }}
+                      onClick={() => deleteMut.mutate({ scope_type: o.scope_type, scope_id: o.scope_id })}>
+                删除
+              </button>
+            </>
+          )}
+        </div>
+        {isEditing && (
+          <>
+            <textarea
+              className="form-input"
+              value={editValue}
+              onChange={(e) => setEditValue(e.target.value)}
+              rows={4}
+              style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', width: '100%' }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '6px', marginTop: '6px' }}>
+              <button className="btn btn-secondary btn-sm" onClick={() => setEditingId(null)}>取消</button>
+              <button className="btn btn-primary btn-sm" disabled={upsertMut.isPending}
+                      onClick={() => upsertMut.mutate({
+                        scope_type: o.scope_type, scope_id: o.scope_id,
+                        payload: { system_prompt_block: editValue },
+                      })}>
+                {upsertMut.isPending ? '保存中…' : '保存'}
+              </button>
+            </div>
+          </>
         )}
       </div>
-      {props.rows.length === 0 ? (
-        <div className="text-sm text-gray-500 italic">{props.emptyHint || '暂无'}</div>
-      ) : (
-        <table className="w-full text-sm border-collapse">
-          <thead>
-            <tr className="border-b text-gray-600">
-              <th className="text-left p-1 font-mono text-xs">scope_id</th>
-              <th className="text-left p-1">Prompt 片段</th>
-              <th className="p-1 w-20"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {props.rows.map((o) => (
-              <tr key={o.id} className="border-b hover:bg-gray-50">
-                <td className="p-1 font-mono text-xs">{o.scope_id.slice(0, 8)}…</td>
-                <td className="p-1 text-xs text-gray-700 truncate max-w-md">
-                  {(o.system_prompt_block || '').slice(0, 80) || <span className="italic text-gray-400">(空)</span>}
-                </td>
-                <td className="p-1 text-right">
-                  <button onClick={() => props.onEdit(o)} className="text-blue-600 mr-2">编辑</button>
-                  <button onClick={() => props.onDelete(o)} className="text-red-600">删</button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </div>
-  );
-}
+    );
+  };
 
-function EditOverrideDialog(props: {
-  scope_type: 'tenant' | 'agent';
-  scope_id: string;
-  initial: string;
-  onCancel: () => void;
-  onSubmit: (v: string) => void;
-  saving: boolean;
-}) {
-  const [value, setValue] = useState(props.initial);
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-white rounded-lg p-6 w-[560px] max-w-full">
-        <h3 className="text-lg font-semibold mb-2">
-          编辑 {props.scope_type} Override
-        </h3>
-        <div className="text-xs text-gray-500 mb-2 font-mono">{props.scope_id}</div>
-        <textarea
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          rows={10}
-          className="w-full border rounded px-2 py-1 font-mono text-xs"
-          placeholder="该 scope 追加的 prompt 片段（可留空 = 不追加 prompt）"
-        />
-        <div className="text-xs text-gray-500 mt-1">
-          Prompt 文本不允许 <code>${'{user.*}'}</code> 占位符（会被引擎拒绝）。
+    <div>
+      {showTenant && (
+        <div>
+          {visibleTenant.length === 0 && !showAddTenant && (
+            <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', padding: '12px 0' }}>暂无租户级 override</div>
+          )}
+          {visibleTenant.map(renderRow)}
+          {showAddTenant && addingScope !== 'tenant' && (
+            <button className="btn btn-ghost btn-sm" style={{ marginTop: '8px' }} onClick={() => setAddingScope('tenant')}>
+              + 添加租户 override
+            </button>
+          )}
+          {addingScope === 'tenant' && (
+            <div style={{ padding: '10px 12px', background: 'var(--bg-elevated)', borderRadius: '6px', marginTop: '8px' }}>
+              <label className="form-label" style={{ fontSize: '11px' }}>tenant_id</label>
+              <input className="form-input" value={newScopeId} onChange={(e) => setNewScopeId(e.target.value)}
+                     placeholder="UUID" style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', marginBottom: '8px' }} />
+              <label className="form-label" style={{ fontSize: '11px' }}>prompt 片段</label>
+              <textarea className="form-input" value={newPrompt} onChange={(e) => setNewPrompt(e.target.value)}
+                        rows={3} style={{ fontFamily: 'var(--font-mono)', fontSize: '12px' }} />
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '6px', marginTop: '8px' }}>
+                <button className="btn btn-secondary btn-sm" onClick={() => { setAddingScope(null); setNewScopeId(''); setNewPrompt(''); }}>取消</button>
+                <button className="btn btn-primary btn-sm" disabled={upsertMut.isPending || !newScopeId.trim()}
+                        onClick={() => upsertMut.mutate({
+                          scope_type: 'tenant', scope_id: newScopeId.trim(),
+                          payload: { system_prompt_block: newPrompt },
+                        })}>
+                  {upsertMut.isPending ? '添加中…' : '添加'}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
-        <div className="mt-4 flex justify-end gap-2">
-          <button onClick={props.onCancel} className="px-3 py-1.5 border rounded">取消</button>
-          <button
-            onClick={() => props.onSubmit(value)}
-            disabled={props.saving}
-            className="px-3 py-1.5 bg-blue-600 text-white rounded disabled:opacity-50"
-          >
-            {props.saving ? '保存中…' : '保存'}
-          </button>
+      )}
+
+      {showAgent && (
+        <div style={{ marginTop: showTenant && visibleTenant.length > 0 ? '12px' : '0' }}>
+          {visibleAgent.length === 0 && !showAddAgent && (
+            <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', padding: '12px 0' }}>该 agent 暂无 override</div>
+          )}
+          {visibleAgent.map(renderRow)}
+          {showAddAgent && (
+            <button className="btn btn-primary btn-sm" style={{ marginTop: '8px' }}
+                    onClick={() => upsertMut.mutate({
+                      scope_type: 'agent', scope_id: agentScopeId!,
+                      payload: { system_prompt_block: '' },
+                    })}>
+              + 为该 agent 添加 override
+            </button>
+          )}
         </div>
-      </div>
+      )}
     </div>
   );
 }

@@ -26,65 +26,66 @@ export function DryRunPanel({ serverId }: Props) {
     onSuccess: setResult,
   });
 
+  const fieldStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: '8px' };
+  const labelStyle: React.CSSProperties = { fontSize: '12px', color: 'var(--text-secondary)', minWidth: '64px' };
+
   return (
-    <div className="p-4 space-y-4">
-      <div className="space-y-3">
-        <div className="flex items-center gap-3">
-          <label className="text-sm font-medium w-20">身份：</label>
-          <select value={identity} onChange={(e) => setIdentity(e.target.value as 'current_user' | 'synthetic')}
-                  className="border rounded px-2 py-1 text-sm">
-            <option value="synthetic">Synthetic（dummy 值，可分享截图）</option>
-            <option value="current_user">Current User（你自己的身份）</option>
-          </select>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+      <div style={fieldStyle}>
+        <label style={labelStyle}>身份</label>
+        <select className="form-input" value={identity} onChange={(e) => setIdentity(e.target.value as 'current_user' | 'synthetic')}
+                style={{ fontSize: '12px', flex: 1 }}>
+          <option value="synthetic">Synthetic（dummy 值，可分享截图）</option>
+          <option value="current_user">Current User（你自己）</option>
+        </select>
+      </div>
+      <div style={fieldStyle}>
+        <label style={labelStyle}>作用域</label>
+        <select className="form-input" value={scope} onChange={(e) => setScope(e.target.value as 'platform' | 'tenant' | 'agent')}
+                style={{ fontSize: '12px', flex: 1 }}>
+          <option value="platform">仅平台层</option>
+          <option value="tenant">平台 + 租户</option>
+          <option value="agent">平台 + 租户 + agent</option>
+        </select>
+      </div>
+      {scope !== 'platform' && (
+        <div style={fieldStyle}>
+          <label style={labelStyle}>tenant_id</label>
+          <input className="form-input" value={tenantId} onChange={(e) => setTenantId(e.target.value)}
+                 placeholder="UUID" style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', flex: 1 }} />
         </div>
-        <div className="flex items-center gap-3">
-          <label className="text-sm font-medium w-20">作用域：</label>
-          <select value={scope} onChange={(e) => setScope(e.target.value as 'platform' | 'tenant' | 'agent')}
-                  className="border rounded px-2 py-1 text-sm">
-            <option value="platform">仅平台层</option>
-            <option value="tenant">平台 + 租户</option>
-            <option value="agent">平台 + 租户 + agent</option>
-          </select>
+      )}
+      {scope === 'agent' && (
+        <div style={fieldStyle}>
+          <label style={labelStyle}>agent_id</label>
+          <input className="form-input" value={agentId} onChange={(e) => setAgentId(e.target.value)}
+                 placeholder="UUID" style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', flex: 1 }} />
         </div>
-        {scope !== 'platform' && (
-          <div className="flex items-center gap-3">
-            <label className="text-sm font-medium w-20">tenant_id：</label>
-            <input value={tenantId} onChange={(e) => setTenantId(e.target.value)}
-                   placeholder="UUID" className="border rounded px-2 py-1 text-sm flex-1 font-mono" />
-          </div>
-        )}
-        {scope === 'agent' && (
-          <div className="flex items-center gap-3">
-            <label className="text-sm font-medium w-20">agent_id：</label>
-            <input value={agentId} onChange={(e) => setAgentId(e.target.value)}
-                   placeholder="UUID" className="border rounded px-2 py-1 text-sm flex-1 font-mono" />
-          </div>
-        )}
+      )}
+      <div>
+        <button className="btn btn-secondary btn-sm" onClick={() => dryRun.mutate()}
+                disabled={dryRun.isPending || (scope !== 'platform' && !tenantId.trim()) || (scope === 'agent' && !agentId.trim())}>
+          {dryRun.isPending ? '渲染中…' : '预览'}
+        </button>
       </div>
 
-      <button
-        onClick={() => dryRun.mutate()}
-        disabled={dryRun.isPending || (scope !== 'platform' && !tenantId)}
-        className="px-4 py-1.5 bg-blue-600 text-white rounded disabled:opacity-50"
-      >
-        {dryRun.isPending ? '渲染中…' : '预览'}
-      </button>
-
       {dryRun.error && (
-        <div className="text-sm text-red-600">错误：{(dryRun.error as Error).message}</div>
+        <div style={{ fontSize: '12px', color: 'var(--error)' }}>
+          错误：{(dryRun.error as Error).message}
+        </div>
       )}
 
       {result && (
-        <div className="space-y-3 border-t pt-4">
-          <ResultField label="使用的层" value={result.used_layers.join(' + ')} />
-          <ResultField label="Resolved URL" value={result.resolved_url} mono />
-          <ResultField label="Resolved Headers" value={JSON.stringify(result.resolved_headers, null, 2)} mono pre />
-          <ResultField label="Resolved Credential" value={result.resolved_credential_state === 'set' ? '✓ set（已脱敏）' : '— unset'} />
-          <ResultField label="Resolved Prompt" value={result.resolved_prompt || '(空)'} pre />
+        <div style={{ paddingTop: '10px', borderTop: '1px solid var(--border-subtle)', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <Field label="使用的层" value={result.used_layers.join(' + ')} />
+          <Field label="Resolved URL" value={result.resolved_url} mono />
+          <Field label="Resolved Headers" value={JSON.stringify(result.resolved_headers, null, 2)} mono pre />
+          <Field label="Resolved Credential" value={result.resolved_credential_state === 'set' ? '✓ set（已脱敏）' : '— unset'} />
+          <Field label="Resolved Prompt" value={result.resolved_prompt || '(空)'} pre />
           {result.errors.length > 0 && (
-            <div className="text-sm text-red-600">
-              <div className="font-medium">渲染错误：</div>
-              {result.errors.map((e, i) => <div key={i} className="text-xs ml-2">• {e}</div>)}
+            <div style={{ fontSize: '12px', color: 'var(--error)' }}>
+              <div style={{ fontWeight: 500, marginBottom: '4px' }}>渲染错误：</div>
+              {result.errors.map((e, i) => <div key={i} style={{ fontSize: '11px', marginLeft: '8px' }}>• {e}</div>)}
             </div>
           )}
         </div>
@@ -93,14 +94,23 @@ export function DryRunPanel({ serverId }: Props) {
   );
 }
 
-function ResultField({ label, value, mono, pre }: { label: string; value: string; mono?: boolean; pre?: boolean }) {
+function Field({ label, value, mono, pre }: { label: string; value: string; mono?: boolean; pre?: boolean }) {
   return (
     <div>
-      <div className="text-xs text-gray-500 mb-1">{label}</div>
+      <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginBottom: '3px' }}>{label}</div>
       {pre ? (
-        <pre className={`bg-gray-50 p-2 rounded overflow-auto max-h-48 text-xs ${mono ? 'font-mono' : ''}`}>{value}</pre>
+        <pre style={{
+          background: 'var(--bg-elevated)', padding: '8px 10px', borderRadius: '6px',
+          maxHeight: '180px', overflow: 'auto', fontSize: '11px',
+          fontFamily: mono ? 'var(--font-mono)' : 'inherit',
+          margin: 0, color: 'var(--text-secondary)',
+        }}>{value}</pre>
       ) : (
-        <div className={`text-sm ${mono ? 'font-mono text-xs' : ''}`}>{value}</div>
+        <div style={{
+          fontSize: '12px', color: 'var(--text-primary)',
+          fontFamily: mono ? 'var(--font-mono)' : 'inherit',
+          wordBreak: 'break-all',
+        }}>{value}</div>
       )}
     </div>
   );

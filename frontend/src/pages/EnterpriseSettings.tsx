@@ -4619,15 +4619,19 @@ export default function EnterpriseSettings() {
                                                         </div>
                                                         {mcpEditServerId && (
                                                             <>
-                                                                <div style={{ borderTop: '1px solid var(--border)', paddingTop: '12px' }}>
-                                                                    <h4 style={{ margin: '0 0 8px 0', fontSize: '13px' }}>租户级 Overrides</h4>
+                                                                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '14px' }}>
+                                                                    <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '10px' }}>
+                                                                        租户级 Overrides
+                                                                    </div>
                                                                     <OverrideMatrix
                                                                         serverId={mcpEditServerId}
                                                                         lockedScope={{ scope_type: 'tenant', tenant_only: true }}
                                                                     />
                                                                 </div>
-                                                                <div style={{ borderTop: '1px solid var(--border)', paddingTop: '12px' }}>
-                                                                    <h4 style={{ margin: '0 0 8px 0', fontSize: '13px' }}>Dry-Run 预览</h4>
+                                                                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '14px', marginTop: '14px' }}>
+                                                                    <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '10px' }}>
+                                                                        Dry-Run 预览
+                                                                    </div>
                                                                     <DryRunPanel serverId={mcpEditServerId} />
                                                                 </div>
                                                             </>
