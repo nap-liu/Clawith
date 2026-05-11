@@ -2780,7 +2780,7 @@ async def execute_tool(
                 result = cli_result
             else:
                 # Fall back to MCP tool execution
-                result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id)
+                result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id, user_id=user_id, session_id=session_id)
 
         # Log tool call activity (skip noisy read operations)
         if tool_name not in ("list_files", "read_file", "read_document"):
@@ -3671,11 +3671,25 @@ async def _send_file_via_slack(agent_id, config, file_path: Path, member_name: s
         return f"Failed to send file via Slack: {e}"
 
 
-async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> str:
+async def _execute_mcp_tool(
+    tool_name: str,
+    arguments: dict,
+    agent_id=None,
+    user_id=None,
+    session_id: str = "",
+) -> str:
     """Execute a tool via MCP if it exists in the DB as an MCP tool."""
     try:
         from app.models.tool import Tool, AgentTool
+        from app.models.mcp_server import MCPServer
         from app.services.mcp_client import MCPClient
+        from app.services.placeholder_engine import (
+            render, render_dict, ALL_ROOTS,
+            DisallowedPlaceholderError, UnknownPlaceholderError,
+        )
+        from app.services.mcp_server_service import (
+            compose_runtime_config, lookup_overrides, build_placeholder_context_for_call,
+        )
 
         async with async_session() as db:
             # Primary lookup: clawith-prefixed name (e.g.
@@ -3696,6 +3710,74 @@ async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> s
                 logger.warning(f"[MCP] Unknown tool: {tool_name}")
                 return f"Unknown tool: {tool_name}"
 
+            # NEW PATH: when tool.mcp_server_id is populated (P0a migration done),
+            # use the mcp_servers table + overrides + placeholder rendering.
+            if tool.mcp_server_id:
+                from app.models.agent import Agent
+
+                srv = (await db.execute(
+                    select(MCPServer).where(MCPServer.id == tool.mcp_server_id)
+                )).scalar_one_or_none()
+                if srv is None:
+                    return f"❌ MCP tool {tool_name}: server row {tool.mcp_server_id} not found"
+
+                # Load agent → derive tenant_id for tenant override lookup
+                agent_row = None
+                if agent_id:
+                    agent_row = (await db.execute(
+                        select(Agent).where(Agent.id == agent_id)
+                    )).scalar_one_or_none()
+                tenant_id = agent_row.tenant_id if agent_row else None
+
+                t_ovr, a_ovr = await lookup_overrides(db, srv.id, tenant_id, agent_id)
+                cfg = compose_runtime_config(srv, t_ovr, a_ovr)
+
+                ctx = await build_placeholder_context_for_call(
+                    db, agent_id, user_id, session_id=session_id,
+                )
+
+                # Render — MCP connection-time gets the FULL ALL_ROOTS context.
+                # Unknown placeholders fail loudly so the LLM sees the config error.
+                try:
+                    resolved_url = render(cfg.url_template, ctx, ALL_ROOTS, on_unknown="raise")
+                except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
+                    return f"❌ MCP tool {tool_name}: URL placeholder error — {e}"
+
+                try:
+                    resolved_headers = render_dict(cfg.headers_template or {}, ctx, ALL_ROOTS, on_unknown="raise")
+                except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
+                    return f"❌ MCP tool {tool_name}: header placeholder error — {e}"
+
+                resolved_credential = None
+                if cfg.credential_template:
+                    try:
+                        resolved_credential = render(cfg.credential_template, ctx, ALL_ROOTS, on_unknown="raise")
+                    except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
+                        return f"❌ MCP tool {tool_name}: credential placeholder error — {e}"
+
+                mcp_name = tool.mcp_tool_name or tool_name
+                # Smithery routing: if the URL still contains run.tools and we have config,
+                # delegate. This preserves the legacy code's Smithery support.
+                if ".run.tools" in resolved_url:
+                    # Smithery path expects merged_config dict with credential and headers.
+                    # Adapter: stuff resolved values back into a dict matching the legacy contract.
+                    smithery_cfg = {
+                        "smithery_api_key": resolved_credential,
+                        "headers": resolved_headers if resolved_headers else None,
+                    }
+                    smithery_cfg = {k: v for k, v in smithery_cfg.items() if v}
+                    return await _execute_via_smithery_connect(
+                        resolved_url, mcp_name, arguments, smithery_cfg, agent_id=agent_id,
+                    )
+
+                client = MCPClient(
+                    resolved_url,
+                    api_key=resolved_credential,
+                    headers=resolved_headers or None,
+                )
+                return await client.call_tool(mcp_name, arguments)
+
+            # LEGACY PATH (mcp_server_id is NULL): unchanged behavior.
             # Load per-agent config override
             agent_config = {}
             if tool and agent_id:

@@ -356,6 +356,7 @@ from app.api.agent_credentials import router as credentials_router
 from app.api.agentbay_control import router as agentbay_control_router
 from app.api.metrics import router as metrics_router
 from app.api.okr import router as okr_router
+from app.api.mcp_servers import router as mcp_servers_router
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
@@ -415,6 +416,7 @@ app.include_router(agentbay_control_router, prefix=settings.API_PREFIX)
 # path with the rest of the admin surface.
 app.include_router(metrics_router, prefix=settings.API_PREFIX)
 app.include_router(okr_router)  # OKR — self-prefixed at /api/okr
+app.include_router(mcp_servers_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])

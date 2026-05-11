@@ -53,6 +53,7 @@ import {
     IconAlertTriangle,
 } from '@tabler/icons-react';
 import { useDropZone } from '../hooks/useDropZone';
+import { McpServerDetailDrawer } from '../components/mcp-servers/McpServerDetailDrawer';
 
 const TABS = ['status', 'aware', 'mind', 'tools', 'skills', 'relationships', 'workspace', 'chat', 'activityLog', 'approvals', 'settings'] as const;
 
@@ -246,6 +247,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
     const [expandedCategories, setExpandedCategories] = useState<Set<string>>(() => new Set());
     const [toolSearch, setToolSearch] = useState('');
     const [toolStatusFilter, setToolStatusFilter] = useState<'all' | 'enabled' | 'disabled' | 'configured'>('all');
+    const [mcpDrawerForServerId, setMcpDrawerForServerId] = useState<string | null>(null);
     // Global (company-level) config for the currently open modal — used to show
     // lock hints and prevent agent from overriding company-set fields.
     const [configGlobalData, setConfigGlobalData] = useState<Record<string, any>>({});
@@ -566,6 +568,17 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                             style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                             title={t('agent.tools.configurePerAgent', 'Configure per-agent settings')}
                         ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
+                    )}
+                    {tool.type === 'mcp' && tool.mcp_server_id && (
+                        <button
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                setMcpDrawerForServerId(tool.mcp_server_id);
+                            }}
+                            title="自定义 prompt / 连接"
+                            style={{ background: 'none', border: 'none', padding: '2px 4px', cursor: 'pointer', fontSize: '14px', color: 'var(--text-tertiary)', lineHeight: 1 }}
+                            className="text-gray-400 hover:text-gray-600"
+                        >⚙</button>
                     )}
                     {canManage && tool.source === 'agent' && tool.agent_tool_id && (
                         <button
@@ -1111,6 +1124,13 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                     </div>
                 );
             })()}
+            {mcpDrawerForServerId && (
+                <McpServerDetailDrawer
+                    serverId={mcpDrawerForServerId}
+                    lockedAgentScope={{ agent_id: agentId }}
+                    onClose={() => setMcpDrawerForServerId(null)}
+                />
+            )}
         </>
     );
 }
