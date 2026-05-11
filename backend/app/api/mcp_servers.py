@@ -184,7 +184,7 @@ async def test_mcp_server_connection(
         headers=srv.headers_template,
     )
     try:
-        await client.initialize()
+        await client.list_tools()
         # Capture & persist
         srv.instructions = client.server_instructions
         srv.instructions_captured_at = datetime.now(timezone.utc)

@@ -59,15 +59,15 @@ async def test_test_connection_captures_instructions(client):
         await db.refresh(srv)
         srv_id = srv.id
 
-    # Mock MCPClient initialize — capture the instructions response
+    # Mock MCPClient list_tools — capture the instructions response
     fake_client = AsyncMock()
     fake_client.server_instructions = "TEST INSTRUCTIONS"
     fake_client.server_info = {"name": "TestServer", "version": "1.0"}
 
-    async def fake_initialize():
-        return None
+    async def fake_list_tools():
+        return []
 
-    fake_client.initialize = fake_initialize
+    fake_client.list_tools = fake_list_tools
 
     with patch("app.api.mcp_servers.MCPClient", return_value=fake_client):
         r = await client.post(
@@ -104,10 +104,10 @@ async def test_test_connection_handles_failure(client):
 
     fake_client = AsyncMock()
 
-    async def fake_initialize_raises():
+    async def fake_list_tools_raises():
         raise RuntimeError("connection refused")
 
-    fake_client.initialize = fake_initialize_raises
+    fake_client.list_tools = fake_list_tools_raises
 
     with patch("app.api.mcp_servers.MCPClient", return_value=fake_client):
         r = await client.post(
