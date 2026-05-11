@@ -153,11 +153,59 @@ def _load_skills_index(agent_id: uuid.UUID) -> str:
     return "\n".join(lines)
 
 
-async def _collect_extension_prompts(agent_id: uuid.UUID) -> list[str]:
-    """Collect prompt blocks contributed by an agent's enabled tools and
-    configured channels.
+async def _collect_channel_prompts(agent_id: uuid.UUID) -> list[str]:
+    """Collect channel-driven prompt blocks for an agent.
 
-    Three sources, in this output order:
+    Per-agent override in ``channel_configs.system_prompt_block`` wins;
+    otherwise falls back to the type-level default in
+    ``channel_type_defaults``. Shared by both the legacy and new MCP
+    collector paths so both stay in lockstep.
+    """
+    from app.database import async_session
+    from app.models.channel_config import ChannelConfig
+    from app.models.channel_type_default import ChannelTypeDefault
+    from sqlalchemy import select
+
+    blocks: list[str] = []
+
+    async with async_session() as db:
+        ch_rows = await db.execute(
+            select(ChannelConfig)
+            .where(
+                ChannelConfig.agent_id == agent_id,
+                ChannelConfig.is_configured == True,  # noqa: E712
+            )
+            .order_by(ChannelConfig.channel_type)
+        )
+        channel_configs = ch_rows.scalars().all()
+
+        if channel_configs:
+            type_defaults_rows = await db.execute(
+                select(ChannelTypeDefault).where(
+                    ChannelTypeDefault.channel_type.in_([c.channel_type for c in channel_configs])
+                )
+            )
+            type_defaults: dict[str, str] = {
+                row.channel_type: (row.system_prompt_block or "").strip() for row in type_defaults_rows.scalars().all()
+            }
+
+            for cfg in channel_configs:
+                override = (cfg.system_prompt_block or "").strip()
+                if override:
+                    blocks.append(override)
+                    continue
+                fallback = type_defaults.get(cfg.channel_type, "")
+                if fallback:
+                    blocks.append(fallback)
+
+    return blocks
+
+
+async def _collect_extension_prompts_legacy(agent_id: uuid.UUID) -> list[str]:
+    """Legacy collector: reads prompt blocks from ``tools.system_prompt_block``
+    and ``tools.mcp_server_instructions`` (pre-P0b path).
+
+    Two sources, in this output order:
 
     1. ``tools.system_prompt_block`` — DBA-fillable per-tool prompts (e.g.
        the ragflow citation rules). Emitted in tool-name order so the
@@ -167,17 +215,11 @@ async def _collect_extension_prompts(agent_id: uuid.UUID) -> list[str]:
        captured during the MCP ``initialize`` handshake. Deduplicated by
        ``mcp_server_url``; servers without instructions contribute
        nothing.
-    3. Channel prompts — per-agent override in
-       ``channel_configs.system_prompt_block`` if set, else the
-       type-level default in ``channel_type_defaults``.
 
-    Returns the list of non-empty prompt block strings, ready to append
-    to ``static_parts``. Empty list when the agent has no extensions
-    that contribute prompts.
+    Channel prompts are always appended via the shared
+    ``_collect_channel_prompts`` helper.
     """
     from app.database import async_session
-    from app.models.channel_config import ChannelConfig
-    from app.models.channel_type_default import ChannelTypeDefault
     from app.models.tool import AgentTool, Tool
     from sqlalchemy import select
 
@@ -216,38 +258,93 @@ async def _collect_extension_prompts(agent_id: uuid.UUID) -> list[str]:
             if instr:
                 blocks.append(instr)
 
-        # Channel-driven blocks. Per-agent override wins; otherwise we
-        # fall back to the type-level default.
-        ch_rows = await db.execute(
-            select(ChannelConfig)
+    return blocks + (await _collect_channel_prompts(agent_id))
+
+
+async def _collect_mcp_prompts_from_servers(agent_id: uuid.UUID) -> list[str]:
+    """New collector: read from mcp_servers + mcp_server_overrides.
+
+    Output ordering: server.name asc (deterministic for prompt-cache
+    byte stability). Per-server prompt = server.system_prompt_block +
+    tenant_override.system_prompt_block + agent_override.system_prompt_block,
+    appended with blank lines and empty layers skipped.
+
+    P0b: NO placeholder rendering yet (PROMPT_SAFE_ROOTS work happens
+    when prompt-context-aware vars become available; for foundation we
+    just append raw text and assert byte-stability vs old path).
+    """
+    from app.database import async_session
+    from app.models.agent import Agent
+    from app.models.mcp_server import MCPServer, MCPServerOverride
+    from app.models.tool import AgentTool, Tool
+    from sqlalchemy import select
+
+    blocks: list[str] = []
+    async with async_session() as db:
+        agent = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
+        tenant_id = agent.tenant_id if agent is not None else None
+
+        # Distinct server ids enabled for this agent
+        srv_id_rows = await db.execute(
+            select(Tool.mcp_server_id)
+            .join(AgentTool, AgentTool.tool_id == Tool.id)
             .where(
-                ChannelConfig.agent_id == agent_id,
-                ChannelConfig.is_configured == True,  # noqa: E712
+                AgentTool.agent_id == agent_id,
+                AgentTool.enabled == True,  # noqa: E712
+                Tool.enabled == True,  # noqa: E712
+                Tool.mcp_server_id.is_not(None),
             )
-            .order_by(ChannelConfig.channel_type)
+            .distinct()
         )
-        channel_configs = ch_rows.scalars().all()
+        server_ids = [r[0] for r in srv_id_rows.all() if r[0] is not None]
+        if not server_ids:
+            return []
 
-        if channel_configs:
-            type_defaults_rows = await db.execute(
-                select(ChannelTypeDefault).where(
-                    ChannelTypeDefault.channel_type.in_([c.channel_type for c in channel_configs])
-                )
-            )
-            type_defaults: dict[str, str] = {
-                row.channel_type: (row.system_prompt_block or "").strip() for row in type_defaults_rows.scalars().all()
-            }
+        servers = (await db.execute(
+            select(MCPServer).where(MCPServer.id.in_(server_ids)).order_by(MCPServer.name)
+        )).scalars().all()
 
-            for cfg in channel_configs:
-                override = (cfg.system_prompt_block or "").strip()
-                if override:
-                    blocks.append(override)
-                    continue
-                fallback = type_defaults.get(cfg.channel_type, "")
-                if fallback:
-                    blocks.append(fallback)
+        # Bulk-load overrides for these servers
+        ovr_rows = (await db.execute(
+            select(MCPServerOverride).where(MCPServerOverride.mcp_server_id.in_(server_ids))
+        )).scalars().all()
+        ovr_index: dict[tuple[uuid.UUID, str, uuid.UUID], MCPServerOverride] = {
+            (o.mcp_server_id, o.scope_type, o.scope_id): o for o in ovr_rows
+        }
+
+        for srv in servers:
+            t_ovr = ovr_index.get((srv.id, "tenant", tenant_id)) if tenant_id else None
+            a_ovr = ovr_index.get((srv.id, "agent", agent_id))
+            parts = [
+                (srv.system_prompt_block or "").strip(),
+                (t_ovr.system_prompt_block or "").strip() if t_ovr else "",
+                (a_ovr.system_prompt_block or "").strip() if a_ovr else "",
+            ]
+            merged = "\n\n".join(p for p in parts if p)
+            if merged:
+                blocks.append(merged)
+
+            # Server instructions captured during initialize handshake
+            instr = (srv.instructions or "").strip()
+            if instr:
+                blocks.append(instr)
 
     return blocks
+
+
+async def _collect_extension_prompts(agent_id: uuid.UUID) -> list[str]:
+    """Dispatch to the new server-table-based collector by default.
+    Set ``MCP_USE_LEGACY_COLLECTOR=1`` env to fall back to the
+    pre-P0b path that reads tools.system_prompt_block directly.
+
+    Channel-driven blocks (channel_configs / channel_type_defaults)
+    use the same path in both modes — only the MCP source differs.
+    """
+    if get_settings().MCP_USE_LEGACY_COLLECTOR:
+        return await _collect_extension_prompts_legacy(agent_id)
+    mcp_blocks = await _collect_mcp_prompts_from_servers(agent_id)
+    channel_blocks = await _collect_channel_prompts(agent_id)
+    return mcp_blocks + channel_blocks
 
 
 async def build_agent_context(
@@ -287,7 +384,7 @@ async def build_agent_context(
         relationships = "\n".join(relationships.split("\n")[1:]).strip()
 
     # --- Compose static and dynamic system prompt blocks ---
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime, timezone as _tz  # noqa: F401
     from app.services.timezone_utils import get_agent_timezone, now_in_timezone
 
     agent_tz_name = await get_agent_timezone(agent_id)
@@ -623,7 +720,7 @@ Strict rules:
             result = await db.execute(
                 sa_select(AgentTrigger).where(
                     AgentTrigger.agent_id == agent_id,
-                    AgentTrigger.is_enabled == True,
+                    AgentTrigger.is_enabled == True,  # noqa: E712
                 )
             )
             triggers = result.scalars().all()

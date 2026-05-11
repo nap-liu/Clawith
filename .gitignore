@@ -67,3 +67,8 @@ docker-compose.replay.yml
 /.last-release-tag
 /.local-cleanup-*.sh
 /.merge-conflicts.txt
+
+# Worktree-local dev convenience scripts (machine-specific paths)
+wt-test.sh
+wt-alembic.sh
+Dockerfile.test
