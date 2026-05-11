@@ -3748,6 +3748,21 @@ async def _execute_mcp_tool(
                 except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
                     return f"❌ MCP tool {tool_name}: header placeholder error — {e}"
 
+                # HTTP headers are ASCII-only on the wire (RFC 7230). When a
+                # placeholder renders to non-ASCII (e.g. ${agent.name} = "小智"),
+                # percent-encode the value so the receiving server can decode it
+                # via standard urllib.parse.unquote. Pure-ASCII values pass through
+                # unchanged.
+                from urllib.parse import quote as _url_quote
+                def _ascii_safe_header(v):
+                    s = str(v)
+                    try:
+                        s.encode("ascii")
+                        return s
+                    except UnicodeEncodeError:
+                        return _url_quote(s, safe="")
+                resolved_headers = {k: _ascii_safe_header(v) for k, v in resolved_headers.items()}
+
                 resolved_credential = None
                 if cfg.credential_template:
                     try:
