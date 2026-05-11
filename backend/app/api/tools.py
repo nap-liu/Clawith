@@ -253,6 +253,7 @@ async def list_tools(
             "parameters_schema": t.parameters_schema,
             "mcp_server_url": t.mcp_server_url,
             "mcp_server_name": t.mcp_server_name,
+            "mcp_server_id": str(t.mcp_server_id) if t.mcp_server_id else None,
             "mcp_tool_name": t.mcp_tool_name,
             "enabled": t.enabled,
             "is_default": t.is_default,
@@ -543,6 +544,7 @@ async def get_agent_tools(
             "is_default": t.is_default,
             "mcp_server_name": t.mcp_server_name,
             "mcp_server_url": t.mcp_server_url,
+            "mcp_server_id": str(t.mcp_server_id) if t.mcp_server_id else None,
             "source": t.source,
         })
     return result
@@ -653,6 +655,7 @@ async def list_agent_installed_tools(
             "source": t.source,
             "mcp_server_name": t.mcp_server_name,
             "mcp_server_url": t.mcp_server_url,
+            "mcp_server_id": str(t.mcp_server_id) if t.mcp_server_id else None,
             "mcp_tool_name": t.mcp_tool_name,
             "installed_by_agent_id": str(at.installed_by_agent_id) if at.installed_by_agent_id else None,
             "installed_by_agent_name": a.name if a else None,
@@ -879,6 +882,7 @@ async def get_agent_tools_with_config(
             "is_default": t.is_default,
             "mcp_server_name": t.mcp_server_name,
             "mcp_server_url": t.mcp_server_url,
+            "mcp_server_id": str(t.mcp_server_id) if t.mcp_server_id else None,
             "config_schema": t.config_schema or {},
             "global_config": masked_global,
             "agent_config": raw_agent,
