@@ -12,6 +12,8 @@ import InvitationCodes from './InvitationCodes';
 
 import LinearCopyButton from '../components/LinearCopyButton';
 import { CliToolsSection } from '../components/cli-tools/CliToolsSection';
+import { OverrideMatrix } from '../components/mcp-servers/OverrideMatrix';
+import { DryRunPanel } from '../components/mcp-servers/DryRunPanel';
 import { useDialog } from '../components/Dialog/DialogProvider';
 import { useToast } from '../components/Toast/ToastProvider';
 import { buildCompanyRegions, type CompanyRegion } from '../utils/companyRegions';
@@ -4615,7 +4617,21 @@ export default function EnterpriseSettings() {
                                                                 每次 MCP 调用时渲染 — 占位符可用所有 root（含 {'${user.*}'}）
                                                             </div>
                                                         </div>
-                                                        {/* OverrideMatrix + DryRunPanel come in Task 6 */}
+                                                        {mcpEditServerId && (
+                                                            <>
+                                                                <div style={{ borderTop: '1px solid var(--border)', paddingTop: '12px' }}>
+                                                                    <h4 style={{ margin: '0 0 8px 0', fontSize: '13px' }}>租户级 Overrides</h4>
+                                                                    <OverrideMatrix
+                                                                        serverId={mcpEditServerId}
+                                                                        lockedScope={{ scope_type: 'tenant', tenant_only: true }}
+                                                                    />
+                                                                </div>
+                                                                <div style={{ borderTop: '1px solid var(--border)', paddingTop: '12px' }}>
+                                                                    <h4 style={{ margin: '0 0 8px 0', fontSize: '13px' }}>Dry-Run 预览</h4>
+                                                                    <DryRunPanel serverId={mcpEditServerId} />
+                                                                </div>
+                                                            </>
+                                                        )}
                                                     </div>
                                                 )}
                                             </div>

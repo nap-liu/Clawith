@@ -5,8 +5,15 @@ import type { MCPServerOverride, MCPServerOverridePutPayload } from '../../types
 
 interface Props {
   serverId: string;
-  /** When set, locks the matrix to a single agent scope (used from AgentDetail). */
-  lockedScope?: { scope_type: 'agent'; scope_id: string };
+  /**
+   * Restrict view:
+   * - { scope_type: 'agent'; scope_id }   — show only that agent's overrides + add button
+   * - { scope_type: 'tenant'; tenant_only: true } — show only tenant overrides (used in modal 高级)
+   * - undefined — show both tenant + agent (no longer used after P4)
+   */
+  lockedScope?:
+    | { scope_type: 'agent'; scope_id: string }
+    | { scope_type: 'tenant'; tenant_only: true };
 }
 
 export function OverrideMatrix({ serverId, lockedScope }: Props) {
@@ -17,9 +24,11 @@ export function OverrideMatrix({ serverId, lockedScope }: Props) {
     system_prompt_block: string;
   } | null>(null);
 
+  const agentScopeId = lockedScope?.scope_type === 'agent' ? lockedScope.scope_id : undefined;
+
   const { data: overrides, isLoading } = useQuery({
-    queryKey: ['mcp-overrides', serverId, lockedScope?.scope_id],
-    queryFn: () => mcpOverridesApi.list(serverId, lockedScope?.scope_id),
+    queryKey: ['mcp-overrides', serverId, agentScopeId],
+    queryFn: () => mcpOverridesApi.list(serverId, agentScopeId),
   });
 
   const upsertMut = useMutation({
@@ -45,30 +54,41 @@ export function OverrideMatrix({ serverId, lockedScope }: Props) {
 
   if (isLoading) return <div className="p-4 text-gray-500">加载中…</div>;
 
-  const visibleTenant = lockedScope ? [] : overrides?.tenant || [];
-  const visibleAgent = lockedScope
-    ? (overrides?.agent || []).filter(o => o.scope_id === lockedScope.scope_id)
-    : overrides?.agent || [];
+  const isTenantOnly = lockedScope?.scope_type === 'tenant' && (lockedScope as { scope_type: 'tenant'; tenant_only: true }).tenant_only;
+  const isAgentLocked = lockedScope?.scope_type === 'agent';
+
+  const visibleTenant = isAgentLocked ? [] : overrides?.tenant || [];
+  const visibleAgent = isAgentLocked
+    ? (overrides?.agent || []).filter(o => o.scope_id === agentScopeId)
+    : isTenantOnly
+      ? []
+      : overrides?.agent || [];
 
   return (
     <div className="p-4 space-y-6">
-      {!lockedScope && (
+      {!isAgentLocked && (
         <Section title="租户级 Override" rows={visibleTenant} scope_type="tenant"
           onEdit={(o) => setEditing({ scope_type: 'tenant', scope_id: o.scope_id,
                                       system_prompt_block: o.system_prompt_block || '' })}
           onDelete={(o) => deleteMut.mutate({ scope_type: 'tenant', scope_id: o.scope_id })}
+          addNew={isTenantOnly ? (() => setEditing({
+            scope_type: 'tenant', scope_id: '_current_tenant_', system_prompt_block: '',
+          })) : undefined}
+          emptyHint={isTenantOnly ? '暂无租户级 override，点击添加。' : '暂无 override'}
         />
       )}
-      <Section title={lockedScope ? '当前 Agent 的 Override' : 'Agent 级 Override'}
-        rows={visibleAgent} scope_type="agent"
-        onEdit={(o) => setEditing({ scope_type: 'agent', scope_id: o.scope_id,
-                                    system_prompt_block: o.system_prompt_block || '' })}
-        onDelete={(o) => deleteMut.mutate({ scope_type: 'agent', scope_id: o.scope_id })}
-        addNew={lockedScope ? (() => setEditing({
-          scope_type: 'agent', scope_id: lockedScope.scope_id, system_prompt_block: '',
-        })) : undefined}
-        emptyHint={lockedScope ? '该 agent 暂无 override，下方点击添加。' : '暂无 override'}
-      />
+      {!isTenantOnly && (
+        <Section title={isAgentLocked ? '当前 Agent 的 Override' : 'Agent 级 Override'}
+          rows={visibleAgent} scope_type="agent"
+          onEdit={(o) => setEditing({ scope_type: 'agent', scope_id: o.scope_id,
+                                      system_prompt_block: o.system_prompt_block || '' })}
+          onDelete={(o) => deleteMut.mutate({ scope_type: 'agent', scope_id: o.scope_id })}
+          addNew={isAgentLocked ? (() => setEditing({
+            scope_type: 'agent', scope_id: agentScopeId!, system_prompt_block: '',
+          })) : undefined}
+          emptyHint={isAgentLocked ? '该 agent 暂无 override，下方点击添加。' : '暂无 override'}
+        />
+      )}
 
       {editing && (
         <EditOverrideDialog
