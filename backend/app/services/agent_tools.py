@@ -2780,7 +2780,7 @@ async def execute_tool(
                 result = cli_result
             else:
                 # Fall back to MCP tool execution
-                result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id)
+                result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id, user_id=user_id, session_id=session_id)
 
         # Log tool call activity (skip noisy read operations)
         if tool_name not in ("list_files", "read_file", "read_document"):
@@ -3671,7 +3671,13 @@ async def _send_file_via_slack(agent_id, config, file_path: Path, member_name: s
         return f"Failed to send file via Slack: {e}"
 
 
-async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> str:
+async def _execute_mcp_tool(
+    tool_name: str,
+    arguments: dict,
+    agent_id=None,
+    user_id=None,
+    session_id: str = "",
+) -> str:
     """Execute a tool via MCP if it exists in the DB as an MCP tool."""
     try:
         from app.models.tool import Tool, AgentTool
