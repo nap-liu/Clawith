@@ -9,6 +9,7 @@ import type { FileBrowserApi } from '../components/FileBrowser';
 import { saveAccentColor, getSavedAccentColor, resetAccentColor, PRESET_COLORS } from '../utils/theme';
 import UserManagement from './UserManagement';
 import InvitationCodes from './InvitationCodes';
+import { McpServersPage } from './admin/McpServersPage';
 import LinearCopyButton from '../components/LinearCopyButton';
 import { CliToolsSection } from '../components/cli-tools/CliToolsSection';
 import { useDialog } from '../components/Dialog/DialogProvider';
@@ -2881,8 +2882,10 @@ export default function EnterpriseSettings() {
     const dialog = useDialog();
     const toast = useToast();
     const qc = useQueryClient();
-    type TabKey = 'llm' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites' | 'okr';
-    const VALID_TABS: TabKey[] = ['info', 'llm', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
+    const currentUser = useAuthStore((s) => s.user);
+    const isPlatformAdmin = currentUser?.role === 'platform_admin' || currentUser?.is_platform_admin === true;
+    type TabKey = 'llm' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites' | 'okr' | 'mcp-servers';
+    const VALID_TABS: TabKey[] = ['info', 'llm', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit', 'mcp-servers'];
     const getTabFromHash = (): TabKey => {
         const hash = window.location.hash.replace('#', '') as TabKey;
         return VALID_TABS.includes(hash) ? hash : 'info';
@@ -3288,9 +3291,22 @@ export default function EnterpriseSettings() {
                             {tab === 'quotas' ? t('enterprise.tabs.quotas', 'Quotas') : tab === 'users' ? t('enterprise.tabs.users', 'Users') : tab === 'invites' ? t('enterprise.tabs.invites', 'Invitations') : tab === 'okr' ? t('nav.okr', 'OKR') : t(`enterprise.tabs.${tab}`)}
                         </div>
                     ))}
+                    {isPlatformAdmin && (
+                        <div
+                            className={`tab ${activeTab === 'mcp-servers' ? 'active' : ''}`}
+                            onClick={() => {
+                                window.location.hash = 'mcp-servers';
+                                setActiveTab('mcp-servers');
+                            }}
+                        >
+                            MCP Servers
+                        </div>
+                    )}
                 </div>
 
                 {activeTab === 'okr' && <OkrTab tenantId={selectedTenantId} t={t} />}
+
+                {activeTab === 'mcp-servers' && isPlatformAdmin && <McpServersPage />}
 
                 {/* ── LLM Model Pool ── */}
                 {activeTab === 'llm' && (
