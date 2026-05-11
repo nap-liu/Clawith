@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { mcpServersApi } from '../../services/mcpServers';
-import type { MCPServerUpdatePayload } from '../../types/mcpServer';
+import type { MCPServerUpdatePayload, TestConnectionResult } from '../../types/mcpServer';
 import { McpServerForm } from './McpServerForm';
 
 interface Props {
@@ -28,7 +28,7 @@ export function McpServerDetailDrawer({ serverId, onClose }: Props) {
 
   const testMutation = useMutation({
     mutationFn: () => mcpServersApi.testConnection(serverId),
-    onSuccess: (res) => {
+    onSuccess: (res: TestConnectionResult) => {
       setTestResult({
         success: res.success,
         message: res.success
