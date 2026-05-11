@@ -701,6 +701,11 @@ async def import_mcp_direct(
     async with async_session() as db:
         imported_tools = []
 
+        # P4: resolve agent's tenant_id for the mcp_servers bridge
+        from app.models.agent import Agent as _Agent
+        _agent_row = (await db.execute(select(_Agent).where(_Agent.id == agent_id))).scalar_one_or_none()
+        _tenant_id = _agent_row.tenant_id if _agent_row else None
+
         async def _ensure_agent_tool(tool_id: uuid.UUID):
             agent_check = await db.execute(
                 select(AgentTool).where(
@@ -717,6 +722,20 @@ async def import_mcp_direct(
                     source="user_installed", installed_by_agent_id=agent_id,
                     config=agent_tool_config,
                 ))
+
+        # P4: helper to bridge tool → mcp_servers and set FK
+        async def _bridge_tool_to_mcp_server(tool: Tool):
+            from app.services.mcp_server_service import upsert_mcp_server_from_tools
+            srv_id = await upsert_mcp_server_from_tools(
+                db,
+                tenant_id=_tenant_id,
+                server_url=mcp_url,
+                server_name=display_name,
+                headers_template=isinstance(headers, dict) and headers or None,
+                api_key=api_key,
+            )
+            tool.mcp_server_id = srv_id
+            await db.flush()
 
         if tools_discovered:
             for mcp_tool in tools_discovered:
@@ -753,6 +772,7 @@ async def import_mcp_direct(
                 )
                 db.add(tool)
                 await db.flush()
+                await _bridge_tool_to_mcp_server(tool)  # P4: auto-bridge
                 await _ensure_agent_tool(tool.id)
                 imported_tools.append(f"✅ {tool_display}")
         else:
@@ -783,6 +803,7 @@ async def import_mcp_direct(
             )
             db.add(tool)
             await db.flush()
+            await _bridge_tool_to_mcp_server(tool)  # P4: auto-bridge
             await _ensure_agent_tool(tool.id)
             imported_tools.append(f"✅ {display_name} (tools couldn't be listed — server may need configuration)")
 
