@@ -53,7 +53,7 @@ import {
     IconAlertTriangle,
 } from '@tabler/icons-react';
 import { useDropZone } from '../hooks/useDropZone';
-import { McpServerDetailDrawer } from '../components/mcp-servers/McpServerDetailDrawer';
+import { AgentMcpPromptDialog } from '../components/mcp-servers/AgentMcpPromptDialog';
 
 const TABS = ['status', 'aware', 'mind', 'tools', 'skills', 'relationships', 'workspace', 'chat', 'activityLog', 'approvals', 'settings'] as const;
 
@@ -230,7 +230,7 @@ const getCategoryLabels = (t: any): Record<string, string> => ({
     agentbay: t('agent.toolCategories.agentbay', 'AgentBay'),
 });
 
-function ToolsManager({ agentId, canManage = false }: { agentId: string; canManage?: boolean }) {
+function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { agentId: string; agentName?: string; canManage?: boolean }) {
     const { t } = useTranslation();
     const dialog = useDialog();
     const toast = useToast();
@@ -247,7 +247,7 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
     const [expandedCategories, setExpandedCategories] = useState<Set<string>>(() => new Set());
     const [toolSearch, setToolSearch] = useState('');
     const [toolStatusFilter, setToolStatusFilter] = useState<'all' | 'enabled' | 'disabled' | 'configured'>('all');
-    const [mcpDrawerForServerId, setMcpDrawerForServerId] = useState<string | null>(null);
+    const [agentPromptDialog, setAgentPromptDialog] = useState<{ serverId: string; toolDisplayName: string } | null>(null);
     // Global (company-level) config for the currently open modal — used to show
     // lock hints and prevent agent from overriding company-set fields.
     const [configGlobalData, setConfigGlobalData] = useState<Record<string, any>>({});
@@ -573,9 +573,12 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                         <button
                             onClick={(e) => {
                                 e.stopPropagation();
-                                setMcpDrawerForServerId(tool.mcp_server_id);
+                                setAgentPromptDialog({
+                                    serverId: tool.mcp_server_id,
+                                    toolDisplayName: tool.mcp_server_name || tool.display_name || tool.name,
+                                });
                             }}
-                            title="自定义 prompt / 连接"
+                            title="自定义 prompt"
                             style={{ background: 'none', border: 'none', padding: '2px 4px', cursor: 'pointer', fontSize: '14px', color: 'var(--text-tertiary)', lineHeight: 1 }}
                             className="text-gray-400 hover:text-gray-600"
                         >⚙</button>
@@ -1124,11 +1127,13 @@ function ToolsManager({ agentId, canManage = false }: { agentId: string; canMana
                     </div>
                 );
             })()}
-            {mcpDrawerForServerId && (
-                <McpServerDetailDrawer
-                    serverId={mcpDrawerForServerId}
-                    lockedAgentScope={{ agent_id: agentId }}
-                    onClose={() => setMcpDrawerForServerId(null)}
+            {agentPromptDialog && (
+                <AgentMcpPromptDialog
+                    agentId={agentId}
+                    agentName={agentName}
+                    toolDisplayName={agentPromptDialog.toolDisplayName}
+                    mcpServerId={agentPromptDialog.serverId}
+                    onClose={() => setAgentPromptDialog(null)}
                 />
             )}
         </>
@@ -5679,7 +5684,7 @@ function AgentDetailInner() {
                                 <h3 style={{ marginBottom: '4px' }}>{t('agent.toolMgmt.title')}</h3>
                                 <p style={{ fontSize: '13px', color: 'var(--text-tertiary)' }}>{t('agent.toolMgmt.description')}</p>
                             </div>
-                            <ToolsManager agentId={id!} canManage={canManage} />
+                            <ToolsManager agentId={id!} agentName={agent?.name || 'Agent'} canManage={canManage} />
                         </div>
                     )
                 }
