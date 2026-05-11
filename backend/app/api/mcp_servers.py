@@ -284,9 +284,33 @@ async def _upsert_override(
 @router.get("/{server_id}/overrides", response_model=OverridesGroupedOut)
 async def list_mcp_overrides(
     server_id: uuid.UUID,
-    current_user: PlatformAdmin,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    agent_id: uuid.UUID | None = None,
 ) -> OverridesGroupedOut:
+    """Platform admin: returns all overrides (all scopes).
+    Non-admin with agent_id: returns only that agent's overrides (after creator check).
+    Non-admin without agent_id: 403.
+    """
+    is_platform = (current_user.role == "platform_admin"
+                   or (current_user.identity and current_user.identity.is_platform_admin))
+    if not is_platform:
+        if agent_id is None:
+            raise HTTPException(status_code=403, detail="agent_id required for non-admin callers")
+        await _require_agent_override_access(current_user, agent_id, db)
+        # Return only the specific agent's overrides — no tenant rows visible to agent admins
+        rows = (await db.execute(
+            select(MCPServerOverride).where(
+                MCPServerOverride.mcp_server_id == server_id,
+                MCPServerOverride.scope_type == "agent",
+                MCPServerOverride.scope_id == agent_id,
+            )
+        )).scalars().all()
+        grouped = OverridesGroupedOut()
+        for r in rows:
+            grouped.agent.append(MCPServerOverrideOut.from_orm_model(r))
+        return grouped
+
     rows = (await db.execute(
         select(MCPServerOverride).where(MCPServerOverride.mcp_server_id == server_id)
     )).scalars().all()

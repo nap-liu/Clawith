@@ -18,8 +18,8 @@ export function OverrideMatrix({ serverId, lockedScope }: Props) {
   } | null>(null);
 
   const { data: overrides, isLoading } = useQuery({
-    queryKey: ['mcp-overrides', serverId],
-    queryFn: () => mcpOverridesApi.list(serverId),
+    queryKey: ['mcp-overrides', serverId, lockedScope?.scope_id],
+    queryFn: () => mcpOverridesApi.list(serverId, lockedScope?.scope_id),
   });
 
   const upsertMut = useMutation({

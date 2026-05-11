@@ -1,7 +1,7 @@
 """Tests for override CRUD + ACL.
 
 ACL matrix:
-- GET /overrides → platform_admin only
+- GET /overrides → platform_admin (full list) OR agent creator (?agent_id=<id>, own scope only)
 - PUT/DELETE /overrides/tenant/{tenant_id} → platform_admin OR org_admin (of that tenant)
 - PUT/DELETE /overrides/agent/{agent_id} → platform_admin OR agent's creator
 """
@@ -176,6 +176,54 @@ async def test_put_agent_override_requires_agent_creator_or_platform_admin(clien
     )
     assert r2.status_code == 200
     assert r2.json()["system_prompt_block"] == "AG"
+
+
+async def test_get_overrides_agent_creator_can_read_own_agent_scope(client):
+    """Agent creator can GET /overrides?agent_id=<id> and sees only their own agent's rows."""
+    srv = await _make_server()
+    creator, _ = await _make_user("member")
+    suffix = uuid.uuid4().hex[:6]
+    async with async_session() as db:
+        agent = Agent(name=f"A_{suffix}", creator_id=creator.id)
+        db.add(agent)
+        await db.flush()
+        # Override for this agent
+        db.add(MCPServerOverride(
+            mcp_server_id=srv.id, scope_type="agent", scope_id=agent.id,
+            system_prompt_block="CREATOR-BLOCK",
+        ))
+        # Another agent's override (should NOT be visible to the creator)
+        db.add(MCPServerOverride(
+            mcp_server_id=srv.id, scope_type="agent", scope_id=uuid.uuid4(),
+            system_prompt_block="OTHER",
+        ))
+        await db.commit()
+        await db.refresh(agent)
+        agent_id = agent.id
+
+    creator_token = create_access_token(str(creator.id), "member")
+    r = await client.get(
+        f"/api/admin/mcp-servers/{srv.id}/overrides",
+        params={"agent_id": str(agent_id)},
+        headers={"Authorization": f"Bearer {creator_token}"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tenant"] == []
+    assert len(body["agent"]) == 1
+    assert body["agent"][0]["scope_id"] == str(agent_id)
+    assert body["agent"][0]["system_prompt_block"] == "CREATOR-BLOCK"
+
+
+async def test_get_overrides_non_admin_without_agent_id_is_403(client):
+    """Non-admin calling GET /overrides without agent_id must get 403."""
+    srv = await _make_server()
+    _, member_token = await _make_user("member")
+    r = await client.get(
+        f"/api/admin/mcp-servers/{srv.id}/overrides",
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert r.status_code == 403
 
 
 async def test_delete_override_clears_row(client):

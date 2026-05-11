@@ -33,8 +33,10 @@ export const mcpServersApi = {
 };
 
 export const mcpOverridesApi = {
-  list: (serverId: string) =>
-    fetchJson<OverridesGrouped>(`/admin/mcp-servers/${serverId}/overrides`),
+  list: (serverId: string, agentId?: string) => {
+    const qs = agentId ? `?agent_id=${agentId}` : '';
+    return fetchJson<OverridesGrouped>(`/admin/mcp-servers/${serverId}/overrides${qs}`);
+  },
   putTenant: (serverId: string, tenantId: string, payload: MCPServerOverridePutPayload) =>
     fetchJson<MCPServerOverride>(
       `/admin/mcp-servers/${serverId}/overrides/tenant/${tenantId}`,
