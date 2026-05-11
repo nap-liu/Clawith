@@ -173,3 +173,82 @@ async def build_placeholder_context_for_call(
         session={"id": session_id or ""},
         channel={"type": channel_type or "web"},
     )
+
+
+# ─── Bridge helper: find-or-create mcp_servers row ─────────────────────────
+
+import re  # noqa: E402 — appended section
+
+
+def _slugify_server_name(name: str) -> str:
+    """e.g. 'My RAGFlow' -> 'my_ragflow'."""
+    s = re.sub(r"[^a-z0-9_-]", "_", name.lower()).strip("_")
+    return s or "mcp_server"
+
+
+async def upsert_mcp_server_from_tools(
+    db,
+    tenant_id: uuid.UUID | None,
+    server_url: str,
+    server_name: str,
+    *,
+    system_prompt_block: str | None = None,
+    headers_template: dict | None = None,
+    api_key: str | None = None,
+) -> uuid.UUID:
+    """Find or create an mcp_servers row for (tenant_id, server_url).
+
+    Behavior:
+    - Existing row: update only fields that are not None (None = "don't touch")
+    - New row: create with provided fields; defaults system_prompt_block=None,
+      headers_template={}, credential_template=None
+    - Returns the row's id.
+    - On name collision (uniq violation), suffixes -2/-3 etc. (matches P0a migration).
+    """
+    existing = (await db.execute(
+        select(MCPServer).where(
+            MCPServer.base_url_template == server_url,
+            (MCPServer.tenant_id == tenant_id) if tenant_id is not None
+            else MCPServer.tenant_id.is_(None),
+        )
+    )).scalar_one_or_none()
+
+    if existing is not None:
+        if system_prompt_block is not None:
+            existing.system_prompt_block = system_prompt_block
+        if headers_template is not None:
+            existing.headers_template = headers_template
+        if api_key is not None:
+            existing.credential_template = api_key  # TODO encrypt at rest in P5
+        await db.flush()
+        return existing.id
+
+    # Create new — derive unique name
+    base = _slugify_server_name(server_name)
+    name = base
+    suffix = 2
+    while True:
+        clash = (await db.execute(
+            select(MCPServer).where(
+                MCPServer.name == name,
+                (MCPServer.tenant_id == tenant_id) if tenant_id is not None
+                else MCPServer.tenant_id.is_(None),
+            )
+        )).scalar_one_or_none()
+        if clash is None:
+            break
+        name = f"{base}-{suffix}"
+        suffix += 1
+
+    new_srv = MCPServer(
+        tenant_id=tenant_id,
+        name=name,
+        display_name=server_name,
+        base_url_template=server_url,
+        headers_template=headers_template or {},
+        credential_template=api_key,
+        system_prompt_block=system_prompt_block,
+    )
+    db.add(new_srv)
+    await db.flush()
+    return new_srv.id
