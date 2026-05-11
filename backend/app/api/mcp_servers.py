@@ -104,6 +104,10 @@ async def update_mcp_server(
     update_data = payload.model_dump(exclude_unset=True)
 
     for field, new_value in update_data.items():
+        # credential_template: None means "don't touch" per schema contract;
+        # callers must send "" to explicitly clear.
+        if field == "credential_template" and new_value is None:
+            continue
         old_value = getattr(srv, field)
         if old_value != new_value:
             # Don't include credential plaintext in audit log — log the fact, not the value

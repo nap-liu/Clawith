@@ -2,6 +2,7 @@
 import uuid
 import pytest
 import httpx
+from sqlalchemy import select
 from app.database import async_session, engine
 from app.models.user import User, Identity
 from app.models.mcp_server import MCPServer
@@ -149,7 +150,6 @@ async def test_delete_404_for_nonexistent(client):
 async def test_delete_cascades_to_overrides(client):
     """Delete server → mcp_server_overrides rows for it should also vanish (FK CASCADE)."""
     from app.models.mcp_server import MCPServerOverride
-    from sqlalchemy import select
     _, admin_token = await _make_user("platform_admin")
     suffix = uuid.uuid4().hex[:6]
     async with async_session() as db:
@@ -176,3 +176,76 @@ async def test_delete_cascades_to_overrides(client):
             select(MCPServerOverride).where(MCPServerOverride.mcp_server_id == srv_id)
         )).scalars().all()
         assert n == [], "overrides should be cascade-deleted with server"
+
+
+# ---------------------------------------------------------------------------
+# ACL: non-platform_admin must be rejected on all write / action endpoints
+# ---------------------------------------------------------------------------
+
+async def test_create_requires_platform_admin(client):
+    _, member_token = await _make_user("member")
+    r = await client.post(
+        "/api/admin/mcp-servers",
+        json={"name": "x", "display_name": "x", "base_url_template": "https://x"},
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert r.status_code == 403
+
+
+async def test_patch_requires_platform_admin(client):
+    _, member_token = await _make_user("member")
+    r = await client.patch(
+        f"/api/admin/mcp-servers/{uuid.uuid4()}",
+        json={"display_name": "y"},
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert r.status_code == 403
+
+
+async def test_delete_requires_platform_admin(client):
+    _, member_token = await _make_user("member")
+    r = await client.delete(
+        f"/api/admin/mcp-servers/{uuid.uuid4()}",
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert r.status_code == 403
+
+
+async def test_test_connection_requires_platform_admin(client):
+    _, member_token = await _make_user("member")
+    r = await client.post(
+        f"/api/admin/mcp-servers/{uuid.uuid4()}/test-connection",
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Credential safety: PATCH with credential_template=null must not clear value
+# ---------------------------------------------------------------------------
+
+async def test_patch_credential_none_does_not_clear(client):
+    _, admin_token = await _make_user("platform_admin")
+    suffix = uuid.uuid4().hex[:6]
+    async with async_session() as db:
+        srv = MCPServer(
+            name=f"keep_{suffix}", display_name="k", base_url_template="https://k",
+            headers_template={}, credential_template="must-not-vanish",
+        )
+        db.add(srv)
+        await db.commit()
+        await db.refresh(srv)
+        srv_id = srv.id
+
+    # Send credential_template: null — should be ignored per schema contract
+    r = await client.patch(
+        f"/api/admin/mcp-servers/{srv_id}",
+        json={"credential_template": None, "display_name": "k2"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["credential_state"] == "set"  # NOT cleared
+
+    async with async_session() as db:
+        srv2 = (await db.execute(select(MCPServer).where(MCPServer.id == srv_id))).scalar_one()
+        assert srv2.credential_template == "must-not-vanish"
