@@ -13,7 +13,10 @@ Composition rules (from design spec §3.3):
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
+
+from sqlalchemy import select
 
 from app.models.mcp_server import MCPServer, MCPServerOverride
 
@@ -70,3 +73,31 @@ def compose_runtime_config(
         credential_template=credential_template,
         prompt_blocks=prompt_blocks,
     )
+
+
+async def lookup_overrides(
+    db,
+    server_id: uuid.UUID,
+    tenant_id: uuid.UUID | None,
+    agent_id: uuid.UUID | None,
+):
+    """Fetch (tenant_override, agent_override) for given scopes; either may be None."""
+    t_ovr = None
+    a_ovr = None
+    if tenant_id:
+        t_ovr = (await db.execute(
+            select(MCPServerOverride).where(
+                MCPServerOverride.mcp_server_id == server_id,
+                MCPServerOverride.scope_type == "tenant",
+                MCPServerOverride.scope_id == tenant_id,
+            )
+        )).scalar_one_or_none()
+    if agent_id:
+        a_ovr = (await db.execute(
+            select(MCPServerOverride).where(
+                MCPServerOverride.mcp_server_id == server_id,
+                MCPServerOverride.scope_type == "agent",
+                MCPServerOverride.scope_id == agent_id,
+            )
+        )).scalar_one_or_none()
+    return t_ovr, a_ovr

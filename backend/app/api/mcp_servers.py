@@ -18,14 +18,18 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import require_role
+from app.core.security import get_current_user, require_role
 from app.database import get_db
-from app.models.mcp_server import MCPServer
+from app.models.agent import Agent
+from app.models.mcp_server import MCPServer, MCPServerOverride
 from app.models.user import User
 from app.schemas.mcp_server import (
     MCPServerCreate,
     MCPServerOut,
     MCPServerUpdate,
+    MCPServerOverridePut,
+    MCPServerOverrideOut,
+    OverridesGroupedOut,
     TestConnectionResult,
 )
 from app.services.audit_logger import write_audit_log
@@ -191,3 +195,181 @@ async def test_mcp_server_connection(
             user_id=current_user.id,
         )
         return TestConnectionResult(success=False, error=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Override CRUD helpers
+# ---------------------------------------------------------------------------
+
+
+async def _require_tenant_override_access(
+    current_user: User, scope_id: uuid.UUID,
+) -> None:
+    """Platform admin OR org_admin of the given tenant."""
+    is_platform = (current_user.role == "platform_admin"
+                   or (current_user.identity and current_user.identity.is_platform_admin))
+    if is_platform:
+        return
+    if current_user.role == "org_admin" and current_user.tenant_id == scope_id:
+        return
+    raise HTTPException(status_code=403, detail="not authorized for this tenant override")
+
+
+async def _require_agent_override_access(
+    current_user: User, agent_id: uuid.UUID, db: AsyncSession,
+) -> None:
+    """Platform admin OR the agent's creator."""
+    is_platform = (current_user.role == "platform_admin"
+                   or (current_user.identity and current_user.identity.is_platform_admin))
+    if is_platform:
+        return
+    agent = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    if agent.creator_id != current_user.id:
+        raise HTTPException(status_code=403, detail="not authorized for this agent override")
+
+
+async def _upsert_override(
+    db: AsyncSession, server_id: uuid.UUID, scope_type: str,
+    scope_id: uuid.UUID, payload: MCPServerOverridePut, user_id: uuid.UUID,
+) -> MCPServerOverride:
+    existing = (await db.execute(
+        select(MCPServerOverride).where(
+            MCPServerOverride.mcp_server_id == server_id,
+            MCPServerOverride.scope_type == scope_type,
+            MCPServerOverride.scope_id == scope_id,
+        )
+    )).scalar_one_or_none()
+
+    update_data = payload.model_dump(exclude_unset=True)
+    # credential_template: None means "don't touch" (mirrors server PATCH semantics)
+    if "credential_template" in update_data and update_data["credential_template"] is None:
+        update_data.pop("credential_template")
+
+    if existing is None:
+        ovr = MCPServerOverride(
+            mcp_server_id=server_id, scope_type=scope_type, scope_id=scope_id,
+            last_modified_by_user_id=user_id,
+            **update_data,
+        )
+        db.add(ovr)
+    else:
+        for f, v in update_data.items():
+            setattr(existing, f, v)
+        existing.last_modified_by_user_id = user_id
+        ovr = existing
+    await db.commit()
+    await db.refresh(ovr)
+    return ovr
+
+
+# ---------------------------------------------------------------------------
+# Override endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{server_id}/overrides", response_model=OverridesGroupedOut)
+async def list_mcp_overrides(
+    server_id: uuid.UUID,
+    current_user: PlatformAdmin,
+    db: AsyncSession = Depends(get_db),
+) -> OverridesGroupedOut:
+    rows = (await db.execute(
+        select(MCPServerOverride).where(MCPServerOverride.mcp_server_id == server_id)
+    )).scalars().all()
+    grouped = OverridesGroupedOut()
+    for r in rows:
+        target_list = grouped.tenant if r.scope_type == "tenant" else grouped.agent
+        target_list.append(MCPServerOverrideOut.from_orm_model(r))
+    return grouped
+
+
+@router.put("/{server_id}/overrides/tenant/{tenant_id}", response_model=MCPServerOverrideOut)
+async def put_tenant_override(
+    server_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    payload: MCPServerOverridePut,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MCPServerOverrideOut:
+    await _require_tenant_override_access(current_user, tenant_id)
+    if (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    ovr = await _upsert_override(db, server_id, "tenant", tenant_id, payload, current_user.id)
+    await write_audit_log(
+        action="MCP_SERVER_OVERRIDE_UPSERT",
+        details={"server_id": str(server_id), "scope_type": "tenant", "scope_id": str(tenant_id)},
+        user_id=current_user.id,
+    )
+    return MCPServerOverrideOut.from_orm_model(ovr)
+
+
+@router.delete("/{server_id}/overrides/tenant/{tenant_id}", status_code=204)
+async def delete_tenant_override(
+    server_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await _require_tenant_override_access(current_user, tenant_id)
+    rows = (await db.execute(
+        select(MCPServerOverride).where(
+            MCPServerOverride.mcp_server_id == server_id,
+            MCPServerOverride.scope_type == "tenant",
+            MCPServerOverride.scope_id == tenant_id,
+        )
+    )).scalars().all()
+    for r in rows:
+        await db.delete(r)
+    await db.commit()
+    await write_audit_log(
+        action="MCP_SERVER_OVERRIDE_DELETE",
+        details={"server_id": str(server_id), "scope_type": "tenant", "scope_id": str(tenant_id)},
+        user_id=current_user.id,
+    )
+
+
+@router.put("/{server_id}/overrides/agent/{agent_id}", response_model=MCPServerOverrideOut)
+async def put_agent_override(
+    server_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    payload: MCPServerOverridePut,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MCPServerOverrideOut:
+    await _require_agent_override_access(current_user, agent_id, db)
+    if (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    ovr = await _upsert_override(db, server_id, "agent", agent_id, payload, current_user.id)
+    await write_audit_log(
+        action="MCP_SERVER_OVERRIDE_UPSERT",
+        details={"server_id": str(server_id), "scope_type": "agent", "scope_id": str(agent_id)},
+        user_id=current_user.id,
+    )
+    return MCPServerOverrideOut.from_orm_model(ovr)
+
+
+@router.delete("/{server_id}/overrides/agent/{agent_id}", status_code=204)
+async def delete_agent_override(
+    server_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await _require_agent_override_access(current_user, agent_id, db)
+    rows = (await db.execute(
+        select(MCPServerOverride).where(
+            MCPServerOverride.mcp_server_id == server_id,
+            MCPServerOverride.scope_type == "agent",
+            MCPServerOverride.scope_id == agent_id,
+        )
+    )).scalars().all()
+    for r in rows:
+        await db.delete(r)
+    await db.commit()
+    await write_audit_log(
+        action="MCP_SERVER_OVERRIDE_DELETE",
+        details={"server_id": str(server_id), "scope_type": "agent", "scope_id": str(agent_id)},
+        user_id=current_user.id,
+    )
