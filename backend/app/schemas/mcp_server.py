@@ -82,3 +82,87 @@ class TestConnectionResult(BaseModel):
     instructions: str | None = None
     server_info: dict | None = None
     error: str | None = None
+
+
+class MCPServerOverridePut(BaseModel):
+    """Request body for PUT /overrides/{scope}/{scope_id}.
+
+    All fields optional — partial update. None = "unset/default";
+    string = "set". Use empty string to explicitly clear text fields.
+    """
+
+    system_prompt_block: str | None = None
+    url_template: str | None = None
+    headers_template: dict | None = None
+    credential_template: str | None = None  # plaintext on input
+
+
+class MCPServerOverrideOut(BaseModel):
+    id: uuid.UUID
+    mcp_server_id: uuid.UUID
+    scope_type: Literal["tenant", "agent"]
+    scope_id: uuid.UUID
+    system_prompt_block: str | None
+    url_template: str | None
+    headers_template: dict | None
+    credential_state: Literal["set", "unset"]
+    last_modified_by_user_id: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_orm_model(cls, ovr) -> "MCPServerOverrideOut":
+        return cls(
+            id=ovr.id,
+            mcp_server_id=ovr.mcp_server_id,
+            scope_type=ovr.scope_type,  # type: ignore[arg-type]
+            scope_id=ovr.scope_id,
+            system_prompt_block=ovr.system_prompt_block,
+            url_template=ovr.url_template,
+            headers_template=ovr.headers_template,
+            credential_state="set" if (ovr.credential_template or "").strip() else "unset",
+            last_modified_by_user_id=ovr.last_modified_by_user_id,
+            created_at=ovr.created_at,
+            updated_at=ovr.updated_at,
+        )
+
+
+class OverridesGroupedOut(BaseModel):
+    """Response for GET /overrides — grouped by scope_type."""
+
+    tenant: list[MCPServerOverrideOut] = Field(default_factory=list)
+    agent: list[MCPServerOverrideOut] = Field(default_factory=list)
+
+
+class DryRunRequest(BaseModel):
+    """Request for POST /dry-run.
+
+    identity:
+    * current_user — uses caller's id/email/etc. for ${user.*} resolution
+    * synthetic — uses fixed dummy values; safe for sharing screenshots
+
+    scope:
+    * platform — only server.system_prompt_block is rendered
+    * tenant — server + tenant override (tenant_id must be set)
+    * agent — server + tenant override + agent override (agent_id must be set)
+    """
+
+    identity: Literal["current_user", "synthetic"] = "synthetic"
+    scope: Literal["platform", "tenant", "agent"] = "platform"
+    tenant_id: uuid.UUID | None = None
+    agent_id: uuid.UUID | None = None
+
+
+class DryRunResponse(BaseModel):
+    """Response for POST /dry-run.
+
+    NEVER returns resolved credential plaintext. Authorization-class
+    headers are masked.
+    """
+
+    resolved_url: str
+    resolved_headers: dict[str, str]  # Authorization-class keys masked to "Bearer ***"
+    resolved_credential_state: Literal["set", "unset"]
+    resolved_prompt: str
+    used_layers: list[Literal["platform", "tenant", "agent"]]
+    errors: list[str] = Field(default_factory=list)  # placeholder render errors etc.
