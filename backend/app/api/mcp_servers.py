@@ -24,6 +24,8 @@ from app.models.agent import Agent
 from app.models.mcp_server import MCPServer, MCPServerOverride
 from app.models.user import User
 from app.schemas.mcp_server import (
+    DryRunRequest,
+    DryRunResponse,
     MCPServerCreate,
     MCPServerOut,
     MCPServerUpdate,
@@ -31,6 +33,16 @@ from app.schemas.mcp_server import (
     MCPServerOverrideOut,
     OverridesGroupedOut,
     TestConnectionResult,
+)
+from app.services.mcp_server_service import compose_runtime_config, lookup_overrides
+from app.services.placeholder_engine import (
+    ALL_ROOTS,
+    DisallowedPlaceholderError,
+    PlaceholderContext,
+    PROMPT_SAFE_ROOTS,
+    UnknownPlaceholderError,
+    render,
+    render_dict,
 )
 from app.services.audit_logger import write_audit_log
 from app.services.mcp_client import MCPClient
@@ -372,4 +384,115 @@ async def delete_agent_override(
         action="MCP_SERVER_OVERRIDE_DELETE",
         details={"server_id": str(server_id), "scope_type": "agent", "scope_id": str(agent_id)},
         user_id=current_user.id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dry-run endpoint
+# ---------------------------------------------------------------------------
+
+_AUTH_HEADER_KEYS = {"authorization", "x-api-key", "x-auth-token"}
+
+_SYNTHETIC_CTX = PlaceholderContext(
+    user={"id": "00000000-0000-0000-0000-000000000000", "email": "preview@example.local",
+          "phone": "0000000000", "name": "Preview User", "display_name": "Preview"},
+    agent={"id": "00000000-0000-0000-0000-000000000000", "name": "PreviewAgent",
+           "slug": "preview"},
+    tenant={"id": "00000000-0000-0000-0000-000000000000"},
+    session={"id": "00000000-0000-0000-0000-000000000000"},
+    channel={"type": "web"},
+)
+
+
+def _build_user_ctx(current_user: User, agent_id: uuid.UUID | None,
+                    tenant_id: uuid.UUID | None) -> PlaceholderContext:
+    """Build a PlaceholderContext from the authenticated caller's identity."""
+    return PlaceholderContext(
+        user={
+            "id": str(current_user.id),
+            "email": current_user.identity.email if current_user.identity else "",
+            "phone": current_user.identity.phone if current_user.identity else "",
+            "name": current_user.display_name or "",
+            "display_name": current_user.display_name or "",
+        },
+        agent={"id": str(agent_id) if agent_id else "", "name": "", "slug": ""},
+        tenant={"id": str(tenant_id or current_user.tenant_id or "")},
+        session={"id": "preview-session"},
+        channel={"type": "web"},
+    )
+
+
+def _mask_auth_headers(headers: dict[str, str]) -> dict[str, str]:
+    out = {}
+    for k, v in headers.items():
+        if k.lower() in _AUTH_HEADER_KEYS:
+            out[k] = "Bearer ***" if v else ""
+        else:
+            out[k] = v
+    return out
+
+
+@router.post("/{server_id}/dry-run", response_model=DryRunResponse)
+async def dry_run_mcp_server(
+    server_id: uuid.UUID,
+    payload: DryRunRequest,
+    current_user: PlatformAdmin,
+    db: AsyncSession = Depends(get_db),
+) -> DryRunResponse:
+    srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
+    if srv is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+
+    # Determine layers + lookup overrides
+    used: list[str] = ["platform"]
+    if payload.scope in ("tenant", "agent"):
+        if payload.tenant_id is None:
+            raise HTTPException(status_code=400, detail="tenant_id required for scope=tenant|agent")
+    if payload.scope == "agent" and payload.agent_id is None:
+        raise HTTPException(status_code=400, detail="agent_id required for scope=agent")
+
+    t_ovr, a_ovr = await lookup_overrides(
+        db, server_id,
+        payload.tenant_id if payload.scope in ("tenant", "agent") else None,
+        payload.agent_id if payload.scope == "agent" else None,
+    )
+    if t_ovr:
+        used.append("tenant")
+    if a_ovr:
+        used.append("agent")
+
+    cfg = compose_runtime_config(srv, t_ovr, a_ovr)
+
+    # Build context
+    if payload.identity == "synthetic":
+        ctx = _SYNTHETIC_CTX
+    else:
+        ctx = _build_user_ctx(current_user, payload.agent_id, payload.tenant_id)
+
+    errors: list[str] = []
+
+    def _safe(template: str, allowed: frozenset[str]) -> str:
+        try:
+            return render(template, ctx, allowed, on_unknown="keep_literal")
+        except DisallowedPlaceholderError as e:
+            errors.append(str(e))
+            return template
+        except UnknownPlaceholderError as e:
+            errors.append(str(e))
+            return template
+
+    resolved_url = _safe(cfg.url_template, ALL_ROOTS)
+    resolved_headers = render_dict(cfg.headers_template or {}, ctx,
+                                   allowed_roots=ALL_ROOTS, on_unknown="keep_literal")
+    resolved_headers = _mask_auth_headers(resolved_headers)
+    # Prompt is rendered with PROMPT_SAFE_ROOTS — ${user.*} would error
+    resolved_prompt = _safe("\n\n".join(cfg.prompt_blocks), PROMPT_SAFE_ROOTS)
+
+    return DryRunResponse(
+        resolved_url=resolved_url,
+        resolved_headers=resolved_headers,
+        resolved_credential_state="set" if (cfg.credential_template or "").strip() else "unset",
+        resolved_prompt=resolved_prompt,
+        used_layers=used,  # type: ignore[arg-type]
+        errors=errors,
     )
