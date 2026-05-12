@@ -74,12 +74,18 @@ async def list_mcp_servers(
 @router.get("/{server_id}", response_model=MCPServerOut)
 async def get_mcp_server(
     server_id: uuid.UUID,
-    current_user: PlatformAdmin,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MCPServerOut:
+    """Anyone allowed to edit the server may also read it.
+
+    Same role matrix as PATCH/dry-run/test-connection: platform_admin,
+    server creator, or same-tenant org_admin / agent_admin.
+    """
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    await _assert_can_edit_server(current_user, srv)
     return MCPServerOut.from_orm_model(srv)
 
 
@@ -246,7 +252,7 @@ async def _require_tenant_override_access(
 async def _require_agent_override_access(
     current_user: User, agent_id: uuid.UUID, db: AsyncSession,
 ) -> None:
-    """Platform admin OR the agent's creator."""
+    """Allowed: platform_admin, agent creator, or same-tenant org_admin / agent_admin."""
     is_platform = (current_user.role == "platform_admin"
                    or (current_user.identity and current_user.identity.is_platform_admin))
     if is_platform:
@@ -254,8 +260,16 @@ async def _require_agent_override_access(
     agent = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
     if agent is None:
         raise HTTPException(status_code=404, detail="agent not found")
-    if agent.creator_id != current_user.id:
-        raise HTTPException(status_code=403, detail="not authorized for this agent override")
+    if agent.creator_id == current_user.id:
+        return
+    # Same-tenant admin: can manage all agent overrides in their tenant
+    if (
+        current_user.role in ("org_admin", "agent_admin")
+        and agent.tenant_id is not None
+        and current_user.tenant_id == agent.tenant_id
+    ):
+        return
+    raise HTTPException(status_code=403, detail="not authorized for this agent override")
 
 
 async def _upsert_override(
@@ -444,9 +458,25 @@ _SYNTHETIC_CTX = PlaceholderContext(
 )
 
 
-def _build_user_ctx(current_user: User, agent_id: uuid.UUID | None,
-                    tenant_id: uuid.UUID | None) -> PlaceholderContext:
-    """Build a PlaceholderContext from the authenticated caller's identity."""
+async def _build_user_ctx(
+    db: AsyncSession,
+    current_user: User,
+    agent_id: uuid.UUID | None,
+    tenant_id: uuid.UUID | None,
+) -> PlaceholderContext:
+    """Build a PlaceholderContext from the authenticated caller + agent row.
+
+    When agent_id is provided, the Agent row is loaded so ${agent.name} /
+    ${agent.slug} resolve to real values (otherwise placeholders render to
+    empty strings, which surprises users seeing the live preview).
+    """
+    agent_name = ""
+    agent_slug = ""
+    if agent_id is not None:
+        agent_row = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
+        if agent_row is not None:
+            agent_name = agent_row.name or ""
+            agent_slug = getattr(agent_row, "slug", "") or ""
     return PlaceholderContext(
         user={
             "id": str(current_user.id),
@@ -455,7 +485,7 @@ def _build_user_ctx(current_user: User, agent_id: uuid.UUID | None,
             "name": current_user.display_name or "",
             "display_name": current_user.display_name or "",
         },
-        agent={"id": str(agent_id) if agent_id else "", "name": "", "slug": ""},
+        agent={"id": str(agent_id) if agent_id else "", "name": agent_name, "slug": agent_slug},
         tenant={"id": str(tenant_id or current_user.tenant_id or "")},
         session={"id": "preview-session"},
         channel={"type": "web"},
@@ -486,15 +516,19 @@ async def dry_run_mcp_server(
 
     # Determine layers + lookup overrides
     used: list[str] = ["platform"]
+    # If caller omits tenant_id, infer it: prefer the server's tenant_id,
+    # falling back to the caller's. This lets the unified editor preview
+    # without redundantly sending tenant context the server already knows.
+    effective_tenant_id = payload.tenant_id or srv.tenant_id or current_user.tenant_id
     if payload.scope in ("tenant", "agent"):
-        if payload.tenant_id is None:
+        if effective_tenant_id is None:
             raise HTTPException(status_code=400, detail="tenant_id required for scope=tenant|agent")
     if payload.scope == "agent" and payload.agent_id is None:
         raise HTTPException(status_code=400, detail="agent_id required for scope=agent")
 
     t_ovr, a_ovr = await lookup_overrides(
         db, server_id,
-        payload.tenant_id if payload.scope in ("tenant", "agent") else None,
+        effective_tenant_id if payload.scope in ("tenant", "agent") else None,
         payload.agent_id if payload.scope == "agent" else None,
     )
     if t_ovr:
@@ -528,7 +562,7 @@ async def dry_run_mcp_server(
     if payload.identity == "synthetic":
         ctx = _SYNTHETIC_CTX
     else:
-        ctx = _build_user_ctx(current_user, payload.agent_id, payload.tenant_id)
+        ctx = await _build_user_ctx(db, current_user, payload.agent_id, effective_tenant_id)
 
     errors: list[str] = []
 
