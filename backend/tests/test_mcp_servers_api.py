@@ -192,12 +192,26 @@ async def test_create_requires_platform_admin(client):
     assert r.status_code == 403
 
 
-async def test_patch_requires_platform_admin(client):
-    _, member_token = await _make_user("member")
+async def test_patch_rejects_non_owner_member(client):
+    """PATCH access now per-server: non-owner member is forbidden after server lookup."""
+    owner, _ = await _make_user("member")
+    suffix = uuid.uuid4().hex[:6]
+    async with async_session() as db:
+        srv = MCPServer(
+            name=f"patch_perm_{suffix}",
+            display_name="x",
+            base_url_template="https://x.example",
+            created_by_user_id=owner.id,
+        )
+        db.add(srv)
+        await db.commit()
+        await db.refresh(srv)
+        srv_id = srv.id
+    _, intruder_token = await _make_user("member")
     r = await client.patch(
-        f"/api/admin/mcp-servers/{uuid.uuid4()}",
+        f"/api/admin/mcp-servers/{srv_id}",
         json={"display_name": "y"},
-        headers={"Authorization": f"Bearer {member_token}"},
+        headers={"Authorization": f"Bearer {intruder_token}"},
     )
     assert r.status_code == 403
 
@@ -211,11 +225,25 @@ async def test_delete_requires_platform_admin(client):
     assert r.status_code == 403
 
 
-async def test_test_connection_requires_platform_admin(client):
-    _, member_token = await _make_user("member")
+async def test_test_connection_rejects_non_owner_member(client):
+    """test-connection access now per-server: non-owner member is forbidden after lookup."""
+    owner, _ = await _make_user("member")
+    suffix = uuid.uuid4().hex[:6]
+    async with async_session() as db:
+        srv = MCPServer(
+            name=f"testconn_perm_{suffix}",
+            display_name="x",
+            base_url_template="https://x.example",
+            created_by_user_id=owner.id,
+        )
+        db.add(srv)
+        await db.commit()
+        await db.refresh(srv)
+        srv_id = srv.id
+    _, intruder_token = await _make_user("member")
     r = await client.post(
-        f"/api/admin/mcp-servers/{uuid.uuid4()}/test-connection",
-        headers={"Authorization": f"Bearer {member_token}"},
+        f"/api/admin/mcp-servers/{srv_id}/test-connection",
+        headers={"Authorization": f"Bearer {intruder_token}"},
     )
     assert r.status_code == 403
 

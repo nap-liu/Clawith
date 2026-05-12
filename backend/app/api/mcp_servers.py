@@ -50,6 +50,31 @@ from app.services.mcp_client import MCPClient
 
 router = APIRouter(prefix="/admin/mcp-servers", tags=["mcp-admin"])
 
+
+async def _assert_can_edit_server(
+    current_user: User,
+    server: MCPServer,
+) -> None:
+    """Edit access: platform_admin, server creator, or same-tenant org_admin / agent_admin."""
+    is_platform = current_user.role == "platform_admin" or (
+        current_user.identity is not None and getattr(current_user.identity, "is_platform_admin", False)
+    )
+    if is_platform:
+        return
+    if server.created_by_user_id is not None and server.created_by_user_id == current_user.id:
+        return
+    if (
+        current_user.role in ("org_admin", "agent_admin")
+        and server.tenant_id is not None
+        and current_user.tenant_id == server.tenant_id
+    ):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="You do not have permission to modify this MCP server",
+    )
+
+
 PlatformAdmin = Annotated[User, Depends(require_role("platform_admin"))]
 
 
@@ -111,12 +136,13 @@ async def create_mcp_server(
 async def update_mcp_server(
     server_id: uuid.UUID,
     payload: MCPServerUpdate,
-    current_user: PlatformAdmin,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> MCPServerOut:
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    await _assert_can_edit_server(current_user, srv)
 
     diff: dict[str, dict] = {}
     update_data = payload.model_dump(exclude_unset=True)
@@ -173,12 +199,13 @@ async def delete_mcp_server(
 @router.post("/{server_id}/test-connection", response_model=TestConnectionResult)
 async def test_mcp_server_connection(
     server_id: uuid.UUID,
-    current_user: PlatformAdmin,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TestConnectionResult:
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    await _assert_can_edit_server(current_user, srv)
 
     # NOTE: At this point base_url_template / headers_template / credential_template
     # may contain ${user.email} etc. — P3 will resolve those. For P1, we treat them
@@ -465,12 +492,13 @@ def _mask_auth_headers(headers: dict[str, str]) -> dict[str, str]:
 async def dry_run_mcp_server(
     server_id: uuid.UUID,
     payload: DryRunRequest,
-    current_user: PlatformAdmin,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DryRunResponse:
     srv = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    await _assert_can_edit_server(current_user, srv)
 
     # Determine layers + lookup overrides
     used: list[str] = ["platform"]
