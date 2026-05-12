@@ -64,11 +64,19 @@ export interface MCPServerOverridePutPayload {
   credential_template?: string | null;
 }
 
+export interface DraftOverrides {
+  base_url_template?: string | null;
+  headers_template?: Record<string, string> | null;
+  credential_template?: string | null;
+  system_prompt_block?: string | null;
+}
+
 export interface DryRunRequest {
   identity: 'current_user' | 'synthetic';
   scope: 'platform' | 'tenant' | 'agent';
   tenant_id?: string | null;
   agent_id?: string | null;
+  draft_overrides?: DraftOverrides | null;
 }
 
 export interface DryRunResponse {
@@ -76,6 +84,6 @@ export interface DryRunResponse {
   resolved_headers: Record<string, string>;
   resolved_credential_state: 'set' | 'unset';
   resolved_prompt: string;
-  used_layers: ('platform' | 'tenant' | 'agent')[];
+  used_layers: ('platform' | 'tenant' | 'agent' | 'draft')[];
   errors: string[];
 }
