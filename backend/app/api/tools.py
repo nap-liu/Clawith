@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user
 from app.database import get_db
+from app.models.mcp_server import MCPServer
 from app.models.tool import Tool, AgentTool
 from app.models.user import User
 
@@ -386,6 +387,28 @@ async def update_mcp_server(
             raise HTTPException(status_code=400, detail="Invalid tenant_id format")
     else:
         target_tenant_id = current_user.tenant_id
+
+    # Permission gate: only platform_admin, server creator, or same-tenant
+    # org_admin / agent_admin may bulk-update. We locate the server row by
+    # name first (across tenants) so cross-tenant callers are rejected with
+    # 403 rather than leaking a 404 / 200 via tenant filtering.
+    srv_q = await db.execute(
+        select(MCPServer).where(MCPServer.name == data.server_name).limit(1)
+    )
+    srv = srv_q.scalar_one_or_none()
+    if srv is not None:
+        is_platform = current_user.role == "platform_admin"
+        is_owner = srv.created_by_user_id is not None and srv.created_by_user_id == current_user.id
+        is_same_tenant_org = (
+            current_user.role in ("org_admin", "agent_admin")
+            and srv.tenant_id is not None
+            and current_user.tenant_id == srv.tenant_id
+        )
+        if not (is_platform or is_owner or is_same_tenant_org):
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have permission to modify this MCP server",
+            )
 
     # Load all tools from this server under the target tenant
     result = await db.execute(
