@@ -562,7 +562,13 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
                     </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                    {/* MCP tools: 配置按钮直接打开 prompt override 对话框（覆盖 legacy JSON config 路径）*/}
+                    {canManage && hasConfig && !isGlobalCategoryConfig && (
+                        <button
+                            onClick={() => openConfig(tool)}
+                            style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                            title={t('agent.tools.configurePerAgent', 'Configure per-agent settings')}
+                        ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
+                    )}
                     {canManage && tool.type === 'mcp' && tool.mcp_server_id && (
                         <button
                             onClick={(e) => {
@@ -573,16 +579,8 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
                                 });
                             }}
                             style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-                            title="自定义本 agent 的 prompt override"
-                        ><IconSettings size={12} stroke={1.8} /> Prompt</button>
-                    )}
-                    {/* 非 MCP 工具：保留 legacy JSON config 编辑 */}
-                    {canManage && hasConfig && !isGlobalCategoryConfig && !(tool.type === 'mcp' && tool.mcp_server_id) && (
-                        <button
-                            onClick={() => openConfig(tool)}
-                            style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-                            title={t('agent.tools.configurePerAgent', 'Configure per-agent settings')}
-                        ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
+                            title="自定义本 agent 的 MCP prompt override"
+                        ><IconMessageCircle size={12} stroke={1.8} /> Prompt</button>
                     )}
                     {canManage && tool.source === 'agent' && tool.agent_tool_id && (
                         <button
