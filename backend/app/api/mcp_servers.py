@@ -88,6 +88,7 @@ async def create_mcp_server(
         headers_template=payload.headers_template,
         credential_template=payload.credential_template,  # TODO P3: envelope-encrypt
         system_prompt_block=payload.system_prompt_block,
+        placeholder_allowlist=payload.placeholder_allowlist,
         created_by_user_id=current_user.id,
     )
     db.add(srv)
@@ -124,6 +125,9 @@ async def update_mcp_server(
         # credential_template: None means "don't touch" per schema contract;
         # callers must send "" to explicitly clear.
         if field == "credential_template" and new_value is None:
+            continue
+        # placeholder_allowlist: None means "don't touch"; send [] to clear restriction.
+        if field == "placeholder_allowlist" and new_value is None:
             continue
         old_value = getattr(srv, field)
         if old_value != new_value:

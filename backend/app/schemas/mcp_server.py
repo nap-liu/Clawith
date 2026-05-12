@@ -24,6 +24,7 @@ class MCPServerCreate(BaseModel):
     headers_template: dict = Field(default_factory=dict)
     credential_template: str | None = None  # plaintext on input; encrypted at rest
     system_prompt_block: str | None = None
+    placeholder_allowlist: list[str] | None = None
     tenant_id: uuid.UUID | None = None  # platform admin can set; org admin can't override
 
 
@@ -39,6 +40,7 @@ class MCPServerUpdate(BaseModel):
     headers_template: dict | None = None
     credential_template: str | None = None  # see docstring
     system_prompt_block: str | None = None  # explicit "" to clear
+    placeholder_allowlist: list[str] | None = None  # null = don't touch, [] = clear restriction
 
 
 class MCPServerOut(BaseModel):
@@ -52,6 +54,7 @@ class MCPServerOut(BaseModel):
     headers_template: dict
     credential_state: Literal["set", "unset"]  # masked
     system_prompt_block: str | None
+    placeholder_allowlist: list[str] | None
     instructions: str | None
     instructions_captured_at: datetime | None
     created_by_user_id: uuid.UUID | None
@@ -69,6 +72,7 @@ class MCPServerOut(BaseModel):
             headers_template=server.headers_template or {},
             credential_state="set" if (server.credential_template or "").strip() else "unset",
             system_prompt_block=server.system_prompt_block,
+            placeholder_allowlist=server.placeholder_allowlist,
             instructions=server.instructions,
             instructions_captured_at=server.instructions_captured_at,
             created_by_user_id=server.created_by_user_id,
