@@ -53,7 +53,8 @@ import {
     IconAlertTriangle,
 } from '@tabler/icons-react';
 import { useDropZone } from '../hooks/useDropZone';
-import { AgentMcpPromptDialog } from '../components/mcp-servers/AgentMcpPromptDialog';
+import MCPServerEditor from '../components/MCPServerEditor';
+import { effectiveEditorRole } from '../components/MCPServerEditor/role';
 
 const TABS = ['status', 'aware', 'mind', 'tools', 'skills', 'relationships', 'workspace', 'chat', 'activityLog', 'approvals', 'settings'] as const;
 
@@ -234,6 +235,8 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
     const { t } = useTranslation();
     const dialog = useDialog();
     const toast = useToast();
+    const currentUser = useAuthStore((s) => s.user);
+    const tmQueryClient = useQueryClient();
     const [tools, setTools] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
     const [configTool, setConfigTool] = useState<any | null>(null);
@@ -247,7 +250,7 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
     const [expandedCategories, setExpandedCategories] = useState<Set<string>>(() => new Set());
     const [toolSearch, setToolSearch] = useState('');
     const [toolStatusFilter, setToolStatusFilter] = useState<'all' | 'enabled' | 'disabled' | 'configured'>('all');
-    const [agentPromptDialog, setAgentPromptDialog] = useState<{ serverId: string; toolDisplayName: string } | null>(null);
+    const [mcpEditor, setMcpEditor] = useState<{ serverId: string; toolDisplayName: string } | null>(null);
     // Global (company-level) config for the currently open modal — used to show
     // lock hints and prevent agent from overriding company-set fields.
     const [configGlobalData, setConfigGlobalData] = useState<Record<string, any>>({});
@@ -562,25 +565,26 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
                     </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                    {canManage && hasConfig && !isGlobalCategoryConfig && (
-                        <button
-                            onClick={() => openConfig(tool)}
-                            style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-                            title={t('agent.tools.configurePerAgent', 'Configure per-agent settings')}
-                        ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
-                    )}
                     {canManage && tool.type === 'mcp' && tool.mcp_server_id && (
                         <button
                             onClick={(e) => {
                                 e.stopPropagation();
-                                setAgentPromptDialog({
+                                setMcpEditor({
                                     serverId: tool.mcp_server_id,
                                     toolDisplayName: tool.mcp_server_name || tool.display_name || tool.name,
                                 });
                             }}
                             style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
-                            title="自定义本 agent 的 MCP prompt override"
-                        ><IconMessageCircle size={12} stroke={1.8} /> Prompt</button>
+                            title="编辑 MCP server 配置（含 prompt override）"
+                        ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
+                    )}
+                    {/* Non-MCP tools that have a config_schema still use the legacy openConfig path */}
+                    {canManage && hasConfig && !isGlobalCategoryConfig && !(tool.type === 'mcp' && tool.mcp_server_id) && (
+                        <button
+                            onClick={() => openConfig(tool)}
+                            style={{ background: 'none', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+                            title={t('agent.tools.configurePerAgent', 'Configure per-agent settings')}
+                        ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
                     )}
                     {canManage && tool.source === 'agent' && tool.agent_tool_id && (
                         <button
@@ -1126,13 +1130,16 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
                     </div>
                 );
             })()}
-            {agentPromptDialog && (
-                <AgentMcpPromptDialog
+            {mcpEditor && (
+                <MCPServerEditor
+                    serverId={mcpEditor.serverId}
+                    mode="agent"
+                    defaultTab="override"
                     agentId={agentId}
-                    agentName={agentName}
-                    toolDisplayName={agentPromptDialog.toolDisplayName}
-                    mcpServerId={agentPromptDialog.serverId}
-                    onClose={() => setAgentPromptDialog(null)}
+                    role={effectiveEditorRole(currentUser)}
+                    titleSuffix={mcpEditor.toolDisplayName}
+                    onClose={() => setMcpEditor(null)}
+                    onSaved={() => tmQueryClient.invalidateQueries({ queryKey: ['agent-tools', agentId] })}
                 />
             )}
         </>

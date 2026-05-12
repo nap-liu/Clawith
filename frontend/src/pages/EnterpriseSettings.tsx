@@ -12,8 +12,8 @@ import InvitationCodes from './InvitationCodes';
 
 import LinearCopyButton from '../components/LinearCopyButton';
 import { CliToolsSection } from '../components/cli-tools/CliToolsSection';
-import { OverrideMatrix } from '../components/mcp-servers/OverrideMatrix';
-import { DryRunPanel } from '../components/mcp-servers/DryRunPanel';
+import MCPServerEditor from '../components/MCPServerEditor';
+import { effectiveEditorRole } from '../components/MCPServerEditor/role';
 import { useDialog } from '../components/Dialog/DialogProvider';
 import { useToast } from '../components/Toast/ToastProvider';
 import { buildCompanyRegions, type CompanyRegion } from '../utils/companyRegions';
@@ -2992,24 +2992,14 @@ export default function EnterpriseSettings() {
         server_url: string;
         api_key: string;
     } | null>(null);
-    const [mcpServerSaving, setMcpServerSaving] = useState(false);
-    // P4: extended modal state
-    const [mcpEditPrompt, setMcpEditPrompt] = useState<string>('');
-    const [mcpEditHeaders, setMcpEditHeaders] = useState<string>('{}');
+    // Resolved server.id (UUID) for the currently editing MCP server — populated by the effect below
+    // by matching base_url_template. Used to mount <MCPServerEditor>.
     const [mcpEditServerId, setMcpEditServerId] = useState<string | null>(null);
-    const [mcpAdvancedOpen, setMcpAdvancedOpen] = useState<boolean>(
-        () => localStorage.getItem('mcp_modal_advanced_open') === 'true'
-    );
-    const [mcpTestResult2, setMcpTestResult2] = useState<{ success: boolean; msg: string } | null>(null);
-    const [mcpTesting2, setMcpTesting2] = useState(false);
 
-    // P4: fetch mcp_server row when modal opens to populate prompt/headers
+    // Resolve mcp_server.id from base_url_template when the edit modal opens.
     useEffect(() => {
         if (!editingMcpServer) {
-            setMcpEditPrompt('');
-            setMcpEditHeaders('{}');
             setMcpEditServerId(null);
-            setMcpTestResult2(null);
             return;
         }
         (async () => {
@@ -3018,10 +3008,8 @@ export default function EnterpriseSettings() {
                 const match = list.find((s: any) => s.base_url_template === editingMcpServer.server_url);
                 if (match) {
                     setMcpEditServerId(match.id);
-                    setMcpEditPrompt(match.system_prompt_block || '');
-                    setMcpEditHeaders(JSON.stringify(match.headers_template || {}, null, 2));
                 }
-            } catch (_e) { /* swallow — modal still works without prefill */ }
+            } catch (_e) { /* swallow — editor will still show error state */ }
         })();
     }, [editingMcpServer]);
 
@@ -4481,204 +4469,17 @@ export default function EnterpriseSettings() {
                                 );
                             })()}
 
-                            {/* ─── Edit MCP Server Modal ─── */}
-                            {editingMcpServer && (
-                                <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.55)', zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center', overflowY: 'auto', padding: '32px 0' }}
-                                    onClick={e => { if (e.target === e.currentTarget) setEditingMcpServer(null); }}>
-                                    <div className="card" style={{ width: '600px', maxWidth: '95vw', padding: '24px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                                        <h3 style={{ margin: 0, fontSize: '15px' }}>Edit MCP Server</h3>
-                                        <div style={{ fontSize: '12px', color: 'var(--text-secondary)', background: 'var(--bg-tertiary)', padding: '6px 10px', borderRadius: '6px' }}>
-                                            <strong>{editingMcpServer.server_name}</strong>
-                                            <span style={{ marginLeft: '8px', color: 'var(--text-tertiary)' }}>Updates all tools from this server at once</span>
-                                        </div>
-
-                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                                            <div>
-                                                <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>Server URL</label>
-                                                <input
-                                                    type="password"
-                                                    className="form-input"
-                                                    value={editingMcpServer.server_url}
-                                                    onChange={e => setEditingMcpServer(s => s ? { ...s, server_url: e.target.value } : null)}
-                                                    placeholder="https://mcp.example.com/sse"
-                                                    autoComplete="off"
-                                                />
-                                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '3px' }}>Stored encrypted. For URL-embedded keys (e.g. Tavily), include the key directly here.</div>
-                                            </div>
-                                            <div>
-                                                <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>
-                                                    API Key <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>(optional)</span>
-                                                </label>
-                                                <input
-                                                    type="password"
-                                                    className="form-input"
-                                                    value={editingMcpServer.api_key}
-                                                    onChange={e => setEditingMcpServer(s => s ? { ...s, api_key: e.target.value } : null)}
-                                                    placeholder="Leave blank to keep existing key"
-                                                    autoComplete="new-password"
-                                                />
-                                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '3px' }}>Sent as <code style={{ background: 'rgba(0,0,0,0.06)', padding: '0 3px', borderRadius: '3px' }}>Authorization: Bearer ...</code> Takes priority over URL-embedded keys.</div>
-                                            </div>
-
-                                            {/* Auth explanation */}
-                                            <div style={{ padding: '10px 12px', background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.18)', borderRadius: '6px', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.65' }}>
-                                                <div style={{ fontWeight: 600, marginBottom: '4px', color: 'var(--text-primary)' }}>How authentication works</div>
-                                                <div>- <strong>URL-embedded key</strong> (e.g. Tavily <code style={{ background: 'rgba(0,0,0,0.06)', padding: '0 3px', borderRadius: '3px' }}>?tavilyApiKey=xxx</code>): include in Server URL above, leave API Key blank.</div>
-                                                <div>- <strong>Bearer token</strong> auth: enter in the API Key field. It is injected as an HTTP header on every request — the URL stays clean.</div>
-                                                <div>- If both are present, the API Key field takes priority over any URL-embedded value.</div>
-                                            </div>
-
-                                            {/* P4: System Prompt Block */}
-                                            <div>
-                                                <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>
-                                                    System Prompt Block
-                                                </label>
-                                                <textarea
-                                                    className="form-input"
-                                                    value={mcpEditPrompt}
-                                                    onChange={e => setMcpEditPrompt(e.target.value)}
-                                                    rows={6}
-                                                    style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', resize: 'vertical' }}
-                                                    placeholder="拼到 LLM context 的 prompt 文本。不允许 ${user.*}（用户身份请放 URL/headers/API Key）"
-                                                />
-                                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '3px' }}>
-                                                    可用占位符：<code>{'${agent.name}'}</code> <code>{'${tenant.id}'}</code> <code>{'${session.id}'}</code> <code>{'${channel.type}'}</code>
-                                                </div>
-                                            </div>
-
-                                            {/* P4: Test Connection */}
-                                            {mcpEditServerId && (
-                                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                                    <button
-                                                        className="btn btn-secondary"
-                                                        type="button"
-                                                        disabled={mcpTesting2}
-                                                        onClick={async () => {
-                                                            setMcpTesting2(true);
-                                                            setMcpTestResult2(null);
-                                                            try {
-                                                                const r = await fetchJson<any>(`/admin/mcp-servers/${mcpEditServerId}/test-connection`, { method: 'POST' });
-                                                                setMcpTestResult2({
-                                                                    success: r.success,
-                                                                    msg: r.success
-                                                                        ? `✓ instructions 已刷新（${(r.instructions || '').length} 字符）`
-                                                                        : `✗ ${r.error || '未知错误'}`,
-                                                                });
-                                                            } catch (e: any) {
-                                                                setMcpTestResult2({ success: false, msg: `✗ ${String(e?.message || e)}` });
-                                                            }
-                                                            setMcpTesting2(false);
-                                                        }}
-                                                    >
-                                                        {mcpTesting2 ? '握手中…' : 'Test Connection'}
-                                                    </button>
-                                                    {mcpTestResult2 && (
-                                                        <span style={{
-                                                            fontSize: '12px',
-                                                            color: mcpTestResult2.success ? 'var(--success)' : 'var(--error)',
-                                                        }}>
-                                                            {mcpTestResult2.msg}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                            )}
-
-                                            {/* P4: Advanced collapsible section */}
-                                            <div style={{ borderTop: '1px solid var(--border)', paddingTop: '12px' }}>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => {
-                                                        const next = !mcpAdvancedOpen;
-                                                        setMcpAdvancedOpen(next);
-                                                        localStorage.setItem('mcp_modal_advanced_open', String(next));
-                                                    }}
-                                                    style={{
-                                                        background: 'none', border: 'none', padding: 0, cursor: 'pointer',
-                                                        fontSize: '13px', fontWeight: 500, color: 'var(--text-primary)',
-                                                    }}
-                                                >
-                                                    {mcpAdvancedOpen ? '▾' : '▸'} 高级
-                                                </button>
-                                                {mcpAdvancedOpen && (
-                                                    <div style={{ marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                                                        <div>
-                                                            <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>
-                                                                Headers Template (JSON)
-                                                            </label>
-                                                            <textarea
-                                                                className="form-input"
-                                                                value={mcpEditHeaders}
-                                                                onChange={e => setMcpEditHeaders(e.target.value)}
-                                                                rows={4}
-                                                                style={{ fontFamily: 'var(--font-mono)', fontSize: '12px' }}
-                                                                placeholder='{"X-User-Email": "${user.email}"}'
-                                                            />
-                                                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '3px' }}>
-                                                                每次 MCP 调用时渲染 — 占位符可用所有 root（含 {'${user.*}'}）
-                                                            </div>
-                                                        </div>
-                                                        {mcpEditServerId && (
-                                                            <>
-                                                                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '14px' }}>
-                                                                    <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '10px' }}>
-                                                                        租户级 Overrides
-                                                                    </div>
-                                                                    <OverrideMatrix
-                                                                        serverId={mcpEditServerId}
-                                                                        lockedScope={{ scope_type: 'tenant', tenant_only: true }}
-                                                                    />
-                                                                </div>
-                                                                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '14px', marginTop: '14px' }}>
-                                                                    <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '10px' }}>
-                                                                        Dry-Run 预览
-                                                                    </div>
-                                                                    <DryRunPanel serverId={mcpEditServerId} />
-                                                                </div>
-                                                            </>
-                                                        )}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        </div>
-
-                                        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-                                            <button className="btn btn-secondary" onClick={() => setEditingMcpServer(null)} disabled={mcpServerSaving}>Cancel</button>
-                                            <button className="btn btn-primary" disabled={mcpServerSaving || !editingMcpServer.server_url} onClick={async () => {
-                                                setMcpServerSaving(true);
-                                                try {
-                                                    let parsedHeaders: any = undefined;
-                                                    try {
-                                                        parsedHeaders = JSON.parse(mcpEditHeaders || '{}');
-                                                    } catch (he: any) {
-                                                        toast.error('Headers JSON 解析失败', { details: String(he?.message || he) });
-                                                        setMcpServerSaving(false);
-                                                        return;
-                                                    }
-                                                    const body: any = {
-                                                        server_name: editingMcpServer.server_name,
-                                                        server_url: editingMcpServer.server_url,
-                                                        api_key: editingMcpServer.api_key || undefined,
-                                                        tenant_id: selectedTenantId || undefined,
-                                                        system_prompt_block: mcpEditPrompt,
-                                                        headers_template: parsedHeaders,
-                                                    };
-                                                    const result = await fetchJson<any>('/tools/mcp-server', {
-                                                        method: 'PUT',
-                                                        body: JSON.stringify(body),
-                                                    });
-                                                    if (result.mcp_server_id) {
-                                                        setMcpEditServerId(result.mcp_server_id);
-                                                    }
-                                                    await loadAllTools();
-                                                    setEditingMcpServer(null);
-                                                } catch (e: any) {
-                                                    toast.error('更新服务器失败', { details: String(e?.message || e) });
-                                                }
-                                                setMcpServerSaving(false);
-                                            }}>{mcpServerSaving ? 'Saving...' : 'Save Changes'}</button>
-                                        </div>
-                                    </div>
-                                </div>
+                            {/* ─── Edit MCP Server Modal — unified <MCPServerEditor> ─── */}
+                            {editingMcpServer && mcpEditServerId && (
+                                <MCPServerEditor
+                                    serverId={mcpEditServerId}
+                                    mode="server-admin"
+                                    defaultTab="basic"
+                                    role={effectiveEditorRole(currentUser)}
+                                    titleSuffix={editingMcpServer.server_name}
+                                    onClose={() => { setEditingMcpServer(null); }}
+                                    onSaved={() => loadAllTools()}
+                                />
                             )}
 
                             {/* Per-Tool Config Modal */}
