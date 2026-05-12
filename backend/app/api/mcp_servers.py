@@ -51,28 +51,12 @@ from app.services.mcp_client import MCPClient
 router = APIRouter(prefix="/admin/mcp-servers", tags=["mcp-admin"])
 
 
-async def _assert_can_edit_server(
-    current_user: User,
-    server: MCPServer,
-) -> None:
-    """Edit access: platform_admin, server creator, or same-tenant org_admin / agent_admin."""
-    is_platform = current_user.role == "platform_admin" or (
-        current_user.identity is not None and getattr(current_user.identity, "is_platform_admin", False)
-    )
-    if is_platform:
-        return
-    if server.created_by_user_id is not None and server.created_by_user_id == current_user.id:
-        return
-    if (
-        current_user.role in ("org_admin", "agent_admin")
-        and server.tenant_id is not None
-        and current_user.tenant_id == server.tenant_id
-    ):
-        return
-    raise HTTPException(
-        status_code=403,
-        detail="You do not have permission to modify this MCP server",
-    )
+from app.services.mcp_permissions import assert_can_edit_server as _assert_can_edit_server_sync  # noqa: E402
+
+
+async def _assert_can_edit_server(current_user: User, server: MCPServer) -> None:
+    """Async wrapper around the shared sync helper so endpoint awaits don't break."""
+    _assert_can_edit_server_sync(current_user, server)
 
 
 PlatformAdmin = Annotated[User, Depends(require_role("platform_admin"))]

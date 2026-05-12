@@ -195,6 +195,7 @@ async def upsert_mcp_server_from_tools(
     system_prompt_block: str | None = None,
     headers_template: dict | None = None,
     api_key: str | None = None,
+    created_by_user_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Find or create an mcp_servers row for (tenant_id, server_url).
 
@@ -248,6 +249,7 @@ async def upsert_mcp_server_from_tools(
         headers_template=headers_template or {},
         credential_template=api_key,
         system_prompt_block=system_prompt_block,
+        created_by_user_id=created_by_user_id,
     )
     db.add(new_srv)
     await db.flush()

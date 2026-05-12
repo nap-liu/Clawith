@@ -388,27 +388,28 @@ async def update_mcp_server(
     else:
         target_tenant_id = current_user.tenant_id
 
-    # Permission gate: only platform_admin, server creator, or same-tenant
-    # org_admin / agent_admin may bulk-update. We locate the server row by
-    # name first (across tenants) so cross-tenant callers are rejected with
-    # 403 rather than leaking a 404 / 200 via tenant filtering.
+    # Permission gate. Two cases:
+    # 1. mcp_servers row exists → must be allowed to edit it (assert_can_edit_server)
+    # 2. mcp_servers row doesn't exist BUT tools do (legacy migration state where
+    #    upsert_mcp_server_from_tools will create the row) → must be allowed to
+    #    create in the target tenant. Without this, a non-admin member could
+    #    silently introduce a brand-new MCP server row by calling PUT with a
+    #    name that doesn't exist in mcp_servers yet.
+    # We look up by name across tenants (rather than restricting to target_tenant)
+    # so cross-tenant callers fall into the edit branch (and get 403) instead of
+    # the create branch.
+    from app.services.mcp_permissions import (
+        assert_can_create_server_in_tenant,
+        assert_can_edit_server,
+    )
     srv_q = await db.execute(
         select(MCPServer).where(MCPServer.name == data.server_name).limit(1)
     )
     srv = srv_q.scalar_one_or_none()
     if srv is not None:
-        is_platform = current_user.role == "platform_admin"
-        is_owner = srv.created_by_user_id is not None and srv.created_by_user_id == current_user.id
-        is_same_tenant_org = (
-            current_user.role in ("org_admin", "agent_admin")
-            and srv.tenant_id is not None
-            and current_user.tenant_id == srv.tenant_id
-        )
-        if not (is_platform or is_owner or is_same_tenant_org):
-            raise HTTPException(
-                status_code=403,
-                detail="You do not have permission to modify this MCP server",
-            )
+        assert_can_edit_server(current_user, srv)
+    else:
+        assert_can_create_server_in_tenant(current_user, target_tenant_id)
 
     # Load all tools from this server under the target tenant
     result = await db.execute(
@@ -458,6 +459,7 @@ async def update_mcp_server(
         system_prompt_block=data.system_prompt_block,
         headers_template=data.headers_template,
         api_key=data.api_key,
+        created_by_user_id=current_user.id,
     )
     # Link tools rows to the upserted mcp_servers row
     for tool in tools:
