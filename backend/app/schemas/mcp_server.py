@@ -140,6 +140,18 @@ class OverridesGroupedOut(BaseModel):
     agent: list[MCPServerOverrideOut] = Field(default_factory=list)
 
 
+class DraftOverrides(BaseModel):
+    """Unsaved edits being typed in the UI. dry-run applies these on top of the
+    composed (server + tenant + agent) config, then resolves placeholders.
+    Any field set to None means "fall through to the composed value".
+    """
+
+    base_url_template: str | None = None
+    headers_template: dict | None = None
+    credential_template: str | None = None
+    system_prompt_block: str | None = None
+
+
 class DryRunRequest(BaseModel):
     """Request for POST /dry-run.
 
@@ -157,6 +169,7 @@ class DryRunRequest(BaseModel):
     scope: Literal["platform", "tenant", "agent"] = "platform"
     tenant_id: uuid.UUID | None = None
     agent_id: uuid.UUID | None = None
+    draft_overrides: DraftOverrides | None = None
 
 
 class DryRunResponse(BaseModel):
@@ -170,5 +183,5 @@ class DryRunResponse(BaseModel):
     resolved_headers: dict[str, str]  # Authorization-class keys masked to "Bearer ***"
     resolved_credential_state: Literal["set", "unset"]
     resolved_prompt: str
-    used_layers: list[Literal["platform", "tenant", "agent"]]
+    used_layers: list[Literal["platform", "tenant", "agent", "draft"]]
     errors: list[str] = Field(default_factory=list)  # placeholder render errors etc.

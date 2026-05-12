@@ -492,6 +492,26 @@ async def dry_run_mcp_server(
 
     cfg = compose_runtime_config(srv, t_ovr, a_ovr)
 
+    # Apply unsaved draft overrides (highest priority, transient). Semantic:
+    # url/headers/credential — draft REPLACES the composed value entirely.
+    # prompt — draft APPENDS as the final prompt block (visible alongside the
+    # composed stack, so the user sees "what gets added on top of what exists").
+    if payload.draft_overrides is not None:
+        from dataclasses import replace
+        d = payload.draft_overrides
+        new_prompts = cfg.prompt_blocks
+        if d.system_prompt_block is not None and d.system_prompt_block.strip():
+            new_prompts = cfg.prompt_blocks + [d.system_prompt_block]
+        cfg = replace(
+            cfg,
+            url_template=d.base_url_template if d.base_url_template is not None else cfg.url_template,
+            headers_template=d.headers_template if d.headers_template is not None else cfg.headers_template,
+            credential_template=d.credential_template if d.credential_template is not None else cfg.credential_template,
+            prompt_blocks=new_prompts,
+        )
+        if "draft" not in used:
+            used.append("draft")
+
     # Build context
     if payload.identity == "synthetic":
         ctx = _SYNTHETIC_CTX
