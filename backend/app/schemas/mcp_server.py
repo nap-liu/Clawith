@@ -54,6 +54,7 @@ class MCPServerOut(BaseModel):
     system_prompt_block: str | None
     instructions: str | None
     instructions_captured_at: datetime | None
+    created_by_user_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
 
@@ -70,6 +71,7 @@ class MCPServerOut(BaseModel):
             system_prompt_block=server.system_prompt_block,
             instructions=server.instructions,
             instructions_captured_at=server.instructions_captured_at,
+            created_by_user_id=server.created_by_user_id,
             created_at=server.created_at,
             updated_at=server.updated_at,
         )

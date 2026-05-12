@@ -88,6 +88,7 @@ async def create_mcp_server(
         headers_template=payload.headers_template,
         credential_template=payload.credential_template,  # TODO P3: envelope-encrypt
         system_prompt_block=payload.system_prompt_block,
+        created_by_user_id=current_user.id,
     )
     db.add(srv)
     try:
