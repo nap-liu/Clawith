@@ -354,6 +354,23 @@ class SSOService:
             identity_data,
         )
 
+        if not member:
+            # Reuse any OrgMember already owned by this user under this provider, even when
+            # _find_identity_member misses (e.g. oauth2 providers whose payloads carry no
+            # external_id/open_id/unionid → lookup chain has nothing to match on). Without
+            # this fallback every SSO login created a fresh OrgMember row.
+            fallback_result = await db.execute(
+                select(OrgMember)
+                .where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.user_id == uid,
+                    OrgMember.status == "active",
+                )
+                .order_by(OrgMember.synced_at)
+                .limit(1)
+            )
+            member = fallback_result.scalar_one_or_none()
+
         if member:
             # Always link user
             member.user_id = uid
