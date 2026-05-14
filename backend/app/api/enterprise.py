@@ -1351,7 +1351,7 @@ async def list_org_members(
     rows = result.all()
     member_paths = await derive_member_department_paths(
         db,
-        [m for m, _provider_name, _provider_type in rows],
+        [m for m, _provider_name, _provider_type, _user_display_name in rows],
     )
     return [
         {
