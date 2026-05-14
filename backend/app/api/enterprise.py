@@ -1280,7 +1280,61 @@ async def list_org_departments(
 
 
 
-from sqlalchemy import or_
+from sqlalchemy import or_, and_, case
+from app.models.org import AgentRelationship
+
+
+def _canonical_org_member_id_subquery():
+    """Subquery exposing canonical OrgMember.id per user_id group.
+
+    A single platform user (user_id) can have multiple active OrgMember rows
+    accumulated from past SSO churn. We pick one canonical row per user_id by
+    ranking with ROW_NUMBER():
+
+      1. has at least one agent_relationships entry
+      2. has a non-null external_id
+      3. name is not a placeholder ("<Provider> User ...")
+      4. earliest synced_at (stable tie-breaker)
+
+    Rows where user_id IS NULL partition on the row's own id (= each its own
+    canonical), so they pass through unchanged.
+
+    Only status='active' rows participate; soft-deleted rows can't become
+    canonical.
+    """
+    rel_count = (
+        select(func.count(AgentRelationship.id))
+        .where(AgentRelationship.member_id == OrgMember.id)
+        .correlate(OrgMember)
+        .scalar_subquery()
+    )
+    is_real_name = case(
+        (
+            and_(
+                OrgMember.name.notlike("Oauth2 User %"),
+                OrgMember.name.notlike("Dingtalk User %"),
+                OrgMember.name.notlike("Wecom User %"),
+                OrgMember.name.notlike("Feishu User %"),
+            ),
+            1,
+        ),
+        else_=0,
+    )
+    rn = func.row_number().over(
+        partition_by=func.coalesce(OrgMember.user_id, OrgMember.id),
+        order_by=[
+            rel_count.desc(),
+            case((OrgMember.external_id.is_not(None), 1), else_=0).desc(),
+            is_real_name.desc(),
+            OrgMember.synced_at.asc(),
+        ],
+    ).label("rn")
+    return (
+        select(OrgMember.id.label("om_id"), rn)
+        .where(OrgMember.status == "active")
+        .subquery()
+    )
+
 
 @router.get("/org/members")
 async def list_org_members(
@@ -1311,11 +1365,19 @@ async def list_org_members(
         # Auto-scope: use the user's own tenant when available
         tenant_id = effective_tenant_id  # None only for true global admin
 
-    query = select(OrgMember, IdentityProvider.name.label("provider_name"), IdentityProvider.provider_type, User.display_name.label("user_display_name")).outerjoin(
-        IdentityProvider, OrgMember.provider_id == IdentityProvider.id
-    ).outerjoin(
-        User, OrgMember.user_id == User.id
-    ).where(OrgMember.status == "active")
+    canonical = _canonical_org_member_id_subquery()
+    query = (
+        select(
+            OrgMember,
+            IdentityProvider.name.label("provider_name"),
+            IdentityProvider.provider_type,
+            User.display_name.label("user_display_name"),
+        )
+        .join(canonical, and_(OrgMember.id == canonical.c.om_id, canonical.c.rn == 1))
+        .outerjoin(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
+        .outerjoin(User, OrgMember.user_id == User.id)
+        .where(OrgMember.status == "active")
+    )
     if tenant_id:
         query = query.where(OrgMember.tenant_id == uuid.UUID(tenant_id))
     if department_id:
