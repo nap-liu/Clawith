@@ -93,10 +93,10 @@ def test_json_output_detected_and_suffixed(tmp_workspace, agent_id):
 
 
 def test_per_tool_budget_beats_default(tmp_workspace, agent_id):
-    # grep has budget 20_000; default is 50_000. A 25k string exceeds grep's
+    # grep has budget 40_000; default is 100_000. A 50k string exceeds grep's
     # budget → materialized. Same string under a tool that uses default →
     # inline.
-    size = 25_000
+    size = 50_000
     s = "y" * size
 
     view_grep = _finalize(s, tool_name="grep", agent_id=agent_id, tool_call_id="c1")
@@ -176,5 +176,5 @@ def test_budget_for_unknown_tool_uses_default():
 
 
 def test_budget_for_known_tool_uses_registry():
-    assert tos.budget_for("grep") == 20_000
-    assert tos.budget_for("execute_code") == 30_000
+    assert tos.budget_for("grep") == 40_000
+    assert tos.budget_for("execute_code") == 60_000

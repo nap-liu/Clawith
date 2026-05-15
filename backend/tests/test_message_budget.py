@@ -132,6 +132,7 @@ def test_over_budget_picks_largest_fresh(tmp_workspace, agent_id):
         fresh_start_idx=fresh_start,
         agent_id=agent_id,
         session_id="sess-over",
+        max_chars=120_000,
     )
 
     # Historical message is byte-identical — same LLMMessage instance,
@@ -155,7 +156,7 @@ def test_over_budget_picks_largest_fresh(tmp_workspace, agent_id):
         len(m.content) for m in api_messages
         if m.role == "tool" and isinstance(m.content, str)
     )
-    assert total <= tos.MAX_TOOL_RESULTS_PER_MESSAGE_CHARS
+    assert total <= 120_000
 
     # Files actually written.
     session_dir = tmp_workspace / agent_id / ".tool_results" / "sess-over"
@@ -349,6 +350,7 @@ def test_vision_tool_does_not_block_enforcement(tmp_workspace, agent_id):
         fresh_start_idx=fresh_start,
         agent_id=agent_id,
         session_id="sess-vision-mix",
+        max_chars=120_000,
     )
 
     # Vision msg untouched.
@@ -360,4 +362,4 @@ def test_vision_tool_does_not_block_enforcement(tmp_workspace, agent_id):
         len(m.content) for m in api_messages
         if m.role == "tool" and isinstance(m.content, str)
     )
-    assert total_text <= tos.MAX_TOOL_RESULTS_PER_MESSAGE_CHARS
+    assert total_text <= 120_000
