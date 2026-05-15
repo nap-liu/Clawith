@@ -29,13 +29,48 @@ def test_build_visible_agents_query_restricts_to_same_tenant_and_visible_permiss
     assert "agent_permissions.scope_id" in sql
 
 
-def test_build_visible_agents_query_platform_admin_still_uses_visibility_filters():
+def test_build_visible_agents_query_platform_admin_sees_everything_in_tenant():
+    """platform_admin is a cross-tenant operator; sees own tenant fully,
+    including other users' private agents."""
     admin = make_user(role="platform_admin", tenant_id=None)
 
     sql = str(build_visible_agents_query(admin, tenant_id=uuid.uuid4()))
 
     assert "agents.tenant_id" in sql
-    assert "agents.access_mode" in sql
+    # No access_mode filter — platform_admin sees private agents too.
+    assert "access_mode" not in sql
+    # No per-user grant filter either.
+    assert "agent_permissions" not in sql
+
+
+def test_build_visible_agents_query_org_admin_hides_others_private():
+    """org_admin is a tenant-level manager. Sees own + non-private agents
+    (company + custom). Other users' private agents are filtered out
+    to preserve v1.9.3 privacy guarantee."""
+    admin = make_user(role="org_admin")
+
+    sql = str(build_visible_agents_query(admin))
+
+    assert "agents.tenant_id" in sql
+    assert "agents.creator_id" in sql
+    assert "access_mode" in sql
+    # org_admin shouldn't need per-user grant table — non-private is enough.
+    assert "agent_permissions" not in sql
+
+
+def test_build_visible_agents_query_regular_user_uses_explicit_grants():
+    """Regular users see own creations, company-visible agents, and any
+    agent explicitly added to a custom roster they're on."""
+    user = make_user(role="member")
+
+    sql = str(build_visible_agents_query(user))
+
+    assert "agents.tenant_id" in sql
+    assert "agents.creator_id" in sql
+    # Regular user needs both company-mode filter and explicit-grant filter.
+    assert "access_mode" in sql
+    assert "agent_permissions.scope_type" in sql
+    assert "agent_permissions.scope_id" in sql
 
 
 class _ScalarResult:
@@ -44,6 +79,78 @@ class _ScalarResult:
 
     def scalar_one_or_none(self):
         return self.value
+
+
+class _ScalarsResult:
+    def __init__(self, values):
+        self.values = values
+
+    def all(self):
+        return self.values
+
+
+class _AccessLevelDb:
+    """Stub session returning queued results for the access-level helper."""
+
+    def __init__(self, queued):
+        self._queued = list(queued)
+
+    async def execute(self, _stmt):
+        return self._queued.pop(0)
+
+
+def _make_agent(creator_id, tenant_id, access_mode="company", company_access_level=None):
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        creator_id=creator_id,
+        tenant_id=tenant_id,
+        access_mode=access_mode,
+        company_access_level=company_access_level,
+    )
+
+
+@pytest.mark.asyncio
+async def test_access_level_platform_admin_can_manage_others_private():
+    """platform_admin retains manage access even on someone else's
+    private agent — required for cross-tenant operations / audit."""
+    tenant = uuid.uuid4()
+    admin = SimpleNamespace(id=uuid.uuid4(), role="platform_admin", tenant_id=tenant, is_active=True)
+    creator = uuid.uuid4()
+    agent = _make_agent(creator_id=creator, tenant_id=tenant, access_mode="private")
+
+    db = _AccessLevelDb([_ScalarResult(admin)])
+    level = await permissions.get_agent_access_level_for_user_id(db, admin.id, agent)
+
+    assert level == "manage"
+
+
+@pytest.mark.asyncio
+async def test_access_level_org_admin_cannot_manage_others_private():
+    """org_admin must NOT see someone else's private agent — v1.9.3 privacy."""
+    tenant = uuid.uuid4()
+    admin = SimpleNamespace(id=uuid.uuid4(), role="org_admin", tenant_id=tenant, is_active=True)
+    creator = uuid.uuid4()
+    agent = _make_agent(creator_id=creator, tenant_id=tenant, access_mode="private")
+
+    # First db.execute resolves the user; second resolves agent_permissions
+    db = _AccessLevelDb([_ScalarResult(admin), _ScalarsResult([])])
+    level = await permissions.get_agent_access_level_for_user_id(db, admin.id, agent)
+
+    assert level is None
+
+
+@pytest.mark.asyncio
+async def test_access_level_org_admin_manages_non_private():
+    """org_admin manages company / custom agents in tenant even if not creator."""
+    tenant = uuid.uuid4()
+    admin = SimpleNamespace(id=uuid.uuid4(), role="org_admin", tenant_id=tenant, is_active=True)
+    creator = uuid.uuid4()
+    agent = _make_agent(creator_id=creator, tenant_id=tenant, access_mode="company")
+
+    db = _AccessLevelDb([_ScalarResult(admin)])
+    level = await permissions.get_agent_access_level_for_user_id(db, admin.id, agent)
+
+    assert level == "manage"
 
 
 class _RelationshipStatusDb:

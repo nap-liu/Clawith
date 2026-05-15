@@ -20,11 +20,17 @@ def build_visible_agents_query(
 ):
     """Build a query for agents visible to the current user.
 
-    Admins (platform_admin, org_admin) see every agent in the target tenant
-    unconditionally — including agents shared as ``specific users`` even when
-    the admin isn't on the recipient list. Owners need to manage what they
-    own, full stop. Non-admins see: own creations + company-shared agents
-    + agents explicitly granted to them.
+    Role-based visibility (refined v1.9.3 access_mode model):
+
+    - ``platform_admin``: cross-tenant operator. Sees every agent in the
+      target tenant unconditionally, including other users' ``private``
+      and ``custom`` agents. This is required for ops/audit duties.
+    - ``org_admin``: regular company manager. Sees own creations +
+      ``company``/``custom`` agents (not in custom roster is OK, admin
+      still manages them). Cannot see other users' ``private`` agents —
+      that preserves v1.9.3's privacy guarantee for personal agents.
+    - Regular users: own creations + ``company`` agents + agents
+      explicitly added to a ``custom`` roster they're on.
     """
     stmt = select(Agent)
 
@@ -32,7 +38,10 @@ def build_visible_agents_query(
     if target_tenant_id is None:
         return stmt.where(false())
 
-    if user.role in ("platform_admin", "org_admin"):
+    if user.role == "platform_admin":
+        return stmt.where(Agent.tenant_id == target_tenant_id)
+
+    if user.role == "org_admin":
         return stmt.where(
             Agent.tenant_id == target_tenant_id,
             or_(
@@ -93,7 +102,11 @@ async def get_agent_access_level_for_user_id(
         return "manage"
 
     access_mode = getattr(agent, "access_mode", None) or "company"
-    if _is_admin(user) and access_mode != "private":
+    # platform_admin manages everything in the tenant including others' private agents.
+    # org_admin only manages non-private agents — preserves v1.9.3 privacy guarantee.
+    if user.role == "platform_admin":
+        return "manage"
+    if user.role == "org_admin" and access_mode != "private":
         return "manage"
 
     perms_result = await db.execute(select(AgentPermission).where(AgentPermission.agent_id == agent.id))
