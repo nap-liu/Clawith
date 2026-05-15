@@ -378,40 +378,6 @@ async def test_no_relationship_returns_error():
 
 
 @pytest.mark.asyncio
-async def test_append_focus_item_creates_file(tmp_path):
-    """_append_focus_item should create/append to focus.md."""
-    from app.services.agent_tools import _append_focus_item, WORKSPACE_ROOT
-
-    agent_id = uuid.uuid4()
-    with patch("app.services.agent_tools.WORKSPACE_ROOT", tmp_path):
-        await _append_focus_item(agent_id, "test_item", "Test description")
-
-        focus_path = tmp_path / str(agent_id) / "focus.md"
-        assert focus_path.exists()
-        content = focus_path.read_text()
-        assert "test_item" in content
-        assert "Test description" in content
-        assert "- [ ]" in content
-
-
-@pytest.mark.asyncio
-async def test_append_focus_item_no_duplicate(tmp_path):
-    """_append_focus_item should not duplicate existing items."""
-    from app.services.agent_tools import _append_focus_item
-
-    agent_id = uuid.uuid4()
-    focus_path = tmp_path / str(agent_id) / "focus.md"
-    focus_path.parent.mkdir(parents=True, exist_ok=True)
-    focus_path.write_text("# Focus\n\n- [ ] test_item: Existing description\n")
-
-    with patch("app.services.agent_tools.WORKSPACE_ROOT", tmp_path):
-        await _append_focus_item(agent_id, "test_item", "New description")
-
-    content = focus_path.read_text()
-    assert content.count("test_item") == 1
-
-
-@pytest.mark.asyncio
 async def test_create_on_message_trigger():
     """_create_on_message_trigger should create a trigger in DB."""
     from app.services.agent_tools import _create_on_message_trigger
@@ -434,7 +400,14 @@ async def test_create_on_message_trigger():
         enter_count += 1
         return db
 
-    with patch("app.services.agent_tools.async_session") as mock_session_ctx:
+    # v1.9.3 introduced DB-backed focus items; ensure_focus_item now opens its own
+    # async_session via app.database, bypassing the agent_tools patch. Stub it out
+    # so the test stays at the trigger-DB level instead of needing a real agent row.
+    async def _stub_ensure_focus_item(agent_id, focus_ref=None, description=None):
+        return focus_ref
+
+    with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
+         patch("app.services.agent_tools.ensure_focus_item", side_effect=_stub_ensure_focus_item):
         mock_session_ctx.return_value.__aenter__ = AsyncMock(side_effect=_enter)
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
