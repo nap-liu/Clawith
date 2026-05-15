@@ -59,6 +59,7 @@ async def main():
     import app.models.notification   # noqa
     import app.models.gateway_message # noqa
     import app.models.chat_compaction # noqa  # FK target of chat_messages.compacted_into; fresh DB create_all needs it registered
+    import app.models.focus          # noqa  # v1.9.3 AgentFocusItem table; fresh DB create_all needs it registered
 
     # Create all tables that don't exist yet (safe to run on every startup)
     async with engine.begin() as conn:

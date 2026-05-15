@@ -8,7 +8,6 @@ import { useDialog } from '../components/Dialog/DialogProvider';
 import { useToast } from '../components/Toast/ToastProvider';
 import type { FileBrowserApi } from '../components/FileBrowser';
 import FileBrowser from '../components/FileBrowser';
-import UserMultiSelect from '../components/UserMultiSelect';
 import ChannelConfig from '../components/ChannelConfig';
 import MarkdownRenderer from '../components/MarkdownRenderer';
 import PromptModal from '../components/PromptModal';

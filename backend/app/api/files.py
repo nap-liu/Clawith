@@ -504,7 +504,7 @@ async def download_file(
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    target = _safe_path(agent_id, path)
+    target, _, _ = _visible_path(agent_id, path, user.tenant_id)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
     return FileResponse(
@@ -534,6 +534,10 @@ async def write_file(
             detail="Focus is stored in the system database. Use the Focus API.",
         )
     if path.startswith("enterprise_info"):
+        # enterprise_info is admin-only company knowledge base; intentionally
+        # bypasses workspace_file revision tracking + collaborative locks
+        # because it's not part of agent-user pair editing flow. revision_id
+        # is always None to signal "no version history" to the frontend.
         if current_user.role not in ("platform_admin", "org_admin"):
             raise HTTPException(status_code=403, detail="Only admins can edit enterprise knowledge base")
         if path.strip("/") == "enterprise_info":
@@ -651,7 +655,7 @@ async def restore_file_revision(
     if revision.after_content is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot restore an empty/deleted revision")
 
-    target = _safe_path(agent_id, revision.path)
+    target, _, _ = _visible_path(agent_id, revision.path, current_user.tenant_id)
     before = await read_text_if_exists(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     async with aiofiles.open(target, "w", encoding="utf-8") as f:
