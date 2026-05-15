@@ -326,18 +326,17 @@ class MCPClient:
         if self._transport == "streamable":
             return await self._streamable_request(method, params)
 
-        # Auto-detect: try Streamable HTTP first
-        # Capture the error message here — `except ... as X` binds X only
-        # inside the except block; referencing it later (in the SSE
-        # fallback's error path) would raise NameError on Python 3.11+.
-        streamable_err_msg: str | None = None
+        # Auto-detect: try Streamable HTTP first. Python clears exception
+        # variables after an `except ... as name` block exits, so keep a stable
+        # string copy for the later SSE fallback error.
+        streamable_error_message = ""
         try:
             result = await self._streamable_request(method, params)
             self._transport = "streamable"
             return result
         except Exception as streamable_err:
-            streamable_err_msg = str(streamable_err)
-            logger.info(f"[MCPClient] Streamable HTTP failed ({streamable_err_msg}), trying SSE transport...")
+            streamable_error_message = str(streamable_err)
+            logger.info(f"[MCPClient] Streamable HTTP failed ({streamable_err}), trying SSE transport...")
 
         # Fallback to SSE
         try:
@@ -347,7 +346,7 @@ class MCPClient:
         except Exception as sse_err:
             raise Exception(
                 f"Both transports failed. "
-                f"Streamable HTTP: {streamable_err_msg}; "
+                f"Streamable HTTP: {streamable_error_message}; "
                 f"SSE: {sse_err}"
             )
 

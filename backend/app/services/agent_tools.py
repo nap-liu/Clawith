@@ -26,6 +26,7 @@ import re
 
 from loguru import logger
 from sqlalchemy import select, or_
+from sqlalchemy.orm import selectinload
 
 from app.database import async_session
 from app.models.task import Task
@@ -42,12 +43,21 @@ from app.services.document_conversion import (
     convert_html_to_pdf as convert_html_file_to_pdf,
     convert_html_to_pptx as convert_html_file_to_pptx,
 )
+from app.services.focus_service import (
+    complete_focus_item,
+    ensure_focus_item,
+    is_focus_file_path,
+    list_focus_items,
+    upsert_focus_item,
+)
 from app.services.workspace_collaboration import (
     delete_workspace_file,
     move_workspace_path,
     read_text_if_exists,
     write_workspace_file,
 )
+from app.core.permissions import evaluate_agent_relationship_status, evaluate_human_relationship_status
+from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.config import get_settings
 
 
@@ -124,7 +134,8 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
 
     Priority:
     1. agent_tools.config (per-agent override)
-    2. tools.config (company/global config)
+    2. tenant_settings tool_config:<tool_name> for builtin company config
+    3. tools.config (tenant-specific/admin tool config or non-secret defaults)
 
     Both configs are decrypted using the tool's config_schema for
     schema-aware field detection (e.g. smithery_api_key with type=password).
@@ -136,20 +147,32 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
         return cached
 
     from app.models.tool import Tool, AgentTool
+    from app.models.agent import Agent as AgentModel
+    from app.services.tool_config import get_tenant_tool_config
 
     async with async_session() as db:
+        agent_tenant_id = None
+        if agent_id:
+            tenant_r = await db.execute(select(AgentModel.tenant_id).where(AgentModel.id == agent_id))
+            agent_tenant_id = tenant_r.scalar_one_or_none()
+
         # 1. Try per-agent + global config together
         if agent_id:
             result = await db.execute(
-                select(AgentTool.config, Tool.config, Tool.config_schema)
+                select(AgentTool.config, Tool.config, Tool.config_schema, Tool.source, Tool.name)
                 .join(Tool, AgentTool.tool_id == Tool.id)
                 .where(AgentTool.agent_id == agent_id, Tool.name == tool_name)
             )
             row = result.first()
             if row:
-                agent_config, global_config, config_schema = row
+                agent_config, global_config, config_schema, tool_source, db_tool_name = row
+                base_config = global_config or {}
+                tenant_config = {}
+                if tool_source == "builtin":
+                    base_config = {}
+                    tenant_config = await get_tenant_tool_config(db, agent_tenant_id, db_tool_name, config_schema)
                 # Merge: agent overrides global
-                merged = {**(global_config or {}), **(agent_config or {})}
+                merged = {**base_config, **tenant_config, **(agent_config or {})}
                 if merged:
                     # Decrypt with schema awareness
                     merged = _decrypt_sensitive_fields(merged, config_schema)
@@ -160,9 +183,17 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
         # 2. Fallback to global config only
         result = await db.execute(select(Tool).where(Tool.name == tool_name))
         tool = result.scalar_one_or_none()
-        if tool and tool.config:
+        if tool:
+            tenant_config = {}
+            if tool.source == "builtin":
+                tenant_config = await get_tenant_tool_config(db, agent_tenant_id, tool.name, tool.config_schema)
+            base_config = {} if tool.source == "builtin" else (tool.config or {})
+            merged = {**base_config, **tenant_config}
+        else:
+            merged = {}
+        if tool and merged:
             # Decrypt with schema awareness
-            decrypted = _decrypt_sensitive_fields(tool.config, tool.config_schema)
+            decrypted = _decrypt_sensitive_fields(merged, tool.config_schema)
             logger.info(f"[ToolConfig] DB global config for {tool_name}")
             _set_cached_tool_config(agent_id, tool_name, decrypted)
             return decrypted
@@ -202,13 +233,13 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read file contents from the workspace. Can read soul.md for personality, memory/memory.md for memory, focus.md for current focus items, skills/ for skill files, and enterprise_info/ for shared company info. Use offset and limit for reading large files in chunks.",
+            "description": "Read file contents from the workspace. Can read soul.md for personality, memory/memory.md for memory, skills/ for skill files, and enterprise_info/ for shared company info. Focus is not stored in files; use list_focus_items and upsert_focus_item for Focus. Use offset and limit for reading large files in chunks.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path, e.g.: soul.md, focus.md, memory/memory.md, skills/xxx.md, enterprise_info/company_profile.md",
+                        "description": "File path, e.g.: soul.md, memory/memory.md, skills/xxx.md, enterprise_info/company_profile.md",
                     },
                     "offset": {
                         "type": "integer",
@@ -226,8 +257,71 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_focus_items",
+            "description": "List your structured Focus items. Focus is your current working state and is stored in the system database, not in focus.md.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_completed": {
+                        "type": "boolean",
+                        "description": "Whether to include completed Focus items. Default true.",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "upsert_focus_item",
+            "description": "Create or update one Focus item in structured storage. Use this whenever you start tracking an active task, reminder, delegated wait, or system concern.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Stable short identifier, snake_case preferred. If omitted, the system derives one from description.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Clear human-readable description of what is being tracked.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["normal", "system"],
+                        "description": "Use normal for user/business work, system for platform-maintained focus such as heartbeat/OKR automation.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Optional origin label, e.g. user, trigger, a2a, okr.",
+                    },
+                },
+                "required": ["description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_focus_item",
+            "description": "Mark a Focus item completed. Use this after the tracked task/reminder/wait has been handled.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Focus item identifier to complete.",
+                    }
+                },
+                "required": ["key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_file",
-            "description": "Create or fully overwrite a file in the workspace. Use this when writing a new file or replacing the entire content. For targeted edits to an existing file (change one section without rewriting everything), prefer edit_file instead. Before creating a new document under workspace/, first inspect the relevant directories with list_files, prefer an existing topical subfolder (for example workspace/reports/, workspace/knowledge_base/, workspace/research/) over the workspace root, and create a new subfolder when the content belongs to a new category. Avoid placing standalone document files directly in workspace/ root unless the user explicitly wants that. Can update memory/memory.md, focus.md, task_history.md, create documents in workspace/, create skills in skills/. enterprise_info/ is shared company context and is read-only for agents.",
+            "description": "Create or fully overwrite a file in the workspace. Use this when writing a new file or replacing the entire content. For targeted edits to an existing file (change one section without rewriting everything), prefer edit_file instead. Before creating a new document under workspace/, first inspect the relevant directories with list_files, prefer an existing topical subfolder (for example workspace/reports/, workspace/knowledge_base/, workspace/research/) over the workspace root, and create a new subfolder when the content belongs to a new category. Avoid placing standalone document files directly in workspace/ root unless the user explicitly wants that. Can update memory/memory.md, task_history.md, create documents in workspace/, create skills in skills/. Focus is managed with Focus tools, not files. enterprise_info/ is shared company context and is read-only for agents.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -371,7 +465,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "set_trigger",
-            "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or a human user replies — use from_agent_name for agents, or from_user_name for human users on Feishu/Slack/Discord), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.).",
+            "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Every trigger is attached to a focus item; if focus_ref is omitted, the system will automatically create a focus item from the reason and attach the trigger to it. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or a human user replies — use from_agent_name for agents, or from_user_name for human users on Feishu/Slack/Discord), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -394,7 +488,7 @@ AGENT_TOOLS = [
                     },
                     "focus_ref": {
                         "type": "string",
-                        "description": "Optional: identifier of the focus item in focus.md that this trigger relates to (use the checklist identifier, e.g. 'daily_news_check')",
+                        "description": "Optional: identifier of the structured Focus item that this trigger relates to. If omitted, a Focus item is created automatically from the trigger reason.",
                     },
                 },
                 "required": ["name", "type", "config", "reason"],
@@ -865,6 +959,31 @@ AGENT_TOOLS = [
         "function": {
             "name": "generate_image_google",
             "description": "Generate an image via Google Gemini Image (Nano Banana) or Vertex AI. Save to workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed image description in English.",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": "Image size. Default: 1024x1024.",
+                    },
+                    "save_path": {
+                        "type": "string",
+                        "description": "Workspace path to save the image.",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image_custom",
+            "description": "Generate an image via the company-configured custom image API. Save to workspace.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1683,6 +1802,81 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "agentbay_code_write_file",
+            "description": "[ENV: Code Sandbox] Write a text file inside the AgentBay Code Sandbox.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "remote_path": {
+                        "type": "string",
+                        "description": "Absolute path inside the code sandbox, e.g. /home/wuying/main.py",
+                    },
+                    "content": {"type": "string", "description": "File content to write."},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["overwrite", "append"],
+                        "description": "Write mode. Default: overwrite.",
+                        "default": "overwrite",
+                    },
+                },
+                "required": ["remote_path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "agentbay_code_read_file",
+            "description": "[ENV: Code Sandbox] Read a text file from the AgentBay Code Sandbox.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "remote_path": {
+                        "type": "string",
+                        "description": "Absolute path inside the code sandbox, e.g. /home/wuying/main.py",
+                    },
+                },
+                "required": ["remote_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "agentbay_code_edit_file",
+            "description": "[ENV: Code Sandbox] Edit a text file inside the AgentBay Code Sandbox by replacing exact text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "remote_path": {
+                        "type": "string",
+                        "description": "Absolute path inside the code sandbox, e.g. /home/wuying/main.py",
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "List of exact text replacements.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "oldText": {"type": "string", "description": "Exact text to replace."},
+                                "newText": {"type": "string", "description": "Replacement text."},
+                            },
+                            "required": ["oldText", "newText"],
+                        },
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Preview changes without applying them. Default: false.",
+                        "default": False,
+                    },
+                },
+                "required": ["remote_path", "edits"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "agentbay_file_transfer",
             "description": (
                 "Transfer a file between any two endpoints: the agent workspace, "
@@ -1740,8 +1934,11 @@ AGENT_TOOLS = [
 # _CHANNEL_MESSAGE_TOOL_NAMES and is only added when a channel is configured,
 # to avoid sending duplicate tool definitions to the LLM.
 _ALWAYS_INCLUDE_CORE = {
+    "complete_focus_item",
+    "list_focus_items",
     "send_channel_file",
     "send_file_to_agent",
+    "upsert_focus_item",
     "write_file",
 }
 # Channel message tool - available when any channel (Feishu/DingTalk/WeCom) is configured
@@ -2377,10 +2574,43 @@ async def execute_tool(
     try:
         if tool_name == "list_files":
             result = _list_files(ws, arguments.get("path", ""), tenant_id=_agent_tenant_id)
+        elif tool_name == "list_focus_items":
+            items = await list_focus_items(agent_id, include_completed=bool(arguments.get("include_completed", True)))
+            if not items:
+                result = "No Focus items."
+            else:
+                lines = ["Focus items:"]
+                for item in items:
+                    label = "completed" if item["status"] == "completed" else "in_progress"
+                    kind = f", {item['kind']}" if item.get("kind") == "system" else ""
+                    lines.append(f"- {item['key']} [{label}{kind}]: {item['description']}")
+                result = "\n".join(lines)
+        elif tool_name == "upsert_focus_item":
+            description = (arguments.get("description") or "").strip()
+            if not description:
+                return "❌ Missing required argument 'description' for upsert_focus_item"
+            item = await upsert_focus_item(
+                agent_id,
+                key=arguments.get("key"),
+                description=description,
+                status="in_progress",
+                kind=arguments.get("kind") or "normal",
+                source=arguments.get("source") or "user",
+                metadata={"tool": "upsert_focus_item"},
+            )
+            result = f"✅ Focus item saved: {item['key']} — {item['description']}"
+        elif tool_name == "complete_focus_item":
+            key = (arguments.get("key") or "").strip()
+            if not key:
+                return "❌ Missing required argument 'key' for complete_focus_item"
+            item = await complete_focus_item(agent_id, key=key)
+            result = f"✅ Focus item completed: {key}" if item else f"❌ Focus item not found: {key}"
         elif tool_name == "read_file":
             path = arguments.get("path")
             if not path:
                 return "❌ Missing required argument 'path' for read_file"
+            if is_focus_file_path(path):
+                return "❌ Focus is no longer stored in focus.md. Use list_focus_items, upsert_focus_item, and complete_focus_item."
             offset = int(arguments.get("offset", 0))
             limit = int(arguments.get("limit", 2000))
             result = _read_file(ws, path, tenant_id=_agent_tenant_id, offset=offset, limit=limit)
@@ -2400,7 +2630,9 @@ async def execute_tool(
                 return "❌ Missing required argument 'path' for write_file. Please provide a file path like 'skills/my-skill/SKILL.md'"
             if content is None:
                 return "❌ Missing required argument 'content' for write_file"
-            if _is_enterprise_info_path(path):
+            if is_focus_file_path(path):
+                result = "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item."
+            elif _is_enterprise_info_path(path):
                 result = "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
             else:
                 async with async_session() as _wdb:
@@ -2430,7 +2662,9 @@ async def execute_tool(
             if not destination_path:
                 return "❌ Missing required argument 'destination_path' for move_file"
             protected = {"tasks.json", "soul.md"}
-            if str(source_path).strip("/") in protected:
+            if is_focus_file_path(source_path) or is_focus_file_path(destination_path):
+                result = "❌ Focus is no longer stored in focus.md. Use Focus tools instead."
+            elif str(source_path).strip("/") in protected:
                 result = f"❌ {source_path} cannot be moved (protected)"
             elif _is_enterprise_info_path(source_path) or _is_enterprise_info_path(destination_path):
                 result = "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
@@ -2452,7 +2686,9 @@ async def execute_tool(
                 result = f"✅ {move_result.message}" if move_result.ok else f"❌ {move_result.message}"
         elif tool_name == "delete_file":
             path = arguments.get("path", "")
-            if _is_enterprise_info_path(path):
+            if is_focus_file_path(path):
+                result = "❌ Focus is no longer stored in focus.md. Use Focus tools instead."
+            elif _is_enterprise_info_path(path):
                 result = "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
             else:
                 async with async_session() as _wdb:
@@ -2490,7 +2726,9 @@ async def execute_tool(
             if new_string is None:
                 return "❌ Missing required argument 'new_string' for edit_file"
             replace_all = arguments.get("replace_all", False)
-            if _is_enterprise_info_path(path):
+            if is_focus_file_path(path):
+                result = "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item."
+            elif _is_enterprise_info_path(path):
                 result = "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
             else:
                 file_path = (ws / path).resolve()
@@ -2616,8 +2854,10 @@ async def execute_tool(
             result = await _generate_image(agent_id, ws, arguments, "openai")
         elif tool_name == "generate_image_google":
             result = await _generate_image(agent_id, ws, arguments, "google")
+        elif tool_name == "generate_image_custom":
+            result = await _generate_image(agent_id, ws, arguments, "custom")
         elif tool_name == "discover_resources":
-            result = await _discover_resources(arguments)
+            result = await _discover_resources(agent_id, arguments)
         elif tool_name == "import_mcp_server":
             result = await _import_mcp_server(agent_id, arguments)
         # ── Feishu Bitable Tools ──
@@ -2688,6 +2928,12 @@ async def execute_tool(
             result = await _agentbay_browser_type(agent_id, ws, arguments)
         elif tool_name == "agentbay_code_execute":
             result = await _agentbay_code_execute(agent_id, ws, arguments)
+        elif tool_name == "agentbay_code_write_file":
+            result = await _agentbay_code_write_file(agent_id, ws, arguments)
+        elif tool_name == "agentbay_code_read_file":
+            result = await _agentbay_code_read_file(agent_id, ws, arguments)
+        elif tool_name == "agentbay_code_edit_file":
+            result = await _agentbay_code_edit_file(agent_id, ws, arguments)
         elif tool_name == "agentbay_browser_extract":
             result = await _agentbay_browser_extract(agent_id, ws, arguments)
         elif tool_name == "agentbay_browser_observe":
@@ -2750,7 +2996,7 @@ async def execute_tool(
             result = await _update_kr_content(agent_id, user_id, arguments)
         elif tool_name == "update_kr_progress":
             result = await _update_kr_progress(agent_id, user_id, arguments)
-        # collect_okr_progress: batch-read all focus.md files and sync progress to DB
+        # collect_okr_progress: legacy batch progress collection
         elif tool_name == "collect_okr_progress":
             result = await _collect_okr_progress(agent_id)
         # generate_okr_report: build daily/weekly structured report and store it
@@ -3997,6 +4243,18 @@ async def _smithery_auto_recover(api_key: str, mcp_url: str, namespace: str, con
                 f"💡 Please re-authorize by telling me: `import_mcp_server(server_id=\"...\", reauthorize=true)`"
             )
 
+        if conn_result.get("auth_url"):
+            # A newly-created Smithery connection is not usable until the user
+            # completes OAuth. Keep the existing stored connection in place so
+            # a still-valid old connection is not overwritten by an unauthenticated
+            # replacement. The user-facing auth URL is enough for recovery.
+            return (
+                f"🔐 MCP tool connection expired. Re-authorization needed.\n\n"
+                f"Please visit the following URL to re-authorize:\n"
+                f"{conn_result['auth_url']}\n\n"
+                f"After completing authorization, the tools will work again automatically."
+            )
+
         # Update stored config with new connection info
         new_config = {
             "smithery_namespace": conn_result["namespace"],
@@ -4023,14 +4281,6 @@ async def _smithery_auto_recover(api_key: str, mcp_url: str, namespace: str, con
                     await db.commit()
             except Exception:
                 pass  # Non-critical — connection may still work
-
-        if conn_result.get("auth_url"):
-            return (
-                f"🔐 MCP tool connection expired. Re-authorization needed.\n\n"
-                f"Please visit the following URL to re-authorize:\n"
-                f"{conn_result['auth_url']}\n\n"
-                f"After completing authorization, the tools will work again automatically."
-            )
 
         # Connection re-created without OAuth — should work now
         return None  # Signal caller to retry (but we don't retry here to avoid loops)
@@ -5167,6 +5417,22 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
             if not config:
                 return "❌ This agent has no Feishu channel configured"
             if direct_user_id and not member_name:
+                rel_result = await db.execute(
+                    select(AgentRelationship)
+                    .join(OrgMember, AgentRelationship.member_id == OrgMember.id)
+                    .where(
+                        AgentRelationship.agent_id == agent_id,
+                        (OrgMember.external_id == direct_user_id) | (OrgMember.open_id == direct_user_id),
+                        OrgMember.status == "active",
+                    )
+                    .options(selectinload(AgentRelationship.member))
+                )
+                direct_rel = rel_result.scalars().first()
+                if not direct_rel:
+                    return "❌ Recipient is not in your active relationship network"
+                status_info = await evaluate_human_relationship_status(db, direct_rel)
+                if status_info["access_status"] != "active":
+                    return f"❌ Relationship to recipient is not active ({status_info['access_status_reason'] or 'restricted'})"
                 try:
                     resp = await feishu_service.send_message(
                         config.app_id, config.app_secret,
@@ -5195,7 +5461,8 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
 
             target_member = None
             for r in rels:
-                if r.member and r.member.name == member_name:
+                status_info = await evaluate_human_relationship_status(db, r)
+                if r.member and status_info["access_status"] == "active" and r.member.name == member_name:
                     target_member = r.member
                     break
 
@@ -5305,6 +5572,12 @@ async def _send_channel_message(agent_id: uuid.UUID, args: dict) -> str:
                 .options(selectinload(AgentRelationship.member))
             )
             rows = result.all()
+            active_rows = []
+            for rel, member, provider in rows:
+                status_info = await evaluate_human_relationship_status(db, rel)
+                if status_info["access_status"] == "active":
+                    active_rows.append((rel, member, provider))
+            rows = active_rows
 
             if not rows:
                 return f"❌ {member_name} is not in your relationship network"
@@ -5842,6 +6115,8 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
             agent = agent_res.scalar_one_or_none()
             if not agent:
                 return "❌ Agent not found"
+            if await ensure_access_granted_platform_relationships(db, agent, created_by_user_id=agent.creator_id):
+                await db.flush()
 
             # 1. Look up target user by username or display_name within tenant
 
@@ -5866,6 +6141,23 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
                 all_r = await db.execute(list_query)
                 names = [f"{u.display_name or u.username}" for u in all_r.scalars().all()]
                 return f"❌ No user named '{username}' found in your organization. Available users: {', '.join(names) if names else 'none'}"
+
+            rel_result = await db.execute(
+                select(AgentRelationship)
+                .join(OrgMember, AgentRelationship.member_id == OrgMember.id)
+                .where(
+                    AgentRelationship.agent_id == agent_id,
+                    OrgMember.user_id == target_user.id,
+                    OrgMember.status == "active",
+                )
+                .options(selectinload(AgentRelationship.member))
+            )
+            rel = rel_result.scalars().first()
+            if not rel:
+                return f"❌ {target_user.display_name or target_user.username} is not in your active relationship network"
+            status_info = await evaluate_human_relationship_status(db, rel, source_agent=agent)
+            if status_info["access_status"] != "active":
+                return f"❌ Relationship to {target_user.display_name or target_user.username} is not active ({status_info['access_status_reason'] or 'restricted'})"
 
             # Agent-initiated platform messages should always go to the long-lived primary session
             # for this agent+user pair, so trigger-driven outreach does not fragment into dozens of
@@ -5916,6 +6208,7 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
             return f"✅ Message sent to {display} on web platform. It has been saved to their chat history."
 
     except Exception as e:
+        logger.exception("[PlatformMessage] Error")
         return f"❌ Web message send error: {str(e)[:200]}"
 
 
@@ -5995,13 +6288,18 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, ws: Path, args: dict) ->
 
             # Enforce relationship: only allow file transfer with agents in relationships
             rel_check = await db.execute(
-                select(AgentAgentRelationship.id).where(
-                    ((AgentAgentRelationship.agent_id == from_agent_id) & (AgentAgentRelationship.target_agent_id == target_agent.id))
-                    | ((AgentAgentRelationship.agent_id == target_agent.id) & (AgentAgentRelationship.target_agent_id == from_agent_id))
+                select(AgentAgentRelationship).where(
+                    AgentAgentRelationship.agent_id == from_agent_id,
+                    AgentAgentRelationship.target_agent_id == target_agent.id,
                 ).limit(1)
             )
-            if not rel_check.scalar_one_or_none():
+            rel = rel_check.scalar_one_or_none()
+            if not rel:
                 return f"❌ You do not have a relationship with {target_agent.name}. Only agents in your relationship list can receive files. Ask your administrator to add a relationship if needed."
+            if hasattr(rel, "agent_id"):
+                status_info = await evaluate_agent_relationship_status(db, rel)
+                if status_info["access_status"] != "active":
+                    return f"❌ Relationship to {target_agent.name} is not active ({status_info['access_status_reason'] or 'restricted'}). Ask a manager of both agents to review Relationships."
 
             target_tenant_id = str(target_agent.tenant_id) if target_agent.tenant_id else None
             target_name = target_agent.name
@@ -6179,6 +6477,12 @@ async def _create_on_message_trigger(
     """Programmatically create an on_message trigger for an agent."""
     from app.models.trigger import AgentTrigger
 
+    focus_ref = await ensure_focus_item(
+        agent_id,
+        focus_ref=focus_ref,
+        description=reason or trigger_name,
+    )
+
     config: dict = {"from_agent_name": from_agent_name}
     if notification_summary:
         config["_notification_summary"] = notification_summary
@@ -6241,23 +6545,11 @@ async def _create_on_message_trigger(
 
 
 async def _append_focus_item(agent_id: uuid.UUID, identifier: str, description: str) -> None:
-    """Append a pending focus item to the agent's focus.md."""
-    focus_path = WORKSPACE_ROOT / str(agent_id) / "focus.md"
-    line = f"- [ ] {identifier}: {description}\n"
+    """Create or update an in-progress Focus item."""
     try:
-        if focus_path.exists():
-            content = focus_path.read_text(encoding="utf-8")
-            if identifier in content:
-                return
-            if not content.endswith("\n"):
-                content += "\n"
-            content += line
-        else:
-            content = f"# Focus\n\n{line}"
-        focus_path.parent.mkdir(parents=True, exist_ok=True)
-        focus_path.write_text(content, encoding="utf-8")
+        await ensure_focus_item(agent_id, focus_ref=identifier, description=description)
     except Exception as e:
-        logger.warning(f"[A2A] Failed to update focus.md for agent {agent_id}: {e}")
+        logger.warning(f"[A2A] Failed to update Focus for agent {agent_id}: {e}")
 
 
 async def _wake_agent_async(agent_id: uuid.UUID, reason_context: str, *, from_agent_id: uuid.UUID | None = None, skip_dedup: bool = False, a2a_session_id: str | None = None) -> None:
@@ -6266,7 +6558,10 @@ async def _wake_agent_async(agent_id: uuid.UUID, reason_context: str, *, from_ag
     Delegates to the public wake_agent_with_context API in trigger_daemon.
     """
     from app.services.trigger_daemon import wake_agent_with_context
-    await wake_agent_with_context(agent_id, reason_context, from_agent_id=from_agent_id, skip_dedup=skip_dedup, a2a_session_id=a2a_session_id)
+    kwargs = {"from_agent_id": from_agent_id, "skip_dedup": skip_dedup}
+    if a2a_session_id is not None:
+        kwargs["a2a_session_id"] = a2a_session_id
+    await wake_agent_with_context(agent_id, reason_context, **kwargs)
 
 
 async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
@@ -6336,13 +6631,18 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             # Enforce relationship: only allow communication with agents in relationships
             # (AgentAgentRelationship is imported at module level — no local import needed)
             rel_check = await db.execute(
-                select(AgentAgentRelationship.id).where(
-                    ((AgentAgentRelationship.agent_id == from_agent_id) & (AgentAgentRelationship.target_agent_id == target.id))
-                    | ((AgentAgentRelationship.agent_id == target.id) & (AgentAgentRelationship.target_agent_id == from_agent_id))
+                select(AgentAgentRelationship).where(
+                    AgentAgentRelationship.agent_id == from_agent_id,
+                    AgentAgentRelationship.target_agent_id == target.id,
                 ).limit(1)
             )
-            if not rel_check.scalar_one_or_none():
+            rel = rel_check.scalar_one_or_none()
+            if not rel:
                 return f"❌ You do not have a relationship with {target.name}. Only agents in your relationship list can be contacted. Ask your administrator to add a relationship if needed."
+            if hasattr(rel, "agent_id"):
+                status_info = await evaluate_agent_relationship_status(db, rel)
+                if status_info["access_status"] != "active":
+                    return f"❌ Relationship to {target.name} is not active ({status_info['access_status_reason'] or 'restricted'}). Ask a manager of both agents to review Relationships."
 
             src_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id))
             src_participant = src_part_r.scalar_one_or_none()
@@ -6805,8 +7105,8 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
     """Get recent posts from the Agent Plaza, scoped to agent's tenant."""
     from app.models.plaza import PlazaPost, PlazaComment
-    from app.models.agent import Agent as AgentModel, AgentPermission
-    from sqlalchemy import desc, exists, and_
+    from app.models.agent import Agent as AgentModel
+    from sqlalchemy import desc
 
     limit = min(arguments.get("limit", 10), 20)
 
@@ -6820,18 +7120,8 @@ async def _plaza_get_new_posts(agent_id: uuid.UUID, arguments: dict) -> str:
             if agent.is_system:
                 return "System agents cannot access Plaza."
 
-            private_agent_exists = await db.execute(
-                select(
-                    exists().where(
-                        and_(
-                            AgentPermission.agent_id == agent_id,
-                            AgentPermission.scope_type == "user",
-                        )
-                    )
-                )
-            )
-            if private_agent_exists.scalar():
-                return "Private agents cannot access Plaza."
+            if (getattr(agent, "access_mode", None) or "company") != "company":
+                return "Only company-wide agents can access Plaza."
 
             tenant_id = agent.tenant_id if agent else None
 
@@ -6874,8 +7164,7 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
     reports, not through Plaza posts.
     """
     from app.models.plaza import PlazaPost
-    from app.models.agent import Agent as AgentModel, AgentPermission
-    from sqlalchemy import exists, and_
+    from app.models.agent import Agent as AgentModel
 
     content = arguments.get("content", "").strip()
     if not content:
@@ -6898,18 +7187,8 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
                     "Use send_platform_message to communicate with users directly."
                 )
 
-            private_agent_exists = await db.execute(
-                select(
-                    exists().where(
-                        and_(
-                            AgentPermission.agent_id == agent_id,
-                            AgentPermission.scope_type == "user",
-                        )
-                    )
-                )
-            )
-            if private_agent_exists.scalar():
-                return "Private agents are not allowed to post to Plaza."
+            if (getattr(agent, "access_mode", None) or "company") != "company":
+                return "Only company-wide agents are allowed to post to Plaza."
             post = PlazaPost(
                 author_id=agent_id,
                 author_type="agent",
@@ -6958,8 +7237,7 @@ async def _plaza_create_post(agent_id: uuid.UUID, arguments: dict) -> str:
 async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
     """Add a comment to a plaza post."""
     from app.models.plaza import PlazaPost, PlazaComment
-    from app.models.agent import Agent as AgentModel, AgentPermission
-    from sqlalchemy import exists, and_
+    from app.models.agent import Agent as AgentModel
 
     post_id = arguments.get("post_id", "")
     content = arguments.get("content", "").strip()
@@ -6989,18 +7267,8 @@ async def _plaza_add_comment(agent_id: uuid.UUID, arguments: dict) -> str:
             if agent.is_system:
                 return "System agents are not allowed to comment on Plaza posts."
 
-            private_agent_exists = await db.execute(
-                select(
-                    exists().where(
-                        and_(
-                            AgentPermission.agent_id == agent_id,
-                            AgentPermission.scope_type == "user",
-                        )
-                    )
-                )
-            )
-            if private_agent_exists.scalar():
-                return "Private agents are not allowed to comment on Plaza posts."
+            if (getattr(agent, "access_mode", None) or "company") != "company":
+                return "Only company-wide agents are allowed to comment on Plaza posts."
 
             comment = PlazaComment(
                 post_id=pid,
@@ -7336,7 +7604,7 @@ async def _execute_code_legacy(ws: Path, arguments: dict) -> str:
 
 # ─── Resource Discovery Executors ───────────────────────────────
 
-async def _discover_resources(arguments: dict) -> str:
+async def _discover_resources(agent_id: uuid.UUID, arguments: dict) -> str:
     """Search Smithery registry for MCP servers."""
     query = arguments.get("query", "")
     if not query:
@@ -7344,7 +7612,7 @@ async def _discover_resources(arguments: dict) -> str:
     max_results = min(arguments.get("max_results", 5), 10)
 
     from app.services.resource_discovery import search_smithery
-    return await search_smithery(query, max_results)
+    return await search_smithery(query, max_results, agent_id=agent_id)
 
 
 async def _import_mcp_server(agent_id: uuid.UUID, arguments: dict) -> str:
@@ -7452,6 +7720,17 @@ async def _handle_set_trigger(
         return f"❌ Invalid trigger type '{ttype}'. Valid types: {', '.join(VALID_TRIGGER_TYPES)}"
     if not reason:
         return "❌ Missing required argument 'reason'"
+
+    try:
+        focus_ref = await ensure_focus_item(
+            agent_id,
+            focus_ref=focus_ref,
+            description=reason or name,
+            system=False,
+        )
+    except Exception as e:
+        logger.warning(f"[Trigger] Failed to ensure Focus item for trigger {name}: {e}")
+        focus_ref = focus_ref or name
 
     # Validate type-specific config
     if ttype == "cron":
@@ -7563,7 +7842,7 @@ async def _handle_set_trigger(
                     existing.type = ttype
                     existing.config = config
                     existing.reason = reason
-                    existing.focus_ref = focus_ref or None
+                    existing.focus_ref = focus_ref
                     existing.is_enabled = True
                     # Keep fire_count and last_fired_at — they are cumulative stats
                     await db.commit()
@@ -7575,7 +7854,7 @@ async def _handle_set_trigger(
                 type=ttype,
                 config=config,
                 reason=reason,
-                focus_ref=focus_ref or None,
+                focus_ref=focus_ref,
             )
             db.add(trigger)
             await db.commit()
@@ -7862,6 +8141,7 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
     - siliconflow: OpenAI-compatible API (FLUX models, China-friendly)
     - openai: Native OpenAI API (GPT Image)
     - google: Google Gemini Native Image API (Nano Banana)
+    - custom: Configurable HTTP API for gateways such as TokenRouter/OpenRouter
 
     The tool config is resolved via the standard _get_tool_config() hierarchy:
     global tool config (admin-set) -> per-agent tool config override.
@@ -7925,8 +8205,21 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
                 base_url or "https://generativelanguage.googleapis.com/v1beta",
                 prompt, size,
             )
+        elif provider == "custom":
+            image_bytes = await _generate_image_custom_api(
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                endpoint_path=config.get("endpoint_path") or "/chat/completions",
+                request_body_template_json=config.get("request_body_template_json") or "",
+                response_image_path=config.get("response_image_path") or "choices.0.message.images.0.image_url.url",
+                extra_headers_json=config.get("extra_headers_json") or "",
+                timeout_seconds=config.get("timeout_seconds") or 120,
+                prompt=prompt,
+                size=size,
+            )
         else:
-            return f"❌ Unknown image generation provider: {provider}. Supported: siliconflow, openai, google"
+            return f"❌ Unknown image generation provider: {provider}. Supported: siliconflow, openai, google, custom"
 
         if not image_bytes:
             return "❌ Image generation returned empty result. Please try a different prompt."
@@ -8051,6 +8344,267 @@ async def _generate_image_openai(
         raise ValueError(f"No b64_json or URL in OpenAI response: {data}")
 
 
+def _json_path_get(data: Any, path: str) -> Any:
+    """Read a simple dotted JSON path, with numeric list indexes."""
+    if not path:
+        return None
+
+    current: Any = data
+    for raw_part in path.split("."):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if isinstance(current, list):
+            if not part.isdigit():
+                return None
+            index = int(part)
+            if index >= len(current):
+                return None
+            current = current[index]
+        elif isinstance(current, dict):
+            if part not in current:
+                return None
+            current = current[part]
+        else:
+            return None
+    return current
+
+
+def _render_json_template(template_json: str, variables: dict[str, str]) -> dict:
+    """Parse JSON first, then replace placeholders inside string values.
+
+    This avoids corrupting JSON when a prompt contains quotes, newlines, or
+    other characters that need escaping.
+    """
+    template_text = template_json.strip()
+    parse_errors: list[str] = []
+
+    candidates = [template_text]
+    normalized_quotes = (
+        template_text
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+    if normalized_quotes != template_text:
+        candidates.append(normalized_quotes)
+
+    # Users often paste a JSON example copied from a string literal, leaving
+    # escaped quotes like { \"model\": \"{model}\" }. Treat that as JSON too.
+    for text in list(candidates):
+        if '\\"' in text:
+            candidates.append(text.replace('\\"', '"'))
+
+    template = None
+    for text in candidates:
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, str):
+                parsed = json.loads(parsed)
+            template = parsed
+            break
+        except Exception as e:
+            parse_errors.append(str(e))
+
+    if template is None:
+        detail = parse_errors[-1] if parse_errors else "unknown parse error"
+        raise ValueError(detail)
+
+    def render(value: Any) -> Any:
+        if isinstance(value, str):
+            rendered = value
+            for key, replacement in variables.items():
+                rendered = rendered.replace("{" + key + "}", replacement)
+            return rendered
+        if isinstance(value, list):
+            return [render(item) for item in value]
+        if isinstance(value, dict):
+            return {key: render(item) for key, item in value.items()}
+        return value
+
+    rendered = render(template)
+    if not isinstance(rendered, dict):
+        raise ValueError("Request body template must be a JSON object.")
+    return rendered
+
+
+def _json_structure_preview(data: Any, depth: int = 0) -> Any:
+    if depth > 4:
+        return "..."
+    if isinstance(data, dict):
+        return {k: _json_structure_preview(v, depth + 1) for k, v in list(data.items())[:12]}
+    if isinstance(data, list):
+        preview = [_json_structure_preview(item, depth + 1) for item in data[:2]]
+        if len(data) > 2:
+            preview.append(f"... {len(data)} items total")
+        return preview
+    if isinstance(data, str):
+        if data.startswith("data:image"):
+            return f"data:image... len={len(data)}"
+        if len(data) > 160:
+            return data[:160] + "..."
+    return data
+
+
+def _find_first_image_reference(data: Any) -> Any:
+    common_paths = [
+        "choices.0.message.images.0.image_url.url",
+        "choices.0.message.images.0.image_url",
+        "data.0.b64_json",
+        "data.0.url",
+        "output.0.content.0.image_url",
+        "output.0.content.0.image_base64",
+    ]
+    for path in common_paths:
+        value = _json_path_get(data, path)
+        if value:
+            return value
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, dict):
+            for key in ("url", "b64_json", "image_url", "image_base64"):
+                nested = value.get(key)
+                if isinstance(nested, str) and nested:
+                    return nested
+                if isinstance(nested, dict):
+                    found = walk(nested)
+                    if found:
+                        return found
+            for nested in value.values():
+                found = walk(nested)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = walk(item)
+                if found:
+                    return found
+        elif isinstance(value, str) and (
+            value.startswith("data:image")
+            or value.startswith("http://")
+            or value.startswith("https://")
+        ):
+            return value
+        return None
+
+    return walk(data)
+
+
+async def _custom_image_reference_to_bytes(image_ref: Any, client: Any) -> bytes:
+    import base64
+
+    if isinstance(image_ref, dict):
+        image_ref = image_ref.get("url") or image_ref.get("b64_json") or image_ref.get("image_base64")
+
+    if not isinstance(image_ref, str) or not image_ref:
+        raise ValueError("Response image path did not resolve to a URL, data URL, or base64 string.")
+
+    if image_ref.startswith("data:image"):
+        _, _, encoded = image_ref.partition(",")
+        if not encoded:
+            raise ValueError("Image data URL did not contain base64 payload.")
+        return base64.b64decode(encoded)
+
+    if image_ref.startswith("http://") or image_ref.startswith("https://"):
+        img_resp = await client.get(image_ref, timeout=60)
+        img_resp.raise_for_status()
+        return img_resp.content
+
+    return base64.b64decode(image_ref)
+
+
+async def _generate_image_custom_api(
+    api_key: str,
+    model: str,
+    base_url: str,
+    endpoint_path: str,
+    request_body_template_json: str,
+    response_image_path: str,
+    extra_headers_json: str,
+    timeout_seconds: int | str,
+    prompt: str,
+    size: str,
+) -> bytes:
+    """Generate image via a configurable gateway API.
+
+    The default request/response shape supports TokenRouter and OpenRouter:
+    POST /chat/completions with image/text modalities, image returned in
+    choices.0.message.images.0.image_url.url as a data URL.
+    """
+    import httpx
+
+    if not base_url:
+        raise ValueError("Custom image API base_url is not configured.")
+    if not model:
+        raise ValueError("Custom image API model is not configured.")
+
+    timeout = int(timeout_seconds or 120)
+    endpoint = endpoint_path or "/chat/completions"
+    if endpoint.startswith("http://") or endpoint.startswith("https://"):
+        url = endpoint
+    else:
+        url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+
+    variables = {"prompt": prompt, "size": size, "model": model}
+    if request_body_template_json.strip():
+        try:
+            payload = _render_json_template(request_body_template_json, variables)
+        except Exception as e:
+            raise ValueError(f"Invalid request_body_template_json: {e}")
+    else:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "modalities": ["image", "text"],
+            "stream": False,
+        }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers_json.strip():
+        try:
+            extra_headers = json.loads(extra_headers_json)
+        except Exception as e:
+            raise ValueError(f"Invalid extra_headers_json: {e}")
+        if not isinstance(extra_headers, dict):
+            raise ValueError("extra_headers_json must be a JSON object.")
+        headers.update({str(k): str(v) for k, v in extra_headers.items() if v is not None})
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code < 200 or resp.status_code >= 300:
+            try:
+                err_body = resp.json()
+                err_msg = (
+                    err_body.get("error", {}).get("message")
+                    if isinstance(err_body.get("error"), dict)
+                    else err_body.get("message")
+                ) or resp.text[:300]
+            except Exception:
+                err_msg = resp.text[:300]
+            raise ValueError(f"Custom image API error ({resp.status_code}): {err_msg}")
+
+        try:
+            data = resp.json()
+        except Exception:
+            raise ValueError("Custom image API returned non-JSON response.")
+
+        image_ref = _json_path_get(data, response_image_path) if response_image_path else None
+        if not image_ref:
+            image_ref = _find_first_image_reference(data)
+        if not image_ref:
+            preview = json.dumps(_json_structure_preview(data), ensure_ascii=False)
+            raise ValueError(
+                "No image found in custom image API response. "
+                f"Check response_image_path. Response structure: {preview[:800]}"
+            )
+
+        return await _custom_image_reference_to_bytes(image_ref, client)
+
+
 async def _generate_image_google(
     api_key: str, model: str, base_url: str, prompt: str, size: str
 ) -> bytes:
@@ -8063,7 +8617,7 @@ async def _generate_image_google(
     import httpx
     import base64
 
-    url = f"{base_url.rstrip('/')}/models/{model}:generateContent?key={api_key}"
+    url = f"{base_url.rstrip('/')}/models/{model}:generateContent"
 
     # Convert WxH size to aspect ratio for Gemini API
     # Supported: 1:1, 3:4, 4:3, 9:16, 16:9
@@ -8083,7 +8637,6 @@ async def _generate_image_google(
         "generationConfig": {
             "responseModalities": ["IMAGE"],
             "imageConfig": {
-                "numberOfImages": 1,
                 "aspectRatio": aspect_ratio,
             },
         },
@@ -8091,7 +8644,12 @@ async def _generate_image_google(
 
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(
-            url, json=payload, headers={"Content-Type": "application/json"}
+            url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
         )
         if resp.status_code != 200:
             try:
@@ -10573,6 +11131,119 @@ async def _agentbay_code_execute(agent_id: Optional[uuid.UUID], ws: Path, argume
         return f"❌ 代码执行失败: {str(e)[:200]}"
 
 
+async def _agentbay_code_write_file(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
+    """Write a text file in the AgentBay Code Sandbox."""
+    if not agent_id:
+        return "AgentBay tools require agent context"
+
+    from app.services.agentbay_client import get_agentbay_client_for_agent
+
+    remote_path = arguments.get("remote_path") or arguments.get("path") or ""
+    content = arguments.get("content")
+    mode = arguments.get("mode", "overwrite")
+
+    if not remote_path.strip():
+        return "Missing required argument 'remote_path'"
+    if content is None:
+        return "Missing required argument 'content'"
+    if mode not in ("overwrite", "append"):
+        return "Invalid mode. Use 'overwrite' or 'append'."
+
+    try:
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "code", session_id=_session_id)
+        result = await asyncio.to_thread(
+            client._session.file_system.write_file,
+            remote_path,
+            str(content),
+            mode,
+        )
+        if result.success:
+            byte_count = len(str(content).encode("utf-8"))
+            return f"File written in AgentBay Code Sandbox: {remote_path} ({byte_count} bytes, mode={mode})"
+        return f"Write failed: {result.error_message}"
+    except RuntimeError as e:
+        return f"{str(e)}. Please configure AgentBay in Agent settings."
+    except Exception as e:
+        logger.exception(f"[AgentBay] Code write file failed for agent {agent_id}")
+        return f"Write file failed: {str(e)[:200]}"
+
+
+async def _agentbay_code_read_file(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
+    """Read a text file from the AgentBay Code Sandbox."""
+    if not agent_id:
+        return "AgentBay tools require agent context"
+
+    from app.services.agentbay_client import get_agentbay_client_for_agent
+
+    remote_path = arguments.get("remote_path") or arguments.get("path") or ""
+    if not remote_path.strip():
+        return "Missing required argument 'remote_path'"
+
+    try:
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "code", session_id=_session_id)
+        result = await asyncio.to_thread(
+            client._session.file_system.read_file,
+            remote_path,
+        )
+        if result.success:
+            content = getattr(result, "content", "") or ""
+            return f"File read from AgentBay Code Sandbox: {remote_path}\n\n{content[:12000]}"
+        return f"Read failed: {result.error_message}"
+    except RuntimeError as e:
+        return f"{str(e)}. Please configure AgentBay in Agent settings."
+    except Exception as e:
+        logger.exception(f"[AgentBay] Code read file failed for agent {agent_id}")
+        return f"Read file failed: {str(e)[:200]}"
+
+
+async def _agentbay_code_edit_file(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
+    """Edit a text file in the AgentBay Code Sandbox."""
+    if not agent_id:
+        return "AgentBay tools require agent context"
+
+    from app.services.agentbay_client import get_agentbay_client_for_agent
+
+    remote_path = arguments.get("remote_path") or arguments.get("path") or ""
+    edits = arguments.get("edits")
+    dry_run = bool(arguments.get("dry_run", False))
+
+    if not remote_path.strip():
+        return "Missing required argument 'remote_path'"
+    if not isinstance(edits, list) or not edits:
+        return "Missing required argument 'edits'"
+
+    normalized_edits = []
+    for edit in edits:
+        if not isinstance(edit, dict):
+            return "Each edit must be an object with oldText and newText."
+        old_text = edit.get("oldText")
+        new_text = edit.get("newText")
+        if old_text is None or new_text is None:
+            return "Each edit must include oldText and newText."
+        normalized_edits.append({"oldText": str(old_text), "newText": str(new_text)})
+
+    try:
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "code", session_id=_session_id)
+        result = await asyncio.to_thread(
+            client._session.file_system.edit_file,
+            remote_path,
+            normalized_edits,
+            dry_run,
+        )
+        if result.success:
+            action = "Previewed edits for" if dry_run else "Edited"
+            return f"{action} AgentBay Code Sandbox file: {remote_path} ({len(normalized_edits)} replacement(s))"
+        return f"Edit failed: {result.error_message}"
+    except RuntimeError as e:
+        return f"{str(e)}. Please configure AgentBay in Agent settings."
+    except Exception as e:
+        logger.exception(f"[AgentBay] Code edit file failed for agent {agent_id}")
+        return f"Edit file failed: {str(e)[:200]}"
+
+
 async def _handle_email_tool(tool_name: str, agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     """Dispatch email tool calls to the email_service module."""
     from app.services.email_service import send_email, read_emails, reply_email
@@ -12815,7 +13486,7 @@ async def _update_kr_content(agent_id: uuid.UUID | None, user_id: uuid.UUID | No
 
 
 async def _collect_okr_progress(agent_id: uuid.UUID | None) -> str:
-    """Batch-collect KR progress from all team members' focus.md files.
+    """Batch-collect KR progress from legacy team member focus files.
 
     Delegates to okr_scheduler.collect_all_focus_updates(). The calling agent
     must be the OKR Agent — we look up its tenant from the DB.

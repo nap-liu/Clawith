@@ -3,8 +3,11 @@
 from loguru import logger
 from sqlalchemy import select
 from app.database import async_session
+from app.models.tenant import Tenant
+from app.models.tenant_setting import TenantSetting
 from app.models.tool import Tool
 from app.config import get_settings
+from app.services.tool_config import meaningful_config, tenant_tool_config_key
 
 _settings = get_settings()
 
@@ -15,6 +18,19 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "jina_read",
     "update_objective",
 }
+
+LEGACY_IMAGE_TOOL_MODEL_DEFAULTS = {
+    "generate_image_siliconflow": "black-forest-labs/FLUX.1-schnell",
+    "generate_image_openai": "dall-e-3",
+    "generate_image_google": "gemini-2.5-flash-image",
+}
+
+
+def _global_builtin_config(tool_data: dict) -> dict:
+    """Return config safe to store on the global builtin Tool row."""
+    if (tool_data.get("config_schema") or {}).get("fields"):
+        return {}
+    return tool_data.get("config", {})
 
 # Builtin tool definitions — these map to the hardcoded AGENT_TOOLS
 BUILTIN_TOOLS = [
@@ -37,14 +53,14 @@ BUILTIN_TOOLS = [
     {
         "name": "read_file",
         "display_name": "Read File",
-        "description": "Read file contents from the workspace. Can read soul.md, focus.md, memory/memory.md, skills/, and enterprise_info/. Use offset and limit for reading large files in chunks.",
+        "description": "Read file contents from the workspace. Can read soul.md, memory/memory.md, skills/, and enterprise_info/. Focus is stored in system tools, not focus.md. Use offset and limit for reading large files in chunks.",
         "category": "file",
         "icon": "📄",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path, e.g.: soul.md, focus.md, memory/memory.md"},
+                "path": {"type": "string", "description": "File path, e.g.: soul.md, memory/memory.md"},
                 "offset": {"type": "integer", "description": "Starting line number (0-indexed, default 0). Use with limit for pagination."},
                 "limit": {"type": "integer", "description": "Maximum number of lines to read (default 2000). Use with offset for pagination."},
             },
@@ -56,6 +72,59 @@ BUILTIN_TOOLS = [
                 {"key": "max_file_size_kb", "label": "Max file size (KB)", "type": "number", "default": 500},
             ]
         },
+    },
+    {
+        "name": "list_focus_items",
+        "display_name": "List Focus Items",
+        "description": "List structured Focus items from the system database.",
+        "category": "file",
+        "icon": "◎",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "include_completed": {"type": "boolean", "description": "Whether to include completed Focus items. Default true."},
+            },
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "upsert_focus_item",
+        "display_name": "Upsert Focus Item",
+        "description": "Create or update a structured Focus item in the system database.",
+        "category": "file",
+        "icon": "◎",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Stable short identifier, snake_case preferred."},
+                "description": {"type": "string", "description": "Human-readable description of what is being tracked."},
+                "kind": {"type": "string", "enum": ["normal", "system"], "description": "normal or system"},
+                "source": {"type": "string", "description": "Optional origin label, e.g. user, trigger, a2a, okr."},
+            },
+            "required": ["description"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "complete_focus_item",
+        "display_name": "Complete Focus Item",
+        "description": "Mark a structured Focus item completed.",
+        "category": "file",
+        "icon": "◎",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Focus item identifier to complete."},
+            },
+            "required": ["key"],
+        },
+        "config": {},
+        "config_schema": {},
     },
     {
         "name": "write_file",
@@ -388,7 +457,7 @@ BUILTIN_TOOLS = [
     {
         "name": "set_trigger",
         "display_name": "Set Trigger",
-        "description": "Set a new trigger to wake yourself up at a specific time or condition. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or human user replies).",
+        "description": "Set a new trigger to wake yourself up at a specific time or condition. Every trigger is attached to a focus item; if focus_ref is omitted, the system creates a focus item from the reason. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or human user replies).",
         "category": "aware",
         "icon": "⚡",
         "is_default": True,
@@ -399,7 +468,7 @@ BUILTIN_TOOLS = [
                 "type": {"type": "string", "enum": ["cron", "once", "interval", "poll", "on_message"], "description": "Trigger type"},
                 "config": {"type": "object", "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\"}. on_message: {\"from_agent_name\": \"Morty\"} or {\"from_user_name\": \"张三\"}"},
                 "reason": {"type": "string", "description": "What to do when this trigger fires"},
-                "focus_ref": {"type": "string", "description": "Optional: which focus item this relates to"},
+                "focus_ref": {"type": "string", "description": "Optional: which focus item this relates to. If omitted, one is created automatically."},
             },
             "required": ["name", "type", "config", "reason"],
         },
@@ -1077,7 +1146,7 @@ BUILTIN_TOOLS = [
             "required": ["prompt"],
         },
         "config": {
-            "model": "black-forest-labs/FLUX.1-schnell",
+            "model": "",
             "api_key": "",
             "base_url": "",
         },
@@ -1087,7 +1156,7 @@ BUILTIN_TOOLS = [
                     "key": "model",
                     "label": "Model",
                     "type": "text",
-                    "default": "black-forest-labs/FLUX.1-schnell",
+                    "default": "",
                     "placeholder": "e.g. black-forest-labs/FLUX.1-schnell",
                 },
                 {
@@ -1124,7 +1193,7 @@ BUILTIN_TOOLS = [
             "required": ["prompt"],
         },
         "config": {
-            "model": "dall-e-3",
+            "model": "",
             "api_key": "",
             "base_url": "",
         },
@@ -1134,7 +1203,7 @@ BUILTIN_TOOLS = [
                     "key": "model",
                     "label": "Model",
                     "type": "text",
-                    "default": "dall-e-3",
+                    "default": "",
                     "placeholder": "e.g. dall-e-3 or dall-e-2",
                 },
                 {
@@ -1171,7 +1240,7 @@ BUILTIN_TOOLS = [
             "required": ["prompt"],
         },
         "config": {
-            "model": "gemini-2.5-flash-image",
+            "model": "",
             "api_key": "",
             "base_url": "",
         },
@@ -1181,7 +1250,7 @@ BUILTIN_TOOLS = [
                     "key": "model",
                     "label": "Model",
                     "type": "text",
-                    "default": "gemini-2.5-flash-image",
+                    "default": "",
                     "placeholder": "e.g. gemini-2.5-flash-image",
                 },
                 {
@@ -1202,6 +1271,99 @@ BUILTIN_TOOLS = [
         },
     },
     {
+        "name": "generate_image_custom",
+        "display_name": "Generate Image (Custom API)",
+        "description": "Generate an image through a custom OpenAI-compatible or gateway API. Configure the request body template and response image path for providers such as TokenRouter or OpenRouter.",
+        "category": "media",
+        "icon": "🎨",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Detailed image description."},
+                "size": {"type": "string", "description": "Image size (e.g. 1024x1024). Default 1024x1024."},
+                "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
+            },
+            "required": ["prompt"],
+        },
+        "config": {
+            "api_key": "",
+            "base_url": "",
+            "endpoint_path": "/chat/completions",
+            "model": "",
+            "request_body_template_json": "{\n  \"model\": \"{model}\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"{prompt}\"\n    }\n  ],\n  \"modalities\": [\"image\", \"text\"],\n  \"stream\": false\n}",
+            "response_image_path": "choices.0.message.images.0.image_url.url",
+            "extra_headers_json": "",
+            "timeout_seconds": 120,
+        },
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "api_key",
+                    "label": "API Key",
+                    "type": "password",
+                    "default": "",
+                    "placeholder": "API key for your image generation gateway",
+                },
+                {
+                    "key": "model",
+                    "label": "Model",
+                    "type": "text",
+                    "default": "",
+                    "placeholder": "e.g. google/gemini-2.5-flash-image",
+                },
+                {
+                    "key": "base_url",
+                    "label": "Base URL",
+                    "type": "text",
+                    "default": "",
+                    "placeholder": "e.g. https://api.tokenrouter.com/v1 or https://openrouter.ai/api/v1",
+                },
+                {
+                    "key": "endpoint_path",
+                    "label": "Endpoint Path",
+                    "type": "text",
+                    "default": "/chat/completions",
+                    "placeholder": "/chat/completions",
+                    "advanced": True,
+                },
+                {
+                    "key": "request_body_template_json",
+                    "label": "Request Body Template JSON",
+                    "type": "textarea",
+                    "default": "{\n  \"model\": \"{model}\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"{prompt}\"\n    }\n  ],\n  \"modalities\": [\"image\", \"text\"],\n  \"stream\": false\n}",
+                    "placeholder": "{\n  \"model\": \"{model}\",\n  \"messages\": [{\"role\": \"user\", \"content\": \"{prompt}\"}],\n  \"modalities\": [\"image\", \"text\"],\n  \"stream\": false\n}",
+                    "advanced": True,
+                },
+                {
+                    "key": "response_image_path",
+                    "label": "Response Image Path",
+                    "type": "text",
+                    "default": "choices.0.message.images.0.image_url.url",
+                    "placeholder": "choices.0.message.images.0.image_url.url",
+                    "advanced": True,
+                },
+                {
+                    "key": "extra_headers_json",
+                    "label": "Extra Headers JSON",
+                    "type": "textarea",
+                    "default": "",
+                    "placeholder": "{\n  \"HTTP-Referer\": \"https://your-app.example\",\n  \"X-Title\": \"Clawith\"\n}",
+                    "advanced": True,
+                },
+                {
+                    "key": "timeout_seconds",
+                    "label": "Timeout Seconds",
+                    "type": "number",
+                    "default": 120,
+                    "min": 10,
+                    "max": 600,
+                    "advanced": True,
+                },
+            ]
+        },
+    },
+    {
         "name": "discover_resources",
         "display_name": "Resource Discovery",
         "description": "Search public MCP registries (Smithery + ModelScope) for tools and capabilities that can extend your abilities. Use this when you encounter a task you cannot handle with your current tools.",
@@ -1216,7 +1378,7 @@ BUILTIN_TOOLS = [
             },
             "required": ["query"],
         },
-        "config": {"smithery_api_key": "", "modelscope_api_token": ""},
+        "config": {},
         "config_schema": {
             "fields": [
                 {
@@ -1275,7 +1437,7 @@ BUILTIN_TOOLS = [
                 },
             },
         },
-        "config": {"smithery_api_key": "", "modelscope_api_token": ""},
+        "config": {},
         "config_schema": {
             "fields": [
                 {
@@ -1561,17 +1723,14 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
-        # collect_okr_progress — OKR Agent uses this during heartbeat to batch-read
-        # all team members' focus.md files and sync KR values to the database.
+        # collect_okr_progress — legacy OKR Agent heartbeat collection path.
         # This replaces the need to contact each member individually.
         "name": "collect_okr_progress",
         "display_name": "Collect OKR Progress",
         "description": (
-            "Scan all team members' focus.md files and sync their reported KR progress "
-            "to the OKR database. For each Agent workspace that has a focus.md, the tool "
-            "reads current KR values and creates progress log entries. Returns a summary "
-            "of how many KRs were updated. Use this during your heartbeat cycle before "
-            "generating a report to ensure you have the latest data."
+            "Legacy batch sync for reported KR progress. Prefer direct OKR tools such as "
+            "get_my_okr and update_kr_progress for new work. Returns a summary of how many "
+            "KRs were updated."
         ),
         "category": "okr",
         "icon": "📊",
@@ -2460,7 +2619,7 @@ BUILTIN_TOOLS = [
 AGENTBAY_TOOLS = [
     {
         "name": "agentbay_browser_navigate",
-        "display_name": "AgentBay: 浏览器访问",
+        "display_name": "AgentBay: Browser Navigate",
         "description": "[ENV: Browser] Navigate to a URL in the AgentBay HEADLESS BROWSER environment. IMPORTANT: This browser runs in an ISOLATED environment — it does NOT share filesystem, processes, or downloads with the Cloud Desktop (computer_* tools) or Code Sandbox (code_execute/command_exec). Files downloaded here are NOT accessible from other environments. Tip: after navigating, use browser_observe to identify interactive elements, then use browser_type/browser_click to interact.",
         "category": "agentbay",
         "icon": "🌐",
@@ -2499,7 +2658,7 @@ AGENTBAY_TOOLS = [
     },
     {
         "name": "agentbay_browser_screenshot",
-        "display_name": "AgentBay: 浏览器截图",
+        "display_name": "AgentBay: Browser Screenshot",
         "description": "[ENV: Browser] Take a screenshot of the current page in the headless browser. This browser is ISOLATED from the Cloud Desktop and Code Sandbox. Use this after clicking, typing, or submitting a form to verify the result — it preserves the current page state. Never call browser_navigate just to take a screenshot.",
         "category": "agentbay",
         "icon": "📸",
@@ -2524,7 +2683,7 @@ AGENTBAY_TOOLS = [
     },
     {
         "name": "agentbay_browser_click",
-        "display_name": "AgentBay: 浏览器点击",
+        "display_name": "AgentBay: Browser Click",
         "description": "[ENV: Browser] Click an element in the headless browser (ISOLATED from Desktop and Code Sandbox). selector can be a CSS selector (e.g. #btn) or natural language description (e.g. 'the Send button').",
         "category": "agentbay",
         "icon": "🖱️",
@@ -2541,7 +2700,7 @@ AGENTBAY_TOOLS = [
     },
     {
         "name": "agentbay_browser_type",
-        "display_name": "AgentBay: 浏览器输入",
+        "display_name": "AgentBay: Browser Type",
         "description": "[ENV: Browser] Type text into an element in the headless browser (ISOLATED from Desktop and Code Sandbox). selector can be a CSS selector or natural language description (e.g. 'phone number input').",
         "category": "agentbay",
         "icon": "⌨️",
@@ -2559,7 +2718,7 @@ AGENTBAY_TOOLS = [
     },
     {
         "name": "agentbay_code_execute",
-        "display_name": "AgentBay: 代码执行",
+        "display_name": "AgentBay: Code Execute",
         "description": "[ENV: Code Sandbox] Execute code (Python, Bash, Node.js) in the AgentBay Code Sandbox. IMPORTANT: This sandbox is an ISOLATED environment — it does NOT share filesystem, processes, or network with the Headless Browser (browser_* tools) or Cloud Desktop (computer_* tools). Files created here are NOT accessible from other environments.",
         "category": "agentbay",
         "icon": "💻",
@@ -2572,6 +2731,90 @@ AGENTBAY_TOOLS = [
                 "timeout": {"type": "integer", "description": "超时时间（秒）", "default": 30},
             },
             "required": ["language", "code"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "agentbay_code_write_file",
+        "display_name": "AgentBay: Write Code Sandbox File",
+        "description": "[ENV: Code Sandbox] Write a text file inside the AgentBay Code Sandbox.",
+        "category": "agentbay",
+        "icon": "📝",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "remote_path": {
+                    "type": "string",
+                    "description": "Absolute path inside the code sandbox, e.g. /home/wuying/main.py",
+                },
+                "content": {"type": "string", "description": "File content to write."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["overwrite", "append"],
+                    "description": "Write mode. Default: overwrite.",
+                    "default": "overwrite",
+                },
+            },
+            "required": ["remote_path", "content"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "agentbay_code_read_file",
+        "display_name": "AgentBay: Read Code Sandbox File",
+        "description": "[ENV: Code Sandbox] Read a text file from the AgentBay Code Sandbox.",
+        "category": "agentbay",
+        "icon": "📖",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "remote_path": {
+                    "type": "string",
+                    "description": "Absolute path inside the code sandbox, e.g. /home/wuying/main.py",
+                },
+            },
+            "required": ["remote_path"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "agentbay_code_edit_file",
+        "display_name": "AgentBay: Edit Code Sandbox File",
+        "description": "[ENV: Code Sandbox] Edit a text file inside the AgentBay Code Sandbox by replacing exact text.",
+        "category": "agentbay",
+        "icon": "✏️",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "remote_path": {
+                    "type": "string",
+                    "description": "Absolute path inside the code sandbox, e.g. /home/wuying/main.py",
+                },
+                "edits": {
+                    "type": "array",
+                    "description": "List of exact text replacements.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "oldText": {"type": "string", "description": "Exact text to replace."},
+                            "newText": {"type": "string", "description": "Replacement text."},
+                        },
+                        "required": ["oldText", "newText"],
+                    },
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Preview changes without applying them. Default: false.",
+                    "default": False,
+                },
+            },
+            "required": ["remote_path", "edits"],
         },
         "config": {},
         "config_schema": {},
@@ -3138,6 +3381,7 @@ async def seed_builtin_tools():
 
         new_tool_ids = []
         for t in BUILTIN_TOOLS:
+            seed_config = _global_builtin_config(t)
             result = await db.execute(select(Tool).where(Tool.name == t["name"]))
             existing = result.scalar_one_or_none()
             if not existing:
@@ -3150,7 +3394,7 @@ async def seed_builtin_tools():
                     icon=t["icon"],
                     is_default=t["is_default"],
                     parameters_schema=t.get("parameters_schema", {"type": "object", "properties": {}}),
-                    config=t.get("config", {}),
+                    config=seed_config,
                     config_schema=t.get("config_schema", {}),
                     source="builtin",
                 )
@@ -3181,20 +3425,32 @@ async def seed_builtin_tools():
                     existing.config_schema = t["config_schema"]
                     updated_fields.append("config_schema")
                     # Merge new config defaults when config_schema changes
-                    if t.get("config"):
-                        existing.config = {**t["config"], **(existing.config or {})}
+                    if seed_config:
+                        existing.config = {**seed_config, **(existing.config or {})}
                         updated_fields.append("config")
-                if not existing.config and t.get("config"):
-                    existing.config = t["config"]
+                if not existing.config and seed_config:
+                    existing.config = seed_config
                     updated_fields.append("config")
-                elif t.get("config") and existing.config != t["config"]:
+                elif seed_config and existing.config != seed_config:
                     # Merge new config keys into existing config so that flags like
                     # okr_agent_only are propagated to already-created tool records.
                     # Existing keys take precedence (agent-specific overrides are preserved).
-                    merged = {**t["config"], **(existing.config or {})}
+                    merged = {**seed_config, **(existing.config or {})}
                     if merged != existing.config:
                         existing.config = merged
                         updated_fields.append("config")
+                legacy_model = LEGACY_IMAGE_TOOL_MODEL_DEFAULTS.get(t["name"])
+                if legacy_model and existing.config == {
+                    "model": legacy_model,
+                    "api_key": "",
+                    "base_url": "",
+                }:
+                    existing.config = {
+                        "model": "",
+                        "api_key": "",
+                        "base_url": "",
+                    }
+                    updated_fields.append("config")
                 if existing.parameters_schema != t["parameters_schema"]:
                     existing.parameters_schema = t["parameters_schema"]
                     updated_fields.append("parameters_schema")
@@ -3299,6 +3555,47 @@ async def seed_builtin_tools():
                     f"to {len(browser_enabled_agent_ids)} agent(s)"
                 )
 
+        # Code sandbox file helpers are non-default, but should be available
+        # wherever the user has already enabled AgentBay code execution tools.
+        code_anchor_names = [
+            "agentbay_code_execute",
+            "agentbay_command_exec",
+            "agentbay_file_transfer",
+        ]
+        code_helper_names = [
+            "agentbay_code_write_file",
+            "agentbay_code_read_file",
+            "agentbay_code_edit_file",
+        ]
+        code_anchor_tools_r = await db.execute(select(Tool.id).where(Tool.name.in_(code_anchor_names)))
+        code_anchor_tool_ids = [row[0] for row in code_anchor_tools_r.fetchall()]
+        code_helper_tools_r = await db.execute(select(Tool).where(Tool.name.in_(code_helper_names)))
+        code_helper_tools = code_helper_tools_r.scalars().all()
+        if code_anchor_tool_ids and code_helper_tools:
+            code_enabled_agent_r = await db.execute(
+                select(AgentTool.agent_id)
+                .where(AgentTool.tool_id.in_(code_anchor_tool_ids), AgentTool.enabled == True)  # noqa: E712
+                .distinct()
+            )
+            code_enabled_agent_ids = [row[0] for row in code_enabled_agent_r.fetchall()]
+            code_assigned_count = 0
+            for agent_id in code_enabled_agent_ids:
+                for helper_tool in code_helper_tools:
+                    existing_assignment = await db.execute(
+                        select(AgentTool).where(
+                            AgentTool.agent_id == agent_id,
+                            AgentTool.tool_id == helper_tool.id,
+                        )
+                    )
+                    if not existing_assignment.scalar_one_or_none():
+                        db.add(AgentTool(agent_id=agent_id, tool_id=helper_tool.id, enabled=True))
+                        code_assigned_count += 1
+            if code_assigned_count:
+                logger.info(
+                    f"[ToolSeeder] Auto-assigned {code_assigned_count} AgentBay code file helper tool(s) "
+                    f"to {len(code_enabled_agent_ids)} agent(s)"
+                )
+
         OBSOLETE_TOOLS = ["bing_search", "manage_tasks"]
         for obsolete_name in OBSOLETE_TOOLS:
             result = await db.execute(select(Tool).where(Tool.name == obsolete_name))
@@ -3306,6 +3603,43 @@ async def seed_builtin_tools():
             if obsolete:
                 await db.delete(obsolete)
                 logger.info(f"[ToolSeeder] Removed obsolete tool: {obsolete_name}")
+
+        # Legacy deployments stored company credentials for builtin tools in
+        # the global tools.config row. Move those values into the first tenant's
+        # tenant_settings once, then clear the global row so new companies do
+        # not inherit another company's keys.
+        first_tenant_r = await db.execute(select(Tenant).order_by(Tenant.created_at).limit(1))
+        first_tenant = first_tenant_r.scalar_one_or_none()
+        if first_tenant:
+            builtin_config_tools_r = await db.execute(select(Tool).where(Tool.source == "builtin"))
+            migrated = 0
+            for tool in builtin_config_tools_r.scalars().all():
+                if not (tool.config_schema or {}).get("fields"):
+                    continue
+                legacy_config = meaningful_config(tool.config or {})
+                if not legacy_config:
+                    tool.config = {}
+                    continue
+                setting_key = tenant_tool_config_key(tool.name)
+                existing_setting_r = await db.execute(
+                    select(TenantSetting).where(
+                        TenantSetting.tenant_id == first_tenant.id,
+                        TenantSetting.key == setting_key,
+                    )
+                )
+                if not existing_setting_r.scalar_one_or_none():
+                    db.add(TenantSetting(
+                        tenant_id=first_tenant.id,
+                        key=setting_key,
+                        value={"config": legacy_config},
+                    ))
+                    migrated += 1
+                tool.config = {}
+            if migrated:
+                logger.info(
+                    f"[ToolSeeder] Migrated {migrated} legacy builtin tool config(s) "
+                    f"to tenant_settings for tenant {first_tenant.id}"
+                )
 
         await db.commit()
         logger.info("[ToolSeeder] Builtin tools seeded")

@@ -20,6 +20,7 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.user import User
 from app.models.workspace import WorkspaceFileRevision
+from app.services.focus_service import is_focus_file_path
 from app.services.workspace_collaboration import (
     acquire_edit_lock,
     content_hash,
@@ -67,6 +68,66 @@ class FileLockBody(BaseModel):
 
 class RestoreRevisionBody(BaseModel):
     revision_id: uuid.UUID
+
+
+TEXT_PREVIEW_EXTENSIONS = {
+    ".bat",
+    ".bash",
+    ".c",
+    ".cfg",
+    ".clj",
+    ".cpp",
+    ".cs",
+    ".css",
+    ".dart",
+    ".env",
+    ".go",
+    ".h",
+    ".hpp",
+    ".ini",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".less",
+    ".lua",
+    ".m",
+    ".mm",
+    ".php",
+    ".pl",
+    ".pm",
+    ".properties",
+    ".py",
+    ".r",
+    ".rb",
+    ".rs",
+    ".sass",
+    ".scala",
+    ".scss",
+    ".sh",
+    ".sql",
+    ".swift",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".vue",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".zsh",
+}
+
+TEXT_PREVIEW_FILENAMES = {
+    ".dockerignore",
+    ".env",
+    ".env.example",
+    ".gitignore",
+    ".npmrc",
+    ".prettierrc",
+    "dockerfile",
+    "makefile",
+}
 
 
 def _agent_base_dir(agent_id: uuid.UUID) -> Path:
@@ -135,7 +196,10 @@ async def list_files(
     for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name)):
         if entry.name == '.gitkeep':
             continue
-        # Hide creator-only files from non-creators
+        if not path and entry.name.lower() in {"focus.md", "agenda.md"}:
+            continue
+        if not path and entry.name == "enterprise_info":
+            continue
         if entry.name in CREATOR_ONLY_FILES and not is_creator:
             continue
         rel = str(entry.resolve().relative_to(base_abs))
@@ -163,12 +227,15 @@ async def read_file(
     """Read the content of a file."""
     agent, _access = await check_agent_access(db, current_user, agent_id)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
-    target = _safe_path(agent_id, path)
-
-    # Block non-creators from reading creator-only files
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    if is_focus_file_path(path):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Focus is stored in the system database. Use the Focus API.",
+        )
+    target, _, _ = _visible_path(agent_id, path, current_user.tenant_id)
 
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
@@ -182,7 +249,9 @@ async def read_file(
 
 
 def _file_kind(path: str) -> str:
-    ext = Path(path).suffix.lower()
+    file_path = Path(path)
+    ext = file_path.suffix.lower()
+    name = file_path.name.lower()
     if ext in {".md", ".markdown"}:
         return "markdown"
     if ext == ".csv":
@@ -197,7 +266,7 @@ def _file_kind(path: str) -> str:
         return "docx"
     if ext in {".pptx", ".ppt"}:
         return "pptx"
-    if ext in {".txt", ".log", ".json"}:
+    if ext in {".txt", ".log", ".json"} or ext in TEXT_PREVIEW_EXTENSIONS or name in TEXT_PREVIEW_FILENAMES:
         return "text"
     if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}:
         return "image"
@@ -459,7 +528,21 @@ async def write_file(
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    target = _safe_path(agent_id, path)
+    if is_focus_file_path(path):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Focus is stored in the system database. Use the Focus API.",
+        )
+    if path.startswith("enterprise_info"):
+        if current_user.role not in ("platform_admin", "org_admin"):
+            raise HTTPException(status_code=403, detail="Only admins can edit enterprise knowledge base")
+        if path.strip("/") == "enterprise_info":
+            raise HTTPException(status_code=400, detail="Cannot overwrite enterprise_info root")
+        target, _, _ = _visible_path(agent_id, path, current_user.tenant_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        async with aiofiles.open(target, "w", encoding="utf-8") as f:
+            await f.write(data.content)
+        return {"status": "ok", "path": path, "revision_id": None}
 
     result = await write_workspace_file(
         db,
@@ -489,6 +572,8 @@ async def lock_file(
 ):
     """Acquire or refresh a short-lived human editing lock for a file."""
     await check_agent_access(db, current_user, agent_id)
+    if is_focus_file_path(data.path):
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Focus is stored in the system database.")
     lock = await acquire_edit_lock(
         db,
         agent_id=agent_id,
@@ -523,6 +608,8 @@ async def get_file_revisions(
 ):
     """List version history for the currently opened Workspace file."""
     await check_agent_access(db, current_user, agent_id)
+    if is_focus_file_path(path):
+        return []
     if path.startswith("enterprise_info"):
         return []
     revisions = await list_revisions(db, agent_id=agent_id, path=path)
@@ -596,7 +683,16 @@ async def delete_file(
     filename = Path(path).name
     if filename in CREATOR_ONLY_FILES and not is_creator:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
-    target = _safe_path(agent_id, path)
+    if is_focus_file_path(path):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Focus is stored in the system database. Use the Focus API.",
+        )
+    if path.startswith("enterprise_info") and current_user.role not in ("platform_admin", "org_admin"):
+        raise HTTPException(status_code=403, detail="Only admins can delete enterprise knowledge base files")
+    if path.strip("/") == "enterprise_info":
+        raise HTTPException(status_code=400, detail="Cannot delete enterprise_info root")
+    target, _, _ = _visible_path(agent_id, path, current_user.tenant_id)
 
     if not target.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")

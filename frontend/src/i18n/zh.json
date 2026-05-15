@@ -592,8 +592,8 @@
         "companyWideDesc": "组织中的所有用户都可以使用此数字员工",
         "onlyMe": "仅我可见",
         "onlyMeDesc": "只有创建者可以使用此数字员工",
-        "specificUsers": "指定用户",
-        "specificUsersDesc": "从公司成员中选择特定人员",
+        "custom": "指定成员",
+        "customDesc": "在设置中指定可使用的平台用户",
         "defaultAccess": "默认访问级别",
         "useAccess": "使用",
         "useAccessDesc": "任务、聊天、工具、技能、工作区",
@@ -1096,6 +1096,9 @@
     "dangerZone": "危险区域",
     "deleteCompanyDesc": "永久删除此公司及其所有数据，包括数字员工、模型、工具和技能。此操作无法撤销。",
     "deleteCompany": "删除此公司",
+    "deleteCompanyTitle": "删除公司",
+    "deleteCompanyConfirmButton": "永久删除",
+    "deleteCompanyFailed": "删除失败",
     "timezone": {
       "title": "公司时区",
       "description": "所有数字员工的默认时区。数字员工可以单独覆盖。",
@@ -1370,6 +1373,9 @@
         "agentbay_browser_observe": "AgentBay: 浏览器观察",
         "agentbay_browser_login": "AgentBay: 浏览器登录",
         "agentbay_code_execute": "AgentBay: 代码执行",
+        "agentbay_code_write_file": "AgentBay: 写入代码沙箱文件",
+        "agentbay_code_read_file": "AgentBay: 读取代码沙箱文件",
+        "agentbay_code_edit_file": "AgentBay: 编辑代码沙箱文件",
         "agentbay_command_exec": "AgentBay: Shell 命令",
         "agentbay_computer_screenshot": "AgentBay: 桌面截图",
         "agentbay_computer_precision_screenshot": "AgentBay: 精细截图",
@@ -1436,6 +1442,9 @@
         "agentbay_browser_observe": "[ENV: Browser] 观察并识别页面上的交互元素。",
         "agentbay_browser_login": "[ENV: Browser] 在无头浏览器中处理登录流程。",
         "agentbay_code_execute": "[ENV: Code Sandbox] 在 AgentBay 代码沙箱中执行代码（Python、Bash、Node.js）。",
+        "agentbay_code_write_file": "[ENV: Code Sandbox] 在 AgentBay 代码沙箱中写入文本文件。",
+        "agentbay_code_read_file": "[ENV: Code Sandbox] 从 AgentBay 代码沙箱读取文本文件。",
+        "agentbay_code_edit_file": "[ENV: Code Sandbox] 通过精确替换文本编辑 AgentBay 代码沙箱中的文件。",
         "agentbay_command_exec": "[ENV: Code Sandbox] 在 AgentBay 代码沙箱中执行 Shell 命令。",
         "agentbay_computer_screenshot": "[ENV: Cloud Desktop] 对云桌面进行截图，并返回坐标系。支持用于小控件的局部精细截图。",
         "agentbay_computer_precision_screenshot": "[ENV: Cloud Desktop] 针对小控件和点击偏移场景获取放大的局部精细截图。",
@@ -1820,6 +1829,15 @@
       "ssoUrlEmpty": "请先开启 SSO 以生成地址"
     },
     "deleteCompanyConfirm": "确定要删除该公司及其所有数据吗?此操作不可撤销。"
+  },
+  "dialog": {
+    "confirmTitle": "请确认",
+    "errorTitle": "出错了",
+    "successTitle": "成功",
+    "warningTitle": "提示",
+    "infoTitle": "提示",
+    "showDetails": "查看详细信息",
+    "hideDetails": "收起详细信息"
   },
   "common": {
     "create": "创建",

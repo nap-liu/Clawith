@@ -17,7 +17,8 @@ import type { LivePreviewState } from '../components/AgentBayLivePanel';
 import AgentSidePanel, { SidePanelTab } from '../components/AgentSidePanel';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../components/WorkspaceOperationPanel';
 import AgentCredentials from '../components/AgentCredentials';
-import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../services/api';
+import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../services/api';
+import type { FocusApiItem } from '../services/api';
 import ModelSwitcher from '../components/ModelSwitcher';
 import { useAppStore } from '../stores';
 import { useAuthStore } from '../stores';
@@ -70,9 +71,15 @@ const WORKSPACE_TOOLS = new Set([
     'convert_html_to_pptx',
 ]);
 
-const AWARE_TOOLS = new Set(['set_trigger', 'update_trigger', 'cancel_trigger', 'list_triggers']);
+const AWARE_TOOLS = new Set(['set_trigger', 'update_trigger', 'cancel_trigger', 'list_triggers', 'list_focus_items', 'upsert_focus_item', 'complete_focus_item']);
 const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
 const trimLeadingPictograph = (value: string) => value.replace(/^\p{Extended_Pictographic}\s*/u, '');
+const formatReflectionTitle = (value: string | undefined, isZh: boolean) => {
+    const clean = trimLeadingPictograph(value || 'Trigger execution').trim();
+    const legacyMatch = clean.match(/^内心独白[:：]\s*(.*)$/);
+    if (legacyMatch) return isZh ? `内心独白：${legacyMatch[1]}` : `Reflection: ${legacyMatch[1]}`;
+    return clean;
+};
 const safeDisplayIcon = (icon?: string | null, fallback: React.ReactNode = <IconTools size={18} stroke={1.8} />) =>
     icon && !EMOJI_RE.test(icon) ? icon : fallback;
 
@@ -82,10 +89,29 @@ type FocusItem = {
     description: string;
     done: boolean;
     inProgress: boolean;
+    section: 'active' | 'system' | 'completed';
+    synthetic?: boolean;
+    system?: boolean;
 };
 
+function focusItemFromApi(item: FocusApiItem): FocusItem {
+    const done = item.status === 'completed';
+    const system = item.kind === 'system';
+    return {
+        id: item.id,
+        name: item.key,
+        description: item.description || item.key,
+        done,
+        inProgress: !done,
+        section: done ? 'completed' : (system ? 'system' : 'active'),
+        system,
+    };
+}
+
 function isFocusPath(path?: string | null): boolean {
-    return !!path && path.replace(/^\/+/, '').toLowerCase() === 'focus.md';
+    if (!path) return false;
+    const normalized = path.replace(/^\/+/, '').toLowerCase();
+    return normalized === 'focus.md' || normalized.endsWith('/focus.md');
 }
 
 function workspaceActionForTool(tool: string): WorkspaceLiveDraft['action'] {
@@ -155,21 +181,33 @@ function parseFocusItems(raw: string): FocusItem[] {
     const lines = raw.split('\n');
     const focusItems: FocusItem[] = [];
     let currentItem: FocusItem | null = null;
+    let currentSection: FocusItem['section'] = 'active';
     for (const line of lines) {
+        const heading = line.match(/^##\s+(.+?)\s*$/);
+        if (heading) {
+            const title = heading[1].trim().toLowerCase();
+            if (title === '已完成' || title === 'completed') currentSection = 'completed';
+            else if (title === '系统 focus' || title === 'system focus' || title === 'system') currentSection = 'system';
+            else if (title === '进行中' || title === 'in progress' || title === 'active') currentSection = 'active';
+            continue;
+        }
         const match = line.match(/^\s*-\s*\[([ x/])\]\s*(.+)/i);
         if (match) {
             if (currentItem) focusItems.push(currentItem);
             const marker = match[1];
             const fullText = match[2].trim();
-            const colonIdx = fullText.indexOf(':');
+            const systemKeyMatch = fullText.match(/^(system:[^:]+)\s*:\s*(.*)$/);
+            const colonIdx = systemKeyMatch ? -1 : fullText.indexOf(':');
             const itemName = colonIdx > 0 ? fullText.substring(0, colonIdx).trim() : fullText;
             const itemDesc = colonIdx > 0 ? fullText.substring(colonIdx + 1).trim() : '';
             currentItem = {
-                id: itemName,
-                name: itemName,
-                description: itemDesc,
-                done: marker.toLowerCase() === 'x',
+                id: systemKeyMatch ? systemKeyMatch[1] : itemName,
+                name: systemKeyMatch ? systemKeyMatch[1] : itemName,
+                description: systemKeyMatch ? systemKeyMatch[2] : itemDesc,
+                done: marker.toLowerCase() === 'x' || currentSection === 'completed',
                 inProgress: marker === '/',
+                section: systemKeyMatch ? 'system' : currentSection,
+                system: currentSection === 'system' || !!systemKeyMatch,
             };
         } else if (currentItem && line.trim() && /^\s{2,}/.test(line)) {
             currentItem.description = currentItem.description
@@ -179,6 +217,36 @@ function parseFocusItems(raw: string): FocusItem[] {
     }
     if (currentItem) focusItems.push(currentItem);
     return focusItems;
+}
+
+function isOkrSystemTrigger(trig: any): boolean {
+    if (!trig?.is_system) return false;
+    const name = String(trig.name || '');
+    return /(^|_)(okr|daily_okr|weekly_okr|biweekly_okr|monthly_okr|okr_collection|okr_report)/i.test(name);
+}
+
+function focusKeyFromTrigger(trig: any): string {
+    if (trig?.focus_ref) return String(trig.focus_ref);
+    if (isOkrSystemTrigger(trig)) return 'system:okr_reports';
+    if (trig?.is_system) return `system:${String(trig.name || 'trigger')}`;
+    return String(trig.name || trig.reason || 'trigger_focus');
+}
+
+function synthesizeFocusForTrigger(trig: any): FocusItem {
+    const key = focusKeyFromTrigger(trig);
+    const isSystem = !!trig.is_system || key.startsWith('system:');
+    return {
+        id: `synthetic:${key}`,
+        name: key,
+        description: key === 'system:okr_reports'
+            ? 'OKR 自动汇总、日报收集与周期报告'
+            : trig.reason || trig.name || key,
+        done: !trig.is_enabled && !isSystem,
+        inProgress: false,
+        section: isSystem ? 'system' : 'active',
+        synthetic: true,
+        system: isSystem,
+    };
 }
 
 function parseAgentBayTransferArgs(rawArgs: any): NonNullable<LivePreviewState['transfer']> {
@@ -247,6 +315,7 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
     const [deletingToolId, setDeletingToolId] = useState<string | null>(null);
     const [configCategory, setConfigCategory] = useState<string | null>(null);
     const [focusedField, setFocusedField] = useState<string | null>(null);
+    const [showAdvancedToolConfig, setShowAdvancedToolConfig] = useState(false);
     const [expandedCategories, setExpandedCategories] = useState<Set<string>>(() => new Set());
     const [toolSearch, setToolSearch] = useState('');
     const [toolStatusFilter, setToolStatusFilter] = useState<'all' | 'enabled' | 'disabled' | 'configured'>('all');
@@ -316,8 +385,19 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
         return keys;
     };
 
+    const applyConfigDefaults = (fields: any[] = [], config: Record<string, any> = {}) => {
+        const next = { ...config };
+        for (const field of fields) {
+            if (field.default !== undefined && (next[field.key] === undefined || next[field.key] === null || next[field.key] === '')) {
+                next[field.key] = field.default;
+            }
+        }
+        return next;
+    };
+
     const openConfig = (tool: any) => {
         setConfigTool(tool);
+        setShowAdvancedToolConfig(false);
         // Build merged config: start with global defaults, overlay agent overrides.
         // For sensitive fields, only use agent_config values (global ones are masked
         // like "****xxxx" and should not pre-fill the input).
@@ -329,6 +409,7 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
             if (!sensitiveKeys.has(k)) merged[k] = v;
         }
         Object.assign(merged, agentCfg);
+        Object.assign(merged, applyConfigDefaults(tool.config_schema?.fields || [], merged));
         setConfigData(merged);
         setConfigJson(JSON.stringify(agentCfg, null, 2));
         setFocusedField(null);
@@ -336,6 +417,7 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
 
     const openCategoryConfig = async (category: string) => {
         setConfigCategory(category);
+        setShowAdvancedToolConfig(false);
         setConfigData({});
         setConfigGlobalData({});
         setConfigSaving(true);
@@ -884,6 +966,14 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
                 const fields = configTool ? (configTool.config_schema?.fields || []) : (target.fields || []);
                 const title = configTool ? configTool.display_name : target.title;
                 const isCat = !!configCategory;
+                const visibleFields = fields.filter((field: any) => {
+                    if (!field.depends_on) return true;
+                    return Object.entries(field.depends_on).every(([depKey, depVals]: [string, any]) =>
+                        (depVals as string[]).includes(configData[depKey] ?? '')
+                    );
+                });
+                const primaryFields = visibleFields.filter((field: any) => !field.advanced);
+                const advancedFields = visibleFields.filter((field: any) => field.advanced);
                 return (
                     <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.55)', zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                         onClick={() => { setConfigTool(null); setConfigCategory(null); }}>
@@ -898,14 +988,7 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
 
                             {fields.length > 0 ? (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                                    {fields
-                                        .filter((field: any) => {
-                                            // Handle depends_on: hide fields unless dependency is met
-                                            if (!field.depends_on) return true;
-                                            return Object.entries(field.depends_on).every(([depKey, depVals]: [string, any]) =>
-                                                (depVals as string[]).includes(configData[depKey] ?? '')
-                                            );
-                                        })
+                                    {primaryFields
                                         .map((field: any) => {
                                             // Get user role from store directly in the map function
                                             const userFromStore = useAuthStore.getState().user;
@@ -1002,6 +1085,15 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
                                                         </select>
                                                     ) : field.type === 'number' ? (
                                                         <input type="number" className="form-input" value={configData[field.key] ?? field.default ?? ''} placeholder={field.placeholder || ''} min={field.min} max={field.max} onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value ? Number(e.target.value) : '' }))} />
+                                                    ) : field.type === 'textarea' ? (
+                                                        <textarea
+                                                            className="form-input"
+                                                            value={configData[field.key] ?? ''}
+                                                            placeholder={field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default')}
+                                                            rows={Math.max(3, Math.min(10, String(configData[field.key] ?? field.default ?? field.placeholder ?? '').split('\n').length))}
+                                                            style={{ minHeight: '88px', fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)', resize: 'vertical' }}
+                                                            onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}
+                                                        />
                                                     ) : (
                                                         <>
                                                         {(() => {
@@ -1037,6 +1129,72 @@ function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { age
                                                 </div>
                                             );
                                         })}
+                                    {advancedFields.length > 0 && (
+                                        <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '10px', marginTop: '2px' }}>
+                                            <button
+                                                type="button"
+                                                className="btn btn-ghost"
+                                                onClick={() => setShowAdvancedToolConfig(v => !v)}
+                                                style={{ padding: 0, minWidth: 'auto', fontSize: '12px', color: 'var(--text-secondary)' }}
+                                            >
+                                                {showAdvancedToolConfig ? 'Hide advanced settings' : 'Advanced settings'}
+                                            </button>
+                                            {showAdvancedToolConfig && (
+                                                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginTop: '12px' }}>
+                                                    {advancedFields.map((field: any) => {
+                                                        const userFromStore = useAuthStore.getState().user;
+                                                        const currentUserRole = userFromStore?.role;
+                                                        const isReadOnly = field.read_only_for_roles?.includes(currentUserRole);
+                                                        return (
+                                                            <div key={field.key}>
+                                                                <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>
+                                                                    {field.label}
+                                                                    {isReadOnly && <span style={{ fontWeight: 400, color: 'var(--text-tertiary)', marginLeft: '4px' }}>(Admin only)</span>}
+                                                                </label>
+                                                                {field.type === 'checkbox' ? (
+                                                                    <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: isReadOnly ? 'not-allowed' : 'pointer' }}>
+                                                                        <input
+                                                                            type="checkbox"
+                                                                            checked={configData[field.key] ?? field.default ?? false}
+                                                                            disabled={isReadOnly}
+                                                                            onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.checked }))}
+                                                                            style={{ opacity: 0, width: 0, height: 0 }}
+                                                                        />
+                                                                        <span style={{ position: 'absolute', inset: 0, background: (configData[field.key] ?? field.default) ? 'var(--accent-primary)' : 'var(--bg-tertiary)', borderRadius: '11px', transition: 'background 0.2s', opacity: isReadOnly ? 0.6 : 1 }}>
+                                                                            <span style={{ position: 'absolute', left: (configData[field.key] ?? field.default) ? '20px' : '2px', top: '2px', width: '18px', height: '18px', background: '#fff', borderRadius: '50%', transition: 'left 0.2s' }} />
+                                                                        </span>
+                                                                    </label>
+                                                                ) : field.type === 'select' ? (
+                                                                    <select className="form-input" value={configData[field.key] ?? field.default ?? ''} disabled={isReadOnly}
+                                                                        onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}>
+                                                                        {(field.options || []).map((o: any) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                                                                    </select>
+                                                                ) : field.type === 'number' ? (
+                                                                    <input type="number" className="form-input" value={configData[field.key] ?? field.default ?? ''} disabled={isReadOnly} placeholder={field.placeholder || ''} min={field.min} max={field.max} onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value ? Number(e.target.value) : '' }))} />
+                                                                ) : field.type === 'textarea' ? (
+                                                                    <textarea
+                                                                        className="form-input"
+                                                                        value={configData[field.key] ?? field.default ?? ''}
+                                                                        disabled={isReadOnly}
+                                                                        placeholder={field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default')}
+                                                                        rows={Math.max(3, Math.min(10, String(configData[field.key] ?? field.default ?? field.placeholder ?? '').split('\n').length))}
+                                                                        style={{ minHeight: '88px', fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)', resize: 'vertical' }}
+                                                                        onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}
+                                                                    />
+                                                                ) : (
+                                                                    <input type={field.type === 'password' ? 'password' : 'text'} autoComplete={field.type === 'password' ? 'new-password' : undefined} className="form-input"
+                                                                        value={configData[field.key] ?? field.default ?? ''}
+                                                                        disabled={isReadOnly}
+                                                                        placeholder={field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default')}
+                                                                        onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))} />
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
                                     {/* Email tool: test connection button + help text */}
                                     {configTool?.category === 'email' && (
                                         <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -1228,7 +1386,428 @@ function fetchAuth<T>(url: string, options?: RequestInit): Promise<T> {
     return fetch(`/api${url}`, {
         ...options,
         headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    }).then(r => r.json());
+    }).then(async r => {
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            throw new Error(data?.detail || data?.message || `Request failed (${r.status})`);
+        }
+        return data;
+    });
+}
+
+type AccessUser = {
+    id: string;
+    name: string;
+    username?: string;
+    email?: string;
+    access_level: 'use' | 'manage';
+    is_required?: boolean;
+    required_reason?: 'creator' | 'company_admin' | string | null;
+};
+type AccessUserCandidate = { id: string; name: string; username?: string; email?: string };
+
+function AccessPermissionsPanel({
+    agentId,
+    permData,
+    canManage,
+    queryClient,
+}: {
+    agentId: string;
+    permData: any;
+    canManage: boolean;
+    queryClient: any;
+}) {
+    const { t, i18n } = useTranslation();
+    const isChinese = i18n.language?.startsWith('zh');
+    const canManagePermissions = permData?.can_manage ?? canManage;
+    const isOwner = permData?.is_owner ?? false;
+    const creatorId = permData?.creator_id ? String(permData.creator_id) : null;
+    const currentScope = permData?.scope_type === 'user' ? 'private' : (permData?.scope_type || 'company');
+    const currentAccessLevel = permData?.access_level || 'use';
+    const [localScope, setLocalScope] = useState(currentScope);
+    const [localAccessLevel, setLocalAccessLevel] = useState(currentAccessLevel);
+    const [savingScope, setSavingScope] = useState<string | null>(null);
+    const [permissionError, setPermissionError] = useState<string | null>(null);
+    const [userSearch, setUserSearch] = useState('');
+    const [showUserDropdown, setShowUserDropdown] = useState(false);
+    const userSearchRef = useRef<HTMLDivElement | null>(null);
+    const userAccess: AccessUser[] = (permData?.user_access || []).map((u: any) => ({
+        id: u.id,
+        name: u.name,
+        username: u.username,
+        email: u.email,
+        access_level: u.access_level === 'manage' ? 'manage' : 'use',
+        is_required: !!u.is_required,
+        required_reason: u.required_reason || null,
+    }));
+    const toPermissionPayloadScope = (scope: string) => scope === 'private' ? 'user' : scope;
+
+    const { data: candidates } = useQuery({
+        queryKey: ['agent-permission-candidates', agentId, userSearch],
+        queryFn: () => fetchAuth<{ users: AccessUserCandidate[]; agents: any[] }>(`/agents/${agentId}/permissions/candidates${userSearch.trim() ? `?search=${encodeURIComponent(userSearch.trim())}` : ''}`),
+        enabled: !!agentId && canManagePermissions,
+    });
+
+    useEffect(() => {
+        setLocalScope(currentScope);
+        setLocalAccessLevel(currentAccessLevel);
+    }, [currentScope, currentAccessLevel]);
+
+    const savePermissions = async (payload: any) => {
+        setPermissionError(null);
+        await fetchAuth(`/agents/${agentId}/permissions`, {
+            method: 'PUT',
+            body: JSON.stringify(payload),
+        });
+        queryClient.invalidateQueries({ queryKey: ['agent-permissions', agentId] });
+        queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
+        queryClient.invalidateQueries({ queryKey: ['agents'] });
+    };
+
+    const scopeOptions = [
+        {
+            value: 'company',
+            icon: <IconBuilding size={14} stroke={1.8} />,
+            label: t('agent.settings.perm.companyWide', 'Company-wide'),
+            desc: isChinese ? '所有平台用户和所有 Agent 都可以访问；可参与 Plaza。' : 'All platform users and all agents can access it; Plaza is enabled.',
+        },
+        {
+            value: 'private',
+            icon: <IconUser size={14} stroke={1.8} />,
+            label: t('agent.settings.perm.onlyMe', 'Only Me'),
+            desc: isChinese ? '只有创建者可以使用和管理；不可参与 Plaza。' : 'Only the creator can use and manage it; Plaza is disabled.',
+        },
+        {
+            value: 'custom',
+            icon: <IconLock size={14} stroke={1.8} />,
+            label: isChinese ? '指定访问' : 'Custom',
+            desc: isChinese ? '指定可访问的平台用户；不可参与 Plaza。Agent 关系请在“关系”里配置。' : 'Choose platform users explicitly; Plaza is disabled. Agent relationships are configured in Relationships.',
+        },
+    ] as const;
+
+    const accessLevels = [
+        { val: 'use', label: <><IconEye size={13} stroke={1.8} /> {t('agent.settings.perm.useAccess', 'Use')}</>, desc: t('agent.settings.perm.useAccessDesc', 'Task, Chat, Tools, Skills, Workspace') },
+        { val: 'manage', label: <><IconSettings size={13} stroke={1.8} /> {t('agent.settings.perm.manageAccess', 'Manage')}</>, desc: t('agent.settings.perm.manageAccessDesc', 'Full access including Settings, Mind, Relationships') },
+    ];
+
+    const setScope = async (scope: string) => {
+        if (!canManagePermissions) return;
+        if (scope === 'private' && !isOwner) {
+            setPermissionError(isChinese ? '仅创建者可以切换为“仅我可见”，否则管理员会立即失去管理入口。' : 'Only the creator can switch to Only Me, otherwise the manager would lose access immediately.');
+            return;
+        }
+        const previousScope = localScope;
+        setLocalScope(scope);
+        setSavingScope(scope);
+        try {
+            await savePermissions({
+                scope_type: toPermissionPayloadScope(scope),
+                access_level: localAccessLevel,
+                user_access: userAccess,
+            });
+        } catch (e) {
+            setLocalScope(previousScope);
+            setPermissionError(e instanceof Error ? e.message : String(e));
+            console.error('Failed to update permissions', e);
+        } finally {
+            setSavingScope(null);
+        }
+    };
+
+    const setCompanyAccessLevel = async (level: string) => {
+        const previousLevel = localAccessLevel;
+        setLocalAccessLevel(level);
+        setSavingScope(`level:${level}`);
+        try {
+            await savePermissions({
+                scope_type: toPermissionPayloadScope(localScope),
+                access_level: level,
+                user_access: userAccess,
+            });
+        } catch (e) {
+            setLocalAccessLevel(previousLevel);
+            setPermissionError(e instanceof Error ? e.message : String(e));
+            console.error('Failed to update access level', e);
+        } finally {
+            setSavingScope(null);
+        }
+    };
+
+    const addUser = (userId: string) => {
+        const candidate = candidates?.users?.find(u => u.id === userId);
+        if (!candidate || userAccess.some(u => u.id === userId)) return;
+        savePermissions({
+            scope_type: 'custom',
+            access_level: currentAccessLevel,
+            user_access: [...userAccess, { ...candidate, access_level: creatorId === userId ? 'manage' : 'use' }],
+        }).catch(e => console.error('Failed to add user access', e));
+    };
+
+    const isLockedAccessUser = (user: AccessUser) => user.is_required || creatorId === user.id;
+    const lockedAccessTitle = (user: AccessUser) => {
+        if (user.required_reason === 'company_admin') {
+            return isChinese ? '公司管理员会自动保留管理权限' : 'Company admins automatically keep manage access';
+        }
+        return isChinese ? '创建者始终保留管理权限' : 'The creator always keeps manage access';
+    };
+
+    const updateUserLevel = (userId: string, level: 'use' | 'manage') => {
+        const target = userAccess.find(u => u.id === userId);
+        if (target && isLockedAccessUser(target)) return;
+        savePermissions({
+            scope_type: 'custom',
+            access_level: currentAccessLevel,
+            user_access: userAccess.map(u => u.id === userId ? { ...u, access_level: level } : u),
+        }).catch(e => console.error('Failed to update user access', e));
+    };
+
+    const removeUser = (userId: string) => {
+        const target = userAccess.find(u => u.id === userId);
+        if (target && isLockedAccessUser(target)) return;
+        savePermissions({
+            scope_type: 'custom',
+            access_level: currentAccessLevel,
+            user_access: userAccess.filter(u => u.id !== userId),
+        }).catch(e => console.error('Failed to remove user access', e));
+    };
+
+    const toggleUser = (user: AccessUserCandidate) => {
+        if (userAccess.some(existing => existing.id === user.id)) return;
+        addUser(user.id);
+    };
+
+    const visibleUserResults = candidates?.users || [];
+
+    return (
+        <div className="card" style={{ marginBottom: '12px' }}>
+            <h4 style={{ marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <IconLock size={16} stroke={1.8} /> {t('agent.settings.perm.title', 'Access Permissions')}
+            </h4>
+            <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '16px' }}>
+                {t('agent.settings.perm.description', 'Control who can see and interact with this agent. Only the creator or admin can change this.')}
+            </p>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '16px' }}>
+                {scopeOptions.map((scope) => {
+                    const disabled = !canManagePermissions || (scope.value === 'private' && !isOwner);
+                    const selected = localScope === scope.value;
+                    return (
+                    <button
+                        key={scope.value}
+                        type="button"
+                        disabled={!canManagePermissions}
+                        onClick={() => setScope(scope.value)}
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '10px',
+                            width: '100%',
+                            textAlign: 'left',
+                            padding: '12px 14px',
+                            borderRadius: '8px',
+                            cursor: disabled ? 'not-allowed' : 'pointer',
+                            border: selected ? '1px solid var(--accent-primary)' : '1px solid var(--border-subtle)',
+                            background: selected ? 'rgba(99,102,241,0.06)' : 'transparent',
+                            opacity: disabled ? 0.55 : 1,
+                            transition: 'all 0.15s',
+                        }}
+                    >
+                        <input
+                            type="radio"
+                            name="perm_scope"
+                            checked={selected}
+                            disabled={disabled}
+                            readOnly
+                            style={{ accentColor: 'var(--accent-primary)' }}
+                        />
+                        <div>
+                            <div style={{ fontWeight: 500, fontSize: '13px', display: 'flex', alignItems: 'center', gap: '5px' }}>
+                                {scope.icon} {scope.label}
+                                {savingScope === scope.value && <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', fontWeight: 400 }}>{isChinese ? '保存中...' : 'Saving...'}</span>}
+                            </div>
+                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{scope.desc}</div>
+                        </div>
+                    </button>
+                );})}
+            </div>
+
+            {permissionError && (
+                <div style={{ margin: '-4px 0 12px', fontSize: '12px', color: 'var(--error)' }}>
+                    {permissionError}
+                </div>
+            )}
+
+            {localScope === 'company' && canManagePermissions && (
+                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}>
+                    <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '8px' }}>
+                        {t('agent.settings.perm.defaultAccess', 'Default Access Level')}
+                    </label>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                        {accessLevels.map(opt => (
+                            <label key={opt.val}
+                                style={{
+                                    flex: 1,
+                                    padding: '10px 12px',
+                                    borderRadius: '8px',
+                                    cursor: 'pointer',
+                                    border: localAccessLevel === opt.val ? '1px solid var(--accent-primary)' : '1px solid var(--border-subtle)',
+                                    background: localAccessLevel === opt.val ? 'rgba(99,102,241,0.06)' : 'transparent',
+                                    transition: 'all 0.15s',
+                                }}
+                            >
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                    <input
+                                        type="radio"
+                                        name="access_level"
+                                        checked={localAccessLevel === opt.val}
+                                        onChange={() => setCompanyAccessLevel(opt.val)}
+                                        style={{ accentColor: 'var(--accent-primary)' }}
+                                    />
+                                    <span style={{ fontWeight: 500, fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px' }}>{opt.label}</span>
+                                </div>
+                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px', marginLeft: '20px' }}>{opt.desc}</div>
+                            </label>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {localScope === 'custom' && canManagePermissions && (
+                <div
+                    style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}
+                    onMouseDownCapture={(e) => {
+                        const target = e.target as Node;
+                        if (userSearchRef.current && !userSearchRef.current.contains(target)) {
+                            setShowUserDropdown(false);
+                        }
+                    }}
+                >
+                    <div>
+                        <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                            <IconUser size={14} stroke={1.8} /> {isChinese ? '平台用户' : 'Platform Users'}
+                        </div>
+                        <div ref={userSearchRef} style={{ position: 'relative', marginBottom: '8px', maxWidth: '520px' }}>
+                            <input
+                                className="input"
+                                value={userSearch}
+                                onChange={(e) => {
+                                    setUserSearch(e.target.value);
+                                    setShowUserDropdown(true);
+                                }}
+                                onFocus={() => setShowUserDropdown(true)}
+                                placeholder={isChinese ? '搜索用户姓名或邮箱...' : 'Search users by name or email...'}
+                                style={{ fontSize: '12px', width: '100%' }}
+                            />
+                            {showUserDropdown && visibleUserResults.length > 0 && (
+                                <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', marginTop: '4px', maxHeight: '220px', overflowY: 'auto', zIndex: 20, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
+                                    {visibleUserResults.map(u => {
+                                        const checked = userAccess.some(existing => existing.id === u.id);
+                                        const existingUser = userAccess.find(existing => existing.id === u.id);
+                                        return (
+                                            <div
+                                                key={u.id}
+                                                style={{ padding: '8px 12px', cursor: checked ? 'default' : 'pointer', fontSize: '13px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'flex-start', gap: '8px', opacity: checked ? 0.72 : 1 }}
+                                                onClick={() => toggleUser(u)}
+                                                onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-elevated)')}
+                                                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+                                            >
+                                                <input type="checkbox" checked={checked} readOnly disabled={checked} style={{ marginTop: '2px' }} />
+                                                <div style={{ minWidth: 0, flex: 1 }}>
+                                                    <div style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', gap: '6px', alignItems: 'center' }}>
+                                                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.name}</span>
+                                                        {checked && (
+                                                            <span className="badge" style={{ fontSize: '10px', flexShrink: 0 }}>
+                                                                {existingUser?.is_required
+                                                                    ? (existingUser.required_reason === 'company_admin' ? (isChinese ? '管理员' : 'Admin') : (isChinese ? '创建者' : 'Creator'))
+                                                                    : (isChinese ? '已添加' : 'Added')}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    {(u.email || u.username) && (
+                                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            {[u.username, u.email].filter(Boolean).join(' · ')}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                            {showUserDropdown && userSearch.trim() && visibleUserResults.length === 0 && (
+                                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '6px' }}>
+                                    {t('agent.detail.noSearchResults', 'No available results')}
+                                </div>
+                            )}
+                        </div>
+                        {userAccess.length > 0 && (
+                            <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '6px' }}>
+                                {isChinese ? '已授权用户' : 'Granted users'}
+                            </div>
+                        )}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                            {userAccess.map(u => {
+                                const isCreatorUser = creatorId === u.id;
+                                const lockedUser = isLockedAccessUser(u);
+                                return (
+                                <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px', border: '1px solid var(--border-subtle)', borderRadius: '8px' }}>
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                        <div style={{ fontSize: '12px', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                            {u.name}
+                                            {isCreatorUser && (
+                                                <span className="badge" style={{ fontSize: '10px', marginLeft: '6px' }}>
+                                                    {isChinese ? '创建者' : 'Creator'}
+                                                </span>
+                                            )}
+                                            {!isCreatorUser && u.required_reason === 'company_admin' && (
+                                                <span className="badge" style={{ fontSize: '10px', marginLeft: '6px' }}>
+                                                    {isChinese ? '管理员' : 'Admin'}
+                                                </span>
+                                            )}
+                                        </div>
+                                        {u.email && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.email}</div>}
+                                    </div>
+                                    <select
+                                        className="input"
+                                        value={lockedUser ? 'manage' : u.access_level}
+                                        disabled={lockedUser}
+                                        onChange={(e) => updateUserLevel(u.id, e.target.value as 'use' | 'manage')}
+                                        style={{ width: '92px', fontSize: '12px', opacity: lockedUser ? 0.65 : 1, cursor: lockedUser ? 'not-allowed' : 'pointer' }}
+                                        title={lockedUser ? lockedAccessTitle(u) : undefined}
+                                    >
+                                        <option value="use">{t('agent.settings.perm.useAccess', 'Use')}</option>
+                                        <option value="manage">{t('agent.settings.perm.manageAccess', 'Manage')}</option>
+                                    </select>
+                                    <button
+                                        className="btn btn-ghost btn-sm"
+                                        disabled={lockedUser}
+                                        onClick={() => removeUser(u.id)}
+                                        title={lockedUser ? lockedAccessTitle(u) : undefined}
+                                        style={{ opacity: lockedUser ? 0.35 : 1, cursor: lockedUser ? 'not-allowed' : 'pointer' }}
+                                    >
+                                        ×
+                                    </button>
+                                </div>
+                            );})}
+                            {userAccess.length === 0 && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{isChinese ? '尚未指定用户。创建者会自动保留管理权限。' : 'No users selected. The creator keeps manage access automatically.'}</div>}
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {localScope !== 'company' && (
+                <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                    {isChinese ? '非全公司可见的 Agent 不会出现在 Plaza，也不能在 Plaza 发布或评论。' : 'Agents that are not company-wide cannot view, post, or comment in Plaza.'}
+                </div>
+            )}
+
+            {!canManagePermissions && (
+                <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--text-tertiary)', fontStyle: 'italic' }}>
+                    {t('agent.settings.perm.readOnly', 'Only the creator or admin can change permissions')}
+                </div>
+            )}
+        </div>
+    );
 }
 
 // ── Pulse LED keyframe (shared with Chat.tsx, guarded by ID) ──────────────
@@ -1456,7 +2035,7 @@ function AnalysisCard({
                                             {!isLast && <div className="analysis-trace-rail" />}
                                         </div>
                                         <div className="analysis-trace-row-content" style={{ paddingBottom: isLast ? 0 : '18px' }}>
-                                            <div style={{ fontSize: '15px', lineHeight: 1.5, color: 'var(--text-primary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                                            <div style={{ fontSize: '13px', lineHeight: 1.5, color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                                                 {itemPreview}
                                             </div>
                                             {item.content.length > itemPreview.length && (
@@ -1464,7 +2043,7 @@ function AnalysisCard({
                                                     <summary style={{ cursor: 'pointer', color: 'var(--text-tertiary)', fontSize: '12px', listStyle: 'none' }}>
                                                         {t('agent.chat.showMore')}
                                                     </summary>
-                                                    <div style={{ marginTop: '8px', color: 'var(--text-secondary)', fontSize: '13px', lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                                                    <div style={{ marginTop: '8px', color: 'var(--text-secondary)', fontSize: '13px', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                                                         {item.content}
                                                     </div>
                                                 </details>
@@ -1499,9 +2078,9 @@ function AnalysisCard({
                                                 overflow: 'hidden',
                                                 textOverflow: 'ellipsis',
                                                 whiteSpace: 'nowrap',
-                                                color: running ? 'var(--text-primary)' : 'var(--text-secondary)',
-                                                fontSize: '15px',
-                                                lineHeight: 1.45,
+                                                color: running ? 'var(--text-secondary)' : 'var(--text-tertiary)',
+                                                fontSize: '13px',
+                                                lineHeight: 1.5,
                                             }}>
                                                 {meta.title}
                                             </div>
@@ -1624,7 +2203,7 @@ function AnalysisCard({
                                     <IconClock size={18} stroke={1.65} />
                                     </div>
                                 </div>
-                                <div style={{ color: 'var(--text-tertiary)', fontSize: '15px', lineHeight: 1.45 }}>
+                                <div style={{ color: 'var(--text-tertiary)', fontSize: '13px', lineHeight: 1.5 }}>
                                     {t('agent.chat.inProgress')}
                                 </div>
                             </div>
@@ -1683,8 +2262,8 @@ function ThoughtDisclosure({
                     <div style={{
                         paddingBottom: '14px',
                         color: 'var(--text-secondary)',
-                        fontSize: '15px',
-                        lineHeight: 1.65,
+                        fontSize: '13px',
+                        lineHeight: 1.5,
                         whiteSpace: 'pre-wrap',
                         wordBreak: 'break-word',
                         maxHeight: '260px',
@@ -1701,7 +2280,7 @@ function ThoughtDisclosure({
                             <IconClock size={18} stroke={1.65} />
                             </div>
                         </div>
-                        <div style={{ color: 'var(--text-tertiary)', fontSize: '15px', lineHeight: 1.45 }}>
+                        <div style={{ color: 'var(--text-tertiary)', fontSize: '13px', lineHeight: 1.5 }}>
                             {t('agent.chat.inProgress')}
                         </div>
                     </div>
@@ -1724,31 +2303,67 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
     const humanSearchRef = useRef<HTMLDivElement>(null);
     const agentSearchRef = useRef<HTMLDivElement>(null);
     const getHumanMemberSourceLabel = useCallback((member: any) => {
-        if (member?.provider_name) return member.provider_name;
-        return isChinese ? '平台用户' : 'Platform User';
+        const providerName = (member?.provider_name || '').trim();
+        const providerType = (member?.provider_type || '').trim().toLowerCase();
+        if (!providerName || providerType === 'platform' || providerType === 'web' || providerName.toLowerCase() === 'web') {
+            return isChinese ? '平台用户' : 'Platform User';
+        }
+        return providerName;
     }, [isChinese]);
 
     const renderHumanMemberSourceBadge = useCallback((member: any) => {
-        const isPlatformUser = !member?.provider_name;
+        const providerName = (member?.provider_name || '').trim();
+        const providerType = (member?.provider_type || '').trim().toLowerCase();
+        const isPlatformUser = !providerName || providerType === 'platform' || providerType === 'web' || providerName.toLowerCase() === 'web';
+        const showPlatformBadge = Boolean(member?.is_platform_user) && !isPlatformUser;
+        const badgeStyle = (platform: boolean): React.CSSProperties => ({
+            display: 'inline-flex',
+            alignItems: 'center',
+            padding: '1px 6px',
+            borderRadius: '999px',
+            fontSize: '10px',
+            fontWeight: 600,
+            marginRight: '6px',
+            background: platform ? 'rgba(99,102,241,0.10)' : 'rgba(16,185,129,0.10)',
+            color: platform ? 'rgb(79,70,229)' : 'rgb(16,185,129)',
+            border: platform ? '1px solid rgba(99,102,241,0.18)' : '1px solid rgba(16,185,129,0.18)',
+        });
         return (
-            <span
-                style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    padding: '1px 6px',
-                    borderRadius: '999px',
-                    fontSize: '10px',
-                    fontWeight: 600,
-                    marginRight: '6px',
-                    background: isPlatformUser ? 'rgba(99,102,241,0.10)' : 'rgba(16,185,129,0.10)',
-                    color: isPlatformUser ? 'rgb(79,70,229)' : 'rgb(16,185,129)',
-                    border: isPlatformUser ? '1px solid rgba(99,102,241,0.18)' : '1px solid rgba(16,185,129,0.18)',
-                }}
-            >
-                {getHumanMemberSourceLabel(member)}
-            </span>
+            <>
+                <span style={badgeStyle(isPlatformUser)}>
+                    {getHumanMemberSourceLabel(member)}
+                </span>
+                {showPlatformBadge && (
+                    <span style={badgeStyle(true)}>
+                        {isChinese ? '平台用户' : 'Platform User'}
+                    </span>
+                )}
+            </>
         );
-    }, [getHumanMemberSourceLabel]);
+    }, [getHumanMemberSourceLabel, isChinese]);
+
+    const getRestrictedTitle = useCallback((reason?: string | null) => {
+        const reasonText = reason ? ` (${reason})` : '';
+        return isChinese
+            ? `当关系目标不存在、停用/过期，或当前访问权限不再允许这个 Agent 与该用户/Agent 互动时，会显示为 restricted。关系记录会保留，但运行时不会使用。${reasonText}`
+            : `Restricted means the target is missing, inactive/expired, or current access permissions no longer allow this agent to interact with that user/agent. The record is kept, but runtime use is blocked.${reasonText}`;
+    }, [isChinese]);
+
+    const [restrictedTooltip, setRestrictedTooltip] = useState<{ text: string; x: number; y: number } | null>(null);
+    const showRestrictedTooltip = useCallback((event: React.SyntheticEvent<HTMLElement>, reason?: string | null) => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        const tooltipWidth = Math.min(320, Math.max(220, window.innerWidth - 32));
+        const x = Math.min(
+            Math.max(rect.left + rect.width / 2, 16 + tooltipWidth / 2),
+            window.innerWidth - 16 - tooltipWidth / 2,
+        );
+        setRestrictedTooltip({
+            text: getRestrictedTitle(reason),
+            x,
+            y: rect.top - 8,
+        });
+    }, [getRestrictedTitle]);
+    const hideRestrictedTooltip = useCallback(() => setRestrictedTooltip(null), []);
 
     const [search, setSearch] = useState('');
     const [showHumanForm, setShowHumanForm] = useState(false);
@@ -1785,10 +2400,17 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
     const relatedAgentIds = useMemo(() => new Set(agentRelationships.map((r: any) => r.target_agent_id)), [agentRelationships]);
     const selectedMemberIds = useMemo(() => new Set(selectedMembers.map((m: any) => m.id)), [selectedMembers]);
     const selectedAgentIds = useMemo(() => new Set(selectedAgents.map((a: any) => a.id)), [selectedAgents]);
+    const relatedMemberById = useMemo(() => {
+        const map = new Map<string, any>();
+        relationships.forEach((r: any) => {
+            if (r.member_id) map.set(r.member_id, r);
+        });
+        return map;
+    }, [relationships]);
 
     const visibleMemberResults = useMemo(
-        () => searchResults.filter((m: any) => !relatedMemberIds.has(m.id)),
-        [searchResults, relatedMemberIds],
+        () => searchResults,
+        [searchResults],
     );
     const visibleAgentResults = useMemo(
         () => agentSearchResults.filter((a: any) => !relatedAgentIds.has(a.id)),
@@ -1797,7 +2419,7 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
 
     const loadOrgMembers = async (keyword = '') => {
         const query = keyword.trim() ? `?search=${encodeURIComponent(keyword.trim())}` : '';
-        const results = await fetchAuth<any[]>(`/enterprise/org/members${query}`);
+        const results = await fetchAuth<any[]>(`/agents/${agentId}/relationships/member-candidates${query}`);
         setSearchResults(results);
     };
 
@@ -1963,6 +2585,33 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
 
     return (
         <div>
+            {restrictedTooltip && (
+                <div
+                    style={{
+                        position: 'fixed',
+                        left: restrictedTooltip.x,
+                        top: restrictedTooltip.y,
+                        transform: 'translate(-50%, -100%)',
+                        zIndex: 10000,
+                        width: 'max-content',
+                        maxWidth: 'min(320px, calc(100vw - 32px))',
+                        padding: '8px 10px',
+                        borderRadius: '8px',
+                        border: '1px solid var(--border-subtle)',
+                        background: 'var(--bg-primary)',
+                        color: 'var(--text-primary)',
+                        boxShadow: '0 10px 30px rgba(0,0,0,0.16)',
+                        fontSize: '12px',
+                        lineHeight: 1.45,
+                        whiteSpace: 'normal',
+                        overflowWrap: 'anywhere',
+                        wordBreak: 'break-word',
+                        pointerEvents: 'none',
+                    }}
+                >
+                    {restrictedTooltip.text}
+                </div>
+            )}
             <div className="card" style={{ marginBottom: '12px' }}>
                 <h4 style={{ marginBottom: '12px' }}>{t('agent.detail.humanRelationships')}</h4>
                 <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>{t('agent.detail.humanRelationships')}</p>
@@ -1979,7 +2628,22 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px' }}>
                                     <div style={{ width: '36px', height: '36px', borderRadius: '50%', background: 'rgba(224,238,238,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', fontWeight: 600, flexShrink: 0 }}>{r.member?.name?.[0] || '?'}</div>
                                     <div style={{ flex: 1, minWidth: 0 }}>
-                                        <div style={{ fontWeight: 600, fontSize: '13px' }}>{r.member?.name || '?'} <span className="badge" style={{ fontSize: '10px', marginLeft: '4px' }}>{r.relation_label}</span></div>
+                                        <div style={{ fontWeight: 600, fontSize: '13px' }}>
+                                            {r.member?.name || '?'} <span className="badge" style={{ fontSize: '10px', marginLeft: '4px' }}>{r.relation_label}</span>
+                                            {r.access_status && r.access_status !== 'active' && (
+                                                <span
+                                                    className="badge"
+                                                    onMouseEnter={(event) => showRestrictedTooltip(event, r.access_status_reason)}
+                                                    onMouseLeave={hideRestrictedTooltip}
+                                                    onFocus={(event) => showRestrictedTooltip(event, r.access_status_reason)}
+                                                    onBlur={hideRestrictedTooltip}
+                                                    tabIndex={0}
+                                                    style={{ fontSize: '10px', marginLeft: '4px', color: 'var(--warning)', background: 'rgba(245,158,11,0.12)', cursor: 'help' }}
+                                                >
+                                                    {r.access_status}
+                                                </span>
+                                            )}
+                                        </div>
                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
                                             {renderHumanMemberSourceBadge(r.member)}
                                             {r.member?.department_path || ''} · {r.member?.email || ''}
@@ -2053,15 +2717,42 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                             {showMemberDropdown && visibleMemberResults.length > 0 && (
                                 <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', marginTop: '4px', maxHeight: '200px', overflowY: 'auto', zIndex: 10, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
                                     {visibleMemberResults.map((m: any) => {
-                                        const checked = selectedMemberIds.has(m.id);
+                                        const existingRelationship = relatedMemberById.get(m.id);
+                                        const alreadyAdded = Boolean(existingRelationship);
+                                        const checked = alreadyAdded || selectedMemberIds.has(m.id);
                                         return (
-                                            <div key={m.id} style={{ padding: '8px 12px', cursor: 'pointer', fontSize: '13px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'flex-start', gap: '8px' }}
-                                                onClick={() => toggleMemberSelection(m)}
-                                                onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-elevated)')}
+                                            <div
+                                                key={m.id}
+                                                style={{
+                                                    padding: '8px 12px',
+                                                    cursor: alreadyAdded ? 'default' : 'pointer',
+                                                    fontSize: '13px',
+                                                    borderBottom: '1px solid var(--border-subtle)',
+                                                    display: 'flex',
+                                                    alignItems: 'flex-start',
+                                                    gap: '8px',
+                                                    opacity: alreadyAdded ? 0.72 : 1,
+                                                }}
+                                                onClick={() => {
+                                                    if (!alreadyAdded) toggleMemberSelection(m);
+                                                }}
+                                                onMouseEnter={e => (e.currentTarget.style.background = alreadyAdded ? 'transparent' : 'var(--bg-elevated)')}
                                                 onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
-                                                <input type="checkbox" checked={checked} readOnly style={{ marginTop: '2px' }} />
+                                                <input type="checkbox" checked={checked} disabled={alreadyAdded} readOnly style={{ marginTop: '2px' }} />
                                                 <div style={{ minWidth: 0, flex: 1 }}>
-                                                    <div style={{ fontWeight: 500 }}>{m.name}</div>
+                                                    <div style={{ fontWeight: 500 }}>
+                                                        {m.name}
+                                                        {alreadyAdded && (
+                                                            <span className="badge" style={{ fontSize: '10px', marginLeft: '6px', color: 'var(--text-tertiary)', background: 'var(--bg-elevated)' }}>
+                                                                {isChinese ? '已添加' : 'Added'}
+                                                            </span>
+                                                        )}
+                                                        {alreadyAdded && existingRelationship?.relation_label && (
+                                                            <span className="badge" style={{ fontSize: '10px', marginLeft: '4px' }}>
+                                                                {existingRelationship.relation_label}
+                                                            </span>
+                                                        )}
+                                                    </div>
                                                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
                                                         {renderHumanMemberSourceBadge(m)}
                                                         {m.department_path} · {m.email}
@@ -2131,8 +2822,9 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '16px' }}>
                         {agentRelationships.map((r: any) => (
                             <div key={r.id} style={{
-                                borderRadius: '8px', border: '1px solid rgba(16,185,129,0.3)',
-                                background: 'rgba(16,185,129,0.05)', overflow: 'hidden',
+                                borderRadius: '8px',
+                                border: `1px solid ${r.access_status && r.access_status !== 'active' ? 'rgba(245,158,11,0.35)' : 'rgba(16,185,129,0.3)'}`,
+                                background: r.access_status && r.access_status !== 'active' ? 'rgba(245,158,11,0.06)' : 'rgba(16,185,129,0.05)', overflow: 'hidden',
                                 opacity: deletingIds.has(r.id) ? 0.4 : 1,
                                 transition: 'opacity 0.2s ease',
                                 pointerEvents: deletingIds.has(r.id) ? 'none' : 'auto',
@@ -2140,8 +2832,26 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '10px' }}>
                                     <div style={{ width: '36px', height: '36px', borderRadius: '50%', background: 'rgba(16,185,129,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '16px', flexShrink: 0 }}>A</div>
                                     <div style={{ flex: 1, minWidth: 0 }}>
-                                        <div style={{ fontWeight: 600, fontSize: '13px' }}>{r.target_agent?.name || '?'} <span className="badge" style={{ fontSize: '10px', marginLeft: '4px', background: 'rgba(16,185,129,0.15)', color: 'rgb(16,185,129)' }}>{r.relation_label}</span></div>
-                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{r.target_agent?.role_description || 'Agent'}</div>
+                                        <div style={{ fontWeight: 600, fontSize: '13px' }}>
+                                            {r.target_agent?.name || '?'} <span className="badge" style={{ fontSize: '10px', marginLeft: '4px', background: 'rgba(16,185,129,0.15)', color: 'rgb(16,185,129)' }}>{r.relation_label}</span>
+                                            {r.access_status && r.access_status !== 'active' && (
+                                                <span
+                                                    className="badge"
+                                                    onMouseEnter={(event) => showRestrictedTooltip(event, r.access_status_reason)}
+                                                    onMouseLeave={hideRestrictedTooltip}
+                                                    onFocus={(event) => showRestrictedTooltip(event, r.access_status_reason)}
+                                                    onBlur={hideRestrictedTooltip}
+                                                    tabIndex={0}
+                                                    style={{ fontSize: '10px', marginLeft: '4px', color: 'var(--warning)', background: 'rgba(245,158,11,0.12)', cursor: 'help' }}
+                                                >
+                                                    {r.access_status}
+                                                </span>
+                                            )}
+                                        </div>
+                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                                            {r.target_agent?.role_description || 'Agent'}
+                                            {r.access_status_reason ? ` · ${r.access_status_reason}` : ''}
+                                        </div>
                                         {r.description && editingAgentId !== r.id && <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>{r.description}</div>}
                                     </div>
                                     {!readOnly && editingAgentId !== r.id && (
@@ -2330,21 +3040,19 @@ function AgentDetailInner() {
         enabled: !!id,
     });
 
-    // Tenant default model — used to render a "默认" tag in ModelSwitcher.
+    // Tenant default model — used to render the "默认" tag and as a visual
+    // fallback when an agent has no explicit primary model.
     const { data: myTenant } = useQuery({
         queryKey: ['tenant', 'me'],
         queryFn: () => tenantApi.me(),
         staleTime: 5 * 60 * 1000,
     });
 
-    // Chat-side picker. Source-of-truth is agent.primary_model_id; the
-    // picker mirrors it bidirectionally:
-    //   - User picks model in chat → handleModelChange PATCHes the agent.
-    //   - Agent's saved default changes elsewhere (settings page, tenant
-    //     default migration) → useEffect below pulls the new value in.
-    // Earlier draft only synced on first mount (`overrideModelId === null`)
-    // which left the chat picker stuck on a stale value when the agent
-    // default was updated by another path.
+    // Chat-side picker. The saved agent model is still the default source,
+    // but ordinary collaborators must be able to pick a per-chat override
+    // without needing permission to edit agent settings. Users with manage
+    // access keep the previous behavior: picking here also updates the saved
+    // agent default.
     const [overrideModelId, setOverrideModelId] = useState<string | null>(null);
     useEffect(() => {
         if (agent?.primary_model_id && agent.primary_model_id !== overrideModelId) {
@@ -2356,13 +3064,14 @@ function AgentDetailInner() {
     const handleModelChange = useCallback(async (newModelId: string | null) => {
         setOverrideModelId(newModelId);
         if (!id || !newModelId || newModelId === agent?.primary_model_id) return;
+        if ((agent as any)?.access_level !== 'manage') return;
         try {
             await agentApi.update(id, { primary_model_id: newModelId });
             queryClient.invalidateQueries({ queryKey: ['agent', id] });
         } catch {
             setOverrideModelId(agent?.primary_model_id || null);
         }
-    }, [id, agent?.primary_model_id]);
+    }, [id, agent?.primary_model_id, (agent as any)?.access_level, queryClient]);
 
     // Track onboarding kickoff per (agent, session) so the agent only greets
     // once per session. The agent opens the conversation itself — no visible
@@ -2381,11 +3090,12 @@ function AgentDetailInner() {
         refetchInterval: awareDataActive ? 5000 : false,
     });
 
-    // ── Aware tab data: focus.md ──
-    const { data: focusFile } = useQuery({
-        queryKey: ['file', id, 'focus.md'],
-        queryFn: () => fileApi.read(id!, 'focus.md').catch(() => null),
+    // ── Aware tab data: structured Focus ──
+    const { data: focusRecords = [], refetch: refetchFocusItems } = useQuery({
+        queryKey: ['focus', id],
+        queryFn: () => focusApi.list(id!, true),
         enabled: !!id && awareDataActive,
+        refetchInterval: awareDataActive ? 5000 : false,
     });
 
     // ── Aware tab data: task_history.md ──
@@ -2410,16 +3120,27 @@ function AgentDetailInner() {
     });
 
     // ── Aware tab state ──
-    const [expandedFocus, setExpandedFocus] = useState<string | null>(null);
+    const [expandedFocusIds, setExpandedFocusIds] = useState<Set<string>>(() => new Set());
     const [expandedReflection, setExpandedReflection] = useState<string | null>(null);
     const [reflectionMessages, setReflectionMessages] = useState<Record<string, any[]>>({});
     const [showAllFocus, setShowAllFocus] = useState(false);
     const [showCompletedFocus, setShowCompletedFocus] = useState(false);
-    const [showAllTriggers, setShowAllTriggers] = useState(false);
     const [showAllReflections, setShowAllReflections] = useState(false);
+    const [awareView, setAwareView] = useState<'list' | 'calendar'>('list');
+    const [awareCalendarMode, setAwareCalendarMode] = useState<'day' | 'week' | 'month'>('week');
+    const [awareCalendarDate, setAwareCalendarDate] = useState<Date>(() => new Date());
     const [reflectionPage, setReflectionPage] = useState(0);
     const REFLECTIONS_PAGE_SIZE = 10;
     const SECTION_PAGE_SIZE = 5;
+
+    const toggleExpandedFocus = (focusId: string) => {
+        setExpandedFocusIds(prev => {
+            const next = new Set(prev);
+            if (next.has(focusId)) next.delete(focusId);
+            else next.add(focusId);
+            return next;
+        });
+    };
 
     const loadReflectionMessages = async (sessionId: string) => {
         if (!id || reflectionMessages[sessionId]) return;
@@ -3326,7 +4047,8 @@ function AgentDetailInner() {
                     openAwarePanel();
                     if (d.status === 'done') {
                         refetchTriggers();
-                        queryClient.invalidateQueries({ queryKey: ['file', id, 'focus.md'] });
+                        refetchFocusItems();
+                        queryClient.invalidateQueries({ queryKey: ['focus', id] });
                     }
                 }
                 if (d.name === 'agentbay_file_transfer') {
@@ -3405,7 +4127,8 @@ function AgentDetailInner() {
                         }
                     if (isFocusPath(activity.path)) {
                         openAwarePanel();
-                        queryClient.invalidateQueries({ queryKey: ['file', id, 'focus.md'] });
+                        refetchFocusItems();
+                        queryClient.invalidateQueries({ queryKey: ['focus', id] });
                     } else if (allowLivePanelAutoFocus()) {
                         setSidePanelTab('workspace');
                         setLivePanelVisible(true);
@@ -4225,21 +4948,6 @@ function AgentDetailInner() {
         enabled: !!id && activeTab === 'settings',
     });
 
-    // Org members for "specific users" permission scope (port from fork's
-    // 4-24 batch: feat 设置页面增加指定用户权限选项)
-    const { data: members = [] } = useQuery({
-        queryKey: ['org-members-perm'],
-        queryFn: enterpriseApi.listMembers,
-        enabled: activeTab === 'settings',
-    });
-    const [permEditScope, setPermEditScope] = useState<string | null>(null);
-    const [permEditUserIds, setPermEditUserIds] = useState<string[]>([]);
-    useEffect(() => {
-        if (permData && activeTab === 'settings') {
-            setPermEditUserIds(permData?.scope_ids || []);
-        }
-    }, [permData, activeTab]);
-
     // ─── Soul editor ─────────────────────────────────────
     const [soulEditing, setSoulEditing] = useState(false);
     const [soulDraft, setSoulDraft] = useState('');
@@ -4481,8 +5189,7 @@ function AgentDetailInner() {
         </div>
     );
     const renderAwarePreview = () => {
-        const raw = focusFile?.content || '';
-        const focusItems = parseFocusItems(raw);
+        const focusItems = focusRecords.map(focusItemFromApi);
         const isZh = i18n.language?.startsWith('zh');
         const formatTrigger = (trig: any) => {
             if (trig.type === 'cron' && trig.config?.expr) return `Cron ${trig.config.expr}`;
@@ -4490,21 +5197,203 @@ function AgentDetailInner() {
             if (trig.type === 'once' && trig.config?.at) return new Date(trig.config.at).toLocaleString();
             return trig.name || trig.type;
         };
+        const triggerTitle = (trig: any) => String(trig.reason || trig.name || trig.type || '').trim();
+        const triggerMeta = (trig: any) => {
+            const schedule = formatTrigger(trig);
+            if (!trig.reason || schedule === trig.reason) return schedule;
+            return schedule;
+        };
+        const triggerTooltip = (trig: any) => {
+            const title = triggerTitle(trig);
+            const meta = triggerMeta(trig);
+            const parts = [title, meta];
+            if (trig.reason && trig.reason !== title) parts.push(String(trig.reason));
+            if (trig.name && trig.name !== title) parts.push(String(trig.name));
+            return Array.from(new Set(parts.filter(Boolean))).join('\n');
+        };
         const triggersByFocus: Record<string, any[]> = {};
-        const standaloneTriggers: any[] = [];
         const focusNames = new Set(focusItems.map((item) => item.name));
         for (const trig of awareTriggers as any[]) {
             if (trig.focus_ref && focusNames.has(trig.focus_ref)) {
                 if (!triggersByFocus[trig.focus_ref]) triggersByFocus[trig.focus_ref] = [];
                 triggersByFocus[trig.focus_ref].push(trig);
             } else {
-                standaloneTriggers.push(trig);
+                const synthetic = synthesizeFocusForTrigger(trig);
+                if (!triggersByFocus[synthetic.name]) triggersByFocus[synthetic.name] = [];
+                triggersByFocus[synthetic.name].push(trig);
             }
         }
-        const renderCheck = (state: 'todo' | 'active' | 'done', label: string) => (
-            <span className={`aware-side-check ${state}`} aria-label={label}>
-                {state === 'done' ? '✓' : state === 'active' ? '•' : ''}
-            </span>
+        const displayFocusItems = focusItems;
+        const activeFocusItems = displayFocusItems.filter(item => !item.done && !item.system);
+        const systemFocusItems = displayFocusItems.filter(item => !item.done && item.system);
+        const completedFocusItems = displayFocusItems.filter(item => item.done);
+        const renderTriggerDot = (done: boolean, label: string) => (
+            <span className={`aware-side-status-dot ${done ? 'done' : 'active'}`} aria-label={label} />
+        );
+        const renderFocusItem = (item: FocusItem) => {
+            const isExpanded = expandedFocusIds.has(item.id);
+            const itemTriggers = triggersByFocus[item.name] || [];
+            return (
+                <div key={item.id} className={`aware-side-focus ${item.done ? 'done' : ''}`}>
+                    <button className="aware-side-focus-head" type="button" onClick={() => toggleExpandedFocus(item.id)}>
+                        <div className="aware-side-trigger-main">
+                            <div className="aware-side-item-title">
+                                <span>{item.description || item.name}</span>
+                                {item.done && (
+                                    <span className="aware-side-focus-badge done">
+                                        {t('agent.aware.completed')}
+                                    </span>
+                                )}
+                            </div>
+                            {item.description && <div className="aware-side-item-meta">{item.name}</div>}
+                        </div>
+                        <span className="aware-side-count">
+                            {isZh ? `${itemTriggers.length} 个` : itemTriggers.length}
+                        </span>
+                        <span className={`aware-side-chevron ${isExpanded ? 'open' : ''}`}>▶</span>
+                    </button>
+                    {isExpanded && (
+                        <div className="aware-side-nested">
+                            {itemTriggers.length === 0 ? (
+                                <div className="aware-side-empty compact">{t('agent.aware.noTriggers')}</div>
+                            ) : itemTriggers.map((trig: any) => (
+                                <div key={trig.id} className={`aware-side-trigger ${trig.is_enabled ? '' : 'done'}`}>
+                                    {renderTriggerDot(!trig.is_enabled, trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
+                                    <div className="aware-side-trigger-main">
+                                        <div className="aware-side-item-title">{triggerTitle(trig)}</div>
+                                        <div className="aware-side-item-meta">{triggerMeta(trig)}</div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+        const renderFocusGroup = (title: string, items: FocusItem[]) => {
+            if (items.length === 0) return null;
+            return (
+                <div className="aware-side-focus-group">
+                    <div className="aware-side-subtitle">{title}</div>
+                    {items.slice(0, 12).map(renderFocusItem)}
+                </div>
+            );
+        };
+        const parseTriggerTime = (trig: any): Date | null => {
+            if (trig.type === 'once' && trig.config?.at) {
+                const date = new Date(trig.config.at);
+                return Number.isNaN(date.getTime()) ? null : date;
+            }
+            return null;
+        };
+        const startOfDay = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate());
+        const today = startOfDay(new Date());
+        const calendarAnchor = startOfDay(awareCalendarDate);
+        const calendarDays = (() => {
+            if (awareCalendarMode === 'day') return [calendarAnchor];
+            if (awareCalendarMode === 'month') {
+                const first = new Date(calendarAnchor.getFullYear(), calendarAnchor.getMonth(), 1);
+                return Array.from({ length: 31 }, (_, idx) => new Date(first.getFullYear(), first.getMonth(), first.getDate() + idx))
+                    .filter(date => date.getMonth() === first.getMonth());
+            }
+            const weekStart = new Date(calendarAnchor);
+            weekStart.setDate(calendarAnchor.getDate() - ((calendarAnchor.getDay() + 6) % 7));
+            return Array.from({ length: 7 }, (_, idx) => new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + idx));
+        })();
+        const calendarRangeLabel = (() => {
+            if (awareCalendarMode === 'day') {
+                return calendarAnchor.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric', weekday: 'short' });
+            }
+            if (awareCalendarMode === 'month') {
+                return calendarAnchor.toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
+            }
+            const first = calendarDays[0];
+            const last = calendarDays[calendarDays.length - 1];
+            return `${first.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} - ${last.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`;
+        })();
+        const shiftCalendar = (direction: -1 | 1) => {
+            setAwareCalendarDate(prev => {
+                const next = new Date(prev);
+                if (awareCalendarMode === 'day') next.setDate(next.getDate() + direction);
+                else if (awareCalendarMode === 'week') next.setDate(next.getDate() + direction * 7);
+                else next.setMonth(next.getMonth() + direction);
+                return next;
+            });
+        };
+        const timedTriggers = (awareTriggers as any[]).filter((trig) => ['once', 'cron', 'interval'].includes(trig.type));
+        const recurringTriggers = timedTriggers.filter((trig) => !parseTriggerTime(trig));
+        const triggersForDay = (day: Date) => timedTriggers.filter((trig) => {
+            const when = parseTriggerTime(trig);
+            return !!when && startOfDay(when).getTime() === day.getTime();
+        });
+        const renderCalendar = () => (
+            <div className="aware-calendar">
+                <div className="aware-calendar-header">
+                    <div className="aware-calendar-toolbar">
+                        {(['day', 'week', 'month'] as const).map(mode => (
+                            <button
+                                key={mode}
+                                type="button"
+                                className={`aware-view-button ${awareCalendarMode === mode ? 'active' : ''}`}
+                                onClick={() => setAwareCalendarMode(mode)}
+                            >
+                                {isZh ? ({ day: '日', week: '周', month: '月' } as const)[mode] : mode}
+                            </button>
+                        ))}
+                    </div>
+                    <div className="aware-calendar-nav">
+                        <button type="button" className="aware-calendar-nav-button" onClick={() => shiftCalendar(-1)} aria-label={isZh ? '上一段时间' : 'Previous'}>
+                            ‹
+                        </button>
+                        <button type="button" className="aware-calendar-range" onClick={() => setAwareCalendarDate(new Date())}>
+                            {calendarRangeLabel}
+                        </button>
+                        <button type="button" className="aware-calendar-nav-button" onClick={() => shiftCalendar(1)} aria-label={isZh ? '下一段时间' : 'Next'}>
+                            ›
+                        </button>
+                    </div>
+                </div>
+                <div className={`aware-calendar-grid mode-${awareCalendarMode}`}>
+                    {calendarDays.map((day) => {
+                        const items = triggersForDay(day);
+                        const isToday = day.getTime() === today.getTime();
+                        return (
+                            <div key={day.toISOString()} className={`aware-calendar-day ${isToday ? 'is-today' : ''}`}>
+                                <div className="aware-calendar-day-label">
+                                    {day.toLocaleDateString(undefined, awareCalendarMode === 'month' ? { day: 'numeric' } : { weekday: 'short', month: 'numeric', day: 'numeric' })}
+                                    {isToday && <span className="aware-calendar-today-pill">{isZh ? '今天' : 'Today'}</span>}
+                                </div>
+                                {items.length === 0 ? (
+                                    <div className="aware-calendar-empty">-</div>
+                                ) : items.slice(0, 3).map((trig: any) => (
+                                    <div key={trig.id} className="aware-calendar-event" data-tooltip={triggerTooltip(trig)} aria-label={triggerTooltip(trig)}>
+                                        {renderTriggerDot(!trig.is_enabled, trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
+                                        <span className="aware-calendar-event-body">
+                                            <span className="aware-calendar-event-title">{triggerTitle(trig)}</span>
+                                            <span className="aware-calendar-event-meta">{triggerMeta(trig)}</span>
+                                        </span>
+                                    </div>
+                                ))}
+                                {items.length > 3 && <div className="aware-calendar-more">+{items.length - 3}</div>}
+                            </div>
+                        );
+                    })}
+                </div>
+                {recurringTriggers.length > 0 && (
+                    <div className="aware-calendar-recurring">
+                        <div className="aware-side-subtitle">{isZh ? '重复计划' : 'Recurring'}</div>
+                        {recurringTriggers.slice(0, 6).map((trig: any) => (
+                            <div key={trig.id} className="aware-calendar-event recurring" data-tooltip={triggerTooltip(trig)} aria-label={triggerTooltip(trig)}>
+                                {renderTriggerDot(!trig.is_enabled, trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
+                                <span className="aware-calendar-event-body">
+                                    <span className="aware-calendar-event-title">{triggerTitle(trig)}</span>
+                                    <span className="aware-calendar-event-meta">{triggerMeta(trig)}</span>
+                                </span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
         );
         const reflectionPreview = (msg: any) => {
             if (!msg) return '';
@@ -4521,70 +5410,48 @@ function AgentDetailInner() {
         return (
             <div className="aware-side-preview">
                 <div className="aware-side-section">
-                    <div className="aware-side-section-title">{t('agent.aware.focus')}</div>
-                    {focusItems.length === 0 ? (
-                        <div className="aware-side-empty">{t('agent.aware.focusEmpty')}</div>
-                    ) : focusItems.slice(0, 12).map((item) => {
-                        const isExpanded = expandedFocus === item.id;
-                        const itemTriggers = triggersByFocus[item.name] || [];
-                        return (
-                            <div key={item.id} className={`aware-side-focus ${item.done ? 'done' : ''}`}>
-                                <button className="aware-side-focus-head" type="button" onClick={() => setExpandedFocus(isExpanded ? null : item.id)}>
-                                    <span
-                                        className={`aware-side-focus-marker ${item.done ? 'done' : item.inProgress ? 'active' : 'todo'}`}
-                                        aria-label={item.done ? t('agent.aware.completed') : item.inProgress ? t('agent.aware.inProgress') : t('agent.aware.focus')}
-                                    />
-                                    <div className="aware-side-trigger-main">
-                                        <div className="aware-side-item-title">{item.description || item.name}</div>
-                                        {item.description && <div className="aware-side-item-meta">{item.name}</div>}
-                                    </div>
-                                    <span className="aware-side-count">
-                                        {isZh ? `${itemTriggers.length} 个` : itemTriggers.length}
-                                    </span>
-                                    <span className={`aware-side-chevron ${isExpanded ? 'open' : ''}`}>▶</span>
-                                </button>
-                                {isExpanded && (
-                                    <div className="aware-side-nested">
-                                        {itemTriggers.length === 0 ? (
-                                            <div className="aware-side-empty compact">{t('agent.aware.noTriggers')}</div>
-                                        ) : itemTriggers.map((trig: any) => (
-                                            <div key={trig.id} className={`aware-side-trigger ${trig.is_enabled ? '' : 'done'}`}>
-                                                {renderCheck(trig.is_enabled ? 'todo' : 'done', trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
-                                                <div className="aware-side-trigger-main">
-                                                    <div className="aware-side-item-title">{formatTrigger(trig)}</div>
-                                                    <div className="aware-side-item-meta">{trig.reason || trig.type}</div>
-                                                </div>
-                                            </div>
-                                        ))}
-                                    </div>
-                                )}
-                            </div>
-                        );
-                    })}
-                </div>
-                <div className="aware-side-section">
-                    <div className="aware-side-section-title">{t('agent.aware.standaloneTriggers')}</div>
-                    {standaloneTriggers.length === 0 ? (
-                        <div className="aware-side-empty">{t('agent.aware.noTriggers')}</div>
-                    ) : standaloneTriggers.slice(0, 16).map((trig: any) => (
-                        <div key={trig.id} className={`aware-side-trigger ${trig.is_enabled ? '' : 'done'}`}>
-                            {renderCheck(trig.is_enabled ? 'todo' : 'done', trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
-                            <div className="aware-side-trigger-main">
-                                <div className="aware-side-item-title">{formatTrigger(trig)}</div>
-                                <div className="aware-side-item-meta">{trig.reason || trig.type}</div>
-                            </div>
+                    <div className="aware-side-title-row">
+                        <div className="aware-side-section-title">{t('agent.aware.focus')}</div>
+                        <div className="aware-view-switch">
                             <button
-                                className="btn btn-ghost"
-                                style={{ padding: '2px 7px', fontSize: '11px' }}
-                                onClick={async () => {
-                                    await triggerApi.update(id!, trig.id, { is_enabled: !trig.is_enabled });
-                                    refetchTriggers();
-                                }}
+                                type="button"
+                                className={`aware-view-button ${awareView === 'list' ? 'active' : ''}`}
+                                onClick={() => setAwareView('list')}
                             >
-                                {trig.is_enabled ? t('agent.aware.disable') : t('agent.aware.enable')}
+                                {isZh ? '列表' : 'List'}
+                            </button>
+                            <button
+                                type="button"
+                                className={`aware-view-button ${awareView === 'calendar' ? 'active' : ''}`}
+                                onClick={() => setAwareView('calendar')}
+                            >
+                                {isZh ? '日历' : 'Calendar'}
                             </button>
                         </div>
-                    ))}
+                    </div>
+                    {awareView === 'calendar' ? renderCalendar() : (
+                        displayFocusItems.length === 0 ? (
+                            <div className="aware-side-empty">{t('agent.aware.focusEmpty')}</div>
+                        ) : (
+                            <>
+                                {renderFocusGroup(isZh ? '进行中' : 'In progress', activeFocusItems)}
+                                {renderFocusGroup(isZh ? '系统 Focus' : 'System Focus', systemFocusItems)}
+                                {completedFocusItems.length > 0 && (
+                                    <div className="aware-side-focus-group">
+                                        <button
+                                            type="button"
+                                            className="aware-side-collapse"
+                                            onClick={() => setShowCompletedFocus(!showCompletedFocus)}
+                                        >
+                                            <span>{showCompletedFocus ? (isZh ? '收起已完成' : 'Hide completed') : (isZh ? `已完成 (${completedFocusItems.length})` : `Completed (${completedFocusItems.length})`)}</span>
+                                            <span className={`aware-side-chevron ${showCompletedFocus ? 'open' : ''}`}>▶</span>
+                                        </button>
+                                        {showCompletedFocus && completedFocusItems.slice(0, 12).map(renderFocusItem)}
+                                    </div>
+                                )}
+                            </>
+                        )
+                    )}
                 </div>
                 <div className="aware-side-section">
                     <div className="aware-side-section-title">{t('agent.aware.reflections')}</div>
@@ -4609,7 +5476,7 @@ function AgentDetailInner() {
                                 >
                                     <span className="aware-side-dot active" />
                                     <div className="aware-side-trigger-main">
-                                        <div className="aware-side-item-title">{trimLeadingPictograph(session.title || 'Trigger execution')}</div>
+                                        <div className="aware-side-item-title">{formatReflectionTitle(session.title, !!isZh)}</div>
                                         <div className="aware-side-item-meta">
                                             {new Date(session.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                                             {session.message_count > 0 ? ` · ${session.message_count}` : ''}
@@ -4621,15 +5488,54 @@ function AgentDetailInner() {
                                     <div className="aware-side-reflection-detail">
                                         {msgs.length === 0 ? (
                                             <div className="aware-side-empty compact">{isZh ? '正在加载...' : 'Loading...'}</div>
-                                        ) : msgs.slice(0, 6).map((msg: any, index: number) => (
-                                            <div key={index} className={`aware-side-reflection-message role-${msg.role}`}>
-                                                <span className="aware-side-reflection-role">{msg.role}</span>
-                                                <span className="aware-side-reflection-text">{reflectionPreview(msg).slice(0, 180)}</span>
-                                            </div>
-                                        ))}
-                                        {msgs.length > 6 && (
-                                            <div className="aware-side-empty compact">{isZh ? `还有 ${msgs.length - 6} 条消息` : `${msgs.length - 6} more messages`}</div>
-                                        )}
+                                        ) : msgs.map((msg: any, index: number) => {
+                                            const isTool = msg.role === 'tool_call' || msg.role === 'tool_result';
+                                            const toolName = isTool
+                                                ? (msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'tool')
+                                                : '';
+                                            const toolArgs = isTool
+                                                ? (msg.toolArgs || (() => { try { return JSON.parse(msg.content || '{}').args; } catch { return {}; } })())
+                                                : null;
+                                            const toolResult = isTool ? (msg.toolResult || '') : '';
+                                            const argsText = typeof toolArgs === 'string' ? toolArgs : JSON.stringify(toolArgs || {}, null, 2);
+                                            const resultText = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult, null, 2);
+                                            const body = String(msg.content || '');
+                                            return (
+                                                <details key={index} className={`aware-side-reflection-message role-${msg.role}`}>
+                                                    <summary style={{ display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer', listStyle: 'none' } as any}>
+                                                        <span className="aware-side-reflection-role">{msg.role}</span>
+                                                        <span className="aware-side-reflection-text">{reflectionPreview(msg).slice(0, 180)}</span>
+                                                    </summary>
+                                                    <div style={{
+                                                        marginTop: '6px',
+                                                        paddingTop: '6px',
+                                                        borderTop: '1px solid var(--border-subtle)',
+                                                        whiteSpace: 'pre-wrap',
+                                                        maxHeight: '260px',
+                                                        overflow: 'auto',
+                                                        fontFamily: isTool ? 'monospace' : undefined,
+                                                        fontSize: isTool ? '10px' : '11px',
+                                                        lineHeight: 1.5,
+                                                        color: 'var(--text-secondary)',
+                                                    }}>
+                                                        {isTool ? (
+                                                            <>
+                                                                <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{toolName}</div>
+                                                                <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{isZh ? '参数' : 'Arguments'}</div>
+                                                                {argsText || '{}'}
+                                                                {resultText && (
+                                                                    <>
+                                                                        <div style={{ borderTop: '1px dashed var(--border-subtle)', margin: '8px 0', opacity: 0.5 }} />
+                                                                        <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{isZh ? '结果' : 'Result'}</div>
+                                                                        {resultText}
+                                                                    </>
+                                                                )}
+                                                            </>
+                                                        ) : body}
+                                                    </div>
+                                                </details>
+                                            );
+                                        })}
                                     </div>
                                 )}
                             </div>
@@ -4644,65 +5550,65 @@ function AgentDetailInner() {
         <>
             <div className={`agent-detail-page ${activeTab === 'chat' ? 'agent-detail-page--chat' : 'agent-detail-page--settings'}`}>
                 {/* Header */}
-                <div className="page-header agent-detail-header">
-                    {activeTab === 'chat' ? <div
-                        className="agent-detail-identity agent-detail-identity--compact"
-                        onMouseEnter={clearCardCloseTimer}
-                        onMouseLeave={scheduleCardClose}
-                    >
-                        <div className="agent-detail-identity-trigger">
-                        <div className="agent-detail-avatar">{(Array.from(agent.name || 'A')[0] as string || 'A').toUpperCase()}</div>
-                        <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
-                            {canManage && editingName ? (
-                                <input
-                                    className="page-title"
-                                    autoFocus
-                                    value={nameInput}
-                                    onChange={e => setNameInput(e.target.value)}
-                                    onBlur={async () => {
-                                        setEditingName(false);
-                                        if (nameInput.trim() && nameInput !== agent.name) {
-                                            await agentApi.update(id!, { name: nameInput.trim() } as any);
-                                            queryClient.invalidateQueries({ queryKey: ['agent', id] });
-                                        } else {
-                                            setNameInput(agent.name);
-                                        }
-                                    }}
-                                    onKeyDown={async e => {
-                                        if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
-                                        if (e.key === 'Escape') { setEditingName(false); setNameInput(agent.name); }
-                                    }}
-                                    style={{
-                                        background: 'var(--bg-elevated)', border: '1px solid var(--accent-primary)',
-                                        borderRadius: '6px', color: 'var(--text-primary)',
-                                        padding: '4px 10px', minWidth: '320px', width: 'auto', outline: 'none',
-                                        marginBottom: '0', display: 'block',
-                                    }}
-                                />
-                            ) : (
-                                <h1 className="page-title"
-                                    title={canManage ? "Click to edit name" : undefined}
-                                    onClick={() => { if (canManage) { setNameInput(agent.name); setEditingName(true); } }}
-                                    style={{ cursor: canManage ? 'text' : 'default', borderBottom: canManage ? '1px dashed transparent' : 'none', display: 'inline-block', marginBottom: '0' }}
-                                    onMouseEnter={e => { if (canManage) e.currentTarget.style.borderBottomColor = 'var(--text-tertiary)'; }}
-                                    onMouseLeave={e => { if (canManage) e.currentTarget.style.borderBottomColor = 'transparent'; }}
-                                >
-                                    {agent.name}
-                                </h1>
-                            )}
-                        </div>
-                        <button
-                            className={`agent-info-chevron${infoCardOpen ? ' agent-info-chevron--open' : ''}`}
-                            onClick={e => { e.stopPropagation(); setInfoCardOpen(prev => !prev); }}
-                            aria-label="Toggle agent info"
+                {activeTab === 'chat' && (
+                    <div className="page-header agent-detail-header">
+                        <div
+                            className="agent-detail-identity agent-detail-identity--compact"
+                            onMouseEnter={clearCardCloseTimer}
+                            onMouseLeave={scheduleCardClose}
                         >
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
-                        </button>
+                            <div className="agent-detail-identity-trigger">
+                            <div className="agent-detail-avatar">{(Array.from(agent.name || 'A')[0] as string || 'A').toUpperCase()}</div>
+                            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+                                {canManage && editingName ? (
+                                    <input
+                                        className="page-title"
+                                        autoFocus
+                                        value={nameInput}
+                                        onChange={e => setNameInput(e.target.value)}
+                                        onBlur={async () => {
+                                            setEditingName(false);
+                                            if (nameInput.trim() && nameInput !== agent.name) {
+                                                await agentApi.update(id!, { name: nameInput.trim() } as any);
+                                                queryClient.invalidateQueries({ queryKey: ['agent', id] });
+                                            } else {
+                                                setNameInput(agent.name);
+                                            }
+                                        }}
+                                        onKeyDown={async e => {
+                                            if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                                            if (e.key === 'Escape') { setEditingName(false); setNameInput(agent.name); }
+                                        }}
+                                        style={{
+                                            background: 'var(--bg-elevated)', border: '1px solid var(--accent-primary)',
+                                            borderRadius: '6px', color: 'var(--text-primary)',
+                                            padding: '4px 10px', minWidth: '320px', width: 'auto', outline: 'none',
+                                            marginBottom: '0', display: 'block',
+                                        }}
+                                    />
+                                ) : (
+                                    <h1 className="page-title"
+                                        title={canManage ? "Click to edit name" : undefined}
+                                        onClick={() => { if (canManage) { setNameInput(agent.name); setEditingName(true); } }}
+                                        style={{ cursor: canManage ? 'text' : 'default', borderBottom: canManage ? '1px dashed transparent' : 'none', display: 'inline-block', marginBottom: '0' }}
+                                        onMouseEnter={e => { if (canManage) e.currentTarget.style.borderBottomColor = 'var(--text-tertiary)'; }}
+                                        onMouseLeave={e => { if (canManage) e.currentTarget.style.borderBottomColor = 'transparent'; }}
+                                    >
+                                        {agent.name}
+                                    </h1>
+                                )}
+                            </div>
+                            <button
+                                className={`agent-info-chevron${infoCardOpen ? ' agent-info-chevron--open' : ''}`}
+                                onClick={e => { e.stopPropagation(); setInfoCardOpen(prev => !prev); }}
+                                aria-label="Toggle agent info"
+                            >
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                            </button>
+                            </div>
+                            {renderAgentInfoCard()}
                         </div>
-                        {renderAgentInfoCard()}
-                    </div> : <div />}
-                    <div className="agent-detail-actions">
-                        {activeTab === 'chat' && (
+                        <div className="agent-detail-actions">
                             <>
                                 <button
                                     className={`btn btn-ghost agent-top-action ${livePanelVisible && sidePanelTab === 'workspace' ? 'active' : ''}`}
@@ -4728,18 +5634,18 @@ function AgentDetailInner() {
                                     <span>{t('agent.tabs.settings')}</span>
                                 </button>
                             </>
-                        )}
-                        {activeTab === 'chat' && (agent as any)?.agent_type !== 'openclaw' && (
-                            <>
+                            {(agent as any)?.agent_type !== 'openclaw' && (
+                                <>
                                 {agent.status === 'stopped' ? (
                                     <button className="btn btn-secondary" onClick={async () => { await agentApi.start(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.start')}</button>
                                 ) : agent.status === 'running' ? (
                                     <button className="btn btn-secondary" onClick={async () => { await agentApi.stop(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.stop')}</button>
                                 ) : null}
-                            </>
-                        )}
+                                </>
+                            )}
+                        </div>
                     </div>
-                </div>
+                )}
 
                 {/* Tabs */}
                 {activeTab !== 'chat' && <div className="tabs">
@@ -4962,9 +5868,9 @@ function AgentDetailInner() {
 
                 {/* ── Aware Tab ── */}
                 {activeTab === 'aware' && (() => {
-                    // Parse focus.md into focus items with multi-line descriptions
-                    const raw = focusFile?.content || '';
-                    const focusItems = parseFocusItems(raw);
+                    // Structured Focus items from the backend database
+                    const focusItems = focusRecords.map(focusItemFromApi);
+                    const isZh = i18n.language?.startsWith('zh');
 
                     // Helper: convert trigger config to natural language
                     const triggerToHuman = (trig: any): string => {
@@ -5035,21 +5941,24 @@ function AgentDetailInner() {
 
                     // Group triggers by focus_ref
                     const triggersByFocus: Record<string, any[]> = {};
-                    const standaloneTriggers: any[] = [];
+                    const focusNames = new Set(focusItems.map((item) => item.name));
                     for (const trig of awareTriggers) {
-                        if (trig.focus_ref && focusItems.some(f => f.name === trig.focus_ref)) {
+                        if (trig.focus_ref && focusNames.has(trig.focus_ref)) {
                             if (!triggersByFocus[trig.focus_ref]) triggersByFocus[trig.focus_ref] = [];
                             triggersByFocus[trig.focus_ref].push(trig);
                         } else {
-                            standaloneTriggers.push(trig);
+                            const synthetic = synthesizeFocusForTrigger(trig);
+                            if (!triggersByFocus[synthetic.name]) triggersByFocus[synthetic.name] = [];
+                            triggersByFocus[synthetic.name].push(trig);
                         }
                     }
+                    const displayFocusItems = focusItems;
 
                     // Group activity logs by trigger name -> focus_ref
                     const triggerLogsByFocus: Record<string, any[]> = {};
                     const triggerNameToFocus: Record<string, string> = {};
                     for (const trig of awareTriggers) {
-                        if (trig.focus_ref) triggerNameToFocus[trig.name] = trig.focus_ref;
+                        triggerNameToFocus[trig.name] = trig.focus_ref || focusKeyFromTrigger(trig);
                     }
                     const triggerRelatedLogs = activityLogs.filter((log: any) =>
                         log.action_type === 'trigger_fired' || log.action_type === 'trigger_created' ||
@@ -5073,23 +5982,25 @@ function AgentDetailInner() {
                         }
                     }
 
-                    const hasFocusItems = focusItems.length > 0;
-                    const hasStandalone = standaloneTriggers.length > 0;
+                    const hasFocusItems = displayFocusItems.length > 0;
 
                     // Split focus items: active first, completed separately
-                    const activeFocusItems = focusItems.filter(f => !f.done);
-                    const completedFocusItems = focusItems.filter(f => f.done);
+                    const activeFocusItems = displayFocusItems.filter(f => !f.done && !f.system);
+                    const systemFocusItems = displayFocusItems.filter(f => !f.done && f.system);
+                    const completedFocusItems = displayFocusItems.filter(f => f.done);
                     const visibleActiveFocus = showAllFocus ? activeFocusItems : activeFocusItems.slice(0, SECTION_PAGE_SIZE);
                     const hiddenActiveCount = activeFocusItems.length - visibleActiveFocus.length;
+                    const renderTriggerDot = (done: boolean, label: string) => (
+                        <span className={`aware-side-status-dot ${done ? 'done' : 'active'}`} aria-label={label} />
+                    );
 
                     // Render a focus item row
-                    const renderFocusItem = (item: typeof focusItems[0]) => {
-                        const isExpanded = expandedFocus === item.id;
+                    const renderFocusItem = (item: FocusItem) => {
+                        const isExpanded = expandedFocusIds.has(item.id);
                         const itemTriggers = triggersByFocus[item.name] || [];
                         const itemLogs = triggerLogsByFocus[item.name] || [];
                         const displayTitle = item.description || item.name;
                         const displaySubtitle = item.description ? item.name : null;
-                        const focusState = item.done ? 'done' : item.inProgress ? 'active' : 'todo';
 
                         return (
                             <div key={item.id} style={{
@@ -5102,7 +6013,7 @@ function AgentDetailInner() {
                             }}>
                                 {/* Focus Item Header */}
                                 <div
-                                    onClick={() => setExpandedFocus(isExpanded ? null : item.id)}
+                                    onClick={() => toggleExpandedFocus(item.id)}
                                     style={{
                                         padding: '12px 16px',
                                         display: 'flex',
@@ -5114,17 +6025,23 @@ function AgentDetailInner() {
                                     onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-secondary)')}
                                     onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
                                 >
-                                    <span
-                                        className={`aware-side-focus-marker ${focusState}`}
-                                        style={{ marginTop: '2px' }}
-                                        aria-label={focusState === 'done' ? t('agent.aware.completed') : focusState === 'active' ? t('agent.aware.inProgress') : t('agent.aware.focus')}
-                                    />
                                     <div style={{ flex: 1, minWidth: 0 }}>
                                         <div style={{
                                             fontSize: '13px', fontWeight: 500, lineHeight: '20px',
                                             textDecoration: item.done ? 'line-through' : 'none',
                                             color: item.done ? 'var(--text-tertiary)' : 'var(--text-primary)',
-                                        }}>{displayTitle}</div>
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '8px',
+                                            flexWrap: 'wrap',
+                                        }}>
+                                            <span>{displayTitle}</span>
+                                            {item.done && (
+                                                <span className="aware-side-focus-badge done">
+                                                    {t('agent.aware.completed')}
+                                                </span>
+                                            )}
+                                        </div>
                                         {displaySubtitle && (
                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', fontFamily: 'monospace', marginTop: '2px' }}>
                                                 {displaySubtitle}
@@ -5164,9 +6081,7 @@ function AgentDetailInner() {
                                                         borderRadius: '6px', background: 'var(--bg-secondary)',
                                                         opacity: trig.is_enabled ? 1 : 0.5,
                                                     }}>
-                                                        <span className={`aware-side-check ${trig.is_enabled ? 'todo' : 'done'}`}>
-                                                            {trig.is_enabled ? '' : '✓'}
-                                                        </span>
+                                                        {renderTriggerDot(!trig.is_enabled, trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
                                                         <div style={{ flex: 1 }}>
                                                             <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-primary)' }}>
                                                                 {triggerToHuman(trig)}
@@ -5179,19 +6094,11 @@ function AgentDetailInner() {
                                                         <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>
                                                             {t('agent.aware.fired', { count: trig.fire_count })}
                                                         </span>
-                                                        {!trig.is_enabled && (
-                                                            <span style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>{t('agent.aware.disabled')}</span>
-                                                        )}
+                                                        <span style={{ fontSize: '10px', color: trig.is_enabled ? 'var(--accent-primary)' : 'var(--success, #10b981)' }}>
+                                                            {trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed')}
+                                                        </span>
                                                         <div style={{ display: 'flex', gap: '4px' }}>
-                                                            <button className="btn btn-ghost" style={{ padding: '2px 6px', fontSize: '11px' }}
-                                                                onClick={async (e) => {
-                                                                    e.stopPropagation();
-                                                                    await triggerApi.update(id!, trig.id, { is_enabled: !trig.is_enabled });
-                                                                    refetchTriggers();
-                                                                }}>
-                                                                {trig.is_enabled ? t('agent.aware.disable') : t('agent.aware.enable')}
-                                                            </button>
-                                                            <button className="btn btn-ghost" style={{ padding: '2px 6px', fontSize: '11px', color: 'var(--error)' }}
+                                                            {!trig.is_system && <button className="btn btn-ghost" style={{ padding: '2px 6px', fontSize: '11px', color: 'var(--error)' }}
                                                                 onClick={async (e) => {
                                                                     e.stopPropagation();
                                                                     const ok = await dialog.confirm(t('agent.aware.deleteTriggerConfirm', { name: trig.name }), { title: '删除触发器', danger: true, confirmLabel: '删除' });
@@ -5201,7 +6108,7 @@ function AgentDetailInner() {
                                                                     }
                                                                 }}>
                                                                 {t('common.delete', 'Delete')}
-                                                            </button>
+                                                            </button>}
                                                         </div>
                                                     </div>
                                                 ))}
@@ -5262,8 +6169,8 @@ function AgentDetailInner() {
                                     {hasFocusItems && (
                                         <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
                                             {i18n.language?.startsWith('zh')
-                                                ? `${activeFocusItems.length} 个进行中${completedFocusItems.length > 0 ? ` · ${completedFocusItems.length} 个已完成` : ''}`
-                                                : `${activeFocusItems.length} active${completedFocusItems.length > 0 ? ` · ${completedFocusItems.length} done` : ''}`}
+                                                ? `${activeFocusItems.length} 个进行中${systemFocusItems.length > 0 ? ` · ${systemFocusItems.length} 个系统` : ''}${completedFocusItems.length > 0 ? ` · ${completedFocusItems.length} 个已完成` : ''}`
+                                                : `${activeFocusItems.length} active${systemFocusItems.length > 0 ? ` · ${systemFocusItems.length} system` : ''}${completedFocusItems.length > 0 ? ` · ${completedFocusItems.length} done` : ''}`}
                                         </span>
                                     )}
                                 </div>
@@ -5289,6 +6196,16 @@ function AgentDetailInner() {
                                     >
                                         {t('agent.aware.showLess')}
                                     </button>
+                                )}
+
+                                {/* System Focus Items */}
+                                {systemFocusItems.length > 0 && (
+                                    <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--border-subtle)' }}>
+                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', fontWeight: 600, marginBottom: '6px' }}>
+                                            {i18n.language?.startsWith('zh') ? '系统 Focus' : 'System Focus'}
+                                        </div>
+                                        {systemFocusItems.map(renderFocusItem)}
+                                    </div>
                                 )}
 
                                 {/* Completed Focus Items — auto-collapsed */}
@@ -5323,88 +6240,6 @@ function AgentDetailInner() {
                                     </div>
                                 )}
                             </div>
-                            {/* ── Standalone Triggers Card ── */}
-                            {hasStandalone && (
-                                <div className="card" style={{ marginBottom: '16px', padding: '16px' }}>
-                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                                        <div>
-                                            <h4 style={{ margin: 0, fontSize: '14px', fontWeight: 600 }}>{t('agent.aware.standaloneTriggers')}</h4>
-                                        </div>
-                                        <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                            {i18n.language?.startsWith('zh')
-                                                ? `${standaloneTriggers.length} 个触发器`
-                                                : `${standaloneTriggers.length} trigger${standaloneTriggers.length > 1 ? 's' : ''}`}
-                                        </span>
-                                    </div>
-                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                                        {[...standaloneTriggers].sort((a: any, b: any) => (b.is_enabled ? 1 : 0) - (a.is_enabled ? 1 : 0)).slice(0, showAllTriggers ? undefined : SECTION_PAGE_SIZE).map((trig: any) => (
-                                            <div key={trig.id} style={{
-                                                padding: '10px 14px', borderRadius: '8px',
-                                                border: '1px solid var(--border-subtle)',
-                                                display: 'flex', alignItems: 'center', gap: '10px',
-                                                opacity: trig.is_enabled ? 1 : 0.5,
-                                                background: 'var(--bg-primary)',
-                                            }}>
-                                                <span className={`aware-side-check ${trig.is_enabled ? 'todo' : 'done'}`}>
-                                                    {trig.is_enabled ? '' : '✓'}
-                                                </span>
-                                                <div style={{ flex: 1 }}>
-                                                    <div style={{ fontSize: '13px', fontWeight: 500 }}>{triggerToHuman(trig)}</div>
-                                                    {triggerReasonText(trig) && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{triggerReasonText(trig)}</div>}
-                                                    <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', fontFamily: 'monospace', marginTop: '2px' }}>
-                                                        {trig.name}{trig.type === 'cron' ? ` · ${trig.config?.expr}` : ''}
-                                                    </div>
-                                                </div>
-                                                <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>
-                                                    {t('agent.aware.fired', { count: trig.fire_count })}
-                                                </span>
-                                                {!trig.is_enabled && (
-                                                    <span style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>{t('agent.aware.disabled')}</span>
-                                                )}
-                                                <div style={{ display: 'flex', gap: '4px' }}>
-                                                    <button className="btn btn-ghost" style={{ padding: '2px 6px', fontSize: '11px' }}
-                                                        onClick={async () => {
-                                                            await triggerApi.update(id!, trig.id, { is_enabled: !trig.is_enabled });
-                                                            refetchTriggers();
-                                                        }}>
-                                                        {trig.is_enabled ? t('agent.aware.disable') : t('agent.aware.enable')}
-                                                    </button>
-                                                    <button className="btn btn-ghost" style={{ padding: '2px 6px', fontSize: '11px', color: 'var(--error)' }}
-                                                        onClick={async () => {
-                                                            const ok = await dialog.confirm(t('agent.aware.deleteTriggerConfirm', { name: trig.name }), { title: '删除触发器', danger: true, confirmLabel: '删除' });
-                                                            if (ok) {
-                                                                await triggerApi.delete(id!, trig.id);
-                                                                refetchTriggers();
-                                                            }
-                                                        }}>
-                                                        {t('common.delete', 'Delete')}
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        ))}
-                                    </div>
-                                    {standaloneTriggers.length > SECTION_PAGE_SIZE && (
-                                        <button
-                                            onClick={(e) => { const collapse = showAllTriggers; setShowAllTriggers(!showAllTriggers); if (collapse) e.currentTarget.closest('.card')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); }}
-                                            className="btn btn-ghost"
-                                            style={{ width: '100%', fontSize: '12px', color: 'var(--text-tertiary)', padding: '8px', marginTop: '4px' }}
-                                        >
-                                            {showAllTriggers
-                                                ? (i18n.language?.startsWith('zh') ? '收起' : 'Show less')
-                                                : (i18n.language?.startsWith('zh') ? `显示更多 ${standaloneTriggers.length - SECTION_PAGE_SIZE} 项...` : `Show ${standaloneTriggers.length - SECTION_PAGE_SIZE} more...`)
-                                            }
-                                        </button>
-                                    )}
-                                </div>
-                            )}
-
-                            {/* Raw markdown toggle */}
-                            {raw && (
-                                <details style={{ marginTop: '4px', marginBottom: '16px' }}>
-                                    <summary style={{ fontSize: '11px', color: 'var(--text-tertiary)', cursor: 'pointer' }}>{t('agent.aware.viewRawMarkdown')}</summary>
-                                    <pre style={{ fontSize: '11px', marginTop: '8px', padding: '12px', background: 'var(--bg-secondary)', borderRadius: '6px', whiteSpace: 'pre-wrap', maxHeight: '300px', overflow: 'auto' }}>{raw}</pre>
-                                </details>
-                            )}
 
                             {reflectionSessions.length > 0 && (() => {
                                 const totalPages = Math.ceil(reflectionSessions.length / REFLECTIONS_PAGE_SIZE);
@@ -5455,7 +6290,7 @@ function AgentDetailInner() {
                                                             }} />
                                                             <div style={{ flex: 1, minWidth: 0 }}>
                                                                 <div style={{ fontSize: '12px', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                                    {trimLeadingPictograph(session.title || 'Trigger execution')}
+                                                                    {formatReflectionTitle(session.title, !!isZh)}
                                                                 </div>
                                                                 <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '1px' }}>
                                                                     {new Date(session.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
@@ -5481,19 +6316,16 @@ function AgentDetailInner() {
                                                                                 const tResult = msg.toolResult || '';
                                                                                 const argsStr = typeof tArgs === 'string' ? tArgs : JSON.stringify(tArgs || {}, null, 2);
                                                                                 const resultStr = typeof tResult === 'string' ? tResult : JSON.stringify(tResult, null, 2);
-                                                                                const hasDetail = argsStr.length > 60 || resultStr;
-                                                                                const Tag = hasDetail ? 'details' : 'div';
-                                                                                const HeaderTag = hasDetail ? 'summary' : 'div';
                                                                                 return (
-                                                                                    <Tag key={mi} style={{ borderRadius: '6px', background: 'var(--bg-secondary)', overflow: 'hidden' }}>
-                                                                                        <HeaderTag style={{
+                                                                                    <details key={mi} style={{ borderRadius: '6px', background: 'var(--bg-secondary)', overflow: 'hidden' }}>
+                                                                                        <summary style={{
                                                                                             padding: '5px 10px',
-                                                                                            fontSize: '11px', cursor: hasDetail ? 'pointer' : 'default',
+                                                                                            fontSize: '11px', cursor: 'pointer',
                                                                                             display: 'flex', alignItems: 'center', gap: '8px',
                                                                                             listStyle: 'none',
                                                                                             WebkitAppearance: 'none',
                                                                                         } as any}>
-                                                                                            {hasDetail && <span style={{ fontSize: '8px', color: 'var(--text-tertiary)', flexShrink: 0 }}>&#9654;</span>}
+                                                                                            <span style={{ fontSize: '8px', color: 'var(--text-tertiary)', flexShrink: 0 }}>&#9654;</span>
                                                                                             <span style={{
                                                                                                 fontWeight: 600, fontSize: '10px', color: 'var(--text-primary)',
                                                                                                 padding: '1px 6px', borderRadius: '3px',
@@ -5506,24 +6338,24 @@ function AgentDetailInner() {
                                                                                             }}>
                                                                                                 {argsStr.replace(/\n/g, ' ').substring(0, 60)}{argsStr.length > 60 ? '...' : ''}
                                                                                             </span>
-                                                                                        </HeaderTag>
-                                                                                        {hasDetail && (
-                                                                                            <div style={{
-                                                                                                padding: '8px 10px', borderTop: '1px solid var(--border-subtle)',
-                                                                                                fontFamily: 'monospace', fontSize: '10px', lineHeight: 1.5,
-                                                                                                whiteSpace: 'pre-wrap', maxHeight: '200px', overflow: 'auto',
-                                                                                                color: 'var(--text-secondary)',
-                                                                                            }}>
-                                                                                                {argsStr}
-                                                                                                {resultStr && (
-                                                                                                    <>
-                                                                                                        <div style={{ borderTop: '1px dashed var(--border-subtle)', margin: '6px 0', opacity: 0.5 }} />
-                                                                                                        <span style={{ color: 'var(--text-tertiary)' }}>→ </span>{resultStr.substring(0, 500)}
-                                                                                                    </>
-                                                                                                )}
-                                                                                            </div>
-                                                                                        )}
-                                                                                    </Tag>
+                                                                                        </summary>
+                                                                                        <div style={{
+                                                                                            padding: '8px 10px', borderTop: '1px solid var(--border-subtle)',
+                                                                                            fontFamily: 'monospace', fontSize: '10px', lineHeight: 1.5,
+                                                                                            whiteSpace: 'pre-wrap', maxHeight: '260px', overflow: 'auto',
+                                                                                            color: 'var(--text-secondary)',
+                                                                                        }}>
+                                                                                            <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{isZh ? '参数' : 'Arguments'}</div>
+                                                                                            {argsStr || '{}'}
+                                                                                            {resultStr && (
+                                                                                                <>
+                                                                                                    <div style={{ borderTop: '1px dashed var(--border-subtle)', margin: '8px 0', opacity: 0.5 }} />
+                                                                                                    <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{isZh ? '结果' : 'Result'}</div>
+                                                                                                    {resultStr.substring(0, 1000)}
+                                                                                                </>
+                                                                                            )}
+                                                                                        </div>
+                                                                                    </details>
                                                                                 );
                                                                             }
                                                                             if (msg.role === 'tool_result') {
@@ -6691,9 +7523,7 @@ function AgentDetailInner() {
                                                 <ModelSwitcher
                                                     value={overrideModelId}
                                                     onChange={handleModelChange}
-                                                    /* "默认" badge tracks the
-                                                       agent's saved default. */
-                                                    tenantDefaultId={agent?.primary_model_id || null}
+                                                    tenantDefaultId={myTenant?.default_model_id || null}
                                                     disabled={!wsConnected}
                                                 />
                                                 <div style={{ flex: 1 }} />
@@ -7113,7 +7943,7 @@ function AgentDetailInner() {
                                                     <option value="">--</option>
                                                     {llmModels.filter((m: any) => m.enabled || m.id === settingsForm.primary_model_id).map((m: any) => (
                                                         <option key={m.id} value={m.id}>
-                                                            {m.label} ({m.provider}/{m.model}){!m.enabled ? ` [${t('enterprise.llm.disabled', 'Disabled')}]` : ''}
+                                                            {m.label || m.model}
                                                         </option>
                                                     ))}
                                                 </select>
@@ -7135,7 +7965,7 @@ function AgentDetailInner() {
                                                     <option value="">--</option>
                                                     {llmModels.filter((m: any) => m.enabled || m.id === settingsForm.fallback_model_id).map((m: any) => (
                                                         <option key={m.id} value={m.id}>
-                                                            {m.label} ({m.provider}/{m.model}){!m.enabled ? ` [${t('enterprise.llm.disabled', 'Disabled')}]` : ''}
+                                                            {m.label || m.model}
                                                         </option>
                                                     ))}
                                                 </select>
@@ -7384,196 +8214,12 @@ function AgentDetailInner() {
                                 </div>}
 
                                 {/* Permission Management */}
-                                {(() => {
-                                    const scopeLabels: Record<string, React.ReactNode> = {
-                                        company: <><IconBuilding size={14} stroke={1.8} /> {t('agent.settings.perm.companyWide', 'Company-wide')}</>,
-                                        specific: <><IconUser size={14} stroke={1.8} /> {t('agent.settings.perm.specificUsers', 'Specific users')}</>,
-                                        user: <><IconUser size={14} stroke={1.8} /> {t('agent.settings.perm.onlyMe', 'Only Me')}</>,
-                                    };
-
-                                    const savePermissions = async (scopeType: string, scopeIds: string[], accessLevel?: string) => {
-                                        try {
-                                            await fetchAuth(`/agents/${id}/permissions`, {
-                                                method: 'PUT',
-                                                headers: { 'Content-Type': 'application/json' },
-                                                body: JSON.stringify({
-                                                    scope_type: scopeType,
-                                                    scope_ids: scopeIds,
-                                                    access_level: accessLevel ?? permData?.access_level ?? 'use',
-                                                }),
-                                            });
-                                            queryClient.invalidateQueries({ queryKey: ['agent-permissions', id] });
-                                            queryClient.invalidateQueries({ queryKey: ['agent', id] });
-                                        } catch (e) {
-                                            console.error('Failed to update permissions', e);
-                                        }
-                                    };
-
-                                    const canManagePermissions = permData?.can_manage ?? canManage;
-                                    // Backend `update_agent_permissions` (agents.py:603-606) auto-fills
-                                    // scope_ids with [creator_id] when frontend sends scope_ids=[] for
-                                    // scope_type='user'. So GET returns scope_ids=[creator_id] for both
-                                    // "Only Me" and "Specific users (just self)" — we treat the
-                                    // creator-only case as "Only Me" so radios stay clickable.
-                                    const creatorId = (agent as any)?.creator_id;
-                                    const scopeIdsLen = permData?.scope_ids?.length ?? 0;
-                                    const onlyCreatorScope = scopeIdsLen === 0
-                                        || (scopeIdsLen === 1 && permData?.scope_ids?.[0] === creatorId);
-                                    const resolvedScope = permData?.scope_type === 'user' && !onlyCreatorScope
-                                        ? 'specific'
-                                        : (permData?.scope_type || 'company');
-                                    const currentScope = permEditScope || resolvedScope;
-                                    const currentAccessLevel = permData?.access_level || 'use';
-
-                                    const handleScopeChange = async (newScope: string) => {
-                                        if (newScope === 'specific') {
-                                            setPermEditScope('specific');
-                                            setPermEditUserIds(permData?.scope_ids?.length ? permData.scope_ids : []);
-                                            return;
-                                        }
-                                        setPermEditScope(null);
-                                        setPermEditUserIds([]);
-                                        await savePermissions(newScope, []);
-                                    };
-
-                                    const handleSaveSpecific = async () => {
-                                        const me = useAuthStore.getState().user;
-                                        const ids = permEditUserIds.length > 0 ? permEditUserIds : (me?.id ? [me.id] : []);
-                                        await savePermissions('user', ids);
-                                        setPermEditScope(null);
-                                    };
-
-                                    const handleAccessLevelChange = async (newLevel: string) => {
-                                        const ids = currentScope === 'specific'
-                                            ? (permData?.scope_ids ?? [])
-                                            : [];
-                                        await savePermissions(currentScope === 'specific' ? 'user' : currentScope, ids, newLevel);
-                                    };
-
-                                    return (
-                                        <div className="card" style={{ marginBottom: '12px' }}>
-                                            <h4 style={{ marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}><IconLock size={16} stroke={1.8} /> {t('agent.settings.perm.title', 'Access Permissions')}</h4>
-                                            <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '16px' }}>
-                                                {t('agent.settings.perm.description', 'Control who can see and interact with this agent. Only the creator or admin can change this.')}
-                                            </p>
-
-                                            {/* Scope Selection */}
-                                            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '16px' }}>
-                                                {(['company', 'specific', 'user'] as const).map((scope) => (
-                                                    <label
-                                                        key={scope}
-                                                        style={{
-                                                            display: 'flex',
-                                                            alignItems: 'center',
-                                                            gap: '10px',
-                                                            padding: '12px 14px',
-                                                            borderRadius: '8px',
-                                                            cursor: canManagePermissions ? 'pointer' : 'default',
-                                                            border: currentScope === scope
-                                                                ? '1px solid var(--accent-primary)'
-                                                                : '1px solid var(--border-subtle)',
-                                                            background: currentScope === scope
-                                                                ? 'rgba(99,102,241,0.06)'
-                                                                : 'transparent',
-                                                            opacity: canManagePermissions ? 1 : 0.7,
-                                                            transition: 'all 0.15s',
-                                                        }}
-                                                    >
-                                                        <input
-                                                            type="radio"
-                                                            name="perm_scope"
-                                                            checked={currentScope === scope}
-                                                            disabled={!canManagePermissions}
-                                                            onChange={() => handleScopeChange(scope)}
-                                                            style={{ accentColor: 'var(--accent-primary)' }}
-                                                        />
-                                                        <div>
-                                                            <div style={{ fontWeight: 500, fontSize: '13px', display: 'flex', alignItems: 'center', gap: '5px' }}>{scopeLabels[scope]}</div>
-                                                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
-                                                                {scope === 'company' && t('agent.settings.perm.companyWideDesc', 'All users in the organization can use this agent')}
-                                                                {scope === 'specific' && t('agent.settings.perm.specificUsersDesc', 'Select specific people from your company')}
-                                                                {scope === 'user' && t('agent.settings.perm.onlyMeDesc', 'Only the creator can use this agent')}
-                                                            </div>
-                                                        </div>
-                                                    </label>
-                                                ))}
-                                            </div>
-
-                                            {/* Access Level for company scope */}
-                                            {currentScope === 'company' && canManagePermissions && (
-                                                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}>
-                                                    <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '8px' }}>
-                                                        {t('agent.settings.perm.defaultAccess', 'Default Access Level')}
-                                                    </label>
-                                                    <div style={{ display: 'flex', gap: '8px' }}>
-                                                        {[{ val: 'use', label: <><IconEye size={13} stroke={1.8} /> {t('agent.settings.perm.useAccess', 'Use')}</>, desc: t('agent.settings.perm.useAccessDesc', 'Task, Chat, Tools, Skills, Workspace') },
-                                                        { val: 'manage', label: <><IconSettings size={13} stroke={1.8} /> {t('agent.settings.perm.manageAccess', 'Manage')}</>, desc: t('agent.settings.perm.manageAccessDesc', 'Full access including Settings, Mind, Relationships') }].map(opt => (
-                                                            <label key={opt.val}
-                                                                style={{
-                                                                    flex: 1,
-                                                                    padding: '10px 12px',
-                                                                    borderRadius: '8px',
-                                                                    cursor: 'pointer',
-                                                                    border: currentAccessLevel === opt.val
-                                                                        ? '1px solid var(--accent-primary)'
-                                                                        : '1px solid var(--border-subtle)',
-                                                                    background: currentAccessLevel === opt.val
-                                                                        ? 'rgba(99,102,241,0.06)'
-                                                                        : 'transparent',
-                                                                    transition: 'all 0.15s',
-                                                                }}
-                                                            >
-                                                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                                                    <input type="radio" name="access_level" checked={currentAccessLevel === opt.val}
-                                                                        onChange={() => handleAccessLevelChange(opt.val)}
-                                                                        style={{ accentColor: 'var(--accent-primary)' }} />
-                                                                    <span style={{ fontWeight: 500, fontSize: '13px', display: 'inline-flex', alignItems: 'center', gap: '5px' }}>{opt.label}</span>
-                                                                </div>
-                                                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px', marginLeft: '20px' }}>{opt.desc}</div>
-                                                            </label>
-                                                        ))}
-                                                    </div>
-                                                </div>
-                                            )}
-
-                                            {currentScope === 'specific' && canManagePermissions && (
-                                                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}>
-                                                    <UserMultiSelect
-                                                        members={members as any[]}
-                                                        selectedIds={permEditUserIds}
-                                                        onSelectionChange={setPermEditUserIds}
-                                                        listMaxHeight={200}
-                                                        showSelectedCount={false}
-                                                    />
-                                                    <div style={{ marginTop: '8px', display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '8px' }}>
-                                                        {permEditUserIds.length > 0 && (
-                                                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                                                {t('wizard.step4.selectedCount', { count: permEditUserIds.length })}
-                                                            </span>
-                                                        )}
-                                                        <button className="btn btn-primary" onClick={handleSaveSpecific}
-                                                            style={{ padding: '4px 16px', fontSize: '12px', height: '28px' }}>
-                                                            {t('common.save', '保存')}
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                            )}
-
-                                            {currentScope === 'user' && permData?.scope_names?.length > 0 && (
-                                                <div style={{ marginTop: '12px', fontSize: '12px', color: 'var(--text-secondary)' }}>
-                                                    <span style={{ fontWeight: 500 }}>{t('agent.settings.perm.currentAccess', 'Current access')}:</span>{' '}
-                                                    {permData.scope_names.map((s: any) => s.name).join(', ')}
-                                                </div>
-                                            )}
-
-                                            {!canManagePermissions && (
-                                                <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--text-tertiary)', fontStyle: 'italic' }}>
-                                                    {t('agent.settings.perm.readOnly', 'Only the creator or admin can change permissions')}
-                                                </div>
-                                            )}
-                                        </div>
-                                    );
-                                })()}
+                                <AccessPermissionsPanel
+                                    agentId={id!}
+                                    permData={permData}
+                                    canManage={canManage}
+                                    queryClient={queryClient}
+                                />
 
                                 {/* Timezone */}
                                 <div className="card" style={{ marginBottom: '12px' }}>
