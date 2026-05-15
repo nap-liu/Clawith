@@ -29,18 +29,30 @@ def test_build_visible_agents_query_restricts_to_same_tenant_and_visible_permiss
     assert "agent_permissions.scope_id" in sql
 
 
+def _where_clause(stmt) -> str:
+    """Extract the SQL WHERE substring. ``str(select)`` includes the
+    SELECT projection (every column name like ``agents.access_mode``),
+    which would pollute filter-shape assertions; we only care about
+    what's in the WHERE clause."""
+    sql = str(stmt)
+    idx = sql.find("\nWHERE")
+    if idx == -1:
+        idx = sql.find(" WHERE")
+    return sql[idx:] if idx != -1 else ""
+
+
 def test_build_visible_agents_query_platform_admin_sees_everything_in_tenant():
     """platform_admin is a cross-tenant operator; sees own tenant fully,
     including other users' private agents."""
     admin = make_user(role="platform_admin", tenant_id=None)
 
-    sql = str(build_visible_agents_query(admin, tenant_id=uuid.uuid4()))
+    where = _where_clause(build_visible_agents_query(admin, tenant_id=uuid.uuid4()))
 
-    assert "agents.tenant_id" in sql
-    # No access_mode filter — platform_admin sees private agents too.
-    assert "access_mode" not in sql
+    assert "agents.tenant_id" in where
+    # No access_mode filter in WHERE — platform_admin sees private agents too.
+    assert "access_mode" not in where
     # No per-user grant filter either.
-    assert "agent_permissions" not in sql
+    assert "agent_permissions" not in where
 
 
 def test_build_visible_agents_query_org_admin_hides_others_private():
@@ -49,13 +61,13 @@ def test_build_visible_agents_query_org_admin_hides_others_private():
     to preserve v1.9.3 privacy guarantee."""
     admin = make_user(role="org_admin")
 
-    sql = str(build_visible_agents_query(admin))
+    where = _where_clause(build_visible_agents_query(admin))
 
-    assert "agents.tenant_id" in sql
-    assert "agents.creator_id" in sql
-    assert "access_mode" in sql
+    assert "agents.tenant_id" in where
+    assert "agents.creator_id" in where
+    assert "access_mode" in where
     # org_admin shouldn't need per-user grant table — non-private is enough.
-    assert "agent_permissions" not in sql
+    assert "agent_permissions" not in where
 
 
 def test_build_visible_agents_query_regular_user_uses_explicit_grants():
@@ -63,14 +75,14 @@ def test_build_visible_agents_query_regular_user_uses_explicit_grants():
     agent explicitly added to a custom roster they're on."""
     user = make_user(role="member")
 
-    sql = str(build_visible_agents_query(user))
+    where = _where_clause(build_visible_agents_query(user))
 
-    assert "agents.tenant_id" in sql
-    assert "agents.creator_id" in sql
+    assert "agents.tenant_id" in where
+    assert "agents.creator_id" in where
     # Regular user needs both company-mode filter and explicit-grant filter.
-    assert "access_mode" in sql
-    assert "agent_permissions.scope_type" in sql
-    assert "agent_permissions.scope_id" in sql
+    assert "access_mode" in where
+    assert "agent_permissions.scope_type" in where
+    assert "agent_permissions.scope_id" in where
 
 
 class _ScalarResult:
@@ -82,8 +94,13 @@ class _ScalarResult:
 
 
 class _ScalarsResult:
+    """Stub mimicking sqlalchemy Result.scalars().all() chain."""
+
     def __init__(self, values):
         self.values = values
+
+    def scalars(self):
+        return self
 
     def all(self):
         return self.values
