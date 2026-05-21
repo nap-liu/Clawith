@@ -2986,32 +2986,13 @@ export default function EnterpriseSettings() {
     const [mcpRawInput, setMcpRawInput] = useState('');
     const [mcpTestResult, setMcpTestResult] = useState<any>(null);
     const [mcpTesting, setMcpTesting] = useState(false);
-    // Edit Server modal state — null when closed, otherwise the server to edit
+    // Edit Server modal state — null when closed, otherwise the server to edit.
+    // server_id is the FK from tools.mcp_server_id; using it directly avoids fragile
+    // base_url_template string matching (host.docker.internal vs in-cluster names diverge).
     const [editingMcpServer, setEditingMcpServer] = useState<{
+        server_id: string;
         server_name: string;
-        server_url: string;
-        api_key: string;
     } | null>(null);
-    // Resolved server.id (UUID) for the currently editing MCP server — populated by the effect below
-    // by matching base_url_template. Used to mount <MCPServerEditor>.
-    const [mcpEditServerId, setMcpEditServerId] = useState<string | null>(null);
-
-    // Resolve mcp_server.id from base_url_template when the edit modal opens.
-    useEffect(() => {
-        if (!editingMcpServer) {
-            setMcpEditServerId(null);
-            return;
-        }
-        (async () => {
-            try {
-                const list = await fetchJson<any[]>('/admin/mcp-servers');
-                const match = list.find((s: any) => s.base_url_template === editingMcpServer.server_url);
-                if (match) {
-                    setMcpEditServerId(match.id);
-                }
-            } catch (_e) { /* swallow — editor will still show error state */ }
-        })();
-    }, [editingMcpServer]);
 
     const [editingToolId, setEditingToolId] = useState<string | null>(null);
     const [editingConfig, setEditingConfig] = useState<Record<string, any>>({});
@@ -4298,13 +4279,12 @@ export default function EnterpriseSettings() {
                                                 </div>
                                             </div>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
-                                                {tool.type === 'mcp' && tool.mcp_server_name && (
+                                                {tool.type === 'mcp' && tool.mcp_server_id && tool.mcp_server_name && (
                                                     <button
                                                         style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--text-secondary)' }}
                                                         onClick={() => setEditingMcpServer({
+                                                            server_id: tool.mcp_server_id,
                                                             server_name: tool.mcp_server_name,
-                                                            server_url: tool.mcp_server_url || '',
-                                                            api_key: '',
                                                         })}
                                                     >
                                                         Edit Server
@@ -4470,9 +4450,9 @@ export default function EnterpriseSettings() {
                             })()}
 
                             {/* ─── Edit MCP Server Modal — unified <MCPServerEditor> ─── */}
-                            {editingMcpServer && mcpEditServerId && (
+                            {editingMcpServer && (
                                 <MCPServerEditor
-                                    serverId={mcpEditServerId}
+                                    serverId={editingMcpServer.server_id}
                                     mode="server-admin"
                                     defaultTab="basic"
                                     role={effectiveEditorRole(currentUser)}

@@ -7,7 +7,6 @@ import { visibleTabs } from './types';
 import BasicTab from './BasicTab';
 import AdvancedTab from './AdvancedTab';
 import OverrideTab from './OverrideTab';
-import TenantOverridesTab from './TenantOverridesTab';
 import TestTab from './TestTab';
 
 export default function MCPServerEditor(props: MCPServerEditorProps) {
@@ -51,7 +50,6 @@ export default function MCPServerEditor(props: MCPServerEditorProps) {
     t === 'basic' ? '基础'
     : t === 'advanced' ? '高级'
     : t === 'override' ? 'Override'
-    : t === 'tenant' ? '租户 Overrides'
     : '测试';
 
   const handleSaved = useCallback(() => {
@@ -121,7 +119,6 @@ export default function MCPServerEditor(props: MCPServerEditorProps) {
               {activeTab === 'basic' && <BasicTab server={server} role={role} agentId={agentId} onSaved={handleSaved} />}
               {activeTab === 'advanced' && <AdvancedTab server={server} role={role} agentId={agentId} onSaved={handleSaved} />}
               {activeTab === 'override' && agentId && <OverrideTab server={server} agentId={agentId} role={role} onSaved={handleSaved} />}
-              {activeTab === 'tenant' && <TenantOverridesTab server={server} />}
               {activeTab === 'test' && <TestTab server={server} agentId={agentId} />}
             </>
           )}
