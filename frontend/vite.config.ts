@@ -31,12 +31,15 @@ export default defineConfig({
         port: 3008,
         host: '0.0.0.0',
         proxy: {
+            // Default 8008 matches a uvicorn run on the host. When running host-side
+            // `vite` against a docker stack whose backend is only reachable through the
+            // frontend nginx (3008), set VITE_API_PROXY_TARGET=http://localhost:3008.
             '/api': {
-                target: 'http://localhost:8008',
+                target: process.env.VITE_API_PROXY_TARGET || 'http://localhost:8008',
                 changeOrigin: true,
             },
             '/ws': {
-                target: 'ws://localhost:8008',
+                target: (process.env.VITE_API_PROXY_TARGET || 'http://localhost:8008').replace(/^http/, 'ws'),
                 ws: true,
             },
         },
