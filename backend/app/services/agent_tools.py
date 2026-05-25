@@ -7488,6 +7488,7 @@ async def _execute_code(
             language=language,
             timeout=timeout,
             work_dir=str(work_dir),
+            agent_id=str(agent_id) if agent_id else None,
         )
 
         # Format result for user display
