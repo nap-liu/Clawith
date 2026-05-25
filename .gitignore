@@ -72,3 +72,5 @@ docker-compose.replay.yml
 wt-test.sh
 wt-alembic.sh
 Dockerfile.test
+.aio-test/
+docs/superpowers/
