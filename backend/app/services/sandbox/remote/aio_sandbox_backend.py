@@ -300,7 +300,11 @@ class AioSandboxBackend(BaseSandboxBackend):
                 stderr_parts.append("\n".join(tb) if tb else out.get("evalue", ""))
 
         status = data.get("status", "ok")
-        ok_run = status == "ok" and not stderr_parts
+        has_error_output = any(
+            out.get("output_type") == "error"
+            for out in data.get("outputs", []) or []
+        )
+        ok_run = status == "ok" and not has_error_output
         return ExecutionResult(
             success=ok_run,
             stdout=("".join(stdout_parts))[:_STDOUT_LIMIT],
@@ -319,7 +323,8 @@ class AioSandboxBackend(BaseSandboxBackend):
         if anchor in self._jupyter_sessions:
             return self._jupyter_sessions[anchor]
         session_uuid = await self._create_jupyter_session(client)
-        self._jupyter_sessions[anchor] = session_uuid
+        if session_uuid:  # only cache real UUIDs; empty string means create failed
+            self._jupyter_sessions[anchor] = session_uuid
         return session_uuid
 
     async def _create_jupyter_session(
@@ -376,7 +381,7 @@ class AioSandboxBackend(BaseSandboxBackend):
     @staticmethod
     def _is_session_missing(body: dict[str, Any]) -> bool:
         msg = (body.get("message") or "").lower()
-        return "session not found" in msg or ("session" in msg and "not found" in msg)
+        return "session not found" in msg
 
     @staticmethod
     def _error_result(error_msg: str, start: float, exit_code: int = 1) -> ExecutionResult:

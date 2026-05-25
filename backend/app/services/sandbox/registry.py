@@ -1,5 +1,6 @@
 """Sandbox backend registry and factory."""
 
+import threading
 from typing import Type
 from loguru import logger
 
@@ -7,18 +8,27 @@ from app.services.sandbox.base import SandboxBackend
 from app.services.sandbox.config import SandboxConfig, SandboxType
 
 
+# Module-level instance cache so backends with internal state (e.g. the
+# AioSandboxBackend's per-anchor jupyter UUID cache) survive across calls
+# from agent_tools._execute_code(). Without this, every tool invocation
+# would create a fresh backend instance and lose all session state.
+#
+# Key: (type, api_url, api_key) — these are the dimensions that meaningfully
+# distinguish "different sandbox targets". Other config fields (timeouts,
+# resource limits, language mapping) don't change runtime identity.
+_BACKEND_INSTANCES: dict[tuple[SandboxType, str, str], SandboxBackend] = {}
+_BACKEND_INSTANCES_LOCK = threading.Lock()
+
+
 def get_sandbox_backend(config: SandboxConfig) -> SandboxBackend:
     """
-    Factory function: create sandbox backend instance based on config.
-
-    This function uses dependency injection to allow easy testing and
-    customization. For production use, pass the config from settings.
+    Factory function: return a (cached) sandbox backend instance for the config.
 
     Args:
         config: SandboxConfig describing which backend to create
 
     Returns:
-        SandboxBackend instance
+        SandboxBackend instance (cached per (type, api_url, api_key))
 
     Raises:
         ValueError: If the sandbox type is unknown or not supported
@@ -30,7 +40,17 @@ def get_sandbox_backend(config: SandboxConfig) -> SandboxBackend:
     if not backend_class:
         raise ValueError(f"Unknown sandbox type: {config.type}")
 
-    return backend_class(config)
+    cache_key = (config.type, config.api_url or "", config.api_key or "")
+    with _BACKEND_INSTANCES_LOCK:
+        instance = _BACKEND_INSTANCES.get(cache_key)
+        if instance is None:
+            instance = backend_class(config)
+            _BACKEND_INSTANCES[cache_key] = instance
+            logger.debug(
+                f"[Sandbox] Created and cached new backend instance: "
+                f"type={config.type}, url={config.api_url or '(local)'}"
+            )
+    return instance
 
 
 # Registry mapping - populated at module load time
