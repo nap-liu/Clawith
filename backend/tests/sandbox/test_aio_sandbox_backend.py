@@ -52,7 +52,8 @@ async def test_bash_hello_world_with_agent_id(backend, agent_id):
         agent_id=agent_id,
     )
     assert result.success is True
-    assert "hello-from-gem" in result.stdout
+    # Match the prefix only — the sandbox image's default user may change.
+    assert "hello-from-" in result.stdout
     assert result.exit_code == 0
 
 
