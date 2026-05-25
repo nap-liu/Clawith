@@ -10,6 +10,7 @@ To run locally:
 import os
 import uuid
 
+import httpx
 import pytest
 
 from app.services.sandbox.config import SandboxConfig, SandboxType
@@ -34,16 +35,14 @@ def backend() -> AioSandboxBackend:
 
 @pytest.fixture
 def agent_id() -> str:
-    """Stable per-test agent id so re-runs don't pile up sessions."""
+    """Fresh UUID per test execution to prevent cross-test session collisions."""
     return f"test-{uuid.uuid4().hex[:8]}"
 
 
-@pytest.mark.asyncio
 async def test_health_check_returns_true_for_running_sandbox(backend):
     assert await backend.health_check() is True
 
 
-@pytest.mark.asyncio
 async def test_bash_hello_world_with_agent_id(backend, agent_id):
     result = await backend.execute(
         code="echo hello-from-$(whoami)",
@@ -57,7 +56,6 @@ async def test_bash_hello_world_with_agent_id(backend, agent_id):
     assert result.exit_code == 0
 
 
-@pytest.mark.asyncio
 async def test_python_uses_jupyter_session_state(backend, agent_id):
     """Variables set in one call persist to the next via session_id."""
     r1 = await backend.execute(
@@ -80,7 +78,6 @@ async def test_python_uses_jupyter_session_state(backend, agent_id):
     assert "84" in r2.stdout
 
 
-@pytest.mark.asyncio
 async def test_shell_session_preserves_cwd_across_calls(backend, agent_id):
     """exec_dir routes the session, and `cd` persists within the session."""
     r1 = await backend.execute(
@@ -102,7 +99,6 @@ async def test_shell_session_preserves_cwd_across_calls(backend, agent_id):
     assert "/tmp" in r2.stdout
 
 
-@pytest.mark.asyncio
 async def test_two_agents_have_isolated_shell_sessions(backend):
     a1 = f"agentA-{uuid.uuid4().hex[:8]}"
     a2 = f"agentB-{uuid.uuid4().hex[:8]}"
@@ -125,9 +121,20 @@ async def test_two_agents_have_isolated_shell_sessions(backend):
     assert "from-A" not in r.stdout  # B must NOT see A's env
 
 
-@pytest.mark.asyncio
 async def test_unknown_session_id_auto_recreates(backend, agent_id):
-    """If sandbox restarts and our session vanishes, execute() auto-recreates."""
+    """If sandbox restarts and our session vanishes, execute() auto-recreates.
+
+    Step 1: first execute() must create a named shell session
+            `clawith-{agent_id}` (server-side identity tied to agent).
+    Step 2: we manually delete that session via HTTP to simulate sandbox
+            restart / GC.
+    Step 3: next execute() must transparently recreate the session and
+            succeed.
+
+    The pre-DELETE existence check is what makes this test a meaningful
+    TDD signal: a stub that doesn't create named sessions will fail at
+    step 1, not vacuously pass through step 3.
+    """
     await backend.execute(
         code="echo first",
         language="bash",
@@ -136,9 +143,17 @@ async def test_unknown_session_id_auto_recreates(backend, agent_id):
         agent_id=agent_id,
     )
 
-    import httpx
     session_id = f"clawith-{agent_id}"
     async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{os.environ['SANDBOX_API_URL']}/v1/shell/sessions",
+            timeout=5.0,
+        )
+        sessions = resp.json().get("data", {}).get("sessions", {})
+        assert session_id in sessions, (
+            f"Backend must create named session {session_id!r}; "
+            f"sandbox only knows: {list(sessions.keys())[:10]}"
+        )
         await client.delete(
             f"{os.environ['SANDBOX_API_URL']}/v1/shell/sessions/{session_id}",
             timeout=5.0,
