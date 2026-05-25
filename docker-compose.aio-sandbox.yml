@@ -1,5 +1,8 @@
-# Local-only compose overlay for the aio-sandbox integration worktree.
-# Bring up the bundled aio-sandbox container alongside the rest of the stack.
+# AIO-Sandbox compose profile for the integration worktree.
+# Adds the bundled aio-sandbox container to the stack.
+#
+# Usage:
+#     docker compose -f docker-compose.yml -f docker-compose.aio-sandbox.yml up -d
 #
 # Opt-in: backend uses subprocess execution by default. To route code
 # execution through the bundled sandbox, set in your .env file:
@@ -7,7 +10,10 @@
 #     SANDBOX_TYPE=aio_sandbox
 #     SANDBOX_API_URL=http://aio-sandbox:8080
 #
-# Run: docker compose up -d
+# Why a dedicated file (not docker-compose.override.yml):
+# - The project's .gitignore reserves docker-compose.override.yml for
+#   personal local developer overrides. This profile is a feature toggle
+#   that belongs in git, so it gets its own filename.
 #
 # Notes:
 # - The aio-sandbox service deliberately does NOT publish its 8080 port
