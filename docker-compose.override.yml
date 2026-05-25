@@ -1,0 +1,48 @@
+# Local-only compose overlay for the aio-sandbox integration worktree.
+# Bring up the bundled aio-sandbox container alongside the rest of the stack.
+#
+# Opt-in: backend uses subprocess execution by default. To route code
+# execution through the bundled sandbox, set in your .env file:
+#
+#     SANDBOX_TYPE=aio_sandbox
+#     SANDBOX_API_URL=http://aio-sandbox:8080
+#
+# Run: docker compose up -d
+#
+# Notes:
+# - The aio-sandbox service deliberately does NOT publish its 8080 port
+#   to the host (avoids conflicting with the worktree's spike-aio-sandbox
+#   exploration container on port 8091). Backend reaches it over the
+#   compose-internal docker network via DNS name `aio-sandbox`.
+# - Mount /data/agents on the sandbox so it sees the same agent_data
+#   directory the backend writes to. The plan's audit found that /home/gem
+#   subpaths trigger macOS gfuse permission issues; /data/agents is safe
+#   on both macOS and Linux.
+
+services:
+  aio-sandbox:
+    image: ghcr.io/agent-infra/sandbox:latest
+    container_name: clawith-aio-sandbox
+    restart: unless-stopped
+    shm_size: 2gb
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./backend/agent_data:/data/agents
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/sandbox"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
+    networks:
+      - default
+
+  backend:
+    environment:
+      SANDBOX_TYPE: ${SANDBOX_TYPE:-subprocess}
+      SANDBOX_API_URL: ${SANDBOX_API_URL:-}
+      SANDBOX_API_KEY: ${SANDBOX_API_KEY:-}
+    depends_on:
+      aio-sandbox:
+        condition: service_healthy
