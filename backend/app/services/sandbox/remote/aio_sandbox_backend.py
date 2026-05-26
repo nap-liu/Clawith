@@ -179,8 +179,18 @@ class AioSandboxBackend(BaseSandboxBackend):
         # agent's own private workspace, mirroring a per-user Linux box.
         # Use a literal-quoted path so unusual chars in agent_id can't escape.
         quoted_cwd = "'" + cwd.replace("'", "'\\''") + "'"
+        # Package-isolation env vars: PIP_USER=1 makes `pip install xxx`
+        # land in $HOME/.local/... per-agent; NPM_CONFIG_PREFIX redirects
+        # `npm install -g xxx` to $HOME/.npm-global/... per-agent (plain
+        # `npm install xxx` was already per-cwd which is per-agent here).
+        # PATH augmented so any globally-installed npm bin (e.g. `tsc`,
+        # `vite`) is found.
         cmd = (
-            f"cd {quoted_cwd} && export HOME={quoted_cwd} && "
+            f"cd {quoted_cwd} && "
+            f"export HOME={quoted_cwd} && "
+            f"export PIP_USER=1 && "
+            f'export NPM_CONFIG_PREFIX="$HOME/.npm-global" && '
+            f'export PATH="$HOME/.npm-global/bin:$PATH" && '
             + self._build_shell_command(code, language)
         )
 
@@ -395,23 +405,49 @@ class AioSandboxBackend(BaseSandboxBackend):
         session_uuid = await self._create_jupyter_session(client)
         if session_uuid:  # only cache real UUIDs; empty string means create failed
             self._jupyter_sessions[anchor] = session_uuid
-            # Silent HOME setup; failures are non-fatal — worst case the user's
-            # code sees the default /home/gem HOME and SSH falls back to that.
-            setup = f"import os; os.environ['HOME'] = {cwd!r}"
+            # Silent per-agent isolation setup. Failures are non-fatal — worst
+            # case the kernel falls back to the container-shared HOME/site
+            # paths. Mirrors the shell-side export block AND forces sys.path
+            # to include the per-agent user-site, because Python computes
+            # user-site at interpreter startup (before our HOME override
+            # takes effect); without this `pip install` from a shell cell
+            # would land in <cwd>/.local but `import` from a python cell
+            # would still look at /home/gem/.local. Explicit sys.path.insert
+            # at the front guarantees per-agent versions win.
+            user_site_py310 = cwd + "/.local/lib/python3.10/site-packages"
+            setup = (
+                "import os, sys\n"
+                f"os.environ['HOME'] = {cwd!r}\n"
+                "os.environ['PIP_USER'] = '1'\n"
+                f"os.environ['PYTHONUSERBASE'] = {(cwd + '/.local')!r}\n"
+                f"os.environ['NPM_CONFIG_PREFIX'] = {(cwd + '/.npm-global')!r}\n"
+                "os.environ['PATH'] = "
+                f"{(cwd + '/.npm-global/bin')!r} + os.pathsep + os.environ.get('PATH', '')\n"
+                f"_ag_us = {user_site_py310!r}\n"
+                "os.makedirs(_ag_us, exist_ok=True)\n"
+                "if _ag_us not in sys.path: sys.path.insert(0, _ag_us)"
+            )
             try:
                 await self._jupyter_exec(client, session_uuid, setup, cwd, 10)
             except Exception as e:  # noqa: BLE001
-                logger.warning(f"[AioSandbox] jupyter HOME setup failed: {e}")
+                logger.warning(f"[AioSandbox] jupyter env setup failed: {e}")
         return session_uuid
 
     async def _create_jupyter_session(
         self,
         client: httpx.AsyncClient,
     ) -> str:
-        """Create a new jupyter kernel and return its server-assigned UUID."""
+        """Create a new jupyter kernel and return its server-assigned UUID.
+
+        Pinned to `python3.10` so the kernel uses the same Python interpreter
+        as the system `pip` binary. Without this pin the default `python3`
+        kernelspec is ambiguous on the aio-sandbox image (multiple Python
+        versions installed under /opt/) and a `pip install` from a shell
+        cell could land in a site dir the jupyter kernel doesn't import from.
+        """
         resp = await client.post(
             f"{self.base_url}/v1/jupyter/sessions/create",
-            json={"kernel_name": "python3"},
+            json={"kernel_name": "python3.10"},
             headers=self._headers(),
             timeout=10.0,
         )
