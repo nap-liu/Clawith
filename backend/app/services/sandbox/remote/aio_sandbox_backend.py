@@ -185,17 +185,29 @@ class AioSandboxBackend(BaseSandboxBackend):
         # `npm install xxx` was already per-cwd which is per-agent here).
         # PATH augmented so any globally-installed npm bin (e.g. `tsc`,
         # `vite`) is found.
+        # Non-interactive shell env vars: signals every well-behaved CI-aware
+        # tool (npm, yarn, pnpm, npx, prompts, apt, debconf, git over https)
+        # to skip prompts and pick safe defaults. This is the standard CI
+        # contract — not a hack. Tools that ignore these (rare) will still
+        # hit the status:running timeout branch and trigger a session reset.
         cmd = (
             f"cd {quoted_cwd} && "
             f"export HOME={quoted_cwd} && "
             f"export PIP_USER=1 && "
             f'export NPM_CONFIG_PREFIX="$HOME/.npm-global" && '
             f'export PATH="$HOME/.npm-global/bin:$PATH" && '
+            f"export CI=true && "
+            f"export NPM_CONFIG_YES=true && "
+            f"export DEBIAN_FRONTEND=noninteractive && "
+            f"export GIT_TERMINAL_PROMPT=0 && "
             + self._build_shell_command(code, language)
         )
 
         body, ok = await self._shell_exec(client, session_id, cmd, timeout)
-        if not ok and self._is_session_missing(body):
+        # Both "session not found" (ok=false) and the v1.0.0.152 zombie state
+        # (ok=true + status:"terminated") need a recreate before the user's
+        # command actually runs on a fresh bash.
+        if self._is_session_missing(body):
             await self._create_shell_session(client, session_id, cwd)
             body, ok = await self._shell_exec(client, session_id, cmd, timeout)
 
@@ -205,6 +217,49 @@ class AioSandboxBackend(BaseSandboxBackend):
         data = body.get("data", {}) or {}
         output = (data.get("output") or "")[:_STDOUT_LIMIT]
         server_message = (body.get("message") or "").strip()
+
+        # Server returned status:"running" → our `timeout` window elapsed but
+        # the underlying bash process is still alive and will hold the session
+        # forever (v1.0.0.152 doesn't implement `hard_timeout`, verified by
+        # direct curl probes). Queued follow-up commands would pile up behind
+        # it. The only way to release the session is to DELETE it; the next
+        # call into `_run_shell` will see "Session not found" via
+        # `_is_session_missing` and auto-recreate a fresh session.
+        if data.get("status") == "running":
+            try:
+                await client.delete(
+                    f"{self.base_url}/v1/shell/sessions/{session_id}",
+                    headers=self._headers(),
+                    timeout=5.0,
+                )
+                # v1.0.0.152 quirk: after DELETE the session stays in the
+                # sessions list with status="terminated" — subsequent exec
+                # calls return success=True with exit_code=-1 and empty
+                # output (the LLM-visible "-1 cascade" bug). Atomically
+                # recreate the session here so the next call uses a fresh
+                # bash subprocess.
+                await self._create_shell_session(client, session_id, cwd)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[AioSandbox] DELETE+recreate after timeout for {session_id} failed: {e}"
+                )
+            return ExecutionResult(
+                success=False,
+                stdout=output,
+                stderr="",
+                exit_code=124,
+                duration_ms=0,
+                error=(
+                    f"Command timed out after {timeout}s and was killed. The "
+                    f"shell session has been reset — any exported env vars and "
+                    f"background processes are gone; the next call starts "
+                    f"fresh. If the command was waiting for stdin (an "
+                    f"interactive prompt), retry with non-interactive flags "
+                    f"like --yes / -y / --non-interactive. If the command "
+                    f"legitimately needs longer than {timeout}s, pass a larger "
+                    f"timeout in the tool arguments."
+                ),
+            )
 
         if not ok:
             # Build the most informative error we can. If we have command output
@@ -263,9 +318,20 @@ class AioSandboxBackend(BaseSandboxBackend):
         command: str,
         timeout: int,
     ) -> tuple[dict[str, Any], bool]:
+        # Pass `timeout` so the server returns control after that many seconds
+        # with status:"running" instead of holding the HTTP connection open
+        # until our httpx timeout fires. v1.0.0.152 does NOT honor
+        # `hard_timeout` (verified by direct curl probe), so the only way to
+        # actually release a stuck command is to DELETE the session — see
+        # the status:"running" branch in _run_shell. Without sending
+        # `timeout` here, the server would wait forever for hang commands.
         resp = await client.post(
             f"{self.base_url}/v1/shell/exec",
-            json={"id": session_id, "command": command},
+            json={
+                "id": session_id,
+                "command": command,
+                "timeout": float(timeout),
+            },
             headers=self._headers(),
             timeout=float(timeout + 10),
         )
@@ -494,7 +560,17 @@ class AioSandboxBackend(BaseSandboxBackend):
     @staticmethod
     def _is_session_missing(body: dict[str, Any]) -> bool:
         msg = (body.get("message") or "").lower()
-        return "session not found" in msg
+        if "session not found" in msg:
+            return True
+        # v1.0.0.152 quirk: after DELETE (or a kill-from-elsewhere) the
+        # session lingers in the list with status="terminated" and exec
+        # calls against it return success:true + exit_code:-1 + empty
+        # output. Treat that as missing so the recreate path runs and the
+        # next command lands on a fresh bash subprocess.
+        data = body.get("data") or {}
+        if data.get("status") == "terminated":
+            return True
+        return False
 
     @staticmethod
     def _error_result(error_msg: str, start: float, exit_code: int = 1) -> ExecutionResult:

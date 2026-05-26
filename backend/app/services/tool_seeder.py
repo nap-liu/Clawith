@@ -1002,7 +1002,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
                 "code": {"type": "string", "description": "Code to execute"},
-                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Choose based on task complexity (default 30, platform cap 300; e.g. 30 for short commands, 60-180 for pip/npm install, 180-300 for heavy compiles or data work)."},
+                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Choose based on task complexity (default 60, platform cap 300; e.g. 30 for echo/ls, 60-120 for pip/npm install of small pkgs, 180-300 for heavy compiles or git clone of large repos). If a command times out the session is reset and the command's bg processes / exported env vars are lost — pick a generous timeout for long jobs."},
             },
             "required": ["language", "code"],
         },
@@ -1068,7 +1068,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
                 "code": {"type": "string", "description": "Code to execute"},
-                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Choose based on task complexity (default 30, platform cap 300; e.g. 30 for short commands, 60-180 for pip/npm install, 180-300 for heavy compiles or data work)."},
+                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Choose based on task complexity (default 60, platform cap 300; e.g. 30 for echo/ls, 60-120 for pip/npm install of small pkgs, 180-300 for heavy compiles or git clone of large repos). If a command times out the session is reset and the command's bg processes / exported env vars are lost — pick a generous timeout for long jobs."},
             },
             "required": ["language", "code"],
         },
@@ -1119,6 +1119,25 @@ BUILTIN_TOOLS = [
             "workspace/, enterprise_info/). Same convention as execute_code. "
             "Save user-visible files under workspace/ (e.g. `git clone <url> "
             "workspace/<name>`, `cd workspace && ...`). Use relative paths.\n"
+            "\n"
+            "• Non-interactive shell — stdin is NOT a TTY. CI=true / "
+            "DEBIAN_FRONTEND=noninteractive / GIT_TERMINAL_PROMPT=0 / "
+            "NPM_CONFIG_YES=true are pre-exported so npm/apt/git/prompts-based "
+            "tools auto-skip questions. Never write `read x` from stdin; pass "
+            "values via env vars, config files, or command-line arguments.\n"
+            "\n"
+            "• If a command times out (you'll get a `Command timed out and "
+            "was killed` error and the session is reset), the underlying "
+            "command was almost certainly blocking on stdin or doing a slow "
+            "network operation. Strategies:\n"
+            "  - Use explicit non-interactive flags (--yes / -y / -q).\n"
+            "  - For tools that ignore CI=true (e.g. some `@clack/prompts` "
+            "    based CLIs like newer create-vite asking 'Package name'): "
+            "    skip the wizard. Manually write package.json / config files "
+            "    and run the underlying installer, or use a lighter "
+            "    alternative (`degit`, a template git clone, etc.).\n"
+            "  - For genuinely slow operations (large npm install, big git "
+            "    clone), pass a larger `timeout` (up to 300s).\n"
             "\n"
             "• Shell calls always start from the agent root — `cwd` is reset on "
             "every call so you can rely on relative paths like `workspace/` and "
@@ -1189,7 +1208,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
                 "code": {"type": "string", "description": "Code to execute"},
-                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Choose based on task complexity (default 30, platform cap 300; e.g. 30 for short commands, 60-180 for pip/npm install, 180-300 for heavy compiles or data work)."},
+                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Choose based on task complexity (default 60, platform cap 300; e.g. 30 for echo/ls, 60-120 for pip/npm install of small pkgs, 180-300 for heavy compiles or git clone of large repos). If a command times out the session is reset and the command's bg processes / exported env vars are lost — pick a generous timeout for long jobs."},
             },
             "required": ["language", "code"],
         },
