@@ -46,21 +46,10 @@ Failure modes that propagate to ExecutionResult
 - Two recreate attempts both failing → ExecutionResult(success=False, exit_code=1)
 """
 import json
-import re
 import time
 from typing import Any
 
 import httpx
-
-# ANSI color / control sequences. Jupyter / IPython colorize tracebacks by
-# default, and many CLI tools (git, ls --color, etc.) also emit them. The LLM
-# can read them but they waste tokens and hurt readability. Strip them from
-# stdout/stderr before returning to the caller.
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
-
-
-def _strip_ansi(text: str) -> str:
-    return _ANSI_ESCAPE_RE.sub("", text) if text else text
 from loguru import logger
 
 from app.services.sandbox.base import (
@@ -211,6 +200,7 @@ class AioSandboxBackend(BaseSandboxBackend):
             f"export NPM_CONFIG_YES=true && "
             f"export DEBIAN_FRONTEND=noninteractive && "
             f"export GIT_TERMINAL_PROMPT=0 && "
+            f"export NO_COLOR=1 && "
             + self._build_shell_command(code, language)
         )
 
@@ -226,7 +216,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         # `data.output` field often contains the actionable stderr text — don't
         # let it get swallowed by the generic top-level message.
         data = body.get("data", {}) or {}
-        output = _strip_ansi(data.get("output") or "")[:_STDOUT_LIMIT]
+        output = (data.get("output") or "")[:_STDOUT_LIMIT]
         server_message = (body.get("message") or "").strip()
 
         # Server returned status:"running" → our `timeout` window elapsed but
@@ -414,18 +404,18 @@ class AioSandboxBackend(BaseSandboxBackend):
         for out in data.get("outputs", []) or []:
             otype = out.get("output_type")
             if otype == "stream" and out.get("name") == "stdout":
-                stdout_parts.append(_strip_ansi(out.get("text", "")))
+                stdout_parts.append(out.get("text", ""))
             elif otype == "stream" and out.get("name") == "stderr":
-                stderr_parts.append(_strip_ansi(out.get("text", "")))
+                stderr_parts.append(out.get("text", ""))
             elif otype == "execute_result":
                 data_field = out.get("data") or {}
-                stdout_parts.append(_strip_ansi(data_field.get("text/plain", "")))
+                stdout_parts.append(data_field.get("text/plain", ""))
             elif otype == "error":
                 ename = out.get("ename", "")
                 evalue = out.get("evalue", "")
                 tb = out.get("traceback") or []
                 if tb:
-                    stderr_parts.append(_strip_ansi("\n".join(tb)))
+                    stderr_parts.append("\n".join(tb))
                 else:
                     stderr_parts.append(f"{ename}: {evalue}".strip(": "))
 
@@ -501,13 +491,21 @@ class AioSandboxBackend(BaseSandboxBackend):
                 "import os, sys\n"
                 f"os.environ['HOME'] = {cwd!r}\n"
                 "os.environ['PIP_USER'] = '1'\n"
+                "os.environ['NO_COLOR'] = '1'\n"
                 f"os.environ['PYTHONUSERBASE'] = {(cwd + '/.local')!r}\n"
                 f"os.environ['NPM_CONFIG_PREFIX'] = {(cwd + '/.npm-global')!r}\n"
                 "os.environ['PATH'] = "
                 f"{(cwd + '/.npm-global/bin')!r} + os.pathsep + os.environ.get('PATH', '')\n"
                 f"_ag_us = {user_site_py310!r}\n"
                 "os.makedirs(_ag_us, exist_ok=True)\n"
-                "if _ag_us not in sys.path: sys.path.insert(0, _ag_us)"
+                "if _ag_us not in sys.path: sys.path.insert(0, _ag_us)\n"
+                # IPython colorizes tracebacks regardless of NO_COLOR; ask the
+                # kernel itself to switch its color scheme to plain text so
+                # exception output is readable without client-side stripping.
+                "try:\n"
+                "    _ip = get_ipython()\n"
+                "    if _ip is not None: _ip.run_line_magic('colors', 'NoColor')\n"
+                "except Exception: pass"
             )
             try:
                 await self._jupyter_exec(client, session_uuid, setup, cwd, 10)
