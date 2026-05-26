@@ -46,10 +46,21 @@ Failure modes that propagate to ExecutionResult
 - Two recreate attempts both failing → ExecutionResult(success=False, exit_code=1)
 """
 import json
+import re
 import time
 from typing import Any
 
 import httpx
+
+# ANSI color / control sequences. Jupyter / IPython colorize tracebacks by
+# default, and many CLI tools (git, ls --color, etc.) also emit them. The LLM
+# can read them but they waste tokens and hurt readability. Strip them from
+# stdout/stderr before returning to the caller.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text) if text else text
 from loguru import logger
 
 from app.services.sandbox.base import (
@@ -215,7 +226,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         # `data.output` field often contains the actionable stderr text — don't
         # let it get swallowed by the generic top-level message.
         data = body.get("data", {}) or {}
-        output = (data.get("output") or "")[:_STDOUT_LIMIT]
+        output = _strip_ansi(data.get("output") or "")[:_STDOUT_LIMIT]
         server_message = (body.get("message") or "").strip()
 
         # Server returned status:"running" → our `timeout` window elapsed but
@@ -403,18 +414,18 @@ class AioSandboxBackend(BaseSandboxBackend):
         for out in data.get("outputs", []) or []:
             otype = out.get("output_type")
             if otype == "stream" and out.get("name") == "stdout":
-                stdout_parts.append(out.get("text", ""))
+                stdout_parts.append(_strip_ansi(out.get("text", "")))
             elif otype == "stream" and out.get("name") == "stderr":
-                stderr_parts.append(out.get("text", ""))
+                stderr_parts.append(_strip_ansi(out.get("text", "")))
             elif otype == "execute_result":
                 data_field = out.get("data") or {}
-                stdout_parts.append(data_field.get("text/plain", ""))
+                stdout_parts.append(_strip_ansi(data_field.get("text/plain", "")))
             elif otype == "error":
                 ename = out.get("ename", "")
                 evalue = out.get("evalue", "")
                 tb = out.get("traceback") or []
                 if tb:
-                    stderr_parts.append("\n".join(tb))
+                    stderr_parts.append(_strip_ansi("\n".join(tb)))
                 else:
                     stderr_parts.append(f"{ename}: {evalue}".strip(": "))
 
@@ -434,8 +445,13 @@ class AioSandboxBackend(BaseSandboxBackend):
         error_msg = None
         if not ok_run:
             if stderr_parts:
-                first_line = stderr_parts[0].splitlines()[0] if stderr_parts[0].splitlines() else stderr_parts[0]
-                error_msg = first_line[:300]
+                # Jupyter tracebacks start with a row of dashes (a visual
+                # separator) and end with "ExceptionName: message" — the
+                # last line is the actionable summary, the first line is
+                # decorative. Pick the last non-empty, non-dashes line.
+                lines = [l for l in "\n".join(stderr_parts).splitlines() if l.strip()]
+                candidates = [l for l in lines if set(l.strip()) - {"-", "="}]
+                error_msg = ((candidates or lines)[-1] if (candidates or lines) else "Unknown error")[:300]
             elif not ok:
                 raw = body.get("message") or json.dumps(body)[:500]
                 error_msg = f"sandbox returned no traceback. Raw response: {raw[:300]}"
