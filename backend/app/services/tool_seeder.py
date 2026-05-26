@@ -978,7 +978,18 @@ BUILTIN_TOOLS = [
     {
         "name": "execute_code",
         "display_name": "Code Executor",
-        "description": "Execute code (Python, Bash, Node.js) in a local sandboxed subprocess within the agent's workspace. Useful for data processing, calculations, file transformations, and automation.",
+        "description": (
+            "Execute code (Python, Bash, Node.js) in a local sandboxed subprocess. "
+            "Working directory is the agent's root (contains soul.md, memory/, "
+            "skills/, workspace/, enterprise_info/). To save files for the user "
+            "write them under workspace/ (e.g. workspace/report.md). Use relative "
+            "paths from the agent root. EACH CALL IS A FRESH PROCESS — variables, "
+            "imports, environment variables, and `cd` do NOT carry over between "
+            "calls; include all setup in every call. For long outputs (e.g. "
+            "pip list) the stdout is truncated to 10000 chars; prefer narrow "
+            "queries (pip show <pkg>, ls workspace) over full listings. Timeouts: "
+            "default 30s, max 60s; subprocess has no internet by default."
+        ),
         "category": "code",
         "icon": "💻",
         "is_default": True,
@@ -1096,7 +1107,52 @@ BUILTIN_TOOLS = [
     {
         "name": "execute_code_aio",
         "display_name": "Code Executor (AIO Sandbox)",
-        "description": "Execute code (Python, Bash, Node.js) in a self-hosted aio-sandbox container. Persistent runtime + per-agent session isolation + freely installable pip/npm/git dependencies. Variable state and the working directory survive between calls for the same agent. Requires the aio-sandbox container to be running and reachable.",
+        "description": (
+            "Execute code (Python, Bash, Node.js) in a self-hosted aio-sandbox "
+            "container with PERSISTENT state per agent.\n"
+            "\n"
+            "• Working directory: agent root (contains soul.md, memory/, skills/, "
+            "workspace/, enterprise_info/). Same convention as execute_code. "
+            "Save user-visible files under workspace/ (e.g. `git clone <url> "
+            "workspace/<name>`, `cd workspace && ...`). Use relative paths.\n"
+            "\n"
+            "• Shell calls always start from the agent root — `cwd` is reset on "
+            "every call so you can rely on relative paths like `workspace/` and "
+            "`memory/` without any `pwd` probe (same convention as execute_code). "
+            "Within a single call, `cd workspace && ls && cat foo` works as you "
+            "expect. Exported env vars and any background processes you launched "
+            "DO persist across calls (the shell session itself is reused), but "
+            "the current directory is intentionally not.\n"
+            "\n"
+            "• Python (Jupyter) kernel persists variables and imports ACROSS "
+            "calls. After `import pandas as pd` in one call, `pd` is still "
+            "defined in the next. Don't re-import unless you intend to reset.\n"
+            "\n"
+            "• Dependencies: `pip install <pkg>` / `npm install <pkg>` / "
+            "`apt install <pkg>` (with sudo). Pip and npm packages persist "
+            "across calls and container restarts.\n"
+            "\n"
+            "• Pre-installed tools: python3.10/3.11/3.12, node v22, git, gh, "
+            "uv, curl, wget, vim/nano, jq, rg, htop, imagemagick, yt-dlp. "
+            "requests, numpy, pandas are pre-installed in the system Python.\n"
+            "\n"
+            "• Outputs are truncated to ~10 KB stdout / 5 KB stderr. For long "
+            "listings prefer narrow queries (pip show, ls -1 workspace/X, "
+            "head/tail) over full dumps.\n"
+            "\n"
+            "• Files written here are visible to the read_file / list_files / "
+            "write_file tools using relative paths from the agent root (e.g. "
+            "the LLM-side `read_file(\"workspace/foo.txt\")` reads what bash "
+            "wrote at `workspace/foo.txt`).\n"
+            "\n"
+            "• Errors include the real Python traceback / shell stderr. If the "
+            "result starts with `❌ Error: sandbox returned no traceback`, that "
+            "is a sandbox-server-side failure — simplify the input or split "
+            "into smaller calls; it is not a bug in your code.\n"
+            "\n"
+            "• Timeouts: default 30s, max 60s per call. Internet access is "
+            "available. Requires the aio-sandbox container to be running."
+        ),
         "category": "code",
         "icon": "📦",
         "is_default": False,

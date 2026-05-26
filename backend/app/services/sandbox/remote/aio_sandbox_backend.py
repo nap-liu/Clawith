@@ -45,6 +45,7 @@ Failure modes that propagate to ExecutionResult
 - Timeout → ExecutionResult(success=False, exit_code=124)
 - Two recreate attempts both failing → ExecutionResult(success=False, exit_code=1)
 """
+import json
 import time
 from typing import Any
 
@@ -165,25 +166,49 @@ class AioSandboxBackend(BaseSandboxBackend):
         timeout: int,
     ) -> ExecutionResult:
         session_id = f"clawith-{anchor}"
-        cmd = self._build_shell_command(code, language)
+        # Force-reset cwd to agent root on every call. The shell session
+        # persists across calls (so exported env vars / background processes
+        # survive), but the working directory is statelessly reset to align
+        # with execute_code (subprocess) semantics — the LLM can rely on
+        # the same path conventions regardless of previous call history.
+        # Use a literal-quoted path so unusual chars in agent_id can't escape.
+        quoted_cwd = "'" + cwd.replace("'", "'\\''") + "'"
+        cmd = f"cd {quoted_cwd} && " + self._build_shell_command(code, language)
 
         body, ok = await self._shell_exec(client, session_id, cmd, timeout)
         if not ok and self._is_session_missing(body):
             await self._create_shell_session(client, session_id, cwd)
             body, ok = await self._shell_exec(client, session_id, cmd, timeout)
 
+        # Always pull whatever the server gave us. Even on `ok=False` the
+        # `data.output` field often contains the actionable stderr text — don't
+        # let it get swallowed by the generic top-level message.
+        data = body.get("data", {}) or {}
+        output = (data.get("output") or "")[:_STDOUT_LIMIT]
+        server_message = (body.get("message") or "").strip()
+
         if not ok:
+            # Build the most informative error we can. If we have command output
+            # surface it as stderr so the LLM sees the real failure. The server's
+            # top-level message (which is sometimes a server-side Python exception
+            # like "'ErrorObservation' object has no attribute 'exit_code'") goes
+            # in `error` so the LLM can tell it apart from its own code's stderr.
+            err = server_message or "Shell execution failed"
+            if "'ErrorObservation'" in err or "AttributeError" in err:
+                err = (
+                    f"sandbox server-side error: {err}. "
+                    f"Try a simpler command, split into multiple steps, "
+                    f"or fall back to the python tool."
+                )
             return ExecutionResult(
                 success=False,
                 stdout="",
-                stderr="",
+                stderr=output,
                 exit_code=1,
                 duration_ms=0,
-                error=body.get("message", "Shell execution failed"),
+                error=err,
             )
 
-        data = body.get("data", {}) or {}
-        output = (data.get("output") or "")[:_STDOUT_LIMIT]
         exit_code = data.get("exit_code", 0)
         return ExecutionResult(
             success=(exit_code == 0),
@@ -237,12 +262,15 @@ class AioSandboxBackend(BaseSandboxBackend):
     def _build_shell_command(code: str, language: str) -> str:
         if language == "bash":
             return code
-        # node / javascript: pass via stdin to avoid argv quoting headaches
-        # and to support multi-line scripts cleanly.
         if language in ("node", "javascript"):
-            # heredoc with random delimiter would be safer; keep simple for now.
-            escaped = code.replace("'", "'\\''")
-            return f"node -e '{escaped}'"
+            # Use a here-doc with a random delimiter so we never have to escape
+            # the user's code. A `node -e '...'` form needs every `'` in the
+            # code replaced with `'\''`, and that mess leaks back into the
+            # LLM's view of stdout, confusing it about whether its script was
+            # transmitted correctly.
+            import secrets
+            delim = "AIOSB_NODE_" + secrets.token_hex(16).upper()
+            return f"node <<'{delim}'\n{code}\n{delim}"
         return code
 
     # ------------------------------------------------------------------ Jupyter path
@@ -273,16 +301,11 @@ class AioSandboxBackend(BaseSandboxBackend):
             )
             self._jupyter_sessions[anchor] = returned_uuid
 
-        if not ok:
-            return ExecutionResult(
-                success=False,
-                stdout="",
-                stderr="",
-                exit_code=1,
-                duration_ms=0,
-                error=body.get("message", "Jupyter execution failed"),
-            )
-
+        # Always try to parse outputs — even when the top-level `success=false`
+        # the server frequently embeds the real Python traceback under
+        # `data.outputs[].error.traceback`. Surfacing that detail is what makes
+        # the difference between "❌ Error: Code execution error" (useless) and
+        # the actual NameError / SyntaxError the LLM can act on.
         data = body.get("data", {}) or {}
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
@@ -296,22 +319,45 @@ class AioSandboxBackend(BaseSandboxBackend):
                 data_field = out.get("data") or {}
                 stdout_parts.append(data_field.get("text/plain", ""))
             elif otype == "error":
+                ename = out.get("ename", "")
+                evalue = out.get("evalue", "")
                 tb = out.get("traceback") or []
-                stderr_parts.append("\n".join(tb) if tb else out.get("evalue", ""))
+                if tb:
+                    stderr_parts.append("\n".join(tb))
+                else:
+                    stderr_parts.append(f"{ename}: {evalue}".strip(": "))
 
         status = data.get("status", "ok")
         has_error_output = any(
             out.get("output_type") == "error"
             for out in data.get("outputs", []) or []
         )
-        ok_run = status == "ok" and not has_error_output
+        ok_run = ok and status == "ok" and not has_error_output
+
+        # Compose a never-useless error message:
+        # 1. If we extracted any traceback / stderr, surface its first line so the
+        #    LLM gets the actionable hint without parsing structured fields.
+        # 2. If the server completely failed and gave us nothing parseable, dump
+        #    the raw response body — anything is better than the bare
+        #    "Code execution error" string the LLM saw before.
+        error_msg = None
+        if not ok_run:
+            if stderr_parts:
+                first_line = stderr_parts[0].splitlines()[0] if stderr_parts[0].splitlines() else stderr_parts[0]
+                error_msg = first_line[:300]
+            elif not ok:
+                raw = body.get("message") or json.dumps(body)[:500]
+                error_msg = f"sandbox returned no traceback. Raw response: {raw[:300]}"
+            else:
+                error_msg = f"jupyter status={status!r} (no outputs)"
+
         return ExecutionResult(
             success=ok_run,
             stdout=("".join(stdout_parts))[:_STDOUT_LIMIT],
             stderr=("".join(stderr_parts))[:_STDERR_LIMIT],
             exit_code=0 if ok_run else 1,
             duration_ms=0,
-            error=None if ok_run else f"Jupyter status: {status}",
+            error=error_msg,
         )
 
     async def _ensure_jupyter_session(

@@ -79,8 +79,10 @@ async def test_python_uses_jupyter_session_state(backend, agent_id):
     assert "84" in r2.stdout
 
 
-async def test_shell_session_preserves_cwd_across_calls(backend, agent_id):
-    """exec_dir routes the session, and `cd` persists within the session."""
+async def test_shell_cwd_resets_to_work_dir_each_call(backend, agent_id):
+    """cwd is statelessly reset to work_dir on every call (matches
+    execute_code/subprocess semantics so the LLM has a single mental model)."""
+    # Within a single call, `cd` still takes effect for chained commands.
     r1 = await backend.execute(
         code="cd /tmp && pwd",
         language="bash",
@@ -88,8 +90,9 @@ async def test_shell_session_preserves_cwd_across_calls(backend, agent_id):
         work_dir="/data/agents",
         agent_id=agent_id,
     )
-    assert "/tmp" in r1.stdout
+    assert "/tmp" in r1.stdout, "cd should work within a single call"
 
+    # Next call: cwd is back to work_dir, NOT carried over from the previous call.
     r2 = await backend.execute(
         code="pwd",
         language="bash",
@@ -97,7 +100,31 @@ async def test_shell_session_preserves_cwd_across_calls(backend, agent_id):
         work_dir="/data/agents",
         agent_id=agent_id,
     )
-    assert "/tmp" in r2.stdout
+    assert r2.stdout.strip() == "/data/agents", (
+        f"each call must reset cwd to work_dir; got {r2.stdout!r}"
+    )
+
+
+async def test_shell_env_vars_persist_across_calls(backend, agent_id):
+    """Exported env vars DO persist across calls — the shell session itself
+    is reused, only cwd is reset. Background processes also survive."""
+    await backend.execute(
+        code="export AIOSB_MARKER=persisted-value",
+        language="bash",
+        timeout=10,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+    )
+    r = await backend.execute(
+        code='echo "marker=$AIOSB_MARKER"',
+        language="bash",
+        timeout=10,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+    )
+    assert "marker=persisted-value" in r.stdout, (
+        f"env vars should survive across calls; got {r.stdout!r}"
+    )
 
 
 async def test_two_agents_have_isolated_shell_sessions(backend):
