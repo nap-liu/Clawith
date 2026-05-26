@@ -166,14 +166,23 @@ class AioSandboxBackend(BaseSandboxBackend):
         timeout: int,
     ) -> ExecutionResult:
         session_id = f"clawith-{anchor}"
-        # Force-reset cwd to agent root on every call. The shell session
-        # persists across calls (so exported env vars / background processes
-        # survive), but the working directory is statelessly reset to align
-        # with execute_code (subprocess) semantics — the LLM can rely on
-        # the same path conventions regardless of previous call history.
+        # Force-reset cwd AND HOME to the agent root on every call. The shell
+        # session persists across calls (so exported env vars / background
+        # processes survive), but the working directory + HOME are statelessly
+        # reset to align with execute_code (subprocess) semantics.
+        #
+        # HOME is the critical one for SSH / git / npm / pip --user / etc. —
+        # the underlying sandbox container has HOME=/home/gem which would be
+        # shared by every agent, so `~/.ssh/id_*` written by one agent would
+        # be readable by another. Pinning HOME=<agent root> makes `ssh user@host`,
+        # `git config --global ...`, `~/.ssh/known_hosts`, etc. all land in the
+        # agent's own private workspace, mirroring a per-user Linux box.
         # Use a literal-quoted path so unusual chars in agent_id can't escape.
         quoted_cwd = "'" + cwd.replace("'", "'\\''") + "'"
-        cmd = f"cd {quoted_cwd} && " + self._build_shell_command(code, language)
+        cmd = (
+            f"cd {quoted_cwd} && export HOME={quoted_cwd} && "
+            + self._build_shell_command(code, language)
+        )
 
         body, ok = await self._shell_exec(client, session_id, cmd, timeout)
         if not ok and self._is_session_missing(body):
@@ -284,8 +293,14 @@ class AioSandboxBackend(BaseSandboxBackend):
         cwd: str,
         timeout: int,
     ) -> ExecutionResult:
-        # Ensure we have a real UUID session for this anchor.
-        session_uuid = await self._ensure_jupyter_session(client, anchor)
+        # Ensure we have a real UUID session for this anchor, and that the
+        # kernel's HOME env is pinned to the agent root (the underlying
+        # container has HOME=/home/gem which would be shared across agents;
+        # we want per-agent ~/.ssh / ~/.gitconfig semantics, matching the
+        # shell tool). The HOME pin runs as a silent setup call the very
+        # first time we create a kernel for this anchor — subsequent user
+        # cells therefore start at line 1 with clean traceback line numbers.
+        session_uuid = await self._ensure_jupyter_session(client, anchor, cwd)
 
         body, ok = await self._jupyter_exec(client, session_uuid, code, cwd, timeout)
 
@@ -364,13 +379,29 @@ class AioSandboxBackend(BaseSandboxBackend):
         self,
         client: httpx.AsyncClient,
         anchor: str,
+        cwd: str,
     ) -> str:
-        """Return the server UUID for this anchor, creating one if needed."""
+        """Return the server UUID for this anchor, creating one if needed.
+
+        On first creation we silently pin os.environ['HOME'] = cwd so the
+        kernel (and any subprocess.run() it spawns) sees the agent root as
+        $HOME — ssh, git, npm, etc. then find per-agent ~/.ssh, ~/.gitconfig
+        etc. instead of the container-shared /home/gem. The setup runs as a
+        dedicated execute call before any user code, so user cells keep
+        clean line numbers (their first cell is still `In[1]` line 1).
+        """
         if anchor in self._jupyter_sessions:
             return self._jupyter_sessions[anchor]
         session_uuid = await self._create_jupyter_session(client)
         if session_uuid:  # only cache real UUIDs; empty string means create failed
             self._jupyter_sessions[anchor] = session_uuid
+            # Silent HOME setup; failures are non-fatal — worst case the user's
+            # code sees the default /home/gem HOME and SSH falls back to that.
+            setup = f"import os; os.environ['HOME'] = {cwd!r}"
+            try:
+                await self._jupyter_exec(client, session_uuid, setup, cwd, 10)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[AioSandbox] jupyter HOME setup failed: {e}")
         return session_uuid
 
     async def _create_jupyter_session(
