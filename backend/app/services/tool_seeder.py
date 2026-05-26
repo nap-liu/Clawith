@@ -1094,6 +1094,67 @@ BUILTIN_TOOLS = [
     },
 
     {
+        "name": "execute_code_aio",
+        "display_name": "Code Executor (AIO Sandbox)",
+        "description": "Execute code (Python, Bash, Node.js) in a self-hosted aio-sandbox container. Persistent runtime + per-agent session isolation + freely installable pip/npm/git dependencies. Variable state and the working directory survive between calls for the same agent. Requires the aio-sandbox container to be running and reachable.",
+        "category": "code",
+        "icon": "📦",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
+                "code": {"type": "string", "description": "Code to execute"},
+                "timeout": {"type": "integer", "description": "Max execution time in seconds (default 30, max 60)"},
+            },
+            "required": ["language", "code"],
+        },
+        "config": {
+            "sandbox_type": "aio_sandbox",
+            "api_url": "http://aio-sandbox:8080",
+            "api_key": "",
+            "default_timeout": 30,
+            "max_timeout": 60,
+        },
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "api_url",
+                    "label": "Sandbox URL",
+                    "type": "text",
+                    "default": "http://aio-sandbox:8080",
+                    "placeholder": "http://aio-sandbox:8080",
+                    "required": True,
+                },
+                {
+                    "key": "api_key",
+                    "label": "Bearer Token (optional)",
+                    "type": "password",
+                    "default": "",
+                    "placeholder": "Only set if the sandbox is auth-protected",
+                    "required": False,
+                },
+                {
+                    "key": "default_timeout",
+                    "label": "Default Timeout (seconds)",
+                    "type": "number",
+                    "default": 30,
+                    "min": 5,
+                    "max": 300,
+                },
+                {
+                    "key": "max_timeout",
+                    "label": "Max Timeout (seconds)",
+                    "type": "number",
+                    "default": 60,
+                    "min": 10,
+                    "max": 300,
+                },
+            ]
+        },
+    },
+
+    {
         "name": "upload_image",
         "display_name": "Upload Image",
         "description": "Upload images from the workspace or a URL to ImageKit CDN and get a public URL. Useful for sharing images externally or embedding them in reports.",

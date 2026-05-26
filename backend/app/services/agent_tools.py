@@ -2392,6 +2392,7 @@ _TOOL_AUTONOMY_MAP = {
     "execute_code": "execute_code",
     "sql_execute": "sql_execute",
     "execute_code_e2b": "execute_code",
+    "execute_code_aio": "execute_code",
 }
 
 
@@ -2465,7 +2466,7 @@ async def _execute_tool_direct(
                 )
                 await _wdb.commit()
             return f"✅ {move_result.message}" if move_result.ok else f"❌ {move_result.message}"
-        elif tool_name in ("execute_code", "execute_code_e2b"):
+        elif tool_name in ("execute_code", "execute_code_e2b", "execute_code_aio"):
             logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
             return await _execute_code(agent_id, ws, arguments, tool_name=tool_name)
         elif tool_name == "sql_execute":
@@ -2841,7 +2842,7 @@ async def execute_tool(
             result = await _plaza_create_post(agent_id, arguments)
         elif tool_name == "plaza_add_comment":
             result = await _plaza_add_comment(agent_id, arguments)
-        elif tool_name in ("execute_code", "execute_code_e2b"):
+        elif tool_name in ("execute_code", "execute_code_e2b", "execute_code_aio"):
             logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
             result = await _execute_code(agent_id, ws, arguments, tool_name=tool_name)
         elif tool_name == "sql_execute":
@@ -7441,9 +7442,10 @@ async def _execute_code(
         agent_id: The agent's UUID (used to fetch per-agent tool config).
         ws: Agent workspace root path.
         arguments: Tool call arguments (language, code, timeout).
-        tool_name: The originating tool name — either 'execute_code' (local)
-                   or 'execute_code_e2b' (cloud).  Used to look up the
-                   correct per-agent tool config entry in the database.
+        tool_name: The originating tool name — 'execute_code' (local subprocess),
+                   'execute_code_e2b' (E2B cloud), or 'execute_code_aio'
+                   (self-hosted AIO sandbox).  Used to look up the correct
+                   per-agent tool config entry in the database.
     """
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
@@ -7460,9 +7462,10 @@ async def _execute_code(
     work_dir = ws.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # For E2B tool: do NOT fall back to local subprocess on error —
-    # the user explicitly chose cloud execution.
-    is_e2b_tool = (tool_name == "execute_code_e2b")
+    # These tools are an explicit choice of a non-subprocess sandbox; if their
+    # config or runtime is broken, surface the error rather than silently
+    # falling back to local subprocess execution.
+    is_explicit_remote_sandbox = tool_name in ("execute_code_e2b", "execute_code_aio")
 
     try:
         # Import here to avoid circular imports
@@ -7496,17 +7499,17 @@ async def _execute_code(
 
     except ValueError as e:
         # Sandbox disabled or misconfigured
-        if is_e2b_tool:
+        if is_explicit_remote_sandbox:
             # Do not silently fall back — surface the config error to the user
-            return f"❌ E2B sandbox configuration error: {str(e)[:300]}\nPlease check the API key in the tool settings."
+            return f"❌ Sandbox configuration error: {str(e)[:300]}\nPlease check the tool settings."
         logger.warning(f"[Sandbox] Config issue, falling back to legacy subprocess: {e}")
         return await _execute_code_legacy(ws, arguments)
 
     except Exception as e:
         logger.exception(f"[Sandbox] Execution failed for agent {agent_id} (tool={tool_name})")
-        if is_e2b_tool:
+        if is_explicit_remote_sandbox:
             # Do not silently fall back to local execution
-            return f"❌ E2B execution error: {str(e)[:200]}"
+            return f"❌ Sandbox execution error: {str(e)[:200]}"
         # For local tool: try legacy subprocess as last resort
         try:
             return await _execute_code_legacy(ws, arguments)
