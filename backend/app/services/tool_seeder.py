@@ -987,8 +987,12 @@ BUILTIN_TOOLS = [
             "imports, environment variables, and `cd` do NOT carry over between "
             "calls; include all setup in every call. For long outputs (e.g. "
             "pip list) the stdout is truncated to 10000 chars; prefer narrow "
-            "queries (pip show <pkg>, ls workspace) over full listings. Timeouts: "
-            "default 30s, max 60s; subprocess has no internet by default."
+            "queries (pip show <pkg>, ls workspace) over full listings. "
+            "Timeouts: pass `timeout=<seconds>` per call to pick your own "
+            "budget (default 30s, platform safety cap 300s). Pick short for "
+            "echo/ls (30s), medium for pip install of small pkgs (60s), "
+            "longer for large compiles or big data work (180-300s). "
+            "Subprocess has no internet by default."
         ),
         "category": "code",
         "icon": "💻",
@@ -998,7 +1002,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
                 "code": {"type": "string", "description": "Code to execute"},
-                "timeout": {"type": "integer", "description": "Max execution time in seconds (default 30, max 60)"},
+                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Choose based on task complexity (default 30, platform cap 300; e.g. 30 for short commands, 60-180 for pip/npm install, 180-300 for heavy compiles or data work)."},
             },
             "required": ["language", "code"],
         },
@@ -1008,7 +1012,7 @@ BUILTIN_TOOLS = [
             "memory_limit": "256m",
             "allow_network": True,
             "default_timeout": 30,
-            "max_timeout": 60,
+            "max_timeout": 300,
         },
         "config_schema": {
             "fields": [
@@ -1064,7 +1068,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
                 "code": {"type": "string", "description": "Code to execute"},
-                "timeout": {"type": "integer", "description": "Max execution time in seconds (default 30, max 60)"},
+                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Choose based on task complexity (default 30, platform cap 300; e.g. 30 for short commands, 60-180 for pip/npm install, 180-300 for heavy compiles or data work)."},
             },
             "required": ["language", "code"],
         },
@@ -1072,7 +1076,7 @@ BUILTIN_TOOLS = [
             "sandbox_type": "e2b",
             "api_key": "",
             "default_timeout": 30,
-            "max_timeout": 60,
+            "max_timeout": 300,
         },
         "config_schema": {
             "fields": [
@@ -1159,8 +1163,14 @@ BUILTIN_TOOLS = [
             "is a sandbox-server-side failure — simplify the input or split "
             "into smaller calls; it is not a bug in your code.\n"
             "\n"
-            "• Timeouts: default 30s, max 60s per call. Internet access is "
-            "available. Requires the aio-sandbox container to be running."
+            "• Timeouts: pass `timeout=<seconds>` per call to pick your own "
+            "budget (default 30s if omitted, platform safety cap 300s). "
+            "Guidance: echo/pwd/short python = 30s; pip/npm install of small "
+            "packages or git clone of small repos = 60s; apt install (sudo) "
+            "or git clone of medium repos = 120-180s; heavy data crunch, "
+            "matplotlib chart generation, or installing scipy/pandas-stack "
+            "= 180-300s. Internet access is available. Requires the "
+            "aio-sandbox container to be running."
         ),
         "category": "code",
         "icon": "📦",
@@ -1170,7 +1180,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
                 "code": {"type": "string", "description": "Code to execute"},
-                "timeout": {"type": "integer", "description": "Max execution time in seconds (default 30, max 60)"},
+                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Choose based on task complexity (default 30, platform cap 300; e.g. 30 for short commands, 60-180 for pip/npm install, 180-300 for heavy compiles or data work)."},
             },
             "required": ["language", "code"],
         },
@@ -1179,7 +1189,7 @@ BUILTIN_TOOLS = [
             "api_url": "http://aio-sandbox:8080",
             "api_key": "",
             "default_timeout": 30,
-            "max_timeout": 60,
+            "max_timeout": 300,
         },
         "config_schema": {
             "fields": [

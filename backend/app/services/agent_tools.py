@@ -7456,7 +7456,10 @@ async def _execute_code(
     """
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
-    timeout = min(arguments.get("timeout", 30), 60)  # Max 60 seconds
+    # Platform safety cap (~5 min). The agent is expected to choose its own
+    # timeout based on the task; this is just the upper bound so a runaway
+    # pip-install / git-clone / data-crunch can't hold the WS open forever.
+    timeout = min(arguments.get("timeout", 30), 300)
 
     if not code.strip():
         return "❌ No code provided"
@@ -7531,7 +7534,8 @@ async def _execute_code_legacy(ws: Path, arguments: dict) -> str:
 
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
-    timeout = min(arguments.get("timeout", 30), 60)
+    # Platform safety cap aligned with the primary _execute_code path.
+    timeout = min(arguments.get("timeout", 30), 300)
 
     if not code.strip():
         return "❌ No code provided"
