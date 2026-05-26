@@ -2377,6 +2377,13 @@ async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
 
 # ─── Tool Executors ─────────────────────────────────────────────
 
+# All tool names that route to the _execute_code handler.
+_CODE_EXEC_TOOL_NAMES: frozenset[str] = frozenset({"execute_code", "execute_code_e2b", "execute_code_aio"})
+
+# Subset of _CODE_EXEC_TOOL_NAMES that must NOT silently fall back to local subprocess
+# when their config or runtime is broken — the user made an explicit choice.
+_REMOTE_SANDBOX_TOOL_NAMES: frozenset[str] = frozenset({"execute_code_e2b", "execute_code_aio"})
+
 # Mapping from tool_name to autonomy action_type used for policy lookup and notifications.
 # Each tool name maps to the action_type key in the agent's autonomy_policy dict.
 # Using the tool's own name avoids misleading notification titles (e.g. showing
@@ -2466,7 +2473,7 @@ async def _execute_tool_direct(
                 )
                 await _wdb.commit()
             return f"✅ {move_result.message}" if move_result.ok else f"❌ {move_result.message}"
-        elif tool_name in ("execute_code", "execute_code_e2b", "execute_code_aio"):
+        elif tool_name in _CODE_EXEC_TOOL_NAMES:
             logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
             return await _execute_code(agent_id, ws, arguments, tool_name=tool_name)
         elif tool_name == "sql_execute":
@@ -2842,7 +2849,7 @@ async def execute_tool(
             result = await _plaza_create_post(agent_id, arguments)
         elif tool_name == "plaza_add_comment":
             result = await _plaza_add_comment(agent_id, arguments)
-        elif tool_name in ("execute_code", "execute_code_e2b", "execute_code_aio"):
+        elif tool_name in _CODE_EXEC_TOOL_NAMES:
             logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
             result = await _execute_code(agent_id, ws, arguments, tool_name=tool_name)
         elif tool_name == "sql_execute":
@@ -7465,7 +7472,7 @@ async def _execute_code(
     # These tools are an explicit choice of a non-subprocess sandbox; if their
     # config or runtime is broken, surface the error rather than silently
     # falling back to local subprocess execution.
-    is_explicit_remote_sandbox = tool_name in ("execute_code_e2b", "execute_code_aio")
+    is_explicit_remote_sandbox = tool_name in _REMOTE_SANDBOX_TOOL_NAMES
 
     try:
         # Import here to avoid circular imports
