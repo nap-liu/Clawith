@@ -412,6 +412,12 @@ export default function WorkspaceOperationPanel({
     const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
     const [revisions, setRevisions] = useState<any[]>([]);
     const [fileTree, setFileTree] = useState<WorkspaceFileNode[]>([]);
+    // Track which directories have already had their children fetched, and
+    // which are currently fetching. Used so a large workspace (think: a
+    // freshly-cloned ant-design repo) doesn't trigger thousands of
+    // /api/agents/<id>/files/?path=... calls on first render.
+    const [loadedDirs, setLoadedDirs] = useState<Set<string>>(() => new Set());
+    const [loadingDirs, setLoadingDirs] = useState<Set<string>>(() => new Set());
     const [activityOpenLocal, setActivityOpenLocal] = useState(false);
     const activityOpen = activityOpenProp ?? activityOpenLocal;
     const setActivityOpen = onActivityToggle ?? setActivityOpenLocal;
@@ -488,17 +494,51 @@ export default function WorkspaceOperationPanel({
         }
     };
 
+    // Load only the root level on mount / refresh. Subdirectories are fetched
+    // lazily by `expandDir` when the user clicks a directory's chevron — this
+    // avoids the prior behavior of recursively walking up to 4 levels deep on
+    // first render, which produced thousands of file-list requests for large
+    // repos cloned into workspace/.
     const loadFileTree = async () => {
-        const loadDir = async (path: string, depth: number): Promise<WorkspaceFileNode[]> => {
-            if (depth > 4) return [];
-        const items = await fileApi.list(agentId, path).catch(() => []);
-        return Promise.all(items.map(async (item: WorkspaceFileNode) => {
-            if (!item.is_dir) return item;
-            return { ...item, children: await loadDir(item.path, depth + 1) };
-        }));
-        };
-        const roots = await loadDir(treeScope === 'workspace' ? WORKSPACE_ROOT : '', 0);
-        setFileTree(roots);
+        const rootPath = treeScope === 'workspace' ? WORKSPACE_ROOT : '';
+        const items = await fileApi.list(agentId, rootPath).catch(() => []);
+        setFileTree(items);
+        setLoadedDirs(new Set([rootPath]));
+        setLoadingDirs(new Set());
+    };
+
+    // Update a node in the (possibly nested) fileTree by path, attaching the
+    // freshly-fetched children. Immutable update so React state diff'ing fires.
+    const attachChildrenAt = (
+        nodes: WorkspaceFileNode[],
+        targetPath: string,
+        children: WorkspaceFileNode[],
+    ): WorkspaceFileNode[] => nodes.map((node) => {
+        if (node.path === targetPath) return { ...node, children };
+        if (node.is_dir && node.children) {
+            return { ...node, children: attachChildrenAt(node.children, targetPath, children) };
+        }
+        return node;
+    });
+
+    // Lazy-load a single directory's immediate children. Idempotent: a second
+    // call for the same path while a fetch is in flight is a no-op, and once a
+    // directory is in `loadedDirs` we never refetch (use a manual refresh to
+    // pick up new files).
+    const expandDir = async (dirPath: string) => {
+        if (loadedDirs.has(dirPath) || loadingDirs.has(dirPath)) return;
+        setLoadingDirs((prev) => new Set(prev).add(dirPath));
+        try {
+            const children = await fileApi.list(agentId, dirPath).catch(() => []);
+            setFileTree((tree) => attachChildrenAt(tree, dirPath, children));
+            setLoadedDirs((prev) => new Set(prev).add(dirPath));
+        } finally {
+            setLoadingDirs((prev) => {
+                const next = new Set(prev);
+                next.delete(dirPath);
+                return next;
+            });
+        }
     };
 
     useEffect(() => {
@@ -1145,6 +1185,7 @@ export default function WorkspaceOperationPanel({
         if (node.is_dir) {
             const expanded = expandedDirs.has(node.path);
             const dirSelected = selectedDirPath === node.path;
+            const isLoading = loadingDirs.has(node.path);
             return (
                 <div key={node.path || node.name}>
                     <div className={`workspace-op-tree-dir ${dirSelected ? 'active' : ''}`} style={{ paddingLeft: `${6 + depth * 12}px` }}>
@@ -1152,6 +1193,13 @@ export default function WorkspaceOperationPanel({
                             className="workspace-op-tree-dir-main"
                             onClick={() => {
                                 setSelectedDirPath(node.path);
+                                // Lazy-fetch children the first time the user
+                                // opens this directory. fire-and-forget so the
+                                // chevron flips immediately; the children render
+                                // once attachChildrenAt updates state.
+                                if (!expanded) {
+                                    void expandDir(node.path);
+                                }
                                 setExpandedDirs((prev) => {
                                     const next = new Set(prev);
                                     if (next.has(node.path)) next.delete(node.path);
@@ -1160,7 +1208,9 @@ export default function WorkspaceOperationPanel({
                                 });
                             }}
                         >
-                            <span className="workspace-op-tree-chevron">{expanded ? '▾' : '▸'}</span>
+                            <span className="workspace-op-tree-chevron">
+                                {isLoading ? '◌' : (expanded ? '▾' : '▸')}
+                            </span>
                             <span>{node.name}</span>
                         </button>
                         {node.path !== WORKSPACE_ROOT && node.path !== SKILLS_ROOT && node.path !== MEMORY_ROOT && node.path !== ENTERPRISE_ROOT && canModifyPath(node.path) && (
