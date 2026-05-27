@@ -55,6 +55,8 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       # Password reset token lifetime in minutes (default: 30)
       PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-30}
+      # Per-skill total file size limit in bytes (install_skill, ClawHub/GitHub fetch). Default 500 KB.
+      MAX_SKILL_SIZE: ${MAX_SKILL_SIZE:-512000}
     volumes:
       - ./backend:/app
       - ./backend/agent_data:/data/agents

@@ -26,7 +26,7 @@ CLAWHUB_BASE = os.getenv("CLAWHUB_BASE", "https://clawhub.ai/api").rstrip("/")
 CLAWHUB_MIRROR_BASE = os.getenv("CLAWHUB_MIRROR_BASE", "https://cn.clawhub-mirror.com/api").rstrip("/")
 GITHUB_API = "https://api.github.com"
 
-MAX_SKILL_SIZE = 512_000  # 500 KB total limit per skill
+MAX_SKILL_SIZE = int(os.getenv("MAX_SKILL_SIZE", "512000"))  # bytes; default 500 KB, override via env
 
 
 async def _get_tenant_setting(tenant_id: str | None, key: str) -> str:
