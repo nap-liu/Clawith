@@ -218,7 +218,7 @@ async def test_agent_relationship_status_requires_original_creator_to_still_mana
 
     assert status["access_allowed"] is False
     assert status["access_status"] == "restricted"
-    assert status["access_status_reason"] == "relationship_creator_no_longer_manages_both_agents"
+    assert status["access_status_reason"] == "relationship_creator_no_longer_has_access_to_both_agents"
 
 
 @pytest.mark.asyncio
@@ -248,10 +248,13 @@ async def test_agent_relationship_status_active_when_original_creator_still_mana
         created_by_user_id=creator_id,
     )
 
-    async def can_manage(_db, user_id, _agent):
+    async def can_access(_db, user_id, _agent):
         return user_id == creator_id
 
-    monkeypatch.setattr(permissions, "user_can_manage_agent_id", can_manage)
+    # Source side checks manage; target side now checks view (manage implies view,
+    # so a creator who manages both passes both gates).
+    monkeypatch.setattr(permissions, "user_can_manage_agent_id", can_access)
+    monkeypatch.setattr(permissions, "user_can_view_agent_id", can_access)
 
     status = await permissions.evaluate_agent_relationship_status(
         _RelationshipStatusDb(source),

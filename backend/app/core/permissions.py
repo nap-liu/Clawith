@@ -135,6 +135,20 @@ async def user_can_manage_agent_id(
     return (await get_agent_access_level_for_user_id(db, user_id, agent)) == "manage"
 
 
+async def user_can_view_agent_id(
+    db: AsyncSession,
+    user_id: uuid.UUID | None,
+    agent: Agent,
+) -> bool:
+    """Whether a user can *see* an agent (any access level, not just manage).
+
+    Visibility is the superset of manageability (``manage`` implies ``view``),
+    and is equivalent to ``build_visible_agents_query`` membership: a user sees
+    their own agents, company agents, and custom agents they're rostered on.
+    """
+    return (await get_agent_access_level_for_user_id(db, user_id, agent)) is not None
+
+
 async def get_agent_accessible_user_ids(db: AsyncSession, agent: Agent) -> set[uuid.UUID]:
     """Return platform users who can access an agent under current policy."""
     access_mode = getattr(agent, "access_mode", None) or "company"
@@ -220,7 +234,9 @@ async def evaluate_agent_relationship_status(
 
     created_by_user_id = getattr(rel, "created_by_user_id", None)
     if created_by_user_id:
-        if await user_can_manage_agent_id(db, created_by_user_id, source) and await user_can_manage_agent_id(db, created_by_user_id, target):
+        # Source must still be MANAGED by the creator; target need only be VISIBLE
+        # (relationship is directional source->target, target is not mutated).
+        if await user_can_manage_agent_id(db, created_by_user_id, source) and await user_can_view_agent_id(db, created_by_user_id, target):
             return {
                 "access_allowed": True,
                 "access_status": "active",
@@ -229,7 +245,7 @@ async def evaluate_agent_relationship_status(
         return {
             "access_allowed": False,
             "access_status": "restricted",
-            "access_status_reason": "relationship_creator_no_longer_manages_both_agents",
+            "access_status_reason": "relationship_creator_no_longer_has_access_to_both_agents",
         }
 
     target_mode = getattr(target, "access_mode", None) or "company"
@@ -249,7 +265,7 @@ async def evaluate_agent_relationship_status(
         if not user_id or user_id in seen:
             continue
         seen.add(user_id)
-        if await user_can_manage_agent_id(db, user_id, source) and await user_can_manage_agent_id(db, user_id, target):
+        if await user_can_manage_agent_id(db, user_id, source) and await user_can_view_agent_id(db, user_id, target):
             return {
                 "access_allowed": True,
                 "access_status": "active",

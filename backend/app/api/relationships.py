@@ -61,10 +61,6 @@ def _display_provider_name(provider_name: str | None, provider_type: str | None)
     return provider_name
 
 
-async def _can_manage_agent(db: AsyncSession, user_id: uuid.UUID, agent: Agent) -> bool:
-    return (await get_agent_access_level_for_user_id(db, user_id, agent)) == "manage"
-
-
 # ─── Schemas ───────────────────────────────────────────
 
 class RelationshipIn(BaseModel):
@@ -422,12 +418,12 @@ async def search_visible_agents(
             )
         )
 
+    # Candidates are everything VISIBLE to the user — managing the target is not
+    # required to relate the (managed) source agent to it. ``can_manage`` is a
+    # cheap display hint (creator/admin) so the UI need not issue per-agent queries.
     result = await db.execute(stmt.order_by(Agent.created_at.desc()).limit(50))
-    agents = [
-        agent
-        for agent in result.scalars().all()
-        if await _can_manage_agent(db, current_user.id, agent)
-    ]
+    agents = result.scalars().all()
+    is_admin = current_user.role in ("platform_admin", "org_admin")
     return [
         {
             "id": str(agent.id),
@@ -436,7 +432,7 @@ async def search_visible_agents(
             "avatar_url": agent.avatar_url or "",
             "creator_id": str(agent.creator_id),
             "access_mode": getattr(agent, "access_mode", None) or "company",
-            "can_manage": True,
+            "can_manage": bool(is_admin or agent.creator_id == current_user.id),
         }
         for agent in agents
     ]
@@ -518,9 +514,10 @@ async def save_agent_relationships(
         )
         target_agent = target_result.scalar_one_or_none()
         if not target_agent:
+            # Must be VISIBLE to the user; managing the target is not required since
+            # the relationship is directional (source -> target) and the user already
+            # manages the source (enforced by _can_manage_relationships above).
             raise HTTPException(status_code=403, detail="Target agent is not visible to the current user")
-        if not await _can_manage_agent(db, current_user.id, target_agent):
-            raise HTTPException(status_code=403, detail="You must manage both agents to create this relationship")
         existing = existing_by_target.get(target_id)
         db.add(AgentAgentRelationship(
             agent_id=agent_id,
