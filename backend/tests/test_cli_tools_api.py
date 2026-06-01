@@ -632,3 +632,60 @@ async def test_rollback_body_rejects_extra_keys():
             "version_id": str(uuid.uuid4()),
             "sha256": "a" * 64,  # not allowed
         })
+
+
+@pytest.mark.asyncio
+async def test_upload_binary_413_uses_configured_cap(monkeypatch, tmp_path):
+    """The upload endpoint enforces whatever ``_BINARY_MAX_BYTES`` is set to,
+    returning 413 with the byte count in the detail.
+
+    This is the production failure path: a binary above the cap yields
+    ``413 binary exceeds <N> bytes``. We shrink the module-level cap (the
+    same knob ``CLI_BINARY_MAX_BYTES`` drives) so a tiny shebang script is
+    already oversize, proving the limit is honoured end-to-end.
+    """
+    tool = _make_tool(config=CliToolConfig(binary=BinaryMetadata()).model_dump(mode="json"))
+    db = FakeDB(tool=tool)
+    user = _platform_admin()
+    monkeypatch.setattr(cli_tools_api, "_STORAGE_ROOT", tmp_path)
+    monkeypatch.setattr(cli_tools_api, "_BINARY_MAX_BYTES", 8)
+
+    payload = b"#!/bin/sh\necho hello\n"  # > 8 bytes
+
+    class _FakeUpload:
+        filename = "big.sh"
+        file = io.BytesIO(payload)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await upload_binary(
+            tool_id=tool.id,
+            file=_FakeUpload(),  # type: ignore[arg-type]
+            db=db,
+            user=user,
+        )
+    assert exc_info.value.status_code == 413
+    assert "exceeds 8 bytes" in str(exc_info.value.detail)
+
+
+def test_binary_max_bytes_configurable_via_env(monkeypatch):
+    """``_BINARY_MAX_BYTES`` reads ``CLI_BINARY_MAX_BYTES`` at import,
+    defaulting to 100 MiB when unset (mirrors ``MAX_SKILL_SIZE``).
+
+    Reloads the module under different env so the override path is exercised,
+    then restores the default so sibling tests see the unpatched constant.
+    """
+    import importlib
+
+    try:
+        monkeypatch.delenv("CLI_BINARY_MAX_BYTES", raising=False)
+        importlib.reload(cli_tools_api)
+        assert cli_tools_api._BINARY_MAX_BYTES == 100 * 1024 * 1024
+
+        monkeypatch.setenv("CLI_BINARY_MAX_BYTES", "314572800")  # 300 MiB
+        importlib.reload(cli_tools_api)
+        assert cli_tools_api._BINARY_MAX_BYTES == 314572800
+    finally:
+        # Restore the module to its default-env state regardless of outcome,
+        # so later tests in this process don't inherit a patched constant.
+        monkeypatch.delenv("CLI_BINARY_MAX_BYTES", raising=False)
+        importlib.reload(cli_tools_api)

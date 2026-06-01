@@ -25,6 +25,7 @@ surface.
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -60,7 +61,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tools/cli", tags=["cli-tools"])
 
-_BINARY_MAX_BYTES = 100 * 1024 * 1024
+# Upload size cap for CLI tool binaries, in bytes. Default 100 MiB; override
+# via the CLI_BINARY_MAX_BYTES env var so prod can raise it without a code
+# change (mirrors MAX_SKILL_SIZE). Node SEA / pkg / bun single-file builds
+# embed the JS runtime and routinely exceed 100 MiB, so large first-party
+# binaries need a higher cap. Read once at import — change it in compose/.env
+# and restart the backend to take effect.
+_BINARY_MAX_BYTES = int(os.getenv("CLI_BINARY_MAX_BYTES", str(100 * 1024 * 1024)))
 _STORAGE_ROOT = Path("/data/cli_binaries")
 
 

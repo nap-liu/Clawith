@@ -57,6 +57,9 @@ services:
       PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-30}
       # Per-skill total file size limit in bytes (install_skill, ClawHub/GitHub fetch). Default 500 KB.
       MAX_SKILL_SIZE: ${MAX_SKILL_SIZE:-512000}
+      # CLI tool binary upload size cap in bytes (POST /tools/cli/{id}/binary). Default 100 MiB.
+      # Raise for large Node SEA / pkg / bun single-file binaries (keep <= frontend nginx 500m).
+      CLI_BINARY_MAX_BYTES: ${CLI_BINARY_MAX_BYTES:-104857600}
     volumes:
       - ./backend:/app
       - ./backend/agent_data:/data/agents
