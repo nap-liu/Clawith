@@ -21,9 +21,13 @@ from app.services.feishu_service import feishu_service
 
 router = APIRouter(tags=["feishu"])
 
-# Default LLM timeout for Feishu channel (fallback when model has no request_timeout set).
-# The per-model request_timeout field takes precedence — see _get_llm_timeout().
-_LLM_TIMEOUT_SECONDS_DEFAULT = 180.0
+# IM channels render the agent's reply verbatim to the end user. When the LLM
+# layer returns one of its error sentinels we keep the ORIGINAL error visible
+# (operators/users need the concrete failure reason) and APPEND a short recovery
+# hint that guides the user to reset the session with /new.
+# (Front-end WebSocket chat does NOT go through this module, so it is unaffected.)
+_LLM_ERROR_PREFIXES = ("[LLM Error]", "[LLM call error]", "[Error]")
+_IM_LLM_RECOVERY_HINT = "\n\n———\n如果反复出现此问题，请发送 /new 开启新对话后重试。"
 
 # Number of tool status lines to keep visible in the Feishu card.
 # Shows the last N non-running lines plus any active "running" entry.
@@ -132,19 +136,6 @@ def _normalize_history_messages(history: list[dict] | None) -> list[dict]:
             continue
         normalized.append(msg)
     return normalized
-
-
-def _get_llm_timeout(model) -> float:
-    """Get effective LLM timeout for the Feishu channel.
-
-    Prefer the model-level request_timeout so each model can have its own
-    budget (local vLLM may need 300 s, cloud APIs often need only 60 s).
-    Falls back to _LLM_TIMEOUT_SECONDS_DEFAULT when the field is absent or zero.
-    """
-    timeout = getattr(model, "request_timeout", None)
-    if timeout and float(timeout) > 0:
-        return float(timeout)
-    return _LLM_TIMEOUT_SECONDS_DEFAULT
 
 
 class _SerialPatchQueue:
@@ -1672,7 +1663,7 @@ async def _call_agent_llm(
     """
     from app.models.agent import Agent
     from app.models.llm import LLMModel
-    from app.services.llm import call_llm
+    from app.services.llm import call_llm_with_failover
 
     # Load agent and model
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -1721,102 +1712,38 @@ async def _call_agent_llm(
     # Use actual user_id so the system prompt knows who it's chatting with
     effective_user_id = user_id or agent_id
 
-    # Determine effective timeout: prefer model-level setting, else use module default.
-    _timeout = _get_llm_timeout(model)
+    # Reuse the unified, failover-aware caller — the SAME path as the WebSocket
+    # chat endpoint, so every provider behaves identically on both surfaces.
+    #
+    # IMPORTANT: do NOT wrap this in an outer ``asyncio.wait_for``. That would cap
+    # the ENTIRE multi-round tool-calling loop with one budget and kill long-but-
+    # healthy conversations — the root cause of the channel-wide
+    # "Model response timed out (>180s)" errors. Per-request timeouts already live
+    # inside call_llm (the httpx client timeout), and the loop is bounded by the
+    # agent's ``max_tool_rounds``.
+    reply = await call_llm_with_failover(
+        primary_model=model,
+        fallback_model=fallback_model,
+        messages=messages,
+        agent_name=agent.name,
+        role_description=agent.role_description or "",
+        agent_id=agent_id,
+        user_id=effective_user_id,
+        session_id=session_id,
+        on_chunk=on_chunk,
+        on_thinking=on_thinking,
+        on_tool_call=on_tool_call,
+        supports_vision=getattr(model, "supports_vision", False),
+        is_group=is_group,
+    )
 
-    try:
-        reply = await asyncio.wait_for(
-            call_llm(
-                model,
-                messages,
-                agent.name,
-                agent.role_description or "",
-                agent_id=agent_id,
-                user_id=effective_user_id,
-                session_id=session_id,
-                supports_vision=getattr(model, 'supports_vision', False),
-                on_chunk=on_chunk,
-                on_thinking=on_thinking,
-                on_tool_call=on_tool_call,
-                is_group=is_group,
-            ),
-            timeout=_timeout,
-        )
-        return reply
-    except asyncio.TimeoutError:
+    # IM channels render this reply directly to the end user. Keep the original
+    # error sentinel visible (it carries the concrete failure reason) and append
+    # a short recovery hint that guides the user to reset the session with /new.
+    if reply and any(reply.startswith(p) for p in _LLM_ERROR_PREFIXES):
         logger.error(
-            f"[LLM] Call timed out after {_timeout}s "
-            f"(agent_id={agent_id}, model={getattr(model, 'model', 'unknown')})"
+            f"[Channel] LLM error surfaced on IM channel "
+            f"(agent_id={agent_id}, model={getattr(model, 'model', 'unknown')}): {reply[:200]}"
         )
-        if fallback_model:
-            # Use the fallback model's own timeout budget.
-            _fb_timeout = _get_llm_timeout(fallback_model)
-            logger.info(f"[LLM] Retrying timed-out request with fallback model: {fallback_model.model} (timeout={_fb_timeout}s)")
-            try:
-                reply = await asyncio.wait_for(
-                    call_llm(
-                        fallback_model,
-                        messages,
-                        agent.name,
-                        agent.role_description or "",
-                        agent_id=agent_id,
-                        user_id=effective_user_id,
-                        session_id=session_id,
-                        supports_vision=getattr(fallback_model, 'supports_vision', False),
-                        on_chunk=on_chunk,
-                        on_thinking=on_thinking,
-                        on_tool_call=on_tool_call,
-                        is_group=is_group,
-                    ),
-                    timeout=_fb_timeout,
-                )
-                return reply
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"[LLM] Fallback call also timed out after {_fb_timeout}s "
-                    f"(agent_id={agent_id}, model={getattr(fallback_model, 'model', 'unknown')})"
-                )
-                return f"⚠️ Model response timed out (>{int(_fb_timeout)}s). Please retry or shorten your request."
-            except Exception as e2:
-                import traceback
-                traceback.print_exc()
-                return f"⚠️ Model error: Primary Timeout | Fallback: {str(e2)[:80]}"
-        return f"⚠️ Model response timed out (>{int(_timeout)}s). Please retry or shorten your request."
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        error_msg = str(e) or repr(e)
-        logger.error(f"[LLM] Primary model error: {error_msg}")
-        # Runtime fallback: primary model failed -> retry with fallback model
-        if fallback_model:
-            logger.info(f"[LLM] Retrying with fallback model: {fallback_model.model}")
-            try:
-                _fb_timeout = _get_llm_timeout(fallback_model)
-                reply = await asyncio.wait_for(
-                    call_llm(
-                        fallback_model,
-                        messages,
-                        agent.name,
-                        agent.role_description or "",
-                        agent_id=agent_id,
-                        user_id=effective_user_id,
-                        session_id=session_id,
-                        supports_vision=getattr(fallback_model, 'supports_vision', False),
-                        on_chunk=on_chunk,
-                        on_thinking=on_thinking,
-                        on_tool_call=on_tool_call,
-                        is_group=is_group,
-                    ),
-                    timeout=_fb_timeout,
-                )
-                return reply
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"[LLM] Fallback call timed out after {_fb_timeout}s "
-                    f"(agent_id={agent_id}, model={getattr(fallback_model, 'model', 'unknown')})"
-                )
-                return f"⚠️ Model error: Primary: {str(e)[:80]} | Fallback Timeout"
-            except Exception as e2:
-                traceback.print_exc()
-                return f"⚠️ Model error: Primary: {str(e)[:80]} | Fallback: {str(e2)[:80]}"
-        return f"⚠️ 调用模型出错: {error_msg[:150]}"
+        return reply + _IM_LLM_RECOVERY_HINT
+    return reply
