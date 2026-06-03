@@ -39,7 +39,7 @@
   }
 
   function startOAuth() {
-    var returnTo = location.origin + location.pathname; // 干净 URL（不含 query）
+    var returnTo = location.href.split("#")[0].split("?")[0]; // 干净 URL（不含 query/fragment，兼容 opaque origin）
     location.assign(API_BASE + "/api/sdk/auth/start?return_to=" + encodeURIComponent(returnTo));
     return new Promise(function () { /* 页面即将卸载，永不 resolve */ });
   }
@@ -50,7 +50,10 @@
     var code = params.get("code");
     var st = params.get("state");
     if (code && st) {
-      state.readyPromise = exchange(code, st);
+      state.readyPromise = exchange(code, st).catch(function (err) {
+        state.readyPromise = null; // 允许下次 ready() 重试
+        throw err;
+      });
     } else {
       state.readyPromise = startOAuth();
     }
@@ -63,7 +66,7 @@
     for (var k in payload) { if (Object.prototype.hasOwnProperty.call(payload, k)) body[k] = payload[k]; }
     // 自动注入 report 上下文（隔离 Reflection session 靠它定位是哪个报告）
     body.report = Object.assign({ short_id: shortIdFromUrl(), title: document.title }, payload.report || {});
-    return fetch(API_BASE + "/api/webhooks/t/" + encodeURIComponent(token), {
+    return fetch(API_BASE + "/api/webhooks/t/" + token, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
