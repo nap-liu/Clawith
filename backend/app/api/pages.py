@@ -54,11 +54,15 @@ async def render_page(short_id: str, db: AsyncSession = Depends(get_db)):
     )
     await db.commit()
 
+    csp = "sandbox allow-scripts allow-forms allow-popups allow-modals"
+    if "/sdk/clawith.js" in html_content:
+        # 引用了反馈 SDK 的报告：允许 SDK init 自动整页跳转去 OAuth
+        csp += " allow-top-navigation"
+
     return HTMLResponse(
         content=html_content,
         headers={
-            # CSP sandbox: isolates origin, prevents access to parent localStorage/cookies
-            "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups allow-modals",
+            "Content-Security-Policy": csp,
             "X-Content-Type-Options": "nosniff",
         },
     )
