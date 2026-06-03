@@ -11446,6 +11446,32 @@ def _resolve_sql_max_bytes() -> int:
     return DEFAULT_SQL_MAX_BYTES
 
 
+async def _bounded_collect(row_source, max_rows: int, max_bytes: int):
+    """Collect rows from an async row source under dual limits.
+
+    Stops when either max_rows or max_bytes is reached; sets truncated=True if
+    more rows exist beyond the limit (N+1: the source yielded one more row).
+    Always returns at least one row when the source is non-empty, even if that
+    single row exceeds max_bytes.
+
+    Returns (rows: list[tuple], truncated: bool).
+    """
+    rows: list = []
+    total_bytes = 0
+    truncated = False
+    async for row in row_source:
+        if len(rows) >= max_rows:
+            truncated = True  # N+1: one more row exists beyond the cap
+            break
+        row_bytes = sum(len(str(v)) for v in row)
+        if rows and total_bytes + row_bytes > max_bytes:
+            truncated = True
+            break
+        rows.append(tuple(row))
+        total_bytes += row_bytes
+    return rows, truncated
+
+
 async def _sql_execute(arguments: dict) -> str:
     """Execute SQL on any database via connection URI."""
     import asyncio
