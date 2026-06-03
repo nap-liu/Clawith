@@ -11422,7 +11422,7 @@ HARD_SQL_MAX_ROWS = 50_000
 DEFAULT_SQL_MAX_BYTES = 16 * 1024 * 1024
 HARD_SQL_MAX_BYTES = 64 * 1024 * 1024
 SQL_DISPLAY_CHAR_BUDGET = 64_000
-SQL_FETCH_BATCH = 1_000  # streaming fetch batch size (used by DB backends in a later task)
+SQL_FETCH_BATCH = 1_000  # streaming fetch batch size for all DB backends
 
 
 def _clamp_sql_max_rows(raw) -> int:
@@ -11463,7 +11463,7 @@ async def _bounded_collect(row_source, max_rows: int, max_bytes: int):
         if len(rows) >= max_rows:
             truncated = True  # N+1: one more row exists beyond the cap
             break
-        row_bytes = sum(len(str(v)) for v in row)
+        row_bytes = sum(len(str(v)) for v in row)  # char-count approximation; CJK uses more real bytes — max_rows + host swap are the primary guards
         if rows and total_bytes + row_bytes > max_bytes:
             truncated = True
             break
@@ -11660,7 +11660,7 @@ def _format_sql_result(columns: list, rows: list, truncated: bool, max_rows: int
 
     if truncated:
         result += (
-            f"\n\n⚠️ 已达硬上限:返回 {len(rows)} 行,可能还有更多,结果不完整。\n"
+            f"\n\n⚠️ 已达返回上限:返回 {len(rows)} 行,可能还有更多,结果不完整。\n"
             f"请勿基于这些行做整体统计/计数/求和 —— 数据不全。\n"
             f"建议在 SQL 内聚合,例如:\n"
             f"  SELECT col, COUNT(*), SUM(x) FROM t GROUP BY col;\n"

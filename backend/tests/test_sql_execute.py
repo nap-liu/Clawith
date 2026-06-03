@@ -79,12 +79,12 @@ def test_format_normal_rows_no_truncation():
     out = _format_sql_result(["id"], [(1,), (2,)], truncated=False, max_rows=5000)
     assert "id" in out
     assert "(2 rows)" in out
-    assert "硬上限" not in out
+    assert "返回上限" not in out
 
 
 def test_format_truncated_appends_aggregation_guidance():
     out = _format_sql_result(["id"], [(1,), (2,)], truncated=True, max_rows=5000)
-    assert "硬上限" in out
+    assert "返回上限" in out
     assert "GROUP BY" in out
     assert "max_rows" in out
     assert "50000" in out
@@ -116,7 +116,7 @@ async def test_sqlite_select_under_limit():
         out = await _sql_execute({"connection_string": f"sqlite:///{path}",
                                   "sql": "SELECT * FROM t"})
         assert "(5 rows)" in out
-        assert "硬上限" not in out
+        assert "返回上限" not in out
     finally:
         os.remove(path)
 
@@ -132,7 +132,7 @@ async def test_sqlite_select_hits_max_rows_and_warns():
                                 "sql": f"INSERT INTO t VALUES ({i})"})
         out = await _sql_execute({"connection_string": f"sqlite:///{path}",
                                   "sql": "SELECT * FROM t", "max_rows": 3})
-        assert "硬上限" in out
+        assert "返回上限" in out
         assert "GROUP BY" in out
     finally:
         os.remove(path)
@@ -145,7 +145,7 @@ async def test_sqlite_non_query_statement_reports_rows_affected():
         out = await _sql_execute({"connection_string": f"sqlite:///{path}",
                                   "sql": "CREATE TABLE t (id INTEGER)"})
         assert "executed successfully" in out
-        assert "硬上限" not in out
+        assert "返回上限" not in out
     finally:
         os.remove(path)
 
