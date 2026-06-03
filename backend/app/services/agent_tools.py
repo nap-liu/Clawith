@@ -11473,7 +11473,13 @@ async def _bounded_collect(row_source, max_rows: int, max_bytes: int):
 
 
 async def _sql_execute(arguments: dict) -> str:
-    """Execute SQL on any database via connection URI."""
+    """Execute SQL on any database via connection URI.
+
+    Parses and clamps max_rows (default DEFAULT_SQL_MAX_ROWS, hard ceiling HARD_SQL_MAX_ROWS)
+    and resolves max_bytes (env-overridable, hard ceiling HARD_SQL_MAX_BYTES), then passes both
+    through to the DB-specific backend so that streaming and dual-limit enforcement are active
+    for every engine.
+    """
     import asyncio
 
     connection_string = arguments.get("connection_string", "").strip()
