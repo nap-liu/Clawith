@@ -3,6 +3,7 @@ from app.services.agent_tools import (
     _clamp_sql_max_rows,
     DEFAULT_SQL_MAX_ROWS,
     HARD_SQL_MAX_ROWS,
+    SQL_DISPLAY_CHAR_BUDGET,
 )
 
 
@@ -64,3 +65,34 @@ async def test_bounded_collect_always_returns_at_least_one_row():
     rows, truncated = await _bounded_collect(_gen([("x" * 50,)]), max_rows=100, max_bytes=8)
     assert rows == [("x" * 50,)]
     assert truncated is False
+
+
+from app.services.agent_tools import _format_sql_result
+
+
+def test_format_empty_rows():
+    out = _format_sql_result(["id", "name"], [], truncated=False, max_rows=5000)
+    assert "0 rows" in out
+    assert "id, name" in out
+
+
+def test_format_normal_rows_no_truncation():
+    out = _format_sql_result(["id"], [(1,), (2,)], truncated=False, max_rows=5000)
+    assert "id" in out
+    assert "(2 rows)" in out
+    assert "硬上限" not in out
+
+
+def test_format_truncated_appends_aggregation_guidance():
+    out = _format_sql_result(["id"], [(1,), (2,)], truncated=True, max_rows=5000)
+    assert "硬上限" in out
+    assert "GROUP BY" in out
+    assert "max_rows" in out
+    assert "50000" in out
+
+
+def test_format_display_budget_limits_shown_rows():
+    rows = [("x" * 100,) for _ in range(2000)]
+    out = _format_sql_result(["c"], rows, truncated=False, max_rows=5000)
+    assert len(out) <= SQL_DISPLAY_CHAR_BUDGET + 2000
+    assert "展示前" in out

@@ -11586,38 +11586,48 @@ async def _sql_execute_postgres(connection_string: str, sql: str) -> str:
         await conn.close()
 
 
-def _format_sql_result(columns: list, rows: list, total_count: int) -> str:
-    """Format SQL query results as a readable table string."""
+def _format_sql_result(columns: list, rows: list, truncated: bool, max_rows: int) -> str:
+    """Format query rows as a text table, bounded by SQL_DISPLAY_CHAR_BUDGET.
+
+    Shows as many rows as fit the display char budget (so the result stays well
+    under the global tool-output budget and is never force-persisted), and
+    appends explicit truncation + aggregation guidance when the fetch hit a cap.
+    """
     if not rows:
         return f"Query returned 0 rows.\nColumns: {', '.join(columns)}"
 
-    # Convert all values to strings
-    str_rows = []
-    for row in rows:
-        str_rows.append([str(v) if v is not None else "NULL" for v in row])
-
-    # Calculate column widths (cap at 50 chars per column)
-    widths = [min(max(len(c), max((len(r[i]) for r in str_rows), default=0)), 50) for i, c in enumerate(columns)]
-
-    # Build table
+    str_rows = [[str(v) if v is not None else "NULL" for v in row] for row in rows]
+    widths = [
+        min(max(len(c), max((len(r[i]) for r in str_rows), default=0)), 50)
+        for i, c in enumerate(columns)
+    ]
     header = " | ".join(c.ljust(w) for c, w in zip(columns, widths))
     separator = "-+-".join("-" * w for w in widths)
-
     lines = [header, separator]
-    for row in str_rows[:100]:  # Display max 100 rows in formatted output
+    char_count = len(header) + len(separator) + 2
+    shown = 0
+    for row in str_rows:
         line = " | ".join(str(v)[:50].ljust(w) for v, w in zip(row, widths))
+        if char_count + len(line) + 1 > SQL_DISPLAY_CHAR_BUDGET:
+            break
         lines.append(line)
+        char_count += len(line) + 1
+        shown += 1
 
     result = "\n".join(lines)
-
-    if len(rows) > 100:
-        result += f"\n... ({len(rows)} rows total, showing first 100)"
+    if shown < len(rows):
+        result += f"\n(已 fetch {len(rows)} 行,展示前 {shown} 行)"
     else:
         result += f"\n({len(rows)} rows)"
 
-    if total_count > len(rows):
-        result += f"\n(Total matching: {total_count}, fetched: {len(rows)})"
-
+    if truncated:
+        result += (
+            f"\n\n⚠️ 已达硬上限:返回 {len(rows)} 行,可能还有更多,结果不完整。\n"
+            f"请勿基于这些行做整体统计/计数/求和 —— 数据不全。\n"
+            f"建议在 SQL 内聚合,例如:\n"
+            f"  SELECT col, COUNT(*), SUM(x) FROM t GROUP BY col;\n"
+            f"或加 WHERE/LIMIT 缩小范围;确需更多明细可传 max_rows(上限 {HARD_SQL_MAX_ROWS},当前 {max_rows})。"
+        )
     return result
 
 # ─── AgentBay: Browser Extract & Observe ────────────────────────────────
