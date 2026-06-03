@@ -11422,7 +11422,7 @@ HARD_SQL_MAX_ROWS = 50_000
 DEFAULT_SQL_MAX_BYTES = 16 * 1024 * 1024
 HARD_SQL_MAX_BYTES = 64 * 1024 * 1024
 SQL_DISPLAY_CHAR_BUDGET = 64_000
-SQL_FETCH_BATCH = 1_000
+SQL_FETCH_BATCH = 1_000  # streaming fetch batch size (used by DB backends in a later task)
 
 
 def _clamp_sql_max_rows(raw) -> int:
@@ -11440,7 +11440,7 @@ def _resolve_sql_max_bytes() -> int:
     override = os.environ.get("CLAWITH_SQL_MAX_BYTES")
     if override:
         try:
-            return min(int(override), HARD_SQL_MAX_BYTES)
+            return min(max(int(override), 64 * 1024), HARD_SQL_MAX_BYTES)
         except ValueError:
             pass
     return DEFAULT_SQL_MAX_BYTES
@@ -11521,7 +11521,7 @@ async def _sql_execute_sqlite(connection_string: str, sql: str) -> str:
             columns = [d[0] for d in cursor.description]
             rows = await cursor.fetchmany(500)
             await db.commit()
-            return _format_sql_result(columns, [tuple(r) for r in rows], cursor.rowcount)
+            return _format_sql_result(columns, [tuple(r) for r in rows], truncated=False, max_rows=DEFAULT_SQL_MAX_ROWS)
         else:
             await db.commit()
             return f"✅ Statement executed successfully. Rows affected: {cursor.rowcount}"
@@ -11550,7 +11550,7 @@ async def _sql_execute_mysql(connection_string: str, sql: str) -> str:
             if cursor.description:
                 columns = [d[0] for d in cursor.description]
                 rows = await cursor.fetchmany(500)
-                return _format_sql_result(columns, rows, cursor.rowcount)
+                return _format_sql_result(columns, rows, truncated=False, max_rows=DEFAULT_SQL_MAX_ROWS)
             else:
                 await conn.commit()
                 return f"✅ Statement executed successfully. Rows affected: {cursor.rowcount}"
@@ -11577,7 +11577,7 @@ async def _sql_execute_postgres(connection_string: str, sql: str) -> str:
             # Has columns — it's a query
             columns = [attr.name for attr in stmt.get_attributes()]
             rows = await stmt.fetch(500)
-            return _format_sql_result(columns, [tuple(r.values()) for r in rows], len(rows))
+            return _format_sql_result(columns, [tuple(r.values()) for r in rows], truncated=False, max_rows=DEFAULT_SQL_MAX_ROWS)
         else:
             # No columns — it's a statement
             result = await conn.execute(sql)

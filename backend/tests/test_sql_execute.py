@@ -28,7 +28,6 @@ def test_clamp_passes_valid_value():
     assert _clamp_sql_max_rows("3000") == 3000
 
 
-import pytest
 from app.services.agent_tools import _bounded_collect
 
 
@@ -94,5 +93,5 @@ def test_format_truncated_appends_aggregation_guidance():
 def test_format_display_budget_limits_shown_rows():
     rows = [("x" * 100,) for _ in range(2000)]
     out = _format_sql_result(["c"], rows, truncated=False, max_rows=5000)
-    assert len(out) <= SQL_DISPLAY_CHAR_BUDGET + 2000
+    assert len(out) <= SQL_DISPLAY_CHAR_BUDGET + 200
     assert "展示前" in out
