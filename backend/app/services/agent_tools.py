@@ -11530,8 +11530,11 @@ async def _sql_execute_sqlite(connection_string: str, sql: str, max_rows: int, m
                     for r in chunk:
                         yield tuple(r)
 
-            rows, truncated = await _bounded_collect(_source(), max_rows, max_bytes)
-            await db.commit()
+            _src = _source()
+            try:
+                rows, truncated = await _bounded_collect(_src, max_rows, max_bytes)
+            finally:
+                await _src.aclose()
             return _format_sql_result(columns, rows, truncated, max_rows)
         else:
             await db.commit()
@@ -11568,7 +11571,11 @@ async def _sql_execute_mysql(connection_string: str, sql: str, max_rows: int, ma
                         for r in chunk:
                             yield r
 
-                rows, truncated = await _bounded_collect(_source(), max_rows, max_bytes)
+                _src = _source()
+                try:
+                    rows, truncated = await _bounded_collect(_src, max_rows, max_bytes)
+                finally:
+                    await _src.aclose()
                 return _format_sql_result(columns, rows, truncated, max_rows)
             else:
                 await conn.commit()
@@ -11592,7 +11599,9 @@ async def _sql_execute_postgres(connection_string: str, sql: str, max_rows: int,
             columns = [attr.name for attr in stmt.get_attributes()]
             # asyncpg cursors must run inside a transaction.
             async with conn.transaction():
-                cur = await conn.cursor(sql)
+                # Reuse the prepared stmt (avoids a second PREPARE round-trip); the
+                # portal it opens is closed automatically when the transaction exits.
+                cur = await stmt.cursor()
 
                 async def _source():
                     while True:
@@ -11602,7 +11611,11 @@ async def _sql_execute_postgres(connection_string: str, sql: str, max_rows: int,
                         for r in chunk:
                             yield tuple(r.values())
 
-                rows, truncated = await _bounded_collect(_source(), max_rows, max_bytes)
+                _src = _source()
+                try:
+                    rows, truncated = await _bounded_collect(_src, max_rows, max_bytes)
+                finally:
+                    await _src.aclose()
             return _format_sql_result(columns, rows, truncated, max_rows)
         else:
             result = await conn.execute(sql)
