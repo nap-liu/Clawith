@@ -148,3 +148,13 @@ async def test_sqlite_non_query_statement_reports_rows_affected():
         assert "硬上限" not in out
     finally:
         os.remove(path)
+
+
+def test_seeder_sql_execute_declares_max_rows_and_guidance():
+    from app.services.tool_seeder import BUILTIN_TOOLS
+    sql_tool = next(t for t in BUILTIN_TOOLS if t["name"] == "sql_execute")
+    props = sql_tool["parameters_schema"]["properties"]
+    assert "max_rows" in props
+    desc = sql_tool["description"].lower()
+    assert "聚合" in sql_tool["description"] or "aggregate" in desc
+    assert "50000" in str(sql_tool["parameters_schema"]) or "50,000" in sql_tool["description"]

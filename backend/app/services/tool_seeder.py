@@ -2687,7 +2687,13 @@ BUILTIN_TOOLS = [
     {
         "name": "sql_execute",
         "display_name": "SQL Execute",
-        "description": "Connect to any SQL database and execute queries or statements. Supports MySQL, PostgreSQL, SQLite. Pass a standard connection URI and SQL statement.",
+        "description": (
+            "Connect to any SQL database and execute queries or statements. "
+            "Supports MySQL/StarRocks, PostgreSQL, SQLite via a standard connection URI. "
+            "结果有硬上限:默认返回最多 5000 行(可用 max_rows 调到 50000),超出会被截断并提示。"
+            "优先用聚合(COUNT/SUM/AVG/GROUP BY)在 SQL 内完成计算,不要拉取大量原始行在外部统计;"
+            "需要明细时加 WHERE/LIMIT 缩小范围。"
+        ),
         "category": "database",
         "icon": "🗄️",
         "is_default": False,
@@ -2696,7 +2702,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "connection_string": {
                     "type": "string",
-                    "description": "Database connection URI, e.g. mysql://user:pass@host:3306/db, postgresql://user:pass@host:5432/db, sqlite:///path/to/file.db",
+                    "description": "Database connection URI, e.g. mysql://user:pass@host:9030/db (StarRocks FE port), postgresql://user:pass@host:5432/db, sqlite:///path/to/file.db",
                 },
                 "sql": {
                     "type": "string",
@@ -2705,6 +2711,10 @@ BUILTIN_TOOLS = [
                 "timeout": {
                     "type": "integer",
                     "description": "Query timeout in seconds (default 30, max 120)",
+                },
+                "max_rows": {
+                    "type": "integer",
+                    "description": "Max detail rows to return (default 5000, hard cap 50000). 超出会截断并提示改用聚合。",
                 },
             },
             "required": ["connection_string", "sql"],
