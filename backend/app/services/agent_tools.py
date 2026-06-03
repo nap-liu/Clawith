@@ -11416,6 +11416,36 @@ async def _install_skill(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
 
 
 
+# ─── sql_execute memory-safe limits ─────────────────────────────────────
+DEFAULT_SQL_MAX_ROWS = 5_000
+HARD_SQL_MAX_ROWS = 50_000
+DEFAULT_SQL_MAX_BYTES = 16 * 1024 * 1024
+HARD_SQL_MAX_BYTES = 64 * 1024 * 1024
+SQL_DISPLAY_CHAR_BUDGET = 64_000
+SQL_FETCH_BATCH = 1_000
+
+
+def _clamp_sql_max_rows(raw) -> int:
+    """Clamp the agent-supplied max_rows into [1, HARD_SQL_MAX_ROWS]; default on garbage."""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_SQL_MAX_ROWS
+    return min(max(1, v), HARD_SQL_MAX_ROWS)
+
+
+def _resolve_sql_max_bytes() -> int:
+    """Per-fetch byte budget, env-overridable, clamped to the hard ceiling."""
+    import os
+    override = os.environ.get("CLAWITH_SQL_MAX_BYTES")
+    if override:
+        try:
+            return min(int(override), HARD_SQL_MAX_BYTES)
+        except ValueError:
+            pass
+    return DEFAULT_SQL_MAX_BYTES
+
+
 async def _sql_execute(arguments: dict) -> str:
     """Execute SQL on any database via connection URI."""
     import asyncio
