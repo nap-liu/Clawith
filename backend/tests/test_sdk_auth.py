@@ -1,6 +1,5 @@
 """Tests for SDK OAuth identity endpoints (sdk_auth.py)."""
 
-import time
 import pytest
 from urllib.parse import urlparse, parse_qs
 

@@ -65,6 +65,8 @@ def verify_sdk_state(state: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 async def _load_oauth2_provider(db: AsyncSession) -> OAuth2AuthProvider:
+    # 单租户/单 oauth2 provider 假设：报告读者匿名、无 tenant 上下文，故取唯一启用的 provider。
+    # 多租户部署需改为按 tenant_id 过滤（reader 的 tenant 可由 short_id 反查）。
     result = await db.execute(
         select(IdentityProvider).where(
             IdentityProvider.provider_type == "oauth2",
@@ -89,6 +91,8 @@ def _validate_return_to(return_to: str) -> str:
     u = urlparse(return_to)
     if u.scheme not in ("http", "https") or not u.netloc:
         raise HTTPException(status_code=400, detail="return_to must be an absolute http(s) URL")
+    if "@" in u.netloc:
+        raise HTTPException(status_code=400, detail="return_to host must not contain userinfo")
     if not _RETURN_PATH.match(u.path):
         raise HTTPException(status_code=400, detail="return_to must point to a /p/<short_id> page")
     allowed = settings.SDK_ALLOWED_RETURN_HOSTS
@@ -141,13 +145,17 @@ async def sdk_auth_exchange(req: ExchangeRequest, db: AsyncSession = Depends(get
     if token_resp.status_code != 200:
         logger.error(f"SDK OAuth token exchange failed HTTP {token_resp.status_code}: {token_resp.text}")
         raise HTTPException(status_code=502, detail="token exchange failed")
-    access_token = (token_resp.json() or {}).get("access_token")
+    try:
+        token_json = token_resp.json() or {}
+    except Exception:
+        raise HTTPException(status_code=502, detail="token exchange returned non-JSON response")
+    access_token = token_json.get("access_token")
     if not access_token:
         raise HTTPException(status_code=502, detail="no access_token returned")
 
     user_info = await provider.get_user_info(access_token)
     if not user_info.provider_user_id:
-        raise HTTPException(status_code=502, detail="no user id returned")
+        raise HTTPException(status_code=502, detail="userinfo response missing user ID field")
 
     return {
         "userId": user_info.provider_user_id,
