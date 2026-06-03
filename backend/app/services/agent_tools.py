@@ -11496,11 +11496,17 @@ async def _sql_execute(arguments: dict) -> str:
     uri_lower = connection_string.lower()
     try:
         if uri_lower.startswith("sqlite"):
-            return await asyncio.wait_for(_sql_execute_sqlite(connection_string, sql, max_rows, max_bytes), timeout=timeout)
+            return await asyncio.wait_for(
+                _sql_execute_sqlite(connection_string, sql, max_rows, max_bytes), timeout=timeout
+            )
         elif uri_lower.startswith("mysql"):
-            return await asyncio.wait_for(_sql_execute_mysql(connection_string, sql, max_rows, max_bytes), timeout=timeout)
+            return await asyncio.wait_for(
+                _sql_execute_mysql(connection_string, sql, max_rows, max_bytes), timeout=timeout
+            )
         elif uri_lower.startswith("postgresql") or uri_lower.startswith("postgres"):
-            return await asyncio.wait_for(_sql_execute_postgres(connection_string, sql, max_rows, max_bytes), timeout=timeout)
+            return await asyncio.wait_for(
+                _sql_execute_postgres(connection_string, sql, max_rows, max_bytes), timeout=timeout
+            )
         else:
             return "❌ Unsupported database type. Supported: mysql://, postgresql://, sqlite:///"
     except asyncio.TimeoutError:
