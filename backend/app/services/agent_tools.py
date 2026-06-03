@@ -11479,22 +11479,22 @@ async def _sql_execute(arguments: dict) -> str:
     connection_string = arguments.get("connection_string", "").strip()
     sql = arguments.get("sql", "").strip()
     timeout = min(int(arguments.get("timeout", 30)), 120)
+    max_rows = _clamp_sql_max_rows(arguments.get("max_rows", DEFAULT_SQL_MAX_ROWS))
+    max_bytes = _resolve_sql_max_bytes()
 
     if not connection_string:
         return "❌ Missing required argument 'connection_string'"
     if not sql:
         return "❌ Missing required argument 'sql'"
 
-    # Determine database type from URI scheme
     uri_lower = connection_string.lower()
-
     try:
         if uri_lower.startswith("sqlite"):
-            return await asyncio.wait_for(_sql_execute_sqlite(connection_string, sql), timeout=timeout)
+            return await asyncio.wait_for(_sql_execute_sqlite(connection_string, sql, max_rows, max_bytes), timeout=timeout)
         elif uri_lower.startswith("mysql"):
-            return await asyncio.wait_for(_sql_execute_mysql(connection_string, sql), timeout=timeout)
+            return await asyncio.wait_for(_sql_execute_mysql(connection_string, sql, max_rows, max_bytes), timeout=timeout)
         elif uri_lower.startswith("postgresql") or uri_lower.startswith("postgres"):
-            return await asyncio.wait_for(_sql_execute_postgres(connection_string, sql), timeout=timeout)
+            return await asyncio.wait_for(_sql_execute_postgres(connection_string, sql, max_rows, max_bytes), timeout=timeout)
         else:
             return "❌ Unsupported database type. Supported: mysql://, postgresql://, sqlite:///"
     except asyncio.TimeoutError:
@@ -11503,37 +11503,41 @@ async def _sql_execute(arguments: dict) -> str:
         return f"❌ Database error: {type(e).__name__}: {str(e)[:500]}"
 
 
-async def _sql_execute_sqlite(connection_string: str, sql: str) -> str:
-    """Execute SQL on SQLite."""
+async def _sql_execute_sqlite(connection_string: str, sql: str, max_rows: int, max_bytes: int) -> str:
+    """Execute SQL on SQLite (step-based, naturally streaming)."""
     import aiosqlite
 
-    # Parse path from sqlite:///path or sqlite:////absolute/path
     db_path = connection_string.replace("sqlite:///", "", 1)
     if not db_path:
         return "❌ Invalid SQLite connection string. Use: sqlite:///path/to/db.sqlite"
 
     async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
         cursor = await db.execute(sql)
-
-        # Check if it's a SELECT-like query that returns rows
         if cursor.description:
             columns = [d[0] for d in cursor.description]
-            rows = await cursor.fetchmany(500)
+
+            async def _source():
+                while True:
+                    chunk = await cursor.fetchmany(SQL_FETCH_BATCH)
+                    if not chunk:
+                        break
+                    for r in chunk:
+                        yield tuple(r)
+
+            rows, truncated = await _bounded_collect(_source(), max_rows, max_bytes)
             await db.commit()
-            return _format_sql_result(columns, [tuple(r) for r in rows], truncated=False, max_rows=DEFAULT_SQL_MAX_ROWS)
+            return _format_sql_result(columns, rows, truncated, max_rows)
         else:
             await db.commit()
             return f"✅ Statement executed successfully. Rows affected: {cursor.rowcount}"
 
 
-async def _sql_execute_mysql(connection_string: str, sql: str) -> str:
-    """Execute SQL on MySQL."""
+async def _sql_execute_mysql(connection_string: str, sql: str, max_rows: int, max_bytes: int) -> str:
+    """Execute SQL on MySQL/StarRocks via server-side streaming cursor (SSCursor)."""
     import aiomysql
     from urllib.parse import urlparse, parse_qs, unquote
 
     parsed = urlparse(connection_string)
-
     conn = await aiomysql.connect(
         host=parsed.hostname or "localhost",
         port=parsed.port or 3306,
@@ -11542,15 +11546,24 @@ async def _sql_execute_mysql(connection_string: str, sql: str) -> str:
         db=parsed.path.lstrip("/") if parsed.path else None,
         charset=parse_qs(parsed.query).get("charset", ["utf8mb4"])[0],
     )
-
     try:
-        async with conn.cursor() as cursor:
+        # SSCursor = unbuffered/server-side; rows stream instead of being read
+        # whole into client memory on execute() (the default Cursor is buffered).
+        async with conn.cursor(aiomysql.SSCursor) as cursor:
             await cursor.execute(sql)
-
             if cursor.description:
                 columns = [d[0] for d in cursor.description]
-                rows = await cursor.fetchmany(500)
-                return _format_sql_result(columns, rows, truncated=False, max_rows=DEFAULT_SQL_MAX_ROWS)
+
+                async def _source():
+                    while True:
+                        chunk = await cursor.fetchmany(SQL_FETCH_BATCH)
+                        if not chunk:
+                            break
+                        for r in chunk:
+                            yield r
+
+                rows, truncated = await _bounded_collect(_source(), max_rows, max_bytes)
+                return _format_sql_result(columns, rows, truncated, max_rows)
             else:
                 await conn.commit()
                 return f"✅ Statement executed successfully. Rows affected: {cursor.rowcount}"
@@ -11558,28 +11571,34 @@ async def _sql_execute_mysql(connection_string: str, sql: str) -> str:
         conn.close()
 
 
-async def _sql_execute_postgres(connection_string: str, sql: str) -> str:
-    """Execute SQL on PostgreSQL."""
+async def _sql_execute_postgres(connection_string: str, sql: str, max_rows: int, max_bytes: int) -> str:
+    """Execute SQL on PostgreSQL. SELECT-like statements stream via an in-transaction cursor."""
     import asyncpg
 
-    # asyncpg uses standard postgres:// URI
     dsn = connection_string
     if dsn.startswith("postgresql://"):
         dsn = "postgres://" + dsn[len("postgresql://"):]
 
     conn = await asyncpg.connect(dsn)
-
     try:
-        # Try fetch first (for SELECT-like queries)
         stmt = await conn.prepare(sql)
-
         if stmt.get_attributes():
-            # Has columns — it's a query
             columns = [attr.name for attr in stmt.get_attributes()]
-            rows = await stmt.fetch(500)
-            return _format_sql_result(columns, [tuple(r.values()) for r in rows], truncated=False, max_rows=DEFAULT_SQL_MAX_ROWS)
+            # asyncpg cursors must run inside a transaction.
+            async with conn.transaction():
+                cur = await conn.cursor(sql)
+
+                async def _source():
+                    while True:
+                        chunk = await cur.fetch(SQL_FETCH_BATCH)
+                        if not chunk:
+                            break
+                        for r in chunk:
+                            yield tuple(r.values())
+
+                rows, truncated = await _bounded_collect(_source(), max_rows, max_bytes)
+            return _format_sql_result(columns, rows, truncated, max_rows)
         else:
-            # No columns — it's a statement
             result = await conn.execute(sql)
             return f"✅ Statement executed successfully. {result}"
     finally:

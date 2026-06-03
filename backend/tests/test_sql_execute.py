@@ -95,3 +95,56 @@ def test_format_display_budget_limits_shown_rows():
     out = _format_sql_result(["c"], rows, truncated=False, max_rows=5000)
     assert len(out) <= SQL_DISPLAY_CHAR_BUDGET + 200
     assert "展示前" in out
+
+
+# ─── SQLite integration tests ─────────────────────────────────────────────
+
+import os
+import tempfile
+from app.services.agent_tools import _sql_execute
+
+
+async def test_sqlite_select_under_limit():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        await _sql_execute({"connection_string": f"sqlite:///{path}",
+                            "sql": "CREATE TABLE t (id INTEGER, name TEXT)"})
+        for i in range(5):
+            await _sql_execute({"connection_string": f"sqlite:///{path}",
+                                "sql": f"INSERT INTO t VALUES ({i}, 'n{i}')"})
+        out = await _sql_execute({"connection_string": f"sqlite:///{path}",
+                                  "sql": "SELECT * FROM t"})
+        assert "(5 rows)" in out
+        assert "硬上限" not in out
+    finally:
+        os.remove(path)
+
+
+async def test_sqlite_select_hits_max_rows_and_warns():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        await _sql_execute({"connection_string": f"sqlite:///{path}",
+                            "sql": "CREATE TABLE t (id INTEGER)"})
+        for i in range(6):
+            await _sql_execute({"connection_string": f"sqlite:///{path}",
+                                "sql": f"INSERT INTO t VALUES ({i})"})
+        out = await _sql_execute({"connection_string": f"sqlite:///{path}",
+                                  "sql": "SELECT * FROM t", "max_rows": 3})
+        assert "硬上限" in out
+        assert "GROUP BY" in out
+    finally:
+        os.remove(path)
+
+
+async def test_sqlite_non_query_statement_reports_rows_affected():
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        out = await _sql_execute({"connection_string": f"sqlite:///{path}",
+                                  "sql": "CREATE TABLE t (id INTEGER)"})
+        assert "executed successfully" in out
+        assert "硬上限" not in out
+    finally:
+        os.remove(path)
