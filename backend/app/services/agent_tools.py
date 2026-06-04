@@ -465,7 +465,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "set_trigger",
-            "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Every trigger is attached to a focus item; if focus_ref is omitted, the system will automatically create a focus item from the reason and attach the trigger to it. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or a human user replies — use from_agent_name for agents, or from_user_name for human users on Feishu/Slack/Discord), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.).",
+            "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Every trigger is attached to a focus item; if focus_ref is omitted, the system will automatically create a focus item from the reason and attach the trigger to it. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or a human user replies — use from_agent_name for agents, or from_user_name for human users on Feishu/Slack/Discord), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.). For type=webhook you can also set webhook_mode to control how bursts of rapid triggers are handled — see the webhook_mode parameter.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -493,7 +493,7 @@ AGENT_TOOLS = [
                     "webhook_mode": {
                         "type": "string",
                         "enum": ["legacy", "queue", "merge"],
-                        "description": "Webhook processing mode (only for type=webhook): legacy=overwrite latest, keep only newest (default); queue=process each trigger one-by-one in FIFO order, serial, zero loss; merge=accumulate all pending triggers and process them together in one session.",
+                        "description": "Webhook processing mode (type=webhook only). Pick by scenario: legacy (default) = keep only the newest payload (overwrite earlier ones) — for low-frequency events where only the latest matters (e.g. a status ping). queue = handle each trigger one-by-one in FIFO order, serial, zero loss — for when EVERY event must be processed individually and in order (e.g. each reader's feedback, each ticket, each order). merge = accumulate all pending triggers and process them together in one session — for when you want to review/summarize multiple events at once (e.g. batch several alerts into one analysis).",
                     },
                 },
                 "required": ["name", "type", "config", "reason"],
@@ -519,6 +519,11 @@ AGENT_TOOLS = [
                     "reason": {
                         "type": "string",
                         "description": "New reason text",
+                    },
+                    "webhook_mode": {
+                        "type": "string",
+                        "enum": ["legacy", "queue", "merge"],
+                        "description": "For type=webhook only: switch the processing mode of an EXISTING webhook trigger (legacy/queue/merge — see set_trigger.webhook_mode for what each means). Preserves the existing webhook URL/token and any already-queued payloads.",
                     },
                 },
                 "required": ["name"],
@@ -7917,9 +7922,10 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
 
     new_config = arguments.get("config")
     new_reason = arguments.get("reason")
+    new_webhook_mode = arguments.get("webhook_mode")
 
-    if new_config is None and new_reason is None:
-        return "❌ Provide at least one of 'config' or 'reason' to update"
+    if new_config is None and new_reason is None and new_webhook_mode is None:
+        return "❌ Provide at least one of 'config', 'reason', or 'webhook_mode' to update"
 
     try:
         async with async_session() as db:
@@ -7938,6 +7944,20 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
                 old_config = trigger.config
                 trigger.config = new_config
                 changes.append(f"config: {old_config} → {new_config}")
+            if new_webhook_mode is not None:
+                if trigger.type != "webhook":
+                    return "❌ webhook_mode only applies to webhook triggers"
+                if new_webhook_mode not in ("legacy", "queue", "merge"):
+                    return "❌ Invalid webhook_mode (must be legacy/queue/merge)"
+                # Merge into existing config — preserve token / queued payloads, only flip the mode
+                cfg = dict(trigger.config or {})
+                if new_webhook_mode == "legacy":
+                    cfg.pop("webhook_mode", None)  # legacy is the default → drop the key
+                else:
+                    cfg["webhook_mode"] = new_webhook_mode
+                    cfg.setdefault("_webhook_queue", [])  # ensure queue exists when switching to queue/merge
+                trigger.config = cfg
+                changes.append(f"webhook_mode → {new_webhook_mode}")
             if new_reason is not None:
                 trigger.reason = new_reason
                 changes.append(f"reason updated")

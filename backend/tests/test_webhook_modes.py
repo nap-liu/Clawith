@@ -466,3 +466,90 @@ async def test_set_trigger_tool_schema_contains_webhook_mode():
     assert "webhook_mode" in props
     assert props["webhook_mode"]["type"] == "string"
     assert set(props["webhook_mode"]["enum"]) == {"legacy", "queue", "merge"}
+
+
+# --- A+B: discoverability + scenario guidance in tool descriptions ---
+
+
+async def test_set_trigger_description_mentions_webhook_mode():
+    """A: top-level set_trigger description surfaces the webhook_mode capability."""
+    from app.services.agent_tools import AGENT_TOOLS
+
+    st = next(t for t in AGENT_TOOLS if t["function"]["name"] == "set_trigger")
+    assert "webhook_mode" in st["function"]["description"]
+
+
+async def test_webhook_mode_description_has_scenario_guidance():
+    """B: webhook_mode description tells the agent WHEN to use each mode, not just what they do."""
+    from app.services.agent_tools import AGENT_TOOLS
+
+    st = next(t for t in AGENT_TOOLS if t["function"]["name"] == "set_trigger")
+    desc = st["function"]["parameters"]["properties"]["webhook_mode"]["description"]
+    assert "FIFO" in desc and "individually" in desc  # queue scenario
+    assert "summarize" in desc or "together" in desc  # merge scenario
+
+
+# --- C: update_trigger can switch an existing hook's mode without clobbering token/queue ---
+
+
+async def _make_webhook_agent(cfg):
+    async with async_session() as db:
+        ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
+        db.add(ident); await db.flush()
+        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
+        db.add(user); await db.flush()
+        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
+        db.add(agent); await db.flush()
+        db.add(AgentTrigger(agent_id=agent.id, type="webhook", name="h", config=cfg, reason="r", is_enabled=True))
+        await db.commit()
+        return agent.id
+
+
+async def test_update_trigger_schema_contains_webhook_mode():
+    from app.services.agent_tools import AGENT_TOOLS
+
+    ut = next(t for t in AGENT_TOOLS if t["function"]["name"] == "update_trigger")
+    props = ut["function"]["parameters"]["properties"]
+    assert "webhook_mode" in props
+    assert set(props["webhook_mode"]["enum"]) == {"legacy", "queue", "merge"}
+
+
+async def test_update_trigger_switches_mode_preserving_token_and_queue():
+    from app.services.agent_tools import _handle_update_trigger
+
+    aid = await _make_webhook_agent({"token": "tok123", "_webhook_queue": ["x", "y"]})
+    result = await _handle_update_trigger(aid, {"name": "h", "webhook_mode": "queue"})
+    assert "queue" in result
+    async with async_session() as db:
+        t = (await db.execute(select(AgentTrigger).where(AgentTrigger.agent_id == aid))).scalar_one()
+        assert t.config["webhook_mode"] == "queue"
+        assert t.config["token"] == "tok123"               # token preserved
+        assert t.config["_webhook_queue"] == ["x", "y"]    # queued payloads preserved
+
+
+async def test_update_trigger_to_legacy_drops_mode_key():
+    from app.services.agent_tools import _handle_update_trigger
+
+    aid = await _make_webhook_agent({"token": "tok", "webhook_mode": "merge", "_webhook_queue": []})
+    await _handle_update_trigger(aid, {"name": "h", "webhook_mode": "legacy"})
+    async with async_session() as db:
+        t = (await db.execute(select(AgentTrigger).where(AgentTrigger.agent_id == aid))).scalar_one()
+        assert "webhook_mode" not in t.config              # legacy = default → key dropped
+        assert t.config["token"] == "tok"                  # token still preserved
+
+
+async def test_update_trigger_webhook_mode_rejects_non_webhook():
+    from app.services.agent_tools import _handle_update_trigger
+
+    async with async_session() as db:
+        ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
+        db.add(ident); await db.flush()
+        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
+        db.add(user); await db.flush()
+        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
+        db.add(agent); await db.flush()
+        db.add(AgentTrigger(agent_id=agent.id, type="interval", name="iv", config={"minutes": 5}, reason="r", is_enabled=True))
+        await db.commit()
+        aid = agent.id
+    result = await _handle_update_trigger(aid, {"name": "iv", "webhook_mode": "queue"})
+    assert "❌" in result and "webhook" in result.lower()
