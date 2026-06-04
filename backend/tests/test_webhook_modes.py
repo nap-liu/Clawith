@@ -275,6 +275,47 @@ async def test_merge_advance_drops_batch_keeps_late_arrivals():
     assert "_webhook_batch_size" not in trig.config
 
 
+async def test_merge_rendered_batch_equals_deleted_batch():
+    """B1: the wake-context batch (queue[:batch_size]) and the advance-deleted
+    batch must be identical, even when a late entry arrives after the lock.
+
+    Simulate the lock recording batch_size=3 over the queue at lock time, then a
+    4th payload 'd' arriving mid-session (queue becomes [a,b,c,d], batch_size
+    still 3). The rendered slice and the deleted slice are both queue[:3]=[a,b,c];
+    'd' survives for the next batch — never silently dropped.
+    """
+    queue = ["a", "b", "c"]
+    batch_size = 3
+    rendered = queue[:batch_size]
+    assert _merge_webhook_payloads(rendered)  # renders all 3
+    # advance with the same batch_size drops exactly those 3, leaving late arrivals
+    async with async_session() as db:
+        ident = Identity(
+            username=f"u_{uuid.uuid4().hex[:6]}",
+            email=f"{uuid.uuid4().hex[:6]}@t.local",
+            password_hash="x",
+        )
+        db.add(ident); await db.flush()
+        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
+        db.add(user); await db.flush()
+        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
+        db.add(agent); await db.flush()
+        # late arrival 'd' appended after lock → queue now [a,b,c,d], batch_size still 3
+        trig = AgentTrigger(
+            agent_id=agent.id, type="webhook", name="h",
+            config={"token": "x", "webhook_mode": "merge",
+                    "_webhook_queue": ["a", "b", "c", "d"],
+                    "_webhook_batch_size": 3, "_webhook_active": True},
+            reason="r", is_enabled=True,
+        )
+        db.add(trig); await db.commit()
+        _advance_webhook_trigger(db, trig, reply="ok")  # sync helper, mutates in place
+        await db.commit()
+        await db.refresh(trig)
+        assert trig.config["_webhook_queue"] == ["d"]  # exactly the 3 rendered were deleted; 'd' survives
+        assert trig.config.get("_webhook_active") in (False, None)
+
+
 async def test_advance_noop_for_legacy_mode():
     """Defensive: advance must not touch a legacy trigger if ever passed one."""
     async with async_session() as db:

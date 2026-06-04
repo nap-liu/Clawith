@@ -782,12 +782,26 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                                 payload_str = payload_str[:2000] + "... (truncated)"
                             part += f"\nWebhook Payload:\n{payload_str}"
                     elif wmode == "merge":
-                        q = cfg.get("_webhook_queue") or []
-                        if q:
-                            merged = _merge_webhook_payloads(q)
+                        # B1 fix: render the SAME batch the finally will delete —
+                        # read fresh queue + recorded batch_size, not the T0 tick
+                        # snapshot. FIFO guarantees queue[:batch_size] is stable
+                        # between this build and _advance_webhook_trigger, so the
+                        # rendered set == the deleted set (late arrivals only append
+                        # to the tail → never silently dropped).
+                        async with async_session() as _wdb:
+                            _wres = await _wdb.execute(
+                                select(AgentTrigger).where(AgentTrigger.id == t.id)
+                            )
+                            _wtrig = _wres.scalar_one_or_none()
+                        _fresh_cfg = (_wtrig.config if _wtrig else cfg) or {}
+                        _q = _fresh_cfg.get("_webhook_queue") or []
+                        _bs = _fresh_cfg.get("_webhook_batch_size", len(_q))
+                        _batch = _q[:_bs]
+                        if _batch:
+                            merged = _merge_webhook_payloads(_batch)
                             if len(merged) > 2000:
                                 merged = merged[:2000] + "... (truncated)"
-                            part += f"\nWebhook Payload (merged, {len(q)} entries):\n{merged}"
+                            part += f"\nWebhook Payload (merged, {len(_batch)} entries):\n{merged}"
                 context_parts.append(part)
                 trigger_names.append(t.name)
 
