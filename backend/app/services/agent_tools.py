@@ -490,6 +490,11 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "Optional: identifier of the structured Focus item that this trigger relates to. If omitted, a Focus item is created automatically from the trigger reason.",
                     },
+                    "webhook_mode": {
+                        "type": "string",
+                        "enum": ["legacy", "queue", "merge"],
+                        "description": "Webhook processing mode (only for type=webhook): legacy=overwrite latest, keep only newest (default); queue=process each trigger one-by-one in FIFO order, serial, zero loss; merge=accumulate all pending triggers and process them together in one session.",
+                    },
                 },
                 "required": ["name", "type", "config", "reason"],
             },
@@ -7793,6 +7798,10 @@ async def _handle_set_trigger(
         import secrets
         token = secrets.token_urlsafe(8)  # ~11 chars, URL-safe
         config["token"] = token
+        wmode = arguments.get("webhook_mode", "legacy")
+        if wmode in ("queue", "merge"):
+            config["webhook_mode"] = wmode
+            config["_webhook_queue"] = []
 
     # Record the session that created this trigger so trigger results can later be routed to
     # the correct destination instead of being broadcast to every live web session.
@@ -7889,7 +7898,8 @@ async def _handle_set_trigger(
             base = await platform_service.get_public_base_url()
             webhook_url = f"{base.rstrip('/')}/api/webhooks/t/{config['token']}"
 
-            return f"✅ Webhook trigger '{name}' created.\n\nWebhook URL: {webhook_url}\n\nTell the user to configure this URL in their external service (e.g. GitHub, Grafana). When the service sends a POST to this URL, you will be woken up with the payload as context."
+            mode_note = f"\nMode: {wmode}" if wmode in ("queue", "merge") else ""
+            return f"✅ Webhook trigger '{name}' created.\n\nWebhook URL: {webhook_url}{mode_note}\n\nTell the user to configure this URL in their external service (e.g. GitHub, Grafana). When the service sends a POST to this URL, you will be woken up with the payload as context."
 
         return f"✅ Trigger '{name}' created ({ttype}). It will fire according to your config and wake you up with the reason as context."
 

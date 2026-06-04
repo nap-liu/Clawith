@@ -296,3 +296,132 @@ async def test_advance_noop_for_legacy_mode():
         assert trig.config["_webhook_pending"] is True
         assert trig.config["_webhook_payload"] == "p"
         assert "_webhook_active" not in trig.config
+
+
+# ── set_trigger tool: webhook_mode parameter ─────────────────────────────────
+
+
+async def test_set_trigger_creates_queue_hook():
+    """_handle_set_trigger with webhook_mode=queue writes mode + empty queue into config."""
+    from app.services.agent_tools import _handle_set_trigger
+
+    async with async_session() as db:
+        ident = Identity(
+            username=f"u_{uuid.uuid4().hex[:6]}",
+            email=f"{uuid.uuid4().hex[:6]}@t.local",
+            password_hash="x",
+        )
+        db.add(ident)
+        await db.flush()
+        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
+        db.add(user)
+        await db.flush()
+        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
+        db.add(agent)
+        await db.commit()
+        agent_id = agent.id
+
+    result = await _handle_set_trigger(
+        agent_id,
+        {
+            "name": f"wh_{uuid.uuid4().hex[:6]}",
+            "type": "webhook",
+            "config": {},
+            "reason": "test queue mode",
+            "webhook_mode": "queue",
+        },
+    )
+    assert "✅" in result
+
+    async with async_session() as db:
+        t = (await db.execute(select(AgentTrigger).where(AgentTrigger.agent_id == agent_id))).scalar_one()
+        assert t.config.get("webhook_mode") == "queue"
+        assert t.config.get("_webhook_queue") == []
+
+
+async def test_set_trigger_creates_merge_hook():
+    """_handle_set_trigger with webhook_mode=merge writes mode + empty queue into config."""
+    from app.services.agent_tools import _handle_set_trigger
+
+    async with async_session() as db:
+        ident = Identity(
+            username=f"u_{uuid.uuid4().hex[:6]}",
+            email=f"{uuid.uuid4().hex[:6]}@t.local",
+            password_hash="x",
+        )
+        db.add(ident)
+        await db.flush()
+        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
+        db.add(user)
+        await db.flush()
+        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
+        db.add(agent)
+        await db.commit()
+        agent_id = agent.id
+
+    result = await _handle_set_trigger(
+        agent_id,
+        {
+            "name": f"wh_{uuid.uuid4().hex[:6]}",
+            "type": "webhook",
+            "config": {},
+            "reason": "test merge mode",
+            "webhook_mode": "merge",
+        },
+    )
+    assert "✅" in result
+    assert "Mode: merge" in result
+
+    async with async_session() as db:
+        t = (await db.execute(select(AgentTrigger).where(AgentTrigger.agent_id == agent_id))).scalar_one()
+        assert t.config.get("webhook_mode") == "merge"
+        assert t.config.get("_webhook_queue") == []
+
+
+async def test_set_trigger_legacy_omits_mode_key():
+    """_handle_set_trigger without webhook_mode (or with legacy) leaves no webhook_mode in config."""
+    from app.services.agent_tools import _handle_set_trigger
+
+    async with async_session() as db:
+        ident = Identity(
+            username=f"u_{uuid.uuid4().hex[:6]}",
+            email=f"{uuid.uuid4().hex[:6]}@t.local",
+            password_hash="x",
+        )
+        db.add(ident)
+        await db.flush()
+        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
+        db.add(user)
+        await db.flush()
+        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
+        db.add(agent)
+        await db.commit()
+        agent_id = agent.id
+
+    result = await _handle_set_trigger(
+        agent_id,
+        {
+            "name": f"wh_{uuid.uuid4().hex[:6]}",
+            "type": "webhook",
+            "config": {},
+            "reason": "test legacy mode",
+            # no webhook_mode → defaults to legacy
+        },
+    )
+    assert "✅" in result
+
+    async with async_session() as db:
+        t = (await db.execute(select(AgentTrigger).where(AgentTrigger.agent_id == agent_id))).scalar_one()
+        assert "webhook_mode" not in t.config
+        assert "_webhook_queue" not in t.config
+
+
+async def test_set_trigger_tool_schema_contains_webhook_mode():
+    """The set_trigger tool definition exposes the webhook_mode property in its input schema."""
+    from app.services.agent_tools import AGENT_TOOLS
+
+    set_trigger_def = next(t for t in AGENT_TOOLS if t["function"]["name"] == "set_trigger")
+    props = set_trigger_def["function"]["parameters"]["properties"]
+    assert "webhook_mode" in props
+    assert props["webhook_mode"]["type"] == "string"
+    assert set(props["webhook_mode"]["enum"]) == {"legacy", "queue", "merge"}
