@@ -124,3 +124,41 @@ def test_display_parse_malformed_returns_empty_dict():
     from app.services.chat_history import parse_tool_call_for_display
 
     assert parse_tool_call_for_display("{bad json") == {}
+
+
+def test_strip_leading_orphan_tool_messages_drops_orphan():
+    """A context-window slice can cut a tool-call pair, leaving the history
+    starting with a role='tool' that has no preceding tool_calls. LLM APIs
+    reject that, so leading orphan tool messages must be dropped."""
+    from app.services.chat_history import strip_leading_orphan_tool_messages
+
+    msgs = [
+        {"role": "tool", "tool_call_id": "x", "content": "orphan result"},
+        {"role": "assistant", "content": "hi"},
+        {"role": "user", "content": "q"},
+    ]
+    out = strip_leading_orphan_tool_messages(msgs)
+    assert [m["role"] for m in out] == ["assistant", "user"]
+
+
+def test_strip_leading_orphan_tool_messages_multiple():
+    from app.services.chat_history import strip_leading_orphan_tool_messages
+
+    msgs = [
+        {"role": "tool", "content": "a"},
+        {"role": "tool", "content": "b"},
+        {"role": "user", "content": "q"},
+    ]
+    assert strip_leading_orphan_tool_messages(msgs) == [{"role": "user", "content": "q"}]
+
+
+def test_strip_leading_orphan_tool_messages_noop_when_valid():
+    """A well-formed history (no leading tool) is returned unchanged."""
+    from app.services.chat_history import strip_leading_orphan_tool_messages
+
+    msgs = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]},
+        {"role": "tool", "tool_call_id": "1", "content": "r"},
+    ]
+    assert strip_leading_orphan_tool_messages(msgs) == msgs

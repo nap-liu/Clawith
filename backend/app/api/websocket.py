@@ -746,10 +746,10 @@ async def websocket_chat(
                         async def _on_failover(reason: str):
                             await websocket.send_json({"type": "info", "content": f"Primary model error, {reason}"})
 
-                        # To prevent tool call message pairs(assistant + tool) from being broken down.
-                        _truncated = conversation[-ctx_size:]
-                        while _truncated and _truncated[0].get("role") == "tool":
-                            _truncated.pop(0)
+                        # Drop orphan tool messages left if the ctx_size slice cut a
+                        # tool-call pair (shared guard with the IM history path).
+                        from app.services.chat_history import strip_leading_orphan_tool_messages
+                        _truncated = strip_leading_orphan_tool_messages(conversation[-ctx_size:])
 
                         # Per-(user, agent) onboarding. With no row, prepend the
                         # greeting prompt and mark the pair as "greeted" once it

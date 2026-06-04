@@ -26,6 +26,7 @@ original rows; only the LLM context sees the synthetic summary).
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -176,6 +177,32 @@ async def load_messages_for_session(
     return rows
 
 
+def _parse_tool_call_payload(content: str) -> dict[str, Any] | None:
+    """Normalize a stored ``tool_call`` row's JSON into one shape that both
+    readers build on — ``expand_tool_call_row`` (LLM replay) and
+    ``parse_tool_call_for_display`` (web UI). Tolerates the canonical
+    ``name`` / ``args`` schema and the legacy Feishu ``tool_name`` /
+    ``arguments`` schema. Returns ``None`` for malformed / non-dict content;
+    callers apply their own field defaults.
+    """
+    try:
+        data = json.loads(content or "{}")
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    args = data.get("args")
+    if args is None:
+        args = data.get("arguments")
+    return {
+        "name": data.get("name") or data.get("tool_name") or "",
+        "args": args,
+        "status": data.get("status"),
+        "result": data.get("result"),
+        "reasoning_content": data.get("reasoning_content"),
+    }
+
+
 def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
     """Expand one persisted ``tool_call`` row into an OpenAI ``assistant``
     (carrying ``tool_calls``) + ``tool`` (result) message pair.
@@ -183,27 +210,15 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
     This is the single source of truth shared by the web WebSocket path and
     the IM channels, so both replay identical tool-call history into the
     model. The mapping is byte-for-byte the historical websocket.py behaviour.
-
-    Tolerates two stored schemas: the canonical ``name`` / ``args`` written by
-    the unified persistence path, and the legacy Feishu ``tool_name`` /
-    ``arguments`` rows. Returns ``[]`` for malformed rows so callers skip them.
+    Returns ``[]`` for malformed rows so callers skip them.
     """
-    import json as _json
-
-    try:
-        data = _json.loads(msg.content or "{}")
-    except Exception:
-        return []
-    if not isinstance(data, dict):
+    payload = _parse_tool_call_payload(msg.content)
+    if payload is None:
         return []
 
-    name = data.get("name") or data.get("tool_name") or "unknown"
-    args = data.get("args")
-    if args is None:
-        args = data.get("arguments")
-    if args is None:
-        args = {}
-    result = data.get("result") or ""
+    name = payload["name"] or "unknown"
+    args = payload["args"] if payload["args"] is not None else {}
+    result = payload["result"] or ""
     tc_id = f"call_{msg.id}"
 
     asst: dict[str, Any] = {
@@ -215,13 +230,13 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
                 "type": "function",
                 "function": {
                     "name": name,
-                    "arguments": (_json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)),
+                    "arguments": (json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)),
                 },
             }
         ],
     }
-    if data.get("reasoning_content"):
-        asst["reasoning_content"] = data["reasoning_content"]
+    if payload["reasoning_content"]:
+        asst["reasoning_content"] = payload["reasoning_content"]
 
     # Lazy import: vision_inject pulls in optional deps; only needed here.
     from app.services.vision_inject import sanitize_history_tool_result
@@ -258,11 +273,9 @@ async def persist_tool_call(
     if (evt or {}).get("status") != "done":
         return
 
-    import json as _json
-
     from app.utils.sanitize import sanitize_tool_args
 
-    content = _json.dumps(
+    content = json.dumps(
         {
             "name": evt.get("name", ""),
             "args": sanitize_tool_args(evt.get("args")),
@@ -298,25 +311,33 @@ def parse_tool_call_for_display(content: str) -> dict[str, Any]:
 
     Returns ``{}`` for malformed content so callers keep the raw row untouched.
     """
-    import json as _json
-
-    try:
-        data = _json.loads(content or "{}")
-    except Exception:
+    payload = _parse_tool_call_payload(content)
+    if payload is None:
         return {}
-    if not isinstance(data, dict):
-        return {}
-
-    args = data.get("args")
-    if args is None:
-        args = data.get("arguments")
     return {
-        "toolName": data.get("name") or data.get("tool_name") or "",
-        "toolArgs": args,
-        "toolStatus": data.get("status", "done"),
-        "toolResult": data.get("result", ""),
-        "toolThinking": data.get("reasoning_content", ""),
+        "toolName": payload["name"],
+        "toolArgs": payload["args"],
+        "toolStatus": payload["status"] or "done",
+        "toolResult": payload["result"] or "",
+        "toolThinking": payload["reasoning_content"] or "",
     }
+
+
+def strip_leading_orphan_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop leading ``role="tool"`` messages that have no preceding assistant
+    ``tool_calls``.
+
+    A context-window slice (``[-ctx_size:]``) applied AFTER tool_call rows are
+    expanded into assistant(tool_calls)+tool(result) pairs can cut a pair in
+    half, leaving the window starting with an orphan tool result. OpenAI and
+    Anthropic both reject a tool message that is not a response to a preceding
+    ``tool_calls``. Shared by the web and IM history paths; apply right after
+    the slice.
+    """
+    out = list(messages)
+    while out and out[0].get("role") == "tool":
+        out.pop(0)
+    return out
 
 
 async def load_history_for_llm(

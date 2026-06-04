@@ -1609,7 +1609,12 @@ async def _call_agent_llm(
     from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
     ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
     if history:
-        messages.extend(_normalize_history_messages(history)[-ctx_size:])
+        # Expanded tool_call rows are assistant(tool_calls)+tool(result) pairs;
+        # the ctx_size slice can cut a pair, so drop any leading orphan tool
+        # message (same guard the WebSocket path applies after its slice).
+        from app.services.chat_history import strip_leading_orphan_tool_messages
+
+        messages.extend(strip_leading_orphan_tool_messages(_normalize_history_messages(history)[-ctx_size:]))
     messages.append({"role": "user", "content": user_text})
 
     # Use actual user_id so the system prompt knows who it's chatting with
