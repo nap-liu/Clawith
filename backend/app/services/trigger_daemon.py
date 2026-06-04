@@ -227,14 +227,15 @@ async def _evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     if trigger.max_fires is not None and trigger.fire_count >= trigger.max_fires:
         return False
 
-    # Cooldown check
-    if trigger.last_fired_at:
+    cfg = trigger.config or {}
+    t = trigger.type
+    webhook_mode = cfg.get("webhook_mode", "legacy") if t == "webhook" else None
+
+    # Cooldown check — queue/merge webhook 绕过(串行锁保证不并发); 其余 type 行为不变
+    if trigger.last_fired_at and webhook_mode not in ("queue", "merge"):
         cooldown = timedelta(seconds=trigger.cooldown_seconds)
         if (now - trigger.last_fired_at) < cooldown:
             return False
-
-    cfg = trigger.config or {}
-    t = trigger.type
 
     if t == "cron":
         expr = cfg.get("expr", "* * * * *")
@@ -295,10 +296,20 @@ async def _evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
         return await _check_new_agent_messages(trigger)
 
     elif t == "webhook":
-        # Check if a webhook payload is pending
-        if cfg.get("_webhook_pending"):
-            return True
-        return False
+        if webhook_mode == "legacy":
+            return bool(cfg.get("_webhook_pending"))
+        # queue / merge
+        if cfg.get("_webhook_active"):
+            since = cfg.get("_webhook_active_since")
+            if since:
+                try:
+                    since_dt = datetime.fromisoformat(since)
+                    if (now - since_dt) > timedelta(minutes=10):
+                        return True   # 锁超时, 强制重处理(死锁兜底)
+                except Exception:
+                    pass
+            return False              # 串行: 有活动 session, 等
+        return len(cfg.get("_webhook_queue") or []) > 0
 
     return False
 

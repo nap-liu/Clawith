@@ -1,4 +1,6 @@
 import uuid
+from datetime import datetime, timezone, timedelta
+
 import pytest
 import httpx
 from sqlalchemy import select
@@ -8,6 +10,7 @@ from app.models.agent import Agent
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.user import User, Identity
+from app.services.trigger_daemon import _evaluate_trigger
 
 pytestmark = pytest.mark.asyncio
 
@@ -111,3 +114,70 @@ async def test_merge_accumulates():
         assert (await _post(token, {"n": i})).status_code == 200
     cfg = await _trigger_cfg(aid)
     assert len(cfg["_webhook_queue"]) == 4
+
+
+# ── Daemon evaluation tests (queue/merge serial lock + cooldown bypass) ───────
+
+
+def _mk_trigger(mode, *, queue=None, active=False, pending=False, last_fired=None, cooldown=60, active_since=None):
+    cfg = {"token": "x"}
+    if mode != "legacy":
+        cfg["webhook_mode"] = mode
+    if queue is not None:
+        cfg["_webhook_queue"] = queue
+    if active:
+        cfg["_webhook_active"] = True
+        cfg["_webhook_active_since"] = (active_since or datetime.now(timezone.utc)).isoformat()
+    if pending:
+        cfg["_webhook_pending"] = True
+    t = AgentTrigger(agent_id=uuid.uuid4(), type="webhook", name="h", config=cfg, reason="r",
+                     is_enabled=True, cooldown_seconds=cooldown, fire_count=0)
+    t.last_fired_at = last_fired
+    return t
+
+
+async def test_queue_fires_when_queue_nonempty_and_not_active():
+    now = datetime.now(timezone.utc)
+    assert await _evaluate_trigger(_mk_trigger("queue", queue=["a", "b"], active=False), now) is True
+
+
+async def test_queue_skips_when_active():
+    now = datetime.now(timezone.utc)
+    assert await _evaluate_trigger(_mk_trigger("queue", queue=["a"], active=True), now) is False
+
+
+async def test_queue_empty_does_not_fire():
+    now = datetime.now(timezone.utc)
+    assert await _evaluate_trigger(_mk_trigger("queue", queue=[], active=False), now) is False
+
+
+async def test_queue_bypasses_cooldown():
+    now = datetime.now(timezone.utc)
+    # 刚 fire 过(cooldown 内), queue 模式应绕过
+    t = _mk_trigger("queue", queue=["a"], active=False, last_fired=now - timedelta(seconds=5), cooldown=60)
+    assert await _evaluate_trigger(t, now) is True
+
+
+async def test_queue_lock_timeout_forces_refire():
+    now = datetime.now(timezone.utc)
+    # active 但持锁 > 10min → 强制重处理
+    t = _mk_trigger("queue", queue=["a"], active=True, active_since=now - timedelta(minutes=11))
+    assert await _evaluate_trigger(t, now) is True
+
+
+async def test_merge_fires_when_queue_nonempty():
+    now = datetime.now(timezone.utc)
+    assert await _evaluate_trigger(_mk_trigger("merge", queue=["a", "b", "c"], active=False), now) is True
+
+
+async def test_legacy_still_respects_cooldown():
+    now = datetime.now(timezone.utc)
+    # legacy + pending=True 但在 cooldown 内 → 不 fire(现状不变)
+    t = _mk_trigger("legacy", pending=True, last_fired=now - timedelta(seconds=5), cooldown=60)
+    assert await _evaluate_trigger(t, now) is False
+
+
+async def test_legacy_fires_after_cooldown():
+    now = datetime.now(timezone.utc)
+    t = _mk_trigger("legacy", pending=True, last_fired=now - timedelta(seconds=120), cooldown=60)
+    assert await _evaluate_trigger(t, now) is True
