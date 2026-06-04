@@ -24,7 +24,7 @@ class PlatformService:
         Priority:
         1. Environment variable (PUBLIC_BASE_URL) - from .env or docker
         2. Incoming request's base URL (browser address)
-        3. Hardcoded fallback (https://try.clawith.ai)
+        3. Hardcoded fallback (http://localhost:8000)
         """
         # 1. Try environment variable
         env_url = os.environ.get("PUBLIC_BASE_URL")
@@ -49,8 +49,10 @@ class PlatformService:
             # Note: request.base_url might include trailing slash
             return str(request.base_url).rstrip("/")
 
-        # 4. Absolute fallback
-        return "https://try.clawith.ai"
+        # 4. Absolute fallback — honest local default, never a placeholder
+        # domain (a fictional URL like try.clawith.ai would leak into agent
+        # output and channel callbacks). Aligns with core.domain.resolve_base_url.
+        return "http://localhost:8000"
 
 
     async def get_tenant_sso_base_url(self, db: AsyncSession, tenant, request: Request | None = None) -> str:

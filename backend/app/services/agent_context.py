@@ -782,8 +782,6 @@ Strict rules:
             + "/p/<short_id>  (replace <short_id> with actual page id returned by publish_page)",
             "- **File download**: " + _platform_url + "/api/agents/<agent_id>/files/download?path=<rel_path>",
             "- **Gateway poll**: " + _platform_url + "/api/gateway/poll  (used by external agents to check inbox)",
-            "",
-            "Never use placeholder domains (clawith.com, try.clawith.ai, webhook.clawith.com, api.clawith.ai, etc.).",
         ]
         dynamic_parts.append("\n".join(platform_lines))
     except Exception:

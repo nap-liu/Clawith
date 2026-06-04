@@ -471,7 +471,7 @@ AGENT_TOOLS = [
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "Unique name for this trigger, e.g. 'daily_briefing' or 'wait_morty_reply'",
+                        "description": "Unique name for this trigger, e.g. 'daily_briefing' or 'wait_<name>_reply'",
                     },
                     "type": {
                         "type": "string",
@@ -480,7 +480,7 @@ AGENT_TOOLS = [
                     },
                     "config": {
                         "type": "object",
-                        "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message: {\"from_agent_name\": \"Morty\"} or {\"from_user_name\": \"张三\"} (for human users on Feishu/Slack/Discord). webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)",
+                        "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message: {\"from_agent_name\": \"<agent_name>\"} or {\"from_user_name\": \"<user_name>\"} (for human users on Feishu/Slack/Discord). webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)",
                     },
                     "reason": {
                         "type": "string",
@@ -7897,11 +7897,20 @@ async def _handle_set_trigger(
         except Exception:
             pass
 
-        # Return webhook URL for webhook triggers
+        # Return webhook URL for webhook triggers.
+        # Resolve via resolve_base_url (the same tenant-aware resolver used by
+        # list_triggers and the agent's "Platform Base URLs" prompt) so the URL
+        # stays consistent across the system and never falls back to a
+        # placeholder domain like try.clawith.ai.
         if ttype == "webhook":
-            from app.services.platform_service import platform_service
-            base = await platform_service.get_public_base_url()
-            webhook_url = f"{base.rstrip('/')}/api/webhooks/t/{config['token']}"
+            from app.core.domain import resolve_base_url
+            from app.models.agent import Agent as _AgentModel
+            async with async_session() as _url_db:
+                _a_r = await _url_db.execute(select(_AgentModel).where(_AgentModel.id == agent_id))
+                _agent = _a_r.scalar_one_or_none()
+                _tenant_id = str(_agent.tenant_id) if _agent and _agent.tenant_id else None
+                base = (await resolve_base_url(_url_db, request=None, tenant_id=_tenant_id)).rstrip("/")
+            webhook_url = f"{base}/api/webhooks/t/{config['token']}"
 
             mode_note = f"\nMode: {wmode}" if wmode in ("queue", "merge") else ""
             hook_token = config["token"]
