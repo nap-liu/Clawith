@@ -528,7 +528,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_channel_file",
         "display_name": "Send File",
-        "description": "Send a file to a specific person or back to the current conversation. If member_name is provided, the system resolves the recipient across all connected channels (Feishu, Slack, etc.) and delivers the file via the appropriate channel.",
+        "description": "Send a workspace file to a person or back to the current conversation. To send to the person you are CURRENTLY talking to (you are replying inside an IM or web conversation), OMIT member_name — the file is delivered straight back to the current conversation and no relationship or contact lookup is required. Only pass member_name when sending to someone who is NOT the current conversation partner; the system then resolves that person across all connected channels (Feishu, DingTalk, WeCom, Slack, etc.) and delivers via the appropriate one.",
         "category": "communication",
         "icon": "📎",
         "is_default": True,
@@ -536,7 +536,7 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Workspace-relative path to the file"},
-                "member_name": {"type": "string", "description": "Name of the person to send the file to. The system looks up this person across all configured channels and delivers via the appropriate one."},
+                "member_name": {"type": "string", "description": "OPTIONAL. Only set this to send to someone who is NOT the current conversation partner; the system then looks up this person across all configured channels and delivers via the appropriate one. Leave it unset to deliver to the current conversation."},
                 "message": {"type": "string", "description": "Optional message to accompany the file"},
             },
             "required": ["file_path"],

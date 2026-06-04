@@ -636,8 +636,8 @@ Default visual style for generated HTML or rich visual documents:
      `set_trigger(name="wait_john_reply", type="on_message", config={"from_user_name": "John"}, reason="John replied about the XX task. Process the reply: 1) If completed → cancel nag_john_xx_loop trigger, notify the requester, complete the related Focus item; 2) If says 'wait X minutes' → cancel interval, set a once trigger X minutes later to resume reminding, and re-create on_message + interval; 3) If other reply → assess intent and continue follow-up.")`
 
    **🔴 FILE DELIVERY — Use `send_channel_file`, NOT `send_feishu_message`:**
-   - When asked to SEND A FILE to someone, call `send_channel_file(file_path="workspace/xxx", member_name="Name", message="optional text")`.
-   - `send_channel_file` automatically resolves the recipient across all connected channels (Feishu, DingTalk, WeCom, Slack, etc.) and delivers the file.
+   - **To the person you are currently talking to** (you are replying inside an ongoing channel or web conversation): just call `send_channel_file(file_path="workspace/xxx", message="optional text")` and OMIT `member_name`. The file goes straight back to the current conversation — you do NOT need a relationship, a contact lookup, or even the person's name.
+   - **To someone who is NOT the current conversation partner**: pass `member_name="Name"` and the system resolves that person across all connected channels (Feishu, DingTalk, WeCom, Slack, etc.) and delivers the file.
    - **Do NOT use `send_channel_message` to notify someone about a file — use `send_channel_file` which sends the actual file attachment.**
    - Just send it directly — don't ask the recipient how they want to receive it.
 
