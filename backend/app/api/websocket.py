@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.security import decode_access_token
-from app.utils.sanitize import sanitize_tool_args, _is_secrets_file_path
+from app.utils.sanitize import _is_secrets_file_path
 from app.core.permissions import check_agent_access, is_agent_expired
 from app.database import async_session
 from app.models.agent import Agent
@@ -137,18 +137,13 @@ async def get_chat_history(
         if getattr(m, 'thinking', None):
             entry["thinking"] = m.thinking
         if m.role == "tool_call":
-            # Parse JSON-encoded tool call data
-            try:
-                import json
-                data = json.loads(m.content)
+            # Parse JSON-encoded tool call data (shared helper tolerates both the
+            # canonical name/args schema and legacy Feishu tool_name/arguments).
+            from app.services.chat_history import parse_tool_call_for_display
+            parsed = parse_tool_call_for_display(m.content)
+            if parsed:
                 entry["content"] = ""
-                entry["toolName"] = data.get("name", "")
-                entry["toolArgs"] = data.get("args")
-                entry["toolStatus"] = data.get("status", "done")
-                entry["toolResult"] = data.get("result", "")
-                entry["toolThinking"] = data.get("reasoning_content", "")
-            except Exception:
-                pass
+                entry.update(parsed)
         out.append(entry)
     return out
 
@@ -337,39 +332,12 @@ async def websocket_chat(
     conversation: list[dict] = []
     for msg in history_messages:
         if msg.role == "tool_call":
-            # Convert stored tool_call JSON into OpenAI-format assistant+tool pair
-            try:
-                import json as _j_hist
-                tc_data = _j_hist.loads(msg.content)
-                tc_name = tc_data.get("name", "unknown")
-                tc_args = tc_data.get("args", {})
-                tc_result = tc_data.get("result", "")
-                tc_id = f"call_{msg.id}"  # synthetic tool_call_id
-                # Assistant message with tool_calls array
-                asst_msg = {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": tc_id,
-                        "type": "function",
-                        "function": {"name": tc_name, "arguments": _j_hist.dumps(tc_args, ensure_ascii=False)},
-                    }],
-                }
-                if tc_data.get("reasoning_content"):
-                    asst_msg["reasoning_content"] = tc_data["reasoning_content"]
-                conversation.append(asst_msg)
-                # Tool result message. tc_result is already the canonical
-                # llm_view produced by finalize_tool_output when the tool
-                # was executed — append-only, never re-shaped here.
-                from app.services.vision_inject import sanitize_history_tool_result
-                sanitized_result = sanitize_history_tool_result(str(tc_result))
-                conversation.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": sanitized_result,
-                })
-            except Exception:
-                continue  # Skip malformed tool_call records
+            # Expand the stored tool_call row into the OpenAI assistant(tool_calls)
+            # + tool(result) pair via the shared helper, so the web client and the
+            # IM channels replay byte-identical tool-call history into the model.
+            # (malformed rows expand to [], i.e. silently skipped — same as before.)
+            from app.services.chat_history import expand_tool_call_row
+            conversation.extend(expand_tool_call_row(msg))
         else:
             entry = {"role": msg.role, "content": msg.content}
             if hasattr(msg, 'thinking') and msg.thinking:
@@ -695,30 +663,21 @@ async def websocket_chat(
                                 logger.info(f"[WS][Workspace] activity: {_done_tool_name} → {_ws_path}")
 
                         await websocket.send_json({"type": "tool_call", **data})
-                        # Save completed tool calls to DB so they persist in chat history
+                        # Persist completed tool calls via the shared writer — the
+                        # SAME canonical schema every IM channel uses (single source
+                        # of truth, args sanitized + result stored verbatim). Then
+                        # mark the session read for the active viewer (web-only).
                         if data.get("status") == "done":
+                            from app.services.chat_history import persist_tool_call
+                            await persist_tool_call(
+                                async_session,
+                                agent_id=agent_id,
+                                user_id=user_id,
+                                conversation_id=conv_id,
+                                evt=data,
+                            )
                             try:
-                                import json as _json_tc
                                 async with async_session() as _tc_db:
-                                    tc_msg = ChatMessage(
-                                        agent_id=agent_id,
-                                        user_id=user_id,
-                                        role="tool_call",
-                                        content=_json_tc.dumps({
-                                            "name": data.get("name", ""),
-                                            "args": sanitize_tool_args(data.get("args")),
-                                            "status": "done",
-                                            # data["result"] is the llm_view from
-                                            # tool_output_store.finalize_tool_output —
-                                            # already bounded (inline if under the
-                                            # tool's budget, else a <persisted-output>
-                                            # block pointing at the workspace file).
-                                            "result": data.get("result") or "",
-                                            "reasoning_content": data.get("reasoning_content"),
-                                        }),
-                                        conversation_id=conv_id,
-                                    )
-                                    _tc_db.add(tc_msg)
                                     await maybe_mark_session_read_for_active_viewer(
                                         _tc_db,
                                         agent_id=agent_id,
@@ -727,7 +686,7 @@ async def websocket_chat(
                                     )
                                     await _tc_db.commit()
                             except Exception as _tc_err:
-                                logger.warning(f"[WS] Failed to save tool_call: {_tc_err}")
+                                logger.warning(f"[WS] Failed to mark session read: {_tc_err}")
                     
                     # Track thinking content for storage
                     thinking_content = []

@@ -724,6 +724,7 @@ async def process_dingtalk_message(
             reply_text = await _call_agent_llm(
                 db, agent_id, llm_user_text,
                 history=history, user_id=platform_user_id,
+                session_id=session_conv_id,
                 is_group=(conversation_type == "2"),
             )
         finally:

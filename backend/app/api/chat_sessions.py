@@ -490,18 +490,12 @@ async def get_session_messages(
                 sender_name = user_name_cache.get(sender_user_id)
 
         if m.role == "tool_call":
-            import json
+            from app.services.chat_history import parse_tool_call_for_display
             entry: dict = {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
-            try:
-                data = json.loads(m.content)
+            parsed = parse_tool_call_for_display(m.content)
+            if parsed:
                 entry["content"] = ""
-                entry["toolName"] = data.get("name", "")
-                entry["toolArgs"] = data.get("args")
-                entry["toolStatus"] = data.get("status", "done")
-                entry["toolResult"] = data.get("result", "")
-                entry["toolThinking"] = data.get("reasoning_content", "")
-            except Exception:
-                pass
+                entry.update(parsed)
             if sender_name:
                 entry["sender_name"] = sender_name
             if sender_user_id:

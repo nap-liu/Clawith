@@ -162,92 +162,6 @@ class _SerialPatchQueue:
             await self._tail
 
 
-def _build_llm_history_from_chat_messages(history_messages: list) -> list[dict]:
-    """Rebuild LLM history from persisted chat messages.
-
-    Feishu persists real tool calls as `tool_call` rows. To preserve the
-    same conversational continuity as the web client, convert those rows back
-    into assistant tool-call messages plus tool result messages before sending
-    history to the model.
-    """
-    import json as _json
-
-    history: list[dict] = []
-    for msg in history_messages:
-        if msg.role == "tool_call":
-            try:
-                payload = _json.loads(msg.content or "{}")
-            except Exception:
-                payload = {}
-
-            # Support both local schema (tool_name/arguments) and remote schema (name/args)
-            tool_name = payload.get("tool_name") or payload.get("name") or "unknown_tool"
-            tool_args = payload.get("arguments") or payload.get("args") or {}
-            tool_result = payload.get("result") or ""
-            call_id = payload.get("tool_call_id") or f"feishu-tool-{msg.id}"
-
-            history.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": _json.dumps(tool_args, ensure_ascii=False) if isinstance(tool_args, dict) else str(tool_args),
-                    },
-                }],
-            })
-            history.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": str(tool_result) if tool_result else "",
-            })
-            continue
-
-        history.append({"role": msg.role, "content": msg.content})
-    return history
-
-
-async def _save_feishu_tool_call(
-    *,
-    db_session_factory,
-    agent_id: uuid.UUID,
-    user_id: uuid.UUID,
-    conversation_id: str,
-    tool_name: str,
-    status: str,
-    arguments: dict | None,
-    result: str,
-    tool_call_id: str | None = None,
-    reasoning_content: str | None = None,
-) -> None:
-    """Persist a completed Feishu tool call into chat history."""
-    import json as _json
-    from app.models.audit import ChatMessage
-
-    payload = {
-        "tool_name": tool_name,
-        "arguments": arguments or {},
-        "result": result,
-        "tool_call_id": tool_call_id,
-        "status": status,
-        "reasoning_content": reasoning_content,
-    }
-    try:
-        async with db_session_factory() as _tc_db:
-            _tc_db.add(ChatMessage(
-                agent_id=agent_id,
-                user_id=user_id,
-                role="tool_call",
-                content=_json.dumps(payload, ensure_ascii=False, default=str),
-                conversation_id=conversation_id,
-            ))
-            await _tc_db.commit()
-    except Exception as e:
-        logger.warning(f"[Feishu] Failed to save tool_call: {e}")
-
-
 # ─── OAuth ──────────────────────────────────────────────
 
 from fastapi.responses import HTMLResponse, Response
@@ -1038,20 +952,9 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     _tool_errors.append(f"`{tool_name}`: tool status `{status}`")
                     _tool_status_done.append(f"ℹ️ Tool update: `{tool_name}` ({status})")
 
-                if status and status != "running":
-                    from app.database import async_session as _async_session_tc
-                    await _save_feishu_tool_call(
-                        db_session_factory=_async_session_tc,
-                        agent_id=agent_id,
-                        user_id=platform_user_id,
-                        conversation_id=session_conv_id,
-                        tool_name=tool_name,
-                        status=status,
-                        arguments=evt.get("args") or evt.get("arguments") or {},
-                        result=(str(result) if result is not None else "")[:500],
-                        tool_call_id=evt.get("call_id"),
-                        reasoning_content=evt.get("reasoning_content"),
-                    )
+                # Persistence is centralized in _call_agent_llm via the shared
+                # persist_tool_call (one canonical schema for every channel).
+                # This callback only drives live IM progress hints — no DB write.
                 if _patch_msg_id:
                     await _flush_stream("tool", force=True)
 
@@ -1712,6 +1615,29 @@ async def _call_agent_llm(
     # Use actual user_id so the system prompt knows who it's chatting with
     effective_user_id = user_id or agent_id
 
+    # Centralized tool-call persistence: wrap the channel callback so EVERY IM
+    # channel stores completed tool calls with one canonical schema (shared
+    # persist_tool_call) — making them visible in the web UI and replayable in
+    # cross-turn LLM history, exactly like the WebSocket path. The channel's own
+    # callback (if any) is kept purely for live side effects (e.g. Feishu
+    # progress nudges) and must never persist.
+    from app.database import async_session as _persist_session_factory
+    from app.services.chat_history import persist_tool_call as _persist_tool_call
+
+    async def _on_tool_call_persisted(evt: dict):
+        # Persist only when we have a real session + user (FK-safe). IM channels
+        # always pass both; guard keeps stray callers from writing orphan rows.
+        if session_id and user_id is not None:
+            await _persist_tool_call(
+                _persist_session_factory,
+                agent_id=agent_id,
+                user_id=user_id,
+                conversation_id=session_id,
+                evt=evt,
+            )
+        if on_tool_call is not None:
+            await on_tool_call(evt)
+
     # Reuse the unified, failover-aware caller — the SAME path as the WebSocket
     # chat endpoint, so every provider behaves identically on both surfaces.
     #
@@ -1732,7 +1658,7 @@ async def _call_agent_llm(
         session_id=session_id,
         on_chunk=on_chunk,
         on_thinking=on_thinking,
-        on_tool_call=on_tool_call,
+        on_tool_call=_on_tool_call_persisted,
         supports_vision=getattr(model, "supports_vision", False),
         is_group=is_group,
     )

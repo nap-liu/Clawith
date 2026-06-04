@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -291,3 +293,122 @@ async def test_load_history_group_lookup_failure_falls_back_to_anonymous():
     # Original content preserved
     assert user_msgs[0]["content"] == "昨天的报告写好了吗？"
     assert user_msgs[1]["content"] == "帮我订下午3点会议室"
+
+
+async def test_load_history_expands_tool_call_rows():
+    """tool_call 行必须被展开成 assistant(tool_calls) + tool(result) 对,
+    而不是原样保留为 role=tool_call —— 否则它会在喂给 LLM 前被丢弃,
+    数字员工跨轮就看不到自己之前的工具调用历史(IM 通道的核心缺陷)。"""
+    agent_id = uuid.uuid4()
+    u_alice, _ = await _seed_two_users()
+    conv_id = f"test_tc_{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    await _insert_messages_bypass_fk(
+        [
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "user_id": u_alice.id,
+                "role": "user",
+                "content": "查下上海天气",
+                "conversation_id": conv_id,
+                "created_at": now - timedelta(seconds=100),
+            },
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "user_id": u_alice.id,
+                "role": "tool_call",
+                "content": json.dumps(
+                    {"name": "get_weather", "args": {"city": "SH"}, "status": "done", "result": "sunny"}
+                ),
+                "conversation_id": conv_id,
+                "created_at": now - timedelta(seconds=50),
+            },
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "user_id": u_alice.id,
+                "role": "assistant",
+                "content": "今天上海晴",
+                "conversation_id": conv_id,
+                "created_at": now - timedelta(seconds=10),
+            },
+        ]
+    )
+    async with async_session() as db:
+        history = await load_history_for_llm(db, agent_id=agent_id, conversation_id=conv_id, ctx_size=50)
+
+    roles = [m["role"] for m in history]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    assert "tool_call" not in roles  # no raw tool_call row leaks through
+
+    tc_asst = history[1]
+    assert tc_asst["content"] is None
+    assert tc_asst["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert json.loads(tc_asst["tool_calls"][0]["function"]["arguments"]) == {"city": "SH"}
+
+    tool_msg = history[2]
+    assert tool_msg["tool_call_id"] == tc_asst["tool_calls"][0]["id"]
+    assert tool_msg["content"] == "sunny"
+
+
+@asynccontextmanager
+async def _fk_bypass_session():
+    """An async_session whose FK triggers are disabled, so persist_tool_call
+    can write a chat_messages row without a real agent/user present."""
+    async with async_session() as db:
+        await db.execute(text("SET session_replication_role = replica"))
+        yield db
+
+
+async def test_persist_tool_call_done_roundtrips_via_canonical_schema():
+    """A done tool call persisted via the shared writer must read back through
+    load_history_for_llm as the canonical assistant+tool pair, with secret args
+    masked — proving the IM落库 schema matches the read/replay path."""
+    from app.services.chat_history import persist_tool_call
+
+    agent_id = uuid.uuid4()
+    conv_id = f"test_persist_{uuid.uuid4().hex[:8]}"
+    await persist_tool_call(
+        _fk_bypass_session,
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        conversation_id=conv_id,
+        evt={
+            "name": "read_file",
+            "call_id": "c1",
+            "args": {"path": "x.txt", "password": "SECRET"},
+            "status": "done",
+            "result": "file body",
+            "reasoning_content": "reading",
+        },
+    )
+    async with async_session() as db:
+        history = await load_history_for_llm(db, agent_id=agent_id, conversation_id=conv_id, ctx_size=50)
+
+    assert [m["role"] for m in history] == ["assistant", "tool"]
+    fn = history[0]["tool_calls"][0]["function"]
+    assert fn["name"] == "read_file"
+    args = json.loads(fn["arguments"])
+    assert args["path"] == "x.txt"
+    assert args["password"] == "******"  # sanitized before storage
+    assert history[1]["content"] == "file body"
+
+
+async def test_persist_tool_call_running_status_is_not_stored():
+    """Only completed (done) tool calls are persisted; running is a no-op."""
+    from app.services.chat_history import persist_tool_call
+
+    agent_id = uuid.uuid4()
+    conv_id = f"test_persist_run_{uuid.uuid4().hex[:8]}"
+    await persist_tool_call(
+        _fk_bypass_session,
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        conversation_id=conv_id,
+        evt={"name": "x", "args": {}, "status": "running"},
+    )
+    async with async_session() as db:
+        history = await load_history_for_llm(db, agent_id=agent_id, conversation_id=conv_id, ctx_size=50)
+    assert history == []

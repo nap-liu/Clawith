@@ -176,6 +176,149 @@ async def load_messages_for_session(
     return rows
 
 
+def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
+    """Expand one persisted ``tool_call`` row into an OpenAI ``assistant``
+    (carrying ``tool_calls``) + ``tool`` (result) message pair.
+
+    This is the single source of truth shared by the web WebSocket path and
+    the IM channels, so both replay identical tool-call history into the
+    model. The mapping is byte-for-byte the historical websocket.py behaviour.
+
+    Tolerates two stored schemas: the canonical ``name`` / ``args`` written by
+    the unified persistence path, and the legacy Feishu ``tool_name`` /
+    ``arguments`` rows. Returns ``[]`` for malformed rows so callers skip them.
+    """
+    import json as _json
+
+    try:
+        data = _json.loads(msg.content or "{}")
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    name = data.get("name") or data.get("tool_name") or "unknown"
+    args = data.get("args")
+    if args is None:
+        args = data.get("arguments")
+    if args is None:
+        args = {}
+    result = data.get("result") or ""
+    tc_id = f"call_{msg.id}"
+
+    asst: dict[str, Any] = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": tc_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": (_json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)),
+                },
+            }
+        ],
+    }
+    if data.get("reasoning_content"):
+        asst["reasoning_content"] = data["reasoning_content"]
+
+    # Lazy import: vision_inject pulls in optional deps; only needed here.
+    from app.services.vision_inject import sanitize_history_tool_result
+
+    tool_msg = {
+        "role": "tool",
+        "tool_call_id": tc_id,
+        "content": sanitize_history_tool_result(str(result)),
+    }
+    return [asst, tool_msg]
+
+
+async def persist_tool_call(
+    db_session_factory,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    evt: dict[str, Any],
+) -> None:
+    """Persist a completed tool call into chat history using the canonical
+    ``name`` / ``args`` schema — the single writer shared by the web WebSocket
+    path and every IM channel, so the web UI and the LLM-history replay both
+    observe it identically.
+
+    ``evt`` is the ``on_tool_call`` payload emitted by the LLM caller
+    (``name`` / ``call_id`` / ``args`` / ``status`` / ``result`` /
+    ``reasoning_content``). Only ``status == "done"`` is stored; running
+    notifications are ignored. ``args`` are sanitized (secrets masked, base64
+    images redacted) before storage, mirroring the web path. The result is
+    stored verbatim (never truncated). Failures are swallowed — a best-effort
+    audit write must never break the live conversation.
+    """
+    if (evt or {}).get("status") != "done":
+        return
+
+    import json as _json
+
+    from app.utils.sanitize import sanitize_tool_args
+
+    content = _json.dumps(
+        {
+            "name": evt.get("name", ""),
+            "args": sanitize_tool_args(evt.get("args")),
+            "status": "done",
+            "result": evt.get("result") or "",
+            "reasoning_content": evt.get("reasoning_content"),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    try:
+        async with db_session_factory() as db:
+            db.add(
+                ChatMessage(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    role="tool_call",
+                    content=content,
+                    conversation_id=conversation_id,
+                )
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"[chat_history] persist_tool_call failed (non-fatal): {e}")
+
+
+def parse_tool_call_for_display(content: str) -> dict[str, Any]:
+    """Parse a stored ``tool_call`` row's JSON content into the web UI display
+    fields (``toolName`` / ``toolArgs`` / ``toolStatus`` / ``toolResult`` /
+    ``toolThinking``). Tolerates both the canonical ``name`` / ``args`` schema
+    and legacy Feishu ``tool_name`` / ``arguments`` rows, so historical channel
+    conversations render their tool calls instead of showing blanks.
+
+    Returns ``{}`` for malformed content so callers keep the raw row untouched.
+    """
+    import json as _json
+
+    try:
+        data = _json.loads(content or "{}")
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    args = data.get("args")
+    if args is None:
+        args = data.get("arguments")
+    return {
+        "toolName": data.get("name") or data.get("tool_name") or "",
+        "toolArgs": args,
+        "toolStatus": data.get("status", "done"),
+        "toolResult": data.get("result", ""),
+        "toolThinking": data.get("reasoning_content", ""),
+    }
+
+
 async def load_history_for_llm(
     db: AsyncSession,
     *,
@@ -209,28 +352,33 @@ async def load_history_for_llm(
         ctx_size=ctx_size,
     )
 
+    # Resolve group sender display names up front. Two distinct fallbacks:
+    #   * lookup raised (DB outage)          -> wrap_users stays False -> anonymous
+    #   * lookup ok but a user_id is missing -> wrap_with_sender falls back to Unknown
+    wrap_users = False
+    name_map: dict[uuid.UUID, str] = {}
     if is_group:
-        # Collect user_ids first (this comprehension is pure attribute access — cannot raise)
         user_ids = {m.user_id for m in rows if m.role == "user" and m.user_id is not None}
         try:
             name_map = await _batch_load_display_names(db, user_ids)
+            wrap_users = True
         except Exception as e:
             logger.warning(f"[chat_history] display_name batch lookup failed, falling back to anonymous history: {e}")
-            history = [{"role": m.role, "content": m.content} for m in rows]
+            wrap_users = False
+
+    # Build the LLM-ready history. tool_call rows are expanded into the same
+    # assistant(tool_calls) + tool(result) pair the web client replays, so IM
+    # channels preserve identical tool-call continuity instead of dropping it.
+    history: list[dict[str, Any]] = []
+    for m in rows:
+        if m.role == "tool_call":
+            history.extend(expand_tool_call_row(m))
+            continue
+        if wrap_users and m.role == "user" and m.user_id is not None:
+            content = wrap_with_sender(m.content, m.user_id, name_map.get(m.user_id))
         else:
-            history = [
-                {
-                    "role": m.role,
-                    "content": (
-                        wrap_with_sender(m.content, m.user_id, name_map.get(m.user_id))
-                        if m.role == "user" and m.user_id is not None
-                        else m.content
-                    ),
-                }
-                for m in rows
-            ]
-    else:
-        history = [{"role": m.role, "content": m.content} for m in rows]
+            content = m.content
+        history.append({"role": m.role, "content": content})
 
     if rehydrate_images_max is not None:
         # Lazy import: image_context pulls in vision deps that not all
