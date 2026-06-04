@@ -10,7 +10,12 @@ from app.models.agent import Agent
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.user import User, Identity
-from app.services.trigger_daemon import _evaluate_trigger
+from app.services.trigger_daemon import (
+    _evaluate_trigger,
+    _merge_webhook_payloads,
+    _advance_webhook_trigger,
+)
+from app.models.audit import AuditLog
 
 pytestmark = pytest.mark.asyncio
 
@@ -181,3 +186,113 @@ async def test_legacy_fires_after_cooldown():
     now = datetime.now(timezone.utc)
     t = _mk_trigger("legacy", pending=True, last_fired=now - timedelta(seconds=120), cooldown=60)
     assert await _evaluate_trigger(t, now) is True
+
+
+# ── Fire path: merge wake-context format + queue/merge advance ────────────────
+
+
+async def test_merge_wake_context_format():
+    """merge join is numbered, and the (merged, N entries) header counts entries."""
+    merged = _merge_webhook_payloads(["p1", "p2"])
+    assert merged == "--- [1] ---\np1\n--- [2] ---\np2"
+    # The header the wake-context builder wraps it with:
+    header = f"Webhook Payload (merged, {len(['p1', 'p2'])} entries):\n{merged}"
+    assert "(merged, 2 entries)" in header
+
+
+async def _make_persisted_webhook_trigger(mode, queue, *, batch_size=None):
+    """Persist an agent + queue/merge webhook trigger (active lock held)."""
+    async with async_session() as db:
+        ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
+        db.add(ident); await db.flush()
+        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
+        db.add(user); await db.flush()
+        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
+        db.add(agent); await db.flush()
+        cfg = {
+            "token": "x",
+            "webhook_mode": mode,
+            "_webhook_queue": list(queue),
+            "_webhook_active": True,
+            "_webhook_active_since": datetime.now(timezone.utc).isoformat(),
+        }
+        if batch_size is not None:
+            cfg["_webhook_batch_size"] = batch_size
+        trig = AgentTrigger(agent_id=agent.id, type="webhook", name="h", config=cfg, reason="r", is_enabled=True)
+        db.add(trig); await db.commit()
+        await db.refresh(trig)
+        return agent.id, trig.id
+
+
+async def _reload_trigger(trig_id):
+    async with async_session() as db:
+        return (await db.execute(select(AgentTrigger).where(AgentTrigger.id == trig_id))).scalar_one()
+
+
+async def _count_failed_audits(agent_id):
+    async with async_session() as db:
+        rows = (await db.execute(
+            select(AuditLog).where(AuditLog.agent_id == agent_id, AuditLog.action == "webhook_session_failed")
+        )).scalars().all()
+        return len(rows)
+
+
+async def test_queue_advance_success_pops_head_and_releases_lock():
+    agent_id, trig_id = await _make_persisted_webhook_trigger("queue", ["a", "b"])
+    async with async_session() as db:
+        trig = (await db.execute(select(AgentTrigger).where(AgentTrigger.id == trig_id))).scalar_one()
+        _advance_webhook_trigger(db, trig, "ok")
+        await db.commit()
+    trig = await _reload_trigger(trig_id)
+    assert trig.config["_webhook_queue"] == ["b"]
+    assert trig.config["_webhook_active"] is False
+    assert trig.config["_webhook_active_since"] is None
+    assert await _count_failed_audits(agent_id) == 0
+
+
+async def test_queue_advance_failure_still_pops_and_audits():
+    agent_id, trig_id = await _make_persisted_webhook_trigger("queue", ["a", "b"])
+    async with async_session() as db:
+        trig = (await db.execute(select(AgentTrigger).where(AgentTrigger.id == trig_id))).scalar_one()
+        _advance_webhook_trigger(db, trig, None)  # failure: None reply
+        await db.commit()
+    trig = await _reload_trigger(trig_id)
+    assert trig.config["_webhook_queue"] == ["b"]  # still popped (D6)
+    assert trig.config["_webhook_active"] is False
+    assert await _count_failed_audits(agent_id) == 1
+
+
+async def test_merge_advance_drops_batch_keeps_late_arrivals():
+    # batch_size=2 was recorded at lock time; a 3rd entry arrived mid-session.
+    agent_id, trig_id = await _make_persisted_webhook_trigger("merge", ["a", "b", "c"], batch_size=2)
+    async with async_session() as db:
+        trig = (await db.execute(select(AgentTrigger).where(AgentTrigger.id == trig_id))).scalar_one()
+        _advance_webhook_trigger(db, trig, "ok")
+        await db.commit()
+    trig = await _reload_trigger(trig_id)
+    assert trig.config["_webhook_queue"] == ["c"]  # only the 2-entry batch dropped
+    assert trig.config["_webhook_active"] is False
+    assert "_webhook_batch_size" not in trig.config
+
+
+async def test_advance_noop_for_legacy_mode():
+    """Defensive: advance must not touch a legacy trigger if ever passed one."""
+    async with async_session() as db:
+        ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
+        db.add(ident); await db.flush()
+        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
+        db.add(user); await db.flush()
+        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
+        db.add(agent); await db.flush()
+        trig = AgentTrigger(
+            agent_id=agent.id, type="webhook", name="h",
+            config={"token": "x", "_webhook_pending": True, "_webhook_payload": "p"},
+            reason="r", is_enabled=True,
+        )
+        db.add(trig); await db.commit()
+        await db.refresh(trig)
+        _advance_webhook_trigger(db, trig, "ok")
+        await db.commit()
+        assert trig.config["_webhook_pending"] is True
+        assert trig.config["_webhook_payload"] == "p"
+        assert "_webhook_active" not in trig.config
