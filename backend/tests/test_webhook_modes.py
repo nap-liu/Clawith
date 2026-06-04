@@ -553,3 +553,28 @@ async def test_update_trigger_webhook_mode_rejects_non_webhook():
         aid = agent.id
     result = await _handle_update_trigger(aid, {"name": "iv", "webhook_mode": "queue"})
     assert "❌" in result and "webhook" in result.lower()
+
+
+# --- D: webhook creation guides agent to use the Clawith SDK for standalone-page info collection ---
+
+
+async def test_webhook_creation_message_includes_sdk_collection_guidance():
+    from app.services.agent_tools import _handle_set_trigger
+
+    async with async_session() as db:
+        ident = Identity(username=f"u_{uuid.uuid4().hex[:6]}", email=f"{uuid.uuid4().hex[:6]}@t.local", password_hash="x")
+        db.add(ident); await db.flush()
+        user = User(identity_id=ident.id, display_name="U", role="member", is_active=True)
+        db.add(user); await db.flush()
+        agent = Agent(name="A", role_description="", creator_id=user.id, agent_type="native")
+        db.add(agent); await db.commit()
+        aid = agent.id
+    result = await _handle_set_trigger(aid, {"name": "collect", "type": "webhook", "config": {}, "reason": "collect reader info"})
+    # SDK injection + API surface the agent needs
+    assert "/sdk/clawith.js" in result
+    assert "data-hook" in result
+    assert "triggerHook" in result
+    assert "onReady" in result
+    assert "mobile" in result                       # OAuth identity carries mobile
+    # framed as general info collection, NOT narrowly "feedback"
+    assert "survey" in result.lower() or "collection" in result.lower()

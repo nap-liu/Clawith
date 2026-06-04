@@ -7904,7 +7904,24 @@ async def _handle_set_trigger(
             webhook_url = f"{base.rstrip('/')}/api/webhooks/t/{config['token']}"
 
             mode_note = f"\nMode: {wmode}" if wmode in ("queue", "merge") else ""
-            return f"✅ Webhook trigger '{name}' created.\n\nWebhook URL: {webhook_url}{mode_note}\n\nTell the user to configure this URL in their external service (e.g. GitHub, Grafana). When the service sends a POST to this URL, you will be woken up with the payload as context."
+            hook_token = config["token"]
+            return (
+                f"✅ Webhook trigger '{name}' created.\n\n"
+                f"Webhook URL: {webhook_url}{mode_note}\n\n"
+                "Two ways to drive this hook:\n\n"
+                "1) External services — give the URL to the user to configure in GitHub/Grafana/etc.; "
+                "a POST wakes you up with the payload.\n\n"
+                "2) Collect info from a standalone page you generate — your report/HTML pages are hosted "
+                "independently (outside the main app). Inject the Clawith SDK and that page can "
+                "(a) identify whoever opens it via company OAuth (incl. mobile), and (b) POST any info "
+                "collected on the page back to THIS hook to wake you. Add to the HTML <head>:\n"
+                f'   <script src="/sdk/clawith.js" data-hook="{hook_token}"></script>\n'
+                "   Reader identity: window.Clawith.onReady(u => ...)  // {userId, userName, mobile}\n"
+                "   Send info back:  window.Clawith.triggerHook(window.Clawith.hook, { ...any fields })\n"
+                "   Works for ANY reader-to-you collection (survey, confirmation, choice, sign-up, "
+                "feedback, ...), not just feedback. Each call wakes you once "
+                "(use webhook_mode=queue to process them one-by-one)."
+            )
 
         return f"✅ Trigger '{name}' created ({ttype}). It will fire according to your config and wake you up with the reason as context."
 
