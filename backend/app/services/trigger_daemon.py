@@ -227,14 +227,15 @@ async def _evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     if trigger.max_fires is not None and trigger.fire_count >= trigger.max_fires:
         return False
 
-    # Cooldown check
-    if trigger.last_fired_at:
+    cfg = trigger.config or {}
+    t = trigger.type
+    webhook_mode = cfg.get("webhook_mode", "legacy") if t == "webhook" else None
+
+    # Cooldown check — queue/merge webhook 绕过(串行锁保证不并发); 其余 type 行为不变
+    if trigger.last_fired_at and webhook_mode not in ("queue", "merge"):
         cooldown = timedelta(seconds=trigger.cooldown_seconds)
         if (now - trigger.last_fired_at) < cooldown:
             return False
-
-    cfg = trigger.config or {}
-    t = trigger.type
 
     if t == "cron":
         expr = cfg.get("expr", "* * * * *")
@@ -295,10 +296,20 @@ async def _evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
         return await _check_new_agent_messages(trigger)
 
     elif t == "webhook":
-        # Check if a webhook payload is pending
-        if cfg.get("_webhook_pending"):
-            return True
-        return False
+        if webhook_mode == "legacy":
+            return bool(cfg.get("_webhook_pending"))
+        # queue / merge
+        if cfg.get("_webhook_active"):
+            since = cfg.get("_webhook_active_since")
+            if since:
+                try:
+                    since_dt = datetime.fromisoformat(since)
+                    if (now - since_dt) > timedelta(minutes=10):
+                        return True   # 锁超时, 强制重处理(死锁兜底)
+                except Exception:
+                    pass
+            return False              # 串行: 有活动 session, 等
+        return len(cfg.get("_webhook_queue") or []) > 0
 
     return False
 
@@ -608,6 +619,72 @@ async def _resolve_trigger_delivery_target(agent: Agent, triggers: list[AgentTri
 
     return None
 
+
+# ── Webhook queue/merge fire helpers ────────────────────────────────────────
+
+
+def _merge_webhook_payloads(queue: list[str]) -> str:
+    """Join queued webhook payloads into a single numbered block.
+
+    Format: ``--- [1] ---\\n{p1}\\n--- [2] ---\\n{p2}``. Truncation to 2000
+    chars is applied by the caller (after the header is computed).
+    """
+    return "\n".join(f"--- [{i + 1}] ---\n{p}" for i, p in enumerate(queue))
+
+
+def _audit_webhook_failed(db, agent_id, name, detail):
+    """Best-effort audit row when a queue/merge webhook session failed.
+
+    D6: a failed session still counts as done (the entry is popped/dropped),
+    but we record the loss so the user can see it.
+    """
+    try:
+        from app.models.audit import AuditLog
+        db.add(AuditLog(
+            agent_id=agent_id,
+            action="webhook_session_failed",
+            details={"trigger_name": name, "payload": str(detail)[:2000]},
+        ))
+    except Exception:
+        pass
+
+
+def _advance_webhook_trigger(db, trig: AgentTrigger, reply) -> None:
+    """Advance a queue/merge webhook trigger after its session finished.
+
+    queue → pop the head; merge → drop the consumed batch
+    (``_webhook_batch_size`` recorded at lock time). Failure (empty/None
+    reply) still advances (D6) but writes an audit row. Always releases the
+    serial lock (``_webhook_active``) so the 10-min deadlock fallback stays
+    safe. Mutates ``trig.config`` in place; caller commits.
+    """
+    if not trig.config:
+        return
+    wmode = trig.config.get("webhook_mode", "legacy")
+    if wmode not in ("queue", "merge"):
+        return
+    q = list(trig.config.get("_webhook_queue") or [])
+    failed = (reply is None) or (isinstance(reply, str) and reply.strip() == "")
+    if wmode == "queue":
+        if q:
+            done = q.pop(0)
+            if failed:
+                _audit_webhook_failed(db, trig.agent_id, trig.name, done)
+    else:  # merge
+        n = trig.config.get("_webhook_batch_size", len(q))
+        q = q[n:]
+        if failed:
+            _audit_webhook_failed(db, trig.agent_id, trig.name, f"batch={n}")
+    new_cfg = {
+        **trig.config,
+        "_webhook_queue": q,
+        "_webhook_active": False,
+        "_webhook_active_since": None,
+    }
+    new_cfg.pop("_webhook_batch_size", None)
+    trig.config = new_cfg
+
+
 async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTrigger]):
     """Invoke an agent with context from one or more fired triggers.
 
@@ -688,12 +765,43 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                         "\n3. After the tool call succeeds, send a brief confirmation that you received and recorded it."
                         "\n4. Do not only confirm without calling the tool, and do not store the raw long conversation verbatim as the daily report."
                     )
-                # Include webhook payload
-                if t.type == "webhook" and cfg.get("_webhook_payload"):
-                    payload_str = cfg["_webhook_payload"]
-                    if len(payload_str) > 2000:
-                        payload_str = payload_str[:2000] + "... (truncated)"
-                    part += f"\nWebhook Payload:\n{payload_str}"
+                # Include webhook payload (by mode)
+                if t.type == "webhook":
+                    wmode = cfg.get("webhook_mode", "legacy")
+                    if wmode == "legacy":
+                        payload_str = cfg.get("_webhook_payload")
+                        if payload_str:
+                            if len(payload_str) > 2000:
+                                payload_str = payload_str[:2000] + "... (truncated)"
+                            part += f"\nWebhook Payload:\n{payload_str}"
+                    elif wmode == "queue":
+                        q = cfg.get("_webhook_queue") or []
+                        if q:
+                            payload_str = q[0]
+                            if len(payload_str) > 2000:
+                                payload_str = payload_str[:2000] + "... (truncated)"
+                            part += f"\nWebhook Payload:\n{payload_str}"
+                    elif wmode == "merge":
+                        # B1 fix: render the SAME batch the finally will delete —
+                        # read fresh queue + recorded batch_size, not the T0 tick
+                        # snapshot. FIFO guarantees queue[:batch_size] is stable
+                        # between this build and _advance_webhook_trigger, so the
+                        # rendered set == the deleted set (late arrivals only append
+                        # to the tail → never silently dropped).
+                        async with async_session() as _wdb:
+                            _wres = await _wdb.execute(
+                                select(AgentTrigger).where(AgentTrigger.id == t.id)
+                            )
+                            _wtrig = _wres.scalar_one_or_none()
+                        _fresh_cfg = (_wtrig.config if _wtrig else cfg) or {}
+                        _q = _fresh_cfg.get("_webhook_queue") or []
+                        _bs = _fresh_cfg.get("_webhook_batch_size", len(_q))
+                        _batch = _q[:_bs]
+                        if _batch:
+                            merged = _merge_webhook_payloads(_batch)
+                            if len(merged) > 2000:
+                                merged = merged[:2000] + "... (truncated)"
+                            part += f"\nWebhook Payload (merged, {len(_batch)} entries):\n{merged}"
                 context_parts.append(part)
                 trigger_names.append(t.name)
 
@@ -786,18 +894,42 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             except Exception as e:
                 logger.warning(f"Failed to persist tool call for trigger session: {e}")
 
-        reply = await call_llm(
-            model=model,
-            messages=messages,
-            agent_name=agent.name,
-            role_description=agent.role_description or "",
-            agent_id=agent_id,
-            user_id=agent.creator_id,
-            session_id=str(session_id),
-            on_chunk=on_chunk,
-            on_tool_call=on_tool_call,
-            # A2A wake uses the agent's own max_tool_rounds setting (no override)
-        )
+        # reply is initialized so the finally (and post-LLM code) can reference
+        # it even if call_llm raises. The finally ALWAYS advances any queue/merge
+        # webhook trigger + releases the serial lock — success, empty reply, or
+        # exception (D6: failure still counts as done). This is what keeps the
+        # 10-min deadlock fallback in _evaluate_trigger safe.
+        reply = None
+        try:
+            reply = await call_llm(
+                model=model,
+                messages=messages,
+                agent_name=agent.name,
+                role_description=agent.role_description or "",
+                agent_id=agent_id,
+                user_id=agent.creator_id,
+                session_id=str(session_id),
+                on_chunk=on_chunk,
+                on_tool_call=on_tool_call,
+                # A2A wake uses the agent's own max_tool_rounds setting (no override)
+            )
+        finally:
+            if any(t.type == "webhook" for t in triggers):
+                try:
+                    async with async_session() as _db:
+                        for _t in triggers:
+                            if _t.type != "webhook":
+                                continue
+                            _res = await _db.execute(
+                                select(AgentTrigger).where(AgentTrigger.id == _t.id)
+                            )
+                            _trig = _res.scalar_one_or_none()
+                            if not _trig:
+                                continue
+                            _advance_webhook_trigger(_db, _trig, reply)
+                        await _db.commit()
+                except Exception as _e:
+                    logger.warning(f"Failed to advance webhook queue after session: {_e}")
 
         # Save assistant reply to Reflection session
         async with async_session() as db:
@@ -1031,11 +1163,27 @@ async def _tick():
                         if trigger.type == "once":
                             trigger.is_enabled = False
                         if trigger.type == "webhook" and trigger.config:
-                            trigger.config = {
-                                **trigger.config,
-                                "_webhook_pending": False,
-                                "_webhook_payload": None,
-                            }
+                            wmode = trigger.config.get("webhook_mode", "legacy")
+                            if wmode == "legacy":
+                                trigger.config = {
+                                    **trigger.config,
+                                    "_webhook_pending": False,
+                                    "_webhook_payload": None,
+                                }
+                            else:
+                                # queue/merge: acquire the serial lock. Do NOT pop the
+                                # queue yet — it is advanced after the async session
+                                # finishes (success OR failure). merge records how many
+                                # entries this batch consumes so the post-step can drop
+                                # exactly that many (entries appended mid-session stay).
+                                new_cfg = {
+                                    **trigger.config,
+                                    "_webhook_active": True,
+                                    "_webhook_active_since": now.isoformat(),
+                                }
+                                if wmode == "merge":
+                                    new_cfg["_webhook_batch_size"] = len(trigger.config.get("_webhook_queue") or [])
+                                trigger.config = new_cfg
                         if trigger.max_fires and trigger.fire_count >= trigger.max_fires:
                             trigger.is_enabled = False
                 await db.commit()

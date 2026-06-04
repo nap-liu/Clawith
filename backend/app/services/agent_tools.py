@@ -465,7 +465,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "set_trigger",
-            "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Every trigger is attached to a focus item; if focus_ref is omitted, the system will automatically create a focus item from the reason and attach the trigger to it. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or a human user replies — use from_agent_name for agents, or from_user_name for human users on Feishu/Slack/Discord), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.).",
+            "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Every trigger is attached to a focus item; if focus_ref is omitted, the system will automatically create a focus item from the reason and attach the trigger to it. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or a human user replies — use from_agent_name for agents, or from_user_name for human users on Feishu/Slack/Discord), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.). For type=webhook you can also set webhook_mode to control how bursts of rapid triggers are handled — see the webhook_mode parameter.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -489,6 +489,11 @@ AGENT_TOOLS = [
                     "focus_ref": {
                         "type": "string",
                         "description": "Optional: identifier of the structured Focus item that this trigger relates to. If omitted, a Focus item is created automatically from the trigger reason.",
+                    },
+                    "webhook_mode": {
+                        "type": "string",
+                        "enum": ["legacy", "queue", "merge"],
+                        "description": "Webhook processing mode (type=webhook only). Pick by scenario: legacy (default) = keep only the newest payload (overwrite earlier ones) — for low-frequency events where only the latest matters (e.g. a status ping). queue = handle each trigger one-by-one in FIFO order, serial, zero loss — for when EVERY event must be processed individually and in order (e.g. each reader's feedback, each ticket, each order). merge = accumulate all pending triggers and process them together in one session — for when you want to review/summarize multiple events at once (e.g. batch several alerts into one analysis).",
                     },
                 },
                 "required": ["name", "type", "config", "reason"],
@@ -514,6 +519,11 @@ AGENT_TOOLS = [
                     "reason": {
                         "type": "string",
                         "description": "New reason text",
+                    },
+                    "webhook_mode": {
+                        "type": "string",
+                        "enum": ["legacy", "queue", "merge"],
+                        "description": "For type=webhook only: switch the processing mode of an EXISTING webhook trigger (legacy/queue/merge — see set_trigger.webhook_mode for what each means). Preserves the existing webhook URL/token and any already-queued payloads.",
                     },
                 },
                 "required": ["name"],
@@ -7793,6 +7803,10 @@ async def _handle_set_trigger(
         import secrets
         token = secrets.token_urlsafe(8)  # ~11 chars, URL-safe
         config["token"] = token
+        wmode = arguments.get("webhook_mode", "legacy")
+        if wmode in ("queue", "merge"):
+            config["webhook_mode"] = wmode
+            config["_webhook_queue"] = []
 
     # Record the session that created this trigger so trigger results can later be routed to
     # the correct destination instead of being broadcast to every live web session.
@@ -7889,7 +7903,25 @@ async def _handle_set_trigger(
             base = await platform_service.get_public_base_url()
             webhook_url = f"{base.rstrip('/')}/api/webhooks/t/{config['token']}"
 
-            return f"✅ Webhook trigger '{name}' created.\n\nWebhook URL: {webhook_url}\n\nTell the user to configure this URL in their external service (e.g. GitHub, Grafana). When the service sends a POST to this URL, you will be woken up with the payload as context."
+            mode_note = f"\nMode: {wmode}" if wmode in ("queue", "merge") else ""
+            hook_token = config["token"]
+            return (
+                f"✅ Webhook trigger '{name}' created.\n\n"
+                f"Webhook URL: {webhook_url}{mode_note}\n\n"
+                "Two ways to drive this hook:\n\n"
+                "1) External services — give the URL to the user to configure in GitHub/Grafana/etc.; "
+                "a POST wakes you up with the payload.\n\n"
+                "2) Collect info from a standalone page you generate — your report/HTML pages are hosted "
+                "independently (outside the main app). Inject the Clawith SDK and that page can "
+                "(a) identify whoever opens it via company OAuth (incl. mobile), and (b) POST any info "
+                "collected on the page back to THIS hook to wake you. Add to the HTML <head>:\n"
+                f'   <script src="/sdk/clawith.js" data-hook="{hook_token}"></script>\n'
+                "   Reader identity: window.Clawith.onReady(u => ...)  // {userId, userName, mobile}\n"
+                "   Send info back:  window.Clawith.triggerHook(window.Clawith.hook, { ...any fields })\n"
+                "   Works for ANY reader-to-you collection (survey, confirmation, choice, sign-up, "
+                "feedback, ...), not just feedback. Each call wakes you once "
+                "(use webhook_mode=queue to process them one-by-one)."
+            )
 
         return f"✅ Trigger '{name}' created ({ttype}). It will fire according to your config and wake you up with the reason as context."
 
@@ -7907,9 +7939,10 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
 
     new_config = arguments.get("config")
     new_reason = arguments.get("reason")
+    new_webhook_mode = arguments.get("webhook_mode")
 
-    if new_config is None and new_reason is None:
-        return "❌ Provide at least one of 'config' or 'reason' to update"
+    if new_config is None and new_reason is None and new_webhook_mode is None:
+        return "❌ Provide at least one of 'config', 'reason', or 'webhook_mode' to update"
 
     try:
         async with async_session() as db:
@@ -7928,6 +7961,20 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
                 old_config = trigger.config
                 trigger.config = new_config
                 changes.append(f"config: {old_config} → {new_config}")
+            if new_webhook_mode is not None:
+                if trigger.type != "webhook":
+                    return "❌ webhook_mode only applies to webhook triggers"
+                if new_webhook_mode not in ("legacy", "queue", "merge"):
+                    return "❌ Invalid webhook_mode (must be legacy/queue/merge)"
+                # Merge into existing config — preserve token / queued payloads, only flip the mode
+                cfg = dict(trigger.config or {})
+                if new_webhook_mode == "legacy":
+                    cfg.pop("webhook_mode", None)  # legacy is the default → drop the key
+                else:
+                    cfg["webhook_mode"] = new_webhook_mode
+                    cfg.setdefault("_webhook_queue", [])  # ensure queue exists when switching to queue/merge
+                trigger.config = cfg
+                changes.append(f"webhook_mode → {new_webhook_mode}")
             if new_reason is not None:
                 trigger.reason = new_reason
                 changes.append(f"reason updated")

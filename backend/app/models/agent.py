@@ -93,6 +93,7 @@ class Agent(Base):
     max_triggers: Mapped[int] = mapped_column(Integer, default=20)
     min_poll_interval_min: Mapped[int] = mapped_column(Integer, default=5)
     webhook_rate_limit: Mapped[int] = mapped_column(Integer, default=5)
+    webhook_queue_max: Mapped[int] = mapped_column(Integer, default=1000)  # queue/merge 队列上限, 满了背压
 
     # Expiry control
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

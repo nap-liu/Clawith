@@ -102,6 +102,9 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
+    # SDK feedback: 允许作为 OAuth return_to 的 host（空 = 仅校验 /p/<id> 路径，不限 host）
+    SDK_ALLOWED_RETURN_HOSTS: list[str] = []
+
     # Jina AI (Reader + Search APIs)
     JINA_API_KEY: str = ""
 

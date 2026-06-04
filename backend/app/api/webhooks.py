@@ -81,26 +81,28 @@ async def receive_webhook(token: str, request: Request):
         from app.models.agent import Agent
         agent_result = await db.execute(select(Agent).where(Agent.id == target.agent_id))
         agent_obj = agent_result.scalar_one_or_none()
-        agent_rate_limit = (agent_obj.webhook_rate_limit if agent_obj else None) or RATE_LIMIT
-        # Re-check hits against agent-specific limit (hits already collected above)
-        if len(hits) > agent_rate_limit:  # > because we already appended current hit
-            logger.warning(f"Webhook per-agent rate limit ({agent_rate_limit}/min) for token {token[:8]}...")
-            # Log audit entry so user can see dropped webhooks
-            try:
-                from app.models.audit import AuditLog
-                db.add(AuditLog(
-                    agent_id=target.agent_id,
-                    action="webhook_rate_limited",
-                    details={
-                        "trigger_name": target.name,
-                        "limit": agent_rate_limit,
-                        "token_prefix": token[:8],
-                    },
-                ))
-                await db.commit()
-            except Exception:
-                pass
-            return JSONResponse({"ok": True}, status_code=429)
+        mode = (target.config or {}).get("webhook_mode", "legacy")
+        if mode == "legacy":
+            agent_rate_limit = (agent_obj.webhook_rate_limit if agent_obj else None) or RATE_LIMIT
+            # Re-check hits against agent-specific limit (hits already collected above)
+            if len(hits) > agent_rate_limit:  # > because we already appended current hit
+                logger.warning(f"Webhook per-agent rate limit ({agent_rate_limit}/min) for token {token[:8]}...")
+                # Log audit entry so user can see dropped webhooks
+                try:
+                    from app.models.audit import AuditLog
+                    db.add(AuditLog(
+                        agent_id=target.agent_id,
+                        action="webhook_rate_limited",
+                        details={
+                            "trigger_name": target.name,
+                            "limit": agent_rate_limit,
+                            "token_prefix": token[:8],
+                        },
+                    ))
+                    await db.commit()
+                except Exception:
+                    pass
+                return JSONResponse({"ok": True}, status_code=429)
 
         cfg = target.config or {}
 
@@ -128,8 +130,17 @@ async def receive_webhook(token: str, request: Request):
         except Exception:
             payload_str = repr(body[:2000])
 
-        # Store payload and set pending flag
-        new_config = {**cfg, "_webhook_pending": True, "_webhook_payload": payload_str[:8000]}
+        # Store payload — legacy overwrites, queue/merge accumulates
+        if mode == "legacy":
+            new_config = {**cfg, "_webhook_pending": True, "_webhook_payload": payload_str[:8000]}
+        else:  # queue / merge
+            queue = list(cfg.get("_webhook_queue") or [])
+            queue_max = (agent_obj.webhook_queue_max if agent_obj else None) or 1000
+            if len(queue) >= queue_max:
+                logger.warning(f"Webhook queue full ({queue_max}) for trigger {target.name}")
+                return JSONResponse({"ok": False, "error": "queue full"}, status_code=503)
+            queue.append(payload_str[:8000])
+            new_config = {**cfg, "_webhook_queue": queue}
         from sqlalchemy import update
         await db.execute(
             update(AgentTrigger)
