@@ -270,6 +270,8 @@ async def whatsapp_event_webhook(
                 from app.models.audit import ChatMessage
                 from app.services.channel_session import find_or_create_channel_session
                 from app.services.channel_user_service import channel_user_service
+                from app.services.channel_dispatch import ChannelReactions, run_channel_message
+                from app.services.channel_commands import is_channel_command
 
                 agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                 agent_obj = agent_r.scalar_one_or_none()
@@ -285,55 +287,69 @@ async def whatsapp_event_webhook(
                 )
                 platform_user_id = platform_user.id
                 conv_id = f"whatsapp_{sender_phone}"
-                sess = await find_or_create_channel_session(
-                    db=db,
-                    agent_id=agent_id,
-                    user_id=platform_user_id,
-                    external_conv_id=conv_id,
-                    source_channel="whatsapp",
-                    first_message_title=user_text,
-                )
-                session_conv_id = str(sess.id)
-                ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
-                history_r = await db.execute(
-                    select(ChatMessage)
-                    .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-                    .order_by(ChatMessage.created_at.desc())
-                    .limit(ctx_size)
-                )
-                history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
 
-                db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
-                sess.last_message_at = datetime.now(timezone.utc)
-                await db.commit()
+                # 同一 WhatsApp 号码（会话）的多轮消息串行化；不同号码各自独立
+                lock_key = f"whatsapp:{conv_id}"
+                is_cmd = is_channel_command(user_text)
 
-                try:
-                    reply_text = await _call_agent_llm(
-                        db, agent_id, user_text,
-                        history=history, user_id=platform_user_id, session_id=session_conv_id,
+                # 捕获循环变量供闭包使用
+                _sender_phone = sender_phone
+
+                async def _work() -> str:
+                    # 正常消息轮次：会话解析 → 写入用户行 → LLM → 持久化回复 → 发送
+                    sess = await find_or_create_channel_session(
+                        db=db,
+                        agent_id=agent_id,
+                        user_id=platform_user_id,
+                        external_conv_id=conv_id,
+                        source_channel="whatsapp",
+                        first_message_title=user_text,
                     )
-                except Exception as exc:
-                    logger.exception(f"[WhatsApp] LLM failed for agent {agent_id}: {exc}")
-                    reply_text = "Sorry, I encountered an error processing your message."
-
-                try:
-                    await _send_whatsapp_messages(config, sender_phone, reply_text)
-                    config.is_connected = True
-                    # Save assistant reply via the shared writer. Its own session stamps
-                    # created_at at save time (after the tool loop), so the reply orders
-                    # AFTER the turn's tool calls instead of being folded into the web UI's
-                    # analysis card.
-                    from app.services.chat_history import persist_assistant_reply
-                    from app.database import async_session as _areply_session
-                    await persist_assistant_reply(
-                        _areply_session, agent_id=agent_id, user_id=platform_user_id,
-                        conversation_id=session_conv_id, content=reply_text,
+                    session_conv_id = str(sess.id)
+                    ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
+                    history_r = await db.execute(
+                        select(ChatMessage)
+                        .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
+                        .order_by(ChatMessage.created_at.desc())
+                        .limit(ctx_size)
                     )
+                    history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
+
+                    db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
                     sess.last_message_at = datetime.now(timezone.utc)
                     await db.commit()
-                except Exception as exc:
-                    logger.exception(f"[WhatsApp] Send failed for agent {agent_id}: {exc}")
-                    config.is_connected = False
-                    await db.commit()
+
+                    try:
+                        reply_text = await _call_agent_llm(
+                            db, agent_id, user_text,
+                            history=history, user_id=platform_user_id, session_id=session_conv_id,
+                        )
+                    except Exception as exc:
+                        logger.exception(f"[WhatsApp] LLM failed for agent {agent_id}: {exc}")
+                        reply_text = "Sorry, I encountered an error processing your message."
+
+                    try:
+                        await _send_whatsapp_messages(config, _sender_phone, reply_text)
+                        config.is_connected = True
+                        # Save assistant reply via the shared writer. Its own session stamps
+                        # created_at at save time (after the tool loop), so the reply orders
+                        # AFTER the turn's tool calls instead of being folded into the web UI's
+                        # analysis card.
+                        from app.services.chat_history import persist_assistant_reply
+                        from app.database import async_session as _areply_session
+                        await persist_assistant_reply(
+                            _areply_session, agent_id=agent_id, user_id=platform_user_id,
+                            conversation_id=session_conv_id, content=reply_text,
+                        )
+                        sess.last_message_at = datetime.now(timezone.utc)
+                        await db.commit()
+                    except Exception as exc:
+                        logger.exception(f"[WhatsApp] Send failed for agent {agent_id}: {exc}")
+                        config.is_connected = False
+                        await db.commit()
+
+                    return reply_text
+
+                await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
 
     return {"ok": True}

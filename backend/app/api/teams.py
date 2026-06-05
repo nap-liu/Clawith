@@ -459,120 +459,132 @@ async def teams_event_webhook(
         _conv_type = activity.get("conversation", {}).get("conversationType", "")
         _is_group_teams = (_conv_type in ("groupChat", "channel"))
 
-        # Find-or-create session for this Teams conversation
-        sess = await find_or_create_channel_session(
-            db=db,
-            agent_id=agent_id,
-            user_id=platform_user_id if not _is_group_teams else (agent_obj.creator_id if agent_obj else platform_user_id),
-            external_conv_id=conversation_id,
-            source_channel="microsoft_teams",
-            first_message_title=user_text,
-            is_group=_is_group_teams,
-            group_name=activity.get("conversation", {}).get("name") or (f"Teams Group {conversation_id[:8]}" if _is_group_teams else None),
-        )
-        session_conv_id = str(sess.id)
-        from app.services.chat_history import load_history_for_llm
-        history = await load_history_for_llm(
-            db,
-            agent_id=agent_id,
-            conversation_id=session_conv_id,
-            ctx_size=ctx_size,
-            is_group=False,  # group-chat sender wrap not enabled for Teams yet
-        )
+        # 同一 Teams 会话的多轮消息串行化（防止并发入队导致工具调用历史交错）
+        from app.services.channel_dispatch import ChannelReactions, run_channel_message
+        from app.services.channel_commands import is_channel_command
 
-        # Save user message
-        db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
-        sess.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
+        lock_key = f"teams:{conversation_id}"
+        is_cmd = is_channel_command(user_text)
 
-        # Set channel_file_sender contextvar for agent → user file delivery
-        async def _teams_file_sender(file_path, msg: str = ""):
-            _fp = _Path(file_path)
-            use_mi = config.extra_config.get("use_managed_identity", False)
-            has_creds = (config.app_id and config.app_secret) or use_mi
-            if not has_creds or not conversation_id:
-                return
-            # For simplicity, just send file info as text for now
-            file_msg_activity = {
-                "type": "message",
-                "conversation": {"id": conversation_id},
-                "replyToId": reply_to_id,
-                "text": f"Agent sent file: {_fp.name} (Note: file content not directly supported yet, but I can tell you about it: {msg})",
-            }
-            await _send_teams_message(config, conversation_id, file_msg_activity)
-
-        _cfs_s_token = _cfs_s.set(_teams_file_sender)
-
-        # Call LLM
-        try:
-            reply_text = await _call_agent_llm(
-                db, agent_id, user_text,
-                history=history, user_id=platform_user_id, session_id=session_conv_id,
+        async def _work() -> str:
+            # 正常消息轮次：会话解析 → 写入用户行 → LLM → 持久化回复 → 发送
+            # Find-or-create session for this Teams conversation
+            sess = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=platform_user_id if not _is_group_teams else (agent_obj.creator_id if agent_obj else platform_user_id),
+                external_conv_id=conversation_id,
+                source_channel="microsoft_teams",
+                first_message_title=user_text,
+                is_group=_is_group_teams,
+                group_name=activity.get("conversation", {}).get("name") or (f"Teams Group {conversation_id[:8]}" if _is_group_teams else None),
             )
-            _cfs_s.reset(_cfs_s_token)
-            logger.info(f"Teams: LLM reply generated: {reply_text[:80]}")
-        except Exception as e:
-            logger.exception(f"Teams: Failed to call LLM for agent {agent_id}: {e}")
-            reply_text = "Sorry, I encountered an error processing your message."
-            _cfs_s.reset(_cfs_s_token)
-
-        # Save reply
-        try:
-            # Save assistant reply via the shared writer. Its own session stamps
-            # created_at at save time (after the tool loop), so the reply orders
-            # AFTER the turn's tool calls instead of being folded into the web UI's
-            # analysis card.
-            from app.services.chat_history import persist_assistant_reply
-            from app.database import async_session as _areply_session
-            await persist_assistant_reply(
-                _areply_session, agent_id=agent_id, user_id=platform_user_id,
-                conversation_id=session_conv_id, content=reply_text,
+            session_conv_id = str(sess.id)
+            from app.services.chat_history import load_history_for_llm
+            history = await load_history_for_llm(
+                db,
+                agent_id=agent_id,
+                conversation_id=session_conv_id,
+                ctx_size=ctx_size,
+                is_group=False,  # group-chat sender wrap not enabled for Teams yet
             )
+
+            # Save user message
+            db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
-            logger.info(f"Teams: Saved reply to database for conversation {conversation_id}")
-        except Exception as e:
-            logger.exception(f"Teams: Failed to save reply to database: {e}")
-            await db.rollback()
 
-        # Send to Teams
-        use_managed_identity = config.extra_config.get("use_managed_identity", False)
-        has_credentials = (config.app_id and config.app_secret) or use_managed_identity
-        if has_credentials and conversation_id:
-            try:
-                # Get bot's channel account ID from the incoming activity's recipient field
-                # The recipient in the incoming message is the bot itself
-                bot_channel_account = activity.get("recipient", {})
-                if not bot_channel_account.get("id"):
-                    # Fallback: use app_id if recipient not available
-                    if config.app_id:
-                        bot_channel_account = {"id": config.app_id}
-                    else:
-                        logger.error(f"Teams: Cannot determine bot channel account ID - no recipient in activity and no app_id configured")
-                        raise ValueError("Cannot determine bot channel account ID")
-                
-                # Get the user (sender) from the incoming activity's from field
-                user_account = activity.get("from", {})
-                if not user_account.get("id"):
-                    user_account = {"id": sender_id, "name": sender_name}
-                
-                reply_activity = {
+            # Set channel_file_sender contextvar for agent → user file delivery
+            async def _teams_file_sender(file_path, msg: str = ""):
+                _fp = _Path(file_path)
+                use_mi = config.extra_config.get("use_managed_identity", False)
+                has_creds = (config.app_id and config.app_secret) or use_mi
+                if not has_creds or not conversation_id:
+                    return
+                # For simplicity, just send file info as text for now
+                file_msg_activity = {
                     "type": "message",
-                    "from": bot_channel_account,  # Required: Bot's channel account ID (from incoming activity's recipient)
                     "conversation": {"id": conversation_id},
-                    "recipient": user_account,  # The user who sent the message (from incoming activity's from)
-                    "replyToId": reply_to_id,  # Reply to the specific incoming message
-                    "text": reply_text,
+                    "replyToId": reply_to_id,
+                    "text": f"Agent sent file: {_fp.name} (Note: file content not directly supported yet, but I can tell you about it: {msg})",
                 }
-                logger.info(f"Teams: Attempting to send reply to conversation {conversation_id}, from={bot_channel_account.get('id')}, recipient={user_account.get('id')}")
-                await _send_teams_message(config, conversation_id, reply_activity)
-                logger.info(f"Teams: Successfully sent reply to Teams")
-            except Exception as e:
-                logger.exception(f"Teams: Failed to send message to Teams: {e}")
-        else:
-            use_mi = config.extra_config.get("use_managed_identity", False)
-            logger.warning(f"Teams: Cannot send reply - missing credentials (managed_identity={use_mi}, app_id={bool(config.app_id)}, app_secret={bool(config.app_secret)}), conversation_id={bool(conversation_id)}")
+                await _send_teams_message(config, conversation_id, file_msg_activity)
 
+            _cfs_s_token = _cfs_s.set(_teams_file_sender)
+
+            # Call LLM
+            try:
+                reply_text = await _call_agent_llm(
+                    db, agent_id, user_text,
+                    history=history, user_id=platform_user_id, session_id=session_conv_id,
+                )
+                _cfs_s.reset(_cfs_s_token)
+                logger.info(f"Teams: LLM reply generated: {reply_text[:80]}")
+            except Exception as e:
+                logger.exception(f"Teams: Failed to call LLM for agent {agent_id}: {e}")
+                reply_text = "Sorry, I encountered an error processing your message."
+                _cfs_s.reset(_cfs_s_token)
+
+            # Save reply
+            try:
+                # Save assistant reply via the shared writer. Its own session stamps
+                # created_at at save time (after the tool loop), so the reply orders
+                # AFTER the turn's tool calls instead of being folded into the web UI's
+                # analysis card.
+                from app.services.chat_history import persist_assistant_reply
+                from app.database import async_session as _areply_session
+                await persist_assistant_reply(
+                    _areply_session, agent_id=agent_id, user_id=platform_user_id,
+                    conversation_id=session_conv_id, content=reply_text,
+                )
+                sess.last_message_at = datetime.now(timezone.utc)
+                await db.commit()
+                logger.info(f"Teams: Saved reply to database for conversation {conversation_id}")
+            except Exception as e:
+                logger.exception(f"Teams: Failed to save reply to database: {e}")
+                await db.rollback()
+
+            # Send to Teams
+            use_managed_identity = config.extra_config.get("use_managed_identity", False)
+            has_credentials = (config.app_id and config.app_secret) or use_managed_identity
+            if has_credentials and conversation_id:
+                try:
+                    # Get bot's channel account ID from the incoming activity's recipient field
+                    # The recipient in the incoming message is the bot itself
+                    bot_channel_account = activity.get("recipient", {})
+                    if not bot_channel_account.get("id"):
+                        # Fallback: use app_id if recipient not available
+                        if config.app_id:
+                            bot_channel_account = {"id": config.app_id}
+                        else:
+                            logger.error(f"Teams: Cannot determine bot channel account ID - no recipient in activity and no app_id configured")
+                            raise ValueError("Cannot determine bot channel account ID")
+
+                    # Get the user (sender) from the incoming activity's from field
+                    user_account = activity.get("from", {})
+                    if not user_account.get("id"):
+                        user_account = {"id": sender_id, "name": sender_name}
+
+                    reply_activity = {
+                        "type": "message",
+                        "from": bot_channel_account,  # Required: Bot's channel account ID (from incoming activity's recipient)
+                        "conversation": {"id": conversation_id},
+                        "recipient": user_account,  # The user who sent the message (from incoming activity's from)
+                        "replyToId": reply_to_id,  # Reply to the specific incoming message
+                        "text": reply_text,
+                    }
+                    logger.info(f"Teams: Attempting to send reply to conversation {conversation_id}, from={bot_channel_account.get('id')}, recipient={user_account.get('id')}")
+                    await _send_teams_message(config, conversation_id, reply_activity)
+                    logger.info(f"Teams: Successfully sent reply to Teams")
+                except Exception as e:
+                    logger.exception(f"Teams: Failed to send message to Teams: {e}")
+            else:
+                use_mi = config.extra_config.get("use_managed_identity", False)
+                logger.warning(f"Teams: Cannot send reply - missing credentials (managed_identity={use_mi}, app_id={bool(config.app_id)}, app_secret={bool(config.app_secret)}), conversation_id={bool(conversation_id)}")
+
+            return reply_text
+
+        await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
         return {"ok": True}
     except Exception as e:
         logger.exception(f"Teams: Unhandled exception in webhook handler for agent {agent_id}: {e}")

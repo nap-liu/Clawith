@@ -371,69 +371,81 @@ async def slack_event_webhook(
     if _file_user_messages and user_text:
         user_text += "\n" + " ".join(f"[file:{p.split('/')[-1]}]" for p in _file_user_messages)
 
-    # Save user message
-    db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
-    sess.last_message_at = datetime.now(timezone.utc)
-    await db.commit()
+    # 同一 Slack 会话的多轮消息串行化（防止并发入队导致工具调用历史交错）
+    from app.services.channel_dispatch import ChannelReactions, run_channel_message
+    from app.services.channel_commands import is_channel_command
 
-    # Set channel_file_sender contextvar for agent → user file delivery
-    from app.services.agent_tools import channel_file_sender as _cfs_s
-    async def _slack_file_sender(file_path, msg: str = ""):
-        from pathlib import Path as _P
-        _fp = _P(file_path)
-        if not _bot_token or not channel_id:
-            return
-        async with _httpx.AsyncClient(timeout=60) as _hc:
-            _upload_url_resp = await _hc.post(
-                "https://slack.com/api/files.getUploadURLExternal",
-                headers={"Authorization": f"Bearer {_bot_token}"},
-                data={"filename": _fp.name, "length": str(_fp.stat().st_size)},
-            )
-            _ud = _upload_url_resp.json()
-            if not _ud.get("ok"):
-                raise RuntimeError(f"Slack upload URL error: {_ud}")
-            _upload_url = _ud["upload_url"]
-            _file_id = _ud["file_id"]
-            await _hc.post(_upload_url, content=_fp.read_bytes(),
-                            headers={"Content-Type": "application/octet-stream"})
-            _complete = await _hc.post(
-                "https://slack.com/api/files.completeUploadExternal",
-                headers={"Authorization": f"Bearer {_bot_token}"},
-                json={"files": [{"id": _file_id}], "channel_id": channel_id,
-                      "initial_comment": msg or ""},
-            )
-            if not _complete.json().get("ok"):
-                raise RuntimeError(f"Slack upload complete error: {_complete.json()}")
-    _cfs_s_token = _cfs_s.set(_slack_file_sender)
+    lock_key = f"slack:{conv_id}"
+    is_cmd = is_channel_command(user_text)
 
-    # Call LLM
-    from app.services.channel_llm import _call_agent_llm
-    reply_text = await _call_agent_llm(
-        db, agent_id, user_text,
-        history=history, user_id=platform_user_id, session_id=session_conv_id,
-    )
-    _cfs_s.reset(_cfs_s_token)
-    logger.info(f"[Slack] LLM reply: {reply_text[:80]}")
+    async def _work() -> str:
+        # 正常消息轮次：写入用户行 → LLM → 持久化回复 → 发送
+        # Save user message
+        db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
+        sess.last_message_at = datetime.now(timezone.utc)
+        await db.commit()
 
-    # Save assistant reply via the shared writer. Its own session stamps
-    # created_at at save time (after the tool loop), so the reply orders
-    # AFTER the turn's tool calls instead of being folded into the web UI's
-    # analysis card.
-    from app.services.chat_history import persist_assistant_reply
-    from app.database import async_session as _areply_session
-    await persist_assistant_reply(
-        _areply_session, agent_id=agent_id, user_id=platform_user_id,
-        conversation_id=session_conv_id, content=reply_text,
-    )
-    sess.last_message_at = datetime.now(timezone.utc)
-    await db.commit()
+        # Set channel_file_sender contextvar for agent → user file delivery
+        from app.services.agent_tools import channel_file_sender as _cfs_s
+        async def _slack_file_sender(file_path, msg: str = ""):
+            from pathlib import Path as _P
+            _fp = _P(file_path)
+            if not _bot_token or not channel_id:
+                return
+            async with _httpx.AsyncClient(timeout=60) as _hc:
+                _upload_url_resp = await _hc.post(
+                    "https://slack.com/api/files.getUploadURLExternal",
+                    headers={"Authorization": f"Bearer {_bot_token}"},
+                    data={"filename": _fp.name, "length": str(_fp.stat().st_size)},
+                )
+                _ud = _upload_url_resp.json()
+                if not _ud.get("ok"):
+                    raise RuntimeError(f"Slack upload URL error: {_ud}")
+                _upload_url = _ud["upload_url"]
+                _file_id = _ud["file_id"]
+                await _hc.post(_upload_url, content=_fp.read_bytes(),
+                                headers={"Content-Type": "application/octet-stream"})
+                _complete = await _hc.post(
+                    "https://slack.com/api/files.completeUploadExternal",
+                    headers={"Authorization": f"Bearer {_bot_token}"},
+                    json={"files": [{"id": _file_id}], "channel_id": channel_id,
+                          "initial_comment": msg or ""},
+                )
+                if not _complete.json().get("ok"):
+                    raise RuntimeError(f"Slack upload complete error: {_complete.json()}")
+        _cfs_s_token = _cfs_s.set(_slack_file_sender)
 
-    # Send to Slack (chunked)
-    bot_token = config.app_secret or ""
-    if bot_token and channel_id:
-        try:
-            await _send_slack_messages(bot_token, channel_id, reply_text)
-        except Exception as e:
-            logger.error(f"[Slack] Failed to send: {e}")
+        # Call LLM
+        from app.services.channel_llm import _call_agent_llm
+        reply_text = await _call_agent_llm(
+            db, agent_id, user_text,
+            history=history, user_id=platform_user_id, session_id=session_conv_id,
+        )
+        _cfs_s.reset(_cfs_s_token)
+        logger.info(f"[Slack] LLM reply: {reply_text[:80]}")
 
+        # Save assistant reply via the shared writer. Its own session stamps
+        # created_at at save time (after the tool loop), so the reply orders
+        # AFTER the turn's tool calls instead of being folded into the web UI's
+        # analysis card.
+        from app.services.chat_history import persist_assistant_reply
+        from app.database import async_session as _areply_session
+        await persist_assistant_reply(
+            _areply_session, agent_id=agent_id, user_id=platform_user_id,
+            conversation_id=session_conv_id, content=reply_text,
+        )
+        sess.last_message_at = datetime.now(timezone.utc)
+        await db.commit()
+
+        # Send to Slack (chunked)
+        bot_token = config.app_secret or ""
+        if bot_token and channel_id:
+            try:
+                await _send_slack_messages(bot_token, channel_id, reply_text)
+            except Exception as e:
+                logger.error(f"[Slack] Failed to send: {e}")
+
+        return reply_text
+
+    await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
     return {"ok": True}
