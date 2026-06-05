@@ -298,15 +298,6 @@ async def slack_event_webhook(
     )
     session_conv_id = str(sess.id)
 
-    from app.services.chat_history import load_history_for_llm
-    history = await load_history_for_llm(
-        db,
-        agent_id=agent_id,
-        conversation_id=session_conv_id,
-        ctx_size=ctx_size,
-        is_group=False,  # group-chat sender wrap not enabled for Slack yet
-    )
-
     # Handle file attachments: save to workspace/uploads/ and send ack
     from app.config import get_settings as _gs
     import asyncio as _asyncio
@@ -414,6 +405,16 @@ async def slack_event_webhook(
                 if not _complete.json().get("ok"):
                     raise RuntimeError(f"Slack upload complete error: {_complete.json()}")
         _cfs_s_token = _cfs_s.set(_slack_file_sender)
+
+        # 在锁内加载历史，避免并发请求读取到对方尚未写入的历史（race condition）
+        from app.services.chat_history import load_history_for_llm
+        history = await load_history_for_llm(
+            db,
+            agent_id=agent_id,
+            conversation_id=session_conv_id,
+            ctx_size=ctx_size,
+            is_group=False,  # 暂不启用 Slack 群聊 sender wrap
+        )
 
         # Call LLM
         from app.services.channel_llm import _call_agent_llm
