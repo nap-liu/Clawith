@@ -407,7 +407,7 @@ async def slack_event_webhook(
     _cfs_s_token = _cfs_s.set(_slack_file_sender)
 
     # Call LLM
-    from app.api.feishu import _call_agent_llm
+    from app.services.channel_llm import _call_agent_llm
     reply_text = await _call_agent_llm(
         db, agent_id, user_text,
         history=history, user_id=platform_user_id, session_id=session_conv_id,

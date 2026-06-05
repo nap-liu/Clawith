@@ -146,7 +146,7 @@ class DiscordGatewayManager:
         try:
             from app.models.audit import ChatMessage
             from app.models.agent import Agent as AgentModel
-            from app.api.feishu import _call_agent_llm
+            from app.services.channel_llm import _call_agent_llm
             from app.services.channel_session import find_or_create_channel_session
             from app.models.user import User as _User
             from app.core.security import hash_password as _hp

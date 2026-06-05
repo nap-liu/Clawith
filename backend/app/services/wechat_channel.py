@@ -186,7 +186,7 @@ def _extract_wechat_text(item_list: list[dict[str, Any]] | None) -> str:
 
 
 async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], config: ChannelConfig) -> None:
-    from app.api.feishu import _call_agent_llm
+    from app.services.channel_llm import _call_agent_llm
     from app.services.activity_logger import log_activity
 
     from_user_id = str(msg.get("from_user_id") or "").strip()

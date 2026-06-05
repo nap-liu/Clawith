@@ -36,7 +36,7 @@ from app.services.auth_registry import auth_provider_registry
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
 from app.services.platform_service import platform_service
-from app.api.feishu import _call_agent_llm
+from app.services.channel_llm import _call_agent_llm
 from app.schemas.schemas import ChannelConfigOut
 from app.services.wecom_stream import wecom_stream_manager
 

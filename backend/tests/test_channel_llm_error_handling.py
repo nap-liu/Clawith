@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import app.api.feishu as feishu
+import app.services.channel_llm as channel_llm
 
 pytestmark = pytest.mark.asyncio
 
@@ -74,7 +74,7 @@ def _make_agent_and_model(request_timeout=None):
 
 @pytest.fixture(autouse=True)
 def _never_expired(monkeypatch):
-    monkeypatch.setattr(feishu, "is_agent_expired", lambda _a: False)
+    monkeypatch.setattr(channel_llm, "is_agent_expired", lambda _a: False)
 
 
 def _patch_llm(monkeypatch, fake):
@@ -96,7 +96,7 @@ async def test_slow_tool_loop_is_not_killed_by_outer_timeout(monkeypatch):
 
     _patch_llm(monkeypatch, slow_llm)
 
-    reply = await feishu._call_agent_llm(
+    reply = await channel_llm._call_agent_llm(
         _make_db(agent, model), agent.id, "你好", session_id=str(agent.id), user_id=agent.id
     )
     assert reply == "任务完成"
@@ -121,7 +121,7 @@ async def test_llm_error_preserves_original_and_appends_recovery_hint(monkeypatc
 
     _patch_llm(monkeypatch, failing_llm)
 
-    reply = await feishu._call_agent_llm(
+    reply = await channel_llm._call_agent_llm(
         _make_db(agent, model), agent.id, "你好", session_id=str(agent.id), user_id=agent.id
     )
 
@@ -139,7 +139,7 @@ async def test_successful_reply_passes_through(monkeypatch):
 
     _patch_llm(monkeypatch, ok_llm)
 
-    reply = await feishu._call_agent_llm(
+    reply = await channel_llm._call_agent_llm(
         _make_db(agent, model), agent.id, "你好", session_id=str(agent.id), user_id=agent.id
     )
     assert reply == "你好，我可以帮你做什么？"

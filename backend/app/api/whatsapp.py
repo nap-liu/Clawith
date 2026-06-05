@@ -265,7 +265,7 @@ async def whatsapp_event_webhook(
                 if not user_text or not sender_phone:
                     continue
 
-                from app.api.feishu import _call_agent_llm
+                from app.services.channel_llm import _call_agent_llm
                 from app.models.agent import Agent as AgentModel, DEFAULT_CONTEXT_WINDOW_SIZE
                 from app.models.audit import ChatMessage
                 from app.services.channel_session import find_or_create_channel_session

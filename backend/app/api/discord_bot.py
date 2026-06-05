@@ -281,7 +281,7 @@ async def discord_interaction_webhook(
         async def handle_in_background():
             from app.models.audit import ChatMessage
             from app.models.agent import Agent as AgentModel
-            from app.api.feishu import _call_agent_llm
+            from app.services.channel_llm import _call_agent_llm
             from app.services.channel_session import find_or_create_channel_session
             from app.database import async_session
             from datetime import datetime, timezone
