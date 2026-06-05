@@ -454,7 +454,7 @@ async def wecom_event_webhook(
 
         # Process in background task
         asyncio.create_task(
-            _process_wecom_text(db, agent_id, config, from_user, user_text, chat_id=chat_id)
+            _process_wecom_text(agent_id, config, from_user, user_text, chat_id=chat_id)
         )
 
     elif msg_type == "event":
@@ -526,7 +526,7 @@ async def _process_wecom_kf_event(agent_id: uuid.UUID, config_obj: ChannelConfig
                                 logger.info(f"[WeCom KF] Found msg from {msg.get('external_userid')}: {text[:20]}...")
                                 # Call the local process text with extra KF info
                                 await _process_wecom_text(
-                                    session, agent_id, config, 
+                                    agent_id, config,
                                     msg.get("external_userid"), text,
                                     is_kf=True, open_kfid=msg.get("open_kfid"), kf_msg_id=mid
                                 )
@@ -537,7 +537,6 @@ async def _process_wecom_kf_event(agent_id: uuid.UUID, config_obj: ChannelConfig
 
 
 async def _process_wecom_text(
-    db: AsyncSession,
     agent_id: uuid.UUID,
     config: ChannelConfig,
     from_user: str,
