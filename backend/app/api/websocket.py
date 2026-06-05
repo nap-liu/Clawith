@@ -328,21 +328,11 @@ async def websocket_chat(
     # Send session_id to frontend so Take Control can reference the correct session.
     await websocket.send_json({"type": "connected", "session_id": conv_id})
 
-    # Build conversation context from history
-    conversation: list[dict] = []
-    for msg in history_messages:
-        if msg.role == "tool_call":
-            # Expand the stored tool_call row into the OpenAI assistant(tool_calls)
-            # + tool(result) pair via the shared helper, so the web client and the
-            # IM channels replay byte-identical tool-call history into the model.
-            # (malformed rows expand to [], i.e. silently skipped — same as before.)
-            from app.services.chat_history import expand_tool_call_row
-            conversation.extend(expand_tool_call_row(msg))
-        else:
-            entry = {"role": msg.role, "content": msg.content}
-            if hasattr(msg, 'thinking') and msg.thinking:
-                entry["thinking"] = msg.thinking
-            conversation.append(entry)
+    # Build conversation context from history via the shared row→message builder
+    # — the SAME mapping the IM channels use (tool_call rows expand to the
+    # assistant(tool_calls)+tool(result) pair; web replays model thinking).
+    from app.services.chat_history import build_llm_messages_from_rows
+    conversation: list[dict] = build_llm_messages_from_rows(history_messages, include_thinking=True)
 
     # Re-hydrate historical images for multi-turn LLM context
     from app.services.image_context import rehydrate_image_messages
@@ -765,7 +755,7 @@ async def websocket_chat(
                                 prompt_messages=conversation[-ctx_size:],
                             ):
                                 from app.services.chat_history import (
-                                    expand_tool_call_row,
+                                    build_llm_messages_from_rows,
                                     load_messages_for_session,
                                 )
 
@@ -773,16 +763,8 @@ async def websocket_chat(
                                     _pf_rows = await load_messages_for_session(
                                         _pf_db, agent_id=agent_id, conversation_id=conv_id, ctx_size=ctx_size
                                     )
-                                _rebuilt: list[dict] = []
-                                for _m in _pf_rows:
-                                    if _m.role == "tool_call":
-                                        _rebuilt.extend(expand_tool_call_row(_m))
-                                    else:
-                                        _e = {"role": _m.role, "content": _m.content}
-                                        if getattr(_m, "thinking", None):
-                                            _e["thinking"] = _m.thinking
-                                        _rebuilt.append(_e)
-                                conversation = _rebuilt
+                                # Same shared builder as the initial build above.
+                                conversation = build_llm_messages_from_rows(_pf_rows, include_thinking=True)
                         except Exception as _pf_exc:
                             logger.warning(f"[WS] pre-flight compaction skipped (non-fatal): {_pf_exc}")
 

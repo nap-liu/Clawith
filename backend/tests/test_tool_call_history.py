@@ -162,3 +162,47 @@ def test_strip_leading_orphan_tool_messages_noop_when_valid():
         {"role": "tool", "tool_call_id": "1", "content": "r"},
     ]
     assert strip_leading_orphan_tool_messages(msgs) == msgs
+
+
+def _msg_row(role, content, *, user_id=None, thinking=None):
+    return SimpleNamespace(role=role, content=content, id=uuid.uuid4(), user_id=user_id, thinking=thinking)
+
+
+def test_build_messages_expands_tool_call_and_keeps_plain():
+    """The shared rows→messages builder expands tool_call rows and passes
+    plain user/assistant rows through as {role, content}."""
+    from app.services.chat_history import build_llm_messages_from_rows
+
+    rows = [
+        _msg_row("user", "hi"),
+        _msg_row("tool_call", json.dumps({"name": "f", "args": {"a": 1}, "result": "r"})),
+        _msg_row("assistant", "ok"),
+    ]
+    out = build_llm_messages_from_rows(rows)
+    assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant"]
+    assert out[0]["content"] == "hi"
+    assert out[1]["tool_calls"][0]["function"]["name"] == "f"
+    assert out[2]["content"] == "r"
+    assert out[3]["content"] == "ok"
+
+
+def test_build_messages_group_wraps_user_only():
+    """With wrap_user_names + name_map, only user rows get the sender prefix."""
+    from app.services.chat_history import build_llm_messages_from_rows
+
+    uid = uuid.uuid4()
+    rows = [_msg_row("user", "q", user_id=uid), _msg_row("assistant", "a", user_id=uid)]
+    out = build_llm_messages_from_rows(rows, wrap_user_names=True, name_map={uid: "Alice"})
+    assert out[0]["content"].startswith('<sender id="')
+    assert "Alice" in out[0]["content"] and out[0]["content"].endswith("q")
+    assert out[1]["content"] == "a"  # assistant never wrapped
+
+
+def test_build_messages_thinking_only_when_requested():
+    """thinking is carried only when include_thinking is set (web replays it,
+    IM history does not)."""
+    from app.services.chat_history import build_llm_messages_from_rows
+
+    rows = [_msg_row("assistant", "a", thinking="reasoned")]
+    assert "thinking" not in build_llm_messages_from_rows(rows)[0]
+    assert build_llm_messages_from_rows(rows, include_thinking=True)[0]["thinking"] == "reasoned"

@@ -249,6 +249,40 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
     return [asst, tool_msg]
 
 
+def build_llm_messages_from_rows(
+    rows: list[Any],
+    *,
+    wrap_user_names: bool = False,
+    name_map: dict | None = None,
+    include_thinking: bool = False,
+) -> list[dict[str, Any]]:
+    """Map persisted ChatMessage rows into LLM-ready message dicts — the single
+    source of truth for the rows→messages shape, shared by the IM history loader
+    (``load_history_for_llm``) and the web conversation builder (websocket).
+
+    - ``tool_call`` rows expand to the assistant(tool_calls) + tool(result) pair
+      via ``expand_tool_call_row``.
+    - ``user`` rows get a ``<sender …>`` prefix when ``wrap_user_names`` is set
+      (group chats); other roles are never wrapped.
+    - model ``thinking`` is carried only when ``include_thinking`` is set (the
+      web client replays it into context; IM history intentionally does not).
+    """
+    out: list[dict[str, Any]] = []
+    for m in rows:
+        if m.role == "tool_call":
+            out.extend(expand_tool_call_row(m))
+            continue
+        if wrap_user_names and m.role == "user" and m.user_id is not None:
+            content = wrap_with_sender(m.content, m.user_id, (name_map or {}).get(m.user_id))
+        else:
+            content = m.content
+        entry: dict[str, Any] = {"role": m.role, "content": content}
+        if include_thinking and getattr(m, "thinking", None):
+            entry["thinking"] = m.thinking
+        out.append(entry)
+    return out
+
+
 async def persist_tool_call(
     db_session_factory,
     *,
@@ -425,19 +459,10 @@ async def load_history_for_llm(
             logger.warning(f"[chat_history] display_name batch lookup failed, falling back to anonymous history: {e}")
             wrap_users = False
 
-    # Build the LLM-ready history. tool_call rows are expanded into the same
-    # assistant(tool_calls) + tool(result) pair the web client replays, so IM
-    # channels preserve identical tool-call continuity instead of dropping it.
-    history: list[dict[str, Any]] = []
-    for m in rows:
-        if m.role == "tool_call":
-            history.extend(expand_tool_call_row(m))
-            continue
-        if wrap_users and m.role == "user" and m.user_id is not None:
-            content = wrap_with_sender(m.content, m.user_id, name_map.get(m.user_id))
-        else:
-            content = m.content
-        history.append({"role": m.role, "content": content})
+    # Build the LLM-ready history via the shared row→message builder (tool_call
+    # rows expand to the same assistant+tool pair the web client replays, so IM
+    # channels preserve identical tool-call continuity).
+    history = build_llm_messages_from_rows(rows, wrap_user_names=wrap_users, name_map=name_map)
 
     if rehydrate_images_max is not None:
         # Lazy import: image_context pulls in vision deps that not all
