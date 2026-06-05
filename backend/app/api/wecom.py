@@ -548,127 +548,133 @@ async def _process_wecom_text(
     chat_id: str = "",
 ):
     """Process an incoming WeCom text message and reply."""
+    from app.services.channel_commands import is_channel_command
+    from app.services.channel_dispatch import ChannelReactions, run_channel_message
 
-    async with async_session() as db:
-        # Load agent
-        agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-        agent_obj = agent_r.scalar_one_or_none()
-        if not agent_obj:
-            logger.warning(f"[WeCom] Agent {agent_id} not found")
-            return
-        creator_id = agent_obj.creator_id
-        ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
+    # conv_id 与 find_or_create_channel_session 传入的 external_conv_id 完全一致:
+    #   群聊 → wecom_group_{chat_id}  (不含 from_user,避免不同成员开多会话)
+    #   P2P  → wecom_p2p_{from_user}
+    _is_group = bool(chat_id)
+    conv_id = f"wecom_group_{chat_id}" if _is_group else f"wecom_p2p_{from_user}"
+    lock_key = f"wecom:{conv_id}"
+    is_cmd = is_channel_command(user_text)
 
-        # Distinguish group chat from P2P by chat_id presence
-        _is_group = bool(chat_id)
-        if _is_group:
-            conv_id = f"wecom_group_{chat_id}"
-        else:
-            conv_id = f"wecom_p2p_{from_user}"
+    async def _work() -> str:
+        async with async_session() as db:
+            # 加载 Agent
+            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent_obj = agent_r.scalar_one_or_none()
+            if not agent_obj:
+                logger.warning(f"[WeCom] Agent {agent_id} not found")
+                return ""
+            creator_id = agent_obj.creator_id
+            ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
-        extra_info = {"unionid": from_user}
+            extra_info = {"unionid": from_user}
 
-        # Resolve channel user via unified service (uses OrgMember + SSO patterns)
-        platform_user = await channel_user_service.resolve_channel_user(
-            db=db,
-            agent=agent_obj,
-            channel_type="wecom",
-            external_user_id=from_user,
-            extra_info=extra_info,
-        )
-        platform_user_id = platform_user.id
+            # 通过统一服务解析渠道用户(OrgMember + SSO)
+            platform_user = await channel_user_service.resolve_channel_user(
+                db=db,
+                agent=agent_obj,
+                channel_type="wecom",
+                external_user_id=from_user,
+                extra_info=extra_info,
+            )
+            platform_user_id = platform_user.id
 
-        # Find or create session
-        sess = await find_or_create_channel_session(
-            db=db,
-            agent_id=agent_id,
-            user_id=creator_id if _is_group else platform_user_id,
-            external_conv_id=conv_id,
-            source_channel="wecom",
-            first_message_title=user_text,
-            is_group=_is_group,
-            group_name=f"WeCom Group {chat_id[:8]}" if _is_group else None,
-        )
-        session_conv_id = str(sess.id)
+            # 查找或创建会话,external_conv_id 与上方 conv_id 一致
+            sess = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=creator_id if _is_group else platform_user_id,
+                external_conv_id=conv_id,
+                source_channel="wecom",
+                first_message_title=user_text,
+                is_group=_is_group,
+                group_name=f"WeCom Group {chat_id[:8]}" if _is_group else None,
+            )
+            session_conv_id = str(sess.id)
 
-        # Load history
-        from app.services.chat_history import load_history_for_llm
-        history = await load_history_for_llm(
-            db,
-            agent_id=agent_id,
-            conversation_id=session_conv_id,
-            ctx_size=ctx_size,
-            is_group=False,  # group-chat sender wrap not enabled for WeCom yet
-        )
+            # 加载历史消息
+            from app.services.chat_history import load_history_for_llm
+            history = await load_history_for_llm(
+                db,
+                agent_id=agent_id,
+                conversation_id=session_conv_id,
+                ctx_size=ctx_size,
+                is_group=False,  # 企微群聊暂不启用 sender wrap
+            )
 
-        # Save user message
-        db.add(ChatMessage(
-            agent_id=agent_id, user_id=platform_user_id,
-            role="user", content=user_text,
-            conversation_id=session_conv_id,
-        ))
-        sess.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
+            # 写入用户消息行(锁内,保证顺序)
+            db.add(ChatMessage(
+                agent_id=agent_id, user_id=platform_user_id,
+                role="user", content=user_text,
+                conversation_id=session_conv_id,
+            ))
+            sess.last_message_at = datetime.now(timezone.utc)
+            await db.commit()
 
-        # Call LLM
-        reply_text = await _call_agent_llm(
-            db, agent_id, user_text,
-            history=history, user_id=platform_user_id,
-            session_id=session_conv_id,
-        )
-        logger.info(f"[WeCom] LLM reply: {reply_text[:100]}")
+            # 调用 LLM
+            reply_text = await _call_agent_llm(
+                db, agent_id, user_text,
+                history=history, user_id=platform_user_id,
+                session_id=session_conv_id,
+            )
+            logger.info(f"[WeCom] LLM reply: {reply_text[:100]}")
 
-        # Send reply via WeCom API
-        wecom_agent_id = (config.extra_config or {}).get("wecom_agent_id", "")
-        try:
-            access_token = await _get_wecom_token_cached(config.app_id, config.app_secret)
-            async with httpx.AsyncClient(timeout=10) as client:
-                if access_token:
-                    if is_kf and open_kfid:
-                        # For KF messages, need to bridge/trans state first then send via kf/send_msg
-                        res_state = await client.post(
-                            f"https://qyapi.weixin.qq.com/cgi-bin/kf/service_state/trans?access_token={access_token}", 
-                            json={"open_kfid": open_kfid, "external_userid": from_user, "service_state": 1}
-                        )
-                        logger.info(f"[WeCom KF] trans state result: {res_state.json()}")
-                        res_send = await client.post(
-                            f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token={access_token}", 
-                            json={"touser": from_user, "open_kfid": open_kfid, "msgtype": "text", "text": {"content": reply_text}}
-                        )
-                        logger.info(f"[WeCom KF] send_msg result: {res_send.json()}")
-                    else:
-                        # Default legacy Send as text
-                        await client.post(
-                            f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}",
-                            json={
-                                "touser": from_user,
-                                "msgtype": "text",
-                                "agentid": int(wecom_agent_id) if wecom_agent_id else 0,
-                                "text": {"content": reply_text},
-                            },
-                        )
-        except Exception as e:
-            logger.error(f"[WeCom] Failed to send reply: {e}")
+            # 通过企微 API 发送回复
+            wecom_agent_id = (config.extra_config or {}).get("wecom_agent_id", "")
+            try:
+                access_token = await _get_wecom_token_cached(config.app_id, config.app_secret)
+                async with httpx.AsyncClient(timeout=10) as client:
+                    if access_token:
+                        if is_kf and open_kfid:
+                            # KF 消息需先转接状态再发送
+                            res_state = await client.post(
+                                f"https://qyapi.weixin.qq.com/cgi-bin/kf/service_state/trans?access_token={access_token}",
+                                json={"open_kfid": open_kfid, "external_userid": from_user, "service_state": 1}
+                            )
+                            logger.info(f"[WeCom KF] trans state result: {res_state.json()}")
+                            res_send = await client.post(
+                                f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token={access_token}",
+                                json={"touser": from_user, "open_kfid": open_kfid, "msgtype": "text", "text": {"content": reply_text}}
+                            )
+                            logger.info(f"[WeCom KF] send_msg result: {res_send.json()}")
+                        else:
+                            # 默认发送文本消息
+                            await client.post(
+                                f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}",
+                                json={
+                                    "touser": from_user,
+                                    "msgtype": "text",
+                                    "agentid": int(wecom_agent_id) if wecom_agent_id else 0,
+                                    "text": {"content": reply_text},
+                                },
+                            )
+            except Exception as e:
+                logger.error(f"[WeCom] Failed to send reply: {e}")
 
-        # Save assistant reply via the shared writer. Its own session stamps
-        # created_at at save time (after the tool loop), so the reply orders
-        # AFTER the turn's tool calls instead of being folded into the web UI's
-        # analysis card.
-        from app.services.chat_history import persist_assistant_reply
-        from app.database import async_session as _areply_session
-        await persist_assistant_reply(
-            _areply_session, agent_id=agent_id, user_id=platform_user_id,
-            conversation_id=session_conv_id, content=reply_text,
-        )
-        sess.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
+            # 持久化助手回复(独立 session 保证时序在工具调用记录之后)
+            from app.services.chat_history import persist_assistant_reply
+            from app.database import async_session as _areply_session
+            await persist_assistant_reply(
+                _areply_session, agent_id=agent_id, user_id=platform_user_id,
+                conversation_id=session_conv_id, content=reply_text,
+            )
+            sess.last_message_at = datetime.now(timezone.utc)
+            await db.commit()
 
-        # Log activity
-        await log_activity(
-            agent_id, "chat_reply",
-            f"Replied to WeCom message: {reply_text[:80]}",
-            detail={"channel": "wecom", "user_text": user_text[:200], "reply": reply_text[:500]},
-        )
+            # 记录活动日志
+            await log_activity(
+                agent_id, "chat_reply",
+                f"Replied to WeCom message: {reply_text[:80]}",
+                detail={"channel": "wecom", "user_text": user_text[:200], "reply": reply_text[:500]},
+            )
+
+            return reply_text or ""
+
+    # WeCom webhook 无 emoji reaction,ChannelReactions 保持空
+    await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
 
 
 # ─── OAuth Callback (SSO) ──────────────────────────────

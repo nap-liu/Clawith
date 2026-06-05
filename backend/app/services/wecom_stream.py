@@ -151,19 +151,37 @@ class WeComStreamManager:
                         f"body_keys={list(body.keys())}: {user_text[:80]}"
                     )
 
-                    # Process message and get reply
-                    reply_text = await _process_wecom_stream_message(
-                        agent_id=agent_id,
-                        sender_id=sender_id,
-                        user_text=user_text,
-                        chat_id=chat_id,
-                        chat_type=chat_type,
-                    )
+                    # 构造 conv_id / lock_key —— 与 _process_wecom_stream_message
+                    # 内部传给 find_or_create_channel_session 的 external_conv_id 完全一致:
+                    #   群聊 → wecom_group_{chat_id}  (不含 sender_id,避免不同成员开多会话)
+                    #   P2P  → wecom_p2p_{sender_id}
+                    conv_id = _build_wecom_conv_id(sender_id, chat_id, chat_type)
+                    lock_key = f"wecom:{conv_id}"
 
-                    # Reply via streaming
-                    stream_id = generate_req_id("stream")
-                    await client.reply_stream(frame, stream_id, reply_text, finish=True)
-                    logger.info(f"[WeCom Stream] Replied to {sender_id}: {reply_text[:80]}")
+                    from app.services.channel_commands import is_channel_command
+                    from app.services.channel_dispatch import ChannelReactions, run_channel_message
+                    is_cmd = is_channel_command(user_text)
+
+                    # _work 包裹完整的「用户行写入 → LLM → 回复」全程,reply_stream 留
+                    # 在闭包内(inline),确保使用当前回调持有的 frame/client 上下文,
+                    # 避免在 WebSocket 重连后 frame 失效。
+                    async def _work():
+                        reply_text = await _process_wecom_stream_message(
+                            agent_id=agent_id,
+                            sender_id=sender_id,
+                            user_text=user_text,
+                            chat_id=chat_id,
+                            chat_type=chat_type,
+                        )
+                        _stream_id = generate_req_id("stream")
+                        await client.reply_stream(frame, _stream_id, reply_text, finish=True)
+                        logger.info(f"[WeCom Stream] Replied to {sender_id}: {reply_text[:80]}")
+                        return reply_text or ""
+
+                    # WeCom stream 无 emoji reaction,ChannelReactions 保持空
+                    await run_channel_message(
+                        lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work
+                    )
 
                 except Exception as e:
                     logger.error(f"[WeCom Stream] Error handling text message: {e}")
