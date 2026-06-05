@@ -521,55 +521,133 @@ class DingTalkStreamManager:
                         )
 
                         from app.api.dingtalk import process_dingtalk_message
+                        from app.services.channel_dispatch import (
+                            ChannelReactions,
+                            run_channel_message,
+                        )
+                        from app.services.channel_commands import is_channel_command
+                        from app.services.dingtalk_reaction import (
+                            add_thinking_reaction,
+                            recall_thinking_reaction,
+                        )
 
                         if main_loop and main_loop.is_running():
-                            # Add thinking reaction immediately
-                            from app.services.dingtalk_reaction import add_thinking_reaction
-                            _fire_and_forget(main_loop,
-                                add_thinking_reaction(app_key, app_secret, message_id, conversation_id))
-                            _fire_and_forget(main_loop,
-                                process_dingtalk_message(
+                            conv_id = (
+                                f"dingtalk_group_{conversation_id}"
+                                if conversation_type == "2"
+                                else f"dingtalk_p2p_{sender_staff_id}"
+                            )
+                            lock_key = f"dingtalk:{conv_id}"
+                            is_cmd = is_channel_command(user_text)
+
+                            # react-on-consume: 真正开始消费这一轮时才加 thinking 表情;
+                            # 整轮成功后撤回。default-arg 绑定快照 per-message 值。
+                            async def _on_consume(_ak=app_key, _as=app_secret,
+                                                  _mid=message_id, _cid=conversation_id):
+                                await add_thinking_reaction(_ak, _as, _mid, _cid)
+
+                            async def _on_complete(_reply, _ak=app_key, _as=app_secret,
+                                                   _mid=message_id, _cid=conversation_id):
+                                await recall_thinking_reaction(_ak, _as, _mid, _cid)
+
+                            reactions = ChannelReactions(
+                                on_consume=_on_consume, on_complete=_on_complete
+                            )
+
+                            async def _work(_text=user_text, _ssid=sender_staff_id,
+                                            _cid=conversation_id, _ctype=conversation_type,
+                                            _wh=session_webhook, _nick=sender_nick,
+                                            _mid=message_id, _sid=sender_id,
+                                            _title=conversation_title):
+                                await process_dingtalk_message(
                                     agent_id=agent_id,
-                                    sender_staff_id=sender_staff_id,
-                                    user_text=user_text,
-                                    conversation_id=conversation_id,
-                                    conversation_type=conversation_type,
-                                    session_webhook=session_webhook,
-                                    sender_nick=sender_nick,
-                                    message_id=message_id,
-                                    sender_id=sender_id,
-                                    conversation_title=conversation_title,
-                                ))
-                            # Fire-and-forget: ACK immediately, do not wait for LLM
+                                    sender_staff_id=_ssid,
+                                    user_text=_text,
+                                    conversation_id=_cid,
+                                    conversation_type=_ctype,
+                                    session_webhook=_wh,
+                                    sender_nick=_nick,
+                                    message_id=_mid,
+                                    sender_id=_sid,
+                                    conversation_title=_title,
+                                )
+                                return ""
+
+                            _fire_and_forget(
+                                main_loop,
+                                run_channel_message(
+                                    lock_key,
+                                    is_command=is_cmd,
+                                    reactions=reactions,
+                                    work=_work,
+                                ),
+                            )
+                            # ACK immediately; serialization+LLM run on main_loop
                         else:
                             logger.warning("[DingTalk Stream] Main loop not available")
 
                     else:
                         # Non-text message: process media in the main loop
-                        from app.api.dingtalk import process_dingtalk_message
+                        from app.services.channel_dispatch import (
+                            ChannelReactions,
+                            run_channel_message,
+                        )
+                        from app.services.dingtalk_reaction import (
+                            add_thinking_reaction,
+                            recall_thinking_reaction,
+                        )
 
                         if main_loop and main_loop.is_running():
-                            # Add thinking reaction immediately
-                            from app.services.dingtalk_reaction import add_thinking_reaction
-                            _fire_and_forget(main_loop,
-                                add_thinking_reaction(app_key, app_secret, message_id, conversation_id))
-                            # Process media (download + encode) in the main loop
-                            _fire_and_forget(main_loop,
-                                self._handle_media_and_dispatch(
-                                    msg_data=msg_data,
-                                    app_key=app_key,
-                                    app_secret=app_secret,
+                            conv_id = (
+                                f"dingtalk_group_{conversation_id}"
+                                if conversation_type == "2"
+                                else f"dingtalk_p2p_{sender_staff_id}"
+                            )
+                            lock_key = f"dingtalk:{conv_id}"
+
+                            async def _on_consume_media(_ak=app_key, _as=app_secret,
+                                                        _mid=message_id, _cid=conversation_id):
+                                await add_thinking_reaction(_ak, _as, _mid, _cid)
+
+                            async def _on_complete_media(_reply, _ak=app_key, _as=app_secret,
+                                                         _mid=message_id, _cid=conversation_id):
+                                await recall_thinking_reaction(_ak, _as, _mid, _cid)
+
+                            reactions = ChannelReactions(
+                                on_consume=_on_consume_media, on_complete=_on_complete_media
+                            )
+
+                            async def _work_media(_md=msg_data, _ak=app_key, _as=app_secret,
+                                                  _ssid=sender_staff_id, _cid=conversation_id,
+                                                  _ctype=conversation_type, _wh=session_webhook,
+                                                  _nick=sender_nick, _mid=message_id,
+                                                  _sid=sender_id, _title=conversation_title):
+                                await self._handle_media_and_dispatch(
+                                    msg_data=_md,
+                                    app_key=_ak,
+                                    app_secret=_as,
                                     agent_id=agent_id,
-                                    sender_staff_id=sender_staff_id,
-                                    conversation_id=conversation_id,
-                                    conversation_type=conversation_type,
-                                    session_webhook=session_webhook,
-                                    sender_nick=sender_nick,
-                                    message_id=message_id,
-                                    sender_id=sender_id,
-                                    conversation_title=conversation_title,
-                                ))
-                            # Fire-and-forget: ACK immediately, do not wait for LLM
+                                    sender_staff_id=_ssid,
+                                    conversation_id=_cid,
+                                    conversation_type=_ctype,
+                                    session_webhook=_wh,
+                                    sender_nick=_nick,
+                                    message_id=_mid,
+                                    sender_id=_sid,
+                                    conversation_title=_title,
+                                )
+                                return ""
+
+                            _fire_and_forget(
+                                main_loop,
+                                run_channel_message(
+                                    lock_key,
+                                    is_command=False,
+                                    reactions=reactions,
+                                    work=_work_media,
+                                ),
+                            )
+                            # ACK immediately; serialization+LLM run on main_loop
                         else:
                             logger.warning("[DingTalk Stream] Main loop not available")
 

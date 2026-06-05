@@ -728,19 +728,10 @@ async def process_dingtalk_message(
                 is_group=(conversation_type == "2"),
             )
         finally:
-            # Reset ContextVar
+            # Reset ContextVar. (Thinking-reaction recall now fires via the
+            # channel_dispatch on_complete hook, after the turn fully completes.)
             if _cfs_token is not None:
                 _cfs.reset(_cfs_token)
-            # Recall thinking reaction (before sending reply)
-            if message_id and _dt_app_key:
-                try:
-                    from app.services.dingtalk_reaction import recall_thinking_reaction
-                    await recall_thinking_reaction(
-                        _dt_app_key, _dt_app_secret,
-                        message_id, conversation_id,
-                    )
-                except Exception as _recall_err:
-                    logger.warning(f"[DingTalk] Failed to recall thinking reaction: {_recall_err}")
 
         has_media = bool(image_base64_list or saved_file_paths)
         logger.info(
