@@ -220,6 +220,27 @@ async def slack_event_webhook(
     _is_group_slack = bool(channel_id) and not channel_id.startswith("D")
     conv_id = f"slack_{channel_id}" if channel_id else f"slack_dm_{sender_id}"
 
+    # Early-return for channel commands (/new, /reset):
+    # Must run BEFORE find_or_create_channel_session to avoid creating a
+    # ghost session that is immediately archived.
+    from app.services.channel_commands import is_channel_command, handle_channel_command
+    if is_channel_command(user_text):
+        from app.database import async_session as _async_session
+        async with _async_session() as _cmd_db:
+            cmd_result = await handle_channel_command(
+                db=_cmd_db, command=user_text, agent_id=agent_id,
+                user_id=None, external_conv_id=conv_id,
+                source_channel="slack",
+            )
+            await _cmd_db.commit()
+        _bot_token_cmd = config.app_secret or ""
+        if _bot_token_cmd and channel_id:
+            try:
+                await _send_slack_messages(_bot_token_cmd, channel_id, cmd_result["message"])
+            except Exception as _cmd_e:
+                logger.error(f"[Slack] Failed to send command reply: {_cmd_e}")
+        return {"ok": True}
+
     logger.info(f"[Slack] Message from={sender_id}, channel={channel_id}: {user_text[:80]}")
 
     # Load history
@@ -364,26 +385,8 @@ async def slack_event_webhook(
 
     # 同一 Slack 会话的多轮消息串行化（防止并发入队导致工具调用历史交错）
     from app.services.channel_dispatch import ChannelReactions, run_channel_message
-    from app.services.channel_commands import is_channel_command, handle_channel_command
 
     lock_key = f"slack:{conv_id}"
-
-    # Early-return for channel commands (/new, /reset):
-    # archive the session and send a canned reply — no LLM, no lock needed.
-    if is_channel_command(user_text):
-        cmd_result = await handle_channel_command(
-            db=db, command=user_text, agent_id=agent_id,
-            user_id=None, external_conv_id=conv_id,
-            source_channel="slack",
-        )
-        await db.commit()
-        bot_token_cmd = config.app_secret or ""
-        if bot_token_cmd and channel_id:
-            try:
-                await _send_slack_messages(bot_token_cmd, channel_id, cmd_result["message"])
-            except Exception as _cmd_e:
-                logger.error(f"[Slack] Failed to send command reply: {_cmd_e}")
-        return {"ok": True}
 
     async def _work() -> str:
         # 正常消息轮次：写入用户行 → LLM → 持久化回复 → 发送

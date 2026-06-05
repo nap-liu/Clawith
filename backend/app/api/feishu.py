@@ -526,6 +526,31 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             else:
                 conv_id = f"feishu_p2p_{sender_user_id_from_event or sender_open_id}"
 
+            # Early-return for channel commands (/new, /reset):
+            # Must run BEFORE find_or_create_channel_session to avoid creating a
+            # ghost session that is immediately archived.
+            if is_channel_command(user_text):
+                from app.database import async_session as _async_session
+                async with _async_session() as _cmd_db:
+                    cmd_result = await handle_channel_command(
+                        db=_cmd_db, command=user_text, agent_id=agent_id,
+                        user_id=None, external_conv_id=conv_id,
+                        source_channel="feishu",
+                    )
+                    await _cmd_db.commit()
+                _cmd_reply_to = chat_id if chat_type == "group" and chat_id else sender_open_id
+                _cmd_rid_type = "chat_id" if chat_type == "group" and chat_id else "open_id"
+                try:
+                    await feishu_service.send_message(
+                        config.app_id, config.app_secret,
+                        _cmd_reply_to, "text",
+                        json.dumps({"text": cmd_result["message"]}),
+                        receive_id_type=_cmd_rid_type,
+                    )
+                except Exception as _cmd_e:
+                    logger.error(f"[Feishu] Failed to send command reply: {_cmd_e}")
+                return {"code": 0, "msg": "ok"}
+
             # Load recent conversation history via session (session UUID may already exist)
             from app.models.audit import ChatMessage
             from app.models.agent import Agent as AgentModel
@@ -695,29 +720,6 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             #   group → "feishu:feishu_group_{chat_id}"
             #   P2P   → "feishu:feishu_p2p_{user_id_or_open_id}"
             lock_key = f"feishu:{conv_id}"
-
-            # Early-return for channel commands (/new, /reset):
-            # archive the session and send a canned reply — no LLM, no lock needed.
-            if is_channel_command(user_text):
-                cmd_result = await handle_channel_command(
-                    db=db, command=user_text, agent_id=agent_id,
-                    user_id=None, external_conv_id=conv_id,
-                    source_channel="feishu",
-                )
-                await db.commit()
-                _cmd_reply_to = chat_id if chat_type == "group" and chat_id else sender_open_id
-                _cmd_rid_type = "chat_id" if chat_type == "group" and chat_id else "open_id"
-                import json as _cmd_json
-                try:
-                    await feishu_service.send_message(
-                        config.app_id, config.app_secret,
-                        _cmd_reply_to, "text",
-                        _cmd_json.dumps({"text": cmd_result["message"]}),
-                        receive_id_type=_cmd_rid_type,
-                    )
-                except Exception as _cmd_e:
-                    logger.error(f"[Feishu] Failed to send command reply: {_cmd_e}")
-                return {"code": 0, "msg": "ok"}
 
             # Feishu has no emoji "thinking" reaction (unlike DingTalk), so the
             # boundary hooks (on_consume / on_complete / on_error) stay None.
