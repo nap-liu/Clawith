@@ -19,6 +19,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
+from app.services.channel_dispatch import ChannelReactions, run_channel_message
 from app.services.dingtalk_token import dingtalk_token_manager
 
 
@@ -408,6 +409,34 @@ async def _send_dingtalk_media_message(
 
 # ─── Stream Manager ─────────────────────────────────────
 
+
+def _dingtalk_lock_key(conversation_type: str, conversation_id: str, sender_staff_id: str) -> str:
+    """构造与 DB 会话一一对应的 per-session 锁 key(与 dingtalk.py 的 conv_id 同构)。"""
+    conv_id = (
+        f"dingtalk_group_{conversation_id}"
+        if conversation_type == "2"
+        else f"dingtalk_p2p_{sender_staff_id}"
+    )
+    return f"dingtalk:{conv_id}"
+
+
+def _make_dingtalk_reactions(app_key: str, app_secret: str, message_id: str, conversation_id: str) -> ChannelReactions:
+    """钉钉的整轮 reaction:开始消费时加 thinking 表情;成功或失败都撤回。
+
+    on_complete(reply) 与 on_error(exc) 共用同一个撤回函数(用 *_args 兼容两种签名),
+    保证无论成功失败 thinking 表情都会被撤回(等价于原先的 finally 语义)。
+    """
+    from app.services.dingtalk_reaction import add_thinking_reaction, recall_thinking_reaction
+
+    async def _on_consume(_ak=app_key, _as=app_secret, _mid=message_id, _cid=conversation_id):
+        await add_thinking_reaction(_ak, _as, _mid, _cid)
+
+    async def _recall(*_args, _ak=app_key, _as=app_secret, _mid=message_id, _cid=conversation_id):
+        await recall_thinking_reaction(_ak, _as, _mid, _cid)
+
+    return ChannelReactions(on_consume=_on_consume, on_complete=_recall, on_error=_recall)
+
+
 def _fire_and_forget(loop, coro):
     """Schedule a coroutine on the main loop and log any unhandled exception."""
     future = asyncio.run_coroutine_threadsafe(coro, loop)
@@ -521,37 +550,13 @@ class DingTalkStreamManager:
                         )
 
                         from app.api.dingtalk import process_dingtalk_message
-                        from app.services.channel_dispatch import (
-                            ChannelReactions,
-                            run_channel_message,
-                        )
                         from app.services.channel_commands import is_channel_command
-                        from app.services.dingtalk_reaction import (
-                            add_thinking_reaction,
-                            recall_thinking_reaction,
-                        )
 
                         if main_loop and main_loop.is_running():
-                            conv_id = (
-                                f"dingtalk_group_{conversation_id}"
-                                if conversation_type == "2"
-                                else f"dingtalk_p2p_{sender_staff_id}"
-                            )
-                            lock_key = f"dingtalk:{conv_id}"
+                            lock_key = _dingtalk_lock_key(conversation_type, conversation_id, sender_staff_id)
                             is_cmd = is_channel_command(user_text)
-
-                            # react-on-consume: 真正开始消费这一轮时才加 thinking 表情;
-                            # 整轮成功后撤回。default-arg 绑定快照 per-message 值。
-                            async def _on_consume(_ak=app_key, _as=app_secret,
-                                                  _mid=message_id, _cid=conversation_id):
-                                await add_thinking_reaction(_ak, _as, _mid, _cid)
-
-                            async def _on_complete(_reply, _ak=app_key, _as=app_secret,
-                                                   _mid=message_id, _cid=conversation_id):
-                                await recall_thinking_reaction(_ak, _as, _mid, _cid)
-
-                            reactions = ChannelReactions(
-                                on_consume=_on_consume, on_complete=_on_complete
+                            reactions = _make_dingtalk_reactions(
+                                app_key, app_secret, message_id, conversation_id
                             )
 
                             async def _work(_text=user_text, _ssid=sender_staff_id,
@@ -576,10 +581,7 @@ class DingTalkStreamManager:
                             _fire_and_forget(
                                 main_loop,
                                 run_channel_message(
-                                    lock_key,
-                                    is_command=is_cmd,
-                                    reactions=reactions,
-                                    work=_work,
+                                    lock_key, is_command=is_cmd, reactions=reactions, work=_work
                                 ),
                             )
                             # ACK immediately; serialization+LLM run on main_loop
@@ -588,33 +590,10 @@ class DingTalkStreamManager:
 
                     else:
                         # Non-text message: process media in the main loop
-                        from app.services.channel_dispatch import (
-                            ChannelReactions,
-                            run_channel_message,
-                        )
-                        from app.services.dingtalk_reaction import (
-                            add_thinking_reaction,
-                            recall_thinking_reaction,
-                        )
-
                         if main_loop and main_loop.is_running():
-                            conv_id = (
-                                f"dingtalk_group_{conversation_id}"
-                                if conversation_type == "2"
-                                else f"dingtalk_p2p_{sender_staff_id}"
-                            )
-                            lock_key = f"dingtalk:{conv_id}"
-
-                            async def _on_consume_media(_ak=app_key, _as=app_secret,
-                                                        _mid=message_id, _cid=conversation_id):
-                                await add_thinking_reaction(_ak, _as, _mid, _cid)
-
-                            async def _on_complete_media(_reply, _ak=app_key, _as=app_secret,
-                                                         _mid=message_id, _cid=conversation_id):
-                                await recall_thinking_reaction(_ak, _as, _mid, _cid)
-
-                            reactions = ChannelReactions(
-                                on_consume=_on_consume_media, on_complete=_on_complete_media
+                            lock_key = _dingtalk_lock_key(conversation_type, conversation_id, sender_staff_id)
+                            reactions = _make_dingtalk_reactions(
+                                app_key, app_secret, message_id, conversation_id
                             )
 
                             async def _work_media(_md=msg_data, _ak=app_key, _as=app_secret,
@@ -642,7 +621,7 @@ class DingTalkStreamManager:
                                 main_loop,
                                 run_channel_message(
                                     lock_key,
-                                    is_command=False,
+                                    is_command=False,  # 媒体消息不会是命令
                                     reactions=reactions,
                                     work=_work_media,
                                 ),
