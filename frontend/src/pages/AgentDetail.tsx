@@ -3367,7 +3367,15 @@ function AgentDetailInner() {
         const key = buildSessionRuntimeKey(agentId, sess.id);
         const ws = wsMapRef.current[key];
         wsRef.current = ws ?? null;
-        setWsConnected(!!ws && ws.readyState === WebSocket.OPEN);
+        // CONNECTING 是中间态：不要把 wsConnected 打回 false。否则在建连窗口里，任何无关
+        // 状态(权限/scope 异步加载完成等)触发的重新同步，都会让输入框反复闪回 "Connecting…"。
+        // OPEN→已连接；无 ws / 已关闭→未连接；CONNECTING→保持当前显示，交给 onopen/onclose
+        // 事件驱动收敛。
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            setWsConnected(true);
+        } else if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+            setWsConnected(false);
+        }
     };
 
     const fetchMySessions = async (silent = false, agentId: string | undefined = id) => {
@@ -3917,7 +3925,8 @@ function AgentDetailInner() {
         const ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat/${agentId}?token=${authToken}${sessionParam}&lang=${lang}`);
         wsMapRef.current[key] = ws;
         ws.onopen = () => {
-            if (reconnectDisabledRef.current[key]) {
+            // 若本 ws 已被新连接替换(陈旧引用)或已禁用重连，直接关掉它，不要触碰 UI 连接状态。
+            if (reconnectDisabledRef.current[key] || wsMapRef.current[key] !== ws) {
                 ws.close();
                 return;
             }
@@ -3933,8 +3942,12 @@ function AgentDetailInner() {
             }
         };
         ws.onclose = (e) => {
-            if (wsMapRef.current[key] === ws) delete wsMapRef.current[key];
+            const wasCurrent = wsMapRef.current[key] === ws;
+            if (wasCurrent) delete wsMapRef.current[key];
             setSessionUiState(key, { isWaiting: false, isStreaming: false });
+            // 陈旧连接(已被新连接替换或显式关闭)的 onclose 不应扰动当前 UI 状态，也不应触发重连——
+            // 否则活跃连接会被误判为断开，引发无谓的 2s 重连循环。
+            if (!wasCurrent) return;
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
             if (isActiveRuntime) {
                 wsRef.current = null;
