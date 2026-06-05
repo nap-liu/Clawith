@@ -158,9 +158,24 @@ class WeComStreamManager:
                     conv_id = _build_wecom_conv_id(sender_id, chat_id, chat_type)
                     lock_key = f"wecom:{conv_id}"
 
-                    from app.services.channel_commands import is_channel_command
+                    from app.services.channel_commands import is_channel_command, handle_channel_command
                     from app.services.channel_dispatch import ChannelReactions, run_channel_message
-                    is_cmd = is_channel_command(user_text)
+
+                    # Early-return for channel commands (/new, /reset):
+                    # archive the session and reply inline — no LLM, no lock needed.
+                    if is_channel_command(user_text):
+                        async with async_session() as _cmd_db:
+                            cmd_result = await handle_channel_command(
+                                db=_cmd_db, command=user_text, agent_id=agent_id,
+                                user_id=None, external_conv_id=conv_id,
+                                source_channel="wecom",
+                            )
+                            await _cmd_db.commit()
+                        _stream_id_cmd = generate_req_id("stream")
+                        await client.reply_stream(
+                            frame, _stream_id_cmd, cmd_result["message"], finish=True
+                        )
+                        return
 
                     # _work 包裹完整的「用户行写入 → LLM → 回复」全程,reply_stream 留
                     # 在闭包内(inline),确保使用当前回调持有的 frame/client 上下文,
@@ -180,7 +195,7 @@ class WeComStreamManager:
 
                     # WeCom stream 无 emoji reaction,ChannelReactions 保持空
                     await run_channel_message(
-                        lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work
+                        lock_key, is_command=False, reactions=ChannelReactions(), work=_work
                     )
 
                 except Exception as e:

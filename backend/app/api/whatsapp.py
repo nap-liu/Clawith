@@ -271,7 +271,7 @@ async def whatsapp_event_webhook(
                 from app.services.channel_session import find_or_create_channel_session
                 from app.services.channel_user_service import channel_user_service
                 from app.services.channel_dispatch import ChannelReactions, run_channel_message
-                from app.services.channel_commands import is_channel_command
+                from app.services.channel_commands import is_channel_command, handle_channel_command
 
                 agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                 agent_obj = agent_r.scalar_one_or_none()
@@ -290,7 +290,21 @@ async def whatsapp_event_webhook(
 
                 # 同一 WhatsApp 号码（会话）的多轮消息串行化；不同号码各自独立
                 lock_key = f"whatsapp:{conv_id}"
-                is_cmd = is_channel_command(user_text)
+
+                # Early-return for channel commands (/new, /reset):
+                # archive the session and send a canned reply — no LLM, no lock needed.
+                if is_channel_command(user_text):
+                    cmd_result = await handle_channel_command(
+                        db=db, command=user_text, agent_id=agent_id,
+                        user_id=None, external_conv_id=conv_id,
+                        source_channel="whatsapp",
+                    )
+                    await db.commit()
+                    try:
+                        await _send_whatsapp_messages(config, sender_phone, cmd_result["message"])
+                    except Exception as _cmd_e:
+                        logger.error(f"[WhatsApp] Failed to send command reply: {_cmd_e}")
+                    continue
 
                 # 捕获循环变量供闭包使用
                 _sender_phone = sender_phone
@@ -350,6 +364,6 @@ async def whatsapp_event_webhook(
 
                     return reply_text
 
-                await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
+                await run_channel_message(lock_key, is_command=False, reactions=ChannelReactions(), work=_work)
 
     return {"ok": True}

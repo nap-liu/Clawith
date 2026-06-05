@@ -208,7 +208,33 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
     conv_key = str(msg.get("session_id") or from_user_id).strip()
     conv_id = f"wechat_{conv_key}"
     lock_key = f"wechat:{conv_id}"
-    is_cmd = is_channel_command(user_text)
+
+    # Early-return for channel commands (/new, /reset):
+    # archive the session and send a canned reply — no LLM, no lock needed.
+    if is_channel_command(user_text):
+        from app.services.channel_commands import handle_channel_command
+        async with async_session() as _cmd_db:
+            cmd_result = await handle_channel_command(
+                db=_cmd_db, command=user_text, agent_id=agent_id,
+                user_id=None, external_conv_id=conv_id,
+                source_channel="wechat",
+            )
+            await _cmd_db.commit()
+        token = str((config.extra_config or {}).get("bot_token") or "").strip()
+        base_url = str((config.extra_config or {}).get("baseurl") or WECHAT_ILINK_BASE_URL).strip()
+        route_tag = str((config.extra_config or {}).get("route_tag") or "").strip() or None
+        try:
+            await send_wechat_text_message(
+                token=token,
+                base_url=base_url,
+                to_user_id=from_user_id,
+                context_token=context_token,
+                text=cmd_result["message"],
+                route_tag=route_tag,
+            )
+        except Exception as _cmd_e:
+            logger.warning(f"[WeChat] Failed to send command reply: {_cmd_e}")
+        return
 
     async with async_session() as db:
         # 整轮（用户行写入 → LLM → 回复持久化 → 发送）包在 _work 内串行化
@@ -312,7 +338,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             return reply_text or ""
 
         # WeChat 无 emoji reaction，ChannelReactions 保持空
-        await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
+        await run_channel_message(lock_key, is_command=False, reactions=ChannelReactions(), work=_work)
 
 
 class WeChatPollManager:

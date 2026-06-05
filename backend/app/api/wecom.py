@@ -547,7 +547,7 @@ async def _process_wecom_text(
     chat_id: str = "",
 ):
     """Process an incoming WeCom text message and reply."""
-    from app.services.channel_commands import is_channel_command
+    from app.services.channel_commands import is_channel_command, handle_channel_command
     from app.services.channel_dispatch import ChannelReactions, run_channel_message
 
     # conv_id 与 find_or_create_channel_session 传入的 external_conv_id 完全一致:
@@ -556,7 +556,34 @@ async def _process_wecom_text(
     _is_group = bool(chat_id)
     conv_id = f"wecom_group_{chat_id}" if _is_group else f"wecom_p2p_{from_user}"
     lock_key = f"wecom:{conv_id}"
-    is_cmd = is_channel_command(user_text)
+
+    # Early-return for channel commands (/new, /reset):
+    # archive the session and send a canned reply — no LLM, no lock needed.
+    if is_channel_command(user_text):
+        async with async_session() as _cmd_db:
+            cmd_result = await handle_channel_command(
+                db=_cmd_db, command=user_text, agent_id=agent_id,
+                user_id=None, external_conv_id=conv_id,
+                source_channel="wecom",
+            )
+            await _cmd_db.commit()
+        wecom_agent_id_cmd = (config.extra_config or {}).get("wecom_agent_id", "")
+        try:
+            access_token_cmd = await _get_wecom_token_cached(config.app_id, config.app_secret)
+            async with httpx.AsyncClient(timeout=10) as _cl_cmd:
+                if access_token_cmd:
+                    await _cl_cmd.post(
+                        f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token_cmd}",
+                        json={
+                            "touser": from_user,
+                            "msgtype": "text",
+                            "agentid": int(wecom_agent_id_cmd) if wecom_agent_id_cmd else 0,
+                            "text": {"content": cmd_result["message"]},
+                        },
+                    )
+        except Exception as _cmd_e:
+            logger.error(f"[WeCom] Failed to send command reply: {_cmd_e}")
+        return
 
     async def _work() -> str:
         async with async_session() as db:
@@ -673,7 +700,7 @@ async def _process_wecom_text(
             return reply_text or ""
 
     # WeCom webhook 无 emoji reaction,ChannelReactions 保持空
-    await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
+    await run_channel_message(lock_key, is_command=False, reactions=ChannelReactions(), work=_work)
 
 
 # ─── OAuth Callback (SSO) ──────────────────────────────

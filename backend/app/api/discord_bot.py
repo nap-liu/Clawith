@@ -285,8 +285,36 @@ async def discord_interaction_webhook(
             from app.services.channel_llm import _call_agent_llm
             from app.services.channel_session import find_or_create_channel_session
             from app.services.channel_dispatch import ChannelReactions, run_channel_message
+            from app.services.channel_commands import handle_channel_command
             from app.database import async_session
             from datetime import datetime, timezone
+
+            # Early-return for channel commands (/new, /reset):
+            # archive the session and reply via follow-up — no LLM, no lock needed.
+            if is_cmd:
+                async with async_session() as _cmd_db:
+                    cmd_result = await handle_channel_command(
+                        db=_cmd_db, command=user_text, agent_id=agent_id,
+                        user_id=None, external_conv_id=conv_id,
+                        source_channel="discord",
+                    )
+                    await _cmd_db.commit()
+                # Re-read config for bot credentials
+                async with async_session() as _cfg_db:
+                    from sqlalchemy import select as _sel_cmd
+                    _cfg_res = await _cfg_db.execute(_sel_cmd(ChannelConfig).where(
+                        ChannelConfig.agent_id == agent_id,
+                        ChannelConfig.channel_type == "discord",
+                    ))
+                    _cfg = _cfg_res.scalar_one_or_none()
+                    _bot_token_cmd = _cfg.app_secret if _cfg else ""
+                    _app_id_cmd = _cfg.app_id if _cfg else ""
+                if _bot_token_cmd and interaction_token and _app_id_cmd:
+                    try:
+                        await _send_discord_followup(_app_id_cmd, _bot_token_cmd, interaction_token, cmd_result["message"])
+                    except Exception as _cmd_e:
+                        logger.error(f"[Discord] Failed to send command reply: {_cmd_e}")
+                return
 
             async with async_session() as bg_db:
                 # 整轮（用户行写入 → LLM → 回复持久化 → 发送）包在 _work 内串行化
@@ -387,7 +415,7 @@ async def discord_interaction_webhook(
                     return reply_text or ""
 
                 # Discord webhook 无 emoji reaction，ChannelReactions 保持空
-                await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
+                await run_channel_message(lock_key, is_command=False, reactions=ChannelReactions(), work=_work)
 
         # 提前计算 lock_key 和指令标志，供 handle_in_background 内使用
         lock_key = f"discord:{conv_id}"

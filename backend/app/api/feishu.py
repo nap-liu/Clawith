@@ -22,7 +22,7 @@ from app.schemas.schemas import ChannelConfigCreate, ChannelConfigOut, TokenResp
 # `from app.api.feishu import _call_agent_llm`); new code imports it directly.
 from app.services.channel_llm import _call_agent_llm  # noqa: F401
 from app.services.channel_dispatch import ChannelReactions, run_channel_message
-from app.services.channel_commands import is_channel_command
+from app.services.channel_commands import is_channel_command, handle_channel_command
 from app.services.feishu_service import feishu_service
 
 router = APIRouter(tags=["feishu"])
@@ -536,24 +536,6 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
             ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
-            # Pre-resolve session so history lookup uses the UUID  (session created later if new)
-            _pre_sess_r = await db.execute(
-                select(__import__('app.models.chat_session', fromlist=['ChatSession']).ChatSession).where(
-                    __import__('app.models.chat_session', fromlist=['ChatSession']).ChatSession.agent_id == agent_id,
-                    __import__('app.models.chat_session', fromlist=['ChatSession']).ChatSession.external_conv_id == conv_id,
-                )
-            )
-            _pre_sess = _pre_sess_r.scalar_one_or_none()
-            _history_conv_id = str(_pre_sess.id) if _pre_sess else conv_id
-            from app.services.chat_history import load_history_for_llm
-            history = await load_history_for_llm(
-                db,
-                agent_id=agent_id,
-                conversation_id=_history_conv_id,
-                ctx_size=ctx_size,
-                is_group=(chat_type == "group"),
-            )
-
             # --- Resolve Feishu sender identity & find/create platform user ---
             import uuid as _uuid
             import httpx as _httpx
@@ -713,7 +695,29 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             #   group → "feishu:feishu_group_{chat_id}"
             #   P2P   → "feishu:feishu_p2p_{user_id_or_open_id}"
             lock_key = f"feishu:{conv_id}"
-            is_cmd = is_channel_command(user_text)
+
+            # Early-return for channel commands (/new, /reset):
+            # archive the session and send a canned reply — no LLM, no lock needed.
+            if is_channel_command(user_text):
+                cmd_result = await handle_channel_command(
+                    db=db, command=user_text, agent_id=agent_id,
+                    user_id=None, external_conv_id=conv_id,
+                    source_channel="feishu",
+                )
+                await db.commit()
+                _cmd_reply_to = chat_id if chat_type == "group" and chat_id else sender_open_id
+                _cmd_rid_type = "chat_id" if chat_type == "group" and chat_id else "open_id"
+                import json as _cmd_json
+                try:
+                    await feishu_service.send_message(
+                        config.app_id, config.app_secret,
+                        _cmd_reply_to, "text",
+                        _cmd_json.dumps({"text": cmd_result["message"]}),
+                        receive_id_type=_cmd_rid_type,
+                    )
+                except Exception as _cmd_e:
+                    logger.error(f"[Feishu] Failed to send command reply: {_cmd_e}")
+                return {"code": 0, "msg": "ok"}
 
             # Feishu has no emoji "thinking" reaction (unlike DingTalk), so the
             # boundary hooks (on_consume / on_complete / on_error) stay None.
@@ -729,6 +733,17 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 ))
                 _sess.last_message_at = _dt.now(_tz.utc)
                 await db.commit()
+
+                # Load history inside the lock so concurrent turns cannot observe
+                # each other's not-yet-committed rows (race condition fix).
+                from app.services.chat_history import load_history_for_llm
+                history = await load_history_for_llm(
+                    db,
+                    agent_id=agent_id,
+                    conversation_id=session_conv_id,
+                    ctx_size=ctx_size,
+                    is_group=(chat_type == "group"),
+                )
 
                 # Build the message we'll send to the LLM. Group chats get a
                 # platform-injected <sender> prefix (see spec §4.0/§4.1); P2P keeps
@@ -1126,7 +1141,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
 
                 return final_reply_text
 
-            await run_channel_message(lock_key, is_command=is_cmd, reactions=reactions, work=_work)
+            await run_channel_message(lock_key, is_command=False, reactions=reactions, work=_work)
 
     return {"code": 0, "msg": "ok"}
 

@@ -116,7 +116,28 @@ class DiscordGatewayManager:
                 else f"discord_{channel_id_om}_{sender_id_om}"
             )
             lock_key = f"discord:{conv_id_om}"
-            is_cmd = is_channel_command(user_text)
+
+            # Early-return for channel commands (/new, /reset):
+            # archive the session and reply inline — no LLM, no lock needed.
+            if is_channel_command(user_text):
+                from app.services.channel_commands import handle_channel_command
+                async with async_session() as _cmd_db:
+                    cmd_result = await handle_channel_command(
+                        db=_cmd_db, command=user_text, agent_id=agent_id,
+                        user_id=None, external_conv_id=conv_id_om,
+                        source_channel="discord",
+                    )
+                    await _cmd_db.commit()
+                try:
+                    chunks = [
+                        cmd_result["message"][i:i + DISCORD_MSG_LIMIT]
+                        for i in range(0, len(cmd_result["message"]), DISCORD_MSG_LIMIT)
+                    ]
+                    for chunk in chunks:
+                        await message.reply(chunk, mention_author=False)
+                except Exception as _cmd_e:
+                    logger.error(f"[Discord GW] Failed to send command reply: {_cmd_e}")
+                return
 
             async def _work() -> str:
                 # typing 指示器 + 完整处理（用户行写入 → LLM → 回复持久化）包在锁内
@@ -130,7 +151,7 @@ class DiscordGatewayManager:
                 return reply or ""
 
             # Discord gateway 无 emoji reaction，ChannelReactions 保持空
-            await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
+            await run_channel_message(lock_key, is_command=False, reactions=ChannelReactions(), work=_work)
 
         # Run the bot in a background task
         proxy = os.environ.get("DISCORD_PROXY") or os.environ.get("HTTPS_PROXY") or None
