@@ -10,8 +10,6 @@ import pytest
 
 import app.services.channel_dispatch as cd
 
-pytestmark = pytest.mark.asyncio
-
 
 def test_channel_reactions_defaults_all_none():
     r = cd.ChannelReactions()
@@ -142,7 +140,7 @@ async def test_normal_message_holds_session_lock():
     """普通消息执行期间持有该 session 锁(并发同 key 不重叠)。"""
     order = []
 
-    async def make_work(tag):
+    def make_work(tag):
         async def _w():
             order.append(f"{tag}-start")
             await asyncio.sleep(0.02)
@@ -152,8 +150,8 @@ async def test_normal_message_holds_session_lock():
 
     r = cd.ChannelReactions()
     await asyncio.gather(
-        cd.run_channel_message("k:hold", is_command=False, reactions=r, work=await make_work("A")),
-        cd.run_channel_message("k:hold", is_command=False, reactions=r, work=await make_work("B")),
+        cd.run_channel_message("k:hold", is_command=False, reactions=r, work=make_work("A")),
+        cd.run_channel_message("k:hold", is_command=False, reactions=r, work=make_work("B")),
     )
     assert order in (
         ["A-start", "A-end", "B-start", "B-end"],
@@ -177,3 +175,25 @@ async def test_processing_lock_independent_from_compactor_lock():
     async with proc_lock:
         await asyncio.wait_for(comp_lock.acquire(), timeout=0.5)
         comp_lock.release()
+
+
+async def test_different_keys_run_concurrently():
+    """不同 lock_key 的 run_channel_message 应当并发执行(互不阻塞)。"""
+    order = []
+    r = cd.ChannelReactions()
+
+    def make_w(tag):
+        async def _w():
+            order.append(f"{tag}-start")
+            await asyncio.sleep(0.02)
+            order.append(f"{tag}-end")
+            return tag
+        return _w
+
+    await asyncio.gather(
+        cd.run_channel_message("k:key1", is_command=False, reactions=r, work=make_w("A")),
+        cd.run_channel_message("k:key2", is_command=False, reactions=r, work=make_w("B")),
+    )
+    # 不同 key 并发 → 两个 start 都先于两个 end
+    assert order[:2] == ["A-start", "B-start"] or order[:2] == ["B-start", "A-start"]
+    assert set(order[2:]) == {"A-end", "B-end"}

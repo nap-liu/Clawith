@@ -8,8 +8,10 @@
 2. ``/commands`` 不排队、立即执行;
 3. 一束可选的生命周期钩子贯穿整轮(含多轮工具循环),由各通道自行实现 reaction/进度。
 
-它独立于 ``llm.compactor`` 的 ``_session_locks``(后者在工具循环内被调用,复用同一把
-锁会死锁,因 asyncio.Lock 不可重入)。
+它独立于 ``llm.compactor`` 的 ``_session_locks``:两者是不同的注册表(不同的 ``dict``)。
+工具循环内的 ``maybe_compact`` 从 ``compactor._session_locks`` 取锁,而此时本轮已持有
+本模块的处理锁;若两张表合并、同一协程对同 key 再次 ``acquire`` 处理锁,会因
+``asyncio.Lock`` 不可重入而死锁。
 """
 
 import asyncio
@@ -57,7 +59,7 @@ async def _get_session_lock(lock_key: str) -> asyncio.Lock:
         return lock
 
 
-async def _safe(hook, *args) -> None:
+async def _safe(hook: Callable[..., Awaitable[None]] | None, *args: object) -> None:
     """Best-effort fire a lifecycle hook: None -> no-op; exception -> logged, swallowed.
 
     Reactions are side effects; a failing reaction must never break the turn.
