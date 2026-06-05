@@ -930,12 +930,18 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 async def _ws_on_chunk(text: str):
                     _stream_buffer.append(text)
                     if _patch_msg_id:
-                        await _flush_stream("chunk")
+                        try:
+                            await _flush_stream("chunk")
+                        except Exception as _e:
+                            logger.warning(f"[Feishu] chunk flush failed (ignored): {_e}")
 
                 async def _ws_on_thinking(text: str):
                     _thinking_buffer.append(text)
                     if _patch_msg_id:
-                        await _flush_stream("thinking")
+                        try:
+                            await _flush_stream("thinking")
+                        except Exception as _e:
+                            logger.warning(f"[Feishu] thinking flush failed (ignored): {_e}")
 
                 async def _ws_on_tool_call(evt: dict):
                     tool_name = evt.get("name") or "unknown_tool"
@@ -1499,6 +1505,20 @@ async def _handle_feishu_file(
 
     # For non-image files: send simple ack and persist
     # Set up session (needed for persist_assistant_reply)
+    # 群聊文件 ack 也需要获取群名称，避免会话标题退化为 "[文件] filename"
+    _ack_group_name = None
+    if _is_group_file and chat_id:
+        try:
+            _ack_chat_info = await feishu_service.get_chat_info(config.app_id, config.app_secret, chat_id)
+            _ack_real_name = (_ack_chat_info or {}).get("name") if _ack_chat_info else None
+            _ack_group_name = (
+                _ack_real_name.strip() if _ack_real_name and _ack_real_name.strip()
+                else f"Feishu Group {chat_id[:12]}"
+            )
+        except Exception as _ack_gci_err:
+            logger.warning(f"[Feishu] chat-info lookup failed (file ack path): {_ack_gci_err}")
+            _ack_group_name = f"Feishu Group {chat_id[:12]}"
+
     async with _async_session() as _db_ack:
         _ag_r_ack = await _db_ack.execute(_select(AgentModel).where(AgentModel.id == agent_id))
         _ag_obj_ack = _ag_r_ack.scalar_one_or_none()
@@ -1508,6 +1528,7 @@ async def _handle_feishu_file(
             external_conv_id=conv_id, source_channel="feishu",
             first_message_title=f"[文件] {filename}",
             is_group=_is_group_file,
+            group_name=_ack_group_name,
         )
         session_conv_id_ack = str(_sess_ack.id)
         _db_ack.add(ChatMessage(
