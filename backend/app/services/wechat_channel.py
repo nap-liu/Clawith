@@ -240,13 +240,14 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             conv_id=conv_id,
         )
 
-        history_r = await db.execute(
-            select(ChatMessage)
-            .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE)
+        from app.services.chat_history import load_history_for_llm
+
+        history = await load_history_for_llm(
+            db,
+            agent_id=agent_id,
+            conversation_id=session_conv_id,
+            ctx_size=agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE,
         )
-        history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
 
         db.add(
             ChatMessage(
@@ -281,14 +282,14 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             route_tag=route_tag,
         )
 
-        db.add(
-            ChatMessage(
-                agent_id=agent_id,
-                user_id=platform_user_id,
-                role="assistant",
-                content=reply_text,
-                conversation_id=session_conv_id,
-            )
+        # Save assistant reply via the shared writer (own session → created_at
+        # stamped after the tool loop, ordered after the turn's tool calls).
+        from app.services.chat_history import persist_assistant_reply
+        from app.database import async_session as _areply_session
+
+        await persist_assistant_reply(
+            _areply_session, agent_id=agent_id, user_id=platform_user_id,
+            conversation_id=session_conv_id, content=reply_text,
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()

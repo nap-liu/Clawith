@@ -1638,7 +1638,16 @@ async def _call_agent_llm(
                 fresh = await load_history_for_llm(
                     db, agent_id=agent_id, conversation_id=session_id, ctx_size=ctx_size, is_group=is_group
                 )
-                messages = strip_leading_orphan_tool_messages(_normalize_history_messages(fresh)[-ctx_size:])
+                rebuilt = strip_leading_orphan_tool_messages(_normalize_history_messages(fresh)[-ctx_size:])
+                # The reload ends with the current user message as stored in DB
+                # (raw text). Restore the per-turn-augmented user_text that was on
+                # the original prompt — sender wrap and the file-upload hint live
+                # only in user_text, not in the persisted row.
+                if rebuilt and rebuilt[-1].get("role") == "user":
+                    rebuilt[-1] = {"role": "user", "content": user_text}
+                else:
+                    rebuilt.append({"role": "user", "content": user_text})
+                messages = rebuilt
         except Exception as _pf_exc:
             logger.warning(f"[Channel] pre-flight compaction skipped (non-fatal): {_pf_exc}")
 
