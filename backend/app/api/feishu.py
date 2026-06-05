@@ -1091,15 +1091,17 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             from app.services.activity_logger import log_activity
             await log_activity(agent_id, "chat_reply", f"回复了飞书消息: {final_reply_text[:80]}", detail={"channel": "feishu", "user_text": user_text[:200], "reply": final_reply_text[:500]})
 
-            # Save assistant reply to history (use platform_user_id so messages stay in one session)
-            db.add(ChatMessage(
-                agent_id=agent_id,
-                user_id=platform_user_id,
-                role="assistant",
-                content=final_reply_text,
+            # Save assistant reply via the shared writer. Its own session stamps
+            # created_at at save time (after the tool loop), so the reply orders
+            # AFTER the turn's tool calls instead of being folded into the web
+            # UI's analysis card.
+            from app.services.chat_history import persist_assistant_reply
+            from app.database import async_session as _areply_session
+            await persist_assistant_reply(
+                _areply_session, agent_id=agent_id, user_id=platform_user_id,
+                conversation_id=session_conv_id, content=final_reply_text,
                 thinking="".join(_thinking_buffer) or None,
-                conversation_id=session_conv_id,
-            ))
+            )
             _sess.last_message_at = _dt.now(_tz.utc)
             await db.commit()
 
@@ -1490,11 +1492,12 @@ async def _handle_feishu_file(
             except Exception as _e_fb:
                 logger.error(f"[Feishu] Failed to send image reply: {_e_fb}")
 
-        # Save assistant reply in DB
-        async with _async_session() as _db_save:
-            _db_save.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="assistant",
-                                     content=reply_text, conversation_id=session_conv_id))
-            await _db_save.commit()
+        # Save assistant reply via the shared writer (consistent with every channel).
+        from app.services.chat_history import persist_assistant_reply
+        await persist_assistant_reply(
+            _async_session, agent_id=agent_id, user_id=platform_user_id,
+            conversation_id=session_conv_id, content=reply_text,
+        )
 
         # Log activity
         from app.services.activity_logger import log_activity
@@ -1519,11 +1522,12 @@ async def _handle_feishu_file(
     except Exception as e:
         logger.error(f"[Feishu] Failed to send ack: {e}")
 
-    # Store ack in DB
-    async with _async_session() as db2:
-        db2.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="assistant",
-                            content=ack, conversation_id=session_conv_id))
-        await db2.commit()
+    # Store ack via the shared writer (consistent with every channel).
+    from app.services.chat_history import persist_assistant_reply
+    await persist_assistant_reply(
+        _async_session, agent_id=agent_id, user_id=platform_user_id,
+        conversation_id=session_conv_id, content=ack,
+    )
 
 
 

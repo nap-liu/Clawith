@@ -396,6 +396,49 @@ async def test_persist_tool_call_done_roundtrips_via_canonical_schema():
     assert history[1]["content"] == "file body"
 
 
+async def test_persist_assistant_reply_roundtrips():
+    """The assistant reply persisted via the shared writer reads back through
+    load_history_for_llm with its content and optional thinking intact. Using
+    its own session (not the channel's long-lived transaction) stamps
+    created_at at save time — after the tool loop — so the web UI orders it
+    after the turn's tool calls instead of folding it into the analysis card."""
+    from app.services.chat_history import persist_assistant_reply
+
+    agent_id = uuid.uuid4()
+    conv_id = f"test_areply_{uuid.uuid4().hex[:8]}"
+    await persist_assistant_reply(
+        _fk_bypass_session,
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        conversation_id=conv_id,
+        content="上海今天晴",
+        thinking="先查天气再回答",
+    )
+    async with async_session() as db:
+        history = await load_history_for_llm(db, agent_id=agent_id, conversation_id=conv_id, ctx_size=50)
+
+    assert [m["role"] for m in history] == ["assistant"]
+    assert history[0]["content"] == "上海今天晴"
+
+
+async def test_persist_assistant_reply_skips_empty_content():
+    """No-op for empty/blank replies — never write a blank assistant row."""
+    from app.services.chat_history import persist_assistant_reply
+
+    agent_id = uuid.uuid4()
+    conv_id = f"test_areply_empty_{uuid.uuid4().hex[:8]}"
+    await persist_assistant_reply(
+        _fk_bypass_session,
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        conversation_id=conv_id,
+        content="",
+    )
+    async with async_session() as db:
+        history = await load_history_for_llm(db, agent_id=agent_id, conversation_id=conv_id, ctx_size=50)
+    assert history == []
+
+
 async def test_persist_tool_call_running_status_is_not_stored():
     """Only completed (done) tool calls are persisted; running is a no-op."""
     from app.services.chat_history import persist_tool_call

@@ -302,6 +302,44 @@ async def persist_tool_call(
         logger.warning(f"[chat_history] persist_tool_call failed (non-fatal): {e}")
 
 
+async def persist_assistant_reply(
+    db_session_factory,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    content: str,
+    thinking: str | None = None,
+) -> None:
+    """Persist a channel agent's final assistant reply.
+
+    Uses its OWN session (mirroring ``persist_tool_call``) so ``created_at`` is
+    stamped at save time — AFTER the tool loop — keeping the reply ordered
+    after the turn's tool_call rows. Saving through the channel's long-lived
+    request transaction would instead stamp it with the transaction-start time
+    (PostgreSQL ``now()``), placing the reply BEFORE the tool calls; the web UI
+    then folds it into the "ran N tools" analysis card and the reply bubble
+    disappears. No-op for blank content. Failures are swallowed.
+    """
+    if not (content or "").strip():
+        return
+    try:
+        async with db_session_factory() as db:
+            msg = ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="assistant",
+                content=content,
+                conversation_id=conversation_id,
+            )
+            if thinking:
+                msg.thinking = thinking
+            db.add(msg)
+            await db.commit()
+    except Exception as e:
+        logger.warning(f"[chat_history] persist_assistant_reply failed (non-fatal): {e}")
+
+
 def parse_tool_call_for_display(content: str) -> dict[str, Any]:
     """Parse a stored ``tool_call`` row's JSON content into the web UI display
     fields (``toolName`` / ``toolArgs`` / ``toolStatus`` / ``toolResult`` /

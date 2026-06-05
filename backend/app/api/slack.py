@@ -415,8 +415,16 @@ async def slack_event_webhook(
     _cfs_s.reset(_cfs_s_token)
     logger.info(f"[Slack] LLM reply: {reply_text[:80]}")
 
-    # Save reply
-    db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="assistant", content=reply_text, conversation_id=session_conv_id))
+    # Save assistant reply via the shared writer. Its own session stamps
+    # created_at at save time (after the tool loop), so the reply orders
+    # AFTER the turn's tool calls instead of being folded into the web UI's
+    # analysis card.
+    from app.services.chat_history import persist_assistant_reply
+    from app.database import async_session as _areply_session
+    await persist_assistant_reply(
+        _areply_session, agent_id=agent_id, user_id=platform_user_id,
+        conversation_id=session_conv_id, content=reply_text,
+    )
     sess.last_message_at = datetime.now(timezone.utc)
     await db.commit()
 

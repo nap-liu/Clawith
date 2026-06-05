@@ -24,6 +24,7 @@ from app.models.chat_compaction import ChatCompaction
 from app.database import async_session, engine
 from app.services.chat_history import (
     _SyntheticSummaryMessage,
+    load_history_for_llm,
     load_messages_for_session,
 )
 
@@ -324,5 +325,47 @@ async def test_superseded_marker_is_ignored_only_active_used():
         assert "v1 plus mid range" in loaded[0].content
         assert 'epoch="1"' not in loaded[0].content
         assert [r.id for r in loaded[1:]] == [inserted[4].id, inserted[5].id]
+    finally:
+        await _cleanup(conv_id)
+
+
+async def test_load_history_for_llm_compaction_and_tool_call_coexist():
+    """The IM-channel loader must combine compaction with tool-call expansion:
+    older messages fold into an injected summary, while a surviving (non-folded)
+    tool_call row is still expanded into the assistant(tool_calls)+tool(result)
+    pair. This guards the regression point that compaction stays correct for all
+    channels after the tool_call-history change."""
+    import json as _json
+
+    summary = "## Summary\n\n### Key facts\n- earlier sales discussion\n"
+    tc_content = _json.dumps({"name": "get_weather", "args": {"city": "SH"}, "status": "done", "result": "sunny"})
+    conv_id, agent_id, inserted, marker = await _setup(
+        [
+            ("user", "older question", 600),
+            ("assistant", "older answer", 500),
+            ("tool_call", tc_content, 200),
+            ("assistant", "今天上海晴", 100),
+        ],
+        marker_spec={
+            "epoch": 1,
+            "summary": summary,
+            "from_idx": 0,
+            "to_idx": 1,
+            "flag_indices": [0, 1],
+            "passed": True,
+        },
+    )
+    try:
+        async with async_session() as db:
+            history = await load_history_for_llm(db, agent_id=agent_id, conversation_id=conv_id, ctx_size=100)
+
+        roles = [m["role"] for m in history]
+        # injected summary (user) + expanded tool pair + final assistant reply
+        assert roles == ["user", "assistant", "tool", "assistant"]
+        assert "tool_call" not in roles  # surviving tool_call expanded, not raw
+        assert "<conversation-summary" in history[0]["content"]
+        assert history[1]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert history[2]["content"] == "sunny"
+        assert history[3]["content"] == "今天上海晴"
     finally:
         await _cleanup(conv_id)
