@@ -127,7 +127,7 @@ async def get_chat_history(
     result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == conv_id)
-        .order_by(ChatMessage.created_at.asc())
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
         .limit(200)
     )
     messages = result.scalars().all()

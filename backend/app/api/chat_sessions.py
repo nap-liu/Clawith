@@ -433,14 +433,16 @@ async def get_session_messages(
     latest_subq = (
         select(ChatMessage.id)
         .where(ChatMessage.conversation_id == str(session_id))
-        .order_by(desc(ChatMessage.created_at))
+        .order_by(desc(ChatMessage.created_at), desc(ChatMessage.id))
         .limit(500)
         .subquery()
     )
     msgs_result = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.id.in_(select(latest_subq.c.id)))
-        .order_by(ChatMessage.created_at.asc())
+        # id tiebreak: own-transaction tool_call/assistant rows can share a
+        # created_at microsecond; keep the render order deterministic.
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
     )
     messages = msgs_result.scalars().all()
 

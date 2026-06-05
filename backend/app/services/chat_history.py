@@ -158,7 +158,11 @@ async def load_messages_for_session(
             ChatMessage.conversation_id == conversation_id,
             ChatMessage.compacted_into.is_(None),
         )
-        .order_by(ChatMessage.created_at.desc())
+        # id is the deterministic tiebreak: tool_call + assistant rows are each
+        # written in their own transaction, so created_at (PostgreSQL now() =
+        # txn-start) can tie within the same microsecond. Without a secondary
+        # sort the order would flap between reloads.
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
         .limit(ctx_size)
     )
     rows: list[Any] = list(reversed(rows_q.scalars().all()))

@@ -455,3 +455,40 @@ async def test_persist_tool_call_running_status_is_not_stored():
     async with async_session() as db:
         history = await load_history_for_llm(db, agent_id=agent_id, conversation_id=conv_id, ctx_size=50)
     assert history == []
+
+
+async def test_assistant_reply_stamped_after_tool_calls():
+    """Headline-fix regression guard: persist_assistant_reply uses its OWN
+    session, so a reply written after the tool loop gets a created_at no earlier
+    than the turn's tool_call rows — it sorts AFTER them instead of being folded
+    into the web 'ran N tools' analysis card. Reverting the reply to the
+    channel's long-lived request transaction (PostgreSQL now() = txn-start time)
+    would stamp an earlier created_at and fail this. Compares timestamps
+    directly, so it is independent of any sort tiebreak and never flaky (>=)."""
+    from sqlalchemy import select as _select
+
+    from app.services.chat_history import persist_assistant_reply, persist_tool_call
+
+    agent_id = uuid.uuid4()
+    conv_id = f"test_order_{uuid.uuid4().hex[:8]}"
+    await persist_tool_call(
+        _fk_bypass_session,
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        conversation_id=conv_id,
+        evt={"name": "get_weather", "args": {"city": "SH"}, "status": "done", "result": "sunny"},
+    )
+    await persist_assistant_reply(
+        _fk_bypass_session,
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        conversation_id=conv_id,
+        content="今天上海晴",
+    )
+    async with async_session() as db:
+        rows = (
+            await db.execute(_select(ChatMessage).where(ChatMessage.conversation_id == conv_id))
+        ).scalars().all()
+    by_role = {r.role: r for r in rows}
+    assert set(by_role) == {"tool_call", "assistant"}
+    assert by_role["assistant"].created_at >= by_role["tool_call"].created_at
