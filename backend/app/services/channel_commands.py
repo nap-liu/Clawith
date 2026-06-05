@@ -25,7 +25,7 @@ async def handle_channel_command(
     db: AsyncSession,
     command: str,
     agent_id: uuid.UUID,
-    user_id: uuid.UUID,
+    user_id: uuid.UUID | None,
     external_conv_id: str,
     source_channel: str,
 ) -> dict:
