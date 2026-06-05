@@ -741,10 +741,50 @@ async def websocket_chat(
 
                     # Run call_llm_with_failover as a cancellable task
                     async def _call_with_failover():
-                        nonlocal needs_onboarding_mark, onboarding_target_phase
+                        nonlocal needs_onboarding_mark, onboarding_target_phase, conversation
 
                         async def _on_failover(reason: str):
                             await websocket.send_json({"type": "info", "content": f"Primary model error, {reason}"})
+
+                        # Pre-flight compaction: if the about-to-be-sent prompt is
+                        # near the model window, compact NOW and rebuild conversation
+                        # from DB so THIS request stays under it. The web conversation
+                        # lives in memory across a connection (not reloaded per turn),
+                        # so without this rebuild a single oversized turn would
+                        # overflow before the post-round hook could help. The current
+                        # user message is already persisted, so the rebuild includes
+                        # it. Best-effort: any failure leaves conversation untouched.
+                        # (Historical image re-inlining is skipped on this rare path.)
+                        try:
+                            from app.services.llm.compactor import maybe_precompact_prompt
+
+                            if await maybe_precompact_prompt(
+                                agent_id=agent_id,
+                                conversation_id=conv_id,
+                                model=effective_llm_model,
+                                prompt_messages=conversation[-ctx_size:],
+                            ):
+                                from app.services.chat_history import (
+                                    expand_tool_call_row,
+                                    load_messages_for_session,
+                                )
+
+                                async with async_session() as _pf_db:
+                                    _pf_rows = await load_messages_for_session(
+                                        _pf_db, agent_id=agent_id, conversation_id=conv_id, ctx_size=ctx_size
+                                    )
+                                _rebuilt: list[dict] = []
+                                for _m in _pf_rows:
+                                    if _m.role == "tool_call":
+                                        _rebuilt.extend(expand_tool_call_row(_m))
+                                    else:
+                                        _e = {"role": _m.role, "content": _m.content}
+                                        if getattr(_m, "thinking", None):
+                                            _e["thinking"] = _m.thinking
+                                        _rebuilt.append(_e)
+                                conversation = _rebuilt
+                        except Exception as _pf_exc:
+                            logger.warning(f"[WS] pre-flight compaction skipped (non-fatal): {_pf_exc}")
 
                         # Drop orphan tool messages left if the ctx_size slice cut a
                         # tool-call pair (shared guard with the IM history path).

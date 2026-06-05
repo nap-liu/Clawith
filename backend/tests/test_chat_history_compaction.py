@@ -369,3 +369,74 @@ async def test_load_history_for_llm_compaction_and_tool_call_coexist():
         assert history[3]["content"] == "今天上海晴"
     finally:
         await _cleanup(conv_id)
+
+
+def _precompact_model(context_window, ratio=0.85, keep=8, summary_max=2000):
+    """SimpleNamespace duck-typing the LLMModel surface the compactor reads."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        context_window=context_window,
+        compact_trigger_ratio=ratio,
+        keep_recent_turns=keep,
+        compact_summary_max_tokens=summary_max,
+    )
+
+
+async def _markers_for(conv_id: str):
+    from sqlalchemy import select as _select
+
+    async with async_session() as db:
+        return (await db.execute(_select(ChatCompaction).where(ChatCompaction.session_id == conv_id))).scalars().all()
+
+
+async def test_precompact_noop_below_threshold():
+    """Pre-flight is a cheap no-op when the prompt is well under the window:
+    returns False and writes NO compaction marker (no summary LLM call)."""
+    from app.services.llm.compactor import maybe_precompact_prompt
+
+    conv_id, agent_id, _, _ = await _setup([("user", "hi", 100), ("assistant", "hello", 50)])
+    try:
+        triggered = await maybe_precompact_prompt(
+            agent_id=agent_id,
+            conversation_id=conv_id,
+            model=_precompact_model(context_window=131072),
+            prompt_messages=[{"role": "user", "content": "short"}],
+        )
+        assert triggered is False
+        assert await _markers_for(conv_id) == []
+    finally:
+        await _cleanup(conv_id)
+
+
+async def test_precompact_noop_when_history_too_small():
+    """Even when the estimate crosses the pre-flight ratio, compaction is a
+    no-op when there isn't enough older history to fold — no summary LLM call,
+    no marker (guards against thrashing tiny conversations)."""
+    from app.services.llm.compactor import maybe_precompact_prompt
+
+    conv_id, agent_id, _, _ = await _setup([("user", "hi", 100), ("assistant", "hello", 50)])
+    try:
+        triggered = await maybe_precompact_prompt(
+            agent_id=agent_id,
+            conversation_id=conv_id,
+            model=_precompact_model(context_window=100),  # tiny window → estimate >> 95%
+            prompt_messages=[{"role": "user", "content": "x" * 4000}],
+        )
+        assert triggered is False  # select_compaction_span returns None (too few rows)
+        assert await _markers_for(conv_id) == []
+    finally:
+        await _cleanup(conv_id)
+
+
+async def test_precompact_noop_without_conversation_id():
+    """No conversation_id → pre-flight is a no-op (returns False, never raises)."""
+    from app.services.llm.compactor import maybe_precompact_prompt
+
+    triggered = await maybe_precompact_prompt(
+        agent_id=uuid.uuid4(),
+        conversation_id="",
+        model=_precompact_model(context_window=100),
+        prompt_messages=[{"role": "user", "content": "x" * 4000}],
+    )
+    assert triggered is False

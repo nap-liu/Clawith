@@ -540,6 +540,40 @@ async def maybe_compact(
             )
 
 
+async def maybe_precompact_prompt(
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    model: LLMModel,
+    prompt_messages: list[dict],
+) -> bool:
+    """Pre-flight compaction guard for the channel / web entry points.
+
+    Estimates the about-to-be-sent prompt's token count; if it crosses the
+    pre-flight threshold (``PRE_FLIGHT_TRIGGER_RATIO``), compacts NOW so a
+    subsequent history reload returns a slimmer prompt — preventing the current
+    request from overflowing the model window. (The post-round hook only helps
+    the NEXT turn, so a single oversized prompt — big paste, huge first
+    message, accumulated tool output — would otherwise be rejected by the
+    provider before compaction ever ran.)
+
+    Returns ``True`` when compaction fired, in which case the caller MUST
+    reload history before sending. Cheap no-op below the threshold: no DB
+    write and no summary LLM call (``should_compact`` short-circuits inside
+    ``maybe_compact``).
+    """
+    if not (agent_id and conversation_id and model):
+        return False
+    estimate = estimate_prompt_tokens(prompt_messages)
+    result = await maybe_compact(
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        model=model,
+        pre_flight_estimate=estimate,
+    )
+    return result.triggered
+
+
 async def _do_compact(
     *,
     agent_id: uuid.UUID,

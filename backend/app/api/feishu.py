@@ -1621,6 +1621,27 @@ async def _call_agent_llm(
         messages.extend(strip_leading_orphan_tool_messages(_normalize_history_messages(history)[-ctx_size:]))
     messages.append({"role": "user", "content": user_text})
 
+    # Pre-flight compaction: if the about-to-be-sent prompt is near the model
+    # window, compact NOW and reload so THIS request doesn't overflow (the
+    # post-round hook only slims the NEXT turn). The reload already includes the
+    # just-saved current user message — channels save it before calling — so we
+    # rebuild from the fresh history WITHOUT re-appending user_text. Best-effort:
+    # any failure leaves the original messages untouched.
+    if session_id:
+        from app.services.chat_history import load_history_for_llm, strip_leading_orphan_tool_messages
+        from app.services.llm.compactor import maybe_precompact_prompt
+
+        try:
+            if await maybe_precompact_prompt(
+                agent_id=agent_id, conversation_id=session_id, model=model, prompt_messages=messages
+            ):
+                fresh = await load_history_for_llm(
+                    db, agent_id=agent_id, conversation_id=session_id, ctx_size=ctx_size, is_group=is_group
+                )
+                messages = strip_leading_orphan_tool_messages(_normalize_history_messages(fresh)[-ctx_size:])
+        except Exception as _pf_exc:
+            logger.warning(f"[Channel] pre-flight compaction skipped (non-fatal): {_pf_exc}")
+
     # Use actual user_id so the system prompt knows who it's chatting with
     effective_user_id = user_id or agent_id
 
