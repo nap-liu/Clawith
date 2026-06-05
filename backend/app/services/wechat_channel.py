@@ -19,6 +19,8 @@ from app.models.agent import Agent as AgentModel
 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
 from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
+from app.services.channel_commands import is_channel_command
+from app.services.channel_dispatch import ChannelReactions, run_channel_message
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
 
@@ -202,104 +204,115 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
         logger.warning(f"[WeChat] Missing context_token for agent {agent_id}, message skipped")
         return
 
+    # 提前计算 conv_id，供 lock_key 使用（与 find_or_create_channel_session 调用保持一致）
+    conv_key = str(msg.get("session_id") or from_user_id).strip()
+    conv_id = f"wechat_{conv_key}"
+    lock_key = f"wechat:{conv_id}"
+    is_cmd = is_channel_command(user_text)
+
     async with async_session() as db:
-        agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-        agent_obj = agent_r.scalar_one_or_none()
-        if not agent_obj:
-            return
+        # 整轮（用户行写入 → LLM → 回复持久化 → 发送）包在 _work 内串行化
+        async def _work() -> str:
+            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent_obj = agent_r.scalar_one_or_none()
+            if not agent_obj:
+                return ""
 
-        extra_info = {
-            "name": f"WeChat User {from_user_id[:8]}",
-            "external_id": from_user_id,
-        }
-        platform_user = await channel_user_service.resolve_channel_user(
-            db=db,
-            agent=agent_obj,
-            channel_type="wechat",
-            external_user_id=from_user_id,
-            extra_info=extra_info,
-        )
-        platform_user_id = platform_user.id
-        conv_key = str(msg.get("session_id") or from_user_id).strip()
-        conv_id = f"wechat_{conv_key}"
+            extra_info = {
+                "name": f"WeChat User {from_user_id[:8]}",
+                "external_id": from_user_id,
+            }
+            platform_user = await channel_user_service.resolve_channel_user(
+                db=db,
+                agent=agent_obj,
+                channel_type="wechat",
+                external_user_id=from_user_id,
+                extra_info=extra_info,
+            )
+            platform_user_id = platform_user.id
 
-        sess = await find_or_create_channel_session(
-            db=db,
-            agent_id=agent_id,
-            user_id=platform_user_id,
-            external_conv_id=conv_id,
-            source_channel="wechat",
-            first_message_title=user_text,
-        )
-        session_conv_id = str(sess.id)
-        await remember_wechat_context(
-            db,
-            agent_id=agent_id,
-            from_user_id=from_user_id,
-            context_token=context_token,
-            conv_id=conv_id,
-        )
-
-        from app.services.chat_history import load_history_for_llm
-
-        history = await load_history_for_llm(
-            db,
-            agent_id=agent_id,
-            conversation_id=session_conv_id,
-            ctx_size=agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE,
-        )
-
-        db.add(
-            ChatMessage(
+            sess = await find_or_create_channel_session(
+                db=db,
                 agent_id=agent_id,
                 user_id=platform_user_id,
-                role="user",
-                content=user_text,
-                conversation_id=session_conv_id,
+                external_conv_id=conv_id,
+                source_channel="wechat",
+                first_message_title=user_text,
             )
-        )
-        sess.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
+            session_conv_id = str(sess.id)
+            await remember_wechat_context(
+                db,
+                agent_id=agent_id,
+                from_user_id=from_user_id,
+                context_token=context_token,
+                conv_id=conv_id,
+            )
 
-        reply_text = await _call_agent_llm(
-            db=db,
-            agent_id=agent_id,
-            user_text=user_text,
-            history=history,
-            user_id=platform_user_id,
-            session_id=session_conv_id,
-        )
+            from app.services.chat_history import load_history_for_llm
 
-        token = str((config.extra_config or {}).get("bot_token") or "").strip()
-        base_url = str((config.extra_config or {}).get("baseurl") or WECHAT_ILINK_BASE_URL).strip()
-        route_tag = str((config.extra_config or {}).get("route_tag") or "").strip() or None
-        await send_wechat_text_message(
-            token=token,
-            base_url=base_url,
-            to_user_id=from_user_id,
-            context_token=context_token,
-            text=reply_text,
-            route_tag=route_tag,
-        )
+            history = await load_history_for_llm(
+                db,
+                agent_id=agent_id,
+                conversation_id=session_conv_id,
+                ctx_size=agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE,
+            )
 
-        # Save assistant reply via the shared writer (own session → created_at
-        # stamped after the tool loop, ordered after the turn's tool calls).
-        from app.services.chat_history import persist_assistant_reply
-        from app.database import async_session as _areply_session
+            db.add(
+                ChatMessage(
+                    agent_id=agent_id,
+                    user_id=platform_user_id,
+                    role="user",
+                    content=user_text,
+                    conversation_id=session_conv_id,
+                )
+            )
+            sess.last_message_at = datetime.now(timezone.utc)
+            await db.commit()
 
-        await persist_assistant_reply(
-            _areply_session, agent_id=agent_id, user_id=platform_user_id,
-            conversation_id=session_conv_id, content=reply_text,
-        )
-        sess.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
+            reply_text = await _call_agent_llm(
+                db=db,
+                agent_id=agent_id,
+                user_text=user_text,
+                history=history,
+                user_id=platform_user_id,
+                session_id=session_conv_id,
+            )
 
-        await log_activity(
-            agent_id,
-            "chat_reply",
-            f"Replied to WeChat message: {reply_text[:80]}",
-            detail={"channel": "wechat", "user_text": user_text[:200], "reply": reply_text[:500]},
-        )
+            token = str((config.extra_config or {}).get("bot_token") or "").strip()
+            base_url = str((config.extra_config or {}).get("baseurl") or WECHAT_ILINK_BASE_URL).strip()
+            route_tag = str((config.extra_config or {}).get("route_tag") or "").strip() or None
+            await send_wechat_text_message(
+                token=token,
+                base_url=base_url,
+                to_user_id=from_user_id,
+                context_token=context_token,
+                text=reply_text,
+                route_tag=route_tag,
+            )
+
+            # Save assistant reply via the shared writer (own session → created_at
+            # stamped after the tool loop, ordered after the turn's tool calls).
+            from app.services.chat_history import persist_assistant_reply
+            from app.database import async_session as _areply_session
+
+            await persist_assistant_reply(
+                _areply_session, agent_id=agent_id, user_id=platform_user_id,
+                conversation_id=session_conv_id, content=reply_text,
+            )
+            sess.last_message_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            await log_activity(
+                agent_id,
+                "chat_reply",
+                f"Replied to WeChat message: {reply_text[:80]}",
+                detail={"channel": "wechat", "user_text": user_text[:200], "reply": reply_text[:500]},
+            )
+
+            return reply_text or ""
+
+        # WeChat 无 emoji reaction，ChannelReactions 保持空
+        await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
 
 
 class WeChatPollManager:

@@ -18,6 +18,8 @@ from sqlalchemy import select
 
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
+from app.services.channel_commands import is_channel_command
+from app.services.channel_dispatch import ChannelReactions, run_channel_message
 
 try:
     import discord
@@ -104,15 +106,31 @@ class DiscordGatewayManager:
                 f"{message.author.name}: {user_text[:80]}"
             )
 
-            # Show typing indicator while processing
-            async with message.channel.typing():
-                reply = await self._handle_message(agent_id, message, user_text)
+            # 与 _handle_message 中的 conv_id 公式完全一致（DM 无 sender 后缀，
+            # guild 消息含 sender_id 以区分不同成员的会话）
+            sender_id_om = str(message.author.id)
+            channel_id_om = str(message.channel.id)
+            conv_id_om = (
+                f"discord_dm_{sender_id_om}"
+                if message.guild is None
+                else f"discord_{channel_id_om}_{sender_id_om}"
+            )
+            lock_key = f"discord:{conv_id_om}"
+            is_cmd = is_channel_command(user_text)
 
-            # Send reply, chunked if needed
-            if reply:
-                chunks = [reply[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(reply), DISCORD_MSG_LIMIT)]
-                for chunk in chunks:
-                    await message.reply(chunk, mention_author=False)
+            async def _work() -> str:
+                # typing 指示器 + 完整处理（用户行写入 → LLM → 回复持久化）包在锁内
+                async with message.channel.typing():
+                    reply = await self._handle_message(agent_id, message, user_text)
+                # Send reply, chunked if needed
+                if reply:
+                    chunks = [reply[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(reply), DISCORD_MSG_LIMIT)]
+                    for chunk in chunks:
+                        await message.reply(chunk, mention_author=False)
+                return reply or ""
+
+            # Discord gateway 无 emoji reaction，ChannelReactions 保持空
+            await run_channel_message(lock_key, is_command=is_cmd, reactions=ChannelReactions(), work=_work)
 
         # Run the bot in a background task
         proxy = os.environ.get("DISCORD_PROXY") or os.environ.get("HTTPS_PROXY") or None
