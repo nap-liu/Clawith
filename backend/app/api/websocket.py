@@ -763,8 +763,12 @@ async def websocket_chat(
                                     _pf_rows = await load_messages_for_session(
                                         _pf_db, agent_id=agent_id, conversation_id=conv_id, ctx_size=ctx_size
                                     )
-                                # Same shared builder as the initial build above.
+                                # Same shared builder + image rehydration as the
+                                # initial build above, so vision context survives a
+                                # compaction-triggered rebuild.
                                 conversation = build_llm_messages_from_rows(_pf_rows, include_thinking=True)
+                                from app.services.image_context import rehydrate_image_messages
+                                conversation = rehydrate_image_messages(conversation, agent_id, max_images=3)
                         except Exception as _pf_exc:
                             logger.warning(f"[WS] pre-flight compaction skipped (non-fatal): {_pf_exc}")
 

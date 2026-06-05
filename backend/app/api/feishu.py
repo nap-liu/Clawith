@@ -1637,7 +1637,8 @@ async def _call_agent_llm(
                 agent_id=agent_id, conversation_id=session_id, model=model, prompt_messages=messages
             ):
                 fresh = await load_history_for_llm(
-                    db, agent_id=agent_id, conversation_id=session_id, ctx_size=ctx_size, is_group=is_group
+                    db, agent_id=agent_id, conversation_id=session_id, ctx_size=ctx_size,
+                    is_group=is_group, rehydrate_images_max=3,
                 )
                 rebuilt = strip_leading_orphan_tool_messages(_normalize_history_messages(fresh)[-ctx_size:])
                 # The reload ends with the current user message as stored in DB
