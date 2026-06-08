@@ -6969,6 +6969,9 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             history = await load_history_for_llm(
                 db, agent_id=session_agent_id, conversation_id=session_id, ctx_size=ctx_size,
             )
+            # tool_call rows expand to assistant+tool pairs, so history can be up to
+            # ~2×ctx_size messages; re-slice to cap the LLM window AFTER expansion.
+            # (This is NOT a no-op despite load_history_for_llm's row-level limit.)
             messages = strip_leading_orphan_tool_messages(history[-ctx_size:])
             turn_text = "[From " + source_name + "] " + message_text + "\n\n" + A2A_DELIVERY_GUIDANCE
             if messages and messages[-1].get("role") == "user":

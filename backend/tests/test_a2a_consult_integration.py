@@ -11,7 +11,7 @@ No real DB or LLM connection required — all IO is mocked.
 
 import json
 import uuid
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -149,6 +149,8 @@ async def test_consult_routes_through_unified_loop_and_returns_reply():
             captured_on_tool_call.append(on_tool_call)
         return "Unified loop reply"
 
+    # Patch the SOURCE module (call_llm_with_failover is imported lazily inside the
+    # consult branch); if that import is hoisted, retarget to app.services.agent_tools.
     with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
          patch("app.services.llm.call_llm_with_failover", side_effect=fake_failover) as mock_failover, \
          patch("app.services.activity_logger.log_activity", new_callable=AsyncMock):
@@ -249,9 +251,13 @@ async def test_consult_persist_tool_call_stores_raw_connection_string():
             "evt": evt,
         })
 
+    # NOTE: agent_tools.py imports call_llm_with_failover / persist_tool_call lazily
+    # INSIDE the consult branch, so patching the source modules is correct. If those
+    # imports are ever hoisted to module top-level, switch the patch targets to
+    # "app.services.agent_tools.<name>" or these mocks silently stop applying.
     with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
          patch("app.services.llm.call_llm_with_failover", side_effect=fake_failover), \
-         patch("app.services.chat_history.persist_tool_call", side_effect=fake_persist) as mock_persist, \
+         patch("app.services.chat_history.persist_tool_call", side_effect=fake_persist), \
          patch("app.services.activity_logger.log_activity", new_callable=AsyncMock):
 
         mock_session_ctx.return_value.__aenter__ = AsyncMock(side_effect=[db_main, db_reply])
