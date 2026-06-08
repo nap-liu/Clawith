@@ -389,7 +389,13 @@ async def build_agent_context(
 
     agent_tz_name = await get_agent_timezone(agent_id)
     agent_local_now = now_in_timezone(agent_tz_name)
-    now_str = agent_local_now.strftime(f"%Y-%m-%d %H:%M:%S ({agent_tz_name})")
+    # Date granularity only. A passively-injected clock is approximate by
+    # nature; anything finer than a day changes within the 5-minute prefix-cache
+    # TTL and busts the cached system prefix — most acutely on the heartbeat /
+    # scheduled-task / supervision / A2A paths that carry this block inside the
+    # system message (LLMMessage.dynamic_content). An agent that needs the exact
+    # time should call a time tool on demand.
+    now_str = f"{agent_local_now.strftime('%Y-%m-%d')} ({agent_tz_name})"
 
     static_parts = [f"You are {agent_name}, an enterprise digital employee."]
 
