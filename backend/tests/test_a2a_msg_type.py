@@ -81,6 +81,7 @@ def _make_agent(agent_id=None, name="TestAgent", tenant_id=None, agent_type="nat
     agent.fallback_model_id = None
     agent.role_description = ""
     agent.max_tool_rounds = 50
+    agent.context_window_size = 20
     return agent
 
 
@@ -204,7 +205,7 @@ async def test_task_delegate_creates_focus_and_trigger():
 
 @pytest.mark.asyncio
 async def test_consult_calls_llm_synchronously():
-    """consult msg_type should call LLM synchronously and return reply."""
+    """consult msg_type should route through call_llm_with_failover and return reply."""
     from app.services.agent_tools import _send_message_to_agent
 
     from_agent_id = uuid.uuid4()
@@ -222,22 +223,21 @@ async def test_consult_calls_llm_synchronously():
     session.last_message_at = None
 
     model = MagicMock()
-    model.provider = "openai"
-    model.model = "gpt-4"
-    model.api_key_encrypted = "sk-test"
-    model.base_url = None
-    model.temperature = 0.7
-    model.request_timeout = 60
+    model.id = model_id
+    model.enabled = True
+    model.supports_vision = False
 
-    response = MagicMock()
-    response.content = "Here is the answer"
-    response.tool_calls = None
-    response.usage = None
-
-    mock_llm_client = AsyncMock()
-    mock_llm_client.complete = AsyncMock(return_value=response)
-    mock_llm_client.close = AsyncMock()
-
+    # DB responses for the main session (outer async_session context):
+    # 1. source agent lookup
+    # 2. target agent exact-match lookup
+    # 3. relationship check
+    # 4. src_participant lookup
+    # 5. tgt_participant lookup
+    # 6. chat_session lookup
+    # 7. tenant feature-flag lookup
+    # 8. primary LLMModel lookup (consult branch)
+    # 9. load_messages_for_session: ChatMessage rows
+    # 10. load_messages_for_session: ChatCompaction marker
     db = RecordingDB(responses=[
         DummyResult(scalar_value=source_agent),
         DummyResult(scalars_list=[target_agent]),
@@ -247,34 +247,21 @@ async def test_consult_calls_llm_synchronously():
         DummyResult(scalar_value=session),
         DummyResult(scalar_value=_make_tenant()),
         DummyResult(scalar_value=model),
-        DummyResult(scalars_list=[]),
+        DummyResult(scalars_list=[]),   # ChatMessage rows (empty history)
+        DummyResult(scalar_value=None), # ChatCompaction marker (none)
     ])
 
+    # DB for reply-save block (second async_session context)
     db2 = RecordingDB(responses=[
         DummyResult(scalar_value=tgt_participant),
     ])
 
-    call_count = 0
-    session_dbs = [db, db2]
-
-    async def mock_session_enter(self):
-        nonlocal call_count
-        result = session_dbs[min(call_count, len(session_dbs) - 1)]
-        call_count += 1
-        return result
-
     with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
-         patch("app.services.agent_context.build_agent_context", new_callable=AsyncMock, return_value=("static", "dynamic")), \
-         patch("app.services.llm.create_llm_client", return_value=mock_llm_client), \
-         patch("app.services.agent_tools.get_agent_tools_for_llm", new_callable=AsyncMock, return_value=[]), \
-         patch("app.services.llm.get_provider_base_url", return_value="https://api.openai.com/v1"), \
-         patch("app.services.token_tracker.record_token_usage", new_callable=AsyncMock), \
+         patch("app.services.llm.call_llm_with_failover",
+               new_callable=AsyncMock, return_value="Here is the answer") as mock_failover, \
          patch("app.services.activity_logger.log_activity", new_callable=AsyncMock):
 
-        mock_session_ctx.return_value.__aenter__ = AsyncMock(side_effect=[
-            db,
-            db2,
-        ])
+        mock_session_ctx.return_value.__aenter__ = AsyncMock(side_effect=[db, db2])
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
@@ -285,7 +272,10 @@ async def test_consult_calls_llm_synchronously():
 
     assert "Bob replied" in result
     assert "Here is the answer" in result
-    mock_llm_client.complete.assert_awaited()
+    mock_failover.assert_awaited_once()
+    # Verify agent_id passed to failover is target.id (not session_agent_id)
+    call_kwargs = mock_failover.call_args
+    assert call_kwargs.kwargs["agent_id"] == target_agent.id
 
 
 @pytest.mark.asyncio
@@ -515,21 +505,9 @@ async def test_feature_flag_off_falls_back_to_consult():
     session.last_message_at = None
 
     model = MagicMock()
-    model.provider = "openai"
-    model.model = "gpt-4"
-    model.api_key_encrypted = "sk-test"
-    model.base_url = None
-    model.temperature = 0.7
-    model.request_timeout = 60
-
-    response = MagicMock()
-    response.content = "Got it"
-    response.tool_calls = None
-    response.usage = None
-
-    mock_llm_client = AsyncMock()
-    mock_llm_client.complete = AsyncMock(return_value=response)
-    mock_llm_client.close = AsyncMock()
+    model.id = model_id
+    model.enabled = True
+    model.supports_vision = False
 
     db = RecordingDB(responses=[
         DummyResult(scalar_value=source_agent),
@@ -540,7 +518,8 @@ async def test_feature_flag_off_falls_back_to_consult():
         DummyResult(scalar_value=session),
         DummyResult(scalar_value=tenant),
         DummyResult(scalar_value=model),
-        DummyResult(scalars_list=[]),
+        DummyResult(scalars_list=[]),   # ChatMessage rows (empty history)
+        DummyResult(scalar_value=None), # ChatCompaction marker (none)
     ])
 
     db2 = RecordingDB(responses=[
@@ -548,11 +527,8 @@ async def test_feature_flag_off_falls_back_to_consult():
     ])
 
     with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
-         patch("app.services.agent_context.build_agent_context", new_callable=AsyncMock, return_value=("s", "d")), \
-         patch("app.services.llm.create_llm_client", return_value=mock_llm_client), \
-         patch("app.services.agent_tools.get_agent_tools_for_llm", new_callable=AsyncMock, return_value=[]), \
-         patch("app.services.llm.get_provider_base_url", return_value="https://api.openai.com/v1"), \
-         patch("app.services.token_tracker.record_token_usage", new_callable=AsyncMock), \
+         patch("app.services.llm.call_llm_with_failover",
+               new_callable=AsyncMock, return_value="Got it") as mock_failover, \
          patch("app.services.activity_logger.log_activity", new_callable=AsyncMock):
 
         mock_session_ctx.return_value.__aenter__ = AsyncMock(side_effect=[db, db2])
@@ -566,6 +542,7 @@ async def test_feature_flag_off_falls_back_to_consult():
 
     assert "Bob replied" in result
     assert "Got it" in result
+    mock_failover.assert_awaited_once()
 
 
 @pytest.mark.asyncio
