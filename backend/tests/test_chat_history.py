@@ -365,8 +365,10 @@ async def _fk_bypass_session():
 async def test_persist_tool_call_done_roundtrips_via_canonical_schema():
     """A done tool call persisted via the shared writer must read back through
     load_history_for_llm as the canonical assistant+tool pair, with secret args
-    masked — proving the IM落库 schema matches the read/replay path."""
-    from app.services.chat_history import persist_tool_call
+    kept RAW — the LLM replays this verbatim, so masking storage would make the
+    model copy ``"******"`` into new tool calls. Secrets are masked only at the
+    human-facing display boundary (asserted below)."""
+    from app.services.chat_history import parse_tool_call_for_display, persist_tool_call
 
     agent_id = uuid.uuid4()
     conv_id = f"test_persist_{uuid.uuid4().hex[:8]}"
@@ -392,8 +394,26 @@ async def test_persist_tool_call_done_roundtrips_via_canonical_schema():
     assert fn["name"] == "read_file"
     args = json.loads(fn["arguments"])
     assert args["path"] == "x.txt"
-    assert args["password"] == "******"  # sanitized before storage
+    assert args["password"] == "SECRET"  # RAW in the LLM-replay path (not masked at storage)
     assert history[1]["content"] == "file body"
+
+    # The masking moved to the display boundary, not gone: what a human sees is
+    # masked, what the model replays is raw.
+    from sqlalchemy import select as _select
+
+    async with async_session() as db:
+        _rows = (
+            await db.execute(
+                _select(ChatMessage).where(
+                    ChatMessage.conversation_id == conv_id,
+                    ChatMessage.role == "tool_call",
+                )
+            )
+        ).scalars().all()
+    assert len(_rows) == 1
+    display = parse_tool_call_for_display(_rows[0].content)
+    assert display["toolArgs"]["password"] == "******"
+    assert display["toolArgs"]["path"] == "x.txt"
 
 
 async def test_persist_assistant_reply_roundtrips():

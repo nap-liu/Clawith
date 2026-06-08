@@ -303,20 +303,23 @@ async def persist_tool_call(
     ``evt`` is the ``on_tool_call`` payload emitted by the LLM caller
     (``name`` / ``call_id`` / ``args`` / ``status`` / ``result`` /
     ``reasoning_content``). Only ``status == "done"`` is stored; running
-    notifications are ignored. ``args`` are sanitized (secrets masked, base64
-    images redacted) before storage, mirroring the web path. The result is
-    stored verbatim (never truncated). Failures are swallowed — a best-effort
-    audit write must never break the live conversation.
+    notifications are ignored. ``args`` are stored RAW — this persisted row is
+    the single source of truth the LLM replays (``expand_tool_call_row``), so
+    masking secrets here poisons the model (it copied ``connection_string:
+    "******"`` back into new tool calls and looped on "Unsupported database
+    type"). Sanitization is an OUTPUT-BOUNDARY concern, applied only where a
+    human can see it (``parse_tool_call_for_display`` and the live WS
+    broadcast), never at storage. The result is stored verbatim (never
+    truncated). Failures are swallowed — a best-effort audit write must never
+    break the live conversation.
     """
     if (evt or {}).get("status") != "done":
         return
 
-    from app.utils.sanitize import sanitize_tool_args
-
     content = json.dumps(
         {
             "name": evt.get("name", ""),
-            "args": sanitize_tool_args(evt.get("args")),
+            "args": evt.get("args"),
             "status": "done",
             "result": evt.get("result") or "",
             "reasoning_content": evt.get("reasoning_content"),
@@ -390,9 +393,13 @@ def parse_tool_call_for_display(content: str) -> dict[str, Any]:
     payload = _parse_tool_call_payload(content)
     if payload is None:
         return {}
+    # Output boundary: mask secrets here (args are stored RAW so the LLM replay
+    # gets the real connection string; humans/clients must not).
+    from app.utils.sanitize import sanitize_tool_args
+
     return {
         "toolName": payload["name"],
-        "toolArgs": payload["args"],
+        "toolArgs": sanitize_tool_args(payload["args"]),
         "toolStatus": payload["status"] or "done",
         "toolResult": payload["result"] or "",
         "toolThinking": payload["reasoning_content"] or "",

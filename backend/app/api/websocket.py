@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.security import decode_access_token
-from app.utils.sanitize import _is_secrets_file_path
+from app.utils.sanitize import _is_secrets_file_path, sanitize_tool_args
 from app.core.permissions import check_agent_access, is_agent_expired
 from app.database import async_session
 from app.models.agent import Agent
@@ -652,11 +652,15 @@ async def websocket_chat(
                                 }
                                 logger.info(f"[WS][Workspace] activity: {_done_tool_name} → {_ws_path}")
 
-                        await websocket.send_json({"type": "tool_call", **data})
+                        # Output boundary: mask secrets for the client. `data` stays
+                        # raw below so persist_tool_call stores the real args (the LLM
+                        # replays them — masking storage poisons the model).
+                        _ws_data = {**data, "args": sanitize_tool_args(data.get("args"))} if "args" in data else data
+                        await websocket.send_json({"type": "tool_call", **_ws_data})
                         # Persist completed tool calls via the shared writer — the
                         # SAME canonical schema every IM channel uses (single source
-                        # of truth, args sanitized + result stored verbatim). Then
-                        # mark the session read for the active viewer (web-only).
+                        # of truth: args stored RAW for LLM replay, masked only at
+                        # output boundaries). Then mark the session read (web-only).
                         if data.get("status") == "done":
                             from app.services.chat_history import persist_tool_call
                             await persist_tool_call(
