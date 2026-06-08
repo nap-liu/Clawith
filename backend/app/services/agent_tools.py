@@ -2636,7 +2636,13 @@ async def execute_tool(
             path = arguments.get("path")
             if not path:
                 return "❌ Missing required argument 'path' for read_document"
-            max_chars = min(int(arguments.get("max_chars", 8000)), 20000)
+            # No lossy tool-layer cap: return full text and let finalize_tool_output
+            # overflow oversized docs to a file. max_chars stays honored only if a
+            # caller explicitly passes one (the tool schema does not expose it).
+            max_chars = min(
+                int(arguments.get("max_chars", _READ_DOCUMENT_HARD_CHAR_CEILING)),
+                _READ_DOCUMENT_HARD_CHAR_CEILING,
+            )
             result = await _read_document(ws, path, max_chars=max_chars, tenant_id=_agent_tenant_id)
         elif tool_name == "read_image":
             from app.services.tools.read_image import handle_read_image
@@ -4483,6 +4489,13 @@ _READ_DOCUMENT_FALLBACK_TIMEOUT_SECONDS = 10
 _READ_DOCUMENT_MAX_CELL_CHARS = 500
 _READ_DOCUMENT_MAX_COLUMNS = 80
 _READ_DOCUMENT_MAX_XLSX_CELLS = 20000
+# read_document returns the FULL extracted text (bounded only by file size +
+# page/row/cell structural caps). It must NOT lossily truncate at the tool layer:
+# the unified overflow-to-file path (llm.tool_output_store.finalize_tool_output)
+# materializes oversized output to .tool_results/ with a read_file pointer, so the
+# agent can always retrieve the rest. This ceiling is just a memory safety bound,
+# far above any normal document — not a content budget.
+_READ_DOCUMENT_HARD_CHAR_CEILING = 2_000_000
 
 
 def _safe_document_cell_text(value: Any) -> str:
@@ -4497,9 +4510,27 @@ def _safe_document_cell_text(value: Any) -> str:
     return text
 
 
-def _read_document_sync(ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None) -> str:
+def _render_xlsx_row(values) -> str:
+    """Render one spreadsheet row to a tab-joined string, trimming TRAILING empty
+    cells.
+
+    openpyxl ``iter_rows(max_col=_READ_DOCUMENT_MAX_COLUMNS)`` pads every row out
+    to the column cap, so a sparse row (e.g. one value in a far-right SQL column)
+    would otherwise emit dozens of trailing tabs. That padding burned the
+    ``max_chars`` budget and pushed real content past the truncation line. Inner
+    empty cells are kept so a populated cell stays aligned with its header column.
+    """
+    texts = [_safe_document_cell_text(c) for c in values]
+    while texts and not texts[-1].strip():
+        texts.pop()
+    return "\t".join(texts)
+
+
+def _read_document_sync(
+    ws: Path, rel_path: str, max_chars: int = _READ_DOCUMENT_HARD_CHAR_CEILING, tenant_id: str | None = None
+) -> str:
     """Synchronous document extraction. Must run outside the uvicorn event loop."""
-    max_chars = min(max(int(max_chars), 1), 20000)
+    max_chars = min(max(int(max_chars), 1), _READ_DOCUMENT_HARD_CHAR_CEILING)
     try:
         file_path = _resolve_tool_source_path(ws, rel_path, tenant_id=tenant_id)
     except ValueError as exc:
@@ -4599,7 +4630,7 @@ def _read_document_sync(ws: Path, rel_path: str, max_chars: int = 8000, tenant_i
                     if cell_count > _READ_DOCUMENT_MAX_XLSX_CELLS:
                         rows.append("[cell limit reached; remaining cells omitted]")
                         break
-                    row_str = "\t".join(_safe_document_cell_text(c) for c in visible)
+                    row_str = _render_xlsx_row(visible)
                     if row_str.strip():
                         rows.append(row_str)
                 if rows:
@@ -4765,7 +4796,9 @@ def _read_document_with_timeout(ws: Path, rel_path: str, max_chars: int = 8000, 
     return str(payload)
 
 
-async def _read_document(ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None) -> str:
+async def _read_document(
+    ws: Path, rel_path: str, max_chars: int = _READ_DOCUMENT_HARD_CHAR_CEILING, tenant_id: str | None = None
+) -> str:
     """Read content from office documents (PDF, DOCX, XLSX, PPTX)."""
     return await asyncio.to_thread(_read_document_with_timeout, ws, rel_path, max_chars, tenant_id)
 

@@ -48,6 +48,10 @@ TOOL_OUTPUT_MAX_CHARS: dict[str, int | float] = {
     "bash": 60_000,
     "grep": 40_000,
     "search_files": 40_000,
+    # read_document returns full extracted text (no tool-layer truncation); a
+    # modest budget makes large documents overflow to a .tool_results/ file early
+    # so the agent pages through them via read_file instead of flooding context.
+    "read_document": 40_000,
     "read_file": float("inf"),
     "list_files": 100_000,
     "_default": 100_000,
