@@ -4486,14 +4486,20 @@ def _read_file(ws: Path, rel_path: str, tenant_id: str | None = None, offset: in
 _READ_DOCUMENT_MAX_FILE_BYTES = 50 * 1024 * 1024
 _READ_DOCUMENT_TIMEOUT_SECONDS = 25
 _READ_DOCUMENT_FALLBACK_TIMEOUT_SECONDS = 10
-_READ_DOCUMENT_MAX_COLUMNS = 80
-_READ_DOCUMENT_MAX_XLSX_CELLS = 20000
-# read_document returns the FULL extracted text (bounded only by file size +
-# page/row/cell structural caps). It must NOT lossily truncate at the tool layer:
-# the unified overflow-to-file path (llm.tool_output_store.finalize_tool_output)
-# materializes oversized output to .tool_results/ with a read_file pointer, so the
-# agent can always retrieve the rest. This ceiling is just a memory safety bound,
-# far above any normal document — not a content budget.
+_READ_DOCUMENT_MAX_COLUMNS = 80  # per row (xlsx + docx tables)
+_READ_DOCUMENT_MAX_ROWS = 10_000  # per xlsx sheet
+_READ_DOCUMENT_MAX_SHEETS = 10  # per xlsx workbook
+_READ_DOCUMENT_MAX_PAGES = 200  # per pdf
+_READ_DOCUMENT_MAX_SLIDES = 200  # per pptx
+# read_document returns the FULL extracted text. The structural caps above
+# (file size, columns/rows/sheets/pages/slides) are generous memory-safety bounds,
+# far above any normal document — NOT content budgets. When a cap does trim a
+# pathologically large doc it appends an explicit, VISIBLE marker (never a silent
+# drop), so the agent knows content remains and can recover it. The tool layer must
+# NOT lossily truncate mid-content: the unified overflow-to-file path
+# (llm.tool_output_store.finalize_tool_output) materializes oversized output to
+# .tool_results/ with a read_file pointer, so the agent can always retrieve the rest.
+# The 2M ceiling below is the final memory backstop, far above any real document.
 _READ_DOCUMENT_HARD_CHAR_CEILING = 2_000_000
 
 
@@ -4504,7 +4510,7 @@ def _safe_document_cell_text(value: Any) -> str:
     never silently chopped mid-statement (which is unrecoverable for the agent). Output
     that is genuinely too large is handled non-lossily by the unified overflow-to-file
     path (llm.tool_output_store.finalize_tool_output), and total memory stays bounded by
-    the file-size gate + per-sheet cell-count cap + the 2M _READ_DOCUMENT_HARD_CHAR_CEILING.
+    the file-size gate + per-sheet row/column caps + the 2M _READ_DOCUMENT_HARD_CHAR_CEILING.
 
     The only guard kept here is the degenerate huge-integer case: str() on a multi-thousand
     digit int is pathologically slow and can raise under CPython's int_max_str_digits.
@@ -4562,12 +4568,17 @@ def _read_document_sync(
             import pdfplumber
             text_parts = []
             with pdfplumber.open(str(file_path)) as pdf:
-                for i, page in enumerate(pdf.pages[:50]):  # Limit to 50 pages
+                total_pages = len(pdf.pages)
+                for i, page in enumerate(pdf.pages[:_READ_DOCUMENT_MAX_PAGES]):
                     page_text = page.extract_text() or ""
                     if page_text:
                         text_parts.append(f"--- Page {i+1} ---\n{page_text}")
                     if sum(len(part) for part in text_parts) >= max_chars:
                         break
+                if total_pages > _READ_DOCUMENT_MAX_PAGES:
+                    text_parts.append(
+                        f"[PDF has {total_pages} pages; only the first {_READ_DOCUMENT_MAX_PAGES} were extracted]"
+                    )
             content = "\n\n".join(text_parts) if text_parts else "(PDF is empty or text extraction failed)"
 
         elif ext == ".docx":
@@ -4626,23 +4637,44 @@ def _read_document_sync(
             from openpyxl import load_workbook
             wb = load_workbook(str(file_path), read_only=True, data_only=True)
             sheets = []
-            cell_count = 0
-            for ws_name in wb.sheetnames[:10]:  # Limit to 10 sheets
+            total_chars = 0  # bounds peak memory; the cross-sheet content budget
+            all_sheet_names = wb.sheetnames
+            stop = False
+            for ws_name in all_sheet_names[:_READ_DOCUMENT_MAX_SHEETS]:
+                if stop:
+                    break
                 sheet = wb[ws_name]
+                # Declared dimension (read_only): used only to SIGNPOST when a sheet has
+                # more rows than the cap — iter_rows(max_row=...) bounds the actual scan.
+                declared_rows = sheet.max_row
                 rows = []
-                for row in sheet.iter_rows(max_row=200, max_col=_READ_DOCUMENT_MAX_COLUMNS, values_only=True):
-                    visible = row
-                    cell_count += len(visible)
-                    if cell_count > _READ_DOCUMENT_MAX_XLSX_CELLS:
-                        rows.append("[cell limit reached; remaining cells omitted]")
+                for row in sheet.iter_rows(
+                    max_row=_READ_DOCUMENT_MAX_ROWS, max_col=_READ_DOCUMENT_MAX_COLUMNS, values_only=True
+                ):
+                    row_str = _render_xlsx_row(row)
+                    if not row_str.strip():
+                        continue
+                    rows.append(row_str)
+                    total_chars += len(row_str) + 1
+                    if total_chars >= max_chars:
+                        rows.append(
+                            f"[content limit (~{max_chars} chars) reached; remaining cells omitted — "
+                            "oversized output is materialized to a .tool_results/ file you can read_file]"
+                        )
+                        stop = True
                         break
-                    row_str = _render_xlsx_row(visible)
-                    if row_str.strip():
-                        rows.append(row_str)
+                if not stop and declared_rows and declared_rows > _READ_DOCUMENT_MAX_ROWS:
+                    rows.append(
+                        f"[sheet '{ws_name}' has {declared_rows} rows; only the first "
+                        f"{_READ_DOCUMENT_MAX_ROWS} are shown — narrow the columns or query with sql_execute]"
+                    )
                 if rows:
                     sheets.append(f"=== Sheet: {ws_name} ===\n" + "\n".join(rows))
-                if cell_count > _READ_DOCUMENT_MAX_XLSX_CELLS or sum(len(part) for part in sheets) >= max_chars:
-                    break
+            if len(all_sheet_names) > _READ_DOCUMENT_MAX_SHEETS:
+                sheets.append(
+                    f"[workbook has {len(all_sheet_names)} sheets; only the first "
+                    f"{_READ_DOCUMENT_MAX_SHEETS} are shown]"
+                )
             wb.close()
             content = "\n\n".join(sheets) if sheets else "(Excel is empty)"
 
@@ -4650,13 +4682,18 @@ def _read_document_sync(
             from pptx import Presentation
             prs = Presentation(str(file_path))
             slides = []
-            for i, slide in enumerate(prs.slides[:50]):
+            all_slides = list(prs.slides)
+            for i, slide in enumerate(all_slides[:_READ_DOCUMENT_MAX_SLIDES]):
                 texts = []
                 for shape in slide.shapes:
                     if hasattr(shape, "text") and shape.text.strip():
                         texts.append(shape.text)
                 if texts:
                     slides.append(f"--- Slide {i+1} ---\n" + "\n".join(texts))
+            if len(all_slides) > _READ_DOCUMENT_MAX_SLIDES:
+                slides.append(
+                    f"[presentation has {len(all_slides)} slides; only the first {_READ_DOCUMENT_MAX_SLIDES} are shown]"
+                )
             content = "\n\n".join(slides) if slides else "(PPT is empty)"
 
         elif ext in (".txt", ".md", ".json", ".csv", ".log"):
