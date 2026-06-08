@@ -2160,9 +2160,13 @@ def _strip_a2a_msg_type(tools: list[dict]) -> list[dict]:
         if fn.get("name") == "send_message_to_agent":
             t = copy.deepcopy(t)
             fn = t["function"]
-            # Simplify description to only mention consult
+            # Simplify description to only mention consult, but keep the RESET hint
+            # so agents still discover the new_conversation self-reset escape hatch.
             fn["description"] = (
-                "Send a message to a digital employee colleague and receive their reply synchronously."
+                "Send a message to a digital employee colleague and receive their reply synchronously.\n\n"
+                "RESET: If the conversation with a colleague gets stuck — the same tool failing over and "
+                "over, repeated identical errors, looping, or visibly corrupted/garbled context — set "
+                "new_conversation=true to discard the stale history and start a fresh, clean thread."
             )
             params = fn.get("parameters", {})
             props = params.get("properties", {})

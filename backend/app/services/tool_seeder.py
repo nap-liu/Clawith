@@ -568,7 +568,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_message_to_agent",
         "display_name": "Agent Message",
-        "description": "Send a message to a digital employee colleague. Decision guide: target needs to DO WORK and return results? → task_delegate. Just FYI? → notify. Quick factual question? → consult. When unsure, prefer task_delegate.",
+        "description": "Send a message to a digital employee colleague. Decision guide: target needs to DO WORK and return results? → task_delegate. Just FYI? → notify. Quick factual question? → consult. When unsure, prefer task_delegate.\n\nRESET: If an ongoing conversation with a colleague gets stuck — the same tool failing over and over, repeated identical errors, looping, or visibly corrupted/garbled context — set new_conversation=true to discard the stale history and start a fresh, clean thread, then continue.",
         "category": "communication",
         "icon": "🤖",
         "is_default": True,
@@ -578,6 +578,7 @@ BUILTIN_TOOLS = [
                 "agent_name": {"type": "string", "description": "Target agent name"},
                 "message": {"type": "string", "description": "Message content"},
                 "msg_type": {"type": "string", "enum": ["notify", "consult", "task_delegate"], "description": "(1) Target needs to DO WORK and return results? → task_delegate. (2) Just FYI? → notify. (3) Quick factual question? → consult. When unsure, prefer task_delegate."},
+                "new_conversation": {"type": "boolean", "description": "默认 false。仅当当前与该同事的对话明显异常时设为 true 来主动重置 —— 例如对话反复报同一个错、陷入循环、或历史上下文看起来已损坏/混乱。设为 true 会开启一条全新对话线程，丢弃旧的(可能已损坏的)历史，从干净状态重新开始。正常往来请保持 false 或省略。"},
             },
             "required": ["agent_name", "message", "msg_type"],
         },
