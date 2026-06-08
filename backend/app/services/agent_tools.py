@@ -6760,9 +6760,9 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                     ChatSession.agent_id == session_agent_id,
                     ChatSession.peer_agent_id == session_peer_id,
                     ChatSession.source_channel == "agent",
-                )
+                ).order_by(ChatSession.last_message_at.desc().nullslast()).limit(1)
             )
-            chat_session = sess_r.scalar_one_or_none()
+            chat_session = sess_r.scalars().first()
             owner_id = source_agent.creator_id if source_agent else from_agent_id
             if not chat_session:
                 src_part_id = src_participant.id if src_participant else None
