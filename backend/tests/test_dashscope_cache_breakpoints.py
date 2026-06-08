@@ -67,3 +67,49 @@ def test_system_always_included_when_present():
 
 def test_empty_list():
     assert select_cache_breakpoints([]) == []
+
+
+# --- integration: _apply_dashscope_cache_markers consumes the selector ---
+
+def _dashscope_client():
+    from app.services.llm.client import OpenAICompatibleClient
+
+    return OpenAICompatibleClient(
+        api_key="k",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        model="qwen3.7-max",
+        supports_cache_control=True,
+    )
+
+
+def test_dashscope_marks_toolloop_tail_payload():
+    # Regression for the production bug: the tool-result tail (messages[-1])
+    # must carry cache_control so the growing loop tail enters the cache.
+    client = _dashscope_client()
+    payload = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "big-tool-result"},
+    ]
+    client._apply_dashscope_cache_markers(payload)
+    tail = payload[-1]
+    assert isinstance(tail["content"], list), "tool tail content must be wrapped to list form"
+    assert any(b.get("cache_control") for b in tail["content"]), "tool tail must carry cache_control"
+
+
+def test_dashscope_marks_system_prefix():
+    client = _dashscope_client()
+    payload = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a"},
+    ]
+    client._apply_dashscope_cache_markers(payload)
+    sysmsg = payload[0]
+    assert isinstance(sysmsg["content"], list)
+    assert any(b.get("cache_control") for b in sysmsg["content"])

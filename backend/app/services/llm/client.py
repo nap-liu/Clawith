@@ -368,57 +368,40 @@ class OpenAICompatibleClient(LLMClient):
         return "dashscope" in (self.base_url or "").lower()
 
     def _apply_dashscope_cache_markers(self, messages_payload: list[dict]) -> None:
-        """Annotate the stable prefix with explicit cache breakpoints.
+        """Annotate the cache breakpoints chosen by ``select_cache_breakpoints``.
 
-        DashScope's 显式缓存 (https://help.aliyun.com/zh/model-studio/context-cache)
-        requires `cache_control: {"type": "ephemeral"}` on a content
-        block, and the cached segment is the request prefix up to that
-        block. Within the 5-minute TTL these breakpoints land
-        deterministic hits — the cache_creation_input_tokens / cached_tokens
-        fields show up in `usage.prompt_tokens_details`.
+        DashScope's 显式缓存 (https://help.aliyun.com/zh/model-studio/context-cache):
+        ``cache_control: {"type": "ephemeral"}`` on a content block caches the
+        request prefix up to that block (5-minute TTL, reset on hit); the
+        ``cache_creation_input_tokens`` / ``cached_tokens`` fields show up in
+        ``usage.prompt_tokens_details``. cache_control is valid on
+        system/user/assistant/tool roles — content just has to be array form.
 
-        We place at most 2 markers (DashScope's per-request limit is 4):
-
-        * **system message** — the stable prompt prefix; system_prompt
-          is byte-stable for a given agent, so this caches the whole
-          base prompt (typically 4–5K tokens, well above the 1024-token
-          minimum cache block).
-        * **messages[-2]** — tail of the stable history; messages[-1]
-          is the dynamic last user/assistant turn that should NOT be
-          cached. We only mark when the second-to-last message is a
-          user/assistant text turn — tool messages and assistant
-          tool-call turns get skipped to avoid breaking DashScope's
-          per-role content shape rules; the system marker still locks
-          in the large prefix in those cases.
-
-        Mutates `messages_payload` in place.
+        Breakpoint SELECTION lives in the module-level ``select_cache_breakpoints``
+        (single source of truth, unit-tested), so the tool-loop tail is always
+        covered. This method only APPLIES the marks. Mutates in place.
         """
         if not messages_payload:
             return
+        for idx in select_cache_breakpoints(messages_payload):
+            self._apply_cache_control_at(messages_payload, idx)
 
-        def _mark(msg: dict) -> None:
-            content = msg.get("content")
-            if isinstance(content, str) and content.strip():
-                msg["content"] = [{
-                    "type": "text",
-                    "text": content,
-                    "cache_control": {"type": "ephemeral"},
-                }]
-            elif isinstance(content, list):
-                for block in reversed(content):
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        block["cache_control"] = {"type": "ephemeral"}
-                        break
-
-        if messages_payload[0].get("role") == "system":
-            _mark(messages_payload[0])
-
-        # Skip the messages[-2] marker for short conversations (no
-        # stable history to cache) and for non-text tail roles.
-        if len(messages_payload) >= 3:
-            tail = messages_payload[-2]
-            if tail.get("role") in ("user", "assistant") and not tail.get("tool_calls"):
-                _mark(tail)
+    def _apply_cache_control_at(self, messages_payload: list[dict], idx: int) -> None:
+        """Attach cache_control to the last text block of ``messages_payload[idx]``,
+        wrapping plain-string content into a ``[{type:text,...}]`` block. No-op
+        when the message has no markable text (defensive — the selector already
+        filters via ``_is_markable_payload_msg``)."""
+        msg = messages_payload[idx]
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            msg["content"] = [{
+                "type": "text",
+                "text": content,
+                "cache_control": {"type": "ephemeral"},
+            }]
+            return
+        if isinstance(content, list):
+            self._mark_last_text_block_cacheable(content)
 
     def _build_payload(
         self,
