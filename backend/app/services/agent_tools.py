@@ -64,6 +64,15 @@ from app.config import get_settings
 _settings = get_settings()
 WORKSPACE_ROOT = Path(_settings.AGENT_DATA_DIR)
 
+# Delivery guidance appended to every A2A consult turn (not persisted to history
+# so it does not pollute the stored context).
+A2A_DELIVERY_GUIDANCE = (
+    "你正在回复另一位数字员工同事,请简洁、切题地作答。\n"
+    "如果你写了任何文件(报告/文档/分析)需要交付给对方,必须调用 "
+    "send_file_to_agent(agent_name=\"<对方名字>\", file_path=\"<路径>\") 投递 —— "
+    "对方无法访问你的工作区,绝不能只告诉路径。"
+)
+
 # ─── Tool Config Cache ──────────────────────────────────────────
 # Cache tool configurations to avoid frequent DB queries
 # Key: (agent_id, tool_name), Value: (config, expiry_time)
@@ -6922,228 +6931,69 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
                 return f"✅ Task delegated to {target.name}. You will be notified when they complete it."
 
-            # ── consult (default): synchronous request-response ──
-            # Prepare target LLM
-            from app.services.agent_context import build_agent_context
+            # ── consult (default): synchronous request-response via the UNIFIED loop ──
+            # Same loop core (call_llm_with_failover) as web/IM/trigger. A2A specifics:
+            #   run model = target agent's model;  store/agent_id of every A2A row = session_agent_id.
+            from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
             from app.models.llm import LLMModel
+            from app.services.chat_history import (
+                load_history_for_llm,
+                persist_tool_call,
+                strip_leading_orphan_tool_messages,
+            )
+            from app.services.llm import call_llm_with_failover
 
-            # Load primary model (with fallback support)
+            # Resolve target primary + fallback model (skip disabled)
             target_model = None
             if target.primary_model_id:
-                model_r = await db.execute(select(LLMModel).where(LLMModel.id == target.primary_model_id))
-                target_model = model_r.scalar_one_or_none()
-
-            # Config-level fallback: primary missing -> use fallback
-            if not target_model and target.fallback_model_id:
-                fb_r = await db.execute(select(LLMModel).where(LLMModel.id == target.fallback_model_id))
-                target_model = fb_r.scalar_one_or_none()
-                if target_model:
-                    logger.warning(f"[A2A] Primary model unavailable for {target.name}, using fallback: {target_model.model}")
-
+                _m = await db.execute(select(LLMModel).where(LLMModel.id == target.primary_model_id))
+                target_model = _m.scalar_one_or_none()
+                if target_model and not target_model.enabled:
+                    target_model = None
+            target_fallback = None
+            if target.fallback_model_id:
+                _fb = await db.execute(select(LLMModel).where(LLMModel.id == target.fallback_model_id))
+                target_fallback = _fb.scalar_one_or_none()
+                if target_fallback and not target_fallback.enabled:
+                    target_fallback = None
+            if not target_model and target_fallback:
+                target_model, target_fallback = target_fallback, None
             if not target_model:
                 return f"⚠️ {target.name} has no LLM model configured"
 
-            # Build target system prompt
-            target_static, target_dynamic = await build_agent_context(target.id, target.name, target.role_description or "")
-            target_dynamic += (
-                "\n\n--- Agent-to-Agent Message ---\n"
-                "You are receiving a message from another digital employee. "
-                "Reply concisely and helpfully. Focus on the request and provide a clear answer.\n"
-                "\n** CRITICAL FILE DELIVERY RULE **\n"
-                "After you write any file (report, document, analysis, etc.) that the requesting agent needs, "
-                "you MUST call `send_file_to_agent(agent_name=\"<requester_name>\", file_path=\"<path>\")` "
-                "to deliver it. The other agent CANNOT access your workspace. "
-                "Never just tell them the path — always deliver explicitly.\n"
-            )
+            # 1) The inbound user message is already persisted by the common pre-branch
+            #    code (committed at the outer db.commit() above). No second write needed.
 
-            # Load recent history for context
-            conversation_messages: list[dict] = []
-            hist_result = await db.execute(
-                select(ChatMessage)
-                .where(
-                    ChatMessage.conversation_id == session_id,
-                    ChatMessage.agent_id == session_agent_id,
+            # 2) Structured history (tool_call rows auto-expand; NO sanitize poisoning)
+            ctx_size = target.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
+            history = await load_history_for_llm(
+                db, agent_id=session_agent_id, conversation_id=session_id, ctx_size=ctx_size,
+            )
+            messages = strip_leading_orphan_tool_messages(history[-ctx_size:])
+            turn_text = "[From " + source_name + "] " + message_text + "\n\n" + A2A_DELIVERY_GUIDANCE
+            if messages and messages[-1].get("role") == "user":
+                messages[-1] = {"role": "user", "content": turn_text}
+            else:
+                messages.append({"role": "user", "content": turn_text})
+
+            # 3) persist callback stores tool calls under session_agent_id, RAW
+            async def _a2a_persist(evt: dict):
+                await persist_tool_call(
+                    async_session, agent_id=session_agent_id, user_id=owner_id,
+                    conversation_id=session_id, evt=evt,
                 )
-                .order_by(ChatMessage.created_at.desc())
-                .limit(20)
+
+            # 4) Run target via the unified, failover-aware loop. NO outer wait_for.
+            #    agent_id=target.id so build_agent_context loads the right soul/system
+            #    prompt; tool calls are stored under session_agent_id via _a2a_persist.
+            target_reply = await call_llm_with_failover(
+                primary_model=target_model, fallback_model=target_fallback,
+                messages=messages, agent_name=target.name,
+                role_description=target.role_description or "",
+                agent_id=target.id, user_id=owner_id, session_id=session_id,
+                on_tool_call=_a2a_persist,
+                supports_vision=getattr(target_model, "supports_vision", False),
             )
-            for m in reversed(hist_result.scalars().all()):
-                if m.participant_id and src_participant and m.participant_id == src_participant.id:
-                    role = "user"
-                else:
-                    role = "assistant"
-                conversation_messages.append({"role": role, "content": m.content})
-
-            conversation_messages.append({"role": "user", "content": f"[From {source_name}] {message_text}"})
-
-            import random
-            import httpx
-            from app.services.llm import (
-                get_provider_base_url,
-                create_llm_client,
-                LLMMessage,
-                get_model_api_key,
-                LLMError,
-            )
-            from app.services.agent_tools import get_agent_tools_for_llm, execute_tool
-            base_url = get_provider_base_url(target_model.provider, target_model.base_url)
-            if not base_url:
-                return f"⚠️ {target.name}'s model has no API base URL configured"
-
-            full_msgs: list[LLMMessage] = [LLMMessage(role="system", content=target_static, dynamic_content=target_dynamic)] + [
-                LLMMessage(role=m["role"], content=m["content"]) for m in conversation_messages
-            ]
-
-            # Load tools for target agent
-            tools_for_llm = await get_agent_tools_for_llm(target.id)
-
-            max_tool_rounds = target.max_tool_rounds or 50
-            target_reply = ""
-            _a2a_accumulated_usage = None
-
-            from app.services.token_tracker import (
-                TokenUsage,
-                record_token_usage,
-                extract_token_usage,
-                estimate_token_usage_from_chars,
-            )
-            _a2a_accumulated_usage = TokenUsage()
-
-            llm_client = create_llm_client(
-                provider=target_model.provider,
-                api_key=get_model_api_key(target_model),
-                model=target_model.model,
-                base_url=base_url,
-                timeout=float(getattr(target_model, 'request_timeout', None) or 120.0),
-            )
-            _A2A_RETRYABLE_MARKERS = (
-                "http 408", "http 429", "http 500", "http 502", "http 503", "http 504",
-                "timeout", "timed out", "connection failed", "temporarily unavailable", "rate limit",
-            )
-            _A2A_MAX_RETRIES = 3
-
-            def _is_retryable_llm_error(exc: Exception) -> bool:
-                """Determine whether an LLM exception is transient and worth retrying."""
-                if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
-                    return True
-                if isinstance(exc, LLMError):
-                    lowered = (str(exc) or "").lower()
-                    return any(m in lowered for m in _A2A_RETRYABLE_MARKERS)
-                return False
-
-            try:
-                for _round in range(max_tool_rounds):
-                    response = None
-                    for attempt in range(1, _A2A_MAX_RETRIES + 1):
-                        try:
-                            response = await llm_client.complete(
-                                messages=full_msgs,
-                                tools=tools_for_llm if tools_for_llm else None,
-                                temperature=target_model.temperature,
-                                max_tokens=4096,
-                            )
-                            break
-                        except Exception as llm_exc:
-                            if not _is_retryable_llm_error(llm_exc) or attempt >= _A2A_MAX_RETRIES:
-                                raise
-
-                            err_text = str(llm_exc) or type(llm_exc).__name__
-                            # Exponential backoff with jitter to prevent thundering herd
-                            backoff = (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-                            logger.warning(
-                                f"[A2A] LLM call failed for {target.name} (round={_round + 1}, "
-                                f"attempt={attempt}/{_A2A_MAX_RETRIES}): {err_text[:200]}. "
-                                f"Retrying in {backoff:.1f}s"
-                            )
-                            await asyncio.sleep(backoff)
-
-                    if response is None:
-                        raise RuntimeError("A2A LLM response is unexpectedly empty after retries")
-
-                    # Track tokens from API response
-                    usage = extract_token_usage(response.usage)
-                    if usage:
-                        _a2a_accumulated_usage.add(usage)
-                    else:
-                        round_chars = sum(len(m.content or '') for m in full_msgs if isinstance(m.content, str))
-                        _a2a_accumulated_usage.add(estimate_token_usage_from_chars(round_chars))
-
-                    # Check for tool calls
-                    if response.tool_calls:
-                        # Add assistant message with tool calls to conversation
-                        full_msgs.append(LLMMessage(
-                            role="assistant",
-                            content=response.content or None,
-                            tool_calls=[{
-                                "id": tc.get("id", ""),
-                                "type": "function",
-                                "function": tc.get("function", {}),
-                            } for tc in response.tool_calls],
-                            reasoning_content=response.reasoning_content,
-                        ))
-
-                        # Execute each tool call
-                        for tc in response.tool_calls:
-                            fn = tc.get("function", {})
-                            tool_name = fn.get("name", "")
-                            raw_args = fn.get("arguments", "{}")
-                            if isinstance(raw_args, dict):
-                                tool_args = raw_args
-                            else:
-                                try:
-                                    tool_args = json.loads(raw_args) if raw_args else {}
-                                except Exception:
-                                    tool_args = {}
-
-                            tool_result = await execute_tool(tool_name, tool_args, target.id, owner_id)
-
-                            # Nudge: after write_file in A2A, remind to deliver via send_file_to_agent
-                            if tool_name == "write_file" and isinstance(tool_result, str) and tool_result.startswith("\u2705"):
-                                wrote_path = tool_args.get("path", "")
-                                tool_result += (
-                                    f"\n\n⚠️ REMINDER: The requesting agent ({source_name}) cannot access your workspace. "
-                                    f"You MUST now call `send_file_to_agent(agent_name=\"{source_name}\", file_path=\"{wrote_path}\")` "
-                                    f"to deliver this file to them."
-                                )
-
-                            # Save tool_call to DB so it appears in chat history
-                            try:
-                                from app.utils.sanitize import sanitize_tool_args
-                                async with async_session() as _tc_db:
-                                    _tc_db.add(ChatMessage(
-                                        agent_id=session_agent_id,
-                                        user_id=owner_id,
-                                        role="tool_call",
-                                        content=json.dumps({
-                                            "name": tool_name,
-                                            "args": sanitize_tool_args(tool_args),
-                                            "status": "done",
-                                            "result": str(tool_result)[:500],
-                                        }, ensure_ascii=False),
-                                        conversation_id=session_id,
-                                        participant_id=tgt_participant.id if tgt_participant else None,
-                                    ))
-                                    await _tc_db.commit()
-                            except Exception as _tc_err:
-                                logger.error(f"[A2A] Failed to save tool_call: {_tc_err}")
-
-                            # Add tool result to conversation
-                            full_msgs.append(LLMMessage(
-                                role="tool",
-                                tool_call_id=tc.get("id", ""),
-                                content=str(tool_result)[:4000],
-                            ))
-                        continue  # Next LLM round
-
-                    # No tool calls — this is the final text response
-                    target_reply = response.content or ""
-                    break
-            finally:
-                await llm_client.close()
-
-            # Record accumulated A2A tokens for the target agent
-            if _a2a_accumulated_usage and _a2a_accumulated_usage.total_tokens > 0:
-                await record_token_usage(target.id, _a2a_accumulated_usage)
 
             if not target_reply:
                 return f"⚠️ {target.name} did not respond (LLM returned empty)"
