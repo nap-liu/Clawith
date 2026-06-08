@@ -245,6 +245,79 @@ class LLMClient(ABC):
 # OpenAI-Compatible Client
 # ============================================================================
 
+
+def _is_markable_payload_msg(msg: dict) -> bool:
+    """A payload message can carry cache_control iff it has text content to
+    attach the marker to.
+
+    Plain-string content counts (it gets wrapped into a ``[{type:text,...}]``
+    block at apply time); list content counts iff it holds at least one
+    non-empty text block. assistant turns whose content is ``None``/empty
+    (tool-call-only) are NOT markable and must fall back to a neighbour.
+    """
+    content = msg.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+            for b in content
+        )
+    return False
+
+
+def select_cache_breakpoints(messages_payload: list[dict]) -> list[int]:
+    """Single source of truth for DashScope explicit-cache breakpoints.
+
+    Returns the indices of messages whose last text block should carry
+    ``cache_control``. Correct-by-construction invariant: when the message
+    list ends in a tool / assistant-tool_call tail (i.e. mid tool-loop), the
+    returned set ALWAYS contains a breakpoint at or after the last *stable*
+    message — so the growing tool-loop tail enters the cache instead of being
+    re-prefilled every round (the root cause of "responses get slower as the
+    conversation grows").
+
+    Strategy (<=4 markers, DashScope's per-request limit):
+
+    * **system prefix** (index 0) when present.
+    * **last user message** — locks the large pre-loop prefix; survives tail
+      churn across rounds.
+    * **last markable message** walking back from the end — advances the
+      breakpoint to the freshly-appended tail each round (the heart of the
+      fix). When the final message is a content-less assistant tool-call turn,
+      this naturally lands on the preceding tool result.
+    """
+    n = len(messages_payload)
+    if n == 0:
+        return []
+    marks: set[int] = set()
+
+    has_system = messages_payload[0].get("role") == "system"
+    if has_system:
+        marks.add(0)
+
+    # last user message (mid-conversation anchor)
+    for i in range(n - 1, -1, -1):
+        if messages_payload[i].get("role") == "user":
+            marks.add(i)
+            break
+
+    # last markable message overall (advances to the tool-loop tail)
+    for i in range(n - 1, -1, -1):
+        if _is_markable_payload_msg(messages_payload[i]):
+            marks.add(i)
+            break
+
+    ordered = sorted(marks)
+    # DashScope allows at most 4 cache breakpoints per request. Keep the most
+    # valuable: the system prefix (if any) plus the markers nearest the end.
+    if len(ordered) > 4:
+        head = [ordered[0]] if has_system else []
+        tail = ordered[len(ordered) - (4 - len(head)):]
+        ordered = sorted(set(head + tail))
+    return ordered
+
+
 class OpenAICompatibleClient(LLMClient):
     """Client for OpenAI-compatible APIs (OpenAI, DeepSeek, Qwen, etc.)."""
 
