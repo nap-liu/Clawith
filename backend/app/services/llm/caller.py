@@ -840,9 +840,10 @@ async def call_llm(
         # Observability: prefix-cache effectiveness for this round. A ratio that
         # stays low while the tool loop grows means the tail isn't being cached
         # (re-prefilled every round → "responses get slower as the chat grows").
-        _ratio = _cache_hit_ratio(getattr(response, "usage", None))
-        if _ratio is not None:
-            _prompt = response.usage.get("prompt_tokens")
+        _usage = getattr(response, "usage", None)
+        _ratio = _cache_hit_ratio(_usage)
+        if _ratio is not None and isinstance(_usage, dict):
+            _prompt = _usage.get("prompt_tokens")
             _line = f"[LLM] Round {round_i + 1} cache-hit-ratio={_ratio} prompt={_prompt}"
             if _ratio < float(os.environ.get("CLAWITH_CACHE_HIT_WARN_RATIO", "0.7")):
                 logger.warning(_line + " (LOW — prefix cache may be missing the tool-loop tail)")

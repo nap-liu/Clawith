@@ -401,6 +401,14 @@ class OpenAICompatibleClient(LLMClient):
             }]
             return
         if isinstance(content, list):
+            # Idempotency: _messages_to_openai_payload may already have marked
+            # this message's STABLE block (the system static block) and then
+            # appended a VOLATILE dynamic_content block after it. Marking the
+            # last text block now would land cache_control on the volatile
+            # block — a breakpoint that never hits and wastes one of DashScope's
+            # 4 slots. If any block is already marked, leave it as-is.
+            if any(isinstance(b, dict) and b.get("cache_control") for b in content):
+                return
             self._mark_last_text_block_cacheable(content)
 
     def _build_payload(

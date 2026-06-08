@@ -27,7 +27,8 @@ def _last_covered(marks):
 
 def test_single_message_marks_only_system_or_nothing():
     assert select_cache_breakpoints([SYS]) == [0]
-    assert select_cache_breakpoints([USR]) in ([0], [])
+    # a lone user message IS the last markable message → it gets marked
+    assert select_cache_breakpoints([USR]) == [0]
 
 
 def test_invariant_toolloop_tail_is_covered():
@@ -100,6 +101,24 @@ def test_dashscope_marks_toolloop_tail_payload():
     tail = payload[-1]
     assert isinstance(tail["content"], list), "tool tail content must be wrapped to list form"
     assert any(b.get("cache_control") for b in tail["content"]), "tool tail must carry cache_control"
+
+
+def test_apply_cache_control_idempotent_skips_volatile_dynamic_block():
+    # _messages_to_openai_payload marks the system STABLE block and appends a
+    # VOLATILE dynamic_content block after it. Re-marking must NOT land on the
+    # volatile block (that breakpoint never hits + wastes a slot).
+    client = _dashscope_client()
+    payload = [{
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "static prompt", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "\n\n## Current Time\n2026-06-08 17:00:00"},
+        ],
+    }]
+    client._apply_cache_control_at(payload, 0)
+    blocks = payload[0]["content"]
+    assert blocks[0].get("cache_control"), "stable block stays marked"
+    assert not blocks[1].get("cache_control"), "volatile dynamic block must NOT be marked"
 
 
 def test_dashscope_marks_system_prefix():
