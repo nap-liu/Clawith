@@ -13,6 +13,7 @@ All paths now support:
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -39,6 +40,20 @@ from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_
 if TYPE_CHECKING:
     from app.models.agent import Agent
     from app.models.llm import LLMModel
+
+
+def _cache_hit_ratio(usage: dict | None) -> float | None:
+    """``cached_tokens / prompt_tokens`` for one LLM round, or ``None`` when
+    unknown. Surfaces prefix-cache effectiveness: a ratio that stays low while
+    a tool loop grows means the tail is being re-prefilled every round."""
+    if not usage:
+        return None
+    prompt = usage.get("prompt_tokens") or 0
+    if not prompt:
+        return None
+    details = usage.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens") or usage.get("cached_tokens") or 0
+    return round(cached / prompt, 3)
 
 
 TOOLS_REQUIRING_ARGS = frozenset(
@@ -821,6 +836,18 @@ async def call_llm(
 
         # Track tokens for this round
         _accumulated_usage.add(_usage_from_response_or_estimate(response, api_messages))
+
+        # Observability: prefix-cache effectiveness for this round. A ratio that
+        # stays low while the tool loop grows means the tail isn't being cached
+        # (re-prefilled every round → "responses get slower as the chat grows").
+        _ratio = _cache_hit_ratio(getattr(response, "usage", None))
+        if _ratio is not None:
+            _prompt = response.usage.get("prompt_tokens")
+            _line = f"[LLM] Round {round_i + 1} cache-hit-ratio={_ratio} prompt={_prompt}"
+            if _ratio < float(os.environ.get("CLAWITH_CACHE_HIT_WARN_RATIO", "0.7")):
+                logger.warning(_line + " (LOW — prefix cache may be missing the tool-loop tail)")
+            else:
+                logger.info(_line)
 
         # If no tool calls, return the final content
         if not response.tool_calls:

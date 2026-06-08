@@ -113,3 +113,19 @@ def test_dashscope_marks_system_prefix():
     sysmsg = payload[0]
     assert isinstance(sysmsg["content"], list)
     assert any(b.get("cache_control") for b in sysmsg["content"])
+
+
+# --- observability: per-round cache-hit-ratio ---
+
+def test_cache_hit_ratio_helper():
+    from app.services.llm.caller import _cache_hit_ratio
+
+    assert _cache_hit_ratio(
+        {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 70}}
+    ) == 0.7
+    # flat cached_tokens field (no details nesting) also works
+    assert _cache_hit_ratio({"prompt_tokens": 200, "cached_tokens": 50}) == 0.25
+    # unknown / zero prompt → None (don't divide by zero or log noise)
+    assert _cache_hit_ratio({"prompt_tokens": 0}) is None
+    assert _cache_hit_ratio({}) is None
+    assert _cache_hit_ratio(None) is None
