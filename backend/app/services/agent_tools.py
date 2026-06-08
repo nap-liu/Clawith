@@ -695,6 +695,15 @@ AGENT_TOOLS = [
                         "enum": ["notify", "consult", "task_delegate"],
                         "description": "Decision guide: (1) Will the target need to DO WORK and return results? → task_delegate. (2) Is this just a one-way FYI? → notify. (3) Quick factual question needing immediate answer? → consult. When unsure, prefer task_delegate.",
                     },
+                    "new_conversation": {
+                        "type": "boolean",
+                        "description": (
+                            "默认 false。仅当当前与该同事的对话明显异常时设为 true 来主动重置 —— "
+                            "例如对话反复报同一个错、陷入循环、或历史上下文看起来已损坏/混乱。"
+                            "设为 true 会开启一条全新对话线程,丢弃旧的(可能已损坏的)历史,从干净状态重新开始。"
+                            "正常往来请保持 false 或省略。"
+                        ),
+                    },
                 },
                 "required": ["agent_name", "message", "msg_type"],
             },
@@ -6682,6 +6691,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
     message_text = args.get("message", "").strip()
     msg_type = args.get("msg_type", "notify").strip().lower()
     force_async = bool(args.get("force_async"))
+    new_conversation = bool(args.get("new_conversation"))
 
     if not agent_name or not message_text:
         return "❌ Please provide target agent name and message content"
@@ -6755,24 +6765,43 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             # Find or create ChatSession for this agent pair (ordered consistently)
             session_agent_id = min(from_agent_id, target.id, key=str)
             session_peer_id = max(from_agent_id, target.id, key=str)
-            sess_r = await db.execute(
-                select(ChatSession).where(
-                    ChatSession.agent_id == session_agent_id,
-                    ChatSession.peer_agent_id == session_peer_id,
-                    ChatSession.source_channel == "agent",
-                ).order_by(ChatSession.last_message_at.desc().nullslast()).limit(1)
-            )
-            chat_session = sess_r.scalars().first()
             owner_id = source_agent.creator_id if source_agent else from_agent_id
+
+            # Only reuse an existing thread when not explicitly starting a fresh one
+            chat_session = None
+            if not new_conversation:
+                sess_r = await db.execute(
+                    select(ChatSession).where(
+                        ChatSession.agent_id == session_agent_id,
+                        ChatSession.peer_agent_id == session_peer_id,
+                        ChatSession.source_channel == "agent",
+                    ).order_by(ChatSession.last_message_at.desc().nullslast()).limit(1)
+                )
+                chat_session = sess_r.scalars().first()
+
             if not chat_session:
+                _ext = None
+                _suffix = ""
+                if new_conversation:
+                    from sqlalchemy import func as _sa_func
+                    _ext = f"a2a-{uuid.uuid4().hex[:8]}"
+                    _cnt_r = await db.execute(
+                        select(_sa_func.count()).select_from(ChatSession).where(
+                            ChatSession.agent_id == session_agent_id,
+                            ChatSession.peer_agent_id == session_peer_id,
+                            ChatSession.source_channel == "agent",
+                        )
+                    )
+                    _suffix = f" #{(_cnt_r.scalar() or 0) + 1}"
                 src_part_id = src_participant.id if src_participant else None
                 chat_session = ChatSession(
                     agent_id=session_agent_id,
                     user_id=owner_id,
-                    title=f"{source_name} ↔ {target.name}",
+                    title=f"{source_name} ↔ {target.name}{_suffix}",
                     source_channel="agent",
                     participant_id=src_part_id,
                     peer_agent_id=session_peer_id,
+                    external_conv_id=_ext,
                 )
                 db.add(chat_session)
                 await db.flush()
