@@ -6542,42 +6542,6 @@ async def _resolve_a2a_target(
     return target, None
 
 
-async def _ensure_a2a_session(
-    db, from_agent_id: uuid.UUID, target_id: uuid.UUID, source_name: str, owner_id: uuid.UUID
-) -> tuple[ChatSession, str]:
-    """Find or create the ChatSession for a pair of agents.
-
-    Returns (chat_session, session_id_str).
-    """
-    from app.models.participant import Participant
-
-    session_agent_id = min(from_agent_id, target_id, key=str)
-    session_peer_id = max(from_agent_id, target_id, key=str)
-    sess_r = await db.execute(
-        select(ChatSession).where(
-            ChatSession.agent_id == session_agent_id,
-            ChatSession.peer_agent_id == session_peer_id,
-            ChatSession.source_channel == "agent",
-        )
-    )
-    chat_session = sess_r.scalar_one_or_none()
-    if not chat_session:
-        src_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id))
-        src_participant = src_part_r.scalar_one_or_none()
-        src_part_id = src_participant.id if src_participant else None
-        chat_session = ChatSession(
-            agent_id=session_agent_id,
-            user_id=owner_id,
-            title=f"{source_name} ↔ {(await db.execute(select(AgentModel.name).where(AgentModel.id == target_id))).scalar() or 'Unknown'}",
-            source_channel="agent",
-            participant_id=src_part_id,
-            peer_agent_id=session_peer_id,
-        )
-        db.add(chat_session)
-        await db.flush()
-    return chat_session, str(chat_session.id)
-
-
 async def _create_on_message_trigger(
     agent_id: uuid.UUID,
     trigger_name: str,
@@ -6775,7 +6739,10 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                         ChatSession.agent_id == session_agent_id,
                         ChatSession.peer_agent_id == session_peer_id,
                         ChatSession.source_channel == "agent",
-                    ).order_by(ChatSession.last_message_at.desc().nullslast()).limit(1)
+                    ).order_by(
+                        ChatSession.last_message_at.desc().nulls_last(),
+                        ChatSession.created_at.desc(),
+                    ).limit(1)
                 )
                 chat_session = sess_r.scalars().first()
 
