@@ -4486,7 +4486,6 @@ def _read_file(ws: Path, rel_path: str, tenant_id: str | None = None, offset: in
 _READ_DOCUMENT_MAX_FILE_BYTES = 50 * 1024 * 1024
 _READ_DOCUMENT_TIMEOUT_SECONDS = 25
 _READ_DOCUMENT_FALLBACK_TIMEOUT_SECONDS = 10
-_READ_DOCUMENT_MAX_CELL_CHARS = 500
 _READ_DOCUMENT_MAX_COLUMNS = 80
 _READ_DOCUMENT_MAX_XLSX_CELLS = 20000
 # read_document returns the FULL extracted text (bounded only by file size +
@@ -4499,15 +4498,22 @@ _READ_DOCUMENT_HARD_CHAR_CEILING = 2_000_000
 
 
 def _safe_document_cell_text(value: Any) -> str:
-    """Convert spreadsheet/table values without letting pathological cells dominate CPU."""
+    """Stringify a spreadsheet/table cell faithfully — NO content-length truncation.
+
+    read_document must return cell content in full so embedded SQL / long口径 text is
+    never silently chopped mid-statement (which is unrecoverable for the agent). Output
+    that is genuinely too large is handled non-lossily by the unified overflow-to-file
+    path (llm.tool_output_store.finalize_tool_output), and total memory stays bounded by
+    the file-size gate + per-sheet cell-count cap + the 2M _READ_DOCUMENT_HARD_CHAR_CEILING.
+
+    The only guard kept here is the degenerate huge-integer case: str() on a multi-thousand
+    digit int is pathologically slow and can raise under CPython's int_max_str_digits.
+    """
     if value is None:
         return ""
     if isinstance(value, int) and value.bit_length() > 4096:
         return "[large integer omitted]"
-    text = str(value)
-    if len(text) > _READ_DOCUMENT_MAX_CELL_CHARS:
-        return text[:_READ_DOCUMENT_MAX_CELL_CHARS] + "...[cell truncated]"
-    return text
+    return str(value)
 
 
 def _render_xlsx_row(values) -> str:
