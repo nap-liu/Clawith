@@ -509,16 +509,22 @@ async def save_agent_relationships(
 
     for r in _dedupe_agent_relationships(data.relationships, agent_id):
         target_id = uuid.UUID(r.target_agent_id)
-        target_result = await db.execute(
-            build_visible_agents_query(current_user, tenant_id=source_agent.tenant_id).where(Agent.id == target_id)
-        )
-        target_agent = target_result.scalar_one_or_none()
-        if not target_agent:
-            # Must be VISIBLE to the user; managing the target is not required since
-            # the relationship is directional (source -> target) and the user already
-            # manages the source (enforced by _can_manage_relationships above).
-            raise HTTPException(status_code=403, detail="Target agent is not visible to the current user")
         existing = existing_by_target.get(target_id)
+        if existing is None:
+            # Only *newly added* targets are visibility-checked (same gate as the
+            # agent-candidates list). Targets that were ALREADY linked pass through:
+            # GET /agents returns relationships unfiltered, so the user may be replaying
+            # a list that includes inherited rows (e.g. an admin-created link to someone
+            # else's private agent) which are not visible to them. Re-checking those here
+            # would block the user from saving a list they were shown (read/write asymmetry).
+            target_result = await db.execute(
+                build_visible_agents_query(current_user, tenant_id=source_agent.tenant_id).where(Agent.id == target_id)
+            )
+            if target_result.scalar_one_or_none() is None:
+                # Visible is enough; managing the target is not required since the
+                # relationship is directional (source -> target) and the user already
+                # manages the source (enforced by _can_manage_relationships above).
+                raise HTTPException(status_code=403, detail="Target agent is not visible to the current user")
         db.add(AgentAgentRelationship(
             agent_id=agent_id,
             target_agent_id=target_id,

@@ -321,3 +321,55 @@ async def test_save_accepts_visible_but_unmanaged_target(session, monkeypatch):
         )
     ).scalars().all()
     assert [str(r.target_agent_id) for r in rows] == [str(public.id)]
+
+
+@pytest.mark.asyncio
+async def test_save_preserves_existing_relationship_to_now_invisible_target(session, monkeypatch):
+    """Read/write symmetry: GET /agents returns every relationship unfiltered, so a member
+    can *see* a row whose target is not visible to them (e.g. an admin-created link to
+    someone else's private agent). A replace-all save replays that whole list, so those
+    pre-existing rows must pass through — only *newly added* targets are visibility-checked.
+    Otherwise the member is blocked from saving a list they were shown (the 403 bug)."""
+    tenant = uuid.uuid4()
+    user = _new_user(tenant)
+    session.add(user)
+    await session.flush()
+
+    source = _new_agent(tenant, user.id, name="my-source", access_mode="private")
+    # Someone else's private agent — not visible to this member, but already linked.
+    invisible = _new_agent(tenant, uuid.uuid4(), name="secret-bot", access_mode="private")
+    session.add_all([source, invisible])
+    await session.flush()
+
+    from app.models.org import AgentAgentRelationship
+
+    # Pre-existing relationship (e.g. created earlier by an admin).
+    session.add(
+        AgentAgentRelationship(
+            id=uuid.uuid4(),
+            agent_id=source.id,
+            target_agent_id=invisible.id,
+            relation="collaborator",
+            created_by_user_id=uuid.uuid4(),
+        )
+    )
+    await session.flush()
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(rel_api, "_regenerate_relationships_file", _noop)
+
+    # Member replays the full list (including the inherited, invisible-target row).
+    data = AgentRelationshipBatchIn(
+        relationships=[AgentRelationshipIn(target_agent_id=str(invisible.id), relation="collaborator")]
+    )
+    out = await save_agent_relationships(agent_id=source.id, data=data, current_user=user, db=session)
+    assert out["status"] == "ok"
+
+    rows = (
+        await session.execute(
+            select(AgentAgentRelationship).where(AgentAgentRelationship.agent_id == source.id)
+        )
+    ).scalars().all()
+    assert [str(r.target_agent_id) for r in rows] == [str(invisible.id)]
