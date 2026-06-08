@@ -129,3 +129,19 @@ def test_cache_hit_ratio_helper():
     assert _cache_hit_ratio({"prompt_tokens": 0}) is None
     assert _cache_hit_ratio({}) is None
     assert _cache_hit_ratio(None) is None
+
+
+# --- guard: tool definitions must serialize byte-identically across rounds ---
+
+def test_agent_tools_serialize_byte_stable_across_calls():
+    # DashScope (and implicit prefix caching) require the tools array to be
+    # byte-identical every round, or the cached prefix misses. AGENT_TOOLS is a
+    # module-level constant; this guard fails loudly if anyone makes it
+    # non-deterministic (e.g. building it per-call with set/dict ordering).
+    import json
+
+    from app.services.agent_tools import AGENT_TOOLS
+
+    a = json.dumps(AGENT_TOOLS, ensure_ascii=False)
+    b = json.dumps(AGENT_TOOLS, ensure_ascii=False)
+    assert a == b, "AGENT_TOOLS serialization must be byte-identical across rounds"
