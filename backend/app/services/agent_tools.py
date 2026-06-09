@@ -6986,6 +6986,14 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                     conversation_id=session_id, evt=evt,
                 )
 
+            # Collect the target's reasoning/thinking for UI persistence — shown
+            # when a human views the A2A session, NEVER fed back into the LLM.
+            # Same accumulate-across-rounds pattern as the web chat path.
+            _a2a_thinking: list[str] = []
+
+            async def _a2a_on_thinking(text: str):
+                _a2a_thinking.append(text)
+
             # 4) Run target via the unified, failover-aware loop. NO outer wait_for.
             #    agent_id=target.id so build_agent_context loads the right soul/system
             #    prompt; tool calls are stored under session_agent_id via _a2a_persist.
@@ -6995,6 +7003,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 role_description=target.role_description or "",
                 agent_id=target.id, user_id=owner_id, session_id=session_id,
                 on_tool_call=_a2a_persist,
+                on_thinking=_a2a_on_thinking,
                 supports_vision=getattr(target_model, "supports_vision", False),
             )
 
@@ -7005,6 +7014,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             async with async_session() as db2:
                 part_r = await db2.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target.id))
                 tgt_part = part_r.scalar_one_or_none()
+                from app.services.chat_history import cap_thinking
                 db2.add(ChatMessage(
                     agent_id=session_agent_id,
                     user_id=owner_id,
@@ -7012,6 +7022,7 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                     content=target_reply,
                     conversation_id=session_id,
                     participant_id=tgt_part.id if tgt_part else None,
+                    thinking=cap_thinking("".join(_a2a_thinking)),
                 ))
                 await db2.commit()
 

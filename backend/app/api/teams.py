@@ -544,10 +544,14 @@ async def teams_event_webhook(
             _cfs_s_token = _cfs_s.set(_teams_file_sender)
 
             # Call LLM
+            _thinking_chunks: list[str] = []
+            async def _collect_thinking(text: str):
+                _thinking_chunks.append(text)
             try:
                 reply_text = await _call_agent_llm(
                     db, agent_id, user_text,
                     history=history, user_id=platform_user_id, session_id=session_conv_id,
+                    on_thinking=_collect_thinking,
                 )
                 _cfs_s.reset(_cfs_s_token)
                 logger.info(f"Teams: LLM reply generated: {reply_text[:80]}")
@@ -567,6 +571,7 @@ async def teams_event_webhook(
                 await persist_assistant_reply(
                     _areply_session, agent_id=agent_id, user_id=platform_user_id,
                     conversation_id=session_conv_id, content=reply_text,
+                    thinking="".join(_thinking_chunks) or None,
                 )
                 sess.last_message_at = datetime.now(timezone.utc)
                 await db.commit()

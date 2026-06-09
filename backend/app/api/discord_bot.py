@@ -376,9 +376,13 @@ async def discord_interaction_webhook(
                     await bg_db.commit()
 
                     # Call LLM
+                    _thinking_chunks: list[str] = []
+                    async def _collect_thinking(text: str):
+                        _thinking_chunks.append(text)
                     reply_text = await _call_agent_llm(
                         bg_db, agent_id, user_text,
                         history=history, user_id=platform_user_id, session_id=session_conv_id,
+                        on_thinking=_collect_thinking,
                     )
                     logger.info(f"[Discord] LLM reply: {reply_text[:80]}")
 
@@ -391,6 +395,7 @@ async def discord_interaction_webhook(
                     await persist_assistant_reply(
                         _areply_session, agent_id=agent_id, user_id=platform_user_id,
                         conversation_id=session_conv_id, content=reply_text,
+                        thinking="".join(_thinking_chunks) or None,
                     )
                     sess.last_message_at = datetime.now(timezone.utc)
                     await bg_db.commit()

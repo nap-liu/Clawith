@@ -178,6 +178,82 @@ async def test_consult_routes_through_unified_loop_and_returns_reply():
 
 
 @pytest.mark.asyncio
+async def test_consult_persists_target_thinking():
+    """The target's reasoning is collected via on_thinking and saved on the
+    assistant ChatMessage (UI-only field, visible when viewing the A2A session).
+    Accumulates across the tool loop, mirroring the web chat path."""
+    from app.services.agent_tools import _send_message_to_agent
+
+    from_agent_id = uuid.uuid4()
+    target_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+
+    src_participant = _make_participant(ref_id=from_agent_id)
+    tgt_participant = _make_participant(ref_id=target_id)
+    source_agent = _make_agent(from_agent_id, name="Alice")
+    target_agent = _make_agent(target_id, name="Bob", primary_model_id=model_id)
+
+    session = MagicMock()
+    session.id = session_id
+    session.last_message_at = None
+
+    model = MagicMock()
+    model.id = model_id
+    model.enabled = True
+    model.supports_vision = False
+
+    tenant = MagicMock()
+    tenant.a2a_async_enabled = False  # force consult path
+
+    db_main = RecordingDB(responses=[
+        DummyResult(scalar_value=source_agent),
+        DummyResult(scalars_list=[target_agent]),
+        DummyResult(scalar_value=uuid.uuid4()),   # relationship check
+        DummyResult(scalar_value=src_participant),
+        DummyResult(scalar_value=tgt_participant),
+        DummyResult(scalar_value=session),
+        DummyResult(scalar_value=tenant),
+        DummyResult(scalar_value=model),
+        DummyResult(scalars_list=[]),              # ChatMessage history rows
+        DummyResult(scalar_value=None),            # ChatCompaction marker
+    ])
+    db_reply = RecordingDB(responses=[
+        DummyResult(scalar_value=tgt_participant),
+    ])
+
+    async def fake_failover(**kwargs):
+        # The unified loop must hand us an on_thinking sink; simulate the target
+        # emitting reasoning across two rounds, then a final textual reply.
+        on_thinking = kwargs.get("on_thinking")
+        assert on_thinking is not None, "consult must pass on_thinking to collect reasoning"
+        await on_thinking("Bob is reasoning: ")
+        await on_thinking("svc keeps 500ing, I'll report it.")
+        return "svc 持续 500,无法完成注册。"
+
+    with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
+         patch("app.services.llm.call_llm_with_failover", side_effect=fake_failover), \
+         patch("app.services.activity_logger.log_activity", new_callable=AsyncMock):
+
+        mock_session_ctx.return_value.__aenter__ = AsyncMock(side_effect=[db_main, db_reply])
+        mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        result = await _send_message_to_agent(from_agent_id, {
+            "agent_name": "Bob",
+            "message": "Register the report.",
+            "msg_type": "consult",
+        })
+
+    assert "Bob replied" in result
+    # Assistant reply row carries the accumulated thinking (joined across rounds).
+    saved = [m for m in db_reply.added if getattr(m, "role", None) == "assistant"]
+    assert len(saved) == 1
+    assert saved[0].thinking == "Bob is reasoning: svc keeps 500ing, I'll report it."
+    # And it is NOT smuggled into the reply content fed back to the caller agent.
+    assert "Bob is reasoning" not in result
+
+
+@pytest.mark.asyncio
 async def test_consult_persist_tool_call_stores_raw_connection_string():
     """The on_tool_call→persist_tool_call path must store args RAW (no sanitize).
 

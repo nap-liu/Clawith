@@ -720,12 +720,16 @@ async def process_dingtalk_message(
             )
 
         # Call LLM
+        _thinking_chunks: list[str] = []
+        async def _collect_thinking(text: str):
+            _thinking_chunks.append(text)
         try:
             reply_text = await _call_agent_llm(
                 db, agent_id, llm_user_text,
                 history=history, user_id=platform_user_id,
                 session_id=session_conv_id,
                 is_group=(conversation_type == "2"),
+                on_thinking=_collect_thinking,
             )
         finally:
             # Reset ContextVar. (Thinking-reaction recall now fires via the
@@ -772,6 +776,7 @@ async def process_dingtalk_message(
         await persist_assistant_reply(
             _areply_session, agent_id=agent_id, user_id=platform_user_id,
             conversation_id=session_conv_id, content=reply_text,
+            thinking="".join(_thinking_chunks) or None,
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()

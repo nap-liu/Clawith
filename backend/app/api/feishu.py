@@ -1438,10 +1438,15 @@ async def _handle_feishu_file(
                 await _queue_image_patch(_card, _stage=f"image_stream_{reason}")
                 _img_last_flush = now
 
+            _img_thinking_chunks: list[str] = []
+
             async def _img_on_chunk(text: str):
                 _img_stream_buf.append(text)
                 if _patch_msg_id:
                     await _flush_image_stream("chunk")
+
+            async def _img_on_thinking(text: str):
+                _img_thinking_chunks.append(text)
 
             async def _img_heartbeat():
                 while not _img_llm_done:
@@ -1472,6 +1477,7 @@ async def _handle_feishu_file(
                         _db_img, agent_id, llm_user_msg_content, history=_history_img,
                         user_id=platform_user_id, session_id=session_conv_id_img,
                         on_chunk=_img_on_chunk,
+                        on_thinking=_img_on_thinking,
                         is_group=_is_group_file,
                     )
                 finally:
@@ -1511,6 +1517,7 @@ async def _handle_feishu_file(
             await persist_assistant_reply(
                 _async_session, agent_id=agent_id, user_id=platform_user_id,
                 conversation_id=session_conv_id_img, content=reply_text,
+                thinking="".join(_img_thinking_chunks) or None,
             )
             from app.services.activity_logger import log_activity
             await log_activity(agent_id, "chat_reply", f"回复了飞书图片消息: {reply_text[:80]}",

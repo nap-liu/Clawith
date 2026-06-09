@@ -851,10 +851,16 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
 
         # Call LLM (outside the DB session to avoid long transactions)
         collected_content = []
+        collected_thinking = []
         delivered_platform_message_via_tool = False
 
         async def on_chunk(text):
             collected_content.append(text)
+
+        # Collect reasoning/thinking for UI persistence — shown when a human
+        # views the session, NEVER fed back into the LLM. Mirrors web chat.
+        async def on_thinking(text):
+            collected_thinking.append(text)
 
         # Persist tool calls into Reflection Session for Reflections visibility
         async def on_tool_call(data):
@@ -913,6 +919,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 session_id=str(session_id),
                 on_chunk=on_chunk,
                 on_tool_call=on_tool_call,
+                on_thinking=on_thinking,
                 # A2A wake uses the agent's own max_tool_rounds setting (no override)
             )
         finally:
@@ -933,6 +940,11 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 except Exception as _e:
                     logger.warning(f"Failed to advance webhook queue after session: {_e}")
 
+        # Cap the turn's accumulated thinking once; reused by all assistant rows
+        # persisted below (Reflection / A2A mirror / delivery). UI-only field.
+        from app.services.chat_history import cap_thinking
+        _capped_thinking = cap_thinking("".join(collected_thinking))
+
         # Save assistant reply to Reflection session
         async with async_session() as db:
             result = await db.execute(
@@ -947,6 +959,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 content=reply or "".join(collected_content),
                 user_id=agent.creator_id,
                 participant_id=agent_participant.id if agent_participant else None,
+                thinking=_capped_thinking,
             ))
 
             # NOTE: trigger state (last_fired_at, fire_count, auto-disable)
@@ -975,6 +988,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                             content=final_reply,
                             user_id=agent.creator_id,
                             participant_id=_p.id if _p else None,
+                            thinking=_capped_thinking,
                         ))
                         # Update session timestamp
                         from app.models.chat_session import ChatSession as _CS
@@ -1056,6 +1070,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                         role="assistant",
                         content=notification,
                         user_id=agent.creator_id,
+                        thinking=_capped_thinking,
                     ))
                     session_row = await db.get(ChatSession, uuid.UUID(target_session_id))
                     if session_row:

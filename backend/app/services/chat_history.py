@@ -343,6 +343,22 @@ async def persist_tool_call(
         logger.warning(f"[chat_history] persist_tool_call failed (non-fatal): {e}")
 
 
+THINKING_MAX_CHARS = 64_000
+
+
+def cap_thinking(thinking: str | None) -> str | None:
+    """Trim oversized thinking/reasoning before persistence.
+
+    ``thinking`` is a UI-only field (shown when viewing a session, never fed
+    back into ``call_llm``); on long tool loops it can grow to many tens of KB.
+    Cap it so a single row can't store a pathological multi-100KB blob.
+    Returns ``None`` for blank input so callers can pass it straight through.
+    """
+    if not thinking:
+        return None
+    return thinking[:THINKING_MAX_CHARS]
+
+
 async def persist_assistant_reply(
     db_session_factory,
     *,
@@ -373,8 +389,9 @@ async def persist_assistant_reply(
                 content=content,
                 conversation_id=conversation_id,
             )
-            if thinking:
-                msg.thinking = thinking
+            _capped = cap_thinking(thinking)
+            if _capped:
+                msg.thinking = _capped
             db.add(msg)
             await db.commit()
     except Exception as e:

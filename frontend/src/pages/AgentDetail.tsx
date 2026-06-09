@@ -4513,6 +4513,200 @@ function AgentDetailInner() {
         );
     }), [t]);
 
+    // ── Unified grouped conversation renderer ──
+    //
+    // Shared by both the live WebSocket chat and the read-only history view.
+    // Runs the same two-pass lookahead grouping algorithm (analysis steps —
+    // thinking + tool calls + mid-flow text — merge into a single AnalysisCard;
+    // only the *final* answer becomes a real chat bubble), while keeping the
+    // participant-perspective logic (left/right side, sender label, avatar)
+    // pluggable via the `viewOf` callback so A2A / group-chat / read-only views
+    // keep their distinct speaker rendering.
+    const renderGroupedConversation = (
+        messages: any[],
+        viewOf: (m: any) => {
+            isLeft: boolean;
+            senderLabel?: string;
+            avatarText?: string;
+            forceSenderLabel?: boolean;
+            hideAvatar?: boolean;
+        },
+    ) => {
+        // Pass 1: mark each index as 'analysis' or 'final'
+        const msgClass: ('analysis' | 'final')[] = new Array(messages.length).fill('final');
+
+        // Walk backwards: once we see a tool_call, all preceding
+        // assistant messages (until the previous user turn or start)
+        // are reclassified as 'analysis'.
+        let hasFutureTool = false;
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const msg = messages[i];
+            if (msg.role === 'tool_call') {
+                msgClass[i] = 'analysis';
+                hasFutureTool = true;
+            } else if (msg.role === 'user') {
+                // User turn resets the lookahead boundary
+                hasFutureTool = false;
+            } else if (msg.role === 'assistant') {
+                if (hasFutureTool) {
+                    // This assistant message (thinking-only or with content)
+                    // precedes more tool calls → it's part of the analysis
+                    msgClass[i] = 'analysis';
+                }
+                // else: it's a final answer, keep 'final'
+            }
+        }
+
+        // Pass 2: build grouped entries
+        type GroupedEntry =
+            | { type: 'analysis_group'; items: AnalysisItem[]; key: number }
+            | { type: 'msg'; msg: any; i: number };
+        const grouped: GroupedEntry[] = [];
+        let currentGroup: AnalysisItem[] | null = null;
+        let groupStartKey = 0;
+        const flushGroup = () => {
+            if (currentGroup && currentGroup.length > 0) {
+                grouped.push({ type: 'analysis_group', items: currentGroup, key: groupStartKey });
+                currentGroup = null;
+            }
+        };
+        for (let i = 0; i < messages.length; i++) {
+            const msg = messages[i];
+            if (msgClass[i] === 'analysis') {
+                // Open a new group if needed
+                if (!currentGroup) { currentGroup = []; groupStartKey = i; }
+                if (msg.role === 'tool_call') {
+                    // Read-only history persists tool fields packed into `content`
+                    // JSON; live messages carry them as discrete fields. Normalize.
+                    const parsed = (() => { try { return JSON.parse(msg.content || '{}'); } catch { return {}; } })();
+                    const toolThinking = msg.toolThinking;
+                    const toolName = msg.toolName || parsed.name || 'tool';
+                    const toolArgs = msg.toolArgs || parsed.args || {};
+                    const toolStatus = msg.toolStatus;
+                    const toolResult = msg.toolResult ?? parsed.result ?? undefined;
+                    if (toolThinking?.trim()) {
+                        const lastItem = currentGroup[currentGroup.length - 1];
+                        if (!(lastItem?.type === 'thinking' && lastItem.content === toolThinking)) {
+                            currentGroup.push({ type: 'thinking', content: toolThinking });
+                        }
+                    }
+                    currentGroup.push({
+                        type: 'tool',
+                        name: toolName,
+                        args: toolArgs,
+                        status: toolStatus === 'running' ? 'running' : 'done',
+                        result: toolResult || undefined,
+                    });
+                } else if (msg.role === 'assistant') {
+                    // Could be thinking-only OR has content (mid-flow text)
+                    const thinkingText = msg.thinking || '';
+                    const contentText = msg.content?.trim() || '';
+                    // Add thinking block first (if present)
+                    if (thinkingText) {
+                        currentGroup.push({ type: 'thinking', content: thinkingText });
+                    }
+                    // Add mid-flow content as a thinking block too
+                    // (displayed with slightly different style to distinguish)
+                    if (contentText) {
+                        currentGroup.push({ type: 'thinking', content: contentText });
+                    }
+                }
+            } else {
+                // 'final': flush any open group first, then emit as chat bubble
+                if (msg.role === 'assistant' && msg.thinking && currentGroup?.some(item => item.type === 'tool')) {
+                    currentGroup.push({ type: 'thinking', content: msg.thinking });
+                    const contentText = msg.content?.trim() || '';
+                    flushGroup();
+                    if (contentText) grouped.push({ type: 'msg', msg: { ...msg, thinking: undefined }, i });
+                    continue;
+                }
+                flushGroup();
+                grouped.push({ type: 'msg', msg, i });
+            }
+        }
+        flushGroup(); // flush any trailing group
+
+        return grouped.map((entry, entryIdx) => {
+            const previousEntry = grouped[entryIdx - 1];
+            const hideAssistantAvatar = entry.type === 'msg'
+                && entry.msg.role === 'assistant'
+                && previousEntry?.type === 'analysis_group';
+            if (entry.type === 'analysis_group') {
+                // Group is considered running if it has a running tool,
+                // or if it's the very last entry and the agent is still active
+                const isLastEntry = entryIdx === grouped.length - 1;
+                const hasRunningTool = entry.items.some(
+                    it => it.type === 'tool' && it.status === 'running'
+                );
+                const hasToolItems = entry.items.some(it => it.type === 'tool');
+                const groupIsRunning = hasRunningTool || (!hasToolItems && isLastEntry && (isWaiting || isStreaming));
+                // Owner = first final assistant message after this group; its
+                // perspective (left/right + avatar) drives the card alignment.
+                let owner: any = null;
+                for (let k = entryIdx + 1; k < grouped.length; k++) {
+                    const e = grouped[k];
+                    if (e.type === 'msg' && e.msg.role === 'assistant') { owner = e.msg; break; }
+                }
+                const ownerView = owner ? viewOf(owner) : { isLeft: true, avatarText: undefined as string | undefined };
+                return (
+                    <div
+                        key={`ag-${entry.key}`}
+                        className={`chat-msg-row chat-msg-row--analysis${ownerView.isLeft ? '' : ' chat-msg-row--user'}`}
+                    >
+                        <div className="chat-msg-avatar">{ownerView.avatarText || ((agent as any)?.name || 'Agent')[0]}</div>
+                        <AnalysisCard
+                            items={entry.items}
+                            t={t}
+                            expanded={toolGroupExpandedRef.current.has(entry.key) ? !!toolGroupExpandedRef.current.get(entry.key) : false}
+                            onToggle={() => toggleToolGroup(entry.key)}
+                            isGroupRunning={groupIsRunning}
+                        />
+                    </div>
+                );
+            }
+            const { msg, i } = entry;
+            const v = viewOf(msg);
+            // All remaining messages have real content; render as chat bubbles
+            if (msg.role === 'assistant' && msg.thinking) {
+                const contentText = msg.content?.trim() || '';
+                return (
+                    <React.Fragment key={i}>
+                        <ThoughtDisclosure
+                            content={msg.thinking}
+                            t={t}
+                            streaming={!!((msg as any)._streaming && !contentText)}
+                        />
+                        {contentText && (
+                            <ChatMessageItem
+                                msg={{ ...msg, thinking: undefined }}
+                                i={i}
+                                isLeft={v.isLeft}
+                                t={t}
+                                senderLabel={v.senderLabel}
+                                avatarText={v.avatarText}
+                                forceSenderLabel={v.forceSenderLabel}
+                                hideAvatar={v.hideAvatar || hideAssistantAvatar}
+                            />
+                        )}
+                    </React.Fragment>
+                );
+            }
+            return (
+                <ChatMessageItem
+                    key={i}
+                    msg={msg}
+                    i={i}
+                    isLeft={v.isLeft}
+                    t={t}
+                    senderLabel={v.senderLabel}
+                    avatarText={v.avatarText}
+                    forceSenderLabel={v.forceSenderLabel}
+                    hideAvatar={v.hideAvatar || hideAssistantAvatar}
+                />
+            );
+        });
+    };
+
     const handleChatScroll = () => {
         const el = chatContainerRef.current;
         if (!el) return;
@@ -7112,7 +7306,11 @@ function AgentDetailInner() {
                                                     ? historyMsgs.find((m: any) => m.sender_name === thisAgentName)?.participant_id
                                                     : null;
                                                 const viewerId = currentUser?.id != null ? String(currentUser.id) : null;
-                                                return historyMsgs.map((m: any, i: number) => {
+                                                // Route history through the same grouped renderer as the live
+                                                // chat so A2A / group / read-only views also collapse thinking
+                                                // + tool calls into a single AnalysisCard. The participant
+                                                // perspective (left/right, label, avatar) stays distinct here.
+                                                return renderGroupedConversation(historyMsgs, (m: any) => {
                                                     // Determine if this message is from "this agent" (left) or peer (right).
                                                     // Group chat: assistant always left; user msgs are RIGHT only when sent
                                                     // by the logged-in viewer themself, otherwise LEFT (so each distinct
@@ -7129,65 +7327,21 @@ function AgentDetailInner() {
                                                     } else {
                                                         isLeft = m.role === 'assistant';
                                                     }
-                                                    if (m.role === 'tool_call') {
-                                                        const tName = m.toolName || (() => { try { return JSON.parse(m.content || '{}').name; } catch { return 'tool'; } })();
-                                                        const tArgs = m.toolArgs || (() => { try { return JSON.parse(m.content || '{}').args; } catch { return {}; } })();
-                                                        const tResult = m.toolResult ?? (() => { try { return JSON.parse(m.content || '{}').result; } catch { return ''; } })();
-                                                        return (
-                                                            <div key={i} style={{ display: 'flex', gap: '8px', marginBottom: '6px', paddingLeft: '36px', minWidth: 0 }}>
-                                                                <details style={{ flex: 1, minWidth: 0, borderRadius: '8px', background: 'var(--accent-subtle)', border: '1px solid var(--accent-subtle)', fontSize: '12px', overflow: 'hidden' }}>
-                                                                    <summary style={{ padding: '6px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', userSelect: 'none', listStyle: 'none', overflow: 'hidden' }}>
-                                                                        <IconBolt size={13} stroke={1.8} />
-                                                                        <span style={{ fontWeight: 600, color: 'var(--accent-text)' }}>{tName}</span>
-                                                                        {tArgs && typeof tArgs === 'object' && Object.keys(tArgs).length > 0 && <span style={{ color: 'var(--text-tertiary)', fontSize: '11px', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{`(${Object.entries(tArgs).map(([k, v]) => `${k}: ${typeof v === 'string' ? v.slice(0, 30) : JSON.stringify(v)}`).join(', ')})`}</span>}
-                                                                    </summary>
-                                                                    {tResult && <div style={{ padding: '4px 10px 8px' }}><div style={{ color: 'var(--text-secondary)', fontSize: '11px', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '240px', overflow: 'auto', background: 'rgba(0,0,0,0.15)', borderRadius: '4px', padding: '4px 6px' }}>{tResult}</div></div>}
-                                                                </details>
-                                                            </div>
-                                                        );
-                                                    }
-
-                                                    {/* Assistant message with no content: show inline thinking or skip */ }
-                                                    if (m.role === 'assistant' && !m.content?.trim()) {
-                                                        if (m.thinking) {
-                                                            return (
-                                                                <ThoughtDisclosure key={i} content={m.thinking} t={t} />
-                                                            );
-                                                        }
-                                                        return null;
-                                                    }
-                                                    return (
-                                                        <React.Fragment key={i}>
-                                                            {m.role === 'assistant' && m.thinking && (
-                                                                <ThoughtDisclosure content={m.thinking} t={t} />
-                                                            )}
-                                                            <ChatMessageItem
-                                                                msg={{ ...m, thinking: undefined }}
-                                                                i={i}
-                                                                isLeft={isLeft}
-                                                                t={t}
-                                                                senderLabel={
-                                                                    isHumanReadonly
-                                                                        ? (isLeft ? ((agent as any)?.name || 'Agent') : (activeSession.username || 'User'))
-                                                                        : isGroupChat
-                                                                            ? (m.role === 'assistant'
-                                                                                ? ((agent as any)?.name || 'Agent')
-                                                                                : (m.sender_name || 'User'))
-                                                                            : undefined
-                                                                }
-                                                                avatarText={
-                                                                    isHumanReadonly
-                                                                        ? (isLeft ? (((agent as any)?.name || 'Agent')[0]) : ((activeSession.username || 'User')[0]))
-                                                                        : isGroupChat
-                                                                            ? (m.role === 'assistant'
-                                                                                ? ((((agent as any)?.name || 'Agent')[0]) || 'A')
-                                                                                : ((m.sender_name && m.sender_name[0]) || 'U'))
-                                                                            : undefined
-                                                                }
-                                                                forceSenderLabel={isHumanReadonly || isGroupChat}
-                                                            />
-                                                        </React.Fragment>
-                                                    );
+                                                    const senderLabel = isHumanReadonly
+                                                        ? (isLeft ? ((agent as any)?.name || 'Agent') : (activeSession.username || 'User'))
+                                                        : isGroupChat
+                                                            ? (m.role === 'assistant'
+                                                                ? ((agent as any)?.name || 'Agent')
+                                                                : (m.sender_name || 'User'))
+                                                            : undefined;
+                                                    const avatarText = isHumanReadonly
+                                                        ? (isLeft ? (((agent as any)?.name || 'Agent')[0]) : ((activeSession.username || 'User')[0]))
+                                                        : isGroupChat
+                                                            ? (m.role === 'assistant'
+                                                                ? ((((agent as any)?.name || 'Agent')[0]) || 'A')
+                                                                : ((m.sender_name && m.sender_name[0]) || 'U'))
+                                                            : undefined;
+                                                    return { isLeft, senderLabel, avatarText, forceSenderLabel: isHumanReadonly || isGroupChat };
                                                 });
                                             })()}
                                         </div>
@@ -7220,183 +7374,15 @@ function AgentDetailInner() {
                                                     <div className="chat-empty-state__hint">{t('agent.chat.fileSupport')}</div>
                                                 </div>
                                             )}
-                                            {(() => {
-                                                // ── Grouping Algorithm (lookahead-based) ──
-                                                //
-                                                // Goal: merge all "analysis" steps (thinking + tool calls +
-                                                // mid-flow assistant text) into a single AnalysisCard, and
-                                                // only emit a real assistant bubble for the *final* answer.
-                                                //
-                                                // Problem with naive flushing:
-                                                //   Claude and minimax sometimes emit an assistant message with
-                                                //   real content (e.g. "Let me search…") BETWEEN reasoning and
-                                                //   tool calls. The old approach flushed the group on any
-                                                //   assistant content, producing multiple fragmented cards.
-                                                //
-                                                // Solution — two-pass lookahead:
-                                                //   Pass 1: pre-classify every message as either
-                                                //     "analysis"  — part of the internal reasoning/tool loop
-                                                //     "final"     — the actual answer to show the user
-                                                //   Classification rule: an assistant message (even with content)
-                                                //   is "analysis" if there is *at least one more tool_call
-                                                //   somewhere after it in the same sequence*.
-                                                //   Pass 2: build GroupedEntry[] based on classifications.
-
-                                                // Pass 1: mark each index as 'analysis' or 'final'
-                                                const msgClass: ('analysis' | 'final')[] = new Array(chatMessages.length).fill('final');
-
-                                                // Walk backwards: once we see a tool_call, all preceding
-                                                // assistant messages (until the previous user turn or start)
-                                                // are reclassified as 'analysis'.
-                                                let hasFutureTool = false;
-                                                for (let i = chatMessages.length - 1; i >= 0; i--) {
-                                                    const msg = chatMessages[i];
-                                                    if (msg.role === 'tool_call') {
-                                                        msgClass[i] = 'analysis';
-                                                        hasFutureTool = true;
-                                                    } else if (msg.role === 'user') {
-                                                        // User turn resets the lookahead boundary
-                                                        hasFutureTool = false;
-                                                    } else if (msg.role === 'assistant') {
-                                                        if (hasFutureTool) {
-                                                            // This assistant message (thinking-only or with content)
-                                                            // precedes more tool calls → it's part of the analysis
-                                                            msgClass[i] = 'analysis';
-                                                        }
-                                                        // else: it's a final answer, keep 'final'
-                                                    }
-                                                }
-
-                                                // Pass 2: build grouped entries
-                                                type GroupedEntry =
-                                                    | { type: 'analysis_group'; items: AnalysisItem[]; key: number }
-                                                    | { type: 'msg'; msg: any; i: number };
-                                                const grouped: GroupedEntry[] = [];
-                                                let currentGroup: AnalysisItem[] | null = null;
-                                                let groupStartKey = 0;
-                                                const flushGroup = () => {
-                                                    if (currentGroup && currentGroup.length > 0) {
-                                                        grouped.push({ type: 'analysis_group', items: currentGroup, key: groupStartKey });
-                                                        currentGroup = null;
-                                                    }
-                                                };
-                                                for (let i = 0; i < chatMessages.length; i++) {
-
-                                                    const msg = chatMessages[i];
-                                                    if (msgClass[i] === 'analysis') {
-                                                        // Open a new group if needed
-                                                        if (!currentGroup) { currentGroup = []; groupStartKey = i; }
-                                                        if (msg.role === 'tool_call') {
-                                                            if (msg.toolThinking?.trim()) {
-                                                                const lastItem = currentGroup[currentGroup.length - 1];
-                                                                if (!(lastItem?.type === 'thinking' && lastItem.content === msg.toolThinking)) {
-                                                                    currentGroup.push({ type: 'thinking', content: msg.toolThinking });
-                                                                }
-                                                            }
-                                                            currentGroup.push({
-                                                                type: 'tool',
-                                                                name: msg.toolName || 'tool',
-                                                                args: msg.toolArgs || {},
-                                                                status: msg.toolStatus === 'running' ? 'running' : 'done',
-                                                                result: msg.toolResult || undefined,
-                                                            });
-                                                        } else if (msg.role === 'assistant') {
-                                                            // Could be thinking-only OR has content (mid-flow text)
-                                                            const thinkingText = msg.thinking || '';
-                                                            const contentText = msg.content?.trim() || '';
-                                                            // Add thinking block first (if present)
-                                                            if (thinkingText) {
-                                                                currentGroup.push({ type: 'thinking', content: thinkingText });
-                                                            }
-                                                            // Add mid-flow content as a thinking block too
-                                                            // (displayed with slightly different style to distinguish)
-                                                            if (contentText) {
-                                                                currentGroup.push({ type: 'thinking', content: contentText });
-                                                            }
-                                                        }
-                                                    } else {
-                                                        // 'final': flush any open group first, then emit as chat bubble
-                                                        if (msg.role === 'assistant' && msg.thinking && currentGroup?.some(item => item.type === 'tool')) {
-                                                            currentGroup.push({ type: 'thinking', content: msg.thinking });
-                                                            const contentText = msg.content?.trim() || '';
-                                                            flushGroup();
-                                                            if (contentText) grouped.push({ type: 'msg', msg: { ...msg, thinking: undefined }, i });
-                                                            continue;
-                                                        }
-                                                        flushGroup();
-                                                        grouped.push({ type: 'msg', msg, i });
-                                                    }
-                                                }
-                                                flushGroup(); // flush any trailing group
-
-
-                                                return grouped.map((entry, entryIdx) => {
-                                                    const previousEntry = grouped[entryIdx - 1];
-                                                    const hideAssistantAvatar = entry.type === 'msg'
-                                                        && entry.msg.role === 'assistant'
-                                                        && previousEntry?.type === 'analysis_group';
-                                                    if (entry.type === 'analysis_group') {
-                                                        // Group is considered running if it has a running tool,
-                                                        // or if it's the very last entry and the agent is still active
-                                                        const isLastEntry = entryIdx === grouped.length - 1;
-                                                        const hasRunningTool = entry.items.some(
-                                                            it => it.type === 'tool' && it.status === 'running'
-                                                        );
-                                                        const hasToolItems = entry.items.some(it => it.type === 'tool');
-                                                        const groupIsRunning = hasRunningTool || (!hasToolItems && isLastEntry && (isWaiting || isStreaming));
-                                                        return (
-                                                            <div key={`ag-${entry.key}`} className="chat-msg-row chat-msg-row--analysis">
-                                                                <div className="chat-msg-avatar">{(((agent as any)?.name || 'Agent')[0])}</div>
-                                                                <AnalysisCard
-                                                                    items={entry.items}
-                                                                    t={t}
-                                                                    expanded={toolGroupExpandedRef.current.has(entry.key) ? !!toolGroupExpandedRef.current.get(entry.key) : false}
-                                                                    onToggle={() => toggleToolGroup(entry.key)}
-                                                                    isGroupRunning={groupIsRunning}
-                                                                />
-                                                            </div>
-                                                        );
-                                                    }
-                                                    const { msg, i } = entry;
-                                                    // All remaining messages have real content; render as chat bubbles
-                                                    if (msg.role === 'assistant' && msg.thinking) {
-                                                        const contentText = msg.content?.trim() || '';
-                                                        return (
-                                                            <React.Fragment key={i}>
-                                                                <ThoughtDisclosure
-                                                                    content={msg.thinking}
-                                                                    t={t}
-                                                                    streaming={!!((msg as any)._streaming && !contentText)}
-                                                                />
-                                                                {contentText && (
-                                                                    <ChatMessageItem
-                                                                        msg={{ ...msg, thinking: undefined }}
-                                                                        i={i}
-                                                                        isLeft
-                                                                        t={t}
-                                                                        senderLabel={(agent as any)?.name || 'Agent'}
-                                                                        avatarText={((agent as any)?.name || 'Agent')[0]}
-                                                                        hideAvatar={hideAssistantAvatar}
-                                                                    />
-                                                                )}
-                                                            </React.Fragment>
-                                                        );
-                                                    }
-                                                    return (
-                                                        <ChatMessageItem
-                                                            key={i}
-                                                            msg={msg}
-                                                            i={i}
-                                                            isLeft={msg.role === 'assistant'}
-                                                            t={t}
-                                                            senderLabel={msg.role === 'assistant' ? ((agent as any)?.name || 'Agent') : (currentUser?.display_name || undefined)}
-                                                            avatarText={msg.role === 'assistant' ? (((agent as any)?.name || 'Agent')[0]) : (currentUser?.display_name?.[0] || undefined)}
-                                                            hideAvatar={hideAssistantAvatar}
-                                                        />
-                                                    );
-                                                });
-                                            })()
-                                            }
+                                            {renderGroupedConversation(chatMessages, (m) => ({
+                                                isLeft: m.role === 'assistant',
+                                                senderLabel: m.role === 'assistant'
+                                                    ? ((agent as any)?.name || 'Agent')
+                                                    : (currentUser?.display_name || undefined),
+                                                avatarText: m.role === 'assistant'
+                                                    ? (((agent as any)?.name || 'Agent')[0])
+                                                    : (currentUser?.display_name?.[0] || undefined),
+                                            }))}
                                             {isWaiting && (
                                                 <div className="chat-msg-row">
                                                     <div className="chat-msg-avatar">A</div>
