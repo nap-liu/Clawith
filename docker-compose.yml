@@ -60,9 +60,13 @@ services:
       # CLI tool binary upload size cap in bytes (POST /tools/cli/{id}/binary). Default 100 MiB.
       # Raise for large Node SEA / pkg / bun single-file binaries (keep <= frontend nginx 500m).
       CLI_BINARY_MAX_BYTES: ${CLI_BINARY_MAX_BYTES:-104857600}
+      # Persistent rotating logs — bind-mounted to the host so they survive
+      # container rebuilds/deploys. See backend/app/core/logging_config.py.
+      LOG_DIR: /data/logs
     volumes:
       - ./backend:/app
       - ./backend/agent_data:/data/agents
+      - ./backend/logs:/data/logs
       - cli_binaries:/data/cli_binaries
       - cli_tool_state:/data/cli_state
       # docker.sock is used by app.services.agent_manager to orchestrate

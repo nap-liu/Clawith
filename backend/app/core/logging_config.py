@@ -1,5 +1,6 @@
 """Centralized logging configuration using loguru."""
 
+import os
 import sys
 import logging
 from contextvars import ContextVar
@@ -49,6 +50,33 @@ def configure_logging():
         diagnose=True,
         filter=lambda record: (record["extra"].setdefault("trace_id", get_trace_id() or str(uuid4())) is not None)
     )
+
+    # Persistent rotating file sink. Written to LOG_DIR (bind-mounted to the
+    # host in compose) so logs SURVIVE container rebuilds/deploys — that's the
+    # whole point: being able to investigate an incident after the fact. When
+    # LOG_DIR is unset (tests / ad-hoc one-shot containers) the file sink is
+    # skipped so nothing writes to a throwaway path. Best-effort: a broken file
+    # sink must NEVER block app startup.
+    log_dir = os.environ.get("LOG_DIR", "").strip()
+    if log_dir:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            logger.add(
+                os.path.join(log_dir, "clawith.log"),
+                level=os.environ.get("LOG_FILE_LEVEL", "INFO"),
+                # No ANSI colour tags — written verbatim to disk.
+                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {extra[trace_id]:-<12} | {name}:{line} - {message}",
+                rotation=os.environ.get("LOG_ROTATION", "100 MB"),
+                retention=os.environ.get("LOG_RETENTION", "14 days"),
+                compression="gz",
+                enqueue=True,        # async — never block the request path
+                backtrace=True,
+                diagnose=False,      # do NOT persist local variables (may hold secrets)
+                filter=lambda record: (record["extra"].setdefault("trace_id", get_trace_id() or str(uuid4())) is not None),
+            )
+        except Exception as _e:
+            # Logging setup must never crash the app; fall back to stdout only.
+            logger.warning(f"[logging] persistent file sink at {log_dir!r} disabled (setup failed): {_e}")
 
     return logger
 

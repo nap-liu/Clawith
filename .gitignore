@@ -5,6 +5,7 @@ dist/
 *.zip
 .vite/
 *.log
+backend/logs/
 build/
 __pycache__/
 *.pyc
