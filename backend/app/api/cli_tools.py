@@ -542,7 +542,7 @@ async def test_run_cli_tool(
     if sandbox_config.type != "aio_sandbox":
         raise HTTPException(status_code=501, detail="test-run requires SANDBOX_TYPE=aio_sandbox")
     tenant_key = str(tool.tenant_id) if tool.tenant_id else "_global"
-    binary_path = f"/data/cli_binaries/{tenant_key}/{tool.id}/{cfg.binary.sha256}.bin"
+    binary_path = str(BinaryStorage(root=BINARY_ROOT).resolve(tenant_key, str(tool.id), cfg.binary.sha256))
     state_ctx = {}
     if any(v == "$state.dir" for v in cfg.env.values()):
         leaf = StateStorage().ensure_home(tenant_id=tool.tenant_id, tool_id=tool.id, user_id=current_user.id)

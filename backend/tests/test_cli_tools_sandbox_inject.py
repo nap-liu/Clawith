@@ -127,9 +127,6 @@ async def test_build_inject_prefix_for_agent_renders_cli_tools(cli_inject_sessio
 
     monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
     monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
-    # CLI_TOOLS_ROOT determines where binary paths are rendered (storage_root in impl).
-    binaries_root = tmp_path / "binaries"
-    monkeypatch.setenv("CLI_TOOLS_ROOT", str(binaries_root))
 
     async with cli_inject_session() as s:
         # User model uses association_proxy → Identity for email/phone.

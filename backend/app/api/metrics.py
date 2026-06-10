@@ -1,9 +1,8 @@
 """Prometheus scrape endpoint.
 
 Exposes the process-wide default registry in the standard
-`text/plain; version=0.0.4` format. Includes the `clawith_cli_tool_*`
-metrics registered in `app.services.cli_tools.metrics` plus any other
-counters / histograms that land on the default registry.
+`text/plain; version=0.0.4` format. Includes all counters / histograms
+that land on the default registry.
 
 Access policy
 -------------
