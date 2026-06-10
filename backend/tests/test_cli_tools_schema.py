@@ -70,3 +70,29 @@ def test_explicit_env_wins_over_legacy_env_inject():
 def test_sha256_validation_rejects_bad_hex():
     with pytest.raises(ValueError):
         BinaryMetadata(sha256="not-hex")
+
+
+def test_explicit_empty_env_suppresses_legacy_env_inject():
+    """A row that explicitly writes env={} must NOT resurrect legacy env_inject."""
+    cfg = CliToolConfig.model_validate({"env": {}, "env_inject": {"OLD": "x"}})
+    assert cfg.env == {}
+
+
+def test_legacy_m1_flat_shape_drops_binary_path_and_timeout():
+    """M1 rows ({'binary': '/usr/local/bin/svc', 'timeout': 30, 'env_inject': ...})
+    load with the path/timeout dropped and env lifted."""
+    cfg = CliToolConfig.model_validate({
+        "binary": "/usr/local/bin/svc",
+        "timeout": 30,
+        "env_inject": {"K": "v"},
+    })
+    assert cfg.binary.sha256 is None
+    assert cfg.env == {"K": "v"}
+
+
+def test_nested_binary_wins_over_flat_keys():
+    cfg = CliToolConfig.model_validate({
+        "binary": {"sha256": "d" * 64},
+        "binary_sha256": "e" * 64,
+    })
+    assert cfg.binary.sha256 == "d" * 64

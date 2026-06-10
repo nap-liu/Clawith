@@ -84,6 +84,9 @@ class CliToolConfig(BaseModel):
             return {}
 
         binary_sub = _to_subdict(src.pop("binary", None))
+        # Record whether caller explicitly provided an "env" key (even if empty)
+        # before popping it — an explicit env={} must suppress legacy env_inject.
+        has_env = isinstance(data.get("env"), dict)
         env_sub: dict[str, Any] = _to_subdict(src.pop("env", None))
 
         # Legacy nested runtime: only env_inject survives (as env).
@@ -92,7 +95,7 @@ class CliToolConfig(BaseModel):
         # Legacy flat env_inject (M2 / post-M2).
         if not legacy_env:
             legacy_env = src.pop("env_inject", None)
-        if not env_sub and isinstance(legacy_env, dict):
+        if not has_env and isinstance(legacy_env, dict):
             env_sub = dict(legacy_env)
 
         # Legacy sandbox subtree: dropped entirely.
