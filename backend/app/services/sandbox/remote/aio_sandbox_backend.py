@@ -134,6 +134,7 @@ class AioSandboxBackend(BaseSandboxBackend):
                         language=language,
                         cwd=cwd,
                         timeout=timeout,
+                        inject_prefix=kwargs.get("inject_prefix"),
                     )
                 else:
                     return self._error_result(
@@ -164,44 +165,11 @@ class AioSandboxBackend(BaseSandboxBackend):
         language: str,
         cwd: str,
         timeout: int,
+        inject_prefix: str | None = None,
     ) -> ExecutionResult:
         session_id = f"clawith-{anchor}"
-        # Force-reset cwd AND HOME to the agent root on every call. The shell
-        # session persists across calls (so exported env vars / background
-        # processes survive), but the working directory + HOME are statelessly
-        # reset to align with execute_code (subprocess) semantics.
-        #
-        # HOME is the critical one for SSH / git / npm / pip --user / etc. —
-        # the underlying sandbox container has HOME=/home/gem which would be
-        # shared by every agent, so `~/.ssh/id_*` written by one agent would
-        # be readable by another. Pinning HOME=<agent root> makes `ssh user@host`,
-        # `git config --global ...`, `~/.ssh/known_hosts`, etc. all land in the
-        # agent's own private workspace, mirroring a per-user Linux box.
-        # Use a literal-quoted path so unusual chars in agent_id can't escape.
-        quoted_cwd = "'" + cwd.replace("'", "'\\''") + "'"
-        # Package-isolation env vars: PIP_USER=1 makes `pip install xxx`
-        # land in $HOME/.local/... per-agent; NPM_CONFIG_PREFIX redirects
-        # `npm install -g xxx` to $HOME/.npm-global/... per-agent (plain
-        # `npm install xxx` was already per-cwd which is per-agent here).
-        # PATH augmented so any globally-installed npm bin (e.g. `tsc`,
-        # `vite`) is found.
-        # Non-interactive shell env vars: signals every well-behaved CI-aware
-        # tool (npm, yarn, pnpm, npx, prompts, apt, debconf, git over https)
-        # to skip prompts and pick safe defaults. This is the standard CI
-        # contract — not a hack. Tools that ignore these (rare) will still
-        # hit the status:running timeout branch and trigger a session reset.
-        cmd = (
-            f"cd {quoted_cwd} && "
-            f"export HOME={quoted_cwd} && "
-            f"export PIP_USER=1 && "
-            f'export NPM_CONFIG_PREFIX="$HOME/.npm-global" && '
-            f'export PATH="$HOME/.npm-global/bin:$PATH" && '
-            f"export CI=true && "
-            f"export NPM_CONFIG_YES=true && "
-            f"export DEBIAN_FRONTEND=noninteractive && "
-            f"export GIT_TERMINAL_PROMPT=0 && "
-            f"export NO_COLOR=1 && "
-            + self._build_shell_command(code, language)
+        cmd = self._compose_shell_command(
+            cwd=cwd, code=code, language=language, inject_prefix=inject_prefix
         )
 
         body, ok = await self._shell_exec(client, session_id, cmd, timeout)
@@ -343,6 +311,68 @@ class AioSandboxBackend(BaseSandboxBackend):
             )
         body = resp.json()
         return body, bool(body.get("success"))
+
+    @classmethod
+    def _compose_shell_command(
+        cls,
+        *,
+        cwd: str,
+        code: str,
+        language: str,
+        inject_prefix: str | None,
+    ) -> str:
+        """Compose the full per-exec command: env exports → CLI function
+        injection block → user command.
+
+        CLI functions are injected fresh on every exec so identity env
+        (bound inside each function body) always reflects the *current*
+        conversation user — see services/cli_tools/sandbox_inject.py.
+        The prefix may span multiple physical lines (env values can embed
+        newlines); it is always concatenated whole, never line-filtered.
+
+        Force-reset cwd AND HOME to the agent root on every call. The shell
+        session persists across calls (so exported env vars / background
+        processes survive), but the working directory + HOME are statelessly
+        reset to align with execute_code (subprocess) semantics.
+
+        HOME is the critical one for SSH / git / npm / pip --user / etc. —
+        the underlying sandbox container has HOME=/home/gem which would be
+        shared by every agent, so `~/.ssh/id_*` written by one agent would
+        be readable by another. Pinning HOME=<agent root> makes `ssh user@host`,
+        `git config --global ...`, `~/.ssh/known_hosts`, etc. all land in the
+        agent's own private workspace, mirroring a per-user Linux box.
+        Use a literal-quoted path so unusual chars in agent_id can't escape.
+
+        Package-isolation env vars: PIP_USER=1 makes `pip install xxx`
+        land in $HOME/.local/... per-agent; NPM_CONFIG_PREFIX redirects
+        `npm install -g xxx` to $HOME/.npm-global/... per-agent (plain
+        `npm install xxx` was already per-cwd which is per-agent here).
+        PATH augmented so any globally-installed npm bin (e.g. `tsc`,
+        `vite`) is found.
+
+        Non-interactive shell env vars: signals every well-behaved CI-aware
+        tool (npm, yarn, pnpm, npx, prompts, apt, debconf, git over https)
+        to skip prompts and pick safe defaults. This is the standard CI
+        contract — not a hack. Tools that ignore these (rare) will still
+        hit the status:running timeout branch and trigger a session reset.
+        """
+        quoted_cwd = "'" + cwd.replace("'", "'\\''") + "'"
+        exports = (
+            f"cd {quoted_cwd} && "
+            f"export HOME={quoted_cwd} && "
+            f"export PIP_USER=1 && "
+            f'export NPM_CONFIG_PREFIX="$HOME/.npm-global" && '
+            f'export PATH="$HOME/.npm-global/bin:$PATH" && '
+            f"export CI=true && "
+            f"export NPM_CONFIG_YES=true && "
+            f"export DEBIAN_FRONTEND=noninteractive && "
+            f"export GIT_TERMINAL_PROMPT=0 && "
+            f"export NO_COLOR=1"
+        )
+        user_cmd = cls._build_shell_command(code, language)
+        if inject_prefix:
+            return f"{exports} && {inject_prefix}\n{user_cmd}"
+        return f"{exports} && {user_cmd}"
 
     @staticmethod
     def _build_shell_command(code: str, language: str) -> str:
