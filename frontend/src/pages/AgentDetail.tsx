@@ -3224,6 +3224,10 @@ function AgentDetailInner() {
     const wsMapRef = useRef<Record<SessionRuntimeKey, WebSocket>>({});
     const reconnectTimerRef = useRef<Record<SessionRuntimeKey, ReturnType<typeof setTimeout> | null>>({});
     const reconnectDisabledRef = useRef<Record<SessionRuntimeKey, boolean>>({});
+    // Per-session reconnect attempt counter, driving exponential backoff. Reset
+    // to 0 only after a socket proves stable (see onopen) so fast-fail loops back
+    // off instead of hammering every 2s (the WebSocket reconnect-storm fix).
+    const reconnectAttemptsRef = useRef<Record<SessionRuntimeKey, number>>({});
     const sessionUiStateRef = useRef<Record<SessionRuntimeKey, { isWaiting: boolean; isStreaming: boolean }>>({});
     const activeSessionIdRef = useRef<string | null>(null);
     const currentAgentIdRef = useRef<string | undefined>(id);
@@ -3243,6 +3247,7 @@ function AgentDetailInner() {
     const closeSessionSocket = (key: SessionRuntimeKey, disableReconnect = true) => {
         if (disableReconnect) reconnectDisabledRef.current[key] = true;
         clearReconnectTimer(key);
+        reconnectAttemptsRef.current[key] = 0;
         const ws = wsMapRef.current[key];
         if (ws && ws.readyState !== WebSocket.CLOSED) ws.close();
         delete wsMapRef.current[key];
@@ -3915,10 +3920,20 @@ function AgentDetailInner() {
         const scheduleReconnect = () => {
             if (reconnectDisabledRef.current[key]) return;
             clearReconnectTimer(key);
+            // Background tab: do NOT reconnect. A hidden tab that keeps hammering
+            // every 2s is the reconnect-storm amplifier. The visibilitychange
+            // handler resumes the active session the instant it is foregrounded.
+            if (typeof document !== 'undefined' && document.hidden) return;
+            // Exponential backoff with jitter, capped — replaces the old fixed
+            // 2s retry that turned any transient drop into an unbounded storm.
+            const attempt = reconnectAttemptsRef.current[key] || 0;
+            reconnectAttemptsRef.current[key] = attempt + 1;
+            const base = Math.min(30000, 1000 * 2 ** attempt); // 1s,2s,4s,…,30s cap
+            const delay = Math.round(base * (0.75 + Math.random() * 0.5)); // ±25% jitter
             reconnectTimerRef.current[key] = setTimeout(() => {
                 reconnectTimerRef.current[key] = null;
                 if (!reconnectDisabledRef.current[key]) ensureSessionSocket(sess, agentId, authToken);
-            }, 2000);
+            }, delay);
         };
 
         const lang = (i18n.language || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
@@ -3930,6 +3945,14 @@ function AgentDetailInner() {
                 ws.close();
                 return;
             }
+            // Connected — cancel any pending reconnect. Reset the backoff counter
+            // only after the socket proves STABLE (≥3s), so a connection that
+            // opens then immediately drops keeps backing off instead of resetting
+            // to a fast 1s retry loop. Cleared in onclose.
+            clearReconnectTimer(key);
+            (ws as any)._stableTimer = setTimeout(() => {
+                if (wsMapRef.current[key] === ws) reconnectAttemptsRef.current[key] = 0;
+            }, 3000);
             if (currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId) {
                 wsRef.current = ws;
                 setWsConnected(true);
@@ -3942,6 +3965,10 @@ function AgentDetailInner() {
             }
         };
         ws.onclose = (e) => {
+            if ((ws as any)._stableTimer) {
+                clearTimeout((ws as any)._stableTimer);
+                (ws as any)._stableTimer = null;
+            }
             const wasCurrent = wsMapRef.current[key] === ws;
             if (wasCurrent) delete wsMapRef.current[key];
             setSessionUiState(key, { isWaiting: false, isStreaming: false });
@@ -3958,6 +3985,7 @@ function AgentDetailInner() {
             if (e.code === 4003 || e.code === 4002) {
                 reconnectDisabledRef.current[key] = true;
                 clearReconnectTimer(key);
+                reconnectAttemptsRef.current[key] = 0;
                 if (isActiveRuntime && e.code === 4003) setAgentExpired(true);
                 return;
             }
@@ -4249,6 +4277,27 @@ function AgentDetailInner() {
         ensureSessionSocket(activeSession, id, token);
         syncActiveSocketState(activeSession, id);
     }, [id, token, activeTab, activeSession?.id, chatScope, canViewAllAgentChatSessions]);
+
+    // Resume the active session's socket the instant the tab is foregrounded.
+    // scheduleReconnect deliberately no-ops while hidden (storm prevention), so
+    // a tab that dropped in the background needs this kick to reconnect promptly
+    // instead of waiting out a backoff timer.
+    useEffect(() => {
+        const onVisibility = () => {
+            if (document.hidden) return;
+            if (!id || !token || activeTab !== 'chat') return;
+            if (!activeSession || !isWritableSession(activeSession)) return;
+            const key = buildSessionRuntimeKey(id, String(activeSession.id));
+            const ws = wsMapRef.current[key];
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+            // Foreground resume = a fresh, fast reconnect.
+            reconnectAttemptsRef.current[key] = 0;
+            clearReconnectTimer(key);
+            ensureSessionSocket(activeSession, id, token);
+        };
+        document.addEventListener('visibilitychange', onVisibility);
+        return () => document.removeEventListener('visibilitychange', onVisibility);
+    }, [id, token, activeTab, activeSession?.id]);
 
     const handleWorkspacePathDeleted = useCallback((path: string) => {
         let removedName = '';

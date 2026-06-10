@@ -91,6 +91,60 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+async def _await_turn_with_abort(llm_task, recv_json, partial_chunks: list[str]):
+    """Drive a running web turn while listening for abort / disconnect on the socket.
+
+    Returns ``(assistant_response, outcome)`` where ``outcome`` is one of
+    ``"completed" | "aborted" | "disconnected"``.
+
+    Invariant (the "agent gave no reply" fix): a client **disconnect** never
+    cancels the turn. A turn is a unit of work that must run to completion and be
+    persisted, so a reconnecting client sees the reply via history replay — parity
+    with the IM / trigger channels, which are connection-independent. Only an
+    explicit user **abort** cancels the in-flight task.
+
+    ``recv_json`` is a 0-arg coroutine factory (e.g. ``websocket.receive_json``)
+    polled with a short timeout so the loop can notice the task finishing. The
+    turn's streaming callbacks must tolerate a dead socket (see ``safe_send``)
+    so that, after a disconnect, awaiting the task yields the real reply rather
+    than a send error.
+    """
+    import asyncio as _aio
+
+    aborted = False
+    disconnected = False
+    while not llm_task.done():
+        try:
+            msg = await _aio.wait_for(recv_json(), timeout=0.5)
+            if isinstance(msg, dict) and msg.get("type") == "abort":
+                logger.info("[WS] Abort received, cancelling LLM task")
+                llm_task.cancel()
+                aborted = True
+                break
+            # Non-abort messages during generation are ignored; the client should
+            # wait for `done` before sending the next turn.
+        except _aio.TimeoutError:
+            continue
+        except WebSocketDisconnect:
+            # Connection dropped mid-turn — stop listening but DO NOT cancel.
+            disconnected = True
+            break
+
+    if aborted:
+        try:
+            await llm_task
+        except (_aio.CancelledError, Exception):
+            pass
+        partial_text = "".join(partial_chunks).strip()
+        resp = (partial_text + "\n\n*[Generation stopped]*") if partial_text else "*[Generation stopped]*"
+        return resp, "aborted"
+
+    # completed OR disconnected: the task was never cancelled, so it runs to
+    # completion. Await its real result for the caller to persist.
+    resp = await llm_task
+    return resp, ("disconnected" if disconnected else "completed")
+
+
 async def maybe_mark_session_read_for_active_viewer(
     db: AsyncSession,
     *,
@@ -320,10 +374,26 @@ async def websocket_chat(
         return
 
     agent_id_str = str(agent_id)
-    if agent_id_str not in manager.active_connections:
-        manager.active_connections[agent_id_str] = []
-    manager.active_connections[agent_id_str].append((websocket, conv_id, str(user_id)))
-    logger.info(f"[WS] Ready! Agent={agent_name}")
+    _conns = manager.active_connections.setdefault(agent_id_str, [])
+    # Defense-in-depth against reconnect churn: prune dead sockets before
+    # registering so a flapping client can't pile up stale tuples (each would get
+    # duplicate pushes from send_to_session/send_to_user). Checks BOTH states —
+    # client_state catches a client that already dropped (relevant now that a
+    # turn runs to completion *after* disconnect, leaving the old handler — and
+    # its tuple — lingering for seconds), application_state catches one the
+    # server has closed. A live CONNECTED socket has neither flag set, so
+    # multi-tab connections are preserved; only genuinely-dead ones are dropped.
+    from starlette.websockets import WebSocketState as _WSState
+
+    def _ws_dead(ws) -> bool:
+        return (
+            getattr(ws, "client_state", None) == _WSState.DISCONNECTED
+            or getattr(ws, "application_state", None) == _WSState.DISCONNECTED
+        )
+
+    _conns[:] = [(ws, sid, uid) for ws, sid, uid in _conns if not _ws_dead(ws)]
+    _conns.append((websocket, conv_id, str(user_id)))
+    logger.info(f"[WS] Ready! Agent={agent_name} (live conns for agent: {len(_conns)})")
 
     # Send session_id to frontend so Take Control can reference the correct session.
     await websocket.send_json({"type": "connected", "session_id": conv_id})
@@ -543,6 +613,26 @@ async def websocket_chat(
                         llm_model = fallback_llm_model
                         fallback_llm_model = None
 
+            # Set true when the browser dropped mid-turn: the turn still runs to
+            # completion + persists, then we tear the handler down cleanly.
+            client_disconnected = False
+
+            # Broadcast turn output to EVERY live connection viewing this session
+            # — not just the socket that started the turn — so other tabs and
+            # freshly-opened views of an in-flight session see the stream live
+            # (the "connection = subscriber" model). send_to_session is
+            # best-effort per connection and tolerates zero live connections, so:
+            #   (a) the turn still runs to completion + persists after the driver
+            #       drops mid-turn (the disconnect fix), and
+            #   (b) a single-tab session behaves exactly as before — the lone
+            #       driving socket is the only subscriber.
+            # Defined outside the model branch so the final `done` always uses it.
+            async def safe_send(payload: dict):
+                try:
+                    await manager.send_to_session(str(agent_id), conv_id, payload)
+                except Exception:
+                    pass
+
             # Call LLM with streaming
             if effective_llm_model:
                 try:
@@ -577,7 +667,7 @@ async def websocket_chat(
                                 # record so subsequent sessions (or other open
                                 # tabs) see onboarded_for_me=true and skip the
                                 # kickoff effect.
-                                await websocket.send_json({
+                                await safe_send({
                                     "type": "onboarded",
                                     "agent_id": str(agent_id),
                                 })
@@ -587,7 +677,7 @@ async def websocket_chat(
                     async def stream_to_ws(text: str):
                         """Send each chunk to client in real-time."""
                         partial_chunks.append(text)
-                        await websocket.send_json({"type": "chunk", "content": text})
+                        await safe_send({"type": "chunk", "content": text})
                         await maybe_mark_onboarding_progress()
                     
                     async def tool_call_to_ws(data: dict):
@@ -656,7 +746,7 @@ async def websocket_chat(
                         # raw below so persist_tool_call stores the real args (the LLM
                         # replays them — masking storage poisons the model).
                         _ws_data = {**data, "args": sanitize_tool_args(data.get("args"))} if "args" in data else data
-                        await websocket.send_json({"type": "tool_call", **_ws_data})
+                        await safe_send({"type": "tool_call", **_ws_data})
                         # Persist completed tool calls via the shared writer — the
                         # SAME canonical schema every IM channel uses (single source
                         # of truth: args stored RAW for LLM replay, masked only at
@@ -688,7 +778,7 @@ async def websocket_chat(
                     async def thinking_to_ws(text: str):
                         """Send thinking chunks to client for collapsible display."""
                         thinking_content.append(text)
-                        await websocket.send_json({"type": "thinking", "content": text})
+                        await safe_send({"type": "thinking", "content": text})
 
                     _workspace_draft_cache: dict[str, str] = {}
 
@@ -721,7 +811,7 @@ async def websocket_chat(
                             return
                         _workspace_draft_cache[draft_id] = raw_args
 
-                        await websocket.send_json(
+                        await safe_send(
                             {
                                 "type": "workspace_draft",
                                 "id": draft_id,
@@ -738,7 +828,7 @@ async def websocket_chat(
                         nonlocal needs_onboarding_mark, onboarding_target_phase, conversation
 
                         async def _on_failover(reason: str):
-                            await websocket.send_json({"type": "info", "content": f"Primary model error, {reason}"})
+                            await safe_send({"type": "info", "content": f"Primary model error, {reason}"})
 
                         # Pre-flight compaction: if the about-to-be-sent prompt is
                         # near the model window, compact NOW and rebuild conversation
@@ -829,41 +919,26 @@ async def websocket_chat(
 
                     llm_task = _aio.create_task(_call_with_failover())
 
-                    # Listen for abort while LLM is running
-                    aborted = False
-                    while not llm_task.done():
-                        try:
-                            msg = await _aio.wait_for(
-                                websocket.receive_json(), timeout=0.5
-                            )
-                            if msg.get("type") == "abort":
-                                logger.info(f"[WS] Abort received, cancelling LLM task")
-                                llm_task.cancel()
-                                aborted = True
-                                break
-                            # Non-abort messages during generation are ignored;
-                            # the client should wait for `done` before sending next.
-                        except _aio.TimeoutError:
-                            continue
-                        except WebSocketDisconnect:
-                            llm_task.cancel()
-                            raise
-
-                    if aborted:
-                        # Wait for task to finish cancelling
-                        try:
-                            await llm_task
-                        except (_aio.CancelledError, Exception):
-                            pass
-                        partial_text = "".join(partial_chunks).strip()
-                        if partial_text:
-                            assistant_response = partial_text + "\n\n*[Generation stopped]*"
-                        else:
-                            assistant_response = "*[Generation stopped]*"
-                        logger.info(f"[WS] LLM aborted, partial: {assistant_response[:80]}")
+                    # Drive the turn to completion while listening for abort /
+                    # disconnect. A disconnect does NOT cancel the turn — it runs
+                    # to completion and is persisted below, so a reconnecting
+                    # client sees the reply via history replay (parity with the
+                    # connection-independent IM / trigger channels). Only an
+                    # explicit user abort cancels.
+                    assistant_response, _turn_outcome = await _await_turn_with_abort(
+                        llm_task, websocket.receive_json, partial_chunks
+                    )
+                    aborted = _turn_outcome == "aborted"
+                    client_disconnected = _turn_outcome == "disconnected"
+                    if client_disconnected:
+                        logger.info(
+                            f"[WS] Client disconnected mid-turn — turn finished detached, "
+                            f"persisting reply: {str(assistant_response)[:80]}"
+                        )
+                    elif aborted:
+                        logger.info(f"[WS] LLM aborted, partial: {str(assistant_response)[:80]}")
                     else:
-                        assistant_response = await llm_task
-                        logger.info(f"[WS] LLM response: {assistant_response[:80]}")
+                        logger.info(f"[WS] LLM response: {str(assistant_response)[:80]}")
 
                     # call_llm returns error strings instead of raising — detect and
                     # re-raise so the fallback model logic below can trigger correctly.
@@ -955,8 +1030,17 @@ async def websocket_chat(
                 await db.commit()
             logger.info("[WS] Assistant message saved")
 
-            # Final 'done' packet
-            await websocket.send_json({"type": "done", "role": "assistant", "content": assistant_response})
+            # Final 'done' packet — best-effort; a client that dropped mid-turn
+            # gets the reply via history replay on reconnect instead.
+            await safe_send({"type": "done", "role": "assistant", "content": assistant_response})
+
+            # The browser dropped mid-turn: we finished + persisted the reply
+            # detached. Tear down cleanly instead of looping back into receive
+            # (which would raise) — same cleanup as the WebSocketDisconnect path.
+            if client_disconnected:
+                logger.info(f"[WS] Detached turn complete after disconnect; closing handler for {user_id}")
+                manager.disconnect(str(agent_id), websocket)
+                break
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Client disconnected: {user_id}")
