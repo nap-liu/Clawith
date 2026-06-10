@@ -6,6 +6,10 @@ const labelStyle: React.CSSProperties = {
   display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px',
 };
 
+const hintStyle: React.CSSProperties = {
+  fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px',
+};
+
 const actionsRow: React.CSSProperties = {
   display: 'flex', gap: '8px', marginTop: '4px',
   justifyContent: 'flex-end',
@@ -54,7 +58,7 @@ export function BasicInfoStep({
           placeholder={k('fieldNamePlaceholder', 'unique_identifier')}
         />
         {tool?.id && (
-          <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+          <div style={hintStyle}>
             {k('fieldNameLocked', 'Locked after creation.')}
           </div>
         )}
@@ -82,6 +86,9 @@ export function BasicInfoStep({
           style={{ resize: 'vertical' }}
           placeholder={k('fieldDescriptionPlaceholder', 'What this tool does and when to call it')}
         />
+        <div style={hintStyle}>
+          {k('fieldDescriptionHint', '将作为 agent 的命令使用说明(显示在沙箱工具文档里)')}
+        </div>
       </div>
 
       {err && (

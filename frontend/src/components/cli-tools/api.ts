@@ -3,8 +3,6 @@
 import type {
   BinaryVersion,
   CliTool,
-  RuntimeConfig,
-  SandboxConfig,
   TestRunRequest,
   TestRunResponse,
 } from './types';
@@ -17,18 +15,14 @@ export interface CliToolCreateBody {
   name: string;
   display_name: string;
   description?: string;
-  parameters_schema?: Record<string, unknown>;
-  runtime?: RuntimeConfig;
-  sandbox?: SandboxConfig;
+  env?: Record<string, string>;
   tenant_id?: string | null;
 }
 
 export interface CliToolUpdateBody {
   display_name?: string;
   description?: string;
-  parameters_schema?: Record<string, unknown>;
-  runtime?: RuntimeConfig;
-  sandbox?: SandboxConfig;
+  env?: Record<string, string>;
   is_active?: boolean;
 }
 

@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { CliTool } from './types';
-import { defaultRuntimeConfig, defaultSandboxConfig } from './types';
 import { cliToolsApi } from './api';
 import { BasicInfoStep } from './steps/BasicInfoStep';
 import { BinaryStep } from './steps/BinaryStep';
@@ -21,9 +20,8 @@ export function CliToolWizard({
   const [draft, setDraft] = useState<CliTool | null>(tool);
 
   // Basic-info submission carries only name / display_name / description.
-  // Binary metadata is never created-or-edited here; it appears later
-  // through the upload endpoint. Runtime + sandbox are seeded with the
-  // admin-editable defaults so the post-create row is immediately valid.
+  // Binary metadata is managed separately through the upload endpoint.
+  // Env injection is configured in the final step.
   const ensurePersisted = async (partial: Partial<CliTool>): Promise<CliTool> => {
     if (draft?.id) {
       const updated = await cliToolsApi.update(draft.id, {
@@ -40,9 +38,6 @@ export function CliToolWizard({
       name: partial.name,
       display_name: partial.display_name,
       description: partial.description ?? '',
-      parameters_schema: {},
-      runtime: defaultRuntimeConfig(),
-      sandbox: defaultSandboxConfig(),
     });
     setDraft(created);
     return created;
@@ -51,7 +46,7 @@ export function CliToolWizard({
   const labels = [
     t('enterprise.cliTools.wizard.stepBasic', 'Basic info'),
     t('enterprise.cliTools.wizard.stepBinary', 'Binary'),
-    t('enterprise.cliTools.wizard.stepConfig', 'Configuration & test'),
+    t('enterprise.cliTools.wizard.stepConfig', 'Env & test'),
   ];
 
   const title = draft?.display_name || t('enterprise.cliTools.addButton', 'Add CLI Tool');
@@ -98,7 +93,7 @@ export function CliToolWizard({
         {/* Step indicator — clickable once the draft has been persisted
             (i.e. opened in edit mode, or step 1 just submitted). Before
             that, jumping forward is meaningless because there's nothing
-            to configure a binary/schema against. */}
+            to configure a binary/env against. */}
         <div style={{ display: 'flex', gap: '4px', marginBottom: '16px', fontSize: '12px' }}>
           {labels.map((label, idx) => {
             const n = (idx + 1) as Step;

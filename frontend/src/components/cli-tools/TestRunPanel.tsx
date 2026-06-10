@@ -9,8 +9,7 @@ const labelStyle: React.CSSProperties = {
 
 export function TestRunPanel({ tool }: { tool: CliTool }) {
   const { t } = useTranslation();
-  const [paramsText, setParamsText] = useState('{}');
-  const [mockEnvText, setMockEnvText] = useState('{}');
+  const [command, setCommand] = useState('');
   const [result, setResult] = useState<TestRunResponse | null>(null);
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -22,12 +21,7 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
     setResult(null);
     setRunning(true);
     try {
-      const params = JSON.parse(paramsText);
-      const mock = JSON.parse(mockEnvText);
-      const res = await cliToolsApi.testRun(tool.id, {
-        params,
-        mock_env: Object.keys(mock).length ? mock : undefined,
-      });
+      const res = await cliToolsApi.testRun(tool.id, { command });
       setResult(res);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -43,35 +37,22 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
         <button
           className="btn btn-primary"
           style={{ padding: '4px 12px', fontSize: '12px' }}
-          disabled={running || !tool.config.binary.sha256}
+          disabled={running || !tool.config.binary.sha256 || !command.trim()}
           onClick={run}
         >
           {running ? k('running', 'Running…') : k('run', 'Run')}
         </button>
       </div>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-        <div>
-          <label style={labelStyle}>{k('paramsLabel', 'Params (JSON)')}</label>
-          <textarea
-            className="form-input"
-            value={paramsText}
-            onChange={(e) => setParamsText(e.target.value)}
-            rows={2}
-            style={{ fontFamily: 'monospace', resize: 'vertical' }}
-          />
-        </div>
-        <div>
-          <label style={labelStyle}>{k('mockEnvLabel', 'Mock env (JSON)')}</label>
-          <textarea
-            className="form-input"
-            value={mockEnvText}
-            onChange={(e) => setMockEnvText(e.target.value)}
-            rows={2}
-            style={{ fontFamily: 'monospace', resize: 'vertical' }}
-            placeholder={k('mockEnvPlaceholder', '{} to use stored values')}
-          />
-        </div>
+      <div>
+        <label style={labelStyle}>{k('commandLabel', 'Command')}</label>
+        <input
+          className="form-input"
+          value={command}
+          onChange={(e) => setCommand(e.target.value)}
+          placeholder={k('commandPlaceholder', 'svc --version')}
+          style={{ fontFamily: 'monospace' }}
+        />
       </div>
 
       {!tool.config.binary.sha256 && (
@@ -89,9 +70,9 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
           <div style={{ color: 'var(--text-secondary)' }}>
             {k('exitCode', 'exit_code')}: <code>{result.exit_code}</code> · {result.duration_ms} {k('duration', 'ms')}
           </div>
-          {result.error_class && (
+          {result.error_message && (
             <div style={{ color: 'var(--danger, #ff3b30)', marginTop: '4px' }}>
-              [{result.error_class}] {result.error_message}
+              {result.error_message}
             </div>
           )}
           {result.stdout && (
