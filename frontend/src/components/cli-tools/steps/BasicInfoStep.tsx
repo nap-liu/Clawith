@@ -87,7 +87,7 @@ export function BasicInfoStep({
           placeholder={k('fieldDescriptionPlaceholder', 'What this tool does and when to call it')}
         />
         <div style={hintStyle}>
-          {k('fieldDescriptionHint', '将作为 agent 的命令使用说明(显示在沙箱工具文档里)')}
+          {k('fieldDescriptionHint', 'Shown to the agent as usage docs for this command (in the sandbox tool description)')}
         </div>
       </div>
 

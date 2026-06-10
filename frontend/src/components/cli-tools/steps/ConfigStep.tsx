@@ -58,7 +58,7 @@ export function ConfigStep({
           <code>$user.email</code> <code>$agent.id</code>{' '}
           <code>$tenant.id</code> <code>$state.dir</code>{' '}
           <span style={{ color: 'var(--text-tertiary)' }}>
-            ({k('envStateDirHint', '每用户持久状态目录')})
+            ({k('envStateDirHint', 'per-user persistent state directory')})
           </span>
         </div>
       </div>
