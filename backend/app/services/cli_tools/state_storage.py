@@ -1,15 +1,22 @@
 """Per-(tenant, tool, user) persistent HOME for stateful CLIs.
 
 Scope choice — why (tenant, tool, user):
-  * tool-only would let User A see User B's svc login token. Security
-    boundary violation.
-  * user-only would let svc read git's config and vice versa. Not a
-    safety issue, but it corrupts cache semantics and makes upgrade
-    stories (tool-specific cache invalidation) impossible.
-  * (tool, user) is the smallest safe unit: same person using the same
-    tool in two conversations should keep their login.
-  * tenant is the outer namespace to keep tools from different companies
-    fully isolated even if tool IDs or user IDs ever collide.
+  * user-only would let svc read git's config and vice versa. It
+    corrupts cache semantics and makes upgrade stories (tool-specific
+    cache invalidation) impossible.
+  * (tool, user) is the correct cache unit: same person using the same
+    tool in two conversations should keep their login; different tools
+    must not share each other's caches.
+  * tenant is the outer namespace to prevent ID collisions when the same
+    tool ID or user ID appears across different companies.
+
+  NOTE on isolation: this layout provides cache-correctness scoping, NOT
+  security isolation. Every leaf is chown'd to the same sandbox uid
+  (gem=1000) and the volume is mounted whole into the shared sandbox, so
+  any process there can read every other user's leaf. This is an accepted
+  boundary for the trusted-agent use-case (spec v4 §1.3): agents already
+  run with sudo inside the sandbox, so per-user DAC isolation is not a
+  meaningful guarantee here.
 
 Layout on disk (inside the backend container; volume is bind-mounted at
 `/data/cli_state`; the aio-sandbox container mounts the same volume at
@@ -27,8 +34,9 @@ Permission model:
     new subtrees freely.
   * Each leaf directory is chown'd to 1000:1000 (aio-sandbox user 'gem')
     so the sandbox shell can write token caches inside it.
-  * Intermediate tenant/tool directories stay root-owned so gem cannot
-    traverse sideways into other users' leaves.
+  * Intermediate tenant/tool directories use mode 2775 (other=r-x), so
+    gem can traverse and enumerate them. This is intentional: per-user
+    DAC isolation is not enforced at this layer (see NOTE above).
 """
 
 from __future__ import annotations
@@ -61,10 +69,11 @@ def _dir_size_bytes(path: Path) -> int:
 
 
 class StateStorage:
-    """Resolve and ensure the on-disk HOME for a given (tool, user).
+    """Resolve and ensure the on-disk state directory for a given (tool, user).
 
-    The returned path is the *container-visible* path; BinaryRunner's
-    HostPathResolver handles the translation to the docker daemon's view.
+    The returned path is container-visible and needs no translation: the
+    aio-sandbox container mounts the same volume at the same path
+    (/data/cli_state), so paths rendered here are valid inside the sandbox.
     """
 
     def __init__(self, root: Path | None = None) -> None:
@@ -83,8 +92,8 @@ class StateStorage:
 
         Also chowns the leaf to 1000:1000 (aio-sandbox user 'gem') so
         the sandbox shell can write token caches inside it. Intermediate
-        tenant/tool directories are left root-owned so gem cannot
-        traverse sideways into other users' leaves.
+        tenant/tool directories use mode 2775 and are traversable by gem;
+        see module docstring NOTE on isolation for why that is accepted.
         """
         # UUIDs are the only values we accept; stringify defensively.
         tenant_segment = str(tenant_id) if tenant_id is not None else "_global"
@@ -101,8 +110,8 @@ class StateStorage:
 
         # `mkdir` + `chmod` rather than passing mode= directly, because
         # `mode` is masked by the process umask and we need group-write
-        # reliably. 0o2775 (setgid + owner/group rwx) keeps intermediate
-        # dirs root-owned while still being traversable by the backend.
+        # reliably. 0o2775 (setgid + owner/group rwx, other=r-x) makes
+        # all levels traversable by the sandbox user gem (uid 1000).
         for path in (
             self._root / tenant_segment,
             self._root / tenant_segment / tool_segment,
