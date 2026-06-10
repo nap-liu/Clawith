@@ -62,8 +62,8 @@ def _tenant_key(tool: Tool) -> str:
 def _project_binary_into_config(tool: Tool, version: CliToolBinaryVersion) -> None:
     """Rewrite ``tool.config.binary`` to mirror ``version``.
 
-    Runtime / sandbox subtrees are preserved byte-for-byte — this is the
-    only way we ever set binary metadata, and it must never clobber
+    The ``env`` subtree is preserved byte-for-byte — this is the only
+    place we ever set binary metadata, and it must never clobber
     admin-owned config.
     """
     existing = CliToolConfig.model_validate(tool.config or {})
@@ -74,8 +74,7 @@ def _project_binary_into_config(tool: Tool, version: CliToolBinaryVersion) -> No
             original_name=version.original_name,
             uploaded_at=version.uploaded_at,
         ),
-        runtime=existing.runtime,
-        sandbox=existing.sandbox,
+        env=existing.env,
     ).model_dump(mode="json")
 
 

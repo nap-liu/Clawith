@@ -46,9 +46,40 @@ from app.services.cli_tools.errors import CliToolError
 from app.services.cli_tools.schema import (
     BinaryMetadata,
     CliToolConfig,
-    RuntimeConfig,
-    SandboxConfig,
 )
+
+# ---------------------------------------------------------------------------
+# Legacy request-schema helpers (Task 8 will replace these with v5 env-based
+# equivalents; kept here so the API remains importable and backward-compatible
+# with existing UIs until the PATCH/CREATE endpoints are slimmed down).
+# ---------------------------------------------------------------------------
+from pydantic import field_validator as _fv  # noqa: F401 — avoid re-import collision
+
+
+class RuntimeConfig(BaseModel):
+    """Subprocess-era runtime knobs.  Accepted on PATCH/CREATE; silently
+    dropped when writing the v5 config (only env survives via legacy lift).
+    Remove in Task 8 when PATCH/CREATE bodies switch to ``env``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    args_template: list[str] = Field(default_factory=list)
+    env_inject: dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: int = 30
+    persistent_home: bool = False
+    rate_limit_per_minute: Optional[int] = None
+    home_quota_mb: Optional[int] = None
+
+
+class SandboxConfig(BaseModel):
+    """Subprocess-era sandbox knobs.  Accepted on PATCH/CREATE for
+    backward compat; silently dropped by the v5 CliToolConfig validator.
+    Remove in Task 8."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    cpu_limit: Optional[str] = None
+    memory_limit: Optional[str] = None
 from app.services.cli_tools.state_storage import StateStorage
 from app.services.cli_tools.storage import (
     BinaryStorage,

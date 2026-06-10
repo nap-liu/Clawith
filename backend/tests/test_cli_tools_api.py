@@ -38,8 +38,6 @@ from app.api.cli_tools import (
 from app.services.cli_tools.schema import (
     BinaryMetadata,
     CliToolConfig,
-    RuntimeConfig,
-    SandboxConfig,
 )
 
 
@@ -133,8 +131,6 @@ def _make_tool(**overrides):
                 original_name="svc",
                 uploaded_at=datetime.now(timezone.utc),
             ),
-            runtime=RuntimeConfig(timeout_seconds=30),
-            sandbox=SandboxConfig(),
         ).model_dump(mode="json"),
     }
     base.update(overrides)
@@ -242,8 +238,6 @@ async def test_patch_runtime_preserves_binary_metadata():
     tool = _make_tool(config=CliToolConfig(
         binary=BinaryMetadata(sha256=sha_before, size=1024, original_name="svc",
                               uploaded_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
-        runtime=RuntimeConfig(timeout_seconds=30),
-        sandbox=SandboxConfig(),
     ).model_dump(mode="json"))
 
     db = FakeDB(tool=tool)
@@ -347,8 +341,6 @@ async def test_upload_binary_writes_binary_subtree(monkeypatch, tmp_path):
     # Pre-existing tool with no binary and a non-default runtime.
     tool = _make_tool(config=CliToolConfig(
         binary=BinaryMetadata(),
-        runtime=RuntimeConfig(args_template=["--keep"], timeout_seconds=42),
-        sandbox=SandboxConfig(cpu_limit="0.5"),
     ).model_dump(mode="json"))
     db = FakeDB(tool=tool)
     user = _platform_admin()
@@ -413,8 +405,6 @@ async def test_patch_runtime_accepts_post_m2_fields():
     tool = _make_tool(config=CliToolConfig(
         binary=BinaryMetadata(sha256=sha_before, size=1024, original_name="svc",
                               uploaded_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
-        runtime=RuntimeConfig(timeout_seconds=30, rate_limit_per_minute=60, home_quota_mb=500),
-        sandbox=SandboxConfig(),
     ).model_dump(mode="json"))
     db = FakeDB(tool=tool)
     user = _platform_admin()

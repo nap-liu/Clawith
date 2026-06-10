@@ -22,14 +22,13 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.models.cli_tool_binary import CliToolBinaryVersion
+import app.models.mcp_server  # noqa: F401 — registers mcp_servers in metadata so Tool FK resolves
 from app.models.tool import Tool
 from app.models.user import User  # noqa: F401 — registers users table for FK resolution
 from app.services.cli_tools import versioning as versioning_service
 from app.services.cli_tools.schema import (
     BinaryMetadata,
     CliToolConfig,
-    RuntimeConfig,
-    SandboxConfig,
 )
 from app.services.cli_tools.storage import BinaryStorage
 
@@ -52,6 +51,12 @@ async def engine():
         # table name.
         await conn.execute(text(
             "CREATE TABLE users (id TEXT PRIMARY KEY)"
+        ))
+        # Stub table for the FK on tools.mcp_server_id (the column was
+        # added after this test was written; only the PK is needed so the
+        # FK constraint resolves when tools is created below).
+        await conn.execute(text(
+            "CREATE TABLE mcp_servers (id TEXT PRIMARY KEY)"
         ))
         # Create the tool + version tables through the ORM metadata so
         # column types (especially UUID <-> TEXT) match what the service
@@ -79,8 +84,6 @@ async def session(engine):
 async def _insert_tool(session: AsyncSession, *, tenant_id=None) -> Tool:
     config = CliToolConfig(
         binary=BinaryMetadata(),
-        runtime=RuntimeConfig(),
-        sandbox=SandboxConfig(),
     ).model_dump(mode="json")
     tool = Tool(
         id=uuid.uuid4(),
