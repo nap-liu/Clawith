@@ -12,20 +12,23 @@ Scope choice — why (tenant, tool, user):
     fully isolated even if tool IDs or user IDs ever collide.
 
 Layout on disk (inside the backend container; volume is bind-mounted at
-`/data/cli_state`, host-mapped via HostPathResolver for the sandbox):
+`/data/cli_state`; the aio-sandbox container mounts the same volume at
+`/data/cli_state` (same path as backend)):
 
     /data/cli_state/
       <tenant_id>/
         <tool_id>/
-          <user_id>/           <- mounted read-write at /home/sandbox
+          <user_id>/           <- HOME for the sandbox shell
             .config/...        <- whatever the binary decides to write
             .cache/...
 
 Permission model:
-  * The root (`/data/cli_state`) is clawith:clawith rwx so the backend
-    (uid 1000) can `mkdir` new subtrees (see entrypoint.sh).
-  * Each leaf directory is chown'd to 65534:65534 (nobody) so the
-    sandbox can write inside it.
+  * The backend process runs as root (uid 0) and can `mkdir`/`chown`
+    new subtrees freely.
+  * Each leaf directory is chown'd to 1000:1000 (aio-sandbox user 'gem')
+    so the sandbox shell can write token caches inside it.
+  * Intermediate tenant/tool directories stay root-owned so gem cannot
+    traverse sideways into other users' leaves.
 """
 
 from __future__ import annotations
@@ -38,8 +41,8 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_SANDBOX_UID = 65534
-_SANDBOX_GID = 65534
+_SANDBOX_UID = 1000  # aio-sandbox shell user 'gem'
+_SANDBOX_GID = 1000
 
 
 def _dir_size_bytes(path: Path) -> int:
@@ -78,9 +81,10 @@ class StateStorage:
     ) -> Path:
         """Create the `<tenant>/<tool>/<user>` dir if missing, return it.
 
-        Also chowns the leaf to 65534:65534 so the sandbox (running as
-        nobody) can write inside it. The intermediate tenant/tool dirs
-        stay clawith-owned so nobody can't traverse sideways.
+        Also chowns the leaf to 1000:1000 (aio-sandbox user 'gem') so
+        the sandbox shell can write token caches inside it. Intermediate
+        tenant/tool directories are left root-owned so gem cannot
+        traverse sideways into other users' leaves.
         """
         # UUIDs are the only values we accept; stringify defensively.
         tenant_segment = str(tenant_id) if tenant_id is not None else "_global"
@@ -97,9 +101,8 @@ class StateStorage:
 
         # `mkdir` + `chmod` rather than passing mode= directly, because
         # `mode` is masked by the process umask and we need group-write
-        # reliably. The root is setgid with gid 65534, so new leaves
-        # inherit gid 65534; setting mode 2775 (setgid + group rwx) is
-        # what lets the sandbox (uid 65534) write inside its own leaf.
+        # reliably. 0o2775 (setgid + owner/group rwx) keeps intermediate
+        # dirs root-owned while still being traversable by the backend.
         for path in (
             self._root / tenant_segment,
             self._root / tenant_segment / tool_segment,
@@ -114,6 +117,13 @@ class StateStorage:
                 # loudly on first write if the perms are actually wrong,
                 # which is easier to debug than a silent fix here.
                 logger.debug("cli-tools: chmod skipped for %s", path)
+        try:
+            os.chown(leaf, _SANDBOX_UID, _SANDBOX_GID)
+        except PermissionError:
+            # Non-root dev environments can't chown; the sandbox will
+            # fail loudly on first write if perms are actually wrong,
+            # which is easier to debug than a silent fix here.
+            logger.debug("cli-tools: chown skipped for %s", leaf)
         return leaf
 
     def _leaf_path(

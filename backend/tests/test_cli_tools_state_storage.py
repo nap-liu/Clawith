@@ -90,3 +90,18 @@ def test_ensure_home_respects_env_root(state_root, monkeypatch):
     s = StateStorage()  # no explicit root → read from env
     leaf = s.ensure_home(tenant_id=None, tool_id=uuid.uuid4(), user_id=uuid.uuid4())
     assert str(leaf).startswith(str(state_root))
+
+
+def test_ensure_home_chowns_leaf_to_sandbox_gem(tmp_path, monkeypatch):
+    """Leaf must be owned by uid/gid 1000 (aio-sandbox 'gem') so the
+    sandbox shell can write token caches inside it."""
+    from app.services.cli_tools import state_storage as mod
+
+    calls: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(mod.os, "chown", lambda p, u, g: calls.append((str(p), u, g)))
+
+    store = mod.StateStorage(root=tmp_path)
+    leaf = store.ensure_home(tenant_id="t1", tool_id="tool1", user_id="u1")
+
+    assert leaf == (tmp_path / "t1" / "tool1" / "u1").resolve()
+    assert (str(leaf), 1000, 1000) in calls
