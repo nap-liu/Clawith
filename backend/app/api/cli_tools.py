@@ -29,7 +29,6 @@ import os
 import time
 import uuid
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
@@ -42,51 +41,18 @@ from app.database import get_db
 from app.models.audit import AuditLog
 from app.models.tool import Tool
 from app.models.user import User
-from app.services.cli_tools.errors import CliToolError
 from app.services.cli_tools.schema import (
     BinaryMetadata,
     CliToolConfig,
 )
 from app.services.cli_tools.state_storage import StateStorage
 from app.services.cli_tools.storage import (
+    BINARY_ROOT,
     BinaryStorage,
     MagicNumberError,
     SizeLimitExceededError,
 )
 from app.services.cli_tools import versioning as versioning_service
-
-
-# ---------------------------------------------------------------------------
-# Legacy request-schema shims (Task 8 will replace these with v5 env-based
-# equivalents; kept here so the API remains importable and backward-compatible
-# with existing UIs until the PATCH/CREATE endpoints are slimmed down).
-# ---------------------------------------------------------------------------
-
-
-class RuntimeConfig(BaseModel):
-    """Subprocess-era runtime knobs.  Accepted on PATCH/CREATE; silently
-    dropped when writing the v5 config (only env survives via legacy lift).
-    Remove in Task 8 when PATCH/CREATE bodies switch to ``env``."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    args_template: list[str] = Field(default_factory=list)
-    env_inject: Optional[dict[str, str]] = None
-    timeout_seconds: int = 30
-    persistent_home: bool = False
-    rate_limit_per_minute: Optional[int] = None
-    home_quota_mb: Optional[int] = None
-
-
-class SandboxConfig(BaseModel):
-    """Subprocess-era sandbox knobs.  Accepted on PATCH/CREATE for
-    backward compat; silently dropped by the v5 CliToolConfig validator.
-    Remove in Task 8."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    cpu_limit: Optional[str] = None
-    memory_limit: Optional[str] = None
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +65,7 @@ router = APIRouter(prefix="/tools/cli", tags=["cli-tools"])
 # binaries need a higher cap. Read once at import — change it in compose/.env
 # and restart the backend to take effect.
 _BINARY_MAX_BYTES = int(os.getenv("CLI_BINARY_MAX_BYTES", str(100 * 1024 * 1024)))
-_STORAGE_ROOT = Path("/data/cli_binaries")
+_STORAGE_ROOT = BINARY_ROOT
 
 
 def _require_manage(user: User, tool: Optional[Tool] = None) -> None:
@@ -137,36 +103,25 @@ def _audit(db: AsyncSession, user: User, action: str, tool: Tool, detail: dict |
 
 
 class CliToolCreate(BaseModel):
-    """Create body. Binary metadata is intentionally absent — uploads go
-    through POST /tools/cli/{id}/binary after creation."""
+    """Create body. Binary uploads go through POST /tools/cli/{id}/binary."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=100)
     display_name: str = Field(min_length=1, max_length=200)
     description: str = ""
-    parameters_schema: dict = Field(default_factory=dict)
-    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
-    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    env: dict[str, str] = Field(default_factory=dict)
     tenant_id: Optional[uuid.UUID] = None
 
 
 class CliToolUpdate(BaseModel):
-    """Patch body. Deliberately does not accept ``binary`` or ``config``.
-
-    ``extra="forbid"`` means any attempt to slip a ``binary`` (or a full
-    ``config``) dict through this endpoint fails at the parser level with
-    HTTP 422 — the sandbox's on-disk binary can only be changed by the
-    upload endpoint, which writes binary metadata itself and audits it.
-    """
+    """Patch body. ``binary`` stays system-owned (extra=forbid rejects it)."""
 
     model_config = ConfigDict(extra="forbid")
 
     display_name: Optional[str] = None
     description: Optional[str] = None
-    parameters_schema: Optional[dict] = None
-    runtime: Optional[RuntimeConfig] = None
-    sandbox: Optional[SandboxConfig] = None
+    env: Optional[dict[str, str]] = None
     is_active: Optional[bool] = None
 
 
@@ -178,13 +133,11 @@ class CliToolOut(BaseModel):
     type: str
     tenant_id: Optional[uuid.UUID]
     is_active: bool
-    parameters_schema: dict
-    config: dict  # nested shape: {"binary": ..., "runtime": ..., "sandbox": ...}
+    config: dict  # nested shape: {"binary": ..., "env": ...}
 
 
 class TestRunRequest(BaseModel):
-    params: dict = Field(default_factory=dict)
-    mock_env: Optional[dict[str, str]] = None
+    command: str = Field(min_length=1, max_length=2000)
 
 
 class TestRunResponse(BaseModel):
@@ -192,12 +145,11 @@ class TestRunResponse(BaseModel):
     stdout: str
     stderr: str
     duration_ms: int
-    error_class: Optional[str] = None
     error_message: Optional[str] = None
 
 
 def _to_out(tool: Tool) -> CliToolOut:
-    """Normalise stored config to the new nested shape for the response.
+    """Normalise stored config to the v5 nested shape for the response.
 
     Reading through ``CliToolConfig.model_validate`` lifts any legacy
     flat keys into their subtree so the API contract is stable even for
@@ -212,7 +164,6 @@ def _to_out(tool: Tool) -> CliToolOut:
         type=tool.type,
         tenant_id=tool.tenant_id,
         is_active=tool.enabled,
-        parameters_schema=tool.parameters_schema,
         config=cfg,
     )
 
@@ -247,8 +198,7 @@ async def create_cli_tool(
     # Binary metadata starts empty — upload endpoint fills it in.
     initial_config = CliToolConfig(
         binary=BinaryMetadata(),
-        runtime=body.runtime,
-        sandbox=body.sandbox,
+        env=body.env,
     ).model_dump(mode="json")
 
     tool = Tool(
@@ -258,7 +208,7 @@ async def create_cli_tool(
         description=body.description,
         type="cli",
         source="admin",
-        parameters_schema=body.parameters_schema,
+        parameters_schema={},
         config=initial_config,
         tenant_id=effective_tenant,
         enabled=True,
@@ -305,31 +255,19 @@ async def update_cli_tool(
     if body.description is not None:
         diff["description"] = ["...", "..."]
         tool.description = body.description
-    if body.parameters_schema is not None:
-        diff["parameters_schema"] = "updated"
-        tool.parameters_schema = body.parameters_schema
     if body.is_active is not None:
         diff["enabled"] = [tool.enabled, body.is_active]
         tool.enabled = body.is_active
 
-    # Load existing config through the v5 schema so legacy rows get
-    # normalised on first touch. Binary metadata stays whatever the DB
-    # had — neither the request body nor this handler touch it.
-    # v5: only env survives; runtime.env_inject (if provided) replaces env.
-    if body.runtime is not None or body.sandbox is not None:
+    # Binary metadata stays whatever the DB had — this handler never touches it.
+    # env replacement: load existing config through v5 schema, swap env, rewrite.
+    if body.env is not None:
         existing = CliToolConfig.model_validate(tool.config or {})
-        if body.runtime is not None and body.runtime.env_inject is not None:
-            new_env = body.runtime.env_inject
-        else:
-            new_env = existing.env
         tool.config = CliToolConfig(
-            binary=existing.binary,  # preserved; not exposed on PATCH
-            env=new_env,
+            binary=existing.binary,
+            env=body.env,
         ).model_dump(mode="json")
-        if body.runtime is not None:
-            diff["runtime"] = "updated"
-        if body.sandbox is not None:
-            diff["sandbox"] = "updated"
+        diff["env"] = "updated"
 
     _audit(db, user, "cli_tool.update", tool, detail={"changes": list(diff.keys())})
     await db.commit()
@@ -585,89 +523,39 @@ async def test_run_cli_tool(
     tool_id: uuid.UUID,
     body: TestRunRequest,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     tool = await db.get(Tool, tool_id)
     if tool is None or tool.type != "cli":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "CLI tool not found")
-    _require_manage(user, tool)
+    _require_manage(current_user, tool)
 
-    from dataclasses import asdict
+    from app.config import get_sandbox_config
+    from app.services.sandbox.registry import get_sandbox_backend
+    from app.services.cli_tools.placeholders import PlaceholderContext
+    from app.services.cli_tools.sandbox_inject import build_cli_function, render_env
 
-    from app.services.cli_tool_executor import CliExecutionAudit, execute_cli_tool
-
-    storage = BinaryStorage(root=_STORAGE_ROOT)
-    # Don't pre-pick a runner — executor's factory returns the cached
-    # subprocess singleton.
-
-    synthetic_agent_id = uuid.uuid4()
-
-    class _SyntheticAgent:
-        id = synthetic_agent_id
-        tenant_id = tool.tenant_id if tool.tenant_id is not None else user.tenant_id
-
-    user_context = {
-        "id": str(user.id),
-        "phone": str(getattr(user, "primary_mobile", "") or ""),
-        "email": str(getattr(user, "email", "") or ""),
-    }
-
-    # If mock_env supplied, temporarily merge those env keys. Never persist.
-    original_config = dict(tool.config or {})
-    if body.mock_env:
-        normalised = CliToolConfig.model_validate(original_config)
-        tool.config = CliToolConfig(
-            binary=normalised.binary,
-            env={**normalised.env, **body.mock_env},
-        ).model_dump(mode="json")
-
-    async def _write_audit(audit: CliExecutionAudit) -> None:
-        # test-run is an admin-triggered exec. The real user's UUID is
-        # safe to attach to AuditLog.user_id (FK); the synthetic agent id
-        # is random-per-call, only useful via details['agent_id'].
-        db.add(AuditLog(
-            user_id=user.id,
-            agent_id=None,  # synthetic agent is not a real row
-            action="cli_tool.execute",
-            details={
-                "resource_type": "cli_tool_exec",
-                "resource_id": audit.tool_id,
-                "source": "test_run",
-                **asdict(audit),
-            },
-        ))
-
-    try:
-        result = await execute_cli_tool(
-            tool=tool,
-            agent=_SyntheticAgent(),
-            params=body.params,
-            user_context=user_context,
-            storage=storage,
-            audit_sink=_write_audit,
-        )
-        await db.commit()  # persist the audit row alongside any other tx work
-        return TestRunResponse(
-            exit_code=result.exit_code,
-            stdout=result.stdout,
-            stderr=result.stderr,
-            duration_ms=result.duration_ms,
-        )
-    except CliToolError as exc:
-        # Audit sink already fired in the executor's finally; commit the
-        # row even on classified failure so compliance has a record.
-        await db.commit()
-        return TestRunResponse(
-            exit_code=-1,
-            stdout="",
-            stderr="",
-            duration_ms=0,
-            error_class=exc.error_class.value,
-            error_message=exc.message,
-        )
-    finally:
-        # Never commit the mock-env patch.
-        tool.config = original_config
+    cfg = CliToolConfig.model_validate(tool.config or {})
+    if not cfg.binary.sha256:
+        raise HTTPException(status_code=409, detail="binary not uploaded yet")
+    sandbox_config = get_sandbox_config()
+    if sandbox_config.type != "aio_sandbox":
+        raise HTTPException(status_code=501, detail="test-run requires SANDBOX_TYPE=aio_sandbox")
+    tenant_key = str(tool.tenant_id) if tool.tenant_id else "_global"
+    binary_path = f"/data/cli_binaries/{tenant_key}/{tool.id}/{cfg.binary.sha256}.bin"
+    state_ctx = {}
+    if any(v == "$state.dir" for v in cfg.env.values()):
+        leaf = StateStorage().ensure_home(tenant_id=tool.tenant_id, tool_id=tool.id, user_id=current_user.id)
+        state_ctx = {"dir": str(leaf)}
+    ctx = PlaceholderContext(
+        user={"id": str(current_user.id), "phone": str(getattr(current_user, "primary_mobile", "") or ""), "email": str(getattr(current_user, "email", "") or "")},
+        tenant={"id": str(tool.tenant_id) if tool.tenant_id else ""},
+        state=state_ctx,
+    )
+    prefix = build_cli_function(name=tool.name, binary_path=binary_path, env=render_env(cfg.env, ctx))
+    backend = get_sandbox_backend(sandbox_config)
+    result = await backend.execute(code=body.command, language="bash", timeout=60, work_dir="/data/agents", agent_id=f"cli-testrun-{tool.id}", inject_prefix=prefix)
+    return TestRunResponse(exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr, duration_ms=result.duration_ms, error_message=result.error)
 
 
 class HomeUsageOut(BaseModel):

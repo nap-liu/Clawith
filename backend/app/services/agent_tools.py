@@ -3088,13 +3088,9 @@ async def execute_tool(
         elif tool_name == "upsert_member_daily_report":
             result = await _upsert_member_daily_report(agent_id, arguments)
         else:
-            # Try CLI tool execution first, then MCP
-            cli_result = await _try_execute_cli_tool(tool_name, arguments, agent_id=agent_id, user_id=user_id, ws=ws)
-            if cli_result is not None:
-                result = cli_result
-            else:
-                # Fall back to MCP tool execution
-                result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id, user_id=user_id, session_id=session_id)
+            # CLI tools are sandbox shell commands now (not dispatchable);
+            # anything unknown falls through to MCP.
+            result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id, user_id=user_id, session_id=session_id)
 
         # Log tool call activity (skip noisy read operations)
         if tool_name not in ("list_files", "read_file", "read_document"):
@@ -7452,7 +7448,8 @@ async def build_cli_inject_prefix(
                         "email": str(user.email or ""),
                     }
 
-        storage_root = Path(os.environ.get("CLI_TOOLS_ROOT", "/data/cli_binaries"))
+        from app.services.cli_tools.storage import BINARY_ROOT, BinaryStorage
+        binary_storage = BinaryStorage(root=BINARY_ROOT)
         state_storage = StateStorage()
         functions: list[str] = []
         for tool in cli_tools:
@@ -7463,7 +7460,7 @@ async def build_cli_inject_prefix(
             if not cfg.binary.sha256:
                 continue  # no binary uploaded yet
             tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"
-            binary_path = storage_root / tenant_key / str(tool.id) / f"{cfg.binary.sha256}.bin"
+            binary_path = binary_storage.resolve(tenant_key, str(tool.id), cfg.binary.sha256)
 
             state_ctx: dict[str, str] = {}
             needs_state = any(v == "$state.dir" for v in cfg.env.values())
@@ -12930,113 +12927,6 @@ async def _agentbay_computer_list_visible_apps(agent_id: Optional[uuid.UUID], ws
     except Exception as e:
         logger.exception(f"[AgentBay] Computer list_visible_apps failed")
         return f"List applications failed: {str(e)[:200]}"
-
-
-async def _try_execute_cli_tool(
-    tool_name: str,
-    arguments: dict,
-    agent_id: Optional[uuid.UUID] = None,
-    user_id: Optional[uuid.UUID] = None,
-    ws: Optional[Path] = None,
-) -> Optional[str]:
-    """Try to execute a CLI-type tool. Returns None if tool is not CLI type."""
-    try:
-        from dataclasses import asdict
-
-        from app.models.audit import AuditLog
-        from app.models.tool import Tool
-        from app.models.agent import Agent
-        from app.models.user import User
-        from app.services.cli_tool_executor import CliExecutionAudit, execute_cli_tool
-        from app.services.cli_tools.errors import CliToolError
-        from app.services.cli_tools.storage import BinaryStorage
-
-        # Keep the DB session open across execution so the audit_sink
-        # can write its AuditLog row in the same unit of work. The
-        # session is intentionally local to this call; agent dispatch
-        # doesn't have a request-scoped session to reuse.
-        async with async_session() as db:
-            tool = (await db.execute(
-                select(Tool).where(Tool.name == tool_name, Tool.type == "cli")
-            )).scalar_one_or_none()
-            if not tool:
-                return None
-
-            # Keep HEAD: the full rewrite supersedes the old
-            # `execute_cli_tool(merged_config, arguments, user_id, work_dir)`
-            # signature entirely. `AgentTool.config` per-agent override
-            # and `work_dir` are features we intentionally removed when
-            # moving to the typed executor — if we want them back, they
-            # belong in a follow-up PR on top of the new signature, not
-            # here.
-            if not agent_id:
-                return "❌ CLI tool invocation requires an agent context"
-            agent = (await db.execute(
-                select(Agent).where(Agent.id == agent_id)
-            )).scalar_one_or_none()
-            if not agent:
-                return "❌ agent not found"
-
-            user_context = {"id": "", "phone": "", "email": ""}
-            audit_user_id: Optional[uuid.UUID] = None
-            if user_id:
-                user = await db.get(User, user_id)
-                if user:
-                    user_context = {
-                        "id": str(user.id),
-                        "phone": str(user.primary_mobile or ""),
-                        "email": str(user.email or ""),
-                    }
-                    audit_user_id = user.id
-
-            storage = BinaryStorage(root=Path("/data/cli_binaries"))
-            # No pre-picked runner — executor's factory returns the cached
-            # subprocess singleton.
-
-            async def _write_audit(audit: CliExecutionAudit) -> None:
-                # audit_user_id may be None for system-initiated agent
-                # loops without an attributable end-user. AuditLog.user_id
-                # is nullable; we still preserve details['user_id']=None
-                # (populated by the executor) for completeness.
-                db.add(AuditLog(
-                    user_id=audit_user_id,
-                    agent_id=agent.id,
-                    action="cli_tool.execute",
-                    details={
-                        "resource_type": "cli_tool_exec",
-                        "resource_id": audit.tool_id,
-                        "source": "agent",
-                        **asdict(audit),
-                    },
-                ))
-
-            try:
-                try:
-                    exec_result = await execute_cli_tool(
-                        tool=tool,
-                        agent=agent,
-                        params=arguments,
-                        user_context=user_context,
-                        storage=storage,
-                        audit_sink=_write_audit,
-                    )
-                    await db.commit()
-                    return exec_result.stdout or "(no output)"
-                except CliToolError as exc:
-                    # Audit sink already ran in the executor's finally.
-                    # Commit the row so compliance has a record of the
-                    # failed attempt too.
-                    await db.commit()
-                    return f"❌ [{exc.error_class.value}] {exc.message}"
-            except Exception:
-                # Any further DB/commit error: rollback and re-raise
-                # into the outer catch so the user sees a consistent msg.
-                await db.rollback()
-                raise
-
-    except Exception as e:
-        logger.exception(f"[CLI Tool] Execution error for {tool_name}")
-        return f"CLI tool error: {str(e)[:200]}"
 
 
 async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:

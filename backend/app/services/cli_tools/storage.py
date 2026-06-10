@@ -20,6 +20,8 @@ from typing import BinaryIO, Iterable, Iterator
 
 logger = logging.getLogger(__name__)
 
+BINARY_ROOT = Path("/data/cli_binaries")
+
 
 def _dir_size_bytes(path: Path) -> int:
     """Sum file sizes under `path`, tolerating missing entries / races."""

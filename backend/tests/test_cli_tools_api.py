@@ -175,33 +175,22 @@ def test_update_body_rejects_flat_binary_sha256_key():
         CliToolUpdate.model_validate({"binary_sha256": "f" * 64})
 
 
-def test_update_body_accepts_runtime_and_sandbox():
-    """Legitimate admin updates still work.
+def test_update_body_accepts_env():
+    """Legitimate admin update with env dict is accepted."""
+    body = CliToolUpdate.model_validate({"env": {"K": "v", "X": "y"}})
+    assert body.env == {"K": "v", "X": "y"}
 
-    Legacy sandbox fields (network/readonly_fs/image) are silently
-    dropped on read — exercised here to pin the compat behaviour for
-    PATCH bodies coming from old UIs / scripts.
-    """
-    body = CliToolUpdate.model_validate({
-        "runtime": {
-            "args_template": ["--x"],
-            "env_inject": {"K": "v"},
-            "timeout_seconds": 60,
-            "persistent_home": True,
-        },
-        "sandbox": {
-            "cpu_limit": "2",
-            "memory_limit": "1g",
-            "network": True,
-            "readonly_fs": True,
-            "image": None,
-        },
-    })
-    assert body.runtime is not None
-    assert body.runtime.timeout_seconds == 60
-    assert body.sandbox is not None
-    assert body.sandbox.cpu_limit == "2"
-    assert body.sandbox.memory_limit == "1g"
+
+def test_update_body_rejects_runtime_key():
+    """Old ``runtime`` key is rejected by extra=forbid now that the shim is gone."""
+    with pytest.raises(ValidationError):
+        CliToolUpdate.model_validate({"runtime": {"args_template": ["--x"]}})
+
+
+def test_update_body_rejects_sandbox_key():
+    """Old ``sandbox`` key is rejected by extra=forbid now that the shim is gone."""
+    with pytest.raises(ValidationError):
+        CliToolUpdate.model_validate({"sandbox": {"cpu_limit": "2"}})
 
 
 def test_create_body_rejects_binary_subtree():
@@ -224,15 +213,25 @@ def test_create_body_rejects_config_key():
         })
 
 
+def test_create_body_rejects_runtime_key():
+    """Old ``runtime`` key is rejected by extra=forbid now that the shim is gone."""
+    with pytest.raises(ValidationError):
+        CliToolCreate.model_validate({
+            "name": "x",
+            "display_name": "X",
+            "runtime": {"args_template": ["--go"]},
+        })
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Handler-level behaviour (binary preserved on PATCH, rewritten on upload)
 # ─────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_patch_runtime_preserves_binary_metadata():
-    """After updating runtime, binary.sha256 / size / original_name must
-    be byte-identical to the pre-PATCH DB values — the handler never
+async def test_patch_env_preserves_binary_metadata():
+    """After updating env, binary.sha256 / size / original_name must be
+    byte-identical to the pre-PATCH DB values — the handler never
     touches the binary subtree on a PATCH."""
     sha_before = "a" * 64
     tool = _make_tool(config=CliToolConfig(
@@ -243,14 +242,7 @@ async def test_patch_runtime_preserves_binary_metadata():
     db = FakeDB(tool=tool)
     user = _platform_admin()
 
-    body = CliToolUpdate.model_validate({
-        "runtime": {
-            "args_template": ["--new"],
-            "env_inject": {"X": "y"},
-            "timeout_seconds": 90,
-            "persistent_home": True,
-        },
-    })
+    body = CliToolUpdate.model_validate({"env": {"X": "y"}})
 
     out = await update_cli_tool(tool_id=tool.id, body=body, db=db, user=user)
     assert db.committed is True
@@ -260,16 +252,17 @@ async def test_patch_runtime_preserves_binary_metadata():
     assert out.config["binary"]["size"] == 1024
     assert out.config["binary"]["original_name"] == "svc"
 
-    # v5: runtime.env_inject lifted into config["env"]; no "runtime" subtree stored.
+    # env written into config["env"].
     assert out.config["env"] == {"X": "y"}
     assert "runtime" not in out.config
+    assert "sandbox" not in out.config
 
 
 @pytest.mark.asyncio
-async def test_patch_runtime_on_legacy_flat_config_normalises_to_nested():
+async def test_patch_legacy_flat_config_normalises_on_env_update():
     """A row still holding the M2 flat shape gets normalised on first
-    PATCH, and the binary sha survives (critical — we must not lose
-    binary metadata during the migration)."""
+    PATCH with env, and the binary sha survives (critical — we must not
+    lose binary metadata during the migration)."""
     sha_before = "b" * 64
     legacy_flat = {
         "binary_sha256": sha_before,
@@ -280,60 +273,75 @@ async def test_patch_runtime_on_legacy_flat_config_normalises_to_nested():
         "env_inject": {"A": "1"},
         "timeout_seconds": 15,
         "persistent_home": False,
-        "sandbox": {"cpu_limit": "1.0", "memory_limit": "512m",
-                    "network": False, "readonly_fs": True, "image": None},
     }
     tool = _make_tool(config=legacy_flat)
     db = FakeDB(tool=tool)
     user = _platform_admin()
 
-    body = CliToolUpdate.model_validate({
-        "runtime": {
-            "args_template": ["--new"],
-            "env_inject": {"B": "2"},
-            "timeout_seconds": 60,
-            "persistent_home": False,
-        },
-    })
+    body = CliToolUpdate.model_validate({"env": {"B": "2"}})
     out = await update_cli_tool(tool_id=tool.id, body=body, db=db, user=user)
 
     assert out.config["binary"]["sha256"] == sha_before
     assert out.config["binary"]["size"] == 2048
-    # v5: runtime.env_inject lifted into config["env"]; no "runtime" subtree stored.
     assert out.config["env"] == {"B": "2"}
-    # Stored config is now v5 — flat keys and old subtrees are gone.
+    # Stored config is now v5 — flat keys are gone.
     assert "binary_sha256" not in tool.config
     assert "args_template" not in tool.config
     assert "runtime" not in tool.config
 
 
 @pytest.mark.asyncio
-async def test_create_does_not_accept_binary_and_starts_with_empty_binary():
+async def test_patch_display_name_only_does_not_touch_config():
+    """Patching only display_name leaves config (binary + env) untouched."""
+    sha_before = "c" * 64
+    tool = _make_tool(config=CliToolConfig(
+        binary=BinaryMetadata(sha256=sha_before, size=512, original_name="svc",
+                              uploaded_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        env={"EXISTING": "val"},
+    ).model_dump(mode="json"))
+    db = FakeDB(tool=tool)
+    user = _platform_admin()
+
+    body = CliToolUpdate.model_validate({"display_name": "Renamed"})
+    out = await update_cli_tool(tool_id=tool.id, body=body, db=db, user=user)
+
+    assert out.display_name == "Renamed"
+    assert out.config["binary"]["sha256"] == sha_before
+    assert out.config["env"] == {"EXISTING": "val"}
+
+
+@pytest.mark.asyncio
+async def test_create_starts_with_empty_binary_and_writes_env():
     """Create path never writes binary metadata — the stored row starts
-    with an all-None BinaryMetadata."""
+    with an all-None BinaryMetadata; env from body is stored."""
     db = FakeDB()
     user = _platform_admin()
     body = CliToolCreate.model_validate({
         "name": "mytool",
         "display_name": "My Tool",
-        "runtime": {
-            "args_template": ["--go"],
-            "env_inject": {},
-            "timeout_seconds": 30,
-            "persistent_home": False,
-        },
-        "sandbox": {
-            "cpu_limit": "1.0", "memory_limit": "512m",
-            "network": False, "readonly_fs": True, "image": None,
-        },
+        "env": {"MY_KEY": "my_val"},
     })
 
     out = await create_cli_tool(body=body, db=db, user=user)
     assert out.config["binary"]["sha256"] is None
     assert out.config["binary"]["size"] is None
-    # v5: only binary + env in config; runtime/sandbox dropped at write time.
+    # v5: only binary + env in config.
     assert set(out.config.keys()) == {"binary", "env"}
+    assert out.config["env"] == {"MY_KEY": "my_val"}
+    # parameters_schema no longer in CliToolOut
+    assert not hasattr(out, "parameters_schema")
+
+
+@pytest.mark.asyncio
+async def test_create_with_no_env_stores_empty_env():
+    """Create without env field stores empty dict in config["env"]."""
+    db = FakeDB()
+    user = _platform_admin()
+    body = CliToolCreate.model_validate({"name": "x", "display_name": "X"})
+
+    out = await create_cli_tool(body=body, db=db, user=user)
     assert out.config["env"] == {}
+    assert set(out.config.keys()) == {"binary", "env"}
 
 
 @pytest.mark.asyncio
@@ -390,114 +398,6 @@ async def test_patch_404_when_tool_missing():
     with pytest.raises(HTTPException) as exc_info:
         await update_cli_tool(tool_id=uuid.uuid4(), body=body, db=db, user=user)
     assert exc_info.value.status_code == 404
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Post-M2 (dda8c9e) integration: rate_limit / home_quota / backend /
-# egress_allowlist round-trip through PATCH.
-# ─────────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_patch_runtime_accepts_post_m2_fields():
-    """PATCH body with old post-M2 runtime fields (rate_limit_per_minute,
-    home_quota_mb) is accepted by the shim schema and silently dropped in v5.
-    Binary metadata stays untouched; env_inject (if provided) lands in env."""
-    sha_before = "a" * 64
-    tool = _make_tool(config=CliToolConfig(
-        binary=BinaryMetadata(sha256=sha_before, size=1024, original_name="svc",
-                              uploaded_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
-    ).model_dump(mode="json"))
-    db = FakeDB(tool=tool)
-    user = _platform_admin()
-
-    body = CliToolUpdate.model_validate({
-        "runtime": {
-            "args_template": [],
-            "env_inject": {"RATE_KEY": "v"},
-            "timeout_seconds": 30,
-            "persistent_home": True,
-            "rate_limit_per_minute": 120,
-            "home_quota_mb": 2048,
-        },
-    })
-    out = await update_cli_tool(tool_id=tool.id, body=body, db=db, user=user)
-
-    # Binary metadata preserved.
-    assert out.config["binary"]["sha256"] == sha_before
-    # v5: only binary + env; rate_limit/home_quota/timeout retired.
-    assert set(out.config.keys()) == {"binary", "env"}
-    assert out.config["env"] == {"RATE_KEY": "v"}
-    assert "runtime" not in out.config
-
-
-@pytest.mark.asyncio
-async def test_patch_sandbox_silently_drops_legacy_fields():
-    """v5 dropped the entire sandbox subtree. Old UIs / scripts that still
-    POST sandbox fields must not break — the shim schema silently swallows
-    them and they are not stored. The stored config only has binary + env."""
-    tool = _make_tool()
-    db = FakeDB(tool=tool)
-    user = _platform_admin()
-
-    body = CliToolUpdate.model_validate({
-        "sandbox": {
-            "cpu_limit": "1.0",
-            "memory_limit": "512m",
-            "network": True,
-            "readonly_fs": True,
-            "image": None,
-            "backend": "bwrap",
-            "egress_allowlist": ["api.example.com", "registry.example.com"],
-        },
-    })
-    out = await update_cli_tool(tool_id=tool.id, body=body, db=db, user=user)
-
-    # v5: sandbox subtree retired entirely; only binary + env survive.
-    assert set(out.config.keys()) == {"binary", "env"}
-    assert "sandbox" not in out.config
-    assert "cpu_limit" not in out.config
-
-
-@pytest.mark.asyncio
-async def test_read_of_post_m2_flat_config_normalises_and_preserves_values():
-    """A row still carrying the dda8c9e flat shape (env_inject at the top
-    level) gets normalised on every read through `_to_out`, and env_inject
-    lifts into env.  All other flat runtime/sandbox keys are silently dropped
-    in v5 (rate_limit, home_quota, persistent_home, cpu_limit, etc.)."""
-    sha_before = "c" * 64
-    legacy_post_m2_flat = {
-        "binary_sha256": sha_before,
-        "binary_size": 4096,
-        "binary_original_name": "legacy",
-        "binary_uploaded_at": "2026-01-01T00:00:00+00:00",
-        "args_template": ["--old"],
-        "env_inject": {"LEGACY_KEY": "abc"},
-        "timeout_seconds": 30,
-        "persistent_home": True,
-        "rate_limit_per_minute": 42,
-        "home_quota_mb": 777,
-        "sandbox": {"cpu_limit": "1.0", "memory_limit": "512m",
-                    "network": True, "readonly_fs": True, "image": None,
-                    "backend": "docker", "egress_allowlist": ["api.example.com"]},
-    }
-    tool = _make_tool(config=legacy_post_m2_flat)
-    db = FakeDB(tool=tool)
-    user = _platform_admin()
-
-    # PATCH only display_name — runtime/sandbox are not sent, but the flat
-    # row still normalises on serialisation through `_to_out`, so the
-    # output must be v5 shape.
-    body = CliToolUpdate.model_validate({"display_name": "Renamed"})
-    out = await update_cli_tool(tool_id=tool.id, body=body, db=db, user=user)
-
-    assert out.config["binary"]["sha256"] == sha_before
-    assert out.config["binary"]["size"] == 4096
-    # v5: flat env_inject lifts into env; all other runtime/sandbox keys dropped.
-    assert out.config["env"] == {"LEGACY_KEY": "abc"}
-    assert set(out.config.keys()) == {"binary", "env"}
-    assert "runtime" not in out.config
-    assert "sandbox" not in out.config
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -681,3 +581,47 @@ def test_binary_max_bytes_configurable_via_env(monkeypatch):
         # so later tests in this process don't inherit a patched constant.
         monkeypatch.delenv("CLI_BINARY_MAX_BYTES", raising=False)
         importlib.reload(cli_tools_api)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# test-run endpoint: no sandbox → 409 (no binary) or 501 (wrong sandbox type)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+from app.api.cli_tools import TestRunRequest  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_testrun_returns_409_when_binary_not_uploaded():
+    """test-run on a tool with no binary uploaded must return 409."""
+    tool = _make_tool(config=CliToolConfig(binary=BinaryMetadata()).model_dump(mode="json"))
+    db = FakeDB(tool=tool)
+    user = _platform_admin()
+    body = TestRunRequest(command="svc status")
+    with pytest.raises(HTTPException) as exc_info:
+        await cli_tools_api.test_run_cli_tool(tool_id=tool.id, body=body, db=db, current_user=user)
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_testrun_returns_501_when_sandbox_not_aio(monkeypatch):
+    """test-run with SANDBOX_TYPE != aio_sandbox returns 501.
+
+    The handler does ``from app.config import get_sandbox_config`` lazily,
+    so we patch the function on the ``app.config`` module object. Python
+    re-runs the local import each call and looks up the name in the module's
+    ``__dict__``, so patching the module attribute is the correct approach.
+    """
+    from app.services.sandbox.config import SandboxConfig, SandboxType
+    import app.config as app_config
+
+    tool = _make_tool()  # has sha256 — passes the 409 gate
+    db = FakeDB(tool=tool)
+    user = _platform_admin()
+
+    monkeypatch.setattr(app_config, "get_sandbox_config", lambda: SandboxConfig(type=SandboxType.SUBPROCESS))
+
+    body = TestRunRequest(command="svc status")
+    with pytest.raises(HTTPException) as exc_info:
+        await cli_tools_api.test_run_cli_tool(tool_id=tool.id, body=body, db=db, current_user=user)
+    assert exc_info.value.status_code == 501
