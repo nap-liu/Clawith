@@ -2251,12 +2251,22 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             all_tools = all_tools_r.scalars().all()
 
             result = []
+            cli_command_docs: list[str] = []
             db_tool_names = set()
             for t in all_tools:
                 tid = str(t.id)
                 at = assignments.get(tid)
                 enabled = at.enabled if at else t.is_default
                 if not enabled:
+                    continue
+
+                # type='cli' tools are sandbox shell commands, not LLM
+                # functions. Collect their usage docs; appended to
+                # execute_code_aio's description below.
+                if t.type == "cli":
+                    cli_command_docs.append(
+                        f"## `{t.name}` — {t.display_name}\n{t.description}"
+                    )
                     continue
 
                 # Skip feishu tools if the agent has no Feishu channel configured
@@ -2299,6 +2309,18 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 for t in _always_tools:
                     if t["function"]["name"] not in db_tool_names:
                         result.append(t)
+                if cli_command_docs:
+                    cli_suffix = (
+                        "\n\n# Sandbox CLI commands\n"
+                        "The following CLI commands are available directly in this "
+                        "tool's bash shell (composable with pipes like `| jq | head`):\n\n"
+                        + "\n\n".join(cli_command_docs)
+                    )
+                    for td in result:
+                        if td["function"]["name"] == "execute_code_aio":
+                            td["function"]["description"] = (
+                                (td["function"]["description"] or "") + cli_suffix
+                            )
                 # Inject OS-aware paths into computer-related tool descriptions
                 result = _patch_computer_tool_descriptions(result, computer_os_type)
                 # Strip msg_type from send_message_to_agent when async A2A is disabled

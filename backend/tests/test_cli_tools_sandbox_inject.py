@@ -170,3 +170,78 @@ async def test_build_inject_prefix_for_agent_renders_cli_tools(cli_inject_sessio
 async def test_build_inject_prefix_no_cli_tools_returns_none(cli_inject_session):
     from app.services.agent_tools import build_cli_inject_prefix
     assert await build_cli_inject_prefix(agent_id=None, user_id=None) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tests for get_agent_tools_for_llm: cli tools must not appear as LLM functions;
+# their docs must be appended to execute_code_aio's description instead.
+# ──────────────────────────────────────────────────────────────────────────────
+import uuid as _uuid
+
+
+@pytest.fixture
+async def llm_tools_session(monkeypatch):
+    """aiosqlite with tools+agent_tools; patches agent_tools.async_session
+    and stubs channel/os helpers so get_agent_tools_for_llm runs offline."""
+    import app.services.agent_tools as at_mod  # import FIRST (registers ORM models)
+    import app.models.mcp_server  # noqa: F401 — registers mcp_servers in Base.metadata
+    from app.models.tool import Tool, AgentTool
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    eng = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with eng.begin() as conn:
+        # FK target stubs (PK-only) for tools/agent_tools foreign keys.
+        # Add table names here if .create() raises NoReferencedTableError.
+        for stub in (
+            "mcp_servers", "tenants", "agents",
+            "llm_models", "tasks", "channel_configs", "org_members", "org_departments",
+            "agent_agent_relationships", "agent_relationships", "agent_permissions",
+            "agent_templates", "agent_user_onboardings", "task_logs", "mcp_server_overrides",
+        ):
+            await conn.execute(text(f"CREATE TABLE IF NOT EXISTS {stub} (id TEXT PRIMARY KEY)"))
+        await conn.run_sync(lambda c: Tool.__table__.create(c, checkfirst=True))
+        await conn.run_sync(lambda c: AgentTool.__table__.create(c, checkfirst=True))
+
+    async def _false(*a, **k):
+        return False
+
+    async def _none(*a, **k):
+        return None
+
+    monkeypatch.setattr(at_mod, "_agent_has_feishu", _false)
+    monkeypatch.setattr(at_mod, "_agent_has_any_channel", _false)
+    monkeypatch.setattr(at_mod, "_get_computer_os_type", _none)
+    Session = async_sessionmaker(eng, expire_on_commit=False)
+    monkeypatch.setattr(at_mod, "async_session", Session)
+    yield Session
+    await eng.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cli_tools_hidden_from_llm_and_described_in_aio(llm_tools_session):
+    from app.models.tool import Tool
+    from app.services.agent_tools import get_agent_tools_for_llm
+
+    async with llm_tools_session() as s:
+        s.add(Tool(
+            name="svc", display_name="黄鹤楼主档",
+            description="数据查询 CLI。report 是唯一数据来源。",
+            type="cli", category="cli", icon="🔧", source="admin", enabled=True,
+            is_default=True, parameters_schema={}, config={}, config_schema={},
+        ))
+        s.add(Tool(
+            name="execute_code_aio", display_name="Sandbox",
+            description="Run code in sandbox.", type="builtin", category="code",
+            icon="💻", source="builtin", enabled=True, is_default=True,
+            parameters_schema={"type": "object", "properties": {}},
+            config={}, config_schema={},
+        ))
+        await s.commit()
+
+    tools = await get_agent_tools_for_llm(_uuid.uuid4())
+    names = [t["function"]["name"] for t in tools]
+    assert "svc" not in names
+    aio = next(t for t in tools if t["function"]["name"] == "execute_code_aio")
+    assert "svc" in aio["function"]["description"]
+    assert "report 是唯一数据来源" in aio["function"]["description"]
