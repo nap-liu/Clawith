@@ -2889,7 +2889,7 @@ async def execute_tool(
             result = await _plaza_add_comment(agent_id, arguments)
         elif tool_name in _CODE_EXEC_TOOL_NAMES:
             logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
-            result = await _execute_code(agent_id, ws, arguments, tool_name=tool_name)
+            result = await _execute_code(agent_id, ws, arguments, tool_name=tool_name, user_id=user_id)
         elif tool_name == "sql_execute":
             result = await _sql_execute(arguments)
         elif tool_name == "upload_image":
@@ -7386,12 +7386,98 @@ def _check_code_safety(language: str, code: str) -> str | None:
     return None
 
 
+async def build_cli_inject_prefix(
+    agent_id: Optional[uuid.UUID],
+    user_id: Optional[uuid.UUID],
+) -> Optional[str]:
+    """Build the bash function block exposing type='cli' tools in the sandbox.
+
+    Returns None when the agent has no enabled cli tools (the common
+    case — zero overhead for non-CLI deployments). Identity env entries
+    ($user.*/$state.*) are dropped when user_id is None, so the CLI
+    itself reports NOT_LOGGED_IN instead of impersonating anyone.
+    """
+    try:
+        from app.models.tool import Tool, AgentTool
+        from app.models.user import User
+        from app.services.cli_tools.placeholders import PlaceholderContext
+        from app.services.cli_tools.sandbox_inject import build_cli_function, render_env
+        from app.services.cli_tools.schema import CliToolConfig
+        from app.services.cli_tools.state_storage import StateStorage
+
+        async with async_session() as db:
+            tools_r = await db.execute(
+                select(Tool).where(Tool.type == "cli", Tool.enabled == True)  # noqa: E712
+            )
+            cli_tools = list(tools_r.scalars().all())
+            if not cli_tools:
+                return None
+
+            assignments = {}
+            if agent_id:
+                at_r = await db.execute(
+                    select(AgentTool).where(AgentTool.agent_id == agent_id)
+                )
+                assignments = {str(at.tool_id): at for at in at_r.scalars().all()}
+
+            user_ctx: dict[str, str] = {}
+            if user_id:
+                user = await db.get(User, user_id)
+                if user:
+                    user_ctx = {
+                        "id": str(user.id),
+                        "phone": str(user.primary_mobile or ""),
+                        "email": str(user.email or ""),
+                    }
+
+        storage_root = Path(os.environ.get("CLI_TOOLS_ROOT", "/data/cli_binaries"))
+        state_storage = StateStorage()
+        functions: list[str] = []
+        for tool in cli_tools:
+            at = assignments.get(str(tool.id))
+            if not (at.enabled if at else tool.is_default):
+                continue
+            cfg = CliToolConfig.model_validate(tool.config or {})
+            if not cfg.binary.sha256:
+                continue  # no binary uploaded yet
+            tenant_key = str(tool.tenant_id) if tool.tenant_id is not None else "_global"
+            binary_path = storage_root / tenant_key / str(tool.id) / f"{cfg.binary.sha256}.bin"
+
+            state_ctx: dict[str, str] = {}
+            needs_state = any(v == "$state.dir" for v in cfg.env.values())
+            if needs_state and user_id:
+                leaf = state_storage.ensure_home(
+                    tenant_id=tool.tenant_id, tool_id=tool.id, user_id=user_id
+                )
+                state_ctx = {"dir": str(leaf)}
+
+            ctx = PlaceholderContext(
+                user=user_ctx,
+                agent={"id": str(agent_id)} if agent_id else {},
+                tenant={"id": tenant_key if tenant_key != "_global" else ""},
+                state=state_ctx,
+            )
+            try:
+                functions.append(build_cli_function(
+                    name=tool.name,
+                    binary_path=str(binary_path),
+                    env=render_env(cfg.env, ctx),
+                ))
+            except ValueError as e:
+                logger.warning(f"[CLI Inject] skip tool {tool.name}: {e}")
+        return "\n".join(functions) if functions else None
+    except Exception:
+        logger.exception("[CLI Inject] prefix build failed; continuing without CLI")
+        return None
+
+
 async def _execute_code(
     agent_id: Optional[uuid.UUID],
     ws: Path,
     arguments: dict,
     *,
     tool_name: str = "execute_code",
+    user_id: Optional[uuid.UUID] = None,
 ) -> str:
     """Execute code using the configured sandbox backend.
 
@@ -7446,12 +7532,16 @@ async def _execute_code(
 
         backend = get_sandbox_backend(sandbox_config)
         logger.info(f"[Sandbox] Executing code with backend: {backend.__class__.__name__} (tool={tool_name})")
+        inject_prefix = None
+        if tool_name == "execute_code_aio" and language in ("bash", "node"):
+            inject_prefix = await build_cli_inject_prefix(agent_id, user_id)
         result = await backend.execute(
             code=code,
             language=language,
             timeout=timeout,
             work_dir=str(work_dir),
             agent_id=str(agent_id) if agent_id else None,
+            inject_prefix=inject_prefix,
         )
 
         # Format result for user display
