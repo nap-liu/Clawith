@@ -295,6 +295,15 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 
+            # Mirror this inbound message to anyone viewing the session on web in
+            # real time — the agent reply already streams there; this makes the
+            # user's own message show up live too, not only on reload.
+            from app.services.channel_llm import broadcast_channel_user_message
+            await broadcast_channel_user_message(
+                agent_id, session_conv_id, content=user_text,
+                sender_name=None, user_id=platform_user_id,
+            )
+
             reply_text = await _call_agent_llm(
                 db=db,
                 agent_id=agent_id,

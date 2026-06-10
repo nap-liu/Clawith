@@ -27,6 +27,45 @@ _LLM_ERROR_PREFIXES = ("[LLM Error]", "[LLM call error]", "[Error]")
 _IM_LLM_RECOVERY_HINT = "\n\n———\n如果反复出现此问题，请发送 /new 开启新对话后重试。"
 
 
+async def _broadcast_to_web_session(agent_id, session_id, payload: dict) -> None:
+    """Best-effort mirror of one event to every web client viewing this session.
+
+    The web ConnectionManager is a single-process in-memory registry shared by
+    the whole backend (uvicorn runs one process), so this reaches the WS chat
+    connections registered under the same session_id. Lazy import avoids a
+    services->api import cycle; any failure must never affect channel delivery.
+    """
+    if not session_id:
+        return
+    try:
+        from app.api.websocket import manager as _ws_manager
+
+        await _ws_manager.send_to_session(str(agent_id), str(session_id), payload)
+    except Exception:
+        pass
+
+
+async def broadcast_channel_user_message(
+    agent_id, session_id, *, content: str, sender_name: str | None = None, user_id=None
+) -> None:
+    """Mirror an inbound IM (channel) user message to web clients viewing the
+    SAME session in real time. Without this, a person watching a DingTalk/Feishu
+    conversation in the web UI sees the agent's reply stream (see
+    ``_call_agent_llm``) but the channel user's OWN message would not appear
+    until reload. Pass the clean persisted content + sender so the live bubble
+    matches what a reload would render."""
+    await _broadcast_to_web_session(
+        agent_id,
+        session_id,
+        {
+            "type": "channel_user_message",
+            "content": content or "",
+            "sender_name": sender_name,
+            "user_id": str(user_id) if user_id is not None else None,
+        },
+    )
+
+
 def _normalize_history_messages(history: list[dict] | None) -> list[dict]:
     """Drop UI-only message roles before replaying history into the LLM."""
     if not history:
@@ -167,14 +206,7 @@ async def _call_agent_llm(
     # as the WebSocket chat path). Lazy import avoids a services->api import
     # cycle; best-effort so IM delivery is never affected by a web-side hiccup.
     async def _web_broadcast(payload: dict):
-        if not session_id:
-            return
-        try:
-            from app.api.websocket import manager as _ws_manager
-
-            await _ws_manager.send_to_session(str(agent_id), session_id, payload)
-        except Exception:
-            pass
+        await _broadcast_to_web_session(agent_id, session_id, payload)
 
     async def _on_chunk_bridged(text: str):
         await _web_broadcast({"type": "chunk", "content": text})

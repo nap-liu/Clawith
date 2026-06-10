@@ -375,6 +375,13 @@ async def slack_event_webhook(
                            content=_ack, conversation_id=session_conv_id))
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
+        # Mirror this inbound file message to anyone viewing the session on web in
+        # real time (matches what a reload renders: the [file:...] row).
+        from app.services.channel_llm import broadcast_channel_user_message
+        await broadcast_channel_user_message(
+            agent_id, session_conv_id, content=_file_content,
+            sender_name=_slack_real_name or None, user_id=platform_user_id,
+        )
         if _bot_token and channel_id:
             await _send_slack_messages(_bot_token, channel_id, _ack)
         return {"ok": True}
@@ -394,6 +401,15 @@ async def slack_event_webhook(
         db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
+
+        # Mirror this inbound message to anyone viewing the session on web in real
+        # time — the agent reply already streams there; this makes the user's own
+        # message show up live too, not only on reload.
+        from app.services.channel_llm import broadcast_channel_user_message
+        await broadcast_channel_user_message(
+            agent_id, session_conv_id, content=user_text,
+            sender_name=_slack_real_name or None, user_id=platform_user_id,
+        )
 
         # Set channel_file_sender contextvar for agent → user file delivery
         from app.services.agent_tools import channel_file_sender as _cfs_s

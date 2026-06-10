@@ -640,6 +640,14 @@ async def _process_wecom_text(
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 
+            # 实时镜像入站用户消息到正在 web 端查看该会话的客户端 —— agent 回复已经
+            # 在那边流式渲染,这一步让用户自己的消息也实时出现,而非刷新后才看到。
+            from app.services.channel_llm import broadcast_channel_user_message
+            await broadcast_channel_user_message(
+                agent_id, session_conv_id, content=user_text,
+                sender_name=None, user_id=platform_user_id,
+            )
+
             # 调用 LLM
             _thinking_chunks: list[str] = []
             async def _collect_thinking(text: str):

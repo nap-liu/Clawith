@@ -375,6 +375,15 @@ async def discord_interaction_webhook(
                     sess.last_message_at = datetime.now(timezone.utc)
                     await bg_db.commit()
 
+                    # Mirror this inbound message to anyone viewing the session on
+                    # web in real time — the agent reply already streams there; this
+                    # makes the user's own message show up live too, not only on reload.
+                    from app.services.channel_llm import broadcast_channel_user_message
+                    await broadcast_channel_user_message(
+                        agent_id, session_conv_id, content=user_text,
+                        sender_name=_discord_username or None, user_id=platform_user_id,
+                    )
+
                     # Call LLM
                     _thinking_chunks: list[str] = []
                     async def _collect_thinking(text: str):

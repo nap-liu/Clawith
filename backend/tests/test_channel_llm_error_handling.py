@@ -190,6 +190,45 @@ async def test_im_turn_broadcasts_events_to_web_session(monkeypatch):
         assert expected in types, f"web viewer must receive the {expected!r} event of an IM turn"
 
 
+async def test_broadcast_channel_user_message_emits_event(monkeypatch):
+    """The inbound IM user message is mirrored to web viewers of the session with
+    its clean content + sender, so the user's own bubble appears live (not only on
+    reload). Pins the event shape the frontend handler consumes."""
+    import app.api.websocket as ws_mod
+
+    captured: list = []
+
+    async def _fake_send_to_session(agent_id, session_id, payload):
+        captured.append((agent_id, session_id, payload))
+
+    monkeypatch.setattr(ws_mod.manager, "send_to_session", _fake_send_to_session)
+
+    await channel_llm.broadcast_channel_user_message(
+        "agent-1", "sess-9", content="只看 report 的数据", sender_name="刘喜", user_id="u-7"
+    )
+
+    assert len(captured) == 1
+    agent_id, session_id, payload = captured[0]
+    assert agent_id == "agent-1" and session_id == "sess-9"
+    assert payload["type"] == "channel_user_message"
+    assert payload["content"] == "只看 report 的数据"
+    assert payload["sender_name"] == "刘喜"
+    assert payload["user_id"] == "u-7"
+
+
+async def test_broadcast_channel_user_message_no_session_noop(monkeypatch):
+    import app.api.websocket as ws_mod
+
+    captured: list = []
+
+    async def _fake(*_a, **_k):
+        captured.append(1)
+
+    monkeypatch.setattr(ws_mod.manager, "send_to_session", _fake)
+    await channel_llm.broadcast_channel_user_message("a", "", content="x")
+    assert captured == [], "no session_id → no broadcast"
+
+
 async def test_im_turn_without_session_does_not_broadcast(monkeypatch):
     """No session_id (transient call) → no web broadcast, and no crash."""
     agent, model = _make_agent_and_model()

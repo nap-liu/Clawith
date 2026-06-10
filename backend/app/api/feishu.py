@@ -736,6 +736,15 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 _sess.last_message_at = _dt.now(_tz.utc)
                 await db.commit()
 
+                # Mirror this inbound message to anyone viewing the session on web
+                # in real time — the agent reply already streams there; this makes
+                # the user's own message show up live too, not only on reload.
+                from app.services.channel_llm import broadcast_channel_user_message
+                await broadcast_channel_user_message(
+                    agent_id, session_conv_id, content=user_text,
+                    sender_name=sender_name or None, user_id=platform_user_id,
+                )
+
                 # Load history inside the lock so concurrent turns cannot observe
                 # each other's not-yet-committed rows (race condition fix).
                 from app.services.chat_history import load_history_for_llm
@@ -1383,6 +1392,14 @@ async def _handle_feishu_file(
                 )
                 await _db_setup.commit()
 
+            # Mirror this inbound file message to anyone viewing the session on web
+            # in real time (matches what a reload renders: the [file:...] row).
+            from app.services.channel_llm import broadcast_channel_user_message
+            await broadcast_channel_user_message(
+                agent_id, session_conv_id_img, content=f"[file:{filename}]",
+                sender_name=sender_name_file or None, user_id=platform_user_id,
+            )
+
             # ── Streaming card setup ──
             _reply_to = chat_id if chat_type == "group" else sender_open_id
             _rid_type_img = "chat_id" if chat_type == "group" else "open_id"
@@ -1562,6 +1579,14 @@ async def _handle_feishu_file(
         ))
         _sess_ack.last_message_at = _dt.now(_tz.utc)
         await _db_ack.commit()
+
+    # Mirror this inbound file message to anyone viewing the session on web in
+    # real time (matches what a reload renders: the [file:...] row).
+    from app.services.channel_llm import broadcast_channel_user_message
+    await broadcast_channel_user_message(
+        agent_id, session_conv_id_ack, content=f"[file:{filename}]",
+        sender_name=sender_name_file or None, user_id=platform_user_id,
+    )
 
     await asyncio.sleep(random.uniform(1.0, 2.0))
 

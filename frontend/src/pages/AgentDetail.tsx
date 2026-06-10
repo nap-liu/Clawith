@@ -4192,6 +4192,23 @@ function AgentDetailInner() {
                     if (currentSessionId) clearUnreadForSession(currentSessionId);
                     queryClient.invalidateQueries({ queryKey: ['agents'] });
                 }
+            } else if (d.type === 'channel_user_message') {
+                // An IM (DingTalk/Feishu/…) user sent a message in this session —
+                // mirror it live so a web viewer sees the user's own message
+                // without reloading (the agent reply already streams in).
+                setChatMessages(prev => {
+                    const last = prev[prev.length - 1];
+                    if (last && last.role === 'user' && last.content === d.content
+                        && ((last as any).sender_name || '') === (d.sender_name || '')) return prev;
+                    return [...prev, parseChatMsg({
+                        role: 'user',
+                        content: d.content,
+                        ...(d.sender_name ? { sender_name: d.sender_name } : {}),
+                        timestamp: new Date().toISOString(),
+                    })];
+                });
+                const cuSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
+                if (cuSessionId) clearUnreadForSession(cuSessionId);
             } else if (d.type === 'chunk') {
                 setChatMessages(prev => {
                     const last = prev[prev.length - 1];
