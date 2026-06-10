@@ -30,9 +30,14 @@ Layout on disk (inside the backend container; volume is bind-mounted at
             .cache/...
 
 Permission model:
-  * The backend process runs as root (uid 0) and can `mkdir`/`chown`
-    new subtrees freely.
-  * Each leaf directory is chown'd to 1000:1000 (aio-sandbox user 'gem')
+  * The backend process runs as clawith (uid 1000), which equals the
+    aio-sandbox shell user 'gem' (also uid 1000). This uid equality is
+    load-bearing: `chown leaf → 1000` makes the directory writable by
+    both sides of the volume mount without a privilege escalation step.
+    The entrypoint's `find ! -user clawith -exec chown clawith` sweeps
+    up any legacy nobody (65534) leaves from earlier deployments and
+    brings them into the 1000 namespace.
+  * Each leaf directory is chown'd to 1000:1000 (clawith == gem)
     so the sandbox shell can write token caches inside it.
   * Intermediate tenant/tool directories use mode 2775 (other=r-x), so
     gem can traverse and enumerate them. This is intentional: per-user

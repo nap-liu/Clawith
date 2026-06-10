@@ -281,3 +281,167 @@ async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session, 
     prefix = await build_cli_inject_prefix(agent_id=None, user_id=creator_id)
     assert prefix is not None
     assert "YYBPC_CLI_USER_PHONE='13900000000'" in prefix  # creator identity bound, not dropped
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# D3-2: cross-tenant isolation — admin tool scoped to tenant A must not inject
+# into an agent belonging to tenant B.
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+async def cli_inject_session_agents(monkeypatch):
+    """Like cli_inject_session but also creates agent_tools table and an
+    agents stub with a tenant_id column so build_cli_inject_prefix's
+    select(AgentModel.tenant_id) query can return a non-null value."""
+    import app.services.agent_tools as at_mod  # noqa: F401 — registers ORM
+    import app.models.mcp_server  # noqa: F401
+    from app.models.user import Identity, User
+    from app.models.tool import Tool, AgentTool
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    eng = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with eng.begin() as conn:
+        # Stubs for tables with JSONB or deep FK chains.
+        for stub in (
+            "mcp_servers", "tenants", "llm_models",
+            "tasks", "channel_configs", "org_members", "org_departments",
+            "agent_agent_relationships", "agent_relationships",
+            "agent_permissions", "agent_templates", "agent_user_onboardings",
+            "task_logs", "mcp_server_overrides",
+        ):
+            await conn.execute(text(f"CREATE TABLE IF NOT EXISTS {stub} (id TEXT PRIMARY KEY)"))
+        # agents needs at least id + tenant_id; build_cli_inject_prefix only
+        # selects AgentModel.tenant_id so extra columns are not needed.
+        await conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS agents "
+            "(id TEXT PRIMARY KEY, tenant_id TEXT)"
+        ))
+        await conn.run_sync(lambda c: Identity.__table__.create(c, checkfirst=True))
+        await conn.run_sync(lambda c: User.__table__.create(c, checkfirst=True))
+        await conn.run_sync(lambda c: Tool.__table__.create(c, checkfirst=True))
+        await conn.run_sync(lambda c: AgentTool.__table__.create(c, checkfirst=True))
+
+    Session = async_sessionmaker(eng, expire_on_commit=False)
+    monkeypatch.setattr(at_mod, "async_session", Session)
+    yield Session
+    await eng.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cross_tenant_admin_tool_not_injected(cli_inject_session_agents, monkeypatch, tmp_path):
+    """Admin cli tool scoped to tenant A must NOT be injected into an agent
+    belonging to tenant B (cross-tenant isolation, D3-2).
+
+    The agents stub uses TEXT columns; SQLAlchemy's UUID type stores UUID
+    values as hex-without-dashes in SQLite, so insert with .hex format so
+    the select(AgentModel.tenant_id) query can find the row.
+    """
+    import uuid as _uuid_mod
+    from app.models.tool import Tool
+    from app.services.agent_tools import build_cli_inject_prefix
+    from app.services.cli_tools import state_storage as ss_mod
+
+    monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
+    monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
+
+    tenant_a = _uuid_mod.uuid4()
+    tenant_b = _uuid_mod.uuid4()
+    agent_b_id = _uuid_mod.uuid4()
+
+    async with cli_inject_session_agents() as s:
+        # Admin cli tool explicitly scoped to tenant A.
+        s.add(Tool(
+            name="svc_a", display_name="svc_a", description="tenant-A CLI",
+            type="cli", category="cli", icon="🔧", source="admin", enabled=True,
+            is_default=True, parameters_schema={},
+            config={
+                "binary": {"sha256": "b" * 64, "size": 1, "original_name": "svc_a"},
+                "env": {},
+            },
+            config_schema={},
+            tenant_id=tenant_a,
+        ))
+        await s.commit()
+        # Raw-insert agent row for tenant B. Use hex format (no dashes) so
+        # SQLAlchemy's UUID type lookup (which sends hex to SQLite) finds it.
+        await s.execute(
+            text("INSERT INTO agents (id, tenant_id) VALUES (:id, :tid)"),
+            {"id": agent_b_id.hex, "tid": tenant_b.hex},
+        )
+        await s.commit()
+
+    # Tenant B agent must not receive tenant A's CLI tool.
+    prefix_b = await build_cli_inject_prefix(agent_id=agent_b_id, user_id=None)
+    assert prefix_b is None, (
+        "cross-tenant CLI injection: tenant A tool must not appear in tenant B agent's prefix"
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkeypatch, tmp_path):
+    """Admin cli tool scoped to tenant A IS injected into an agent from tenant A."""
+    import uuid as _uuid_mod
+    from app.models.tool import Tool
+    from app.services.agent_tools import build_cli_inject_prefix
+    from app.services.cli_tools import state_storage as ss_mod
+
+    monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
+    monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
+
+    tenant_a = _uuid_mod.uuid4()
+    agent_a_id = _uuid_mod.uuid4()
+
+    async with cli_inject_session_agents() as s:
+        s.add(Tool(
+            name="svc_a", display_name="svc_a", description="tenant-A CLI",
+            type="cli", category="cli", icon="🔧", source="admin", enabled=True,
+            is_default=True, parameters_schema={},
+            config={
+                "binary": {"sha256": "c" * 64, "size": 1, "original_name": "svc_a"},
+                "env": {},
+            },
+            config_schema={},
+            tenant_id=tenant_a,
+        ))
+        await s.commit()
+        # Use hex format so the UUID column lookup finds the row.
+        await s.execute(
+            text("INSERT INTO agents (id, tenant_id) VALUES (:id, :tid)"),
+            {"id": agent_a_id.hex, "tid": tenant_a.hex},
+        )
+        await s.commit()
+
+    prefix_a = await build_cli_inject_prefix(agent_id=agent_a_id, user_id=None)
+    assert prefix_a is not None, "same-tenant CLI tool must be injected into same-tenant agent"
+    assert "svc_a() {" in prefix_a
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# D3-1: graceful degrade — agent has cli tool but no execute_code_aio.
+# get_agent_tools_for_llm must not raise; cli tool must not appear in result;
+# execute_code_aio description must not contain cli suffix.
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_cli_tool_no_aio_graceful_degrade(llm_tools_session):
+    """When an agent has a cli tool enabled but execute_code_aio is NOT in the
+    tool list, get_agent_tools_for_llm must not raise and must not surface the
+    cli tool as an LLM function (graceful degrade, D3-1)."""
+    from app.models.tool import Tool
+    from app.services.agent_tools import get_agent_tools_for_llm
+
+    async with llm_tools_session() as s:
+        s.add(Tool(
+            name="svc", display_name="svc", description="CLI only, no aio in this agent",
+            type="cli", category="cli", icon="🔧", source="admin", enabled=True,
+            is_default=True, parameters_schema={}, config={}, config_schema={},
+        ))
+        # Intentionally do NOT add execute_code_aio.
+        await s.commit()
+
+    tools = await get_agent_tools_for_llm(_uuid.uuid4())
+    names = [t["function"]["name"] for t in tools]
+    assert "svc" not in names, "cli tool must not appear as an LLM function"
+    # execute_code_aio is absent — no description to check; just verify no crash.
+    assert "execute_code_aio" not in names

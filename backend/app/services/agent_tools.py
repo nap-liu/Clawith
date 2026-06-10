@@ -2316,11 +2316,21 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                         "tool's bash shell (composable with pipes like `| jq | head`):\n\n"
                         + "\n\n".join(cli_command_docs)
                     )
+                    aio_found = False
                     for td in result:
                         if td["function"]["name"] == "execute_code_aio":
                             td["function"]["description"] = (
                                 (td["function"]["description"] or "") + cli_suffix
                             )
+                            aio_found = True
+                    if not aio_found:
+                        logger.warning(
+                            "[Tools] Agent %s has CLI tool(s) enabled (%s) but lacks "
+                            "execute_code_aio — CLI commands have nowhere to run. "
+                            "Assign execute_code_aio to this agent alongside the CLI tool(s).",
+                            agent_id,
+                            ", ".join(d.split("\n")[0] for d in cli_command_docs),
+                        )
                 # Inject OS-aware paths into computer-related tool descriptions
                 result = _patch_computer_tool_descriptions(result, computer_os_type)
                 # Strip msg_type from send_message_to_agent when async A2A is disabled
@@ -7436,19 +7446,41 @@ async def build_cli_inject_prefix(
         from app.services.cli_tools.state_storage import StateStorage
 
         async with async_session() as db:
-            tools_r = await db.execute(
-                select(Tool).where(Tool.type == "cli", Tool.enabled == True)  # noqa: E712
-            )
-            cli_tools = list(tools_r.scalars().all())
-            if not cli_tools:
-                return None
-
+            agent_tenant_id = None
             assignments = {}
+            assigned_tool_ids: list[uuid.UUID] = []
             if agent_id:
+                tid_r = await db.execute(
+                    select(AgentModel.tenant_id).where(AgentModel.id == agent_id)
+                )
+                _raw_tid = tid_r.scalar_one_or_none()
+                # Coerce to UUID object: production (Postgres) returns UUID,
+                # test stubs (SQLite TEXT column) return a plain string.
+                if isinstance(_raw_tid, str):
+                    _raw_tid = uuid.UUID(_raw_tid)
+                agent_tenant_id = _raw_tid
                 at_r = await db.execute(
                     select(AgentTool).where(AgentTool.agent_id == agent_id)
                 )
                 assignments = {str(at.tool_id): at for at in at_r.scalars().all()}
+                assigned_tool_ids = [uuid.UUID(tid) for tid in assignments]
+
+            visible_clauses = [Tool.source == "builtin"]
+            if agent_tenant_id:
+                visible_clauses.append((Tool.source == "admin") & (
+                    (Tool.tenant_id == agent_tenant_id) | (Tool.tenant_id.is_(None))
+                ))
+            else:
+                visible_clauses.append((Tool.source == "admin") & (Tool.tenant_id.is_(None)))
+            if assigned_tool_ids:
+                visible_clauses.append((Tool.source == "agent") & Tool.id.in_(assigned_tool_ids))
+
+            tools_r = await db.execute(
+                select(Tool).where(Tool.type == "cli", Tool.enabled == True, or_(*visible_clauses))  # noqa: E712
+            )
+            cli_tools = list(tools_r.scalars().all())
+            if not cli_tools:
+                return None
 
             user_ctx: dict[str, str] = {}
             if user_id:
