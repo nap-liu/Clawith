@@ -27,7 +27,10 @@
 
 services:
   aio-sandbox:
-    image: ghcr.io/agent-infra/sandbox:latest
+    # arm64 dev default; set SANDBOX_IMAGE to the amd64 prod tag when the
+    # sandbox must run linux-x64 CLI binaries (e.g. svc / yybpc-cli):
+    #   SANDBOX_IMAGE=yeyecha-registry.cn-hangzhou.cr.aliyuncs.com/public/aio-sandbox:1.0.0.152-amd64
+    image: ${SANDBOX_IMAGE:-ghcr.io/agent-infra/sandbox:latest}
     container_name: clawith-aio-sandbox
     restart: unless-stopped
     shm_size: 2gb
@@ -35,6 +38,15 @@ services:
       - seccomp:unconfined
     volumes:
       - ./backend/agent_data:/data/agents
+      # CLI tools (svc) are injected as shell functions in the agent's
+      # sandbox session. The binary store is read-only; per-(tenant,tool,
+      # user) state (token caches) is read-write. Same named volumes the
+      # backend mounts, at the same in-container paths — so paths the
+      # backend renders need no translation. NOTE: single-uid (gem=1000)
+      # whole-volume mount provides NO per-user DAC isolation — accepted
+      # for the trusted-scenario design (spec v4 §1.3).
+      - cli_binaries:/data/cli_binaries:ro
+      - cli_tool_state:/data/cli_state
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/sandbox"]
       interval: 10s
