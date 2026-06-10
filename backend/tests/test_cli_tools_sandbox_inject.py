@@ -48,3 +48,13 @@ def test_render_env_resolves_placeholders_and_skips_userless_identity():
     # No user in context → $user.* / $state.* entries are skipped entirely
     # (svc then runs identity-less and reports NOT_LOGGED_IN itself).
     assert render_env(env, PlaceholderContext()) == {"FIXED": "1"}
+
+
+def test_build_cli_function_rejects_unsafe_env_key():
+    with pytest.raises(ValueError):
+        build_cli_function(name="svc", binary_path="/x", env={"A; touch /tmp/P; B": "v"})
+
+
+def test_build_cli_function_rejects_trailing_newline_name():
+    with pytest.raises(ValueError):
+        build_cli_function(name="svc\n", binary_path="/x", env={})

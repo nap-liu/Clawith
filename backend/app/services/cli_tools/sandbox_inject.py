@@ -18,6 +18,10 @@ volumes at the same paths as the backend (/data/cli_binaries ro,
 
 Split: pure functions (quote/render/function text) are unit-tested;
 the DB-touching builder lives in agent_tools (caller side).
+
+Note: the rendered function text may span multiple physical lines when an env
+value contains a newline, but it is still a single valid bash function
+definition; callers must inject it as a whole block and must not filter by line.
 """
 
 from __future__ import annotations
@@ -43,8 +47,9 @@ def shell_quote(value: str) -> str:
 def render_env(env: dict[str, str], ctx: PlaceholderContext) -> dict[str, str]:
     """Resolve placeholder values; drop identity entries with no context.
 
-    An entry whose raw value starts with $user./$state. is dropped when
-    the context lacks user/state data (token resolves to itself).
+    An identity-prefixed entry ($user./$state.) is dropped when its value does
+    not resolve (token comes back unchanged) — e.g. no user in context, or a
+    typo'd field.
     """
     out: dict[str, str] = {}
     for key, raw in env.items():
@@ -57,8 +62,11 @@ def render_env(env: dict[str, str], ctx: PlaceholderContext) -> dict[str, str]:
 
 def build_cli_function(*, name: str, binary_path: str, env: dict[str, str]) -> str:
     """Render one bash function exposing `binary_path` as command `name`."""
-    if not _FUNC_NAME_RE.match(name):
+    if not _FUNC_NAME_RE.fullmatch(name):
         raise ValueError(f"unsafe CLI function name: {name!r}")
+    for key in env:
+        if not _FUNC_NAME_RE.fullmatch(key):
+            raise ValueError(f"unsafe env key: {key!r}")
     assigns = " ".join(f"{k}={shell_quote(v)}" for k, v in env.items())
     prefix = f"{assigns} " if assigns else ""
     return f'{name}() {{ {prefix}{shell_quote(binary_path)} "$@"; }}'
