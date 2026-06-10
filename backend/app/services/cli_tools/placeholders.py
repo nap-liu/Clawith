@@ -9,6 +9,7 @@ Recognised tokens:
   $user.id, $user.phone, $user.email
   $agent.id, $tenant.id
   $params.<name>
+  $state.dir   (per-(tenant,tool,user) persistent state directory)
 
 `$params.<name>` may resolve to either a scalar or a list. Scalars are
 used as-is. Lists are meaningful only for the args_template (they
@@ -30,6 +31,7 @@ class PlaceholderContext:
     agent: dict[str, str] = field(default_factory=dict)
     tenant: dict[str, str] = field(default_factory=dict)
     params: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, str] = field(default_factory=dict)
 
     def lookup(self, key: str) -> Any:
         """Resolve `user.phone` / `agent.id` / `params.<name>`.
@@ -49,6 +51,8 @@ class PlaceholderContext:
             src = self.tenant
         elif root == "params":
             src = self.params
+        elif root == "state":
+            src = self.state
         else:
             return None
         return src.get(field_name)

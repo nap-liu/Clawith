@@ -101,3 +101,13 @@ def test_resolve_list_in_env_is_json_dumped():
     ctx = _ctx_with_list_params()
     # Not a great config, but it shouldn't crash and the result is observable.
     assert resolve("$params.command", ctx) == '["report", "list"]'
+
+
+def test_state_dir_token_resolves():
+    ctx = PlaceholderContext(state={"dir": "/data/cli_state/t/tool/u"})
+    assert resolve("$state.dir", ctx) == "/data/cli_state/t/tool/u"
+
+
+def test_state_dir_token_unresolved_passthrough():
+    ctx = PlaceholderContext()
+    assert resolve("$state.dir", ctx) == "$state.dir"
