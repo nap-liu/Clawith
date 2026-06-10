@@ -28,7 +28,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -47,13 +47,20 @@ from app.services.cli_tools.schema import (
     BinaryMetadata,
     CliToolConfig,
 )
+from app.services.cli_tools.state_storage import StateStorage
+from app.services.cli_tools.storage import (
+    BinaryStorage,
+    MagicNumberError,
+    SizeLimitExceededError,
+)
+from app.services.cli_tools import versioning as versioning_service
+
 
 # ---------------------------------------------------------------------------
-# Legacy request-schema helpers (Task 8 will replace these with v5 env-based
+# Legacy request-schema shims (Task 8 will replace these with v5 env-based
 # equivalents; kept here so the API remains importable and backward-compatible
 # with existing UIs until the PATCH/CREATE endpoints are slimmed down).
 # ---------------------------------------------------------------------------
-from pydantic import field_validator as _fv  # noqa: F401 — avoid re-import collision
 
 
 class RuntimeConfig(BaseModel):
@@ -64,7 +71,7 @@ class RuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     args_template: list[str] = Field(default_factory=list)
-    env_inject: dict[str, str] = Field(default_factory=dict)
+    env_inject: Optional[dict[str, str]] = None
     timeout_seconds: int = 30
     persistent_home: bool = False
     rate_limit_per_minute: Optional[int] = None
@@ -80,13 +87,6 @@ class SandboxConfig(BaseModel):
 
     cpu_limit: Optional[str] = None
     memory_limit: Optional[str] = None
-from app.services.cli_tools.state_storage import StateStorage
-from app.services.cli_tools.storage import (
-    BinaryStorage,
-    MagicNumberError,
-    SizeLimitExceededError,
-)
-from app.services.cli_tools import versioning as versioning_service
 
 logger = logging.getLogger(__name__)
 
@@ -312,17 +312,19 @@ async def update_cli_tool(
         diff["enabled"] = [tool.enabled, body.is_active]
         tool.enabled = body.is_active
 
-    # Load existing config through the nested schema so legacy rows get
+    # Load existing config through the v5 schema so legacy rows get
     # normalised on first touch. Binary metadata stays whatever the DB
     # had — neither the request body nor this handler touch it.
+    # v5: only env survives; runtime.env_inject (if provided) replaces env.
     if body.runtime is not None or body.sandbox is not None:
         existing = CliToolConfig.model_validate(tool.config or {})
-        new_runtime = body.runtime if body.runtime is not None else existing.runtime
-        new_sandbox = body.sandbox if body.sandbox is not None else existing.sandbox
+        if body.runtime is not None and body.runtime.env_inject is not None:
+            new_env = body.runtime.env_inject
+        else:
+            new_env = existing.env
         tool.config = CliToolConfig(
             binary=existing.binary,  # preserved; not exposed on PATCH
-            runtime=new_runtime,
-            sandbox=new_sandbox,
+            env=new_env,
         ).model_dump(mode="json")
         if body.runtime is not None:
             diff["runtime"] = "updated"
@@ -610,17 +612,13 @@ async def test_run_cli_tool(
         "email": str(getattr(user, "email", "") or ""),
     }
 
-    # If mock_env supplied, temporarily replace those env keys. Never persist.
+    # If mock_env supplied, temporarily merge those env keys. Never persist.
     original_config = dict(tool.config or {})
     if body.mock_env:
         normalised = CliToolConfig.model_validate(original_config)
-        patched_runtime = normalised.runtime.model_copy(update={
-            "env_inject": {**normalised.runtime.env_inject, **body.mock_env},
-        })
         tool.config = CliToolConfig(
             binary=normalised.binary,
-            runtime=patched_runtime,
-            sandbox=normalised.sandbox,
+            env={**normalised.env, **body.mock_env},
         ).model_dump(mode="json")
 
     async def _write_audit(audit: CliExecutionAudit) -> None:
@@ -698,20 +696,21 @@ async def get_home_usage(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "CLI tool not found")
     _require_manage(user, tool)
 
-    config = CliToolConfig.model_validate(tool.config or {})
     state_storage = StateStorage()
+    # quota retired in v5; field kept for response-shape stability until Task 8
+    limit_mb = 0
     within, current = state_storage.check_quota(
         tenant_id=tool.tenant_id,
         tool_id=tool.id,
         user_id=user_id,
-        limit_mb=config.runtime.home_quota_mb,
+        limit_mb=limit_mb,
     )
     return HomeUsageOut(
         user_id=user_id,
         bytes=current,
         mb=current // (1024 * 1024),
         within_limit=within,
-        limit_mb=config.runtime.home_quota_mb,
+        limit_mb=limit_mb,
     )
 
 
