@@ -160,6 +160,32 @@ async def _call_agent_llm(
     from app.database import async_session as _persist_session_factory
     from app.services.chat_history import persist_tool_call as _persist_tool_call
 
+    # Mirror this turn to any web client viewing the SAME session in real time.
+    # IM apps render only the final reply, but a person watching the conversation
+    # in the web UI expects the live stream — so broadcast every event to the
+    # session's live web connections (the "connection = subscriber" model, same
+    # as the WebSocket chat path). Lazy import avoids a services->api import
+    # cycle; best-effort so IM delivery is never affected by a web-side hiccup.
+    async def _web_broadcast(payload: dict):
+        if not session_id:
+            return
+        try:
+            from app.api.websocket import manager as _ws_manager
+
+            await _ws_manager.send_to_session(str(agent_id), session_id, payload)
+        except Exception:
+            pass
+
+    async def _on_chunk_bridged(text: str):
+        await _web_broadcast({"type": "chunk", "content": text})
+        if on_chunk is not None:
+            await on_chunk(text)
+
+    async def _on_thinking_bridged(text: str):
+        await _web_broadcast({"type": "thinking", "content": text})
+        if on_thinking is not None:
+            await on_thinking(text)
+
     async def _on_tool_call_persisted(evt: dict):
         # Persist only when we have a real session + user (FK-safe). IM channels
         # always pass both; guard keeps stray callers from writing orphan rows.
@@ -171,6 +197,12 @@ async def _call_agent_llm(
                 conversation_id=session_id,
                 evt=evt,
             )
+        # Mirror to web viewers, masking secrets at the output boundary exactly
+        # like the WebSocket path (raw args stay in the persisted row for replay).
+        from app.utils.sanitize import sanitize_tool_args
+
+        _evt = {**evt, "args": sanitize_tool_args(evt.get("args"))} if "args" in evt else evt
+        await _web_broadcast({"type": "tool_call", **_evt})
         if on_tool_call is not None:
             await on_tool_call(evt)
 
@@ -192,12 +224,16 @@ async def _call_agent_llm(
         agent_id=agent_id,
         user_id=effective_user_id,
         session_id=session_id,
-        on_chunk=on_chunk,
-        on_thinking=on_thinking,
+        on_chunk=_on_chunk_bridged,
+        on_thinking=_on_thinking_bridged,
         on_tool_call=_on_tool_call_persisted,
         supports_vision=getattr(model, "supports_vision", False),
         is_group=is_group,
     )
+
+    # Finalize the streamed bubble for any web client watching this session, so
+    # an IM-driven conversation updates live in the web UI (not only on reload).
+    await _web_broadcast({"type": "done", "role": "assistant", "content": reply})
 
     # IM channels render this reply directly to the end user. Keep the original
     # error sentinel visible (it carries the concrete failure reason) and append

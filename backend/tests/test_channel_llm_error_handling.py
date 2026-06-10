@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -143,3 +144,74 @@ async def test_successful_reply_passes_through(monkeypatch):
         _make_db(agent, model), agent.id, "你好", session_id=str(agent.id), user_id=agent.id
     )
     assert reply == "你好，我可以帮你做什么？"
+
+
+async def test_im_turn_broadcasts_events_to_web_session(monkeypatch):
+    """An IM-driven turn mirrors its live stream to web clients viewing the SAME
+    session, so a DingTalk/Feishu conversation updates in real time in the web UI
+    (not only on reload). Verifies `_call_agent_llm` broadcasts chunk/thinking/
+    tool_call/done via the WebSocket `ConnectionManager.send_to_session` for the
+    turn's session_id — the cross-channel half of the live-broadcast fix."""
+    agent, model = _make_agent_and_model()
+
+    import app.api.websocket as ws_mod
+
+    sent: list[tuple[str, str]] = []
+
+    async def _fake_send_to_session(agent_id, session_id, payload):
+        sent.append((session_id, payload.get("type")))
+
+    monkeypatch.setattr(ws_mod.manager, "send_to_session", _fake_send_to_session)
+    # Keep this a pure wiring test — no real DB writes / compaction.
+    monkeypatch.setattr("app.services.chat_history.persist_tool_call", AsyncMock(), raising=False)
+    monkeypatch.setattr(
+        "app.services.llm.compactor.maybe_precompact_prompt", AsyncMock(return_value=False), raising=False
+    )
+
+    async def fake_llm(*_args, **kwargs):
+        await kwargs["on_thinking"]("想一下")
+        await kwargs["on_chunk"]("昨天销售")
+        await kwargs["on_tool_call"](
+            {"name": "sql_execute", "call_id": "1", "args": {"conn": "secret"}, "status": "done", "result": "ok"}
+        )
+        return "昨天销售额 5050"
+
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_llm, raising=False)
+
+    reply = await channel_llm._call_agent_llm(
+        _make_db(agent, model), agent.id, "看销售", session_id="sess-123", user_id=agent.id
+    )
+
+    assert reply == "昨天销售额 5050"
+    types = [t for _sid, t in sent]
+    sids = {sid for sid, _t in sent}
+    assert sids == {"sess-123"}, "every broadcast must target the turn's session"
+    for expected in ("thinking", "chunk", "tool_call", "done"):
+        assert expected in types, f"web viewer must receive the {expected!r} event of an IM turn"
+
+
+async def test_im_turn_without_session_does_not_broadcast(monkeypatch):
+    """No session_id (transient call) → no web broadcast, and no crash."""
+    agent, model = _make_agent_and_model()
+
+    import app.api.websocket as ws_mod
+
+    sent: list[int] = []
+
+    async def _fake_send_to_session(*_a, **_k):
+        sent.append(1)
+
+    monkeypatch.setattr(ws_mod.manager, "send_to_session", _fake_send_to_session)
+    monkeypatch.setattr("app.services.chat_history.persist_tool_call", AsyncMock(), raising=False)
+
+    async def fake_llm(*_a, **kwargs):
+        await kwargs["on_chunk"]("x")
+        return "ok"
+
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_llm, raising=False)
+
+    reply = await channel_llm._call_agent_llm(
+        _make_db(agent, model), agent.id, "hi", session_id="", user_id=agent.id
+    )
+    assert reply == "ok"
+    assert sent == [], "no session → no broadcast"
