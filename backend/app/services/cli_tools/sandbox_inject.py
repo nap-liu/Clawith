@@ -33,9 +33,13 @@ from app.services.cli_tools.placeholders import PlaceholderContext, resolve
 # bash function names: keep it conservative (no dashes — POSIX-safe).
 _FUNC_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Env entries referencing these roots are identity-scoped: when there is
-# no user in context they are skipped so the CLI sees no identity at all
-# (and reports its own NOT_LOGGED_IN) instead of a fake empty one.
+# Env entries referencing these roots are identity-scoped: when the caller
+# supplied no user context (placeholder resolves to itself) they are skipped
+# so the CLI sees no identity at all (and reports its own NOT_LOGGED_IN)
+# instead of a fake empty one. The caller (build_cli_inject_prefix) decides
+# the user context from the call origin — web/IM = conversation user,
+# trigger/cron = agent creator, A2A consult = source agent owner — so an
+# autonomous run is normally creator-bound, not identity-less.
 _IDENTITY_ROOTS = ("$user.", "$state.")
 
 

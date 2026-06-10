@@ -7411,9 +7411,21 @@ async def build_cli_inject_prefix(
     """Build the bash function block exposing type='cli' tools in the sandbox.
 
     Returns None when the agent has no enabled cli tools (the common
-    case — zero overhead for non-CLI deployments). Identity env entries
-    ($user.*/$state.*) are dropped when user_id is None, so the CLI
-    itself reports NOT_LOGGED_IN instead of impersonating anyone.
+    case — zero overhead for non-CLI deployments).
+
+    Identity binding follows the call origin, via the `user_id` the caller
+    threads in:
+      - web / IM channels → the live conversation user;
+      - trigger / cron / Aware loop (heartbeat passes ``agent.creator_id``)
+        → the agent's creator — the digital employee acts on its owner's
+        behalf, using the owner's data permissions (cron reports rely on
+        this to fetch data);
+      - A2A consult (passes the source agent's ``owner_id``) → the source
+        agent's creator.
+    The resolved user's phone is bound into the CLI function. Only when
+    ``user_id`` is None or the User row is missing (rare edge) are the
+    identity env entries ($user.*/$state.*) dropped — the CLI then runs
+    identity-less and reports NOT_LOGGED_IN rather than impersonating.
     """
     try:
         from app.models.tool import Tool, AgentTool

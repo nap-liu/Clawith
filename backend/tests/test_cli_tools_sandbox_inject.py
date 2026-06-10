@@ -242,3 +242,42 @@ async def test_cli_tools_hidden_from_llm_and_described_in_aio(llm_tools_session)
     aio = next(t for t in tools if t["function"]["name"] == "execute_code_aio")
     assert "svc" in aio["function"]["description"]
     assert "report 是唯一数据来源" in aio["function"]["description"]
+
+
+@pytest.mark.asyncio
+async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session, monkeypatch, tmp_path):
+    """Trigger/cron and A2A pass the agent creator's User PK as user_id;
+    svc binds to the creator's phone (digital employee acts on its owner's
+    behalf). Confirmed product semantics — NOT identity-less for autonomous
+    origins. Guards against regressing to the old (wrong) NOT_LOGGED_IN spec."""
+    from app.models.tool import Tool
+    from app.models.user import Identity, User
+    from app.services.agent_tools import build_cli_inject_prefix
+    from app.services.cli_tools import state_storage as ss_mod
+
+    monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
+    monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
+
+    async with cli_inject_session() as s:
+        # User model uses association_proxy → Identity for email/phone.
+        identity = Identity(email="creator@x.com", phone="13900000000", password_hash="x")
+        s.add(identity)
+        await s.flush()
+        creator = User(identity_id=identity.id, display_name="Creator", role="member", is_active=True)
+        s.add(creator)
+        await s.flush()
+        creator_id = creator.id
+        s.add(Tool(
+            name="svc", display_name="svc", description="d", type="cli",
+            category="cli", icon="🔧", source="admin", enabled=True, is_default=True,
+            parameters_schema={},
+            config={"binary": {"sha256": "a" * 64, "size": 1, "original_name": "svc"},
+                    "env": {"YYBPC_CLI_USER_PHONE": "$user.phone", "YYBPC_CLI_HOME": "$state.dir"}},
+            config_schema={},
+        ))
+        await s.commit()
+
+    # Autonomous origin passes the creator's User PK (as heartbeat.py / A2A do).
+    prefix = await build_cli_inject_prefix(agent_id=None, user_id=creator_id)
+    assert prefix is not None
+    assert "YYBPC_CLI_USER_PHONE='13900000000'" in prefix  # creator identity bound, not dropped
