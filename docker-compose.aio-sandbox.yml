@@ -27,11 +27,16 @@
 
 services:
   aio-sandbox:
-    # agent-infra/sandbox 1.9.3 (amd64). The shell exec layer joins multi-line
-    # bash commands with ';' internally, so agent multi-line bash and the svc
-    # injection block both run cleanly (the 1.0.0.152 multi-line
-    # ErrorObservation bug is fixed at the sandbox layer here).
-    image: ${SANDBOX_IMAGE:-ghcr.io/agent-infra/sandbox:1.9.3}
+    # Default = 1.0.0.152 because it is the only tag with an arm64 build, so
+    # local arm dev (Apple Silicon) runs it NATIVE. 1.9.3 is amd64-ONLY (both
+    # ghcr and the volces mirror) and hangs under Rosetta, so it cannot run on
+    # local arm at all.
+    #
+    # PROD (native amd64) MUST override to 1.9.3 — its shell-exec layer joins
+    # multi-line bash with ';', root-fixing the 1.0.0.152 multi-line
+    # ErrorObservation that broke agent multi-line bash + the svc injection:
+    #   SANDBOX_IMAGE=enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.9.3
+    image: ${SANDBOX_IMAGE:-enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.0.0.152}
     container_name: clawith-aio-sandbox
     restart: unless-stopped
     shm_size: 2gb

@@ -15,11 +15,13 @@
 --        config_cli_binaries:/data/cli_binaries:ro
 --        config_cli_tool_state:/data/cli_state          (rw)
 --    (volumes already exist; project prefix is `config` in prod.)
--- 2. aio-sandbox image = ghcr.io/agent-infra/sandbox:1.9.3 (linux/amd64).
+-- 2. aio-sandbox image = all-in-one-sandbox:1.9.3 (linux/amd64). Mirror:
+--    enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.9.3
 --    1.9.3 is required: its shell-exec layer joins multi-line bash with ';'
 --    (1.0.0.152 returned ErrorObservation for any '\n' command, which broke
---    multi-line agent bash and the svc injection block). svc is a linux-x64
---    Node SEA binary, so the amd64 image is mandatory. Build/push backend +
+--    multi-line agent bash and the svc injection block). 1.9.3 is amd64-only
+--    (no arm64 build); prod is amd64 so this is fine. svc is a linux-x64 Node
+--    SEA binary, so the amd64 image is mandatory anyway. Build/push backend +
 --    all services together (lockstep).
 -- 3. run this SQL; verify:
 --        SELECT config, parameters_schema FROM tools WHERE name='svc';
