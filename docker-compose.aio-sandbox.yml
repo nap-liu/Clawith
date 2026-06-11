@@ -27,10 +27,11 @@
 
 services:
   aio-sandbox:
-    # arm64 dev default; set SANDBOX_IMAGE to the amd64 prod tag when the
-    # sandbox must run linux-x64 CLI binaries (e.g. svc / yybpc-cli):
-    #   SANDBOX_IMAGE=yeyecha-registry.cn-hangzhou.cr.aliyuncs.com/public/aio-sandbox:1.0.0.152-amd64
-    image: ${SANDBOX_IMAGE:-ghcr.io/agent-infra/sandbox:latest}
+    # agent-infra/sandbox 1.9.3 (amd64). The shell exec layer joins multi-line
+    # bash commands with ';' internally, so agent multi-line bash and the svc
+    # injection block both run cleanly (the 1.0.0.152 multi-line
+    # ErrorObservation bug is fixed at the sandbox layer here).
+    image: ${SANDBOX_IMAGE:-ghcr.io/agent-infra/sandbox:1.9.3}
     container_name: clawith-aio-sandbox
     restart: unless-stopped
     shm_size: 2gb
