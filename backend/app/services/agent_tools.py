@@ -2266,12 +2266,18 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 # Only surface tools that have a binary + a safe, non-colliding
                 # function name.
                 if t.type == "cli":
-                    if not (t.config or {}).get("binary", {}).get("sha256"):
-                        continue  # no binary uploaded yet
-                    if not _FUNC_NAME_RE.fullmatch(t.name) or t.name in db_tool_names:
+                    _binary = (t.config or {}).get("binary")
+                    if not (isinstance(_binary, dict) and _binary.get("sha256")):
+                        continue  # no binary uploaded yet (tolerate legacy null/non-dict)
+                    _always_names = {a["function"]["name"] for a in _always_tools}
+                    if (
+                        not _FUNC_NAME_RE.fullmatch(t.name)
+                        or t.name in db_tool_names
+                        or t.name in _always_names
+                    ):
                         logger.warning(
                             f"[Tools] Skipping CLI tool '{t.name}' "
-                            "(unsafe or duplicate function name)"
+                            "(unsafe name, or collides with a builtin/duplicate function)"
                         )
                         continue
                     result.append({
@@ -7561,7 +7567,7 @@ async def _execute_code(
     *,
     tool_name: str = "execute_code",
     user_id: Optional[uuid.UUID] = None,
-    inject_only_tool_names: Optional[set[str]] = None,
+    inject_prefix_override: Optional[str] = None,
 ) -> str:
     """Execute code using the configured sandbox backend.
 
@@ -7617,10 +7623,10 @@ async def _execute_code(
         backend = get_sandbox_backend(sandbox_config)
         logger.info(f"[Sandbox] Executing code with backend: {backend.__class__.__name__} (tool={tool_name})")
         inject_prefix = None
-        if inject_only_tool_names is not None:
-            inject_prefix = await build_cli_inject_prefix(
-                agent_id, user_id, only_tool_names=inject_only_tool_names
-            )
+        if inject_prefix_override is not None:
+            # Caller already built the prefix (e.g. _execute_cli_tool, which
+            # injects just its own tool) — avoid a second DB round-trip.
+            inject_prefix = inject_prefix_override
         elif tool_name == "execute_code_aio" and language in ("bash", "node"):
             inject_prefix = await build_cli_inject_prefix(agent_id, user_id)
         result = await backend.execute(
@@ -7681,7 +7687,7 @@ async def _execute_cli_tool(
     return await _execute_code(
         agent_id, ws, {"language": "bash", "code": command},
         tool_name="execute_code_aio", user_id=user_id,
-        inject_only_tool_names={tool_name},
+        inject_prefix_override=inject,
     )
 
 

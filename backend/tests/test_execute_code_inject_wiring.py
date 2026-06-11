@@ -197,12 +197,12 @@ async def test_execute_code_aio_python_no_inject_prefix(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_execute_code_inject_only_tool_names_uses_single_tool(tmp_path):
-    """inject_only_tool_names routes to build_cli_inject_prefix(only_tool_names=...)."""
+async def test_execute_code_inject_prefix_override_used_directly(tmp_path):
+    """inject_prefix_override is passed straight through — no build call."""
     from app.services.agent_tools import _execute_code
 
     mock_backend = _make_mock_backend()
-    prefix_mock = AsyncMock(return_value="ONE_TOOL_PREFIX")
+    prefix_mock = AsyncMock(return_value="SHOULD_NOT_BE_CALLED")
     with (
         patch("app.services.agent_tools.build_cli_inject_prefix", new=prefix_mock),
         patch("app.services.sandbox.registry.get_sandbox_backend", return_value=mock_backend),
@@ -215,11 +215,11 @@ async def test_execute_code_inject_only_tool_names_uses_single_tool(tmp_path):
             {"language": "bash", "code": "svc report list"},
             tool_name="execute_code_aio",
             user_id=None,
-            inject_only_tool_names={"svc"},
+            inject_prefix_override="OVERRIDE_PREFIX",
         )
 
-    assert prefix_mock.call_args.kwargs.get("only_tool_names") == {"svc"}
-    assert mock_backend.execute.call_args.kwargs.get("inject_prefix") == "ONE_TOOL_PREFIX"
+    prefix_mock.assert_not_called()  # override skips the second DB round-trip
+    assert mock_backend.execute.call_args.kwargs.get("inject_prefix") == "OVERRIDE_PREFIX"
 
 
 @pytest.mark.asyncio
@@ -229,8 +229,8 @@ async def test_execute_cli_tool_runs_command_in_aio_with_single_inject(tmp_path)
 
     seen = {}
 
-    async def fake_exec_code(agent_id, ws, arguments, *, tool_name, user_id, inject_only_tool_names=None):
-        seen.update(arguments=arguments, tool_name=tool_name, inject_only=inject_only_tool_names)
+    async def fake_exec_code(agent_id, ws, arguments, *, tool_name, user_id, inject_prefix_override=None):
+        seen.update(arguments=arguments, tool_name=tool_name, override=inject_prefix_override)
         return "OUTPUT"
 
     with (
@@ -244,7 +244,7 @@ async def test_execute_cli_tool_runs_command_in_aio_with_single_inject(tmp_path)
     assert out == "OUTPUT"
     assert seen["arguments"] == {"language": "bash", "code": "svc report list | jq '.[0]'"}
     assert seen["tool_name"] == "execute_code_aio"
-    assert seen["inject_only"] == {"svc"}
+    assert seen["override"] == "svc() { :; }"  # prebuilt prefix passed straight through
 
 
 @pytest.mark.asyncio

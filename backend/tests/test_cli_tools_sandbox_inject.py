@@ -290,6 +290,7 @@ async def test_cli_tool_is_standalone_function_not_folded(llm_tools_session):
     assert "Sandbox CLI commands" not in (aio["function"]["description"] or "")
 
 
+@pytest.mark.asyncio
 async def test_cli_tool_without_binary_not_surfaced(llm_tools_session):
     """A CLI tool with no uploaded binary does not appear as an LLM function."""
     from app.models.tool import Tool
