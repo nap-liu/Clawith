@@ -1,54 +1,54 @@
--- Migrate the `svc` CLI tool to the sandbox-injection model (v5 config).
+-- Add a per-user persistent HOME to the `svc` CLI tool (sandbox-injection model).
 --
--- After this migration svc is no longer a subprocess CLI tool nor an LLM
--- function: it is injected as a bash function into the agent's aio-sandbox
--- shell. Config collapses to {binary, env}; parameters_schema is retired
--- (cli tools left the LLM function list — see get_agent_tools_for_llm);
--- description becomes the agent-facing command usage docs that get appended
--- to execute_code_aio's description.
+-- Context
+-- -------
+-- svc is already a type='cli' tool injected into the agent's aio-sandbox via an
+-- identity-agnostic PATH wrapper + per-exec identity env (see
+-- services/cli_tools/sandbox_inject.py). Its env is read through
+-- CliToolConfig.model_validate, which lifts the legacy nested shape
+-- (`config.runtime.env_inject`) into `cfg.env` WITHOUT a migration — so there is
+-- deliberately NO "rewrite the whole config" step here (the earlier version of
+-- this file did that and would have dropped GUANDATA_APP_TOKEN,
+-- sandbox.memory_limit, and the runtime.* fields — a data-loss footgun).
 --
--- Run manually at deploy time (follows the "prod changes need approval" rule).
+-- The one thing the prod row is missing is YYBPC_CLI_HOME. Without it svc uses
+-- HOME=<agent workspace>, which is SHARED by every user talking to that agent —
+-- so svc's on-disk token cache (~/.yybpc-cli/token-cache) collides across users
+-- and can serve one user's cached token to another (the stale-token 401 class
+-- of bug). Pointing YYBPC_CLI_HOME at $state.dir (the per-(tenant,tool,user)
+-- directory on the cli_state volume) makes svc's persistent state per-user,
+-- matching the per-user identity it already runs under (YYBPC_CLI_USER_PHONE).
+-- Setting env to $state.dir also flips on the state-dir provisioning in
+-- agent_tools (needs_state = any value == '$state.dir').
 --
--- ── Deploy checklist (prod) ──────────────────────────────────────────────
--- 1. compose: aio-sandbox service mounts the SAME named volumes the backend
---    uses, at the same in-container paths:
+-- This statement is ADDITIVE and IDEMPOTENT: it sets exactly one key via
+-- jsonb_set and leaves binary / GUANDATA_APP_TOKEN / phone / runtime.* /
+-- sandbox.* untouched. Safe to re-run.
+--
+-- Run manually at deploy time (prod changes need approval).
+--
+-- ── Deploy prerequisites (already true in prod, verify once) ───────────────
+-- 1. aio-sandbox mounts the same named volumes as the backend, same paths:
 --        config_cli_binaries:/data/cli_binaries:ro
 --        config_cli_tool_state:/data/cli_state          (rw)
---    (volumes already exist; project prefix is `config` in prod.)
--- 2. aio-sandbox image = all-in-one-sandbox:1.9.3 (linux/amd64). Mirror:
---    enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.9.3
---    1.9.3 is required: its shell-exec layer joins multi-line bash with ';'
---    (1.0.0.152 returned ErrorObservation for any '\n' command, which broke
---    multi-line agent bash and the svc injection block). 1.9.3 is amd64-only
---    (no arm64 build); prod is amd64 so this is fine. svc is a linux-x64 Node
---    SEA binary, so the amd64 image is mandatory anyway. Build/push backend +
---    all services together (lockstep).
--- 3. run this SQL; verify:
---        SELECT config, parameters_schema FROM tools WHERE name='svc';
---    expect config = {"binary": {...}, "env": {...}}, parameters_schema = {}.
--- 4. verify get_agent_tools_for_llm output: NO `svc` function in the list;
---    execute_code_aio description contains the svc usage docs.
--- 5. smoke in chat: agent runs `svc --version` and
---    `svc report list --agent | head` inside execute_code_aio (bash).
--- 6. R-A: sandbox egress must reach api.yeyecha.com (SSO agentLogin is
---    IP-whitelisted). Same host egress as backend → expected OK; verify once.
+-- 2. aio-sandbox image = all-in-one-sandbox:1.9.3 (linux/amd64). 1.9.3 is
+--    required for multi-line bash; the backend additionally delivers each exec
+--    as a single-line base64 transport (bash <(echo <b64> | base64 -d)) so
+--    comments / heredocs / multi-line survive verbatim.
 --
--- Pre-check (inspect current row before running):
---   SELECT config, parameters_schema, description FROM tools WHERE name='svc';
+-- Pre-check (inspect the current row first):
+--   SELECT jsonb_pretty(config::jsonb) FROM tools WHERE name='svc' AND type='cli';
 -- ─────────────────────────────────────────────────────────────────────────
 
-UPDATE tools SET
-  config = jsonb_build_object(
-    -- preserve the system-written binary metadata (sha256/size/…) as-is
-    'binary', (config::jsonb)->'binary',
-    'env', jsonb_build_object(
-      'YYBPC_CLI_USER_PHONE', '$user.phone',
-      'YYBPC_CLI_HOME', '$state.dir'
-    )
-  ),
-  parameters_schema = '{}'::json,
-  description = '黄鹤楼主档数据查询 CLI。用法: svc <子命令> [参数],输出 JSON,可接管道(| jq | head)。建议加 --agent 压缩输出。【重要】所有数据查询优先使用 report 子命令(svc report list 查看全部报表; svc report query --report-id <id> 查询数据),report 是唯一数据分析来源,只有 report 未涵盖的数据才允许使用其他子命令。yk_* 开头的报表已不维护,不要使用。'
+UPDATE tools
+SET config = jsonb_set(
+    config::jsonb,
+    '{runtime,env_inject,YYBPC_CLI_HOME}',
+    '"$state.dir"'::jsonb,
+    true  -- create_missing: add the key if absent
+)
 WHERE name = 'svc' AND type = 'cli';
 
--- Post-check:
---   SELECT config, parameters_schema FROM tools WHERE name='svc';
+-- Post-check (expect env_inject to now contain GUANDATA_APP_TOKEN +
+-- YYBPC_CLI_USER_PHONE + YYBPC_CLI_HOME, everything else unchanged):
+--   SELECT config::jsonb #> '{runtime,env_inject}' FROM tools WHERE name='svc';
