@@ -164,7 +164,7 @@ BUILTIN_TOOLS = [
     {
         "name": "move_file",
         "display_name": "Move File",
-        "description": "Move or rename a file or folder within the workspace. Use this instead of execute_code for reorganizing workspace files, moving generated documents into subfolders, or renaming files. Cannot move soul.md, tasks.json, or enterprise_info/. If destination_path is an existing folder or ends with '/', the original filename is preserved inside that folder. Does not overwrite by default.",
+        "description": "Move or rename a file or folder within the workspace. Use this for reorganizing workspace files, moving generated documents into subfolders, or renaming files (prefer it over shell commands like mv). Cannot move soul.md, tasks.json, or enterprise_info/. If destination_path is an existing folder or ends with '/', the original filename is preserved inside that folder. Does not overwrite by default.",
         "category": "file",
         "icon": "↪",
         "is_default": True,

@@ -368,7 +368,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "move_file",
-            "description": "Move or rename a file or folder within the workspace. Use this instead of execute_code for reorganizing workspace files, moving generated documents into subfolders, or renaming files. Cannot move protected files or shared enterprise_info/ files. If destination_path is an existing folder or ends with '/', the original filename is preserved inside that folder. By default this will not overwrite an existing destination.",
+            "description": "Move or rename a file or folder within the workspace. Use this for reorganizing workspace files, moving generated documents into subfolders, or renaming files (prefer it over shell commands like mv). Cannot move protected files or shared enterprise_info/ files. If destination_path is an existing folder or ends with '/', the original filename is preserved inside that folder. By default this will not overwrite an existing destination.",
             "parameters": {
                 "type": "object",
                 "properties": {
