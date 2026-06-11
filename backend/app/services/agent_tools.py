@@ -7528,7 +7528,9 @@ async def build_cli_inject_prefix(
                 ))
             except ValueError as e:
                 logger.warning(f"[CLI Inject] skip tool {tool.name}: {e}")
-        return "\n".join(functions) if functions else None
+        # Join with '; ' (NOT '\n'): aio-sandbox shell exec rejects newline-
+        # separated commands, so every injected function must sit on one line.
+        return "; ".join(functions) if functions else None
     except Exception:
         logger.exception("[CLI Inject] prefix build failed; continuing without CLI")
         return None

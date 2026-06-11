@@ -371,7 +371,12 @@ class AioSandboxBackend(BaseSandboxBackend):
         )
         user_cmd = cls._build_shell_command(code, language)
         if inject_prefix:
-            return f"{exports} && {inject_prefix}\n{user_cmd}"
+            # aio-sandbox /v1/shell/exec rejects newline-separated commands: a
+            # literal '\n' makes the server return an 'ErrorObservation' /
+            # terminated session. The injected function block and the user
+            # command MUST therefore be joined on a SINGLE line with ';' — the
+            # functions end in '}', so a leading ';' cleanly separates them.
+            return f"{exports} && {inject_prefix}; {user_cmd}"
         return f"{exports} && {user_cmd}"
 
     @staticmethod
