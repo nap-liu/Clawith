@@ -194,3 +194,78 @@ async def test_execute_code_aio_python_no_inject_prefix(tmp_path):
     assert call_kwargs.get("inject_prefix") is None, (
         f"python must not receive inject_prefix, got {call_kwargs.get('inject_prefix')!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_code_inject_only_tool_names_uses_single_tool(tmp_path):
+    """inject_only_tool_names routes to build_cli_inject_prefix(only_tool_names=...)."""
+    from app.services.agent_tools import _execute_code
+
+    mock_backend = _make_mock_backend()
+    prefix_mock = AsyncMock(return_value="ONE_TOOL_PREFIX")
+    with (
+        patch("app.services.agent_tools.build_cli_inject_prefix", new=prefix_mock),
+        patch("app.services.sandbox.registry.get_sandbox_backend", return_value=mock_backend),
+        patch("app.config.get_sandbox_config", return_value=_FakeSandboxConfig()),
+        patch("app.services.agent_tools._get_tool_config", new=AsyncMock(return_value=None)),
+    ):
+        await _execute_code(
+            None,
+            tmp_path,
+            {"language": "bash", "code": "svc report list"},
+            tool_name="execute_code_aio",
+            user_id=None,
+            inject_only_tool_names={"svc"},
+        )
+
+    assert prefix_mock.call_args.kwargs.get("only_tool_names") == {"svc"}
+    assert mock_backend.execute.call_args.kwargs.get("inject_prefix") == "ONE_TOOL_PREFIX"
+
+
+@pytest.mark.asyncio
+async def test_execute_cli_tool_runs_command_in_aio_with_single_inject(tmp_path):
+    """_execute_cli_tool runs the bash command line in aio with single-tool inject."""
+    from app.services import agent_tools
+
+    seen = {}
+
+    async def fake_exec_code(agent_id, ws, arguments, *, tool_name, user_id, inject_only_tool_names=None):
+        seen.update(arguments=arguments, tool_name=tool_name, inject_only=inject_only_tool_names)
+        return "OUTPUT"
+
+    with (
+        patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value="svc() { :; }")),
+        patch("app.services.agent_tools._execute_code", new=fake_exec_code),
+    ):
+        out = await agent_tools._execute_cli_tool(
+            None, tmp_path, "svc", {"command": "svc report list | jq '.[0]'"}, user_id=None
+        )
+
+    assert out == "OUTPUT"
+    assert seen["arguments"] == {"language": "bash", "code": "svc report list | jq '.[0]'"}
+    assert seen["tool_name"] == "execute_code_aio"
+    assert seen["inject_only"] == {"svc"}
+
+
+@pytest.mark.asyncio
+async def test_execute_cli_tool_returns_none_when_not_a_cli_tool(tmp_path):
+    """Unknown / non-CLI tool name → None so the dispatcher falls through to MCP."""
+    from app.services import agent_tools
+
+    with patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value=None)):
+        out = await agent_tools._execute_cli_tool(
+            None, tmp_path, "not_a_cli", {"command": "x"}, user_id=None
+        )
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_execute_cli_tool_missing_command_errors(tmp_path):
+    """A CLI tool called without `command` returns a clear error (not None)."""
+    from app.services import agent_tools
+
+    with patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value="svc() { :; }")):
+        out = await agent_tools._execute_cli_tool(
+            None, tmp_path, "svc", {}, user_id=None
+        )
+    assert out is not None and "command" in out.lower()

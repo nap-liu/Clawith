@@ -164,6 +164,43 @@ async def test_build_inject_prefix_for_agent_renders_cli_tools(cli_inject_sessio
 
 
 @pytest.mark.asyncio
+async def test_build_cli_inject_prefix_only_tool_names_filters(cli_inject_session, monkeypatch, tmp_path):
+    from app.models.user import Identity, User
+    from app.models.tool import Tool
+    from app.services.agent_tools import build_cli_inject_prefix
+    from app.services.cli_tools import state_storage as ss_mod
+
+    monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
+    monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
+
+    async with cli_inject_session() as s:
+        identity = Identity(email="u2@x.com", phone="13800000001", password_hash="x")
+        s.add(identity)
+        await s.flush()
+        user = User(identity_id=identity.id, display_name="U2", role="member", is_active=True)
+        s.add(user)
+        await s.flush()
+        uid = user.id
+        for nm in ("svc", "foo"):
+            s.add(Tool(
+                name=nm, display_name=nm, description=f"{nm} CLI", type="cli",
+                category="cli", icon="🔧", source="admin", enabled=True, is_default=True,
+                parameters_schema={},
+                config={
+                    "binary": {"sha256": "a" * 64, "size": 1, "original_name": nm},
+                    "env": {"YYBPC_CLI_USER_PHONE": "$user.phone"},
+                },
+                config_schema={},
+            ))
+        await s.commit()
+
+    prefix_all = await build_cli_inject_prefix(agent_id=None, user_id=uid)
+    assert "svc() {" in prefix_all and "foo() {" in prefix_all
+    prefix_one = await build_cli_inject_prefix(agent_id=None, user_id=uid, only_tool_names={"svc"})
+    assert "svc() {" in prefix_one and "foo() {" not in prefix_one
+
+
+@pytest.mark.asyncio
 async def test_build_inject_prefix_no_cli_tools_returns_none(cli_inject_session):
     from app.services.agent_tools import build_cli_inject_prefix
     assert await build_cli_inject_prefix(agent_id=None, user_id=None) is None
@@ -216,7 +253,9 @@ async def llm_tools_session(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cli_tools_hidden_from_llm_and_described_in_aio(llm_tools_session):
+async def test_cli_tool_is_standalone_function_not_folded(llm_tools_session):
+    """A CLI tool with a binary surfaces as its own LLM function (with a
+    `command` param) and is NOT folded into execute_code_aio's description."""
     from app.models.tool import Tool
     from app.services.agent_tools import get_agent_tools_for_llm
 
@@ -224,6 +263,41 @@ async def test_cli_tools_hidden_from_llm_and_described_in_aio(llm_tools_session)
         s.add(Tool(
             name="svc", display_name="黄鹤楼主档",
             description="数据查询 CLI。report 是唯一数据来源。",
+            type="cli", category="cli", icon="🔧", source="admin", enabled=True,
+            is_default=True, parameters_schema={},
+            config={"binary": {"sha256": "a" * 64, "size": 10, "original_name": "svc"}},
+            config_schema={},
+        ))
+        s.add(Tool(
+            name="execute_code_aio", display_name="Sandbox",
+            description="Run code in sandbox.", type="builtin", category="code",
+            icon="💻", source="builtin", enabled=True, is_default=True,
+            parameters_schema={"type": "object", "properties": {}},
+            config={}, config_schema={},
+        ))
+        await s.commit()
+
+    tools = await get_agent_tools_for_llm(_uuid.uuid4())
+    names = [t["function"]["name"] for t in tools]
+    # svc is now a standalone LLM function, not folded into aio.
+    assert "svc" in names
+    svc = next(t for t in tools if t["function"]["name"] == "svc")
+    assert "command" in svc["function"]["parameters"]["properties"]
+    assert svc["function"]["parameters"]["required"] == ["command"]
+    # execute_code_aio description is clean — no folded CLI docs.
+    aio = next(t for t in tools if t["function"]["name"] == "execute_code_aio")
+    assert "svc" not in (aio["function"]["description"] or "")
+    assert "Sandbox CLI commands" not in (aio["function"]["description"] or "")
+
+
+async def test_cli_tool_without_binary_not_surfaced(llm_tools_session):
+    """A CLI tool with no uploaded binary does not appear as an LLM function."""
+    from app.models.tool import Tool
+    from app.services.agent_tools import get_agent_tools_for_llm
+
+    async with llm_tools_session() as s:
+        s.add(Tool(
+            name="svc", display_name="svc", description="no binary yet",
             type="cli", category="cli", icon="🔧", source="admin", enabled=True,
             is_default=True, parameters_schema={}, config={}, config_schema={},
         ))
@@ -239,9 +313,6 @@ async def test_cli_tools_hidden_from_llm_and_described_in_aio(llm_tools_session)
     tools = await get_agent_tools_for_llm(_uuid.uuid4())
     names = [t["function"]["name"] for t in tools]
     assert "svc" not in names
-    aio = next(t for t in tools if t["function"]["name"] == "execute_code_aio")
-    assert "svc" in aio["function"]["description"]
-    assert "report 是唯一数据来源" in aio["function"]["description"]
 
 
 @pytest.mark.asyncio

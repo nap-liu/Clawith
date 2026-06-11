@@ -2250,8 +2250,8 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             )
             all_tools = all_tools_r.scalars().all()
 
+            from app.services.cli_tools.sandbox_inject import _FUNC_NAME_RE
             result = []
-            cli_command_docs: list[str] = []
             db_tool_names = set()
             for t in all_tools:
                 tid = str(t.id)
@@ -2260,13 +2260,42 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 if not enabled:
                     continue
 
-                # type='cli' tools are sandbox shell commands, not LLM
-                # functions. Collect their usage docs; appended to
-                # execute_code_aio's description below.
+                # type='cli' tools are standalone LLM functions: the handler
+                # (_execute_cli_tool) runs the supplied bash command line in the
+                # aio sandbox with this tool's identity-bound function injected.
+                # Only surface tools that have a binary + a safe, non-colliding
+                # function name.
                 if t.type == "cli":
-                    cli_command_docs.append(
-                        f"## `{t.name}` — {t.display_name}\n{t.description}"
-                    )
+                    if not (t.config or {}).get("binary", {}).get("sha256"):
+                        continue  # no binary uploaded yet
+                    if not _FUNC_NAME_RE.fullmatch(t.name) or t.name in db_tool_names:
+                        logger.warning(
+                            f"[Tools] Skipping CLI tool '{t.name}' "
+                            "(unsafe or duplicate function name)"
+                        )
+                        continue
+                    result.append({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "command": {
+                                        "type": "string",
+                                        "description": (
+                                            f"要在标准 bash 环境执行的完整命令行;`{t.name}` 命令"
+                                            f"(已注入身份认证)可用,可任意组合,例如 "
+                                            f"`{t.name} report list --agent | jq '.[0]'`"
+                                        ),
+                                    }
+                                },
+                                "required": ["command"],
+                            },
+                        },
+                    })
+                    db_tool_names.add(t.name)
                     continue
 
                 # Skip feishu tools if the agent has no Feishu channel configured
@@ -2309,28 +2338,6 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 for t in _always_tools:
                     if t["function"]["name"] not in db_tool_names:
                         result.append(t)
-                if cli_command_docs:
-                    cli_suffix = (
-                        "\n\n# Sandbox CLI commands\n"
-                        "The following CLI commands are available directly in this "
-                        "tool's bash shell (composable with pipes like `| jq | head`):\n\n"
-                        + "\n\n".join(cli_command_docs)
-                    )
-                    aio_found = False
-                    for td in result:
-                        if td["function"]["name"] == "execute_code_aio":
-                            td["function"]["description"] = (
-                                (td["function"]["description"] or "") + cli_suffix
-                            )
-                            aio_found = True
-                    if not aio_found:
-                        logger.warning(
-                            "[Tools] Agent %s has CLI tool(s) enabled (%s) but lacks "
-                            "execute_code_aio — CLI commands have nowhere to run. "
-                            "Assign execute_code_aio to this agent alongside the CLI tool(s).",
-                            agent_id,
-                            ", ".join(d.split("\n")[0] for d in cli_command_docs),
-                        )
                 # Inject OS-aware paths into computer-related tool descriptions
                 result = _patch_computer_tool_descriptions(result, computer_os_type)
                 # Strip msg_type from send_message_to_agent when async A2A is disabled
@@ -3098,9 +3105,14 @@ async def execute_tool(
         elif tool_name == "upsert_member_daily_report":
             result = await _upsert_member_daily_report(agent_id, arguments)
         else:
-            # CLI tools are sandbox shell commands now (not dispatchable);
-            # anything unknown falls through to MCP.
-            result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id, user_id=user_id, session_id=session_id)
+            # CLI tools (type='cli') are standalone functions executed in the
+            # aio sandbox with that tool's auth injected. Try CLI first; if
+            # tool_name is not a CLI tool for this agent, fall through to MCP.
+            cli_result = await _execute_cli_tool(agent_id, ws, tool_name, arguments, user_id=user_id)
+            if cli_result is not None:
+                result = cli_result
+            else:
+                result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id, user_id=user_id, session_id=session_id)
 
         # Log tool call activity (skip noisy read operations)
         if tool_name not in ("list_files", "read_file", "read_document"):
@@ -7417,6 +7429,7 @@ def _check_code_safety(language: str, code: str) -> str | None:
 async def build_cli_inject_prefix(
     agent_id: Optional[uuid.UUID],
     user_id: Optional[uuid.UUID],
+    only_tool_names: Optional[set[str]] = None,
 ) -> Optional[str]:
     """Build the bash function block exposing type='cli' tools in the sandbox.
 
@@ -7436,6 +7449,10 @@ async def build_cli_inject_prefix(
     ``user_id`` is None or the User row is missing (rare edge) are the
     identity env entries ($user.*/$state.*) dropped — the CLI then runs
     identity-less and reports NOT_LOGGED_IN rather than impersonating.
+
+    ``only_tool_names`` restricts the block to those CLI tool names (used by the
+    standalone CLI-tool LLM functions, which inject just their own tool); when
+    None, every visible CLI tool is included (used by execute_code_aio).
     """
     try:
         from app.models.tool import Tool, AgentTool
@@ -7475,9 +7492,10 @@ async def build_cli_inject_prefix(
             if assigned_tool_ids:
                 visible_clauses.append((Tool.source == "agent") & Tool.id.in_(assigned_tool_ids))
 
-            tools_r = await db.execute(
-                select(Tool).where(Tool.type == "cli", Tool.enabled == True, or_(*visible_clauses))  # noqa: E712
-            )
+            cli_q = select(Tool).where(Tool.type == "cli", Tool.enabled == True, or_(*visible_clauses))  # noqa: E712
+            if only_tool_names:
+                cli_q = cli_q.where(Tool.name.in_(only_tool_names))
+            tools_r = await db.execute(cli_q)
             cli_tools = list(tools_r.scalars().all())
             if not cli_tools:
                 return None
@@ -7543,6 +7561,7 @@ async def _execute_code(
     *,
     tool_name: str = "execute_code",
     user_id: Optional[uuid.UUID] = None,
+    inject_only_tool_names: Optional[set[str]] = None,
 ) -> str:
     """Execute code using the configured sandbox backend.
 
@@ -7598,7 +7617,11 @@ async def _execute_code(
         backend = get_sandbox_backend(sandbox_config)
         logger.info(f"[Sandbox] Executing code with backend: {backend.__class__.__name__} (tool={tool_name})")
         inject_prefix = None
-        if tool_name == "execute_code_aio" and language in ("bash", "node"):
+        if inject_only_tool_names is not None:
+            inject_prefix = await build_cli_inject_prefix(
+                agent_id, user_id, only_tool_names=inject_only_tool_names
+            )
+        elif tool_name == "execute_code_aio" and language in ("bash", "node"):
             inject_prefix = await build_cli_inject_prefix(agent_id, user_id)
         result = await backend.execute(
             code=code,
@@ -7631,6 +7654,35 @@ async def _execute_code(
         except Exception:
             logger.exception(f"[Sandbox] Fallback also failed for agent {agent_id}")
             return f"❌ Execution error: {str(e)[:200]}"
+
+
+async def _execute_cli_tool(
+    agent_id: Optional[uuid.UUID],
+    ws: Path,
+    tool_name: str,
+    arguments: dict,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+) -> Optional[str]:
+    """Run a standalone CLI tool (type='cli') as its own LLM function.
+
+    Returns None when ``tool_name`` is not a visible CLI tool for this agent —
+    the dispatcher then falls through to MCP. Otherwise runs the user-supplied
+    ``command`` as a single bash line in the aio sandbox with ONLY this tool's
+    identity-bound function injected, reusing _execute_code's sandbox / work_dir
+    / timeout / error path.
+    """
+    inject = await build_cli_inject_prefix(agent_id, user_id, only_tool_names={tool_name})
+    if not inject:
+        return None  # not a CLI tool (or no binary) → let dispatcher try MCP
+    command = (arguments.get("command") or "").strip()
+    if not command:
+        return f"❌ Missing required parameter 'command' for CLI tool '{tool_name}'."
+    return await _execute_code(
+        agent_id, ws, {"language": "bash", "code": command},
+        tool_name="execute_code_aio", user_id=user_id,
+        inject_only_tool_names={tool_name},
+    )
 
 
 async def _execute_code_legacy(ws: Path, arguments: dict) -> str:
