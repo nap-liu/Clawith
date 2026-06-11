@@ -533,7 +533,7 @@ async def test_run_cli_tool(
     from app.config import get_sandbox_config
     from app.services.sandbox.registry import get_sandbox_backend
     from app.services.cli_tools.placeholders import PlaceholderContext
-    from app.services.cli_tools.sandbox_inject import build_cli_function, render_env
+    from app.services.cli_tools.sandbox_inject import render_env
 
     cfg = CliToolConfig.model_validate(tool.config or {})
     if not cfg.binary.sha256:
@@ -552,9 +552,16 @@ async def test_run_cli_tool(
         tenant={"id": str(tool.tenant_id) if tool.tenant_id else ""},
         state=state_ctx,
     )
-    prefix = build_cli_function(name=tool.name, binary_path=binary_path, env=render_env(cfg.env, ctx))
+    # New injection contract: identity-agnostic PATH wrapper + per-exec identity
+    # env, delivered to the sandbox via `inject=` (the backend materializes the
+    # wrapper write + env export into the per-exec child bash). Mirrors the
+    # agent-side build_cli_injection shape so test-run exercises the real path.
+    injection = {
+        "wrappers": [{"name": tool.name, "binary_path": binary_path}],
+        "env": render_env(cfg.env, ctx),
+    }
     backend = get_sandbox_backend(sandbox_config)
-    result = await backend.execute(code=body.command, language="bash", timeout=60, work_dir="/data/agents", agent_id=f"cli-testrun-{tool.id}", inject_prefix=prefix)
+    result = await backend.execute(code=body.command, language="bash", timeout=60, work_dir="/data/agents", agent_id=f"cli-testrun-{tool.id}", inject=injection)
     return TestRunResponse(exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr, duration_ms=result.duration_ms, error_message=result.error)
 
 

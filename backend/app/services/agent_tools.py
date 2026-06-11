@@ -2291,9 +2291,11 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                                     "command": {
                                         "type": "string",
                                         "description": (
-                                            f"要在标准 bash 环境执行的完整命令行;`{t.name}` 命令"
-                                            f"(已注入身份认证)可用,可任意组合,例如 "
-                                            f"`{t.name} report list --agent | jq '.[0]'`"
+                                            f"完整的 bash 命令行,**必须以程序名 `{t.name}` 开头**"
+                                            f"(它是沙箱里一个已注入身份认证的真实命令;具体子命令/"
+                                            f"参数见本工具说明)。例如 `{t.name} <参数...>`——不要省略"
+                                            f"程序名只写参数。支持管道/重定向等任意 bash 组合,"
+                                            f"如 `{t.name} <参数...> | jq '.'`。"
                                         ),
                                     }
                                 },
@@ -7432,14 +7434,15 @@ def _check_code_safety(language: str, code: str) -> str | None:
     return None
 
 
-async def build_cli_inject_prefix(
+async def build_cli_injection(
     agent_id: Optional[uuid.UUID],
     user_id: Optional[uuid.UUID],
     only_tool_names: Optional[set[str]] = None,
-) -> Optional[str]:
-    """Build the bash function block exposing type='cli' tools in the sandbox.
+) -> Optional[dict]:
+    """Build the per-exec CLI injection: identity env + PATH-wrapper specs.
 
-    Returns None when the agent has no enabled cli tools (the common
+    Returns ``{"env": {...}, "wrappers": [{"name", "binary_path"}, ...]}`` or
+    None when the agent has no enabled CLI tool with a binary (the common
     case — zero overhead for non-CLI deployments).
 
     Identity binding follows the call origin, via the `user_id` the caller
@@ -7447,24 +7450,27 @@ async def build_cli_inject_prefix(
       - web / IM channels → the live conversation user;
       - trigger / cron / Aware loop (heartbeat passes ``agent.creator_id``)
         → the agent's creator — the digital employee acts on its owner's
-        behalf, using the owner's data permissions (cron reports rely on
-        this to fetch data);
+        behalf, using the owner's data permissions (cron reports rely on this);
       - A2A consult (passes the source agent's ``owner_id``) → the source
         agent's creator.
-    The resolved user's phone is bound into the CLI function. Only when
-    ``user_id`` is None or the User row is missing (rare edge) are the
-    identity env entries ($user.*/$state.*) dropped — the CLI then runs
-    identity-less and reports NOT_LOGGED_IN rather than impersonating.
+    The resolved identity rides on ``env`` (phone / tokens / $state.dir). Only
+    when ``user_id`` is None or the User row is missing are the identity env
+    entries ($user.*/$state.*) dropped — the CLI then runs identity-less and
+    reports NOT_LOGGED_IN rather than impersonating.
 
-    ``only_tool_names`` restricts the block to those CLI tool names (used by the
-    standalone CLI-tool LLM functions, which inject just their own tool); when
-    None, every visible CLI tool is included (used by execute_code_aio).
+    The wrappers are identity-agnostic; the caller injects ``env`` per-exec
+    (bash child / python os.environ), never the persistent session, so it
+    cannot leak across calls (no cross-conversation 串台).
+
+    ``only_tool_names`` restricts to those CLI tool names (standalone CLI-tool
+    LLM functions inject just their own tool); None → all visible CLI tools
+    (execute_code_aio).
     """
     try:
         from app.models.tool import Tool, AgentTool
         from app.models.user import User
         from app.services.cli_tools.placeholders import PlaceholderContext
-        from app.services.cli_tools.sandbox_inject import build_cli_function, render_env
+        from app.services.cli_tools.sandbox_inject import _FUNC_NAME_RE, render_env
         from app.services.cli_tools.schema import CliToolConfig
         from app.services.cli_tools.state_storage import StateStorage
 
@@ -7519,10 +7525,18 @@ async def build_cli_inject_prefix(
         from app.services.cli_tools.storage import BINARY_ROOT, BinaryStorage
         binary_storage = BinaryStorage(root=BINARY_ROOT)
         state_storage = StateStorage()
-        functions: list[str] = []
+        wrappers: list[dict] = []
+        merged_env: dict[str, str] = {}
         for tool in cli_tools:
             at = assignments.get(str(tool.id))
             if not (at.enabled if at else tool.is_default):
+                continue
+            # Skip tools whose name isn't a safe shell/env identifier (would be
+            # an unsafe wrapper filename / export key).
+            if not _FUNC_NAME_RE.fullmatch(tool.name) or any(
+                not _FUNC_NAME_RE.fullmatch(k) for k in (CliToolConfig.model_validate(tool.config or {}).env or {})
+            ):
+                logger.warning(f"[CLI Inject] skip tool {tool.name}: unsafe name or env key")
                 continue
             cfg = CliToolConfig.model_validate(tool.config or {})
             if not cfg.binary.sha256:
@@ -7544,19 +7558,15 @@ async def build_cli_inject_prefix(
                 tenant={"id": tenant_key if tenant_key != "_global" else ""},
                 state=state_ctx,
             )
-            try:
-                functions.append(build_cli_function(
-                    name=tool.name,
-                    binary_path=str(binary_path),
-                    env=render_env(cfg.env, ctx),
-                ))
-            except ValueError as e:
-                logger.warning(f"[CLI Inject] skip tool {tool.name}: {e}")
-        # One function per line; aio-sandbox >= 1.9.3 normalizes the newlines
-        # at its shell-exec layer (prod runs 1.9.3).
-        return "\n".join(functions) if functions else None
+            wrappers.append({"name": tool.name, "binary_path": str(binary_path)})
+            # Later tools win on env-key collisions (identity vars are the same
+            # user, so values agree; tool-specific tokens have distinct keys).
+            merged_env.update(render_env(cfg.env, ctx))
+        if not wrappers:
+            return None
+        return {"env": merged_env, "wrappers": wrappers}
     except Exception:
-        logger.exception("[CLI Inject] prefix build failed; continuing without CLI")
+        logger.exception("[CLI Inject] injection build failed; continuing without CLI")
         return None
 
 
@@ -7567,7 +7577,7 @@ async def _execute_code(
     *,
     tool_name: str = "execute_code",
     user_id: Optional[uuid.UUID] = None,
-    inject_prefix_override: Optional[str] = None,
+    cli_injection: Optional[dict] = None,
 ) -> str:
     """Execute code using the configured sandbox backend.
 
@@ -7622,20 +7632,22 @@ async def _execute_code(
 
         backend = get_sandbox_backend(sandbox_config)
         logger.info(f"[Sandbox] Executing code with backend: {backend.__class__.__name__} (tool={tool_name})")
-        inject_prefix = None
-        if inject_prefix_override is not None:
-            # Caller already built the prefix (e.g. _execute_cli_tool, which
-            # injects just its own tool) — avoid a second DB round-trip.
-            inject_prefix = inject_prefix_override
-        elif tool_name == "execute_code_aio" and language in ("bash", "node"):
-            inject_prefix = await build_cli_inject_prefix(agent_id, user_id)
+        injection = None
+        if cli_injection is not None:
+            # Caller already built it (e.g. _execute_cli_tool, scoped to its own
+            # tool) — avoid a second DB round-trip.
+            injection = cli_injection
+        elif tool_name == "execute_code_aio":
+            # All languages (bash/node/python) get CLI wrappers + identity so
+            # svc is transparently usable everywhere (incl. subprocess).
+            injection = await build_cli_injection(agent_id, user_id)
         result = await backend.execute(
             code=code,
             language=language,
             timeout=timeout,
             work_dir=str(work_dir),
             agent_id=str(agent_id) if agent_id else None,
-            inject_prefix=inject_prefix,
+            inject=injection,
         )
 
         # Format result for user display
@@ -7707,16 +7719,16 @@ async def _execute_cli_tool(
 
     Returns None when ``tool_name`` is not a CLI tool for this agent — the
     dispatcher then falls through to MCP. Otherwise runs the user-supplied
-    ``command`` as a single bash line in the aio sandbox with ONLY this tool's
-    identity-bound function injected, reusing _execute_code's sandbox / work_dir
-    / timeout / error path.
+    ``command`` as bash in the aio sandbox with ONLY this tool injected
+    (wrapper + identity), reusing _execute_code's sandbox / work_dir / timeout /
+    error path.
     """
-    inject = await build_cli_inject_prefix(agent_id, user_id, only_tool_names={tool_name})
-    if not inject:
-        # build returned None: either tool_name isn't a CLI tool (→ MCP), or it
-        # IS a surfaced CLI tool that couldn't be built right now (binary deleted
-        # mid-conversation, or a transient error swallowed by build_cli_inject_prefix).
-        # Distinguish so the latter gets a clear error, not a confusing 'Unknown tool'.
+    injection = await build_cli_injection(agent_id, user_id, only_tool_names={tool_name})
+    if not injection:
+        # None means: tool_name isn't a CLI tool (→ MCP), OR it IS a surfaced CLI
+        # tool that couldn't be built now (binary deleted mid-conversation, or a
+        # transient error swallowed by build_cli_injection). Distinguish so the
+        # latter gets a clear error, not a confusing 'Unknown tool'.
         if await _is_cli_tool_name(agent_id, tool_name):
             return (
                 f"❌ CLI tool '{tool_name}' is currently unavailable "
@@ -7729,7 +7741,7 @@ async def _execute_cli_tool(
     return await _execute_code(
         agent_id, ws, {"language": "bash", "code": command},
         tool_name="execute_code_aio", user_id=user_id,
-        inject_prefix_override=inject,
+        cli_injection=injection,
     )
 
 

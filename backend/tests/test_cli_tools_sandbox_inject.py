@@ -2,7 +2,9 @@
 import pytest
 
 from app.services.cli_tools.sandbox_inject import (
-    build_cli_function,
+    build_wrapper_write_sh,
+    build_env_exports_sh,
+    build_python_prelude,
     render_env,
     shell_quote,
 )
@@ -14,24 +16,60 @@ def test_shell_quote_wraps_and_escapes():
     assert shell_quote("a'b") == "'a'\\''b'"
 
 
-def test_build_cli_function_binds_env_inside_function():
-    text = build_cli_function(
+def test_build_wrapper_write_sh_contains_expected_parts():
+    text = build_wrapper_write_sh(
         name="svc",
         binary_path="/data/cli_binaries/_global/t1/aa.bin",
-        env={"YYBPC_CLI_USER_PHONE": "13800000000", "YYBPC_CLI_HOME": "/data/cli_state/x"},
     )
-    # One function definition, env as command-prefix assignments (NOT export).
-    assert text.startswith("svc() {")
-    assert "export" not in text
-    assert "YYBPC_CLI_USER_PHONE='13800000000'" in text
-    assert "YYBPC_CLI_HOME='/data/cli_state/x'" in text
-    assert "'/data/cli_binaries/_global/t1/aa.bin' \"$@\"" in text
-    assert text.rstrip().endswith("}")
+    # Must write wrapper to $HOME/.local/bin/svc
+    assert 'mkdir -p "$HOME/.local/bin"' in text
+    assert "base64 -d" in text
+    assert "chmod 755" in text
+    # The wrapper content must be base64'd — verify by decoding
+    import base64
+    import re
+    m = re.search(r"echo ([A-Za-z0-9+/=]+) \| base64 -d", text)
+    assert m, f"no base64 block found in: {text}"
+    decoded = base64.b64decode(m.group(1)).decode()
+    assert "#!/bin/sh" in decoded
+    assert "exec '/data/cli_binaries/_global/t1/aa.bin' \"$@\"" in decoded
 
 
-def test_build_cli_function_rejects_unsafe_name():
+def test_build_wrapper_write_sh_rejects_unsafe_name():
     with pytest.raises(ValueError):
-        build_cli_function(name="bad name; rm", binary_path="/x", env={})
+        build_wrapper_write_sh(name="bad name; rm", binary_path="/x")
+
+
+def test_build_wrapper_write_sh_rejects_trailing_newline_name():
+    with pytest.raises(ValueError):
+        build_wrapper_write_sh(name="svc\n", binary_path="/x")
+
+
+def test_build_env_exports_sh_basic():
+    result = build_env_exports_sh({"YYBPC_CLI_USER_PHONE": "13800000000", "YYBPC_CLI_HOME": "/data/cli_state/x"})
+    assert result.startswith("export ")
+    assert "YYBPC_CLI_USER_PHONE='13800000000'" in result
+    assert "YYBPC_CLI_HOME='/data/cli_state/x'" in result
+
+
+def test_build_env_exports_sh_empty_returns_empty_string():
+    assert build_env_exports_sh({}) == ""
+
+
+def test_build_env_exports_sh_rejects_unsafe_key():
+    with pytest.raises(ValueError):
+        build_env_exports_sh({"A; touch /tmp/P; B": "v"})
+
+
+def test_build_python_prelude_contains_wrapper_and_env():
+    wrappers = [{"name": "svc", "binary_path": "/data/cli_binaries/x.bin"}]
+    env = {"MY_KEY": "my_val"}
+    prelude = build_python_prelude(wrappers, env)
+    assert "import os as _os" in prelude
+    assert "expanduser" in prelude
+    assert ".local/bin" in prelude
+    assert "svc" in prelude
+    assert "my_val" in prelude
 
 
 def test_render_env_resolves_placeholders_and_skips_userless_identity():
@@ -50,18 +88,8 @@ def test_render_env_resolves_placeholders_and_skips_userless_identity():
     assert render_env(env, PlaceholderContext()) == {"FIXED": "1"}
 
 
-def test_build_cli_function_rejects_unsafe_env_key():
-    with pytest.raises(ValueError):
-        build_cli_function(name="svc", binary_path="/x", env={"A; touch /tmp/P; B": "v"})
-
-
-def test_build_cli_function_rejects_trailing_newline_name():
-    with pytest.raises(ValueError):
-        build_cli_function(name="svc\n", binary_path="/x", env={})
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# DB-backed tests for build_cli_inject_prefix
+# DB-backed tests for build_cli_injection
 # ──────────────────────────────────────────────────────────────────────────────
 import pytest
 from sqlalchemy import text
@@ -119,10 +147,10 @@ async def cli_inject_session(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_build_inject_prefix_for_agent_renders_cli_tools(cli_inject_session, monkeypatch, tmp_path):
+async def test_build_inject_for_agent_renders_cli_tools(cli_inject_session, monkeypatch, tmp_path):
     from app.models.user import Identity, User
     from app.models.tool import Tool
-    from app.services.agent_tools import build_cli_inject_prefix
+    from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
 
     monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
@@ -156,18 +184,26 @@ async def test_build_inject_prefix_for_agent_renders_cli_tools(cli_inject_sessio
         await s.commit()
         tid = tool.id
 
-    prefix = await build_cli_inject_prefix(agent_id=None, user_id=uid)
-    assert prefix is not None
-    assert "svc() {" in prefix
-    assert "YYBPC_CLI_USER_PHONE='13800000000'" in prefix
-    assert f"_global/{tid}/{'a' * 64}.bin" in prefix
+    injection = await build_cli_injection(agent_id=None, user_id=uid)
+    assert injection is not None
+    # Must return dict shape with env and wrappers
+    assert "env" in injection
+    assert "wrappers" in injection
+    # svc wrapper is present
+    wrapper_names = [w["name"] for w in injection["wrappers"]]
+    assert "svc" in wrapper_names
+    # binary path contains the tool's tenant-key, id, and sha256
+    svc_wrapper = next(w for w in injection["wrappers"] if w["name"] == "svc")
+    assert f"_global/{tid}/{'a' * 64}.bin" in svc_wrapper["binary_path"]
+    # identity env is resolved
+    assert injection["env"].get("YYBPC_CLI_USER_PHONE") == "13800000000"
 
 
 @pytest.mark.asyncio
-async def test_build_cli_inject_prefix_only_tool_names_filters(cli_inject_session, monkeypatch, tmp_path):
+async def test_build_cli_injection_only_tool_names_filters(cli_inject_session, monkeypatch, tmp_path):
     from app.models.user import Identity, User
     from app.models.tool import Tool
-    from app.services.agent_tools import build_cli_inject_prefix
+    from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
 
     monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
@@ -194,16 +230,19 @@ async def test_build_cli_inject_prefix_only_tool_names_filters(cli_inject_sessio
             ))
         await s.commit()
 
-    prefix_all = await build_cli_inject_prefix(agent_id=None, user_id=uid)
-    assert "svc() {" in prefix_all and "foo() {" in prefix_all
-    prefix_one = await build_cli_inject_prefix(agent_id=None, user_id=uid, only_tool_names={"svc"})
-    assert "svc() {" in prefix_one and "foo() {" not in prefix_one
+    injection_all = await build_cli_injection(agent_id=None, user_id=uid)
+    all_names = [w["name"] for w in injection_all["wrappers"]]
+    assert "svc" in all_names and "foo" in all_names
+
+    injection_one = await build_cli_injection(agent_id=None, user_id=uid, only_tool_names={"svc"})
+    one_names = [w["name"] for w in injection_one["wrappers"]]
+    assert "svc" in one_names and "foo" not in one_names
 
 
 @pytest.mark.asyncio
-async def test_build_inject_prefix_no_cli_tools_returns_none(cli_inject_session):
-    from app.services.agent_tools import build_cli_inject_prefix
-    assert await build_cli_inject_prefix(agent_id=None, user_id=None) is None
+async def test_build_inject_no_cli_tools_returns_none(cli_inject_session):
+    from app.services.agent_tools import build_cli_injection
+    assert await build_cli_injection(agent_id=None, user_id=None) is None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -282,6 +321,7 @@ async def test_cli_tool_is_standalone_function_not_folded(llm_tools_session):
     # svc is now a standalone LLM function, not folded into aio.
     assert "svc" in names
     svc = next(t for t in tools if t["function"]["name"] == "svc")
+    # The function must have a "command" property (exact description text may vary)
     assert "command" in svc["function"]["parameters"]["properties"]
     assert svc["function"]["parameters"]["required"] == ["command"]
     # execute_code_aio description is clean — no folded CLI docs.
@@ -324,7 +364,7 @@ async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session, 
     origins. Guards against regressing to the old (wrong) NOT_LOGGED_IN spec."""
     from app.models.tool import Tool
     from app.models.user import Identity, User
-    from app.services.agent_tools import build_cli_inject_prefix
+    from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
 
     monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
@@ -350,9 +390,10 @@ async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session, 
         await s.commit()
 
     # Autonomous origin passes the creator's User PK (as heartbeat.py / A2A do).
-    prefix = await build_cli_inject_prefix(agent_id=None, user_id=creator_id)
-    assert prefix is not None
-    assert "YYBPC_CLI_USER_PHONE='13900000000'" in prefix  # creator identity bound, not dropped
+    injection = await build_cli_injection(agent_id=None, user_id=creator_id)
+    assert injection is not None
+    # creator identity must be bound, not dropped
+    assert injection["env"].get("YYBPC_CLI_USER_PHONE") == "13900000000"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -363,7 +404,7 @@ async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session, 
 @pytest.fixture
 async def cli_inject_session_agents(monkeypatch):
     """Like cli_inject_session but also creates agent_tools table and an
-    agents stub with a tenant_id column so build_cli_inject_prefix's
+    agents stub with a tenant_id column so build_cli_injection's
     select(AgentModel.tenant_id) query can return a non-null value."""
     import app.services.agent_tools as at_mod  # noqa: F401 — registers ORM
     import app.models.mcp_server  # noqa: F401
@@ -383,7 +424,7 @@ async def cli_inject_session_agents(monkeypatch):
             "task_logs", "mcp_server_overrides",
         ):
             await conn.execute(text(f"CREATE TABLE IF NOT EXISTS {stub} (id TEXT PRIMARY KEY)"))
-        # agents needs at least id + tenant_id; build_cli_inject_prefix only
+        # agents needs at least id + tenant_id; build_cli_injection only
         # selects AgentModel.tenant_id so extra columns are not needed.
         await conn.execute(text(
             "CREATE TABLE IF NOT EXISTS agents "
@@ -411,7 +452,7 @@ async def test_cross_tenant_admin_tool_not_injected(cli_inject_session_agents, m
     """
     import uuid as _uuid_mod
     from app.models.tool import Tool
-    from app.services.agent_tools import build_cli_inject_prefix
+    from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
 
     monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
@@ -444,9 +485,9 @@ async def test_cross_tenant_admin_tool_not_injected(cli_inject_session_agents, m
         await s.commit()
 
     # Tenant B agent must not receive tenant A's CLI tool.
-    prefix_b = await build_cli_inject_prefix(agent_id=agent_b_id, user_id=None)
-    assert prefix_b is None, (
-        "cross-tenant CLI injection: tenant A tool must not appear in tenant B agent's prefix"
+    injection_b = await build_cli_injection(agent_id=agent_b_id, user_id=None)
+    assert injection_b is None, (
+        "cross-tenant CLI injection: tenant A tool must not appear in tenant B agent's injection"
     )
 
 
@@ -455,7 +496,7 @@ async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkey
     """Admin cli tool scoped to tenant A IS injected into an agent from tenant A."""
     import uuid as _uuid_mod
     from app.models.tool import Tool
-    from app.services.agent_tools import build_cli_inject_prefix
+    from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
 
     monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
@@ -484,9 +525,10 @@ async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkey
         )
         await s.commit()
 
-    prefix_a = await build_cli_inject_prefix(agent_id=agent_a_id, user_id=None)
-    assert prefix_a is not None, "same-tenant CLI tool must be injected into same-tenant agent"
-    assert "svc_a() {" in prefix_a
+    injection_a = await build_cli_injection(agent_id=agent_a_id, user_id=None)
+    assert injection_a is not None, "same-tenant CLI tool must be injected into same-tenant agent"
+    wrapper_names = [w["name"] for w in injection_a["wrappers"]]
+    assert "svc_a" in wrapper_names
 
 
 # ──────────────────────────────────────────────────────────────────────────────

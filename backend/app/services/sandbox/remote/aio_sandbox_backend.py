@@ -122,9 +122,11 @@ class AioSandboxBackend(BaseSandboxBackend):
 
         try:
             async with httpx.AsyncClient() as client:
+                inject = kwargs.get("inject")
                 if language == "python":
                     result = await self._run_jupyter(
-                        client, anchor=anchor, code=code, cwd=cwd, timeout=timeout
+                        client, anchor=anchor, code=code, cwd=cwd, timeout=timeout,
+                        inject=inject,
                     )
                 elif language in ("bash", "node", "javascript"):
                     result = await self._run_shell(
@@ -134,7 +136,7 @@ class AioSandboxBackend(BaseSandboxBackend):
                         language=language,
                         cwd=cwd,
                         timeout=timeout,
-                        inject_prefix=kwargs.get("inject_prefix"),
+                        inject=inject,
                     )
                 else:
                     return self._error_result(
@@ -165,11 +167,11 @@ class AioSandboxBackend(BaseSandboxBackend):
         language: str,
         cwd: str,
         timeout: int,
-        inject_prefix: str | None = None,
+        inject: dict | None = None,
     ) -> ExecutionResult:
         session_id = f"clawith-{anchor}"
         cmd = self._compose_shell_command(
-            cwd=cwd, code=code, language=language, inject_prefix=inject_prefix
+            cwd=cwd, code=code, language=language, inject=inject
         )
 
         body, ok = await self._shell_exec(client, session_id, cmd, timeout)
@@ -319,16 +321,28 @@ class AioSandboxBackend(BaseSandboxBackend):
         cwd: str,
         code: str,
         language: str,
-        inject_prefix: str | None,
+        inject: dict | None = None,
     ) -> str:
-        """Compose the full per-exec command: env exports → CLI function
-        injection block → user command.
+        """Compose the per-exec command and deliver it **verbatim**.
 
-        CLI functions are injected fresh on every exec so identity env
-        (bound inside each function body) always reflects the *current*
-        conversation user — see services/cli_tools/sandbox_inject.py.
-        The prefix may span multiple physical lines (env values can embed
-        newlines); it is always concatenated whole, never line-filtered.
+        The full script (env exports → CLI wrapper writes → identity env exports
+        → user code) is materialized and run in a child bash via a single-line
+        base64 transport: ``bash <(echo <b64> | base64 -d)``. This is critical:
+
+        - **Correctness**: the sandbox's shell-exec layer splits multi-line
+          commands on newlines (and re-joins with ';'), which silently breaks
+          bash comments (a leading '#' swallows the rest of the joined line ->
+          NO OUTPUT) and multi-line quoted strings. Running a materialized
+          script file sidesteps the splitter entirely — comments, heredocs,
+          multi-line jq filters, loops all run exactly as written.
+        - **No 串台**: identity env is exported *inside the per-exec child bash*,
+          never the persistent per-agent session, so it cannot leak into the
+          next call / another conversation.
+
+        The CLI wrapper (``svc`` etc.) is an identity-agnostic PATH script
+        (see sandbox_inject.build_wrapper_write_sh); identity rides on the
+        per-exec ``inject['env']`` which the child bash + any subprocess inherit
+        — so ``svc`` works from bash, pipes, and ``subprocess.run(['svc'])``.
 
         Force-reset cwd AND HOME to the agent root on every call. The shell
         session persists across calls (so exported env vars / background
@@ -356,8 +370,24 @@ class AioSandboxBackend(BaseSandboxBackend):
         contract — not a hack. Tools that ignore these (rare) will still
         hit the status:running timeout branch and trigger a session reset.
         """
+        import base64
+
+        from app.services.cli_tools.sandbox_inject import (
+            build_env_exports_sh,
+            build_wrapper_write_sh,
+        )
+
         quoted_cwd = "'" + cwd.replace("'", "'\\''") + "'"
-        exports = (
+        script_lines: list[str] = []
+        # CLI wrapper writes FIRST, while $HOME is still the sandbox user's
+        # native home, so they land in the on-PATH ~/.local/bin (the exports
+        # below repoint HOME at the agent dir).
+        if inject:
+            for w in inject.get("wrappers", []):
+                script_lines.append(
+                    build_wrapper_write_sh(name=w["name"], binary_path=w["binary_path"])
+                )
+        script_lines.append(
             f"cd {quoted_cwd} && "
             f"export HOME={quoted_cwd} && "
             f"export PIP_USER=1 && "
@@ -369,16 +399,18 @@ class AioSandboxBackend(BaseSandboxBackend):
             f"export GIT_TERMINAL_PROMPT=0 && "
             f"export NO_COLOR=1"
         )
+        if inject:
+            env_export = build_env_exports_sh(inject.get("env", {}))
+            if env_export:
+                script_lines.append(env_export)  # per-exec identity (child only)
         user_cmd = cls._build_shell_command(code, language)
-        if inject_prefix:
-            # Injection block (function defs) and user command on separate
-            # lines. aio-sandbox >= 1.9.3 normalizes newline-separated *commands*
-            # at its shell-exec layer using a bash-aware split (split_bash_commands,
-            # which respects heredocs / quotes — so the `node <<'DELIM'` heredoc
-            # form is preserved, not corrupted). NOTE: 1.0.0.152 lacked this and
-            # returned ErrorObservation on any '\n' — prod runs 1.9.3.
-            return f"{exports} && {inject_prefix}\n{user_cmd}"
-        return f"{exports} && {user_cmd}"
+        script = "\n".join(script_lines) + "\n" + user_cmd
+        # Deliver verbatim: single-line base64 transport (no newlines for the
+        # sandbox command-splitter to mangle) → decoded script runs in a child
+        # bash exactly as written (comments / heredocs / multi-line preserved),
+        # identity env confined to the child (never the persistent session).
+        b64 = base64.b64encode(script.encode()).decode()
+        return f"bash <(echo {b64} | base64 -d)"
 
     @staticmethod
     def _build_shell_command(code: str, language: str) -> str:
@@ -405,6 +437,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         code: str,
         cwd: str,
         timeout: int,
+        inject: dict | None = None,
     ) -> ExecutionResult:
         # Ensure we have a real UUID session for this anchor, and that the
         # kernel's HOME env is pinned to the agent root (the underlying
@@ -414,6 +447,21 @@ class AioSandboxBackend(BaseSandboxBackend):
         # first time we create a kernel for this anchor — subsequent user
         # cells therefore start at line 1 with clean traceback line numbers.
         session_uuid = await self._ensure_jupyter_session(client, anchor, cwd)
+
+        if inject:
+            # (Re)write the CLI PATH wrappers and set the identity env so
+            # `subprocess.run(['svc', ...])` finds svc on PATH and inherits
+            # identity. Prepended to the SAME cell as the user code: the
+            # sandbox's jupyter does not persist state (env / vars) across
+            # execute calls, so a separate setup cell would not carry over.
+            # (Shifts user traceback line numbers by the prelude length —
+            # accepted trade-off for correct, transparent svc identity.)
+            from app.services.cli_tools.sandbox_inject import build_python_prelude
+
+            prelude = build_python_prelude(
+                inject.get("wrappers", []), inject.get("env", {})
+            )
+            code = prelude + "\n" + code
 
         body, ok = await self._jupyter_exec(client, session_uuid, code, cwd, timeout)
 

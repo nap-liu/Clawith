@@ -1,20 +1,27 @@
-"""D5: Integration tests verifying _execute_code threads inject_prefix through
+"""D5: Integration tests verifying _execute_code threads cli_injection through
 to backend.execute correctly.
 
 Strategy:
-- patch build_cli_inject_prefix to return a fixed sentinel
+- patch build_cli_injection to return a fixed sentinel dict
 - patch get_sandbox_backend to return a mock backend (AsyncMock.execute)
 - patch get_sandbox_config and _get_tool_config to return minimal stubs
 - call _execute_code and assert:
-    * execute_code_aio + bash/node  → inject_prefix == sentinel
-    * execute_code (local) + bash   → inject_prefix is None
-    * execute_code_aio + python     → inject_prefix is None (python doesn't get prefix)
+    * execute_code_aio + bash/node/python → inject == sentinel dict
+    * execute_code (local) → inject is None
+    * _execute_cli_tool passes cli_injection= to _execute_code
+    * returns None for non-CLI / error for missing command / error for unavailable tool
 """
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# The canonical injection dict shape returned by build_cli_injection.
+_INJECTION_DICT = {
+    "env": {"YYBPC_CLI_USER_PHONE": "1"},
+    "wrappers": [{"name": "svc", "binary_path": "/x"}],
+}
 
 
 class _FakeResult:
@@ -40,8 +47,8 @@ def _make_mock_backend(result_sentinel=""):
 
 
 @pytest.mark.asyncio
-async def test_execute_code_aio_bash_receives_inject_prefix(tmp_path):
-    """execute_code_aio + bash: inject_prefix must be threaded through."""
+async def test_execute_code_aio_bash_receives_inject(tmp_path):
+    """execute_code_aio + bash: inject dict must be threaded through to backend.execute."""
     from app.services.agent_tools import _execute_code
 
     agent_id = uuid.uuid4()
@@ -50,8 +57,8 @@ async def test_execute_code_aio_bash_receives_inject_prefix(tmp_path):
 
     with (
         patch(
-            "app.services.agent_tools.build_cli_inject_prefix",
-            new=AsyncMock(return_value="PREFIX_MARK"),
+            "app.services.agent_tools.build_cli_injection",
+            new=AsyncMock(return_value=_INJECTION_DICT),
         ),
         patch(
             "app.services.sandbox.registry.get_sandbox_backend",
@@ -76,22 +83,22 @@ async def test_execute_code_aio_bash_receives_inject_prefix(tmp_path):
 
     mock_backend.execute.assert_called_once()
     call_kwargs = mock_backend.execute.call_args.kwargs
-    assert call_kwargs.get("inject_prefix") == "PREFIX_MARK", (
-        f"expected inject_prefix='PREFIX_MARK', got {call_kwargs.get('inject_prefix')!r}"
+    assert call_kwargs.get("inject") == _INJECTION_DICT, (
+        f"expected inject={_INJECTION_DICT!r}, got {call_kwargs.get('inject')!r}"
     )
 
 
 @pytest.mark.asyncio
-async def test_execute_code_aio_node_receives_inject_prefix(tmp_path):
-    """execute_code_aio + node: inject_prefix must also be threaded through."""
+async def test_execute_code_aio_node_receives_inject(tmp_path):
+    """execute_code_aio + node: inject dict must also be threaded through."""
     from app.services.agent_tools import _execute_code
 
     mock_backend = _make_mock_backend()
 
     with (
         patch(
-            "app.services.agent_tools.build_cli_inject_prefix",
-            new=AsyncMock(return_value="PREFIX_MARK"),
+            "app.services.agent_tools.build_cli_injection",
+            new=AsyncMock(return_value=_INJECTION_DICT),
         ),
         patch(
             "app.services.sandbox.registry.get_sandbox_backend",
@@ -115,59 +122,20 @@ async def test_execute_code_aio_node_receives_inject_prefix(tmp_path):
         )
 
     call_kwargs = mock_backend.execute.call_args.kwargs
-    assert call_kwargs.get("inject_prefix") == "PREFIX_MARK"
+    assert call_kwargs.get("inject") == _INJECTION_DICT
 
 
 @pytest.mark.asyncio
-async def test_execute_code_local_bash_no_inject_prefix(tmp_path):
-    """execute_code (local/subprocess) must NOT receive inject_prefix."""
+async def test_execute_code_aio_python_receives_inject(tmp_path):
+    """execute_code_aio + python: inject dict is also passed (python prelude handles it)."""
     from app.services.agent_tools import _execute_code
 
     mock_backend = _make_mock_backend()
 
     with (
         patch(
-            "app.services.agent_tools.build_cli_inject_prefix",
-            new=AsyncMock(return_value="SHOULD_NOT_APPEAR"),
-        ),
-        patch(
-            "app.services.sandbox.registry.get_sandbox_backend",
-            return_value=mock_backend,
-        ),
-        patch(
-            "app.config.get_sandbox_config",
-            return_value=_FakeSandboxConfig(),
-        ),
-        patch(
-            "app.services.agent_tools._get_tool_config",
-            new=AsyncMock(return_value=None),
-        ),
-    ):
-        await _execute_code(
-            None,
-            tmp_path,
-            {"language": "bash", "code": "echo hi"},
-            tool_name="execute_code",  # <-- local tool, not aio
-            user_id=None,
-        )
-
-    call_kwargs = mock_backend.execute.call_args.kwargs
-    assert call_kwargs.get("inject_prefix") is None, (
-        f"local execute_code must pass inject_prefix=None, got {call_kwargs.get('inject_prefix')!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_execute_code_aio_python_no_inject_prefix(tmp_path):
-    """execute_code_aio + python: inject_prefix must be None (python is not a CLI shell)."""
-    from app.services.agent_tools import _execute_code
-
-    mock_backend = _make_mock_backend()
-
-    with (
-        patch(
-            "app.services.agent_tools.build_cli_inject_prefix",
-            new=AsyncMock(return_value="SHOULD_NOT_APPEAR"),
+            "app.services.agent_tools.build_cli_injection",
+            new=AsyncMock(return_value=_INJECTION_DICT),
         ),
         patch(
             "app.services.sandbox.registry.get_sandbox_backend",
@@ -191,20 +159,61 @@ async def test_execute_code_aio_python_no_inject_prefix(tmp_path):
         )
 
     call_kwargs = mock_backend.execute.call_args.kwargs
-    assert call_kwargs.get("inject_prefix") is None, (
-        f"python must not receive inject_prefix, got {call_kwargs.get('inject_prefix')!r}"
+    assert call_kwargs.get("inject") == _INJECTION_DICT, (
+        f"python must receive inject dict, got {call_kwargs.get('inject')!r}"
     )
 
 
 @pytest.mark.asyncio
-async def test_execute_code_inject_prefix_override_used_directly(tmp_path):
-    """inject_prefix_override is passed straight through — no build call."""
+async def test_execute_code_local_no_inject(tmp_path):
+    """execute_code (local/subprocess) must NOT receive inject (inject=None)."""
     from app.services.agent_tools import _execute_code
 
     mock_backend = _make_mock_backend()
-    prefix_mock = AsyncMock(return_value="SHOULD_NOT_BE_CALLED")
+
     with (
-        patch("app.services.agent_tools.build_cli_inject_prefix", new=prefix_mock),
+        patch(
+            "app.services.agent_tools.build_cli_injection",
+            new=AsyncMock(return_value=_INJECTION_DICT),
+        ),
+        patch(
+            "app.services.sandbox.registry.get_sandbox_backend",
+            return_value=mock_backend,
+        ),
+        patch(
+            "app.config.get_sandbox_config",
+            return_value=_FakeSandboxConfig(),
+        ),
+        patch(
+            "app.services.agent_tools._get_tool_config",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        await _execute_code(
+            None,
+            tmp_path,
+            {"language": "bash", "code": "echo hi"},
+            tool_name="execute_code",  # <-- local tool, not aio
+            user_id=None,
+        )
+
+    call_kwargs = mock_backend.execute.call_args.kwargs
+    assert call_kwargs.get("inject") is None, (
+        f"local execute_code must pass inject=None, got {call_kwargs.get('inject')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_code_cli_injection_override_used_directly(tmp_path):
+    """cli_injection kwarg is passed straight through — no build_cli_injection call."""
+    from app.services.agent_tools import _execute_code
+
+    mock_backend = _make_mock_backend()
+    build_mock = AsyncMock(return_value={"env": {}, "wrappers": []})
+    override_inject = {"env": {"X": "Y"}, "wrappers": [{"name": "svc", "binary_path": "/y"}]}
+
+    with (
+        patch("app.services.agent_tools.build_cli_injection", new=build_mock),
         patch("app.services.sandbox.registry.get_sandbox_backend", return_value=mock_backend),
         patch("app.config.get_sandbox_config", return_value=_FakeSandboxConfig()),
         patch("app.services.agent_tools._get_tool_config", new=AsyncMock(return_value=None)),
@@ -215,11 +224,11 @@ async def test_execute_code_inject_prefix_override_used_directly(tmp_path):
             {"language": "bash", "code": "svc report list"},
             tool_name="execute_code_aio",
             user_id=None,
-            inject_prefix_override="OVERRIDE_PREFIX",
+            cli_injection=override_inject,
         )
 
-    prefix_mock.assert_not_called()  # override skips the second DB round-trip
-    assert mock_backend.execute.call_args.kwargs.get("inject_prefix") == "OVERRIDE_PREFIX"
+    build_mock.assert_not_called()  # override skips the second DB round-trip
+    assert mock_backend.execute.call_args.kwargs.get("inject") == override_inject
 
 
 @pytest.mark.asyncio
@@ -229,12 +238,12 @@ async def test_execute_cli_tool_runs_command_in_aio_with_single_inject(tmp_path)
 
     seen = {}
 
-    async def fake_exec_code(agent_id, ws, arguments, *, tool_name, user_id, inject_prefix_override=None):
-        seen.update(arguments=arguments, tool_name=tool_name, override=inject_prefix_override)
+    async def fake_exec_code(agent_id, ws, arguments, *, tool_name, user_id, cli_injection=None):
+        seen.update(arguments=arguments, tool_name=tool_name, cli_injection=cli_injection)
         return "OUTPUT"
 
     with (
-        patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value="svc() { :; }")),
+        patch("app.services.agent_tools.build_cli_injection", new=AsyncMock(return_value=_INJECTION_DICT)),
         patch("app.services.agent_tools._execute_code", new=fake_exec_code),
     ):
         out = await agent_tools._execute_cli_tool(
@@ -244,7 +253,8 @@ async def test_execute_cli_tool_runs_command_in_aio_with_single_inject(tmp_path)
     assert out == "OUTPUT"
     assert seen["arguments"] == {"language": "bash", "code": "svc report list | jq '.[0]'"}
     assert seen["tool_name"] == "execute_code_aio"
-    assert seen["override"] == "svc() { :; }"  # prebuilt prefix passed straight through
+    # The prebuilt injection dict must be passed through as cli_injection=
+    assert seen["cli_injection"] == _INJECTION_DICT
 
 
 @pytest.mark.asyncio
@@ -253,7 +263,7 @@ async def test_execute_cli_tool_returns_none_when_not_a_cli_tool(tmp_path):
     from app.services import agent_tools
 
     with (
-        patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value=None)),
+        patch("app.services.agent_tools.build_cli_injection", new=AsyncMock(return_value=None)),
         patch("app.services.agent_tools._is_cli_tool_name", new=AsyncMock(return_value=False)),
     ):
         out = await agent_tools._execute_cli_tool(
@@ -269,7 +279,7 @@ async def test_execute_cli_tool_errors_when_cli_tool_unavailable(tmp_path):
     from app.services import agent_tools
 
     with (
-        patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value=None)),
+        patch("app.services.agent_tools.build_cli_injection", new=AsyncMock(return_value=None)),
         patch("app.services.agent_tools._is_cli_tool_name", new=AsyncMock(return_value=True)),
     ):
         out = await agent_tools._execute_cli_tool(
@@ -283,7 +293,7 @@ async def test_execute_cli_tool_missing_command_errors(tmp_path):
     """A CLI tool called without `command` returns a clear error (not None)."""
     from app.services import agent_tools
 
-    with patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value="svc() { :; }")):
+    with patch("app.services.agent_tools.build_cli_injection", new=AsyncMock(return_value=_INJECTION_DICT)):
         out = await agent_tools._execute_cli_tool(
             None, tmp_path, "svc", {}, user_id=None
         )
