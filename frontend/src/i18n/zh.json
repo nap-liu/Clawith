@@ -1484,7 +1484,7 @@
       "wizard": {
         "stepBasic": "基本信息",
         "stepBinary": "二进制",
-        "stepConfig": "配置与测试",
+        "stepConfig": "环境变量与测试",
         "subtitle": "上传二进制、配置环境变量、试跑一次",
         "replaceWarning": "替换二进制将影响所有使用该工具的数字员工。新版本在下次执行时生效。",
         "fieldName": "名称",

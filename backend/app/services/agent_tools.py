@@ -7662,6 +7662,39 @@ async def _execute_code(
             return f"❌ Execution error: {str(e)[:200]}"
 
 
+async def _is_cli_tool_name(agent_id: Optional[uuid.UUID], tool_name: str) -> bool:
+    """True if ``tool_name`` is an enabled type='cli' tool in the agent's tenant.
+
+    ``tool.name`` is globally unique, so a tenant-scoped name match is a reliable
+    existence signal. Used by ``_execute_cli_tool`` to tell "not a CLI tool"
+    (→ fall through to MCP) apart from "is a CLI tool but couldn't be built"
+    (→ surface a clear error instead of a confusing 'Unknown tool').
+    """
+    try:
+        from app.models.tool import Tool
+        from sqlalchemy import or_
+
+        async with async_session() as db:
+            tenant_id = None
+            if agent_id:
+                r = await db.execute(select(AgentModel.tenant_id).where(AgentModel.id == agent_id))
+                tenant_id = r.scalar_one_or_none()
+            q = (
+                select(Tool.id)
+                .where(
+                    Tool.name == tool_name,
+                    Tool.type == "cli",
+                    Tool.enabled == True,  # noqa: E712
+                    or_(Tool.tenant_id == tenant_id, Tool.tenant_id.is_(None)),
+                )
+                .limit(1)
+            )
+            return (await db.execute(q)).scalar_one_or_none() is not None
+    except Exception:
+        logger.exception(f"[CLI] _is_cli_tool_name check failed for {tool_name}")
+        return False
+
+
 async def _execute_cli_tool(
     agent_id: Optional[uuid.UUID],
     ws: Path,
@@ -7672,15 +7705,24 @@ async def _execute_cli_tool(
 ) -> Optional[str]:
     """Run a standalone CLI tool (type='cli') as its own LLM function.
 
-    Returns None when ``tool_name`` is not a visible CLI tool for this agent —
-    the dispatcher then falls through to MCP. Otherwise runs the user-supplied
+    Returns None when ``tool_name`` is not a CLI tool for this agent — the
+    dispatcher then falls through to MCP. Otherwise runs the user-supplied
     ``command`` as a single bash line in the aio sandbox with ONLY this tool's
     identity-bound function injected, reusing _execute_code's sandbox / work_dir
     / timeout / error path.
     """
     inject = await build_cli_inject_prefix(agent_id, user_id, only_tool_names={tool_name})
     if not inject:
-        return None  # not a CLI tool (or no binary) → let dispatcher try MCP
+        # build returned None: either tool_name isn't a CLI tool (→ MCP), or it
+        # IS a surfaced CLI tool that couldn't be built right now (binary deleted
+        # mid-conversation, or a transient error swallowed by build_cli_inject_prefix).
+        # Distinguish so the latter gets a clear error, not a confusing 'Unknown tool'.
+        if await _is_cli_tool_name(agent_id, tool_name):
+            return (
+                f"❌ CLI tool '{tool_name}' is currently unavailable "
+                f"(binary not found or could not be prepared). Check the tool's binary upload."
+            )
+        return None  # genuinely not a CLI tool → let dispatcher try MCP
     command = (arguments.get("command") or "").strip()
     if not command:
         return f"❌ Missing required parameter 'command' for CLI tool '{tool_name}'."

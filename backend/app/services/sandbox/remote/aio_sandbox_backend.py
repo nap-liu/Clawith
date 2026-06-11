@@ -372,11 +372,11 @@ class AioSandboxBackend(BaseSandboxBackend):
         user_cmd = cls._build_shell_command(code, language)
         if inject_prefix:
             # Injection block (function defs) and user command on separate
-            # lines. aio-sandbox >= 1.9.3 splits newline-separated commands and
-            # re-joins them with ';' at its shell-exec layer, so natural
-            # newlines are correct (this is also what makes agent multi-line
-            # bash work). NOTE: 1.0.0.152 lacked this and returned
-            # ErrorObservation on any '\n' — prod runs 1.9.3.
+            # lines. aio-sandbox >= 1.9.3 normalizes newline-separated *commands*
+            # at its shell-exec layer using a bash-aware split (split_bash_commands,
+            # which respects heredocs / quotes — so the `node <<'DELIM'` heredoc
+            # form is preserved, not corrupted). NOTE: 1.0.0.152 lacked this and
+            # returned ErrorObservation on any '\n' — prod runs 1.9.3.
             return f"{exports} && {inject_prefix}\n{user_cmd}"
         return f"{exports} && {user_cmd}"
 

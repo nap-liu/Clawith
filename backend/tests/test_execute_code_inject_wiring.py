@@ -252,11 +252,30 @@ async def test_execute_cli_tool_returns_none_when_not_a_cli_tool(tmp_path):
     """Unknown / non-CLI tool name → None so the dispatcher falls through to MCP."""
     from app.services import agent_tools
 
-    with patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value=None)):
+    with (
+        patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value=None)),
+        patch("app.services.agent_tools._is_cli_tool_name", new=AsyncMock(return_value=False)),
+    ):
         out = await agent_tools._execute_cli_tool(
             None, tmp_path, "not_a_cli", {"command": "x"}, user_id=None
         )
     assert out is None
+
+
+@pytest.mark.asyncio
+async def test_execute_cli_tool_errors_when_cli_tool_unavailable(tmp_path):
+    """A surfaced CLI tool that can't be built (binary gone / transient error)
+    returns a clear error — NOT None — so it isn't masked as 'Unknown tool'."""
+    from app.services import agent_tools
+
+    with (
+        patch("app.services.agent_tools.build_cli_inject_prefix", new=AsyncMock(return_value=None)),
+        patch("app.services.agent_tools._is_cli_tool_name", new=AsyncMock(return_value=True)),
+    ):
+        out = await agent_tools._execute_cli_tool(
+            None, tmp_path, "svc", {"command": "svc report list"}, user_id=None
+        )
+    assert out is not None and "unavailable" in out.lower() and "svc" in out
 
 
 @pytest.mark.asyncio

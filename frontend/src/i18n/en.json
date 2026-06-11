@@ -1719,7 +1719,7 @@
       "wizard": {
         "stepBasic": "Basic info",
         "stepBinary": "Binary",
-        "stepConfig": "Configuration & test",
+        "stepConfig": "Env & test",
         "subtitle": "Upload a binary, configure env, run a test",
         "replaceWarning": "Replacing the binary will affect every agent that uses this tool. The new version takes effect on the next execute.",
         "fieldName": "Name",
