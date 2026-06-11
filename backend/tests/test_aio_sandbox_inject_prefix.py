@@ -21,8 +21,6 @@ def test_compose_with_prefix_places_functions_before_user_code():
     user_pos = cmd.index("svc report list | head")
     export_pos = cmd.index("export NO_COLOR=1")
     assert export_pos < fn_pos < user_pos
-    # Single line: aio-sandbox /v1/shell/exec rejects '\n'-separated commands,
-    # so functions and user code are joined with ';' and the composed command
-    # must contain NO literal newline (single-line bash code case).
-    assert "; svc report list | head" in cmd
-    assert "\n" not in cmd
+    # Functions and user code on separate lines; aio-sandbox >= 1.9.3
+    # normalizes the newlines at its shell-exec layer.
+    assert "\nsvc report list | head" in cmd

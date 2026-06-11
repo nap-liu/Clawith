@@ -371,12 +371,13 @@ class AioSandboxBackend(BaseSandboxBackend):
         )
         user_cmd = cls._build_shell_command(code, language)
         if inject_prefix:
-            # aio-sandbox /v1/shell/exec rejects newline-separated commands: a
-            # literal '\n' makes the server return an 'ErrorObservation' /
-            # terminated session. The injected function block and the user
-            # command MUST therefore be joined on a SINGLE line with ';' — the
-            # functions end in '}', so a leading ';' cleanly separates them.
-            return f"{exports} && {inject_prefix}; {user_cmd}"
+            # Injection block (function defs) and user command on separate
+            # lines. aio-sandbox >= 1.9.3 splits newline-separated commands and
+            # re-joins them with ';' at its shell-exec layer, so natural
+            # newlines are correct (this is also what makes agent multi-line
+            # bash work). NOTE: 1.0.0.152 lacked this and returned
+            # ErrorObservation on any '\n' — prod runs 1.9.3.
+            return f"{exports} && {inject_prefix}\n{user_cmd}"
         return f"{exports} && {user_cmd}"
 
     @staticmethod
