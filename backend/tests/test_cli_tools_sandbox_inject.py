@@ -3,7 +3,6 @@ import pytest
 
 from app.services.cli_tools.sandbox_inject import (
     build_wrapper_write_sh,
-    build_env_exports_sh,
     build_python_prelude,
     render_env,
     shell_quote,
@@ -11,65 +10,88 @@ from app.services.cli_tools.sandbox_inject import (
 from app.services.cli_tools.placeholders import PlaceholderContext
 
 
+def _decode_wrapper(text: str) -> str:
+    import base64
+    import re
+    m = re.search(r"echo ([A-Za-z0-9+/=]+) \| base64 -d", text)
+    assert m, f"no base64 block found in: {text}"
+    return base64.b64decode(m.group(1)).decode()
+
+
 def test_shell_quote_wraps_and_escapes():
     assert shell_quote("abc") == "'abc'"
     assert shell_quote("a'b") == "'a'\\''b'"
 
 
-def test_build_wrapper_write_sh_contains_expected_parts():
+def test_build_wrapper_write_sh_embeds_identity_env_and_writes_to_bindir():
+    """Identity rides INSIDE the wrapper as an `env` prefix (scoped to the
+    binary process), and the wrapper is written to the per-conversation bindir
+    — never the session environment. This is the per-session isolation contract:
+    the next exec rewrites the wrapper with the current sender's identity, so a
+    prior sender's identity can never persist in the shell env."""
     text = build_wrapper_write_sh(
         name="svc",
         binary_path="/data/cli_binaries/_global/t1/aa.bin",
+        env={"YYBPC_CLI_USER_PHONE": "13800000000", "YYBPC_CLI_HOME": "/data/cli_state/x"},
+        bindir='"$HOME/.clawith-bin/abc123"',
     )
-    # Must write wrapper to $HOME/.local/bin/svc
-    assert 'mkdir -p "$HOME/.local/bin"' in text
-    assert "base64 -d" in text
+    assert 'mkdir -p "$HOME/.clawith-bin/abc123"' in text
     assert "chmod 755" in text
-    # The wrapper content must be base64'd — verify by decoding
-    import base64
-    import re
-    m = re.search(r"echo ([A-Za-z0-9+/=]+) \| base64 -d", text)
-    assert m, f"no base64 block found in: {text}"
-    decoded = base64.b64decode(m.group(1)).decode()
+    assert '"$HOME/.clawith-bin/abc123"/svc' in text
+    decoded = _decode_wrapper(text)
     assert "#!/bin/sh" in decoded
-    assert "exec '/data/cli_binaries/_global/t1/aa.bin' \"$@\"" in decoded
+    # Identity is an `env` prefix on the exec line — confined to the binary.
+    assert (
+        "exec env YYBPC_CLI_USER_PHONE='13800000000' YYBPC_CLI_HOME='/data/cli_state/x' "
+        "'/data/cli_binaries/_global/t1/aa.bin' \"$@\"" in decoded
+    )
+
+
+def test_build_wrapper_write_sh_no_env_is_plain_exec():
+    """No identity (e.g. unmapped sender) → wrapper has no env prefix, so the
+    binary runs identity-less and reports its own NOT_LOGGED_IN. Crucially the
+    wrapper is still rewritten, overwriting any prior sender's identity."""
+    text = build_wrapper_write_sh(
+        name="svc", binary_path="/b.bin", env={}, bindir='"$HOME/.clawith-bin/z"'
+    )
+    decoded = _decode_wrapper(text)
+    assert "exec '/b.bin' \"$@\"" in decoded
+    assert "exec env" not in decoded
 
 
 def test_build_wrapper_write_sh_rejects_unsafe_name():
     with pytest.raises(ValueError):
-        build_wrapper_write_sh(name="bad name; rm", binary_path="/x")
+        build_wrapper_write_sh(name="bad name; rm", binary_path="/x", env={}, bindir='"$HOME/b"')
 
 
 def test_build_wrapper_write_sh_rejects_trailing_newline_name():
     with pytest.raises(ValueError):
-        build_wrapper_write_sh(name="svc\n", binary_path="/x")
+        build_wrapper_write_sh(name="svc\n", binary_path="/x", env={}, bindir='"$HOME/b"')
 
 
-def test_build_env_exports_sh_basic():
-    result = build_env_exports_sh({"YYBPC_CLI_USER_PHONE": "13800000000", "YYBPC_CLI_HOME": "/data/cli_state/x"})
-    assert result.startswith("export ")
-    assert "YYBPC_CLI_USER_PHONE='13800000000'" in result
-    assert "YYBPC_CLI_HOME='/data/cli_state/x'" in result
-
-
-def test_build_env_exports_sh_empty_returns_empty_string():
-    assert build_env_exports_sh({}) == ""
-
-
-def test_build_env_exports_sh_rejects_unsafe_key():
+def test_build_wrapper_write_sh_rejects_unsafe_env_key():
     with pytest.raises(ValueError):
-        build_env_exports_sh({"A; touch /tmp/P; B": "v"})
+        build_wrapper_write_sh(
+            name="svc", binary_path="/x", env={"A; rm -rf /": "v"}, bindir='"$HOME/b"'
+        )
 
 
-def test_build_python_prelude_contains_wrapper_and_env():
-    wrappers = [{"name": "svc", "binary_path": "/data/cli_binaries/x.bin"}]
-    env = {"MY_KEY": "my_val"}
-    prelude = build_python_prelude(wrappers, env)
+def test_build_python_prelude_wrapper_carries_env_path_only_no_identity():
+    """Python path: identity rides in the wrapper (env prefix), os.environ gets
+    only PATH (the per-conversation bindir) — NEVER the identity. So a stale
+    kernel os.environ can't leak a prior sender's identity."""
+    wrappers = [{"name": "svc", "binary_path": "/data/cli_binaries/x.bin", "env": {"MY_KEY": "my_val"}}]
+    prelude = build_python_prelude(wrappers, bindir="~/.clawith-bin/abc123")
     assert "import os as _os" in prelude
     assert "expanduser" in prelude
-    assert ".local/bin" in prelude
+    assert ".clawith-bin/abc123" in prelude
     assert "svc" in prelude
-    assert "my_val" in prelude
+    # Identity value appears ONLY inside the wrapper content (base64), not as a
+    # bare os.environ assignment.
+    assert "_os.environ.update" not in prelude
+    assert "_os.environ['MY_KEY']" not in prelude
+    # PATH is prepended with the bindir.
+    assert "_os.environ['PATH']" in prelude
 
 
 def test_render_env_resolves_placeholders_and_skips_userless_identity():
@@ -186,17 +208,17 @@ async def test_build_inject_for_agent_renders_cli_tools(cli_inject_session, monk
 
     injection = await build_cli_injection(agent_id=None, user_id=uid)
     assert injection is not None
-    # Must return dict shape with env and wrappers
-    assert "env" in injection
+    # Per-session isolation shape: each wrapper carries its OWN tool's identity
+    # env (no merged top-level env that would leak across tools/conversations).
     assert "wrappers" in injection
-    # svc wrapper is present
+    assert "env" not in injection
     wrapper_names = [w["name"] for w in injection["wrappers"]]
     assert "svc" in wrapper_names
-    # binary path contains the tool's tenant-key, id, and sha256
     svc_wrapper = next(w for w in injection["wrappers"] if w["name"] == "svc")
+    # binary path contains the tool's tenant-key, id, and sha256
     assert f"_global/{tid}/{'a' * 64}.bin" in svc_wrapper["binary_path"]
-    # identity env is resolved
-    assert injection["env"].get("YYBPC_CLI_USER_PHONE") == "13800000000"
+    # identity env is resolved and attached to THIS wrapper
+    assert svc_wrapper["env"].get("YYBPC_CLI_USER_PHONE") == "13800000000"
 
 
 @pytest.mark.asyncio
@@ -392,8 +414,9 @@ async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session, 
     # Autonomous origin passes the creator's User PK (as heartbeat.py / A2A do).
     injection = await build_cli_injection(agent_id=None, user_id=creator_id)
     assert injection is not None
-    # creator identity must be bound, not dropped
-    assert injection["env"].get("YYBPC_CLI_USER_PHONE") == "13900000000"
+    # creator identity must be bound (on the svc wrapper), not dropped
+    svc_wrapper = next(w for w in injection["wrappers"] if w["name"] == "svc")
+    assert svc_wrapper["env"].get("YYBPC_CLI_USER_PHONE") == "13900000000"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

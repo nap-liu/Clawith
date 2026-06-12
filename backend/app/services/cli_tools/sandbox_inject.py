@@ -1,27 +1,45 @@
-"""Build the CLI-tool sandbox injection (wrappers + identity env).
+"""Build the CLI-tool sandbox injection (identity-carrying PATH wrappers).
 
 Each type='cli' tool (e.g. `svc`) is exposed to the agent's sandbox as a real
-command on PATH via an **identity-agnostic wrapper script**:
+command on PATH via a wrapper script that carries the caller's identity as an
+``env`` prefix on the exec line:
 
-    /home/gem/.local/bin/svc  ->  #!/bin/sh
-                                   exec '/data/cli_binaries/<...>/<sha>.bin' "$@"
+    <bindir>/svc  ->  #!/bin/sh
+                      exec env YYBPC_CLI_USER_PHONE='138...' YYBPC_CLI_HOME='...' \\
+                          '/data/cli_binaries/<...>/<sha>.bin' "$@"
 
-The wrapper carries NO identity — it just execs the binary, inheriting whatever
-env its caller has. Identity (phone / tokens / state dir) is injected per-exec
-as environment variables scoped to that single execution:
+Why identity lives in the WRAPPER, not the session env
+------------------------------------------------------
+The shell session is per-conversation and persistent (so the agent's own
+``export``/``cd`` survive across calls — a documented session semantic). If we
+exported identity into that session it would persist too, and in a multi-user
+group IM conversation a later sender (or an exec whose injection couldn't be
+built) would inherit the previous sender's identity — cross-user impersonation
+with zero malice. Putting identity on the wrapper's exec line instead means:
 
-  * bash: exported inside the per-exec child shell (never the persistent
-    session) so it cannot leak into another call / conversation (no 串台);
-  * python: `os.environ.update(...)` prepended to the user's code.
+  * the identity is scoped to the binary process (and its pipes / subprocesses),
+    never the session env — `env` / logs never show another user's phone;
+  * every exec REWRITES the wrapper with the *current* sender's identity, so a
+    prior sender's identity cannot persist (correct-by-construction, not
+    "re-export wins");
+  * fail-safe: if the injection can't be built (DB blip, deleted binary), NO
+    wrapper is written → `svc` is simply `command not found`, never run under a
+    stale identity.
 
-The wrapper lives in the sandbox user's own ``~/.local/bin`` (resolved at runtime
-from ``$HOME`` / ``expanduser`` — never a hardcoded path), which is on PATH for
-both the shell and the jupyter kernel. So the agent can use `svc` transparently
-from bash, pipes, `subprocess.run(['svc'])`, xargs, etc. — as it would expect.
+Per-conversation bindir
+-----------------------
+The wrapper is written to a per-conversation directory (``bindir``, keyed by a
+hash of the session anchor) that the caller prepends to PATH. A per-agent shared
+path would race across concurrent conversations (two senders rewriting the same
+``svc`` file). The bindir is computed by the backend (which knows the anchor)
+and passed in.
 
-Trust model (current): identity rides on inheritable env, so a malicious agent
-could re-export it. Accepted for now (trusted agent); hardening = per-conversation
-signed token, tracked separately.
+Trust model (current): the wrapper file holds the identity in cleartext on disk;
+a malicious agent in the sandbox could `cat` it (and historical per-anchor
+wrappers, bounded by the LRU). Accepted for the trusted-agent scenario (the
+agent can sudo anyway, spec v4 §1.3); what this design closes is *automatic*
+cross-user leakage. Hardening = per-conversation signed token, tracked
+separately.
 
 Paths need no translation: backend and sandbox mount the same named volumes at
 the same paths (/data/cli_binaries ro, /data/cli_state rw).
@@ -33,7 +51,6 @@ Split: pure rendering functions here (unit-tested); the DB-touching builder
 from __future__ import annotations
 
 import base64
-import json
 import re
 
 from app.services.cli_tools.placeholders import PlaceholderContext, resolve
@@ -42,10 +59,11 @@ from app.services.cli_tools.placeholders import PlaceholderContext, resolve
 # and env keys (so they're safe as `export KEY=` and as a filename on PATH).
 _FUNC_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Wrapper scripts go in the sandbox user's own ~/.local/bin, resolved at runtime
-# (bash: $HOME; python: expanduser) — NOT a hardcoded path. That dir is on PATH
-# for the conventional pip-user layout, used by both the shell and jupyter.
-_WRAPPER_BIN_REL = ".local/bin"
+# Per-conversation wrapper directories live under this dir in the sandbox user's
+# home (resolved at runtime — bash: $HOME; python: expanduser). The leaf is a
+# hash of the session anchor (computed by the backend), giving each conversation
+# its own `svc` so concurrent conversations don't race on one shared file.
+_WRAPPER_BIN_ROOT = ".clawith-bin"
 
 # Env entries referencing these roots are identity-scoped: when the caller
 # supplied no user context (placeholder resolves to itself) they are skipped
@@ -88,20 +106,35 @@ def _validate_env_keys(env: dict[str, str]) -> None:
             raise ValueError(f"unsafe env key: {key!r}")
 
 
-def build_wrapper_write_sh(*, name: str, binary_path: str) -> str:
-    """Bash that (re)writes the identity-agnostic PATH wrapper for one tool.
+def _wrapper_content(binary_path: str, env: dict[str, str]) -> str:
+    """The wrapper script body: `exec [env K='v'...] '<binary>' "$@"`.
 
-    Writes to ``$HOME/.local/bin/<name>`` — ``$HOME`` is resolved by the sandbox
-    at runtime (no hardcoded path). Must run while ``$HOME`` is still the sandbox
-    user's native home (i.e. before any HOME reset), so the wrapper lands in the
-    dir that's on PATH for both the shell and jupyter. Idempotent — safe every
-    exec (cheap; also picks up a new binary version). Content is base64'd to
-    avoid quoting pitfalls; ``name`` is validated so it's safe inside the path.
+    Identity rides as an ``env`` prefix so it is scoped to the binary process
+    (and its pipes / subprocesses), never the shell session. Empty env → a plain
+    ``exec`` (identity-less; the binary reports its own NOT_LOGGED_IN).
+    """
+    _validate_env_keys(env)
+    if env:
+        assigns = " ".join(f"{k}={shell_quote(v)}" for k, v in env.items())
+        exec_line = f"exec env {assigns} {shell_quote(binary_path)} \"$@\""
+    else:
+        exec_line = f"exec {shell_quote(binary_path)} \"$@\""
+    return f"#!/bin/sh\n{exec_line}\n"
+
+
+def build_wrapper_write_sh(
+    *, name: str, binary_path: str, env: dict[str, str], bindir: str
+) -> str:
+    """Bash that (re)writes one tool's identity-carrying wrapper into ``bindir``.
+
+    ``bindir`` is the per-conversation wrapper dir (already quoted for bash, e.g.
+    ``"$HOME/.clawith-bin/<hash>"``) that the caller prepends to PATH. Rewritten
+    every exec with the *current* sender's ``env`` so a prior sender's identity
+    cannot persist. Content is base64'd to avoid quoting pitfalls; ``name`` and
+    every env key are validated so they're safe as a filename / env assignment.
     """
     _validate_name(name)
-    content = f'#!/bin/sh\nexec {shell_quote(binary_path)} "$@"\n'
-    b64 = base64.b64encode(content.encode()).decode()
-    bindir = f'"$HOME/{_WRAPPER_BIN_REL}"'
+    b64 = base64.b64encode(_wrapper_content(binary_path, env).encode()).decode()
     return (
         f"mkdir -p {bindir} && "
         f"echo {b64} | base64 -d > {bindir}/{name} && "
@@ -109,36 +142,32 @@ def build_wrapper_write_sh(*, name: str, binary_path: str) -> str:
     )
 
 
-def build_env_exports_sh(env: dict[str, str]) -> str:
-    """`export K='v' ...` for the per-exec identity env (empty string if none)."""
-    _validate_env_keys(env)
-    if not env:
-        return ""
-    assigns = " ".join(f"{k}={shell_quote(v)}" for k, v in env.items())
-    return f"export {assigns}"
+def build_python_prelude(wrappers: list[dict], bindir: str) -> str:
+    """Python prepended to a python exec: write the identity-carrying wrappers
+    into ``bindir`` and prepend ``bindir`` to PATH.
 
-
-def build_python_prelude(wrappers: list[dict], env: dict[str, str]) -> str:
-    """Python prepended to a python exec: write the PATH wrappers + set os.environ.
-
-    Makes `subprocess.run(['svc', ...])` (and any child process) in jupyter find
-    `svc` on PATH and inherit the identity env. Uses `_`-prefixed names so it
-    won't clash with the user's code.
+    Identity is NOT written to ``os.environ`` — it rides inside each wrapper (env
+    prefix), so a persistent kernel's ``os.environ`` can never leak a prior
+    sender's identity. ``subprocess.run(['svc', ...])`` finds `svc` on PATH and
+    the wrapper supplies the identity. ``bindir`` is an expanduser-style path
+    (e.g. ``~/.clawith-bin/<hash>``); ``_``-prefixed locals avoid clashing with
+    the user's code.
     """
-    _validate_env_keys(env)
     lines = [
-        "import os as _os, base64 as _b64",
-        f"_bindir = _os.path.expanduser({('~/' + _WRAPPER_BIN_REL)!r})",
+        "import os as _os, base64 as _b64, shutil as _shutil",
+        f"_bindir = _os.path.expanduser({bindir!r})",
+        # Clear any PRIOR sender's wrappers first — the wrapper set must reflect
+        # THIS exec's sender (no wrappers below → empty dir → svc not found).
+        "_shutil.rmtree(_bindir, ignore_errors=True)",
         "_os.makedirs(_bindir, exist_ok=True)",
         "_os.environ['PATH'] = _bindir + ':' + _os.environ.get('PATH', '')",
     ]
     for w in wrappers:
         name = w["name"]
         _validate_name(name)
-        content = f'#!/bin/sh\nexec {shell_quote(w["binary_path"])} "$@"\n'
+        content = _wrapper_content(w["binary_path"], w.get("env") or {})
         b64 = base64.b64encode(content.encode()).decode()
         lines.append(f"_p = _os.path.join(_bindir, {name!r})")
         lines.append(f"open(_p, 'wb').write(_b64.b64decode({b64!r}))")
         lines.append("_os.chmod(_p, 0o755)")
-    lines.append(f"_os.environ.update({json.dumps(env)})")
     return "\n".join(lines)

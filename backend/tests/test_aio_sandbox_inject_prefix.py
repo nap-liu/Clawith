@@ -1,13 +1,17 @@
 """Pure tests for AioSandboxBackend shell command composition.
 
-The new API: _compose_shell_command(*, cwd, code, language, inject: dict | None)
-returns a single-line base64 transport: `source <(echo <B64> | base64 -d)`.
-Decode the B64 block to assert on the materialized script contents.
+Contract (per-session isolation): _compose_shell_command(*, cwd, code, language,
+inject, bindir) returns a single-line base64 transport
+`source <(echo <B64> | base64 -d)`. Identity rides INSIDE each wrapper (an `env`
+prefix on its exec line) written to the per-conversation `bindir`, and `bindir`
+is prepended to PATH — identity is NEVER a session-level `export`.
 """
 import base64
 import re
 
 from app.services.sandbox.remote.aio_sandbox_backend import AioSandboxBackend
+
+_BINDIR = "$HOME/.clawith-bin/abc123"
 
 
 def _decode_cmd(cmd: str) -> str:
@@ -17,108 +21,121 @@ def _decode_cmd(cmd: str) -> str:
     return base64.b64decode(m.group(1)).decode()
 
 
+def _wrapper_payloads(script: str) -> list[str]:
+    """Decode every base64 wrapper-write block in the script."""
+    return [base64.b64decode(m).decode() for m in re.findall(r"echo ([A-Za-z0-9+/=]+) \| base64 -d >", script)]
+
+
 def test_compose_without_inject_is_single_line_b64():
-    """No injection: command is the single-line base64 transport."""
     cmd = AioSandboxBackend._compose_shell_command(
-        cwd="/data/agents/a1", code="echo hi", language="bash", inject=None
+        cwd="/data/agents/a1", code="echo hi", language="bash", inject=None, bindir=_BINDIR
     )
-    # Must be a single-line base64 transport.
     assert cmd.startswith("source <(echo ")
     assert "| base64 -d)" in cmd
-    # Decoded script must contain cwd setup and user code.
     script = _decode_cmd(cmd)
     assert "cd '/data/agents/a1'" in script
     assert "export HOME=" in script
     assert "echo hi" in script
-    # No wrapper writes when inject is None.
-    assert "() {" not in script
+    # No wrapper writes and no bindir on PATH when inject is None.
     assert "base64 -d >" not in script
+    assert ".clawith-bin" not in script
 
 
-def test_compose_with_inject_places_wrappers_before_user_code():
-    """Inject with a wrapper: decoded script has wrapper write BEFORE cwd/env/code."""
-    inject = {
-        "wrappers": [{"name": "svc", "binary_path": "/data/cli_binaries/b.bin"}],
+def test_compose_identity_lives_in_wrapper_not_session_export():
+    """The crux: a sender's identity must NOT be a session-level export (which
+    would persist via `source` and leak to the next sender). It appears ONLY
+    inside the wrapper's base64 content, as an `env` prefix."""
+    inject = {"wrappers": [{
+        "name": "svc",
+        "binary_path": "/data/cli_binaries/b.bin",
         "env": {"YYBPC_CLI_USER_PHONE": "13800000000"},
-    }
+    }]}
     cmd = AioSandboxBackend._compose_shell_command(
         cwd="/data/agents/a1", code="svc report list | head", language="bash",
-        inject=inject,
+        inject=inject, bindir=_BINDIR,
     )
-    assert cmd.startswith("source <(echo ")
     script = _decode_cmd(cmd)
+    # Identity must NOT appear as a bare session export.
+    assert "export YYBPC_CLI_USER_PHONE" not in script
+    assert "13800000000" not in script.replace(_wrapper_payloads(script)[0], "")
+    # Identity DOES appear inside the wrapper, as an env prefix on exec.
+    wrapper = _wrapper_payloads(script)[0]
+    assert "exec env YYBPC_CLI_USER_PHONE='13800000000' '/data/cli_binaries/b.bin' \"$@\"" in wrapper
 
-    # Wrapper write must come first (before cd/HOME reset).
-    wrapper_pos = script.index("base64 -d >")  # the wrapper-write line
-    cd_pos = script.index("cd '/data/agents/a1'")
-    env_pos = script.index("YYBPC_CLI_USER_PHONE='13800000000'")
-    user_pos = script.index("svc report list | head")
 
-    assert wrapper_pos < cd_pos < env_pos < user_pos, (
-        "expected: wrapper_write < cd+HOME < identity_env < user_code"
+def test_compose_with_inject_order_and_path_prepend():
+    """Order: cd/HOME reset < wrapper write (into bindir) < PATH prepend < user code."""
+    inject = {"wrappers": [{
+        "name": "svc", "binary_path": "/data/cli_binaries/b.bin", "env": {},
+    }]}
+    cmd = AioSandboxBackend._compose_shell_command(
+        cwd="/data/agents/a1", code="svc report list | head", language="bash",
+        inject=inject, bindir=_BINDIR,
     )
+    script = _decode_cmd(cmd)
+    cd_pos = script.index("cd '/data/agents/a1'")
+    wrapper_pos = script.index("base64 -d >")
+    path_pos = script.index('export PATH="$HOME/.clawith-bin/abc123:$PATH"')
+    user_pos = script.index("svc report list | head")
+    assert cd_pos < wrapper_pos < path_pos < user_pos, (
+        "expected: cd+HOME < wrapper_write < PATH prepend < user_code"
+    )
+    # Wrapper is written into the per-conversation bindir.
+    assert '"$HOME/.clawith-bin/abc123"/svc' in script
 
 
 def test_compose_bash_comment_and_multiline_survive():
-    """Comments and multi-line code survive the b64 transport unchanged."""
     code = "# this is a comment\necho 'line1'\necho 'line2'"
     cmd = AioSandboxBackend._compose_shell_command(
-        cwd="/data/agents/a1", code=code, language="bash", inject=None
+        cwd="/data/agents/a1", code=code, language="bash", inject=None, bindir=_BINDIR
     )
     script = _decode_cmd(cmd)
-    # All three lines must appear verbatim in the decoded script.
-    assert "# this is a comment" in script
-    assert "echo 'line1'" in script
-    assert "echo 'line2'" in script
-    # The comment and subsequent line must be on separate physical lines
-    # (not joined with ';' which would break the comment).
     assert "# this is a comment\necho 'line1'" in script
+    assert "echo 'line2'" in script
 
 
 def test_compose_node_with_inject_heredoc_intact():
-    """node + inject: function block precedes the node heredoc; heredoc body is intact."""
-    inject = {
-        "wrappers": [{"name": "svc", "binary_path": "/data/cli_binaries/b.bin"}],
-        "env": {},
-    }
+    inject = {"wrappers": [{"name": "svc", "binary_path": "/data/cli_binaries/b.bin", "env": {}}]}
     code = "console.log(1)\nconsole.log(2)"
     cmd = AioSandboxBackend._compose_shell_command(
-        cwd="/data/agents/a1", code=code, language="node", inject=inject,
+        cwd="/data/agents/a1", code=code, language="node", inject=inject, bindir=_BINDIR,
     )
     script = _decode_cmd(cmd)
-
-    # Wrapper write present.
     assert "base64 -d >" in script
-    # heredoc form present.
     assert "node <<'" in script
-    # Both console.log lines preserved verbatim and in order.
     assert "console.log(1)\nconsole.log(2)" in script
-
-    wrapper_pos = script.index("base64 -d >")
-    node_pos = script.index("node <<'")
-    assert wrapper_pos < node_pos, "wrapper write must precede the node heredoc"
+    assert script.index("base64 -d >") < script.index("node <<'")
 
 
-def test_compose_env_export_only_no_wrappers():
-    """Inject with env but no wrappers: env export appears, no wrapper writes."""
-    inject = {
-        "wrappers": [],
-        "env": {"MY_TOKEN": "secret123"},
-    }
+def test_compose_reset_wrappers_clears_stale_dir_even_without_inject():
+    """A prior sender wrote a wrapper into bindir (persisted by `source`). When
+    THIS sender has no injection, the compose must still CLEAR the bindir so the
+    stale wrapper can't be used — fail-safe against group-IM impersonation."""
     cmd = AioSandboxBackend._compose_shell_command(
-        cwd="/data/agents/a1", code="echo done", language="bash", inject=inject,
+        cwd="/data/agents/a1", code="svc", language="bash",
+        inject=None, bindir=_BINDIR, reset_wrappers=True,
     )
     script = _decode_cmd(cmd)
-    assert "MY_TOKEN='secret123'" in script
+    # The bindir is wiped (rm -rf) before the user code runs.
+    assert 'rm -rf "$HOME/.clawith-bin/abc123"' in script
+    # No wrapper is written (no inject), so svc is gone.
     assert "base64 -d >" not in script
-    assert "echo done" in script
+
+
+def test_compose_no_reset_no_inject_leaves_bindir_untouched():
+    """A pure non-CLI exec (never had wrappers) must not pay for a clear."""
+    cmd = AioSandboxBackend._compose_shell_command(
+        cwd="/data/agents/a1", code="echo hi", language="bash",
+        inject=None, bindir=_BINDIR, reset_wrappers=False,
+    )
+    script = _decode_cmd(cmd)
+    assert "rm -rf" not in script
+    assert ".clawith-bin" not in script
 
 
 def test_compose_inject_none_still_materializes_user_code():
-    """inject=None: the decoded script still contains the user code verbatim."""
-    code = "print('hello')"
     cmd = AioSandboxBackend._compose_shell_command(
-        cwd="/data/agents/a1", code=code, language="bash", inject=None
+        cwd="/data/agents/a1", code="print('hello')", language="bash", inject=None, bindir=_BINDIR
     )
     script = _decode_cmd(cmd)
     assert "print('hello')" in script

@@ -87,6 +87,27 @@ async def test_evict_anchor_deletes_shell_session_and_jupyter_kernel():
     assert "A:c1" not in b._jupyter_sessions
 
 
+async def test_evict_anchor_cleans_per_conversation_wrapper_dir():
+    """Eviction best-effort removes the anchor's wrapper dir so a prior sender's
+    cleartext identity wrapper doesn't linger on disk (audit hardening)."""
+    b = _backend()
+    sent = []
+
+    async def fake_exec(client, sid, cmd, timeout):
+        sent.append((sid, cmd))
+        return {}, True
+
+    b._shell_exec = fake_exec
+    client = MagicMock()
+    client.delete = AsyncMock()
+
+    await b._evict_anchor(client, "A:c1")
+
+    assert any("rm -rf" in cmd and ".clawith-bin" in cmd for _, cmd in sent), (
+        f"expected a wrapper-dir cleanup rm, got {sent!r}"
+    )
+
+
 async def test_evict_anchor_without_kernel_only_deletes_shell():
     b = _backend()
     client = MagicMock()

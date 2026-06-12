@@ -60,6 +60,7 @@ Failure modes that propagate to ExecutionResult
 - Timeout → ExecutionResult(success=False, exit_code=124)
 - Two recreate attempts both failing → ExecutionResult(success=False, exit_code=1)
 """
+import hashlib
 import json
 import time
 from collections import OrderedDict
@@ -96,6 +97,19 @@ def compute_session_anchor(
     return agent_part
 
 
+# Wrapper-dir leaf for an anchor. A hash keeps the leaf shell-safe (the anchor
+# contains ':' which is the PATH separator) and stable across calls of the same
+# conversation. bash form is "$HOME/.clawith-bin/<leaf>"; python expanduser form
+# is "~/.clawith-bin/<leaf>" — both resolve to the same per-conversation dir.
+_WRAPPER_BIN_ROOT = ".clawith-bin"
+
+
+def _anchor_bindir(anchor: str, *, python: bool = False) -> str:
+    leaf = hashlib.sha256(anchor.encode()).hexdigest()[:16]
+    head = "~" if python else "$HOME"
+    return f"{head}/{_WRAPPER_BIN_ROOT}/{leaf}"
+
+
 class AioSandboxBackend(BaseSandboxBackend):
     """aio-sandbox backend with per-session (conversation) shell + jupyter sessions."""
 
@@ -121,6 +135,12 @@ class AioSandboxBackend(BaseSandboxBackend):
         # growth, not enforcing an exact quota.
         self._anchor_lru: dict[str, OrderedDict[str, None]] = {}
         self._max_anchors_per_agent = 8
+        # Anchors that have EVER had CLI wrappers injected. Once true, every
+        # subsequent exec for that anchor must reset the wrapper dir (even an
+        # inject-less exec) so a prior sender's wrapper can't linger and be run
+        # under a stale identity. Pure non-CLI anchors stay out of this set so
+        # they never pay the reset (and python execs keep clean line numbers).
+        self._anchor_had_wrappers: set[str] = set()
 
     # ------------------------------------------------------------------ Public API
 
@@ -164,10 +184,15 @@ class AioSandboxBackend(BaseSandboxBackend):
                 for stale in self._register_anchor(agent_id or "default", anchor):
                     await self._evict_anchor(client, stale)
                 inject = kwargs.get("inject")
+                # Once an anchor has had wrappers, every later exec must reset the
+                # wrapper dir so a prior sender's wrapper can't be reused.
+                if (inject or {}).get("wrappers"):
+                    self._anchor_had_wrappers.add(anchor)
+                reset_wrappers = anchor in self._anchor_had_wrappers
                 if language == "python":
                     result = await self._run_jupyter(
                         client, anchor=anchor, code=code, cwd=cwd, timeout=timeout,
-                        inject=inject,
+                        inject=inject, reset_wrappers=reset_wrappers,
                     )
                 elif language in ("bash", "node", "javascript"):
                     result = await self._run_shell(
@@ -178,6 +203,7 @@ class AioSandboxBackend(BaseSandboxBackend):
                         cwd=cwd,
                         timeout=timeout,
                         inject=inject,
+                        reset_wrappers=reset_wrappers,
                     )
                 else:
                     return self._error_result(
@@ -218,13 +244,25 @@ class AioSandboxBackend(BaseSandboxBackend):
         return evicted
 
     async def _evict_anchor(self, client: httpx.AsyncClient, anchor: str) -> None:
-        """Best-effort delete of an evicted anchor's sandbox sessions.
+        """Best-effort delete of an evicted anchor's sandbox sessions + wrapper dir.
 
         Failures are non-fatal: a session we fail to delete is reclaimed when
         the sandbox container restarts, and the anchor itself recovers via the
         existing "Session not found" recreate path if it ever becomes active
         again.
         """
+        # Remove the per-conversation wrapper dir FIRST (while the session's bash
+        # is still alive to run it) so a prior sender's cleartext identity wrapper
+        # doesn't linger on disk. Best-effort; bounded residue if it fails.
+        try:
+            await self._shell_exec(
+                client,
+                f"clawith-{anchor}",
+                f'rm -rf "{_anchor_bindir(anchor)}"',
+                5,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[AioSandbox] evict wrapper dir for {anchor!r} failed: {e}")
         try:
             await client.delete(
                 f"{self.base_url}/v1/shell/sessions/clawith-{anchor}",
@@ -233,6 +271,7 @@ class AioSandboxBackend(BaseSandboxBackend):
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[AioSandbox] evict shell session for {anchor!r} failed: {e}")
+        self._anchor_had_wrappers.discard(anchor)
         kernel_uuid = self._jupyter_sessions.pop(anchor, None)
         if kernel_uuid:
             try:
@@ -256,10 +295,12 @@ class AioSandboxBackend(BaseSandboxBackend):
         cwd: str,
         timeout: int,
         inject: dict | None = None,
+        reset_wrappers: bool = False,
     ) -> ExecutionResult:
         session_id = f"clawith-{anchor}"
         cmd = self._compose_shell_command(
-            cwd=cwd, code=code, language=language, inject=inject
+            cwd=cwd, code=code, language=language, inject=inject,
+            bindir=_anchor_bindir(anchor), reset_wrappers=reset_wrappers,
         )
 
         body, ok = await self._shell_exec(client, session_id, cmd, timeout)
@@ -410,10 +451,12 @@ class AioSandboxBackend(BaseSandboxBackend):
         code: str,
         language: str,
         inject: dict | None = None,
+        bindir: str | None = None,
+        reset_wrappers: bool = False,
     ) -> str:
         """Compose the per-exec command and deliver it **verbatim**.
 
-        The full script (env exports → CLI wrapper writes → identity env exports
+        The full script (cwd/HOME/CI exports → CLI wrapper writes → PATH prepend
         → user code) is materialized and *sourced into the session shell* via a
         single-line base64 transport: ``source <(echo <b64> | base64 -d)``.
         This is critical:
@@ -428,21 +471,21 @@ class AioSandboxBackend(BaseSandboxBackend):
           session semantics — the user's ``export``/``cd``-within-script state
           survives to the next call of the *same conversation*. A child bash
           (used 2026-06-11..12) silently dropped every user export.
-        - **No 串台**: sessions are per-conversation (see compute_session_anchor),
-          so identity env sourced into the session can never reach another
-          conversation; within a conversation every exec re-exports the
-          *current* sender's identity before the user code runs, so multi-user
-          (group IM) conversations stay correct.
-
-        The CLI wrapper (``svc`` etc.) is an identity-agnostic PATH script
-        (see sandbox_inject.build_wrapper_write_sh); identity rides on the
-        per-exec ``inject['env']`` which the child bash + any subprocess inherit
-        — so ``svc`` works from bash, pipes, and ``subprocess.run(['svc'])``.
+        - **No 串台 (group IM safe)**: identity is NOT exported into the session.
+          It rides inside each CLI wrapper's exec line (``exec env K='v' bin``),
+          written into the per-conversation ``bindir`` and prepended to PATH.
+          Every exec rewrites the wrapper with the *current* sender's identity,
+          so a prior sender's identity can never persist in the session env
+          (correct-by-construction). If ``inject`` couldn't be built no wrapper
+          is written → the CLI is simply ``command not found``, never run under
+          a stale identity (fail-safe). See sandbox_inject for the full model.
 
         Force-reset cwd AND HOME to the agent root on every call. The shell
         session persists across calls (so exported env vars / background
         processes survive), but the working directory + HOME are statelessly
-        reset to align with execute_code (subprocess) semantics.
+        reset to align with execute_code (subprocess) semantics. The wrapper
+        writes come AFTER the HOME reset so ``bindir`` (``$HOME/.clawith-bin/...``)
+        lands under the agent root.
 
         HOME is the critical one for SSH / git / npm / pip --user / etc. —
         the underlying sandbox container has HOME=/home/gem which would be
@@ -467,21 +510,12 @@ class AioSandboxBackend(BaseSandboxBackend):
         """
         import base64
 
-        from app.services.cli_tools.sandbox_inject import (
-            build_env_exports_sh,
-            build_wrapper_write_sh,
-        )
+        from app.services.cli_tools.sandbox_inject import build_wrapper_write_sh
 
         quoted_cwd = "'" + cwd.replace("'", "'\\''") + "'"
         script_lines: list[str] = []
-        # CLI wrapper writes FIRST, while $HOME is still the sandbox user's
-        # native home, so they land in the on-PATH ~/.local/bin (the exports
-        # below repoint HOME at the agent dir).
-        if inject:
-            for w in inject.get("wrappers", []):
-                script_lines.append(
-                    build_wrapper_write_sh(name=w["name"], binary_path=w["binary_path"])
-                )
+        # cwd + HOME reset FIRST so the per-conversation bindir
+        # (``$HOME/.clawith-bin/...``) lands under the agent root.
         script_lines.append(
             f"cd {quoted_cwd} && "
             f"export HOME={quoted_cwd} && "
@@ -494,16 +528,36 @@ class AioSandboxBackend(BaseSandboxBackend):
             f"export GIT_TERMINAL_PROMPT=0 && "
             f"export NO_COLOR=1"
         )
-        if inject:
-            env_export = build_env_exports_sh(inject.get("env", {}))
-            if env_export:
-                script_lines.append(env_export)  # per-exec identity (child only)
+        wrappers = (inject or {}).get("wrappers") or []
+        if bindir and (wrappers or reset_wrappers):
+            bindir_q = f'"{bindir}"'
+            # Clear any PRIOR sender's wrappers first (they persist in the
+            # `source`d session). The wrapper set must reflect THIS exec's
+            # sender: no inject → empty dir → `svc` is command-not-found, never
+            # a stale identity (fail-safe against group-IM impersonation).
+            script_lines.append(f"rm -rf {bindir_q} && mkdir -p {bindir_q}")
+            for w in wrappers:
+                # Each wrapper carries its OWN tool's identity (env prefix on the
+                # exec line) — never the session env. Rewritten every exec.
+                script_lines.append(
+                    build_wrapper_write_sh(
+                        name=w["name"],
+                        binary_path=w["binary_path"],
+                        env=w.get("env") or {},
+                        bindir=bindir_q,
+                    )
+                )
+            # Prepend the per-conversation bindir so `svc` / pipes /
+            # subprocess.run(['svc']) all resolve to the current wrapper. (PATH
+            # grows by one entry per exec, like the BASE npm-global prepend.)
+            script_lines.append(f'export PATH="{bindir}:$PATH"')
         user_cmd = cls._build_shell_command(code, language)
         script = "\n".join(script_lines) + "\n" + user_cmd
         # Deliver verbatim: single-line base64 transport (no newlines for the
-        # sandbox command-splitter to mangle) → decoded script runs in a child
-        # bash exactly as written (comments / heredocs / multi-line preserved),
-        # identity env confined to the child (never the persistent session).
+        # sandbox command-splitter to mangle) → decoded script is sourced into
+        # the session shell exactly as written (comments / heredocs / multi-line
+        # preserved); identity never touches the session env (it's in the
+        # wrappers), so it cannot leak across senders / conversations.
         b64 = base64.b64encode(script.encode()).decode()
         return f"source <(echo {b64} | base64 -d)"
 
@@ -533,6 +587,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         cwd: str,
         timeout: int,
         inject: dict | None = None,
+        reset_wrappers: bool = False,
     ) -> ExecutionResult:
         # Ensure we have a real UUID session for this anchor, and that the
         # kernel's HOME env is pinned to the agent root (the underlying
@@ -543,18 +598,24 @@ class AioSandboxBackend(BaseSandboxBackend):
         # cells therefore start at line 1 with clean traceback line numbers.
         session_uuid = await self._ensure_jupyter_session(client, anchor, cwd)
 
-        if inject:
-            # (Re)write the CLI PATH wrappers and set the identity env so
-            # `subprocess.run(['svc', ...])` finds svc on PATH and inherits
-            # identity. Prepended to the SAME cell as the user code: the
-            # sandbox's jupyter does not persist state (env / vars) across
-            # execute calls, so a separate setup cell would not carry over.
+        wrappers = (inject or {}).get("wrappers") or []
+        if wrappers or reset_wrappers:
+            # (Re)write the CLI PATH wrappers into the per-conversation bindir and
+            # prepend it to PATH so `subprocess.run(['svc', ...])` finds svc and
+            # inherits its identity (which rides INSIDE the wrapper, not the
+            # kernel's os.environ — so a persistent kernel can't leak a prior
+            # sender's identity). The prelude CLEARS the bindir first, so an
+            # inject-less exec (reset_wrappers, no wrappers) removes a prior
+            # sender's wrapper instead of letting it persist and be reused.
+            # Prepended to the SAME cell as the user code: the sandbox's jupyter
+            # does not persist this setup across execute calls reliably, and
+            # re-running every exec keeps the current sender's identity correct.
             # (Shifts user traceback line numbers by the prelude length —
-            # accepted trade-off for correct, transparent svc identity.)
+            # accepted trade-off for correct svc identity.)
             from app.services.cli_tools.sandbox_inject import build_python_prelude
 
             prelude = build_python_prelude(
-                inject.get("wrappers", []), inject.get("env", {})
+                wrappers, _anchor_bindir(anchor, python=True)
             )
             code = prelude + "\n" + code
 

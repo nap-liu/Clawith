@@ -7443,11 +7443,14 @@ async def build_cli_injection(
     user_id: Optional[uuid.UUID],
     only_tool_names: Optional[set[str]] = None,
 ) -> Optional[dict]:
-    """Build the per-exec CLI injection: identity env + PATH-wrapper specs.
+    """Build the per-exec CLI injection: identity-carrying wrapper specs.
 
-    Returns ``{"env": {...}, "wrappers": [{"name", "binary_path"}, ...]}`` or
+    Returns ``{"wrappers": [{"name", "binary_path", "env": {...}}, ...]}`` or
     None when the agent has no enabled CLI tool with a binary (the common
-    case — zero overhead for non-CLI deployments).
+    case — zero overhead for non-CLI deployments). Each wrapper carries its own
+    tool's identity ``env``; the backend writes it inside the wrapper's exec
+    line (scoped to the binary process), never the session env — so identity
+    can't persist across senders in a shared conversation (see sandbox_inject).
 
     Identity binding follows the call origin, via the `user_id` the caller
     threads in:
@@ -7457,14 +7460,12 @@ async def build_cli_injection(
         behalf, using the owner's data permissions (cron reports rely on this);
       - A2A consult (passes the source agent's ``owner_id``) → the source
         agent's creator.
-    The resolved identity rides on ``env`` (phone / tokens / $state.dir). Only
-    when ``user_id`` is None or the User row is missing are the identity env
-    entries ($user.*/$state.*) dropped — the CLI then runs identity-less and
-    reports NOT_LOGGED_IN rather than impersonating.
-
-    The wrappers are identity-agnostic; the caller injects ``env`` per-exec
-    (bash child / python os.environ), never the persistent session, so it
-    cannot leak across calls (no cross-conversation 串台).
+    The resolved identity (phone / tokens / $state.dir) rides on each wrapper's
+    ``env``. Only when ``user_id`` is None or the User row is missing are the
+    identity entries ($user.*/$state.*) dropped — that wrapper then runs the CLI
+    identity-less (NOT_LOGGED_IN) rather than impersonating; because the wrapper
+    is rewritten every exec, a prior sender's identity is overwritten, not
+    inherited.
 
     ``only_tool_names`` restricts to those CLI tool names (standalone CLI-tool
     LLM functions inject just their own tool); None → all visible CLI tools
@@ -7530,7 +7531,6 @@ async def build_cli_injection(
         binary_storage = BinaryStorage(root=BINARY_ROOT)
         state_storage = StateStorage()
         wrappers: list[dict] = []
-        merged_env: dict[str, str] = {}
         for tool in cli_tools:
             at = assignments.get(str(tool.id))
             if not (at.enabled if at else tool.is_default):
@@ -7562,13 +7562,18 @@ async def build_cli_injection(
                 tenant={"id": tenant_key if tenant_key != "_global" else ""},
                 state=state_ctx,
             )
-            wrappers.append({"name": tool.name, "binary_path": str(binary_path)})
-            # Later tools win on env-key collisions (identity vars are the same
-            # user, so values agree; tool-specific tokens have distinct keys).
-            merged_env.update(render_env(cfg.env, ctx))
+            # Each wrapper carries ONLY its own tool's identity env (no merged
+            # top-level env): the env rides inside the wrapper's exec line, so a
+            # tool's token can't leak into another tool's call or persist in the
+            # session — per-session isolation, see sandbox_inject docstring.
+            wrappers.append({
+                "name": tool.name,
+                "binary_path": str(binary_path),
+                "env": render_env(cfg.env, ctx),
+            })
         if not wrappers:
             return None
-        return {"env": merged_env, "wrappers": wrappers}
+        return {"wrappers": wrappers}
     except Exception:
         logger.exception("[CLI Inject] injection build failed; continuing without CLI")
         return None

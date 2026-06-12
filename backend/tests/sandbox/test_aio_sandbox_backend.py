@@ -309,3 +309,107 @@ async def test_lru_eviction_resets_oldest_conversation(backend, agent_id):
     # c1 was evicted server-side; reactivating it recreates a FRESH session.
     assert r.success is True
     assert "oldest" not in r.stdout
+
+
+# ----------------------------------------------- identity isolation (wrapper-based)
+#
+# These exercise the real failure the per-session work + wrapper-identity design
+# fixes: in a shared (group IM) conversation, a later sender must never inherit a
+# prior sender's CLI identity. We simulate a CLI tool with a fake "svc" binary
+# that just echoes its identity env, and drive _compose_shell_command-level
+# injection through backend.execute(inject=...).
+
+
+async def _install_fake_svc(backend, agent_id) -> str:
+    """Install a stand-in CLI binary INSIDE the sandbox (the test container's
+    tmp is invisible to it). It prints whatever identity env it was given.
+    Returns the in-sandbox path to use as a wrapper binary_path."""
+    path = "/data/agents/_fake_svc.sh"
+    install = (
+        "printf '#!/bin/sh\\necho \"who=${YYBPC_CLI_USER_PHONE:-NONE}\"\\n' > "
+        f"{path} && chmod 755 {path}"
+    )
+    r = await backend.execute(
+        code=install, language="bash", timeout=15, work_dir="/data/agents",
+        agent_id=agent_id,
+    )
+    assert r.success, f"failed to install fake svc: {r.stdout!r} {r.error!r}"
+    return path
+
+
+async def test_group_conversation_second_sender_without_inject_sees_no_prior_identity(
+    backend, agent_id, tmp_path
+):
+    """A(with identity) then B(inject=None) in the SAME conversation: B must NOT
+    inherit A's identity. This is the group-IM impersonation the design fixes."""
+    binpath = await _install_fake_svc(backend, agent_id)
+    conv = "groupchat-1"
+    inject_a = {"wrappers": [{"name": "svc", "binary_path": binpath,
+                              "env": {"YYBPC_CLI_USER_PHONE": "AAA111"}}]}
+    # Sender A runs svc with identity AAA111.
+    ra = await backend.execute(
+        code="svc", language="bash", timeout=15, work_dir="/data/agents",
+        agent_id=agent_id, conversation_id=conv, inject=inject_a,
+    )
+    assert "who=AAA111" in ra.stdout
+    # Sender B's exec has NO injection (e.g. unmapped user / build blip).
+    # svc must now be command-not-found OR identity-less — never AAA111.
+    rb = await backend.execute(
+        code="svc 2>&1 || echo SVC_GONE", language="bash", timeout=15,
+        work_dir="/data/agents", agent_id=agent_id, conversation_id=conv, inject=None,
+    )
+    assert "AAA111" not in rb.stdout, f"B inherited A's identity: {rb.stdout!r}"
+
+
+async def test_group_conversation_second_sender_overrides_identity(
+    backend, agent_id, tmp_path
+):
+    """A then B (both with their own identity) in one conversation: B sees ONLY
+    B's identity (the wrapper is rewritten with the current sender)."""
+    binpath = await _install_fake_svc(backend, agent_id)
+    conv = "groupchat-2"
+    inject_a = {"wrappers": [{"name": "svc", "binary_path": binpath,
+                              "env": {"YYBPC_CLI_USER_PHONE": "AAA111"}}]}
+    inject_b = {"wrappers": [{"name": "svc", "binary_path": binpath,
+                              "env": {"YYBPC_CLI_USER_PHONE": "BBB222"}}]}
+    await backend.execute(code="svc", language="bash", timeout=15,
+                          work_dir="/data/agents", agent_id=agent_id,
+                          conversation_id=conv, inject=inject_a)
+    rb = await backend.execute(code="svc", language="bash", timeout=15,
+                               work_dir="/data/agents", agent_id=agent_id,
+                               conversation_id=conv, inject=inject_b)
+    assert "who=BBB222" in rb.stdout
+    assert "AAA111" not in rb.stdout
+
+
+async def test_identity_not_visible_in_session_env(backend, agent_id, tmp_path):
+    """Identity rides in the wrapper, never the session env: `env` / `echo $VAR`
+    in the same conversation must not reveal the phone."""
+    binpath = await _install_fake_svc(backend, agent_id)
+    conv = "groupchat-3"
+    inject = {"wrappers": [{"name": "svc", "binary_path": binpath,
+                            "env": {"YYBPC_CLI_USER_PHONE": "SECRET999"}}]}
+    await backend.execute(code="svc", language="bash", timeout=15,
+                          work_dir="/data/agents", agent_id=agent_id,
+                          conversation_id=conv, inject=inject)
+    r = await backend.execute(code='echo "leak=[$YYBPC_CLI_USER_PHONE]"; env | grep -c SECRET999 || true',
+                              language="bash", timeout=15, work_dir="/data/agents",
+                              agent_id=agent_id, conversation_id=conv, inject=inject)
+    assert "SECRET999" not in r.stdout, f"identity leaked into session env: {r.stdout!r}"
+    assert "leak=[]" in r.stdout
+
+
+async def test_user_export_still_persists_across_calls_with_inject(backend, agent_id, tmp_path):
+    """The session semantic we must NOT regress: the user's own export persists
+    across calls in the same conversation, even though identity does not."""
+    binpath = await _install_fake_svc(backend, agent_id)
+    conv = "groupchat-4"
+    inject = {"wrappers": [{"name": "svc", "binary_path": binpath,
+                            "env": {"YYBPC_CLI_USER_PHONE": "X"}}]}
+    await backend.execute(code="export MY_OWN=persisted-42", language="bash", timeout=15,
+                          work_dir="/data/agents", agent_id=agent_id,
+                          conversation_id=conv, inject=inject)
+    r = await backend.execute(code='echo "mine=$MY_OWN"', language="bash", timeout=15,
+                              work_dir="/data/agents", agent_id=agent_id,
+                              conversation_id=conv, inject=inject)
+    assert "mine=persisted-42" in r.stdout
