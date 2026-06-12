@@ -1,17 +1,32 @@
-"""aio-sandbox backend with per-agent session isolation.
+"""aio-sandbox backend with per-session (conversation) isolation.
 
 Talks to agent-infra/sandbox (https://github.com/agent-infra/sandbox).
 - Shell (bash / node): /v1/shell/sessions/create + /v1/shell/exec
 - Python: /v1/jupyter/sessions/create + /v1/jupyter/execute (UUID session)
 
-Per-agent isolation strategy
-----------------------------
+Per-session isolation strategy
+------------------------------
+Anchor:
+  ``compute_session_anchor(agent_id, conversation_id)`` — conversation-scoped
+  (``{agent_id}:{conversation_id}``) when the caller has a ChatSession, with
+  a per-agent fallback (``{agent_id}``) for session-less callers. Different
+  conversations of the same agent therefore never share shell env / cwd
+  residue / background processes or jupyter kernel variables. The agent's
+  *filesystem* (work_dir, HOME) intentionally stays per-agent — isolation
+  applies to the execution environment, not the files.
+
 Shell:
-  Each agent gets a shell session keyed `clawith-{agent_id}`.  The sandbox
+  Each anchor gets a shell session keyed `clawith-{anchor}`.  The sandbox
   accepts arbitrary string IDs for shell sessions, so we can use a stable
   human-readable key.  Sessions persist across HTTP calls so `cd`,
   environment variables, and Python variables survive between consecutive
-  execute() calls for the same agent.
+  execute() calls for the same conversation.
+
+Lifecycle:
+  Conversation anchors are tracked in a per-agent LRU (see _register_anchor);
+  past the cap the oldest conversation's shell session and jupyter kernel are
+  deleted best-effort so sandbox-side processes don't grow unboundedly with
+  conversation count.
 
 Jupyter (Python):
   The sandbox server ignores non-UUID session_id values on /v1/jupyter/execute
@@ -19,7 +34,7 @@ Jupyter (Python):
   therefore:
     1. Create a session explicitly via /v1/jupyter/sessions/create on first use.
     2. Store the returned UUID in an in-process dict (_jupyter_sessions) keyed
-       by agent anchor string.
+       by anchor string.
     3. Pass that UUID on every subsequent /v1/jupyter/execute call.
   If the sandbox container restarts (or the kernel is GC'd) the UUID becomes
   stale; the server silently creates a fresh kernel rather than returning
@@ -47,6 +62,7 @@ Failure modes that propagate to ExecutionResult
 """
 import json
 import time
+from collections import OrderedDict
 from typing import Any
 
 import httpx
@@ -65,8 +81,23 @@ _STDOUT_LIMIT = 10000
 _STDERR_LIMIT = 5000
 
 
+def compute_session_anchor(
+    agent_id: str | None, conversation_id: str | None
+) -> str:
+    """Key that isolates shell/jupyter sessions inside aio-sandbox.
+
+    Conversation-scoped when a conversation_id is available, with an
+    agent-level fallback that can never collide with a conversation key
+    (the ':' separator only appears in conversation-scoped anchors).
+    """
+    agent_part = agent_id or "default"
+    if conversation_id:
+        return f"{agent_part}:{conversation_id}"
+    return agent_part
+
+
 class AioSandboxBackend(BaseSandboxBackend):
-    """aio-sandbox backend with per-agent shell + jupyter sessions."""
+    """aio-sandbox backend with per-session (conversation) shell + jupyter sessions."""
 
     name = "aio_sandbox"
 
@@ -81,6 +112,15 @@ class AioSandboxBackend(BaseSandboxBackend):
         # Maps anchor → server-assigned UUID for jupyter kernels.
         # In-process cache; lives as long as the backend instance.
         self._jupyter_sessions: dict[str, str] = {}
+        # Per-agent LRU of live *conversation* anchors. With per-session
+        # isolation, anchors grow with conversations; without a cap the
+        # sandbox accumulates one bash (and possibly one jupyter kernel,
+        # ~50-100 MB) per conversation forever. Agent-level fallback anchors
+        # (no ':') are one-per-agent and exempt. In-process approximation:
+        # multiple workers each keep their own count — the goal is bounding
+        # growth, not enforcing an exact quota.
+        self._anchor_lru: dict[str, OrderedDict[str, None]] = {}
+        self._max_anchors_per_agent = 8
 
     # ------------------------------------------------------------------ Public API
 
@@ -111,17 +151,18 @@ class AioSandboxBackend(BaseSandboxBackend):
         timeout: int = 30,
         work_dir: str | None = None,
         agent_id: str | None = None,
+        conversation_id: str | None = None,
         **kwargs,
     ) -> ExecutionResult:
         start = time.time()
-        # Default to a shared 'no-agent' session for callers without an agent.
-        # Real agent calls always pass agent_id.
-        anchor = agent_id or "default"
+        anchor = compute_session_anchor(agent_id, conversation_id)
         # exec_dir must be absolute. Caller passes the in-container path.
         cwd = work_dir or "/data/agents"
 
         try:
             async with httpx.AsyncClient() as client:
+                for stale in self._register_anchor(agent_id or "default", anchor):
+                    await self._evict_anchor(client, stale)
                 inject = kwargs.get("inject")
                 if language == "python":
                     result = await self._run_jupyter(
@@ -155,6 +196,53 @@ class AioSandboxBackend(BaseSandboxBackend):
 
         result.duration_ms = int((time.time() - start) * 1000)
         return result
+
+    # ------------------------------------------------------------------ Anchor LRU
+
+    def _register_anchor(self, agent_part: str, anchor: str) -> list[str]:
+        """Track a conversation anchor; return anchors evicted past the cap.
+
+        Agent-level fallback anchors (no ':') are exempt — they are
+        one-per-agent by construction so they neither count nor get evicted.
+        """
+        if ":" not in anchor:
+            return []
+        lru = self._anchor_lru.setdefault(agent_part, OrderedDict())
+        if anchor in lru:
+            lru.move_to_end(anchor)
+            return []
+        lru[anchor] = None
+        evicted: list[str] = []
+        while len(lru) > self._max_anchors_per_agent:
+            evicted.append(lru.popitem(last=False)[0])
+        return evicted
+
+    async def _evict_anchor(self, client: httpx.AsyncClient, anchor: str) -> None:
+        """Best-effort delete of an evicted anchor's sandbox sessions.
+
+        Failures are non-fatal: a session we fail to delete is reclaimed when
+        the sandbox container restarts, and the anchor itself recovers via the
+        existing "Session not found" recreate path if it ever becomes active
+        again.
+        """
+        try:
+            await client.delete(
+                f"{self.base_url}/v1/shell/sessions/clawith-{anchor}",
+                headers=self._headers(),
+                timeout=5.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[AioSandbox] evict shell session for {anchor!r} failed: {e}")
+        kernel_uuid = self._jupyter_sessions.pop(anchor, None)
+        if kernel_uuid:
+            try:
+                await client.delete(
+                    f"{self.base_url}/v1/jupyter/sessions/{kernel_uuid}",
+                    headers=self._headers(),
+                    timeout=5.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[AioSandbox] evict jupyter kernel for {anchor!r} failed: {e}")
 
     # ------------------------------------------------------------------ Shell path
 

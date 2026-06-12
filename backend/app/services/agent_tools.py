@@ -2936,7 +2936,9 @@ async def execute_tool(
             result = await _plaza_add_comment(agent_id, arguments)
         elif tool_name in _CODE_EXEC_TOOL_NAMES:
             logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
-            result = await _execute_code(agent_id, ws, arguments, tool_name=tool_name, user_id=user_id)
+            result = await _execute_code(
+                agent_id, ws, arguments, tool_name=tool_name, user_id=user_id, session_id=session_id
+            )
         elif tool_name == "sql_execute":
             result = await _sql_execute(arguments)
         elif tool_name == "upload_image":
@@ -3116,7 +3118,9 @@ async def execute_tool(
             # CLI tools (type='cli') are standalone functions executed in the
             # aio sandbox with that tool's auth injected. Try CLI first; if
             # tool_name is not a CLI tool for this agent, fall through to MCP.
-            cli_result = await _execute_cli_tool(agent_id, ws, tool_name, arguments, user_id=user_id)
+            cli_result = await _execute_cli_tool(
+                agent_id, ws, tool_name, arguments, user_id=user_id, session_id=session_id
+            )
             if cli_result is not None:
                 result = cli_result
             else:
@@ -7578,6 +7582,7 @@ async def _execute_code(
     tool_name: str = "execute_code",
     user_id: Optional[uuid.UUID] = None,
     cli_injection: Optional[dict] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Execute code using the configured sandbox backend.
 
@@ -7589,6 +7594,9 @@ async def _execute_code(
                    'execute_code_e2b' (E2B cloud), or 'execute_code_aio'
                    (self-hosted AIO sandbox).  Used to look up the correct
                    per-agent tool config entry in the database.
+        session_id: The ChatSession id of the calling conversation. Threaded to
+                    the backend as ``conversation_id`` so shell/jupyter sessions
+                    are isolated per conversation, not per agent.
     """
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
@@ -7647,6 +7655,7 @@ async def _execute_code(
             timeout=timeout,
             work_dir=str(work_dir),
             agent_id=str(agent_id) if agent_id else None,
+            conversation_id=session_id or None,
             inject=injection,
         )
 
@@ -7714,6 +7723,7 @@ async def _execute_cli_tool(
     arguments: dict,
     *,
     user_id: Optional[uuid.UUID] = None,
+    session_id: Optional[str] = None,
 ) -> Optional[str]:
     """Run a standalone CLI tool (type='cli') as its own LLM function.
 
@@ -7741,7 +7751,7 @@ async def _execute_cli_tool(
     return await _execute_code(
         agent_id, ws, {"language": "bash", "code": command},
         tool_name="execute_code_aio", user_id=user_id,
-        cli_injection=injection,
+        cli_injection=injection, session_id=session_id,
     )
 
 

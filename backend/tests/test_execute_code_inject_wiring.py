@@ -238,7 +238,7 @@ async def test_execute_cli_tool_runs_command_in_aio_with_single_inject(tmp_path)
 
     seen = {}
 
-    async def fake_exec_code(agent_id, ws, arguments, *, tool_name, user_id, cli_injection=None):
+    async def fake_exec_code(agent_id, ws, arguments, *, tool_name, user_id, cli_injection=None, session_id=None):
         seen.update(arguments=arguments, tool_name=tool_name, cli_injection=cli_injection)
         return "OUTPUT"
 
