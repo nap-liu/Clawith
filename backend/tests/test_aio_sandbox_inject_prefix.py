@@ -1,7 +1,7 @@
 """Pure tests for AioSandboxBackend shell command composition.
 
 The new API: _compose_shell_command(*, cwd, code, language, inject: dict | None)
-returns a single-line base64 transport: `bash <(echo <B64> | base64 -d)`.
+returns a single-line base64 transport: `source <(echo <B64> | base64 -d)`.
 Decode the B64 block to assert on the materialized script contents.
 """
 import base64
@@ -11,8 +11,8 @@ from app.services.sandbox.remote.aio_sandbox_backend import AioSandboxBackend
 
 
 def _decode_cmd(cmd: str) -> str:
-    """Extract and decode the base64 payload from `bash <(echo <B64> | base64 -d)`."""
-    m = re.search(r"bash <\(echo ([A-Za-z0-9+/=]+) \| base64 -d\)", cmd)
+    """Extract and decode the base64 payload from `source <(echo <B64> | base64 -d)`."""
+    m = re.search(r"source <\(echo ([A-Za-z0-9+/=]+) \| base64 -d\)", cmd)
     assert m, f"command does not match expected single-line b64 transport:\n  {cmd!r}"
     return base64.b64decode(m.group(1)).decode()
 
@@ -23,7 +23,7 @@ def test_compose_without_inject_is_single_line_b64():
         cwd="/data/agents/a1", code="echo hi", language="bash", inject=None
     )
     # Must be a single-line base64 transport.
-    assert cmd.startswith("bash <(echo ")
+    assert cmd.startswith("source <(echo ")
     assert "| base64 -d)" in cmd
     # Decoded script must contain cwd setup and user code.
     script = _decode_cmd(cmd)
@@ -45,7 +45,7 @@ def test_compose_with_inject_places_wrappers_before_user_code():
         cwd="/data/agents/a1", code="svc report list | head", language="bash",
         inject=inject,
     )
-    assert cmd.startswith("bash <(echo ")
+    assert cmd.startswith("source <(echo ")
     script = _decode_cmd(cmd)
 
     # Wrapper write must come first (before cd/HOME reset).

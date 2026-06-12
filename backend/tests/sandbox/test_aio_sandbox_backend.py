@@ -196,3 +196,116 @@ async def test_unknown_session_id_auto_recreates(backend, agent_id):
     )
     assert r.success is True
     assert "second" in r.stdout
+
+
+# --------------------------------------------------------- per-session isolation
+
+
+async def test_same_agent_two_conversations_have_isolated_shell_env(backend, agent_id):
+    await backend.execute(
+        code="export MARKER=from-conv1",
+        language="bash",
+        timeout=10,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+        conversation_id="conv1",
+    )
+    same = await backend.execute(
+        code='echo "marker=$MARKER"',
+        language="bash",
+        timeout=10,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+        conversation_id="conv1",
+    )
+    other = await backend.execute(
+        code='echo "marker=$MARKER"',
+        language="bash",
+        timeout=10,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+        conversation_id="conv2",
+    )
+    assert "marker=from-conv1" in same.stdout  # persists inside the conversation
+    assert "from-conv1" not in other.stdout  # never leaks to a sibling conversation
+
+
+async def test_same_agent_two_conversations_have_isolated_python_kernels(backend, agent_id):
+    await backend.execute(
+        code="leak_probe = 'from-conv1'",
+        language="python",
+        timeout=30,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+        conversation_id="conv1",
+    )
+    same = await backend.execute(
+        code="print(leak_probe)",
+        language="python",
+        timeout=30,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+        conversation_id="conv1",
+    )
+    other = await backend.execute(
+        code="print(leak_probe)",
+        language="python",
+        timeout=30,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+        conversation_id="conv2",
+    )
+    assert "from-conv1" in same.stdout  # kernel state persists per conversation
+    assert other.success is False  # sibling conversation gets NameError
+    assert "NameError" in (other.stderr or "") + (other.error or "")
+
+
+async def test_conversation_and_agent_fallback_sessions_do_not_collide(backend, agent_id):
+    await backend.execute(
+        code="export MARKER=from-fallback",
+        language="bash",
+        timeout=10,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+    )
+    r = await backend.execute(
+        code='echo "marker=$MARKER"',
+        language="bash",
+        timeout=10,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+        conversation_id="conv1",
+    )
+    assert "from-fallback" not in r.stdout
+
+
+async def test_lru_eviction_resets_oldest_conversation(backend, agent_id):
+    backend._max_anchors_per_agent = 2
+    await backend.execute(
+        code="export MARKER=oldest",
+        language="bash",
+        timeout=10,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+        conversation_id="c1",
+    )
+    for conv in ("c2", "c3"):  # pushes c1 out of the LRU → its session is deleted
+        await backend.execute(
+            code="true",
+            language="bash",
+            timeout=10,
+            work_dir="/data/agents",
+            agent_id=agent_id,
+            conversation_id=conv,
+        )
+    r = await backend.execute(
+        code='echo "marker=$MARKER"',
+        language="bash",
+        timeout=10,
+        work_dir="/data/agents",
+        agent_id=agent_id,
+        conversation_id="c1",
+    )
+    # c1 was evicted server-side; reactivating it recreates a FRESH session.
+    assert r.success is True
+    assert "oldest" not in r.stdout

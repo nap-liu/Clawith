@@ -414,18 +414,25 @@ class AioSandboxBackend(BaseSandboxBackend):
         """Compose the per-exec command and deliver it **verbatim**.
 
         The full script (env exports → CLI wrapper writes → identity env exports
-        → user code) is materialized and run in a child bash via a single-line
-        base64 transport: ``bash <(echo <b64> | base64 -d)``. This is critical:
+        → user code) is materialized and *sourced into the session shell* via a
+        single-line base64 transport: ``source <(echo <b64> | base64 -d)``.
+        This is critical:
 
         - **Correctness**: the sandbox's shell-exec layer splits multi-line
           commands on newlines (and re-joins with ';'), which silently breaks
           bash comments (a leading '#' swallows the rest of the joined line ->
           NO OUTPUT) and multi-line quoted strings. Running a materialized
-          script file sidesteps the splitter entirely — comments, heredocs,
+          script sidesteps the splitter entirely — comments, heredocs,
           multi-line jq filters, loops all run exactly as written.
-        - **No 串台**: identity env is exported *inside the per-exec child bash*,
-          never the persistent per-agent session, so it cannot leak into the
-          next call / another conversation.
+        - **Persistence**: ``source`` (not a child bash) keeps the documented
+          session semantics — the user's ``export``/``cd``-within-script state
+          survives to the next call of the *same conversation*. A child bash
+          (used 2026-06-11..12) silently dropped every user export.
+        - **No 串台**: sessions are per-conversation (see compute_session_anchor),
+          so identity env sourced into the session can never reach another
+          conversation; within a conversation every exec re-exports the
+          *current* sender's identity before the user code runs, so multi-user
+          (group IM) conversations stay correct.
 
         The CLI wrapper (``svc`` etc.) is an identity-agnostic PATH script
         (see sandbox_inject.build_wrapper_write_sh); identity rides on the
@@ -498,7 +505,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         # bash exactly as written (comments / heredocs / multi-line preserved),
         # identity env confined to the child (never the persistent session).
         b64 = base64.b64encode(script.encode()).decode()
-        return f"bash <(echo {b64} | base64 -d)"
+        return f"source <(echo {b64} | base64 -d)"
 
     @staticmethod
     def _build_shell_command(code: str, language: str) -> str:
