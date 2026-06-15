@@ -180,3 +180,83 @@ async def test_list_tools_raises_on_failure(monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
     with pytest.raises(Exception, match="server not found"):
         await SandboxMcpHubClient("http://x:8080", None).list_tools("bad_server")
+
+
+# ---------------------------------------------------------------------------
+# New tests for code-review fixes
+# ---------------------------------------------------------------------------
+
+
+async def test_call_tool_returns_error_string_on_network_error(monkeypatch):
+    """call_tool must NOT raise on httpx.ConnectError — return an ❌ string."""
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
+    out = await SandboxMcpHubClient("http://x:8080", None).call_tool("srv", "tool", {})
+    assert out.startswith("❌")
+
+
+async def test_call_tool_returns_error_string_on_502(monkeypatch):
+    """call_tool must return an ❌ string with the HTTP status when response is 502."""
+
+    class FakeResp:
+        status_code = 502
+
+        def json(self):
+            raise ValueError("not JSON")
+
+        @property
+        def text(self):
+            return "Bad Gateway"
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, *a, **k):
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
+    out = await SandboxMcpHubClient("http://x:8080", None).call_tool("srv", "tool", {})
+    assert "❌" in out
+    assert "502" in out
+
+
+async def test_list_tools_raises_on_http_500(monkeypatch):
+    """list_tools must raise an Exception containing '500' when response status is 500."""
+
+    class FakeResp:
+        status_code = 500
+
+        def json(self):
+            raise ValueError("not JSON")
+
+        @property
+        def text(self):
+            return "Internal Server Error"
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            return FakeResp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
+    with pytest.raises(Exception, match="500"):
+        await SandboxMcpHubClient("http://x:8080", None).list_tools("my_server")

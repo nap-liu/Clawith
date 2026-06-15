@@ -35,6 +35,7 @@ Usage::
 import base64
 import hashlib
 import json
+import re
 
 import httpx
 
@@ -44,6 +45,9 @@ _HUB_JSON = "/opt/gem/mcp-hub.json"
 _LOCK_FILE = "/tmp/mcp-hub.lock"
 # Stable admin session ID; distinct from per-agent conversation sessions.
 ADMIN_SESSION = "clawith-mcp-admin"
+
+# Defense-in-depth: only allow characters safe for hub JSON keys and shell paths.
+_SAFE_SERVER_NAME = re.compile(r"^[a-z0-9_-]+$")
 
 
 def entry_name(server_name: str, agent_id: str, cfg: dict) -> str:
@@ -56,8 +60,15 @@ def entry_name(server_name: str, agent_id: str, cfg: dict) -> str:
     - **Deterministic**: same inputs always produce the same name.
     - **Per-agent**: changing ``agent_id`` (or ``cfg``) changes the name.
     - **Safe for hub JSON keys**: only ``[a-z0-9_-]`` characters.
+
+    Raises ``ValueError`` if *server_name* contains characters outside
+    ``[a-z0-9_-]`` (defense-in-depth against shell injection).
     """
-    raw = f"{server_name}|{agent_id}|{json.dumps(cfg, sort_keys=True, ensure_ascii=False)}"
+    if not _SAFE_SERVER_NAME.match(server_name):
+        raise ValueError(
+            f"server_name {server_name!r} contains unsafe characters; only [a-z0-9_-] allowed"
+        )
+    raw = f"{server_name}|{agent_id}|{json.dumps(cfg, sort_keys=True)}"
     fingerprint = hashlib.sha256(raw.encode()).hexdigest()[:12]
     return f"{server_name}__{fingerprint}"
 
@@ -71,7 +82,7 @@ class SandboxMcpHost:
 
     # ------------------------------------------------------------------ Internals
 
-    def _h(self) -> dict[str, str]:
+    def _headers(self) -> dict[str, str]:
         h: dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             h["Authorization"] = f"Bearer {self.api_key}"
@@ -82,22 +93,39 @@ class SandboxMcpHost:
 
         Creates the session if it doesn't exist yet (idempotent — the sandbox
         returns success even if the session already exists).
+
+        Raises ``Exception`` if either HTTP request fails or returns a non-200
+        status code.
         """
-        async with httpx.AsyncClient() as c:
-            # Ensure admin session exists (idempotent).
-            await c.post(
-                f"{self.base}/v1/shell/sessions/create",
-                json={"id": ADMIN_SESSION, "exec_dir": "/tmp"},
-                headers=self._h(),
-                timeout=10.0,
-            )
-            r = await c.post(
-                f"{self.base}/v1/shell/exec",
-                json={"id": ADMIN_SESSION, "command": command, "timeout": 30.0},
-                headers=self._h(),
-                timeout=40.0,
-            )
-            return r.json()
+        try:
+            async with httpx.AsyncClient() as c:
+                # Ensure admin session exists (idempotent).
+                create_resp = await c.post(
+                    f"{self.base}/v1/shell/sessions/create",
+                    json={"id": ADMIN_SESSION, "exec_dir": "/tmp"},
+                    headers=self._headers(),
+                    timeout=10.0,
+                )
+                if create_resp.status_code != 200:
+                    raise Exception(
+                        f"admin shell session create HTTP {create_resp.status_code}: "
+                        f"{create_resp.text[:200]}"
+                    )
+
+                exec_resp = await c.post(
+                    f"{self.base}/v1/shell/exec",
+                    json={"id": ADMIN_SESSION, "command": command, "timeout": 30.0},
+                    headers=self._headers(),
+                    timeout=40.0,
+                )
+                if exec_resp.status_code != 200:
+                    raise Exception(
+                        f"admin shell exec HTTP {exec_resp.status_code}: "
+                        f"{exec_resp.text[:200]}"
+                    )
+                return exec_resp.json()
+        except httpx.HTTPError as e:
+            raise Exception(f"admin shell HTTP error: {e}") from e
 
     # ------------------------------------------------------------------ Public API
 
@@ -113,7 +141,13 @@ class SandboxMcpHost:
 
         Idempotent: calling again with the same inputs overwrites the same key
         with the same value (no-op from the hub's perspective).
+
+        Raises ``ValueError`` if *server_name* contains unsafe characters or if
+        *cfg* does not contain a non-empty ``"command"`` key.
         """
+        if not cfg.get("command"):
+            raise ValueError("cfg must contain a non-empty 'command' key")
+
         name = entry_name(server_name, agent_id, cfg)
         entry = {
             "type": "stdio",

@@ -102,3 +102,71 @@ async def test_ensure_registered_no_restart(monkeypatch):
     assert "reload" not in joined
     assert "pkill" not in joined
     assert "kill" not in joined
+
+
+# ---------------------------------------------------------------------------
+# New tests for code-review fixes
+# ---------------------------------------------------------------------------
+
+
+def test_entry_name_rejects_unsafe_server_name():
+    """entry_name must raise ValueError for names containing shell-unsafe chars."""
+    with pytest.raises(ValueError, match="unsafe characters"):
+        entry_name('evil"; rm -rf /; echo', "agentA", {"command": "npx"})
+
+
+async def test_ensure_registered_raises_on_missing_command(monkeypatch):
+    """ensure_registered must raise ValueError if cfg has no 'command' key."""
+    async def fake_exec(self, command: str):
+        return {"success": True}
+
+    monkeypatch.setattr(SandboxMcpHost, "_exec_admin_shell", fake_exec)
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    with pytest.raises(ValueError, match="command"):
+        await host.ensure_registered("srv", "agent1", {})
+
+
+async def test_exec_admin_shell_raises_on_exec_500(monkeypatch):
+    """_exec_admin_shell must raise if the exec POST returns HTTP 500."""
+    import httpx
+
+    class FakeResp200:
+        status_code = 200
+
+        def json(self):
+            return {"success": True}
+
+        @property
+        def text(self):
+            return "ok"
+
+    class FakeResp500:
+        status_code = 500
+
+        def json(self):
+            return {}
+
+        @property
+        def text(self):
+            return "Internal Server Error"
+
+    call_count = 0
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json, headers, timeout):
+            nonlocal call_count
+            call_count += 1
+            if "sessions/create" in url:
+                return FakeResp200()
+            return FakeResp500()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    with pytest.raises(Exception, match="500"):
+        await host._exec_admin_shell("echo hello")

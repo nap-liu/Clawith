@@ -17,6 +17,8 @@ Usage::
     tools  = await client.list_tools("yunxiao__abc123456789")
     result = await client.call_tool("yunxiao__abc123456789", "get_current_user", {})
 """
+import json
+
 import httpx
 
 
@@ -29,7 +31,7 @@ class SandboxMcpHubClient:
 
     # ------------------------------------------------------------------ Internals
 
-    def _h(self) -> dict[str, str]:
+    def _headers(self) -> dict[str, str]:
         h: dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             h["Authorization"] = f"Bearer {self.api_key}"
@@ -41,16 +43,23 @@ class SandboxMcpHubClient:
         """List tools exposed by *server_name* via the hub.
 
         Returns a list of ``{name, description, inputSchema}`` dicts.
-        Raises on ``success: false`` — callers that want a soft error should
-        catch the exception.
+        Raises on non-200 HTTP status, network errors, or ``success: false`` —
+        callers that want a soft error should catch the exception.
         """
-        async with httpx.AsyncClient() as c:
-            r = await c.get(
-                f"{self.base}/v1/mcp/{server_name}/tools",
-                headers=self._h(),
-                timeout=120.0,
-            )
-            body = r.json()
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.get(
+                    f"{self.base}/v1/mcp/{server_name}/tools",
+                    headers=self._headers(),
+                    timeout=120.0,
+                )
+        except httpx.HTTPError as e:
+            raise Exception(f"MCP hub list_tools network error: {e}") from e
+
+        if r.status_code != 200:
+            raise Exception(f"MCP hub list_tools HTTP {r.status_code}: {r.text[:200]}")
+
+        body = r.json()
 
         if not body.get("success"):
             raise Exception(body.get("message") or "list_tools failed")
@@ -75,17 +84,27 @@ class SandboxMcpHubClient:
         """Call *tool_name* on *server_name* via the hub.
 
         Returns the concatenated text content on success.
-        On ``success: false`` returns an error string (does *not* raise) so the
-        LLM sees the error message rather than a Python exception.
+        Never raises — all errors (network, HTTP, envelope) are returned as an
+        ``❌ …`` error string so the LLM sees the error message rather than a
+        Python exception.
         """
-        async with httpx.AsyncClient() as c:
-            r = await c.post(
-                f"{self.base}/v1/mcp/{server_name}/tools/{tool_name}",
-                json=arguments or {},
-                headers=self._h(),
-                timeout=120.0,
-            )
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.post(
+                    f"{self.base}/v1/mcp/{server_name}/tools/{tool_name}",
+                    json=arguments or {},
+                    headers=self._headers(),
+                    timeout=120.0,
+                )
+
+            if r.status_code != 200:
+                return f"❌ MCP tool error: HTTP {r.status_code}: {r.text[:200]}"
+
             body = r.json()
+        except httpx.HTTPError as e:
+            return f"❌ MCP tool network error: {e}"
+        except Exception as e:
+            return f"❌ MCP tool error: {e}"
 
         if not body.get("success"):
             return f"❌ MCP tool error: {body.get('message')}"
@@ -96,5 +115,5 @@ class SandboxMcpHubClient:
 
         if texts:
             return "\n".join(texts)
-        # Fallback: data as string if no text blocks
-        return data if isinstance(data, str) else str(data)
+        # Fallback: data as JSON string if no text blocks
+        return data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
