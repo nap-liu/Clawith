@@ -177,6 +177,8 @@ async def lifespan(app: FastAPI):
             import app.models.agent_credential  # noqa
             import app.models.okr            # noqa
             import app.models.onboarding     # noqa
+            import app.models.mcp_server     # noqa  # FK target of tools.mcp_server_id; fresh-DB create_all needs it registered
+            import app.models.chat_compaction  # noqa  # FK target of chat_messages.compacted_into
 
             import app.models.identity       # noqa
             async with engine.begin() as conn:
