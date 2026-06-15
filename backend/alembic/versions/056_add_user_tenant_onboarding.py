@@ -19,6 +19,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # Idempotent: fresh deploys already create this table from the ORM model
+    # (app/models/onboarding.py) via 001_initial_schema's
+    # Base.metadata.create_all(checkfirst=True). Skip if it already exists so the
+    # numbered upstream chain coexists with our create_all-based initial schema.
+    if sa.inspect(op.get_bind()).has_table("user_tenant_onboardings"):
+        return
     op.create_table(
         "user_tenant_onboardings",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),

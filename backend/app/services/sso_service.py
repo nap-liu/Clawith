@@ -10,7 +10,9 @@ from typing import Any
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
+from app.models.identity import AuthProviderType, IdentityProvider
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services.identity_provider_lookup import get_preferred_identity_provider
@@ -48,7 +50,7 @@ class SSOService:
             query = query.where(User.tenant_id == tenant_id)
         
         result = await db.execute(query)
-        user = result.scalar_one_or_none()
+        user = result.scalars().first()
         
         if user:
             return user
@@ -60,7 +62,10 @@ class SSOService:
             identity = id_result.scalar_one_or_none()
             if identity:
                 # Find any user for this identity (representative)
-                u_res = await db.execute(select(User).where(User.identity_id == identity.id).limit(1))
+                u_query = select(User).where(User.identity_id == identity.id).options(selectinload(User.identity)).limit(1)
+                if tenant_id:
+                    u_query = u_query.where(User.tenant_id == tenant_id)
+                u_res = await db.execute(u_query)
                 return u_res.scalar_one_or_none()
                 
         return None
@@ -95,7 +100,7 @@ class SSOService:
             query = query.where(User.tenant_id == tenant_id)
             
         result = await db.execute(query)
-        user = result.scalar_one_or_none()
+        user = result.scalars().first()
         if user:
             return user
 
@@ -104,7 +109,10 @@ class SSOService:
         id_result = await db.execute(id_query)
         identity = id_result.scalar_one_or_none()
         if identity:
-             u_res = await db.execute(select(User).where(User.identity_id == identity.id).limit(1))
+             u_query = select(User).where(User.identity_id == identity.id).options(selectinload(User.identity)).limit(1)
+             if tenant_id:
+                 u_query = u_query.where(User.tenant_id == tenant_id)
+             u_res = await db.execute(u_query)
              return u_res.scalar_one_or_none()
 
         return None
@@ -154,7 +162,7 @@ class SSOService:
         self,
         db: AsyncSession,
         provider_user_id: str,
-        provider_type: str,
+        provider_type: AuthProviderType | str,
         tenant_id: str | None = None,
         identity_data: dict[str, Any] | None = None,
     ) -> User | None:
@@ -204,7 +212,7 @@ class SSOService:
 
     def _extract_identity_ids(
         self,
-        provider_type: str,
+        provider_type: AuthProviderType | str,
         provider_user_id: str,
         identity_data: dict[str, Any] | None,
     ) -> tuple[str | None, str | None, str | None]:
@@ -245,7 +253,7 @@ class SSOService:
 
     def _identity_lookup_chain(
         self,
-        provider_type: str,
+        provider_type: AuthProviderType | str,
         provider_user_id: str,
         identity_data: dict[str, Any] | None,
     ) -> list[tuple[str, str]]:
@@ -274,7 +282,7 @@ class SSOService:
         self,
         db: AsyncSession,
         provider_id: uuid.UUID,
-        provider_type: str,
+        provider_type: AuthProviderType | str,
         provider_user_id: str,
         identity_data: dict[str, Any] | None = None,
     ):
@@ -299,7 +307,7 @@ class SSOService:
         self,
         db: AsyncSession,
         user_id: str,
-        provider_type: str,
+        provider_type: AuthProviderType | str,
         provider_user_id: str,
         identity_data: dict[str, Any] | None = None,
         tenant_id: str | None = None,
@@ -432,7 +440,7 @@ class SSOService:
         return member
 
     async def unlink_identity(
-        self, db: AsyncSession, user_id: str, provider_type: str, tenant_id: str | None = None
+        self, db: AsyncSession, user_id: str, provider_type: AuthProviderType | str, tenant_id: str | None = None
     ) -> bool:
         """Unlink an external identity (OrgMember) from a user.
 
@@ -474,7 +482,7 @@ class SSOService:
     async def check_duplicate_identity(
         self,
         db: AsyncSession,
-        provider_type: str,
+        provider_type: AuthProviderType | str,
         provider_user_id: str,
         tenant_id: str | None = None,
         identity_data: dict[str, Any] | None = None,
@@ -529,8 +537,8 @@ class SSOService:
         # IP Address: only ONE tenant in the whole system can have SSO enabled.
         # Check if any *other* tenant has an active SSO-enabled provider.
         query = select(IdentityProvider).where(
-            IdentityProvider.sso_login_enabled == True,
-            IdentityProvider.is_active == True,
+            IdentityProvider.sso_login_enabled.is_(True),
+            IdentityProvider.is_active.is_(True),
             IdentityProvider.tenant_id != tenant_id,
         )
         result = await db.execute(query)

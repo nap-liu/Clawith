@@ -27,6 +27,10 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Idempotent: fresh deploys create this table from its ORM model via
+    # 001_initial_schema's Base.metadata.create_all(checkfirst=True). Skip if present.
+    if sa.inspect(op.get_bind()).has_table("cli_tool_binary_versions"):
+        return
     op.create_table(
         "cli_tool_binary_versions",
         sa.Column("id", UUID(as_uuid=True), primary_key=True, nullable=False),
