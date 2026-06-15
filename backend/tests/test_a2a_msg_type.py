@@ -9,7 +9,6 @@ Validates the branching logic in _send_message_to_agent:
 import json
 import uuid
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -365,6 +364,40 @@ async def test_no_relationship_returns_error():
         })
 
     assert "do not have a relationship" in result
+
+
+@pytest.mark.asyncio
+async def test_append_focus_item_creates_file(tmp_path):
+    """_append_focus_item should create/append to focus.md."""
+    from app.services.agent_tools import _append_focus_item
+
+    agent_id = uuid.uuid4()
+    with patch("app.services.agent_tools.WORKSPACE_ROOT", tmp_path):
+        await _append_focus_item(agent_id, "test_item", "Test description")
+
+        focus_path = tmp_path / str(agent_id) / "focus.md"
+        assert focus_path.exists()
+        content = focus_path.read_text()
+        assert "test_item" in content
+        assert "Test description" in content
+        assert "- [ ]" in content
+
+
+@pytest.mark.asyncio
+async def test_append_focus_item_no_duplicate(tmp_path):
+    """_append_focus_item should not duplicate existing items."""
+    from app.services.agent_tools import _append_focus_item
+
+    agent_id = uuid.uuid4()
+    focus_path = tmp_path / str(agent_id) / "focus.md"
+    focus_path.parent.mkdir(parents=True, exist_ok=True)
+    focus_path.write_text("# Focus\n\n- [ ] test_item: Existing description\n")
+
+    with patch("app.services.agent_tools.WORKSPACE_ROOT", tmp_path):
+        await _append_focus_item(agent_id, "test_item", "New description")
+
+    content = focus_path.read_text()
+    assert content.count("test_item") == 1
 
 
 @pytest.mark.asyncio

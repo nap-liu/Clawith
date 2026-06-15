@@ -9,6 +9,9 @@
       "title": "数字员工平台",
       "subtitle": "OpenClaw for Teams",
       "description": "OpenClaw 赋能个人。<br>数字员工平台将其扩展到前沿组织。",
+      "welcome": "欢迎，",
+      "founder": "创始人",
+      "mark": "数字员工平台",
       "features": {
         "multiAgent": {
           "title": "多智能体团队",

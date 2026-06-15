@@ -35,6 +35,7 @@ from .client import LLMError
 from .failover import classify_error, FailoverErrorType
 from .json_recovery import canonicalize_tool_arguments
 from .tool_output_store import enforce_message_budget, finalize_tool_output
+from .finish import FINISH_PROTOCOL_REMINDER, FINISH_TOOL_DEFINITION, find_finish_call
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
 if TYPE_CHECKING:
@@ -632,20 +633,21 @@ async def call_llm(
         agent_id, agent_name, role_description, current_user_name=_user_name, is_group=is_group
     )
 
-    # Load tools dynamically from DB.
+    # Load tools dynamically from DB. `skip_tools=True` is set by the WS handler
+    # on the onboarding greeting turn; keep the runtime-level `finish` tool so
+    # every turn still has an explicit stop signal.
     # Sort by function.name so Anthropic's tools[-1] cache_control lands on a
-    # stable tool block across calls — any iteration order churn from the DB
-    # layer would otherwise invalidate the tools prefix cache every request.
-    tools_for_llm = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
+    # stable tool block across calls — DB iteration-order churn would otherwise
+    # invalidate the tools prefix cache every request.
+    if skip_tools:
+        tools_for_llm = [FINISH_TOOL_DEFINITION]
+    else:
+        tools_for_llm = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
     if tools_for_llm:
         tools_for_llm = sorted(
             tools_for_llm,
             key=lambda t: t.get("function", {}).get("name", ""),
         )
-    # Required by _process_tool_call's `tool_name not in allowed_tool_names`
-    # guard. Restored after the take-ours conflict resolution dropped the
-    # upstream line that computed this in call_llm (call_agent_llm_with_tools
-    # already has its own copy at ~L1121).
     allowed_tool_names = _allowed_tool_names(tools_for_llm)
 
     # Convert messages to LLMMessage format.
@@ -733,12 +735,16 @@ async def call_llm(
 
         try:
             # Use streaming API for real-time responses
+            async def _buffer_chunk(_text: str) -> None:
+                # Final user-facing text must come through finish(content=...).
+                return None
+
             response = await client.stream(
                 messages=dispatch_messages,
                 tools=tools_for_llm if tools_for_llm else None,
                 temperature=model.temperature,
                 max_tokens=max_tokens,
-                on_chunk=on_chunk,
+                on_chunk=_buffer_chunk,
                 on_tool_delta=on_tool_delta,
                 on_thinking=on_thinking,
             )
@@ -850,12 +856,13 @@ async def call_llm(
             else:
                 logger.info(_line)
 
-        # If no tool calls, return the final content
+        # Plain assistant text is not a stop condition. The model must finish
+        # explicitly via finish(content=...).
         if not response.tool_calls:
-            if agent_id and _accumulated_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _accumulated_usage)
-            await client.close()
-            return response.content or "[LLM returned empty content]"
+            if response.content:
+                api_messages.append(LLMMessage(role="assistant", content=response.content))
+            api_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
+            continue
 
         # Execute tool calls
         logger.info(f"[LLM] Round {round_i + 1}: {len(response.tool_calls)} tool call(s)")
@@ -864,11 +871,32 @@ async def call_llm(
             api_messages.append(LLMMessage(role="user", content=retry_instruction))
             continue
 
-        # Remember where this round's appended entries begin. The
-        # message-level budget enforcer operates only on items at or
-        # beyond this index — historical messages (already sent as
-        # prefix bytes in prior rounds) must stay byte-identical so
-        # Anthropic / Qwen / DashScope prefix caches keep hitting.
+        finish_call = find_finish_call(sanitized_tool_calls)
+        if finish_call:
+            if finish_call.valid:
+                if agent_id and _accumulated_usage.total_tokens > 0:
+                    await record_token_usage(agent_id, _accumulated_usage)
+                await client.close()
+                return finish_call.content
+
+            api_messages.append(LLMMessage(
+                role="assistant",
+                content=response.content or None,
+                tool_calls=sanitized_tool_calls,
+                reasoning_content=response.reasoning_content,
+            ))
+            api_messages.append(LLMMessage(
+                role="tool",
+                content=finish_call.error or "`finish` was invalid.",
+                tool_call_id=finish_call.call_id,
+            ))
+            continue
+
+        # Remember where this round's appended entries begin. The message-level
+        # budget enforcer operates only on items at or beyond this index —
+        # historical messages (already sent as prefix bytes in prior rounds) must
+        # stay byte-identical so Anthropic / Qwen / DashScope prefix caches keep
+        # hitting.
         fresh_start = len(api_messages)
 
         # Add assistant message with tool calls
@@ -1254,10 +1282,12 @@ async def call_agent_llm_with_tools(
                 _accumulated_usage.add(_usage_from_response_or_estimate(response, api_messages))
 
                 if not response.tool_calls:
-                    if agent_id and _accumulated_usage.total_tokens > 0:
-                        await record_token_usage(agent_id, _accumulated_usage)
-                    await client.close()
-                    return response.content or "[Empty response]", True, tool_executed
+                    # Plain assistant text is not a stop condition — the model must
+                    # finish() explicitly. Nudge with the protocol reminder and loop.
+                    if response.content:
+                        api_messages.append(LLMMessage(role="assistant", content=response.content))
+                    api_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
+                    continue
 
                 # Execute tool calls
                 # Sanitize first — invalid tool args become a retry user message
@@ -1267,8 +1297,31 @@ async def call_agent_llm_with_tools(
                     api_messages.append(LLMMessage(role="user", content=retry_instruction))
                     continue
 
+                # finish() handling: valid → return content; invalid → surface the
+                # error back to the model and loop.
+                finish_call = find_finish_call(sanitized_tool_calls)
+                if finish_call:
+                    if finish_call.valid:
+                        if agent_id and _accumulated_usage.total_tokens > 0:
+                            await record_token_usage(agent_id, _accumulated_usage)
+                        await client.close()
+                        return finish_call.content, True, tool_executed
+                    api_messages.append(LLMMessage(
+                        role="assistant",
+                        content=response.content or None,
+                        tool_calls=sanitized_tool_calls,
+                        reasoning_content=response.reasoning_content,
+                    ))
+                    api_messages.append(LLMMessage(
+                        role="tool",
+                        tool_call_id=finish_call.call_id,
+                        content=finish_call.error or "`finish` was invalid.",
+                    ))
+                    continue
+
+                # Add assistant message with tool calls.
                 # NB: tc["function"] is shared by reference with _canonicalize_tc_arguments's
-                # in-place canonicalization — must stay as a reference (no deepcopy), or
+                # in-place canonicalization — must stay a reference (no deepcopy), or
                 # history entries will carry the pre-repair malformed arguments.
                 api_messages.append(
                     LLMMessage(

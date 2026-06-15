@@ -39,6 +39,11 @@ router = APIRouter(prefix="/enterprise", tags=["enterprise"])
 settings = get_settings()
 
 
+def _is_platform_admin_user(user: User) -> bool:
+    """Return true for tenant-role or identity-level platform admins."""
+    return user.role == "platform_admin" or bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
+
+
 # ─── Public: Check Email Exists ────────────────────────
 
 class CheckEmailRequest(BaseModel):
@@ -593,11 +598,32 @@ async def send_test_email_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """Send a test email to verify SMTP configuration (admin only)."""
+    import smtplib
+    import socket
+    import ssl
+
     from app.services.system_email_service import send_test_email
 
     try:
         await send_test_email(data.email, db=db)
         return {"success": True, "message": f"Test email sent to {data.email}"}
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "SMTP authentication failed. Please check that the SMTP username is the full email address "
+                "and that the password/app password is valid for this mailbox."
+            ),
+        )
+    except (TimeoutError, socket.timeout, ssl.SSLError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"SMTP TLS/connect timed out: {e}. Please verify the SMTP host, port, and SSL/TLS mode. "
+                "For Zoho, the SMTP host depends on the account data center, for example smtp.zoho.com "
+                "or smtp.zoho.com.cn."
+            ),
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -706,7 +732,7 @@ async def update_system_setting(
 ):
     """Create or update a system setting."""
     # Platform-level settings (e.g. PUBLIC_BASE_URL) require platform_admin
-    if key == "platform" and current_user.role != "platform_admin":
+    if key == "platform" and not _is_platform_admin_user(current_user):
         raise HTTPException(status_code=403, detail="Only platform admin can modify platform settings")
     result = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
     setting = result.scalar_one_or_none()
@@ -829,7 +855,7 @@ async def list_identity_providers(
 ):
     """List identity providers configured for the tenant."""
     # Authorization: non-platform admins can only see their own tenant's providers
-    if tenant_id and current_user.role != "platform_admin":
+    if tenant_id and not _is_platform_admin_user(current_user):
         if str(current_user.tenant_id) != tenant_id:
             raise HTTPException(status_code=403, detail="Cannot access other tenant's providers")
 
@@ -837,13 +863,13 @@ async def list_identity_providers(
     tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
 
     if global_only:
-        if current_user.role != "platform_admin":
+        if not _is_platform_admin_user(current_user):
             raise HTTPException(status_code=403, detail="Only platform admin can access global identity providers")
         query = query.where(IdentityProvider.tenant_id.is_(None))
     elif tid:
         import uuid as _uuid
         query = query.where(IdentityProvider.tenant_id == _uuid.UUID(tid))
-    elif current_user.role != "platform_admin":
+    elif not _is_platform_admin_user(current_user):
         raise HTTPException(status_code=400, detail="tenant_id is required for identity providers")
 
     result = await db.execute(query)
@@ -1001,7 +1027,8 @@ async def create_identity_provider(
     
     # Validate and determine tenant_id
     tid = data.tenant_id
-    if current_user.role == "platform_admin":
+    is_platform_admin = _is_platform_admin_user(current_user)
+    if is_platform_admin:
         # Platform admins can use any tenant_id (including None for global providers)
         pass
     else:
@@ -1012,7 +1039,7 @@ async def create_identity_provider(
             # Validate they can only manage their own tenant
             raise HTTPException(status_code=403, detail="Can only create providers for your own tenant")
 
-    if not tid and not (current_user.role == "platform_admin" and data.provider_type in {"google", "github"}):
+    if not tid and not (is_platform_admin and data.provider_type in {"google", "github"}):
         raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
         
     if data.sso_login_enabled:
@@ -1044,8 +1071,14 @@ async def create_oauth2_provider(
     db: AsyncSession = Depends(get_db),
 ):
     """Create OAuth2 provider - strict config format only."""
-    # Validate tenant
-    tid = data.tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
+    # Validate and determine tenant_id: platform admins may target any tenant
+    # (or global via None); others are restricted to their own tenant.
+    tid = data.tenant_id
+    if not _is_platform_admin_user(current_user):
+        if tid is None:
+            tid = current_user.tenant_id
+        elif str(tid) != str(current_user.tenant_id):
+            raise HTTPException(status_code=403, detail="Can only create providers for your own tenant")
     if not tid:
         raise HTTPException(status_code=400, detail="tenant_id is required")
 
@@ -1091,7 +1124,7 @@ async def update_oauth2_provider(
     if provider.provider_type != "oauth2":
         raise HTTPException(status_code=400, detail="Provider is not an OAuth2 provider")
 
-    if current_user.role != "platform_admin" and provider.tenant_id != current_user.tenant_id:
+    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to update this provider")
 
     # Update basic fields
@@ -1145,7 +1178,7 @@ async def update_identity_provider(
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
         
-    if current_user.role != "platform_admin" and provider.tenant_id != current_user.tenant_id:
+    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to update this provider")
         
     if data.name is not None:
@@ -1200,7 +1233,7 @@ async def delete_identity_provider(
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
         
-    if current_user.role != "platform_admin" and provider.tenant_id != current_user.tenant_id:
+    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this provider")
         
     try:
@@ -1470,7 +1503,7 @@ async def trigger_org_sync(
     if not provider.tenant_id:
         raise HTTPException(status_code=400, detail="Provider must be bound to a tenant")
 
-    if current_user.role != "platform_admin" and provider.tenant_id != current_user.tenant_id:
+    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Cannot sync other tenant's provider")
 
     return await org_sync_service.sync_provider(db, provider_id)

@@ -133,6 +133,7 @@ function PlatformTab() {
 
     // System email configuration
     const [systemEmailConfig, setSystemEmailConfig] = useState({
+        SYSTEM_EMAIL_ENABLED: false,
         SYSTEM_EMAIL_FROM_ADDRESS: '',
         SYSTEM_EMAIL_FROM_NAME: 'Clawith',
         SYSTEM_SMTP_HOST: '',
@@ -196,6 +197,9 @@ function PlatformTab() {
             .then(d => {
                 if (d?.value) {
                     setSystemEmailConfig({
+                        SYSTEM_EMAIL_ENABLED: d.value.SYSTEM_EMAIL_ENABLED !== undefined
+                            ? !!d.value.SYSTEM_EMAIL_ENABLED
+                            : !!(d.value.SYSTEM_EMAIL_FROM_ADDRESS && d.value.SYSTEM_SMTP_HOST),
                         SYSTEM_EMAIL_FROM_ADDRESS: d.value.SYSTEM_EMAIL_FROM_ADDRESS || '',
                         SYSTEM_EMAIL_FROM_NAME: d.value.SYSTEM_EMAIL_FROM_NAME || 'Clawith',
                         SYSTEM_SMTP_HOST: d.value.SYSTEM_SMTP_HOST || '',
@@ -675,11 +679,31 @@ function PlatformTab() {
 
             {/* System Email Configuration */}
             <div className="card" style={{ padding: '16px', marginBottom: '16px' }}>
-                <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '4px', color: 'var(--text-secondary)' }}>
-                    {t('enterprise.systemEmail.title', 'System Email Configuration')}
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: '16px', alignItems: 'flex-start', marginBottom: '4px' }}>
+                    <div>
+                        <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                            {t('enterprise.systemEmail.title', 'System Email Configuration')}
+                        </div>
+                        <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', margin: '4px 0 0' }}>
+                            {t('enterprise.systemEmail.description', 'Configure SMTP settings for sending system emails such as password resets and notifications.')}
+                        </p>
+                    </div>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', paddingTop: '2px', flexShrink: 0 }}>
+                        <input
+                            type="checkbox"
+                            checked={systemEmailConfig.SYSTEM_EMAIL_ENABLED}
+                            onChange={e => setSystemEmailConfig({ ...systemEmailConfig, SYSTEM_EMAIL_ENABLED: e.target.checked })}
+                            style={{ width: '16px', height: '16px' }}
+                        />
+                        <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--text-primary)' }}>
+                            {t('enterprise.systemEmail.enabled', 'Enable system email')}
+                        </span>
+                    </label>
                 </div>
                 <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '16px' }}>
-                    {t('enterprise.systemEmail.description', 'Configure SMTP settings for sending system emails such as password resets and notifications.')}
+                    {systemEmailConfig.SYSTEM_EMAIL_ENABLED
+                        ? t('enterprise.systemEmail.enabledHint', 'System emails are enabled. New email/password registrations will require email verification.')
+                        : t('enterprise.systemEmail.disabledHint', 'System emails are disabled. SMTP settings can be saved and tested, but registration email verification will be skipped.')}
                 </p>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
                     <div>

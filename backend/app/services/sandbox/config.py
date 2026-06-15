@@ -28,6 +28,12 @@ class SandboxConfig(BaseModel):
     cpu_limit: str = "0.5"
     memory_limit: str = "256m"
     allow_network: bool = True
+    allow_unsafe_fallback_when_bwrap_missing: bool = False
+    # When False (default) the local subprocess backend runs relaxed (direct exec,
+    # no bwrap/preexec) — binary CLI tools depend on this (Node SEA needs >8GB
+    # virtual memory, which RLIMIT_AS breaks). Real isolation for agent code is the
+    # remote aio-sandbox backend. Set True to opt into bwrap + preexec hardening.
+    hardened: bool = False
 
     # API sandbox options
     api_key: str = ""
@@ -104,6 +110,11 @@ class SandboxConfig(BaseModel):
             cpu_limit=get_value("cpu_limit", "0.5"),
             memory_limit=get_value("memory_limit", "256m"),
             allow_network=get_value("allow_network", False),
+            allow_unsafe_fallback_when_bwrap_missing=get_value(
+                "allow_unsafe_fallback_when_bwrap_missing",
+                False,
+            ),
+            hardened=get_value("hardened", False),
             default_timeout=get_value("default_timeout", 30),
             max_timeout=get_value("max_timeout", 60),
         )

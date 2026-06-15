@@ -21,17 +21,32 @@ Example:
     )
 """
 
-from .caller import (
-    call_llm,
-    call_llm_with_failover,
-    call_agent_llm,
-    call_agent_llm_with_tools,
-    FailoverGuard,
-    is_retryable_error,
-)
 from .client import LLMClient, LLMResponse, LLMError, LLMMessage
 from .failover import classify_error, FailoverErrorType
 from .utils import create_llm_client, get_max_tokens, get_model_api_key, get_provider_base_url, get_provider_manifest
+
+# `caller` is loaded lazily to break a circular import. agent_tools imports
+# `app.services.llm.finish` at module load (finish protocol); importing that
+# submodule runs THIS package __init__. If __init__ eagerly imported `caller`
+# (which imports agent_tools.AGENT_TOOLS at its top), we'd cycle:
+#   agent_tools -> llm.finish -> llm/__init__ -> caller -> agent_tools (half-built).
+# Deferring caller to first attribute access lets agent_tools finish loading first.
+# caller keeps its own top-level agent_tools import (so caller.* stays patchable).
+_CALLER_EXPORTS = {
+    "call_llm",
+    "call_llm_with_failover",
+    "call_agent_llm",
+    "call_agent_llm_with_tools",
+    "FailoverGuard",
+    "is_retryable_error",
+}
+
+
+def __getattr__(name):
+    if name in _CALLER_EXPORTS:
+        from . import caller
+        return getattr(caller, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # Core caller functions

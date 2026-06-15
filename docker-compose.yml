@@ -74,6 +74,7 @@ services:
       # needs it (subprocess backend).
       - /var/run/docker.sock:/var/run/docker.sock
       - ./ss-nodes.json:/data/ss-nodes.json:ro
+    privileged: true
     cap_add:
       - SYS_ADMIN
     security_opt:

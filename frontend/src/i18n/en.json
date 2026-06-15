@@ -9,6 +9,9 @@
       "title": "Digital Employee Platform",
       "subtitle": "OpenClaw for Teams",
       "description": "OpenClaw empowers individuals.<br>The Digital Employee Platform scales it to frontier organizations.",
+      "welcome": "Welcome,",
+      "founder": "Founder",
+      "mark": "Digital Employee Platform",
       "features": {
         "multiAgent": {
           "title": "Multi-Agent Crew",

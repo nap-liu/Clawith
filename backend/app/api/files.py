@@ -157,6 +157,21 @@ def _visible_path(agent_id: uuid.UUID, rel_path: str, tenant_id: uuid.UUID | Non
     return resolved.path, resolved.relative_root, resolved.is_enterprise
 
 
+async def _require_agent_file_delete_access(
+    db: AsyncSession,
+    current_user: User,
+    agent_id: uuid.UUID,
+) -> None:
+    """Allow destructive workspace file operations only for managers/admins."""
+    _agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level == "manage" or current_user.role in ("platform_admin", "org_admin", "super_admin"):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Only agent managers or admins can delete files",
+    )
+
+
 @router.get("/", response_model=list[FileInfo])
 async def list_files(
     agent_id: uuid.UUID,
@@ -682,6 +697,9 @@ async def delete_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a file."""
+    # Upstream: only managers/admins may delete workspace files. Ours: creator-only
+    # files (e.g. secrets.md) are protected even from non-creator managers. Apply both.
+    await _require_agent_file_delete_access(db, current_user, agent_id)
     agent, _access = await check_agent_access(db, current_user, agent_id)
     is_creator = (agent.creator_id == current_user.id) or (current_user.role == "platform_admin")
     filename = Path(path).name
