@@ -183,3 +183,27 @@ class SandboxMcpHost:
         # No restart or reload required — the patched sandbox image reads
         # mcp-hub.json on every request (@property instead of @cached_property).
         return name
+
+    async def deregister(self, name: str) -> None:
+        """Remove a stdio MCP entry from the sandbox hub config by its entry name.
+
+        The entry name must match the same ``[a-z0-9_-]`` pattern enforced
+        by :func:`entry_name` (the combined ``{server}__{hash}`` form is safe
+        under that same rule since ``__`` is two underscores, each in ``[a-z0-9_-]``).
+
+        Raises ``ValueError`` if *name* contains unsafe characters.
+        The delete is atomic: ``flock`` + ``jq del(.mcpServers[$n])``.
+        """
+        # Validate the full entry name with the same safe-char rule.
+        if not _SAFE_SERVER_NAME.match(name):
+            raise ValueError(
+                f"entry name {name!r} contains unsafe characters; only [a-z0-9_-] allowed"
+            )
+
+        del_cmd = (
+            f"flock {_LOCK_FILE} -c "
+            f"'jq --arg n \"{name}\" \"del(.mcpServers[\\$n])\" "
+            f"{_HUB_JSON} > {_HUB_JSON}.tmp "
+            f"&& mv {_HUB_JSON}.tmp {_HUB_JSON}'"
+        )
+        await self._exec_admin_shell(del_cmd)

@@ -78,10 +78,16 @@ async def test_stdio_discovery_uses_hub(client):
         {"name": "list_projects", "description": "List projects", "inputSchema": {}},
     ]
 
+    class _Settings:
+        SANDBOX_API_URL = "http://sandbox:8080"
+        SANDBOX_API_KEY = "test-key"
+
     with patch("app.api.mcp_servers.SandboxMcpHost") as MockHost, \
-         patch("app.api.mcp_servers.SandboxMcpHubClient") as MockHub:
+         patch("app.api.mcp_servers.SandboxMcpHubClient") as MockHub, \
+         patch("app.config.get_settings", return_value=_Settings()):
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(return_value=f"yx_{suffix}__abc123456")
+        mock_host_inst.deregister = AsyncMock(return_value=None)
         MockHost.return_value = mock_host_inst
 
         mock_hub_inst = MagicMock()
@@ -132,8 +138,13 @@ async def test_stdio_discovery_error_returns_failure(client):
         await db.refresh(srv)
         srv_id = srv.id
 
+    class _Settings:
+        SANDBOX_API_URL = "http://sandbox:8080"
+        SANDBOX_API_KEY = None
+
     with patch("app.api.mcp_servers.SandboxMcpHost") as MockHost, \
-         patch("app.api.mcp_servers.SandboxMcpHubClient"):
+         patch("app.api.mcp_servers.SandboxMcpHubClient"), \
+         patch("app.config.get_settings", return_value=_Settings()):
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(
             side_effect=Exception("sandbox unreachable")
@@ -191,3 +202,105 @@ async def test_http_server_still_uses_mcp_client(client):
 
     # stdio host must NOT have been called for http transport
     mock_host_inst.ensure_registered.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# FIX 5: test-connection returns clear error when SANDBOX_API_URL is empty
+# ---------------------------------------------------------------------------
+
+async def test_stdio_test_connection_fails_without_sandbox_url(client):
+    """test-connection on stdio server with no SANDBOX_API_URL must return
+    success=False and a clear error mentioning SANDBOX_API_URL.
+
+    FAILS before FIX 5 because the guard does not exist."""
+    token = await _make_admin_token()
+    suffix = uuid.uuid4().hex[:6]
+
+    async with async_session() as db:
+        srv = MCPServer(
+            name=f"nourl_{suffix}", display_name="nourl",
+            base_url_template="",
+            headers_template={},
+            transport="stdio",
+            command_template="npx",
+            args_template=["-y", "some-pkg"],
+            env_template={},
+        )
+        db.add(srv)
+        await db.commit()
+        await db.refresh(srv)
+        srv_id = srv.id
+
+    class _EmptySettings:
+        SANDBOX_API_URL = ""
+        SANDBOX_API_KEY = None
+
+    with patch("app.config.get_settings", return_value=_EmptySettings()):
+        r = await client.post(
+            f"/api/admin/mcp-servers/{srv_id}/test-connection",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is False, f"Expected success=False, got: {body}"
+    assert "SANDBOX_API_URL" in (body.get("error") or ""), (
+        f"Expected SANDBOX_API_URL in error message, got: {body}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# FIX 4: test-connection cleans up hub entry after list_tools (deregister)
+# ---------------------------------------------------------------------------
+
+async def test_stdio_discovery_deregisters_after_list_tools(client):
+    """test-connection must call host.deregister(entry) after list_tools completes.
+
+    FAILS before FIX 4 because deregister call is not in the stdio branch."""
+    token = await _make_admin_token()
+    suffix = uuid.uuid4().hex[:6]
+
+    async with async_session() as db:
+        srv = MCPServer(
+            name=f"dereg_{suffix}", display_name="dereg",
+            base_url_template="",
+            headers_template={},
+            transport="stdio",
+            command_template="npx",
+            args_template=["-y", "alibabacloud-devops-mcp-server"],
+            env_template={},
+        )
+        db.add(srv)
+        await db.commit()
+        await db.refresh(srv)
+        srv_id = srv.id
+
+    fake_tools = [{"name": "t", "description": "T", "inputSchema": {}}]
+
+    class _Settings:
+        SANDBOX_API_URL = "http://sandbox:8080"
+        SANDBOX_API_KEY = None
+
+    with patch("app.api.mcp_servers.SandboxMcpHost") as MockHost, \
+         patch("app.api.mcp_servers.SandboxMcpHubClient") as MockHub, \
+         patch("app.config.get_settings", return_value=_Settings()):
+        mock_host_inst = MagicMock()
+        mock_host_inst.ensure_registered = AsyncMock(return_value=f"dereg_{suffix}__abc123456")
+        mock_host_inst.deregister = AsyncMock(return_value=None)
+        MockHost.return_value = mock_host_inst
+
+        mock_hub_inst = MagicMock()
+        mock_hub_inst.list_tools = AsyncMock(return_value=fake_tools)
+        MockHub.return_value = mock_hub_inst
+
+        r = await client.post(
+            f"/api/admin/mcp-servers/{srv_id}/test-connection",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["success"] is True
+
+    # deregister must have been called with the hub entry name
+    mock_host_inst.deregister.assert_awaited_once_with(f"dereg_{suffix}__abc123456")

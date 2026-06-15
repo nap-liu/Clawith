@@ -4084,13 +4084,15 @@ async def _execute_mcp_tool(
 
                 # stdio branch: route through aio-sandbox hub instead of HTTP.
                 if cfg.transport == "stdio":
+                    _settings_now = get_settings()
+                    if not _settings_now.SANDBOX_API_URL:
+                        return f"❌ MCP tool {tool_name}: stdio MCP unavailable — SANDBOX_API_URL not configured"
                     try:
                         r_cmd = render(cfg.command_template or "", ctx, ALL_ROOTS, on_unknown="raise")
                         r_args = [render(a, ctx, ALL_ROOTS, on_unknown="raise") for a in (cfg.args_template or [])]
                         r_env = render_dict(cfg.env_template or {}, ctx, ALL_ROOTS, on_unknown="raise")
                     except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
                         return f"❌ MCP tool {tool_name}: stdio placeholder error — {e}"
-                    _settings_now = get_settings()
                     host = SandboxMcpHost(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
                     entry = await host.ensure_registered(
                         srv.name, str(agent_id), {"command": r_cmd, "args": r_args, "env": r_env}

@@ -79,12 +79,20 @@ async def _make_stdio_fixture():
         return agent.id, user.id, f"mcp_yx_{suffix}"
 
 
+class _SettingsWithSandbox:
+    """Settings stub with a non-empty SANDBOX_API_URL for tests that exercise the stdio path."""
+    SANDBOX_API_URL = "http://sandbox:8080"
+    SANDBOX_API_KEY = "test-key"
+    DEBUG = False
+
+
 async def test_stdio_routes_through_sandbox():
     """stdio transport: ensure_registered called, call_tool result returned."""
     agent_id, user_id, tool_name = await _make_stdio_fixture()
 
     with patch("app.services.agent_tools.SandboxMcpHost") as MockHost, \
-         patch("app.services.agent_tools.SandboxMcpHubClient") as MockHub:
+         patch("app.services.agent_tools.SandboxMcpHubClient") as MockHub, \
+         patch("app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()):
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(return_value="yx__abc123456789")
         MockHost.return_value = mock_host_inst
@@ -110,7 +118,8 @@ async def test_stdio_ensure_registered_receives_rendered_cfg():
     agent_id, user_id, tool_name = await _make_stdio_fixture()
 
     with patch("app.services.agent_tools.SandboxMcpHost") as MockHost, \
-         patch("app.services.agent_tools.SandboxMcpHubClient") as MockHub:
+         patch("app.services.agent_tools.SandboxMcpHubClient") as MockHub, \
+         patch("app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()):
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(return_value="yx__entry")
         MockHost.return_value = mock_host_inst
@@ -211,3 +220,37 @@ async def test_http_server_does_not_call_stdio_host():
     MockMCPClient.assert_called_once()
     # SandboxMcpHubClient must NOT have been instantiated
     MockHub.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# FIX 5: Guard empty SANDBOX_API_URL in stdio branch of _execute_mcp_tool
+# ---------------------------------------------------------------------------
+
+
+class _FakeSettings:
+    """Minimal settings stub with empty SANDBOX_API_URL."""
+    SANDBOX_API_URL = ""
+    SANDBOX_API_KEY = None
+    DEBUG = False
+
+
+async def test_stdio_returns_clear_error_when_sandbox_url_empty():
+    """_execute_mcp_tool with stdio transport and no SANDBOX_API_URL must return
+    a clear error string without attempting to connect.
+
+    FAILS before FIX 5 because the guard does not exist."""
+    agent_id, user_id, tool_name = await _make_stdio_fixture()
+
+    from app.services.agent_tools import _execute_mcp_tool
+
+    with patch("app.services.agent_tools.get_settings", return_value=_FakeSettings()):
+        result = await _execute_mcp_tool(
+            tool_name, {}, agent_id=agent_id, user_id=user_id, session_id="s1"
+        )
+
+    assert "SANDBOX_API_URL" in result, (
+        f"Expected SANDBOX_API_URL in error, got: {result!r}"
+    )
+    assert "stdio" in result.lower() or "MCP" in result, (
+        f"Expected stdio/MCP context in error, got: {result!r}"
+    )

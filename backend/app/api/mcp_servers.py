@@ -107,6 +107,10 @@ async def create_mcp_server(
         system_prompt_block=payload.system_prompt_block,
         placeholder_allowlist=payload.placeholder_allowlist,
         created_by_user_id=current_user.id,
+        transport=payload.transport,
+        command_template=payload.command_template,
+        args_template=payload.args_template,
+        env_template=payload.env_template,
     )
     db.add(srv)
     try:
@@ -205,6 +209,11 @@ async def test_mcp_server_connection(
         if transport == "stdio":
             from app.config import get_settings as _get_settings
             _s = _get_settings()
+            if not _s.SANDBOX_API_URL:
+                return TestConnectionResult(
+                    success=False,
+                    error="stdio MCP unavailable — SANDBOX_API_URL not configured",
+                )
             # Discovery context: render templates with on_unknown="keep_literal" so
             # missing agent-scoped placeholders don't block admin discovery.
             # env may contain ${agent.*} tokens — keep them as literals; the hub
@@ -233,8 +242,17 @@ async def test_mcp_server_connection(
                 {"command": r_cmd, "args": r_args, "env": r_env},
             )
             hub = SandboxMcpHubClient(_s.SANDBOX_API_URL, _s.SANDBOX_API_KEY)
-            tools = await hub.list_tools(entry)
-            tool_count = len(tools)
+            try:
+                tools = await hub.list_tools(entry)
+                tool_count = len(tools)
+            finally:
+                # Best-effort cleanup: remove the __discovery__ hub entry so it
+                # doesn't linger.  Swallow deregister errors — cleanup failure
+                # must not mask the test-connection result.
+                try:
+                    await host.deregister(entry)
+                except Exception:  # noqa: BLE001
+                    pass
 
             # Persist discovery metadata
             srv.instructions = f"stdio MCP server; {tool_count} tools discovered via hub entry {entry}"

@@ -170,3 +170,40 @@ async def test_exec_admin_shell_raises_on_exec_500(monkeypatch):
     host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
     with pytest.raises(Exception, match="500"):
         await host._exec_admin_shell("echo hello")
+
+
+# ---------------------------------------------------------------------------
+# FIX 4: deregister — hub entry cleanup
+# ---------------------------------------------------------------------------
+
+
+async def test_deregister_emits_jq_del_command(monkeypatch):
+    """deregister must emit a shell command containing jq del(.mcpServers) + flock.
+
+    FAILS before FIX 4 because deregister does not exist."""
+    calls = []
+
+    async def fake_exec(self, command: str):
+        calls.append(command)
+        return {"success": True}
+
+    monkeypatch.setattr(SandboxMcpHost, "_exec_admin_shell", fake_exec)
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    await host.deregister("yunxiao__abc123456789")
+
+    assert len(calls) == 1, "deregister should emit exactly one shell command"
+    cmd = calls[0]
+    assert "jq" in cmd, f"Expected 'jq' in command: {cmd}"
+    assert "del(.mcpServers" in cmd, f"Expected 'del(.mcpServers' in command: {cmd}"
+    assert "flock" in cmd, f"Expected 'flock' in command: {cmd}"
+    assert "mcp-hub.json" in cmd, f"Expected 'mcp-hub.json' in command: {cmd}"
+    assert "yunxiao__abc123456789" in cmd, "Entry name must appear in delete command"
+
+
+async def test_deregister_rejects_unsafe_name(monkeypatch):
+    """deregister must raise ValueError for names containing unsafe characters.
+
+    FAILS before FIX 4."""
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    with pytest.raises(ValueError, match="unsafe"):
+        await host.deregister('evil"; rm -rf /')
