@@ -16,8 +16,19 @@ role_contains() {
 
 # --- Permission fixing and privilege dropping ---
 if [ "$(id -u)" = '0' ]; then
-    echo "[entrypoint] Detected root user, fixing permissions..."
-    chown -R clawith:clawith ${AGENT_DATA_DIR}
+    echo "[entrypoint] Detected root user, checking permissions..."
+    # Conditional chown (upstream #657): skip the slow recursive chown when the
+    # data dir is already owned correctly — important once AGENT_DATA_DIR grows.
+    TARGET_DIR="${AGENT_DATA_DIR:-/data/agents}"
+    if [ -d "${TARGET_DIR}" ]; then
+        CURRENT_OWNER=$(stat -c '%U:%G' "${TARGET_DIR}" 2>/dev/null || echo "")
+        if [ "${CURRENT_OWNER}" != "clawith:clawith" ]; then
+            echo "[entrypoint] Directory ${TARGET_DIR} owner is '${CURRENT_OWNER}', fixing permissions..."
+            chown -R clawith:clawith "${TARGET_DIR}"
+        else
+            echo "[entrypoint] Directory ${TARGET_DIR} is already owned by clawith:clawith, skipping chown."
+        fi
+    fi
     # CLI-tool binaries volume — docker creates it as root on first mount.
     if [ -d /data/cli_binaries ]; then
         chown -R clawith:clawith /data/cli_binaries
