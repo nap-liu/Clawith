@@ -50,15 +50,16 @@ ADMIN_SESSION = "clawith-mcp-admin"
 _SAFE_SERVER_NAME = re.compile(r"^[a-z0-9_-]+$")
 
 
-def entry_name(server_name: str, agent_id: str, cfg: dict) -> str:
+def entry_name(server_name: str, agent_id: str, cfg: dict, cwd: str | None = None) -> str:
     """Compute a deterministic per-agent hub entry name.
 
     The name is ``{server_name}__{sha256[:12]}`` where the fingerprint covers
-    ``server_name``, ``agent_id``, and the sorted-key JSON of ``cfg``.
+    ``server_name``, ``agent_id``, the sorted-key JSON of ``cfg``, and
+    optionally ``cwd`` (so two different working directories yield different names).
 
     Properties guaranteed by construction:
     - **Deterministic**: same inputs always produce the same name.
-    - **Per-agent**: changing ``agent_id`` (or ``cfg``) changes the name.
+    - **Per-agent**: changing ``agent_id``, ``cfg``, or ``cwd`` changes the name.
     - **Safe for hub JSON keys**: only ``[a-z0-9_-]`` characters.
 
     Raises ``ValueError`` if *server_name* contains characters outside
@@ -68,7 +69,7 @@ def entry_name(server_name: str, agent_id: str, cfg: dict) -> str:
         raise ValueError(
             f"server_name {server_name!r} contains unsafe characters; only [a-z0-9_-] allowed"
         )
-    raw = f"{server_name}|{agent_id}|{json.dumps(cfg, sort_keys=True)}"
+    raw = f"{server_name}|{agent_id}|{json.dumps(cfg, sort_keys=True)}|{cwd or ''}"
     fingerprint = hashlib.sha256(raw.encode()).hexdigest()[:12]
     return f"{server_name}__{fingerprint}"
 
@@ -129,7 +130,9 @@ class SandboxMcpHost:
 
     # ------------------------------------------------------------------ Public API
 
-    async def ensure_registered(self, server_name: str, agent_id: str, cfg: dict) -> str:
+    async def ensure_registered(
+        self, server_name: str, agent_id: str, cfg: dict, cwd: str | None = None
+    ) -> str:
         """Merge a stdio MCP entry into the sandbox hub config and return its name.
 
         The entry JSON is base64-encoded before being embedded in the shell
@@ -142,19 +145,27 @@ class SandboxMcpHost:
         Idempotent: calling again with the same inputs overwrites the same key
         with the same value (no-op from the hub's perspective).
 
+        ``cwd`` — when provided — sets the working directory for the npx/stdio
+        process inside the sandbox, isolating each agent's working state under
+        its own workspace path (e.g. ``/data/agents/{agent_id}``).  It is also
+        folded into the fingerprint so two agents get distinct hub entries even
+        when their ``cfg`` is identical.
+
         Raises ``ValueError`` if *server_name* contains unsafe characters or if
         *cfg* does not contain a non-empty ``"command"`` key.
         """
         if not cfg.get("command"):
             raise ValueError("cfg must contain a non-empty 'command' key")
 
-        name = entry_name(server_name, agent_id, cfg)
-        entry = {
+        name = entry_name(server_name, agent_id, cfg, cwd=cwd)
+        entry: dict = {
             "type": "stdio",
             "command": cfg["command"],
             "args": cfg.get("args", []),
             "env": cfg.get("env", {}),
         }
+        if cwd:
+            entry["cwd"] = cwd
 
         # Encode entry JSON as base64 — secrets stay inside the blob, never
         # visible as plaintext in the shell command string (or in process lists).

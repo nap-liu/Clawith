@@ -254,3 +254,48 @@ async def test_stdio_returns_clear_error_when_sandbox_url_empty():
     assert "stdio" in result.lower() or "MCP" in result, (
         f"Expected stdio/MCP context in error, got: {result!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-agent working-path isolation: ensure_registered receives cwd
+# ---------------------------------------------------------------------------
+
+
+async def test_stdio_ensure_registered_receives_agent_workspace_cwd():
+    """ensure_registered must be called with cwd = the agent's workspace path.
+
+    The expected path is /data/agents/{agent_id} — matching the pattern used by
+    code execution (_execute_code). Patch ensure_workspace to avoid actual FS
+    access and inspect the cwd kwarg forwarded to ensure_registered.
+    """
+    from pathlib import Path
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    agent_id, user_id, tool_name = await _make_stdio_fixture()
+    expected_cwd = f"/data/agents/{agent_id}"
+
+    mock_host_inst = MagicMock()
+    mock_host_inst.ensure_registered = AsyncMock(return_value="yx__cwd_entry")
+    mock_hub_inst = MagicMock()
+    mock_hub_inst.call_tool = AsyncMock(return_value="CWD-OK")
+
+    with patch("app.services.agent_tools.SandboxMcpHost") as MockHost, \
+         patch("app.services.agent_tools.SandboxMcpHubClient") as MockHub, \
+         patch("app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()), \
+         patch("app.services.agent_tools.ensure_workspace", new=_AsyncMock(return_value=Path(expected_cwd))):
+        MockHost.return_value = mock_host_inst
+        MockHub.return_value = mock_hub_inst
+
+        from app.services.agent_tools import _execute_mcp_tool
+
+        result = await _execute_mcp_tool(
+            tool_name, {}, agent_id=agent_id, user_id=user_id, session_id="s1"
+        )
+
+    assert result == "CWD-OK"
+    mock_host_inst.ensure_registered.assert_awaited_once()
+    call_kwargs = mock_host_inst.ensure_registered.call_args
+    # cwd should be passed as a keyword argument
+    assert call_kwargs.kwargs.get("cwd") == expected_cwd, (
+        f"Expected cwd={expected_cwd!r}, got kwargs={call_kwargs.kwargs}"
+    )

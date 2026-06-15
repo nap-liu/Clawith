@@ -2,6 +2,8 @@
 
 All sandbox shell calls are mocked; no real sandbox needed.
 """
+import base64
+import json
 import pytest
 
 from app.services.sandbox_mcp_host import SandboxMcpHost, entry_name
@@ -207,3 +209,77 @@ async def test_deregister_rejects_unsafe_name(monkeypatch):
     host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
     with pytest.raises(ValueError, match="unsafe"):
         await host.deregister('evil"; rm -rf /')
+
+
+# ---------------------------------------------------------------------------
+# Per-agent working-path isolation tests
+# ---------------------------------------------------------------------------
+
+
+def test_entry_name_different_cwd_yields_different_name():
+    """Two different cwds must produce different entry names (correct-by-construction)."""
+    cfg = {"command": "npx", "args": ["-y", "pkg"], "env": {}}
+    n1 = entry_name("srv", "agentA", cfg, cwd="/data/agents/agent-1")
+    n2 = entry_name("srv", "agentA", cfg, cwd="/data/agents/agent-2")
+    assert n1 != n2
+
+
+def test_entry_name_no_cwd_matches_empty_cwd():
+    """Omitting cwd is the same as cwd=None (backward-compatible fingerprint)."""
+    cfg = {"command": "npx", "args": [], "env": {}}
+    n_none = entry_name("srv", "agentA", cfg, cwd=None)
+    n_default = entry_name("srv", "agentA", cfg)
+    assert n_none == n_default
+
+
+async def test_ensure_registered_includes_cwd_in_entry(monkeypatch):
+    """When cwd is provided, the base64-encoded entry JSON must contain the cwd field."""
+    captured_b64: list[str] = []
+
+    async def fake_exec(self, command: str):
+        # Extract the base64 blob from the shell command (first token after 'echo ')
+        for token in command.split():
+            try:
+                decoded = base64.b64decode(token).decode()
+                captured_b64.append(decoded)
+            except Exception:
+                pass
+        return {"success": True}
+
+    monkeypatch.setattr(SandboxMcpHost, "_exec_admin_shell", fake_exec)
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    await host.ensure_registered(
+        "yunxiao",
+        "agent-xyz",
+        {"command": "npx", "args": ["-y", "pkg"], "env": {"K": "v"}},
+        cwd="/data/agents/agent-xyz",
+    )
+    assert captured_b64, "No base64 blob found in shell command"
+    entry_obj = json.loads(captured_b64[0])
+    assert "cwd" in entry_obj, f"Entry JSON missing 'cwd' key: {entry_obj}"
+    assert entry_obj["cwd"] == "/data/agents/agent-xyz"
+
+
+async def test_ensure_registered_no_cwd_key_when_cwd_is_none(monkeypatch):
+    """When cwd is None (default), the entry JSON must NOT contain the 'cwd' key."""
+    captured_b64: list[str] = []
+
+    async def fake_exec(self, command: str):
+        for token in command.split():
+            try:
+                decoded = base64.b64decode(token).decode()
+                captured_b64.append(decoded)
+            except Exception:
+                pass
+        return {"success": True}
+
+    monkeypatch.setattr(SandboxMcpHost, "_exec_admin_shell", fake_exec)
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    await host.ensure_registered(
+        "yunxiao",
+        "agent-xyz",
+        {"command": "npx", "args": [], "env": {}},
+    )
+    assert captured_b64, "No base64 blob found in shell command"
+    entry_obj = json.loads(captured_b64[0])
+    assert "cwd" not in entry_obj, f"Entry JSON must not contain 'cwd' when None: {entry_obj}"

@@ -4093,9 +4093,19 @@ async def _execute_mcp_tool(
                         r_env = render_dict(cfg.env_template or {}, ctx, ALL_ROOTS, on_unknown="raise")
                     except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
                         return f"❌ MCP tool {tool_name}: stdio placeholder error — {e}"
+                    # Resolve the agent's per-agent workspace so the stdio process
+                    # runs in the same isolated directory as code execution.
+                    work_dir: str | None = None
+                    if agent_id:
+                        try:
+                            ws = await ensure_workspace(uuid.UUID(str(agent_id)))
+                            work_dir = str(ws.resolve())
+                        except Exception:
+                            pass  # non-fatal — fall back to no cwd
                     host = SandboxMcpHost(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
                     entry = await host.ensure_registered(
-                        srv.name, str(agent_id), {"command": r_cmd, "args": r_args, "env": r_env}
+                        srv.name, str(agent_id), {"command": r_cmd, "args": r_args, "env": r_env},
+                        cwd=work_dir,
                     )
                     hub = SandboxMcpHubClient(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
                     return await hub.call_tool(entry, tool.mcp_tool_name or tool_name, arguments)
