@@ -3589,10 +3589,12 @@ export default function AgentDetailPage() {
             const now = new Date();
             const diffMs = now.getTime() - d.getTime();
             const isToday = d.toDateString() === now.toDateString();
+            // Align chat timestamps with the app language (upstream #608).
+            const messageTimestampLocale = i18n.language?.startsWith('zh') ? 'zh-CN' : 'en-US';
             let timeStr = '';
-            if (isToday) timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            else if (diffMs < 7 * 86400000) timeStr = d.toLocaleDateString([], { weekday: 'short' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            else timeStr = d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            if (isToday) timeStr = d.toLocaleTimeString(messageTimestampLocale, { hour: '2-digit', minute: '2-digit' });
+            else if (diffMs < 7 * 86400000) timeStr = d.toLocaleDateString(messageTimestampLocale, { weekday: 'short' }) + ' ' + d.toLocaleTimeString(messageTimestampLocale, { hour: '2-digit', minute: '2-digit' });
+            else timeStr = d.toLocaleDateString(messageTimestampLocale, { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString(messageTimestampLocale, { hour: '2-digit', minute: '2-digit' });
             return (
                 <div className="chat-msg-timestamp">
                     {timeStr}
@@ -6574,6 +6576,7 @@ export default function AgentDetailPage() {
                                     onWorkspaceToggleLock={handleWorkspaceToggleLock}
                                     onWorkspaceEditingChange={handleWorkspaceEditingChange}
                                     onWorkspacePathDeleted={handleWorkspacePathDeleted}
+                                    canManageWorkspace={canManage}
                                     agentId={id}
                                     sessionId={wsSessionId}
                                     onLiveUpdate={(env, screenshotDataUri) => {

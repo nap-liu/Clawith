@@ -44,6 +44,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("ix_user_tenant_onboardings_tenant_id", table_name="user_tenant_onboardings")
-    op.drop_index("ix_user_tenant_onboardings_user_id", table_name="user_tenant_onboardings")
-    op.drop_table("user_tenant_onboardings")
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    
+    if "user_tenant_onboardings" in inspector.get_table_names():
+        indexes = [ix["name"] for ix in inspector.get_indexes("user_tenant_onboardings")]
+        if "ix_user_tenant_onboardings_tenant_id" in indexes:
+            op.drop_index("ix_user_tenant_onboardings_tenant_id", table_name="user_tenant_onboardings")
+        if "ix_user_tenant_onboardings_user_id" in indexes:
+            op.drop_index("ix_user_tenant_onboardings_user_id", table_name="user_tenant_onboardings")
+        op.drop_table("user_tenant_onboardings")

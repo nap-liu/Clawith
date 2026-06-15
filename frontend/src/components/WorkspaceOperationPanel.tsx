@@ -48,6 +48,7 @@ interface Props {
     liveDraft?: WorkspaceLiveDraft | null;
     locked?: boolean;
     canManageEnterpriseInfo?: boolean;
+    canManageWorkspace?: boolean;
     onSelectPath: (path: string) => void;
     onToggleLock?: () => void;
     onEditingChange?: (editing: boolean) => void;
@@ -394,6 +395,7 @@ export default function WorkspaceOperationPanel({
     liveDraft,
     locked = false,
     canManageEnterpriseInfo = false,
+    canManageWorkspace = false,
     onSelectPath,
     onToggleLock,
     onEditingChange,
@@ -443,7 +445,10 @@ export default function WorkspaceOperationPanel({
     const manualTreeScopeRef = useRef<TreeScope | null>(null);
 
     const ext = activePath ? extOf(activePath) : '';
-    const canModifyPath = (path?: string | null) => !isEnterprisePath(path) || canManageEnterpriseInfo;
+    // Workspace write/delete permission (upstream #660): enterprise paths need
+    // canManageEnterpriseInfo; all other workspace paths need canManageWorkspace.
+    const canModifyPath = (path?: string | null) =>
+        isEnterprisePath(path) ? canManageEnterpriseInfo : canManageWorkspace;
     const isWritableTreeDir = (path?: string | null) => isWritableDir(path) && canModifyPath(path);
     const canEdit = !!activePath && EDITABLE_EXTS.has(ext) && canModifyPath(activePath);
     const isHtml = ext === '.html' || ext === '.htm';

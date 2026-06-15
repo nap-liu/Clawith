@@ -199,7 +199,6 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
                 base_config = global_config or {}
                 tenant_config = {}
                 if tool_source == "builtin":
-                    base_config = {}
                     tenant_config = await get_tenant_tool_config(db, agent_tenant_id, db_tool_name, config_schema)
                 # Merge: agent overrides global
                 merged = {**base_config, **tenant_config, **(agent_config or {})}
@@ -217,7 +216,7 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
             tenant_config = {}
             if tool.source == "builtin":
                 tenant_config = await get_tenant_tool_config(db, agent_tenant_id, tool.name, tool.config_schema)
-            base_config = {} if tool.source == "builtin" else (tool.config or {})
+            base_config = tool.config or {}
             merged = {**base_config, **tenant_config}
         else:
             merged = {}
@@ -8825,6 +8824,12 @@ async def _handle_set_trigger(
                 reason=reason,
                 focus_ref=focus_ref,
             )
+            # Fix 4: Safety cap for on_message triggers —
+            # prevent infinite loops if agent creates broad watchers.
+            if ttype == "on_message":
+                trigger.max_fires = trigger.max_fires or 100
+                if not trigger.expires_at:
+                    trigger.expires_at = datetime.now(timezone.utc) + timedelta(days=7)
             db.add(trigger)
             await db.commit()
 
