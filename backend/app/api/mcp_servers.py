@@ -46,6 +46,8 @@ from app.services.placeholder_engine import (
 )
 from app.services.audit_logger import write_audit_log
 from app.services.mcp_client import MCPClient
+from app.services.sandbox_mcp_host import SandboxMcpHost
+from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
 
 router = APIRouter(prefix="/admin/mcp-servers", tags=["mcp-admin"])
@@ -197,31 +199,83 @@ async def test_mcp_server_connection(
         raise HTTPException(status_code=404, detail="MCP server not found")
     await _assert_can_edit_server(current_user, srv)
 
-    # NOTE: At this point base_url_template / headers_template / credential_template
-    # may contain ${user.email} etc. — P3 will resolve those. For P1, we treat them
-    # as literals (test-connection from admin context has no user identity).
-    client = MCPClient(
-        server_url=srv.base_url_template,
-        api_key=srv.credential_template,  # may be None
-        headers=srv.headers_template,
-    )
+    # Transport-aware routing: stdio → aio-sandbox hub; http → MCPClient (unchanged).
+    transport = getattr(srv, "transport", "http") or "http"
     try:
-        await client.list_tools()
-        # Capture & persist
-        srv.instructions = client.server_instructions
-        srv.instructions_captured_at = datetime.now(timezone.utc)
-        await db.commit()
+        if transport == "stdio":
+            from app.config import get_settings as _get_settings
+            _s = _get_settings()
+            # Discovery context: render templates with on_unknown="keep_literal" so
+            # missing agent-scoped placeholders don't block admin discovery.
+            # env may contain ${agent.*} tokens — keep them as literals; the hub
+            # will still start the process (token auth will fail, but listing tools
+            # only needs the process to boot).
+            ctx = _SYNTHETIC_CTX
+            try:
+                r_cmd = render(
+                    getattr(srv, "command_template", None) or "",
+                    ctx, ALL_ROOTS, on_unknown="keep_literal",
+                )
+                r_args = [
+                    render(a, ctx, ALL_ROOTS, on_unknown="keep_literal")
+                    for a in (getattr(srv, "args_template", None) or [])
+                ]
+                r_env = render_dict(
+                    getattr(srv, "env_template", None) or {},
+                    ctx, ALL_ROOTS, on_unknown="keep_literal",
+                )
+            except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
+                return TestConnectionResult(success=False, error=f"stdio placeholder error — {e}")
 
-        await write_audit_log(
-            action="MCP_SERVER_TEST_CONNECTION",
-            details={"server_id": str(server_id), "ok": True},
-            user_id=current_user.id,
-        )
-        return TestConnectionResult(
-            success=True,
-            instructions=client.server_instructions,
-            server_info=client.server_info,
-        )
+            host = SandboxMcpHost(_s.SANDBOX_API_URL, _s.SANDBOX_API_KEY)
+            entry = await host.ensure_registered(
+                srv.name, "__discovery__",
+                {"command": r_cmd, "args": r_args, "env": r_env},
+            )
+            hub = SandboxMcpHubClient(_s.SANDBOX_API_URL, _s.SANDBOX_API_KEY)
+            tools = await hub.list_tools(entry)
+            tool_count = len(tools)
+
+            # Persist discovery metadata
+            srv.instructions = f"stdio MCP server; {tool_count} tools discovered via hub entry {entry}"
+            srv.instructions_captured_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            await write_audit_log(
+                action="MCP_SERVER_TEST_CONNECTION",
+                details={"server_id": str(server_id), "ok": True, "transport": "stdio", "tool_count": tool_count},
+                user_id=current_user.id,
+            )
+            return TestConnectionResult(
+                success=True,
+                instructions=srv.instructions,
+                server_info={"transport": "stdio", "hub_entry": entry, "tool_count": tool_count},
+            )
+        else:
+            # NOTE: At this point base_url_template / headers_template / credential_template
+            # may contain ${user.email} etc. — P3 will resolve those. For P1, we treat them
+            # as literals (test-connection from admin context has no user identity).
+            client = MCPClient(
+                server_url=srv.base_url_template,
+                api_key=srv.credential_template,  # may be None
+                headers=srv.headers_template,
+            )
+            await client.list_tools()
+            # Capture & persist
+            srv.instructions = client.server_instructions
+            srv.instructions_captured_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            await write_audit_log(
+                action="MCP_SERVER_TEST_CONNECTION",
+                details={"server_id": str(server_id), "ok": True},
+                user_id=current_user.id,
+            )
+            return TestConnectionResult(
+                success=True,
+                instructions=client.server_instructions,
+                server_info=client.server_info,
+            )
     except Exception as e:  # noqa: BLE001 — we want to surface anything to the admin
         await write_audit_log(
             action="MCP_SERVER_TEST_CONNECTION",
