@@ -82,13 +82,10 @@ def compose_runtime_config(
         getattr(tenant_override, "args_template", None) if tenant_override else None,
         getattr(server, "args_template", None),
     )
-    env_template = (
-        _override_pick(
-            getattr(agent_override, "env_template", None) if agent_override else None,
-            getattr(tenant_override, "env_template", None) if tenant_override else None,
-            getattr(server, "env_template", None),
-        )
-        or {}
+    env_template = _override_pick(
+        getattr(agent_override, "env_template", None) if agent_override else None,
+        getattr(tenant_override, "env_template", None) if tenant_override else None,
+        getattr(server, "env_template", None),
     )
 
     return ResolvedMCPConfig(

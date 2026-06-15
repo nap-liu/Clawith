@@ -47,6 +47,10 @@ class MCPServer(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    __table_args__ = (
+        CheckConstraint("transport IN ('http', 'stdio')", name="ck_mcp_servers_transport"),
+    )
+
 
 class MCPServerOverride(Base):
     __tablename__ = "mcp_server_overrides"

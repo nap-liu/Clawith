@@ -73,4 +73,4 @@ def test_compose_http_server_no_stdio_fields():
     assert cfg.transport == "http"
     assert cfg.command_template is None
     assert cfg.args_template is None
-    assert cfg.env_template == {}
+    assert cfg.env_template is None

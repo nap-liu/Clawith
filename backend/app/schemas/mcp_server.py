@@ -26,7 +26,7 @@ class MCPServerCreate(BaseModel):
     system_prompt_block: str | None = None
     placeholder_allowlist: list[str] | None = None
     tenant_id: uuid.UUID | None = None  # platform admin can set; org admin can't override
-    transport: str = "http"
+    transport: Literal["http", "stdio"] = "http"
     command_template: str | None = None
     args_template: list[str] | None = None
     env_template: dict | None = None
@@ -55,7 +55,7 @@ class MCPServerUpdate(BaseModel):
     credential_template: str | None = None  # see docstring
     system_prompt_block: str | None = None  # explicit "" to clear
     placeholder_allowlist: list[str] | None = None  # null = don't touch, [] = clear restriction
-    transport: str | None = None
+    transport: Literal["http", "stdio"] | None = None
     command_template: str | None = None
     args_template: list[str] | None = None
     env_template: dict | None = None
@@ -127,6 +127,9 @@ class MCPServerOverridePut(BaseModel):
     url_template: str | None = None
     headers_template: dict | None = None
     credential_template: str | None = None  # plaintext on input
+    command_template: str | None = None
+    args_template: list[str] | None = None
+    env_template: dict | None = None
 
 
 class MCPServerOverrideOut(BaseModel):
