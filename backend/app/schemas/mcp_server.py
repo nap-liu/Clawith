@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class MCPServerCreate(BaseModel):
@@ -20,12 +20,26 @@ class MCPServerCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, pattern=r"^[a-z0-9_-]+$",
                       description="Slug-style identifier; lowercase, digits, _, -")
     display_name: str = Field(..., min_length=1, max_length=200)
-    base_url_template: str = Field(..., min_length=1)
+    base_url_template: str = Field(default="")
     headers_template: dict = Field(default_factory=dict)
     credential_template: str | None = None  # plaintext on input; encrypted at rest
     system_prompt_block: str | None = None
     placeholder_allowlist: list[str] | None = None
     tenant_id: uuid.UUID | None = None  # platform admin can set; org admin can't override
+    transport: str = "http"
+    command_template: str | None = None
+    args_template: list[str] | None = None
+    env_template: dict | None = None
+
+    @model_validator(mode="after")
+    def _check_transport_fields(self) -> "MCPServerCreate":
+        if self.transport == "http":
+            if not (self.base_url_template or "").strip():
+                raise ValueError("base_url_template is required for transport=http")
+        elif self.transport == "stdio":
+            if not (self.command_template or "").strip():
+                raise ValueError("command_template is required for transport=stdio")
+        return self
 
 
 class MCPServerUpdate(BaseModel):
@@ -41,6 +55,10 @@ class MCPServerUpdate(BaseModel):
     credential_template: str | None = None  # see docstring
     system_prompt_block: str | None = None  # explicit "" to clear
     placeholder_allowlist: list[str] | None = None  # null = don't touch, [] = clear restriction
+    transport: str | None = None
+    command_template: str | None = None
+    args_template: list[str] | None = None
+    env_template: dict | None = None
 
 
 class MCPServerOut(BaseModel):
@@ -60,6 +78,10 @@ class MCPServerOut(BaseModel):
     created_by_user_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
+    transport: str = "http"
+    command_template: str | None = None
+    args_template: list[str] | None = None
+    env_template: dict | None = None  # placeholder values, not rendered secrets
 
     @classmethod
     def from_orm_model(cls, server) -> "MCPServerOut":
@@ -78,6 +100,10 @@ class MCPServerOut(BaseModel):
             created_by_user_id=server.created_by_user_id,
             created_at=server.created_at,
             updated_at=server.updated_at,
+            transport=getattr(server, "transport", "http") or "http",
+            command_template=getattr(server, "command_template", None),
+            args_template=getattr(server, "args_template", None),
+            env_template=getattr(server, "env_template", None),
         )
 
 
