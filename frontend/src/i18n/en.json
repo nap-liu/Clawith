@@ -8,9 +8,9 @@
       "badge": "Open Source · Multi-Agent Collaboration",
       "title": "Digital Employee Platform",
       "subtitle": "OpenClaw for Teams",
-      "description": "OpenClaw empowers individuals.<br>The Digital Employee Platform scales it to frontier organizations.",
       "welcome": "Welcome,",
       "founder": "Founder",
+      "description": "OpenClaw empowers individuals.<br>The Digital Employee Platform scales it to frontier organizations.",
       "mark": "Digital Employee Platform",
       "features": {
         "multiAgent": {
@@ -55,18 +55,18 @@
   },
   "nav": {
     "dashboard": "Dashboard",
-    "explore": "Explore",
     "myAgents": "My Digital Employees",
     "myCreated": "Created by me",
     "companyShared": "Company shared",
     "newAgent": "New Digital Employee",
     "hire": "Hire teammate",
     "enterprise": "Company Settings",
-    "adminCompanies": "Companies",
-    "platformSettings": "Platform Settings",
     "language": "Language",
     "plaza": "Plaza",
-    "okr": "OKR"
+    "okr": "OKR",
+    "explore": "Explore",
+    "adminCompanies": "Companies",
+    "platformSettings": "Platform Settings"
   },
   "talentMarket": {
     "title": "Talent Market",
@@ -657,7 +657,6 @@
       "noInstalled": "No tools installed yet",
       "noCompany": "No company-configured tools",
       "configured": "Configured",
-      "globalTools": "Global Tools",
       "config": "️ Config",
       "testConnection": "Test Connection",
       "testing": "Testing...",
@@ -704,6 +703,7 @@
       "selectAgent": "— Select Agent —",
       "failedToCreateSession": "Failed to create session",
       "failed": "Failed",
+      "globalTools": "Global Tools",
       "collapseAll": "Collapse all",
       "expandAll": "Expand all",
       "mcpGroupDescription": "Tools from {{name}}",
@@ -1063,7 +1063,8 @@
       "disabled": "Disabled",
       "enabledHint": "Agents can use notify, task_delegate, and consult modes.",
       "disabledHint": "All agent messages use synchronous consult mode.",
-      "enableWarning": "You are about to enable the A2A Async Communication feature (Beta).\n\nThis feature allows agents to communicate asynchronously via notify and task_delegate modes.\n\nKnown potential issues:\n• Agent replies may contain internal technical terms (trigger names, focus items, etc.)\n• task_delegate callbacks may occasionally be delayed or dropped due to rate limiting\n• Token consumption will increase because each async message triggers a separate agent session\n• Agent loops may occur if triggers are not properly configured\n\nIf you encounter any issues, please return to this page and disable the toggle to restore stable synchronous behavior.\n\nAre you sure you want to enable this feature?"
+      "enableWarning": "You are about to enable the A2A Async Communication feature (Beta).\n\nThis feature allows agents to communicate asynchronously via notify and task_delegate modes.\n\nKnown potential issues:\n• Agent replies may contain internal technical terms (trigger names, focus items, etc.)\n• task_delegate callbacks may occasionally be delayed or dropped due to rate limiting\n• Token consumption will increase because each async message triggers a separate agent session\n• Agent loops may occur if triggers are not properly configured\n\nIf you encounter any issues, please return to this page and disable the toggle to restore stable synchronous behavior.\n\nAre you sure you want to enable this feature?",
+      "note": "Note: OKR daily collection itself uses the more reliable synchronous path and does not depend on this toggle."
     },
     "invites": {
       "pageTitle": "Invitation Codes",
@@ -1428,6 +1429,13 @@
           "step3": "Copy CorpID and Secret",
           "step4": "Paste CorpID and Secret below → click Save",
           "step5": "If you need SSO via WeCom: Turn on the 'SSO Login' switch below, then in WeCom configure: App Management → Webpage Authorization → Set Trusted Domain to your URL domain. Share the 'SSO Login URL' with your team."
+        },
+        "google_workspace": {
+          "step1": "Create an OAuth Web App in Google Cloud Console and enter the Client ID and Client Secret below.",
+          "step2": "Add the same Redirect URL shown below to the Authorized redirect URIs in Google Cloud Console.",
+          "step3": "SSO login will use this same OAuth configuration directly.",
+          "step4": "For organization sync, click Authorize below using a Google Workspace admin account that has Directory read permission.",
+          "step5": "Clawith will encrypt and store the admin refresh token. Subsequent scheduled syncs will automatically refresh the access token."
         }
       },
       "companyUrl": "Company URL",
@@ -1491,6 +1499,7 @@
       "preview": "Preview"
     },
     "identity": {
+      "ssoUrlEmpty": "Please enable SSO first to generate the URL",
       "title": "Organization & Directory Sync",
       "addProvider": "Add Directory Provider",
       "type": "Type",
@@ -1604,8 +1613,7 @@
       "ssoDomainPlaceholder": "e.g. acme.clawith.com",
       "ssoIpConflict": "In IP mode, only one company can enable SSO; another company is already using it.",
       "ssoTitle": "Enterprise SSO",
-      "ssoToggleFailed": "Failed to toggle SSO",
-      "ssoUrlEmpty": "Please enable SSO first to generate the URL"
+      "ssoToggleFailed": "Failed to toggle SSO"
     },
     "dangerZone": "️ Danger Zone",
     "deleteCompanyDesc": "Permanently delete this company and all its data, including agents, models, tools, and skills. This action cannot be undone.",
@@ -1659,6 +1667,12 @@
         "Australia/Sydney": "Australia/Sydney (Australian Eastern Time, UTC+10/+11)",
         "Pacific/Auckland": "Pacific/Auckland (New Zealand Time, UTC+12/+13)"
       },
+      "countryRegionTitle": "Company Country or Region",
+      "countryRegionDescription": "Used to set the company timezone and OKR non-workday rules. Current timezone: {{timezone}}",
+      "searchPlaceholder": "Search country, code, or timezone",
+      "collapseRegionList": "Collapse region list",
+      "expandRegionList": "Expand region list",
+      "noMatch": "No matching country or region",
       "noTenant": "No company selected. Please refresh the page or contact support."
     },
     "users": {
@@ -1781,6 +1795,17 @@
     "saving": "Saving…",
     "cancel": "Cancel",
     "confirm": "Confirm",
+    "confirmActions": {
+      "deleteTitle": "Delete Confirmation",
+      "removeTitle": "Remove Confirmation",
+      "disableTitle": "Disable Confirmation",
+      "forceDelete": "Force Delete",
+      "confirmLabel": "Confirm",
+      "cancelLabel": "Cancel",
+      "deleteLabel": "Delete",
+      "removeLabel": "Remove",
+      "disableLabel": "Disable"
+    },
     "delete": "Delete",
     "search": "Search",
     "loading": "Loading...",
@@ -1789,7 +1814,6 @@
     "close": "Close",
     "edit": "Edit",
     "back": "Back",
-    "next": "Next",
     "yes": "Yes",
     "no": "No",
     "all": "All",
@@ -1816,12 +1840,52 @@
     "collapseSidebar": "Collapse Sidebar",
     "expandSidebar": "Expand Sidebar",
     "deleting": "Deleting...",
-    "clear": "Clear",
     "create": "Create",
+    "noPermission": "You do not have permission to access this page.",
+    "status": {
+      "saved": "Saved",
+      "creating": "Creating...",
+      "exporting": "Exporting...",
+      "uploading": "Uploading...",
+      "analyzing": "Analyzing..."
+    },
+    "file": {
+      "maxFilesWarning": "Maximum {{count}} files can be attached",
+      "imageUploaded": "[Image uploaded: {{name}}...]",
+      "analyzeFiles": "Please analyze these files",
+      "filesImported": "Imported {{count}} files",
+      "skillInstalled": "Installed \"{{name}}\"",
+      "skillImported": "Imported \"{{name}}\"",
+      "triggersCount": "{{count}} triggers"
+    },
+    "model": {
+      "connectivityTest": "Connectivity Test",
+      "connectivityTestFailed": "Connectivity test failed"
+    },
+    "dialog": {
+      "deleteSession": "Delete Session",
+      "deleteSessionConfirm": "Are you sure you want to delete this session?",
+      "deleteTool": "Delete Tool",
+      "deleteToolConfirm": "Are you sure you want to delete {{name}}?",
+      "removeTool": "Remove Tool",
+      "removeToolConfirm": "Are you sure you want to remove this tool?",
+      "deleteModel": "Delete Model",
+      "deleteConfig": "Delete Configuration",
+      "deleteConfigConfirm": "Are you sure you want to delete this configuration?",
+      "disableCompany": "Disable Company",
+      "disableCompanyConfirm": "Are you sure you want to disable this company?",
+      "partialImportFailed": "Partial Import Failed",
+      "partialImportSuccess": "Imported {{success}}/{{total}} tools"
+    },
+    "toast": {
+      "collapseDetails": "Collapse Details",
+      "viewDetails": "View Details"
+    },
+    "next": "Next",
+    "clear": "Clear",
     "disabled": "Disabled",
     "enabled": "Enabled",
     "minutes": "min",
-    "noPermission": "You do not have permission to access this page.",
     "saveFailed": "Save failed",
     "saved": "Saved",
     "switchLanguage": "Switch language"
@@ -2127,6 +2191,137 @@
     "cannotDeleteDefault": "Cannot delete the default company",
     "leaveBlankDefault": "Leave blank to use global default"
   },
+  "postHire": {
+    "title": "Configure new teammate",
+    "visibility": "Visibility",
+    "visibilityCompanyTitle": "Everyone at the company",
+    "visibilityCompanyHint": "Everyone in the company can use this agent",
+    "visibilityOnlyMeTitle": "Only me",
+    "visibilityOnlyMeHint": "Only you can use it; you can share later in Settings",
+    "visibilityCustomTitle": "Custom",
+    "visibilityCustomHint": "Start with creator access, then choose platform users in Settings",
+    "model": "Preferred model",
+    "defaultSuffix": "default",
+    "createOnly": "Just create",
+    "chatNow": "Chat now",
+    "creating": "Creating...",
+    "noModelButtonHint": "Enable at least one model in company settings before creating a teammate from a template.",
+    "noModelError": "No company model is enabled yet. Configure a model before creating a teammate from a template.",
+    "modelRequired": "Choose a model",
+    "noModelsTitle": "No enabled model yet",
+    "noModelsAdminHint": "Enable at least one company model before creating a teammate from a template.",
+    "noModelsMemberHint": "Ask a company admin to enable a model first.",
+    "configureModels": "Configure models",
+    "createFailed": "Failed to create agent",
+    "noModels": "No enabled models — ask an admin to add one"
+  },
+  "agentDetail": {
+    "errorTitle": "Something went wrong",
+    "errorMessage": "An unexpected error occurred while loading this page.",
+    "reloadPage": "Reload Page"
+  },
+  "oauth": {
+    "selectCompany": "Select Company",
+    "selectCompanyHint": "This account is linked to multiple companies. Please select one to sign in:",
+    "completingSignIn": "Completing sign-in...",
+    "missingParams": "Missing OAuth callback parameters",
+    "oauthLoginFailed": "OAuth login failed",
+    "loginFailed": "Login failed",
+    "loginFailedTitle": "OAuth Login Failed"
+  },
+  "takeControl": {
+    "acquiringControl": "Acquiring control...",
+    "inControl": "You are in control. Click or drag on the screenshot.",
+    "dragToRelease": "Drag to release...",
+    "dragging": "Dragging ({{fromX}},{{fromY}}) -> ({{toX}},{{toY}})...",
+    "dragComplete": "Drag complete",
+    "dragFailed": "Drag failed: {{message}}",
+    "clickingAt": "Clicking at ({{x}}, {{y}})...",
+    "clickedAt": "Clicked at ({{x}}, {{y}})",
+    "clickFailed": "Click failed: {{message}}",
+    "typing": "Typing: \"{{text}}\"",
+    "textSent": "Text sent",
+    "typeFailed": "Type failed: {{message}}",
+    "pressing": "Pressing: {{keys}}",
+    "pressed": "Pressed: {{keys}}",
+    "pressFailed": "Key press failed: {{message}}",
+    "exportingCookies": "Exporting cookies...",
+    "loginComplete": "Login complete! {{count}} cookies saved.",
+    "sessionUnlocked": "Session unlocked (no cookies exported).",
+    "unlockFailed": "Unlock failed: {{message}}",
+    "canceling": "Canceling...",
+    "lockFailed": "Failed to acquire control: {{message}}",
+    "title": "Human Control",
+    "exitWithoutSaving": "Exit without saving",
+    "connecting": "Connecting to session...",
+    "typeToSend": "Type text to send...",
+    "browserSession": "Browser session",
+    "saveLoginStateTo": "Save login state to",
+    "exit": "Exit",
+    "saveLoginState": "Save Login State",
+    "sendText": "Send text"
+  },
+  "customAgentModal": {
+    "noModelButtonHint": "Enable at least one model in company settings before creating a platform-hosted teammate.",
+    "nameRequired": "Name is required",
+    "noModelError": "No company model is enabled yet. Configure a model or switch to External agent.",
+    "modelRequired": "Choose a model",
+    "nativeTitle": "Create custom teammate",
+    "externalTitle": "Link external agent",
+    "nativeSubtitle": "Start with the essentials; tune the rest in settings later.",
+    "externalSubtitle": "Create a Clawith connection for an externally running agent.",
+    "nativeMode": "Platform hosted",
+    "externalMode": "External agent",
+    "name": "Name",
+    "namePlaceholderNative": "e.g. Customer researcher",
+    "namePlaceholderExternal": "e.g. OpenClaw research assistant",
+    "role": "Role",
+    "rolePlaceholder": "Describe what this teammate is responsible for.",
+    "visibility": "Visibility",
+    "visibilityCompany": "Everyone at the company",
+    "visibilityCompanyHint": "Everyone in the company can use this agent",
+    "visibilityOnlyMe": "Only me",
+    "visibilityOnlyMeHint": "Only you can use it; you can share it later",
+    "visibilityCustom": "Custom",
+    "visibilityCustomHint": "Start private, then choose members in settings",
+    "model": "Preferred model",
+    "modelFallback": "Model",
+    "defaultModel": "default",
+    "createOnly": "Just create",
+    "creating": "Creating...",
+    "chatNow": "Chat now",
+    "createConnection": "Create connection",
+    "noModelsTitle": "No enabled model yet",
+    "noModelsAdminHint": "Enable at least one company model before creating a platform-hosted teammate.",
+    "noModelsMemberHint": "Ask a company admin to enable a model first.",
+    "noModelsExternalHint": "If you are linking an externally running agent, switch to External agent.",
+    "configureModels": "Configure models",
+    "creationFailed": "Creation failed",
+    "externalCreated": "Connection created",
+    "externalCreatedDesc": "Send the setup instruction below to the external agent so it can sync with Clawith through the gateway.",
+    "gatewayKeyEmbedded": "The API key is included in the setup instruction",
+    "copyKey": "Copy key",
+    "noKeyReturned": "No API key was returned. Open the agent page and generate one there.",
+    "enterAgent": "Open agent"
+  },
+  "errorBoundary": {
+    "title": "Oops, something went wrong.",
+    "description": "An unexpected error occurred. You can try refreshing the page or contact support if the problem persists.",
+    "errorDetails": "Error Details",
+    "refreshPage": "Refresh Page"
+  },
+  "sso": {
+    "missingSessionId": "Missing session ID",
+    "failedToLoadConfig": "Failed to load login configuration",
+    "sessionExpired": "SSO session expired",
+    "redirectingToLogin": "Redirecting to secure login...",
+    "error": "Error",
+    "completingLogin": "Completing login...",
+    "loginTitle": "Login to Digital Employee Platform",
+    "selectLoginMethod": "Select your login method",
+    "loginWith": "Login with {{provider}}",
+    "noProviders": "No SSO providers configured."
+  },
   "users": {
     "newPassword": "New Password",
     "newPasswordPlaceholder": "Leave blank to keep current password",
@@ -2137,18 +2332,5 @@
     "companyObjectives": "Company Objectives",
     "memberObjectives": "Member Objectives",
     "title": "OKR"
-  },
-  "postHire": {
-    "chatNow": "Chat now",
-    "createOnly": "Just create",
-    "defaultSuffix": "default",
-    "model": "Preferred model",
-    "noModels": "No enabled models — ask an admin to add one",
-    "title": "Configure new teammate",
-    "visibility": "Visibility",
-    "visibilityCompanyHint": "Everyone in the company can use this agent",
-    "visibilityCompanyTitle": "Everyone at the company",
-    "visibilityOnlyMeHint": "Only you can use it; you can share later in Settings",
-    "visibilityOnlyMeTitle": "Only me"
   }
 }

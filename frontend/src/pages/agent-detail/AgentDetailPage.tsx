@@ -2147,7 +2147,10 @@ export default function AgentDetailPage() {
     const [scopeDropdownOpen, setScopeDropdownOpen] = useState(false);
     const scopeDropdownRef = useRef<HTMLDivElement>(null);
     const [historyMsgs, setHistoryMsgs] = useState<any[]>([]);
-    const [historyOffset, setHistoryOffset] = useState(0);
+    // Cursor pagination (aligns with the backend `before` timestamp cursor on
+    // GET /agents/{id}/sessions/{id}/messages): the created_at of the oldest
+    // message currently loaded. Older pages are fetched with before=this.
+    const [historyOldestTs, setHistoryOldestTs] = useState<string | null>(null);
     const [historyHasMore, setHistoryHasMore] = useState(true);
     const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
     const HISTORY_PAGE_SIZE = 20;
@@ -2387,7 +2390,7 @@ export default function AgentDetailPage() {
         pendingHistoryInitialScrollRef.current = !writable;
         setChatMessages([]);
         setHistoryMsgs([]);
-        setHistoryOffset(0);
+        setHistoryOldestTs(null);
         setHistoryHasMore(true);
         setHistoryLoadingMore(false);
         setIsStreaming(runtimeState.isStreaming);
@@ -2404,7 +2407,7 @@ export default function AgentDetailPage() {
         const loadSeq = ++sessionLoadSeqRef.current;
         try {
             const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}&offset=0`, {
+            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}`, {
                 headers: { Authorization: `Bearer ${tkn}` },
                 signal: controller.signal,
             });
@@ -2428,6 +2431,9 @@ export default function AgentDetailPage() {
                 ...(m.participant_id && { participant_id: m.participant_id }),
             }));
             setHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
+            // Backend returns the page oldest-first, so msgs[0] is the oldest
+            // loaded row — seed the cursor for the next (older) page.
+            setHistoryOldestTs(msgs.length ? msgs[0].created_at : null);
 
             if (writable) {
                 setChatMessages(preParsed);
@@ -3470,13 +3476,15 @@ export default function AgentDetailPage() {
 
     const loadMoreHistoryMessages = useCallback(async () => {
         if (historyLoadingMore || !historyHasMore || !activeSession || !id) return;
+        // Cursor pagination: without a cursor we cannot page older, and an empty
+        // `before` would re-fetch the newest page → stop instead of looping.
+        if (!historyOldestTs) { setHistoryHasMore(false); return; }
         const sess = activeSession;
         const targetAgentId = id;
         setHistoryLoadingMore(true);
         try {
             const tkn = localStorage.getItem('token');
-            const newOffset = historyOffset + HISTORY_PAGE_SIZE;
-            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}&offset=${newOffset}`, {
+            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}&before=${encodeURIComponent(historyOldestTs)}`, {
                 headers: { Authorization: `Bearer ${tkn}` },
             });
             if (!res.ok) return;
@@ -3496,7 +3504,8 @@ export default function AgentDetailPage() {
             const el = historyContainerRef.current;
             const oldScrollHeight = el?.scrollHeight ?? 0;
             setHistoryMsgs(prev => [...preParsed, ...prev]);
-            setHistoryOffset(newOffset);
+            // Advance the cursor to the oldest row of this (older) page.
+            setHistoryOldestTs(msgs[0]?.created_at ?? historyOldestTs);
             setHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
             // Restore scroll position after new messages are prepended
             requestAnimationFrame(() => {
@@ -3510,7 +3519,7 @@ export default function AgentDetailPage() {
         } finally {
             setHistoryLoadingMore(false);
         }
-    }, [historyLoadingMore, historyHasMore, activeSession, id, historyOffset]);
+    }, [historyLoadingMore, historyHasMore, activeSession, id, historyOldestTs]);
 
     const handleHistoryScroll = () => {
         const el = historyContainerRef.current;
