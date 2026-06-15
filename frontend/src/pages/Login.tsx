@@ -30,8 +30,11 @@ export default function Login() {
     const [tenant, setTenant] = useState<any>(null);
     const [resolving, setResolving] = useState(true);
     const [ssoProviders, setSsoProviders] = useState<any[]>([]);
+    const [oauthProviders, setOauthProviders] = useState<any[]>([]);
     const [ssoLoading, setSsoLoading] = useState(false);
+    const [oauthLoading, setOauthLoading] = useState(false);
     const [ssoError, setSsoError] = useState('');
+    const [oauthError, setOauthError] = useState('');
     const [tenantSelection, setTenantSelection] = useState<any[] | null>(null);
 
     const [form, setForm] = useState({
@@ -80,6 +83,34 @@ export default function Login() {
             .catch(() => { })
             .finally(() => setResolving(false));
     }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+        if (isRegister) {
+            setOauthProviders([]);
+            setOauthError('');
+            return;
+        }
+
+        setOauthLoading(true);
+        setOauthError('');
+        fetchJson<any[]>('/auth/providers')
+            .then(providers => {
+                if (cancelled) return;
+                setOauthProviders((providers || []).filter(p => ['google', 'github'].includes(p.provider_type)));
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setOauthProviders([]);
+                setOauthError('Failed to load social login providers.');
+            })
+            .finally(() => {
+                if (cancelled) return;
+                setOauthLoading(false);
+            });
+
+        return () => { cancelled = true; };
+    }, [isRegister]);
 
     useEffect(() => {
         let cancelled = false;
@@ -274,6 +305,22 @@ export default function Login() {
         google_workspace: { label: 'Google', icon: '/google.svg' },
     };
 
+    const startOAuthLogin = async (providerType: string) => {
+        try {
+            const redirectUri = `${window.location.origin}/oauth/callback/${providerType}`;
+            const res = await fetchJson<{ authorization_url: string }>(
+                `/auth/${providerType}/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`
+            );
+            if (res?.authorization_url) {
+                window.location.href = res.authorization_url;
+            }
+        } catch (err: any) {
+            setError(err.message || 'Failed to start social login');
+        }
+    };
+
+    const shouldShowGlobalOAuth = !tenant?.sso_enabled && !isRegister;
+
     return (
         <div className="login-page">
             {/* ── Left: Branding Panel ── */}
@@ -438,6 +485,63 @@ export default function Login() {
                                 {t('auth.or', 'or')}
                                 <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
                             </div>
+                        </div>
+                    )}
+
+                    {shouldShowGlobalOAuth && (
+                        <div style={{ marginBottom: '24px' }}>
+                            {oauthLoading && (
+                                <div style={{ textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>
+                                    Loading social login providers...
+                                </div>
+                            )}
+
+                            {!oauthLoading && oauthProviders.length > 0 && (
+                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px' }}>
+                                    {oauthProviders.map(p => {
+                                        const meta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' };
+                                        return (
+                                            <button
+                                                key={p.provider_type}
+                                                className="login-submit"
+                                                type="button"
+                                                style={{
+                                                    background: 'var(--bg-secondary)',
+                                                    color: 'var(--text-primary)',
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    justifyContent: 'center',
+                                                    gap: '10px',
+                                                    border: '1px solid var(--border-subtle)',
+                                                }}
+                                                onClick={() => startOAuthLogin(p.provider_type)}
+                                            >
+                                                <span style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--bg-tertiary)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 10 }}>
+                                                    {(meta.label || '').slice(0, 1).toUpperCase()}
+                                                </span>
+                                                Continue with {meta.label || p.name || p.provider_type}
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            )}
+
+                            {!oauthLoading && oauthProviders.length === 0 && oauthError && (
+                                <div style={{ textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>
+                                    {oauthError}
+                                </div>
+                            )}
+
+                            {!oauthLoading && oauthProviders.length > 0 && (
+                                <div style={{
+                                    display: 'flex', alignItems: 'center', gap: '12px',
+                                    margin: '20px 0', color: 'var(--text-tertiary)', fontSize: '11px'
+                                }}>
+                                    <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
+                                    {t('auth.or', 'or')}
+                                    <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
+                                </div>
+                            )}
                         </div>
                     )}
 

@@ -925,7 +925,7 @@ async def oauth_callback(
 
     try:
         # Exchange code for token
-        token_data = await auth_provider.exchange_code_for_token(data.code)
+        token_data = await auth_provider.exchange_code_for_token(data.code, data.redirect_uri)
         access_token = token_data.get("access_token")
         if not access_token:
             raise HTTPException(status_code=400, detail="Failed to get access token from provider")

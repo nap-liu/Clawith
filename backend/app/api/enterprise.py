@@ -823,6 +823,7 @@ async def _regenerate_all_sso_domains(db: AsyncSession):
 @router.get("/identity-providers", response_model=list[IdentityProviderOut])
 async def list_identity_providers(
     tenant_id: str | None = None,
+    global_only: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -835,16 +836,15 @@ async def list_identity_providers(
     query = select(IdentityProvider).order_by(IdentityProvider.created_at.desc())
     tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
 
-    # Require tenant context
-    if not tid:
-        if current_user.role == "platform_admin":
-            # Admin without tenant_id filter sees all
-            pass
-        else:
-            raise HTTPException(status_code=400, detail="tenant_id is required for identity providers")
-    else:
+    if global_only:
+        if current_user.role != "platform_admin":
+            raise HTTPException(status_code=403, detail="Only platform admin can access global identity providers")
+        query = query.where(IdentityProvider.tenant_id.is_(None))
+    elif tid:
         import uuid as _uuid
         query = query.where(IdentityProvider.tenant_id == _uuid.UUID(tid))
+    elif current_user.role != "platform_admin":
+        raise HTTPException(status_code=400, detail="tenant_id is required for identity providers")
 
     result = await db.execute(query)
     providers = []
@@ -960,6 +960,11 @@ def validate_provider_config(provider_type: str, config: dict):
     """Validate identity provider config. Specific field checks are handled by the frontend."""
     if not isinstance(config, dict):
         raise HTTPException(status_code=422, detail="Configuration must be a JSON object")
+    if provider_type in {"google", "github"}:
+        client_id = config.get("client_id") or config.get("app_id")
+        client_secret = config.get("client_secret") or config.get("app_secret")
+        if not client_id or not client_secret:
+            raise HTTPException(status_code=422, detail=f"{provider_type} requires client_id and client_secret")
     return
 
 
@@ -1007,7 +1012,7 @@ async def create_identity_provider(
             # Validate they can only manage their own tenant
             raise HTTPException(status_code=403, detail="Can only create providers for your own tenant")
 
-    if not tid:
+    if not tid and not (current_user.role == "platform_admin" and data.provider_type in {"google", "github"}):
         raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
         
     if data.sso_login_enabled:
