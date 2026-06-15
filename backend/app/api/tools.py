@@ -56,8 +56,8 @@ def _agent_visible_tool_clause(agent_tenant_id: uuid.UUID | None, assignments: d
 
     Visibility rules:
     - builtin tools are global platform capabilities
-    - admin tools belong only to the agent's company
-    - agent-installed tools are visible only when explicitly assigned
+    - admin tools belong only to the agent's company or are platform-wide (tenant_id is NULL)
+    - explicitly assigned tools are always visible
     """
     clauses = [Tool.source == "builtin"]
     # Platform-level admin tools (tenant_id IS NULL) are visible to all tenants;
@@ -71,7 +71,7 @@ def _agent_visible_tool_clause(agent_tenant_id: uuid.UUID | None, assignments: d
 
     assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
     if assigned_tool_ids:
-        clauses.append((Tool.source == "agent") & Tool.id.in_(assigned_tool_ids))
+        clauses.append(Tool.id.in_(assigned_tool_ids))
 
     return or_(*clauses)
 
@@ -82,6 +82,8 @@ def _tool_record_visible_to_agent(
     assignments: dict[str, AgentTool],
 ) -> bool:
     """Pure visibility check mirroring _agent_visible_tool_clause."""
+    if str(tool.id) in assignments:
+        return True
     if tool.source == "builtin":
         return True
     if tool.source == "admin":
@@ -555,8 +557,14 @@ async def update_agent_tools(
                 _agent_visible_tool_clause(agent_obj.tenant_id, assignments),
             )
         )
-        if not tool_r.scalar_one_or_none():
+        tool_obj = tool_r.scalar_one_or_none()
+        if not tool_obj:
             raise HTTPException(status_code=404, detail="Tool not found")
+
+        # System-category tools (e.g. finish) are protocol-level and
+        # must always remain enabled — reject any attempt to disable them.
+        if tool_obj.category == "system" and not u.enabled:
+            continue
 
         # Upsert
         result = await db.execute(

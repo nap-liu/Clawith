@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import time
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from loguru import logger
@@ -16,6 +17,7 @@ from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
+from app.services.storage import store_agent_upload
 
 router = APIRouter(tags=["slack"])
 
@@ -320,17 +322,12 @@ async def slack_event_webhook(
     session_conv_id = str(sess.id)
 
     # Handle file attachments: save to workspace/uploads/ and send ack
-    from app.config import get_settings as _gs
     import asyncio as _asyncio
     import random as _random
-    from pathlib import Path as _Path
     import httpx as _httpx
     from datetime import datetime, timezone
     from app.api.feishu import _FILE_ACK_MESSAGES
     _file_user_messages = []
-    _settings = _gs()
-    _upload_dir = _Path(_settings.AGENT_DATA_DIR) / str(agent_id) / "workspace" / "uploads"
-    _upload_dir.mkdir(parents=True, exist_ok=True)
     _bot_token = config.app_secret or ""
     for _sf in slack_files:
         _fname = _sf.get("name") or _sf.get("title") or f"slack_file_{_sf.get('id', 'unk')}.bin"
@@ -345,8 +342,13 @@ async def slack_event_webhook(
                 _ct = _r.headers.get("content-type", "")
                 if "text/html" in _ct or _r.content[:15].lower().startswith(b"<!doctype html"):
                     raise ValueError(f"Got HTML response (SSO redirect) — Slack App needs 'files:read' scope. Content-Type: {_ct}")
-                (_upload_dir / _fname).write_bytes(_r.content)
-            _file_user_messages.append(f"workspace/uploads/{_fname}")
+                _, _workspace_path, _ = await store_agent_upload(
+                    agent_id,
+                    _fname,
+                    _r.content,
+                    content_type=_ct or None,
+                )
+            _file_user_messages.append(_workspace_path)
             logger.info(f"[Slack] Saved file {_fname} ({len(_r.content)} bytes)")
         except Exception as _e:
             logger.error(f"[Slack] Failed to download file {_fname}: {_e}")

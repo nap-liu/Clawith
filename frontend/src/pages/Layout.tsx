@@ -1178,7 +1178,7 @@ export default function Layout() {
                 <div className="sidebar-bottom">
                     <div className="sidebar-footer">
                         <div className="sidebar-footer-controls" style={{
-                            display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '8px',
+                            display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '8px', width: '100%',
                         }}>
                             <button className="btn btn-ghost" onClick={toggleTheme} style={{
                                 padding: '4px 8px', display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1200,6 +1200,13 @@ export default function Layout() {
                                         lineHeight: 1,
                                     }}>{(unreadCount as number) > 99 ? '99+' : unreadCount}</span>
                                 )}
+                            </button>
+                            <button className="btn btn-ghost sidebar-collapse-btn" onClick={toggleSidebar} style={{
+                                padding: '4px 8px', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                color: 'var(--text-tertiary)',
+                                marginLeft: isSidebarCollapsed ? undefined : 'auto',
+                            }} title={isSidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}>
+                                {isSidebarCollapsed ? SidebarIcons.expand : SidebarIcons.collapse}
                             </button>
                         </div>
                         <div ref={accountMenuRef} style={{ position: 'relative' }}>

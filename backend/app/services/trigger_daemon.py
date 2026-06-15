@@ -1,13 +1,8 @@
-"""Trigger Daemon — evaluates all agent triggers in a single background loop.
+"""Trigger daemon orchestrator.
 
-Replaces the separate heartbeat, scheduler, and supervision reminder services
-with a unified trigger evaluation engine. Runs as an asyncio background task.
-
-Every 15 seconds:
-  1. Load all enabled triggers from DB
-  2. Evaluate each trigger (cron/once/interval/poll/on_message/webhook)
-  3. Group fired triggers by agent_id (30s dedup window)
-  4. Invoke each agent once with all its fired triggers as context
+Trigger-specific evaluation and invocation behavior now lives under
+`app.services.trigger_runtime`. This module owns the main loop, dedup window,
+and distributed claim/invoke flow.
 """
 
 import asyncio
@@ -22,8 +17,23 @@ from loguru import logger
 from sqlalchemy import select
 
 from app.database import async_session
-from app.models.trigger import AgentTrigger
 from app.models.agent import Agent
+from app.models.trigger import AgentTrigger
+from app.services.trigger_runtime.evaluator import (
+    evaluate_trigger as evaluate_trigger_runtime,
+    handle_okr_collection_trigger as handle_okr_collection_trigger_runtime,
+    handle_okr_report_trigger as handle_okr_report_trigger_runtime,
+    mark_trigger_fired as mark_trigger_fired_runtime,
+    mark_trigger_skipped as mark_trigger_skipped_runtime,
+    should_skip_non_workday as should_skip_non_workday_runtime,
+)
+from app.services.trigger_runtime.invoker import invoke_agent_for_triggers as invoke_agent_for_triggers_runtime
+from app.services.trigger_runtime import (
+    claim_ready_trigger_invocations,
+    enqueue_due_trigger,
+    mark_trigger_executions_completed,
+    mark_trigger_executions_failed,
+)
 
 TICK_INTERVAL = 15  # seconds
 DEDUP_WINDOW = 30   # seconds — same agent won't be invoked twice within this window
@@ -45,147 +55,24 @@ def _cleanup_stale_invoke_cache():
 
 
 async def _should_skip_non_workday(trigger: AgentTrigger, local_now: datetime) -> bool:
-    """Skip OKR daily report triggers on company non-workdays when configured."""
-    if trigger.name != "daily_okr_collection":
-        return False
-
-    from app.models.okr import OKRSettings
-    from app.models.tenant import Tenant
-    from app.services.business_calendar import is_non_workday
-
-    async with async_session() as db:
-        result = await db.execute(
-            select(Agent.tenant_id)
-            .where(Agent.id == trigger.agent_id)
-        )
-        tenant_id = result.scalar_one_or_none()
-        if not tenant_id:
-            return False
-
-        settings_result = await db.execute(
-            select(OKRSettings.daily_report_skip_non_workdays)
-            .where(OKRSettings.tenant_id == tenant_id)
-        )
-        skip_enabled = settings_result.scalar_one_or_none()
-        if skip_enabled is False:
-            return False
-
-        tenant_result = await db.execute(
-            select(Tenant.country_region).where(Tenant.id == tenant_id)
-        )
-        country_region = tenant_result.scalar_one_or_none()
-
-    return is_non_workday(local_now.date(), country_region)
+    return await should_skip_non_workday_runtime(trigger, local_now)
 
 
 async def _mark_trigger_skipped(trigger_id: uuid.UUID, now: datetime) -> None:
-    """Advance a cron trigger without invoking the agent."""
-    try:
-        async with async_session() as db:
-            result = await db.execute(select(AgentTrigger).where(AgentTrigger.id == trigger_id))
-            trigger = result.scalar_one_or_none()
-            if trigger:
-                trigger.last_fired_at = now
-                await db.commit()
-    except Exception as e:
-        logger.warning(f"Failed to mark skipped trigger {trigger_id}: {e}")
+    await mark_trigger_skipped_runtime(trigger_id, now)
 
 
 async def _mark_trigger_fired(trigger_id: uuid.UUID, now: datetime) -> None:
-    """Persist fire metadata for a trigger that was already handled."""
-    try:
-        async with async_session() as db:
-            result = await db.execute(select(AgentTrigger).where(AgentTrigger.id == trigger_id))
-            trigger = result.scalar_one_or_none()
-            if trigger:
-                trigger.last_fired_at = now
-                trigger.fire_count += 1
-                if trigger.type == "once":
-                    trigger.is_enabled = False
-                if trigger.max_fires and trigger.fire_count >= trigger.max_fires:
-                    trigger.is_enabled = False
-                await db.commit()
-    except Exception as e:
-        logger.warning(f"Failed to mark fired trigger {trigger_id}: {e}")
+    await mark_trigger_fired_runtime(trigger_id, now)
 
 
 async def _handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> bool:
-    """Handle company-level OKR report generation without waking the agent."""
-    if trigger.name not in {"daily_okr_report", "weekly_okr_report", "monthly_okr_report"}:
-        return False
-
-    from zoneinfo import ZoneInfo
-    from app.models.okr import OKRSettings
-    from app.services.okr_reporting import (
-        generate_company_daily_report,
-        generate_company_monthly_report,
-        generate_company_weekly_report,
-    )
-    from app.services.timezone_utils import get_agent_timezone
-
-    async with async_session() as db:
-        agent_result = await db.execute(select(Agent.tenant_id).where(Agent.id == trigger.agent_id))
-        tenant_id = agent_result.scalar_one_or_none()
-        if not tenant_id:
-            return True
-
-        settings_result = await db.execute(select(OKRSettings).where(OKRSettings.tenant_id == tenant_id))
-        settings = settings_result.scalar_one_or_none()
-        if not settings or not settings.enabled:
-            return True
-
-    tz_name = await get_agent_timezone(trigger.agent_id)
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    local_today = now.astimezone(tz).date()
-
-    if trigger.name == "daily_okr_report":
-        await generate_company_daily_report(tenant_id, local_today - timedelta(days=1))
-    elif trigger.name == "weekly_okr_report":
-        previous_week_anchor = local_today - timedelta(days=7)
-        week_start = previous_week_anchor - timedelta(days=previous_week_anchor.weekday())
-        await generate_company_weekly_report(tenant_id, week_start)
-    elif trigger.name == "monthly_okr_report":
-        previous_month_end = local_today.replace(day=1) - timedelta(days=1)
-        await generate_company_monthly_report(tenant_id, previous_month_end)
-
-    await _mark_trigger_fired(trigger.id, now)
-    logger.info(f"[Trigger] Auto-generated OKR report for trigger {trigger.name}")
-    return True
+    return await handle_okr_report_trigger_runtime(trigger, now)
 
 
 async def _handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) -> bool:
-    """Handle deterministic OKR daily collection without relying on a free-form LLM plan."""
-    if trigger.name != "daily_okr_collection":
-        return False
+    return await handle_okr_collection_trigger_runtime(trigger, now)
 
-    from app.models.okr import OKRSettings
-    from app.services.okr_daily_collection import trigger_daily_collection_for_tenant
-
-    async with async_session() as db:
-        agent_result = await db.execute(select(Agent.tenant_id).where(Agent.id == trigger.agent_id))
-        tenant_id = agent_result.scalar_one_or_none()
-        if not tenant_id:
-            return True
-
-        settings_result = await db.execute(select(OKRSettings).where(OKRSettings.tenant_id == tenant_id))
-        settings = settings_result.scalar_one_or_none()
-        if not settings or not settings.enabled or not settings.daily_report_enabled:
-            return True
-
-    await trigger_daily_collection_for_tenant(tenant_id)
-    await _mark_trigger_fired(trigger.id, now)
-    logger.info(f"[Trigger] Deterministic OKR collection sent for trigger {trigger.name}")
-    return True
-
-# Webhook rate limiter: token -> list of timestamps
-_webhook_hits: dict[str, list[float]] = {}
-WEBHOOK_RATE_LIMIT = 5   # max hits per minute per token
-
-
-# ── SSRF Protection ─────────────────────────────────────────────────
 
 def _is_private_url(url: str) -> bool:
     """Block private/internal URLs to prevent SSRF attacks."""
@@ -214,8 +101,6 @@ def _is_private_url(url: str) -> bool:
     except Exception:
         return True  # Block on any parsing error
 
-
-# ── Trigger Evaluation ──────────────────────────────────────────────
 
 async def _evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     """Return True if this trigger should fire right now."""
@@ -1131,8 +1016,8 @@ async def _tick():
         return
 
 
-    # Evaluate and group fired triggers by agent
-    fired_by_agent: dict[uuid.UUID, list[AgentTrigger]] = {}
+    # Evaluate and enqueue due triggers. Agent invocation happens only after
+    # executions are claimed through the distributed execution queue.
     for trigger in all_triggers:
         # Auto-disable expired triggers
         if trigger.expires_at and now >= trigger.expires_at:
@@ -1150,14 +1035,22 @@ async def _tick():
                 if not handled:
                     handled = await _handle_okr_collection_trigger(trigger, now)
                 if not handled:
-                    fired_by_agent.setdefault(trigger.agent_id, []).append(trigger)
+                    await enqueue_due_trigger(trigger, now)
         except Exception as e:
             logger.warning(f"Error evaluating trigger {trigger.name}: {e}")
+
+    # Claim queued executions with a DB lease so only one worker handles each event.
+    try:
+        fired_by_agent, force_invoke_agents = await claim_ready_trigger_invocations(now)
+    except Exception as e:
+        logger.warning(f"Failed to claim trigger executions: {e}")
+        fired_by_agent = {}
+        force_invoke_agents = set()
 
     # Invoke each agent (with dedup window)
     for agent_id, agent_triggers in fired_by_agent.items():
         last = _last_invoke.get(agent_id)
-        if last and (now - last).total_seconds() < DEDUP_WINDOW:
+        if agent_id not in force_invoke_agents and last and (now - last).total_seconds() < DEDUP_WINDOW:
             continue  # Skip — invoked too recently
         _last_invoke[agent_id] = now
 
@@ -1169,6 +1062,8 @@ async def _tick():
         try:
             async with async_session() as db:
                 for t in agent_triggers:
+                    if (t.config or {}).get("_execution_id"):
+                        continue
                     result = await db.execute(
                         select(AgentTrigger).where(AgentTrigger.id == t.id)
                     )

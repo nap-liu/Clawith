@@ -10,13 +10,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import (
-    create_access_token,
-    get_authenticated_user,
-    get_current_user,
-    hash_password,
-    verify_password,
-)
+from app.core.security import create_access_token, get_authenticated_user, get_current_user, hash_password_async, verify_password_async
 from app.database import get_db
 from app.models.user import Identity, User
 from app.schemas.schemas import (
@@ -169,20 +163,22 @@ async def register_init(
 
     logger.info(f"[REGISTER_INIT] Starting registration for email={data.email}")
 
-    # Check if this is the first user (platform admin setup)
-    from sqlalchemy import func
-    ident_count_result = await db.execute(select(func.count()).select_from(Identity))
-    is_first_user = ident_count_result.scalar() == 0
-    
+    # Resolve email config once
+    from app.services.system_email_service import resolve_email_config_async
+    email_config = await resolve_email_config_async(db)
+
+    # Check if this is the first user (platform admin setup) - Optimize with EXISTS
+    is_first_user = (await db.execute(select(Identity.id).limit(1))).scalar() is None
+
     # Find or Create Identity
     identity = await registration_service.find_or_create_identity(
         db,
         email=data.email,
         username=data.username,
         password=data.password,
-        is_platform_admin=is_first_user
+        is_platform_admin=is_first_user,
+        email_config=email_config,
     )
-
     # Defense-in-depth: verify the returned identity actually belongs to the
     # submitted email. Under normal circumstances this should never trigger
     # (find_or_create_identity no longer uses username as a lookup key), but
@@ -199,7 +195,7 @@ async def register_init(
         )
 
     # If identity existed, verify password
-    if identity.password_hash and not verify_password(data.password, identity.password_hash):
+    if identity.password_hash and not await verify_password_async(data.password, identity.password_hash):
          raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email already registered. Incorrect password."
@@ -317,9 +313,12 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
     from app.services.registration_service import registration_service
     from sqlalchemy import func
 
-    # Check if first user
-    user_count_result = await db.execute(select(func.count()).select_from(User))
-    is_first_user = user_count_result.scalar() == 0
+    # Resolve email config once
+    from app.services.system_email_service import resolve_email_config_async
+    email_config = await resolve_email_config_async(db)
+
+    # Check if first user - Optimize with EXISTS
+    is_first_user = (await db.execute(select(User.id).limit(1))).scalar() is None
 
     # Resolve tenant
     tenant_uuid = None
@@ -366,7 +365,8 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
         email=data.email,
         username=data.username,
         password=data.password,
-        is_platform_admin=is_first_user
+        is_platform_admin=is_first_user,
+        email_config=email_config,
     )
 
     # Defense-in-depth: verify the returned identity actually belongs to the
@@ -395,7 +395,8 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
         display_name=data.display_name or data.username,
         role=role,
         tenant_id=tenant_uuid,
-        registration_source="web"
+        registration_source="web",
+        email_config=email_config,
     )
 
     # Seed default agents for first user
@@ -450,7 +451,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, db: AsyncSes
     result = await db.execute(query)
     identity = result.scalar_one_or_none()
 
-    if not identity or not identity.password_hash or not verify_password(data.password, identity.password_hash):
+    if not identity or not identity.password_hash or not await verify_password_async(data.password, identity.password_hash):
         logger.warning(f"[LOGIN] Invalid credentials for {data.login_identifier} identity_id={identity.id if identity else 'None'}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
@@ -683,9 +684,9 @@ async def reset_password(data: ResetPasswordRequest, db: AsyncSession = Depends(
     if not identity or not identity.is_active:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
-    new_hash = hash_password(data.new_password)
+    new_hash = await hash_password_async(data.new_password)
     identity.password_hash = new_hash
-    
+
     await db.flush()
     await db.commit()
     return {"ok": True}
@@ -892,10 +893,10 @@ async def change_password(
     user = res.scalar_one()
     identity = user.identity
 
-    if not identity or not identity.password_hash or not verify_password(old_password, identity.password_hash):
+    if not identity or not identity.password_hash or not await verify_password_async(old_password, identity.password_hash):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
 
-    new_hash = hash_password(new_password)
+    new_hash = await hash_password_async(new_password)
     identity.password_hash = new_hash
     
     await db.flush()

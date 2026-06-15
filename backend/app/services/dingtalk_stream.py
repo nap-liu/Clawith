@@ -16,11 +16,11 @@ import httpx
 from loguru import logger
 from sqlalchemy import select
 
-from app.config import get_settings
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
 from app.services.channel_dispatch import ChannelReactions, run_channel_message
 from app.services.dingtalk_token import dingtalk_token_manager
+from app.services.storage import store_agent_upload
 
 
 # ─── DingTalk Media Helpers ─────────────────────────────
@@ -78,14 +78,6 @@ async def _download_dingtalk_media(
     return await _download_file(download_url)
 
 
-def _resolve_upload_dir(agent_id: uuid.UUID) -> Path:
-    """Get the uploads directory for an agent, creating it if needed."""
-    settings = get_settings()
-    upload_dir = Path(settings.AGENT_DATA_DIR) / str(agent_id) / "workspace" / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    return upload_dir
-
-
 async def _process_media_message(
     msg_data: dict,
     app_key: str,
@@ -125,17 +117,24 @@ async def _process_media_message(
         if not file_bytes:
             return "[用户发送了图片，但下载失败]", None, None
 
-        # Save to disk
-        upload_dir = _resolve_upload_dir(agent_id)
+        # Save to disk via storage abstraction
         filename = f"dingtalk_img_{uuid.uuid4().hex[:8]}.jpg"
-        save_path = upload_dir / filename
-        save_path.write_bytes(file_bytes)
-        logger.info(f"[DingTalk] Saved image to {save_path} ({len(file_bytes)} bytes)")
+        _, workspace_path, _ = await store_agent_upload(
+            agent_id,
+            filename,
+            file_bytes,
+            content_type="image/jpeg",
+        )
+        logger.info(f"[DingTalk] Saved image to {workspace_path} ({len(file_bytes)} bytes)")
 
         # Base64 encode for LLM vision
         b64_data = base64.b64encode(file_bytes).decode("ascii")
         image_marker = f"[image_data:data:image/jpeg;base64,{b64_data}]"
-        return f"[用户发送了图片]\n{image_marker}", [f"data:image/jpeg;base64,{b64_data}"], [str(save_path)]
+        return (
+            f"[用户发送了图片]\n{image_marker}",
+            [f"data:image/jpeg;base64,{b64_data}"],
+            [workspace_path],
+        )
 
     elif msgtype == "richText":
         # Rich text: may contain text segments + images
@@ -152,17 +151,20 @@ async def _process_media_message(
                         app_key, app_secret, item["downloadCode"]
                     )
                     if file_bytes:
-                        upload_dir = _resolve_upload_dir(agent_id)
                         filename = f"dingtalk_richimg_{uuid.uuid4().hex[:8]}.jpg"
-                        save_path = upload_dir / filename
-                        save_path.write_bytes(file_bytes)
-                        logger.info(f"[DingTalk] Saved rich text image to {save_path}")
+                        _, workspace_path, _ = await store_agent_upload(
+                            agent_id,
+                            filename,
+                            file_bytes,
+                            content_type="image/jpeg",
+                        )
+                        logger.info(f"[DingTalk] Saved rich text image to {workspace_path}")
 
                         b64_data = base64.b64encode(file_bytes).decode("ascii")
                         image_marker = f"[image_data:data:image/jpeg;base64,{b64_data}]"
                         text_parts.append(image_marker)
                         image_base64_list.append(f"data:image/jpeg;base64,{b64_data}")
-                        saved_file_paths.append(str(save_path))
+                        saved_file_paths.append(workspace_path)
 
         combined_text = "\n".join(text_parts).strip()
         if not combined_text:
@@ -187,16 +189,14 @@ async def _process_media_message(
         if download_code:
             file_bytes = await _download_dingtalk_media(app_key, app_secret, download_code)
             if file_bytes:
-                upload_dir = _resolve_upload_dir(agent_id)
                 duration = content.get("duration", "unknown")
                 filename = f"dingtalk_audio_{uuid.uuid4().hex[:8]}.amr"
-                save_path = upload_dir / filename
-                save_path.write_bytes(file_bytes)
-                logger.info(f"[DingTalk] Saved audio to {save_path} ({len(file_bytes)} bytes)")
+                _, workspace_path, _ = await store_agent_upload(agent_id, filename, file_bytes)
+                logger.info(f"[DingTalk] Saved audio to {workspace_path} ({len(file_bytes)} bytes)")
                 return (
                     f"[用户发送了语音消息，时长{duration}ms，已保存到 {filename}]",
                     None,
-                    [str(save_path)],
+                    [workspace_path],
                 )
         return "[用户发送了语音消息，但无法处理]", None, None
 
@@ -207,16 +207,14 @@ async def _process_media_message(
         if download_code:
             file_bytes = await _download_dingtalk_media(app_key, app_secret, download_code)
             if file_bytes:
-                upload_dir = _resolve_upload_dir(agent_id)
                 duration = content.get("duration", "unknown")
                 filename = f"dingtalk_video_{uuid.uuid4().hex[:8]}.mp4"
-                save_path = upload_dir / filename
-                save_path.write_bytes(file_bytes)
-                logger.info(f"[DingTalk] Saved video to {save_path} ({len(file_bytes)} bytes)")
+                _, workspace_path, _ = await store_agent_upload(agent_id, filename, file_bytes)
+                logger.info(f"[DingTalk] Saved video to {workspace_path} ({len(file_bytes)} bytes)")
                 return (
                     f"[用户发送了视频，时长{duration}ms，已保存到 {filename}]",
                     None,
-                    [str(save_path)],
+                    [workspace_path],
                 )
         return "[用户发送了视频，但无法下载]", None, None
 
@@ -228,19 +226,17 @@ async def _process_media_message(
         if download_code:
             file_bytes = await _download_dingtalk_media(app_key, app_secret, download_code)
             if file_bytes:
-                upload_dir = _resolve_upload_dir(agent_id)
                 # Preserve original filename, add prefix to avoid collision
                 safe_name = f"dingtalk_{uuid.uuid4().hex[:8]}_{original_filename}"
-                save_path = upload_dir / safe_name
-                save_path.write_bytes(file_bytes)
+                _, workspace_path, _ = await store_agent_upload(agent_id, safe_name, file_bytes)
                 logger.info(
-                    f"[DingTalk] Saved file '{original_filename}' to {save_path} "
+                    f"[DingTalk] Saved file '{original_filename}' to {workspace_path} "
                     f"({len(file_bytes)} bytes)"
                 )
                 return (
                     f"[file:{original_filename}]",
                     None,
-                    [str(save_path)],
+                    [workspace_path],
                 )
         return f"[用户发送了文件 {original_filename}，但无法下载]", None, None
 

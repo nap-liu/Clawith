@@ -5037,6 +5037,15 @@ select:focus {
   margin-top: 2px;
 }
 
+.aware-side-item-desc {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
 .aware-side-trigger-main {
   flex: 1;
   min-width: 0;

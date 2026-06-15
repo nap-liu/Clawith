@@ -14,15 +14,29 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 from sqlalchemy import select
 
+from app.core.events import get_redis
 from app.database import async_session
 from app.models.trigger import AgentTrigger
 
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
 
-# In-memory rate limiter: token -> list of timestamps
-_rate_hits: dict[str, list[float]] = {}
 RATE_LIMIT = 5       # max hits per minute per token
 MAX_PAYLOAD_SIZE = 65536  # 64KB max payload
+
+
+async def _record_and_count_hits(token: str) -> int:
+    """Record the current hit in Redis and return the rolling 60-second count."""
+    redis = await get_redis()
+    now = time.time()
+    key = f"webhook:rate:{token}"
+    member = f"{now}:{hashlib.sha1(f'{token}:{now}'.encode()).hexdigest()[:8]}"
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.zremrangebyscore(key, 0, now - 60)
+        pipe.zadd(key, {member: now})
+        pipe.zcard(key)
+        pipe.expire(key, 120)
+        _, _, count, _ = await pipe.execute()
+    return int(count)
 
 
 @router.post("/t/{token}")
@@ -37,17 +51,13 @@ async def receive_webhook(token: str, request: Request):
     - Payload size limit (64KB)
     """
     # Rate limiting — use per-agent limit if available
-    now = time.time()
-    hits = _rate_hits.get(token, [])
-    hits = [t for t in hits if now - t < 60]  # keep last 60 seconds
+    hit_count = await _record_and_count_hits(token)
 
     # We'll check per-agent rate limit after finding the trigger below.
     # For now, apply a generous global ceiling to prevent memory abuse.
-    if len(hits) >= 60:  # hard ceiling: 60/min regardless of config
+    if hit_count >= 60:  # hard ceiling: 60/min regardless of config
         logger.warning(f"Webhook hard rate limit exceeded for token {token[:8]}...")
         return JSONResponse({"ok": True}, status_code=429)
-    hits.append(now)
-    _rate_hits[token] = hits
 
     # Payload size check
     body = await request.body()
@@ -84,8 +94,9 @@ async def receive_webhook(token: str, request: Request):
         mode = (target.config or {}).get("webhook_mode", "legacy")
         if mode == "legacy":
             agent_rate_limit = (agent_obj.webhook_rate_limit if agent_obj else None) or RATE_LIMIT
-            # Re-check hits against agent-specific limit (hits already collected above)
-            if len(hits) > agent_rate_limit:  # > because we already appended current hit
+            # Re-check hits against agent-specific limit. hit_count is the rolling
+            # 60s count from Redis (current hit already counted).
+            if hit_count > agent_rate_limit:  # > because current hit is already counted
                 logger.warning(f"Webhook per-agent rate limit ({agent_rate_limit}/min) for token {token[:8]}...")
                 # Log audit entry so user can see dropped webhooks
                 try:
@@ -122,15 +133,21 @@ async def receive_webhook(token: str, request: Request):
         try:
             payload_str = body.decode("utf-8")
             # Try to pretty-format JSON for readability
+            payload_obj = None
             try:
                 payload_obj = json.loads(payload_str)
                 payload_str = json.dumps(payload_obj, ensure_ascii=False, indent=2)
             except json.JSONDecodeError:
-                pass  # Keep as raw string
+                payload_obj = None
         except Exception:
+            payload_obj = None
             payload_str = repr(body[:2000])
 
-        # Store payload — legacy overwrites, queue/merge accumulates
+        # Store payload — legacy overwrites, queue/merge accumulates.
+        # The trigger_daemon's _check_trigger_ready polls these config flags
+        # (_webhook_pending / _webhook_queue) to decide a webhook is "due";
+        # it does NOT consult the TriggerExecution table for webhooks, so the
+        # payload must live in the trigger config here.
         if mode == "legacy":
             new_config = {**cfg, "_webhook_pending": True, "_webhook_payload": payload_str[:8000]}
         else:  # queue / merge
@@ -149,6 +166,6 @@ async def receive_webhook(token: str, request: Request):
         )
         await db.commit()
 
-        logger.info(f"Webhook received for trigger {target.name} (agent {target.agent_id})")
+        logger.info(f"Webhook queued for trigger {target.name} (agent {target.agent_id})")
 
     return JSONResponse({"ok": True})
