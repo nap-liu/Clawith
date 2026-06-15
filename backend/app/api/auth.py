@@ -835,8 +835,23 @@ async def switch_tenant(
 
     # 4. Determine redirect URL
     # Determine redirect URL (Priority: sso_domain > ENV > Request > Fallback)
-    from app.core.domain import resolve_base_url
-    redirect_url = await resolve_base_url(db, request=request, tenant_id=str(tenant.id) if tenant else None)
+    from app.models.system_settings import SystemSetting
+
+    # Global toggle (CP6 #591/#592): admins can disable custom-domain SSO redirect
+    # platform-wide. When enabled (default), resolve via OUR domain-management chain
+    # (resolve_base_url: tenant sso_domain → global → request) rather than upstream's
+    # platform_service, so subdomain_prefix / three-tier fallback keep working.
+    setting_result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == "sso_custom_domain_redirect_enabled")
+    )
+    setting_s = setting_result.scalar_one_or_none()
+    sso_redirect_enabled = setting_s.value.get("enabled", True) if setting_s else True
+
+    if not sso_redirect_enabled:
+        redirect_url = None
+    else:
+        from app.core.domain import resolve_base_url
+        redirect_url = await resolve_base_url(db, request=request, tenant_id=str(tenant.id) if tenant else None)
 
 
     # Include token in redirect URL for cross-domain switching if needed
