@@ -211,6 +211,68 @@ def _slugify_server_name(name: str) -> str:
     return s or "mcp_server"
 
 
+async def persist_stdio_discovered_tools(
+    db,
+    srv,
+    tools: list[dict],
+) -> int:
+    """Upsert Tool rows for tools discovered from a stdio MCP server.
+
+    Idempotent: keyed on (mcp_server_id, mcp_tool_name).  Re-running discovery
+    updates description/parameters_schema but never creates duplicates.
+
+    Naming scheme: ``mcp_{srv.name}_{raw_tool_name}`` — matches the convention
+    used by the HTTP MCP flow (see test_tools_mcp_server_bridge.py fixture).
+    ``Tool.name`` is globally unique, so srv.name (unique per tenant in
+    mcp_servers) makes collisions across servers impossible.
+
+    Returns the number of tools persisted.
+    """
+    from app.models.tool import Tool
+    from sqlalchemy import select
+
+    upserted = 0
+    for t in tools:
+        raw_name: str = t.get("name") or ""
+        description: str = t.get("description") or ""
+        input_schema: dict = t.get("inputSchema") or {}
+        if not raw_name:
+            continue
+
+        tool_name = f"mcp_{srv.name}_{raw_name}"
+        display_name = raw_name.replace("_", " ").title()
+
+        existing = (await db.execute(
+            select(Tool).where(
+                Tool.mcp_server_id == srv.id,
+                Tool.mcp_tool_name == raw_name,
+            )
+        )).scalar_one_or_none()
+
+        if existing is not None:
+            # Update mutable fields; do not reset name to avoid breakage
+            existing.description = description
+            existing.parameters_schema = input_schema
+        else:
+            new_tool = Tool(
+                name=tool_name,
+                display_name=display_name,
+                description=description,
+                type="mcp",
+                source="admin",
+                tenant_id=srv.tenant_id,
+                mcp_server_id=srv.id,
+                mcp_server_name=srv.name,
+                mcp_tool_name=raw_name,
+                parameters_schema=input_schema,
+            )
+            db.add(new_tool)
+        upserted += 1
+
+    await db.flush()
+    return upserted
+
+
 async def upsert_mcp_server_from_tools(
     db,
     tenant_id: uuid.UUID | None,

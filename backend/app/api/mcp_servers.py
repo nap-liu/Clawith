@@ -254,6 +254,11 @@ async def test_mcp_server_connection(
                 except Exception:  # noqa: BLE001
                     pass
 
+            # Persist discovered tools as Tool rows (idempotent upsert).
+            # Mirrors the HTTP MCP flow so stdio tools are assignable to agents.
+            from app.services.mcp_server_service import persist_stdio_discovered_tools
+            await persist_stdio_discovered_tools(db, srv, tools)
+
             # Persist discovery metadata
             srv.instructions = f"stdio MCP server; {tool_count} tools discovered via hub entry {entry}"
             srv.instructions_captured_at = datetime.now(timezone.utc)
