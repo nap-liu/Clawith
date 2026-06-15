@@ -12,6 +12,9 @@ from app.services.sandbox.base import BaseSandboxBackend, ExecutionResult, Sandb
 from app.services.sandbox.config import SandboxConfig
 from app.services.workspace_paths import WorkspacePathError, resolve_path_within_root
 
+MAX_STDOUT_CAPTURE_BYTES = 1_000_000
+MAX_STDERR_CAPTURE_BYTES = 500_000
+
 
 # Security patterns - reused from agent_tools.py
 _DANGEROUS_BASH_ALWAYS = [
@@ -442,11 +445,14 @@ class SubprocessBackend(BaseSandboxBackend):
             stderr_data = bytearray()
 
             async def read_stream(stream, out, label="stdout"):
+                capture_limit = MAX_STDERR_CAPTURE_BYTES if label == "stderr" else MAX_STDOUT_CAPTURE_BYTES
                 while True:
                     chunk = await stream.read(4096)
                     if not chunk:
                         break
-                    out.extend(chunk)
+                    remaining = capture_limit - len(out)
+                    if remaining > 0:
+                        out.extend(chunk[:remaining])
                     # Real-time streaming: push each chunk to the WebSocket
                     if on_output:
                         try:

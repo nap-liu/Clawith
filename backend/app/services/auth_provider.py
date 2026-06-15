@@ -20,6 +20,7 @@ from app.core.security import create_access_token, hash_password
 from app.models.identity import IdentityProvider
 from app.models.user import User, Identity
 from app.services.google_workspace_oauth import GOOGLE_HTTP_PROXY
+from app.services.identity_provider_lookup import get_preferred_identity_provider
 from loguru import logger
 
 
@@ -214,12 +215,11 @@ class BaseAuthProvider(ABC):
         if self.provider:
             return self.provider
 
-        query = select(IdentityProvider).where(IdentityProvider.provider_type == self.provider_type)
-        if tenant_id:
-            query = query.where(IdentityProvider.tenant_id == tenant_id)
-            
-        result = await db.execute(query)
-        provider = result.scalar_one_or_none()
+        provider = await get_preferred_identity_provider(
+            db,
+            self.provider_type,
+            tenant_id,
+        )
 
         if not provider:
             provider = IdentityProvider(

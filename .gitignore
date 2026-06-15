@@ -6,6 +6,7 @@ dist/
 .vite/
 *.log
 backend/logs/
+pnpm-lock.yaml
 build/
 __pycache__/
 *.pyc

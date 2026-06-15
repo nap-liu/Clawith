@@ -70,11 +70,15 @@ from app.services.llm.finish import (
 
 _settings = get_settings()
 WORKSPACE_ROOT = Path(_settings.AGENT_DATA_DIR)
+MAX_EXEC_STDOUT_CAPTURE_BYTES = 1_000_000
+MAX_EXEC_STDERR_CAPTURE_BYTES = 500_000
 
 # Delivery guidance appended to every A2A consult turn (not persisted to history
 # so it does not pollute the stored context).
 A2A_DELIVERY_GUIDANCE = (
     "你正在回复另一位数字员工同事,请简洁、切题地作答。\n"
+    "🔴 必须调用 finish(content=\"...\") 提交完整答复;不要只输出纯文本 —— "
+    "纯文本会被拒绝并要求重做。\n"
     "如果你写了任何文件(报告/文档/分析)需要交付给对方,必须调用 "
     "send_file_to_agent(agent_name=\"<对方名字>\", file_path=\"<路径>\") 投递 —— "
     "对方无法访问你的工作区,绝不能只告诉路径。"
@@ -2193,7 +2197,8 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     """Load enabled tools for an agent from DB (OpenAI function-calling format).
 
     Falls back to hardcoded AGENT_TOOLS if DB not ready.
-    Always includes core system tools (send_channel_file, write_file).
+    Includes core system tools (send_channel_file, write_file) unless the user
+    has explicitly disabled them via the Agent tool panel.
     Feishu tools are only included when the agent has a configured Feishu channel.
     send_channel_message is included when any channel (Feishu/DingTalk/WeCom) is configured.
 
@@ -2262,11 +2267,41 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             from app.services.cli_tools.sandbox_inject import _FUNC_NAME_RE
             result = []
             db_tool_names = set()
+            # Track tool names that were explicitly disabled by the user
+            # (have an AgentTool record with enabled=False). These must NOT
+            # be re-added by the _always_tools fallback below.
+            explicitly_disabled_names = set()
+            # Track tools included via is_default fallback (no AgentTool record)
+            default_included_names = []
+
+            # Key insight: if the agent already has ANY AgentTool assignments,
+            # its tool panel has been configured by the user. In that case,
+            # only include tools with an explicit AgentTool(enabled=True)
+            # record.  Tools without any AgentTool record are NOT included
+            # (they will be provided by _always_tools if they are core tools).
+            #
+            # For agents with ZERO assignments (brand-new, never configured),
+            # fall back to is_default so they get a reasonable starting set.
+            agent_is_configured = len(assignments) > 0
+
             for t in all_tools:
                 tid = str(t.id)
                 at = assignments.get(tid)
-                enabled = at.enabled if at else t.is_default
+
+                if agent_is_configured:
+                    # Configured agent: require explicit AgentTool record
+                    if at is None:
+                        # No assignment → not included (unless _always_tools adds it)
+                        default_included_names.append(t.name)
+                        continue
+                    enabled = at.enabled
+                else:
+                    # Unconfigured agent: use is_default as fallback
+                    enabled = at.enabled if at else t.is_default
+
                 if not enabled:
+                    if at and not at.enabled:
+                        explicitly_disabled_names.add(t.name)
                     continue
 
                 # type='cli' tools are standalone LLM functions: the handler
@@ -2349,17 +2384,45 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 result.append(tool_def)
                 db_tool_names.add(t.name)
 
+            if explicitly_disabled_names:
+                logger.info(
+                    f"[Tools] agent={agent_id} explicitly disabled: "
+                    f"{sorted(explicitly_disabled_names)}"
+                )
+            if default_included_names:
+                logger.info(
+                    f"[Tools] agent={agent_id} skipped (no AgentTool record, "
+                    f"agent_configured={agent_is_configured}): "
+                    f"{sorted(default_included_names)}"
+                )
 
             if result:
-                # Append always-available system tools that aren't already in the DB list
+                # Append always-available system tools that aren't already in
+                # the DB list — but respect explicit user disabling.
+                always_added = []
                 for t in _always_tools:
-                    if t["function"]["name"] not in db_tool_names:
+                    fn_name = t["function"]["name"]
+                    if fn_name not in db_tool_names and fn_name not in explicitly_disabled_names:
                         result.append(t)
+                        always_added.append(fn_name)
+                if always_added:
+                    logger.debug(
+                        f"[Tools] agent={agent_id} added from _always_tools: {always_added}"
+                    )
                 # Inject OS-aware paths into computer-related tool descriptions
                 result = _patch_computer_tool_descriptions(result, computer_os_type)
                 # Strip msg_type from send_message_to_agent when async A2A is disabled
                 if not _a2a_async:
                     result = _strip_a2a_msg_type(result)
+                # Final diagnostic: log the complete tool list and assignment stats
+                final_names = sorted(t["function"]["name"] for t in result)
+                logger.info(
+                    f"[Tools] agent={agent_id} FINAL {len(result)} tools "
+                    f"(assignments={len(assignments)}, "
+                    f"disabled={len(explicitly_disabled_names)}, "
+                    f"default_fallback={len(default_included_names)}): "
+                    f"{final_names}"
+                )
                 return result
     except Exception as e:
         logger.error(f"[Tools] DB load failed, using fallback: {e}")
@@ -6432,6 +6495,7 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, ws: Path, args: dict) ->
             source_agent = src_result.scalar_one_or_none()
             source_name = source_agent.name if source_agent else "Unknown agent"
             source_tenant_id = source_agent.tenant_id if source_agent else None
+            source_creator_id = source_agent.creator_id if source_agent else from_agent_id
 
             # Build base filter: same tenant + not self
             base_filter = [AgentModel.id != from_agent_id]
@@ -6562,6 +6626,80 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, ws: Path, args: dict) ->
             f"Received file from {source_name}",
             detail={"source_agent": source_name, "source_file": rel_path, "delivered_file": target_rel_path},
         )
+
+        # ── Inject file-delivery message into A2A chat session ──
+        # This ensures the target agent sees the file delivery in its
+        # conversation context when send_message_to_agent is called next.
+        logger.info(
+            "[A2A-File] Injecting file delivery message: from=%s to=%s file=%s",
+            source_name,
+            target_name,
+            delivered_name,
+        )
+        try:
+            from app.models.audit import ChatMessage
+            from app.models.chat_session import ChatSession
+            from app.models.participant import Participant
+            async with async_session() as db2:
+                # Find or create A2A session (same ordering as send_message_to_agent)
+                session_agent_id = min(from_agent_id, target_id, key=str)
+                session_peer_id = max(from_agent_id, target_id, key=str)
+                sess_r = await db2.execute(
+                    select(ChatSession).where(
+                        ChatSession.agent_id == session_agent_id,
+                        ChatSession.peer_agent_id == session_peer_id,
+                        ChatSession.source_channel == "agent",
+                    )
+                )
+                chat_session = sess_r.scalar_one_or_none()
+                if not chat_session:
+                    src_part_r = await db2.execute(
+                        select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id)
+                    )
+                    src_participant = src_part_r.scalar_one_or_none()
+                    chat_session = ChatSession(
+                        agent_id=session_agent_id,
+                        user_id=source_creator_id,
+                        title=f"{source_name} ↔ {target_name}",
+                        source_channel="agent",
+                        participant_id=src_participant.id if src_participant else None,
+                        peer_agent_id=session_peer_id,
+                    )
+                    db2.add(chat_session)
+                    await db2.flush()
+
+                file_msg_content = (
+                    f"[File delivery from {source_name}]\n"
+                    f"{source_name} sent you a file: {delivered_name}\n"
+                    f"File path: {target_rel_path}\n"
+                    f"Use read_file(path=\"{target_rel_path}\") to inspect it."
+                )
+                if delivery_note:
+                    file_msg_content += f"\nNote: {delivery_note}"
+
+                # Resolve sender participant for proper attribution
+                src_part_r2 = await db2.execute(
+                    select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id)
+                )
+                src_part2 = src_part_r2.scalar_one_or_none()
+
+                db2.add(ChatMessage(
+                    agent_id=session_agent_id,
+                    user_id=source_creator_id,
+                    role="user",
+                    content=file_msg_content,
+                    conversation_id=str(chat_session.id),
+                    participant_id=src_part2.id if src_part2 else None,
+                ))
+                chat_session.last_message_at = ts
+                await db2.commit()
+                logger.info(
+                    "[A2A-File] Injected file delivery message into session %s for %s",
+                    chat_session.id,
+                    target_name,
+                )
+        except Exception as e:
+            logger.error(f"[A2A-File] FAILED to inject file delivery message: {e}")
 
         return (
             f"✅ File sent to {target_name}.\n"
@@ -7028,6 +7166,9 @@ async def _send_message_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
             # 1) The inbound user message is already persisted by the common pre-branch
             #    code (committed at the outer db.commit() above). No second write needed.
+            #    Target context is built inside call_llm_with_failover (agent_id=target.id);
+            #    the A2A finish()+file-delivery protocol rides in A2A_DELIVERY_GUIDANCE
+            #    appended to the turn message below (not a separate inline system prompt).
 
             # 2) Structured history (tool_call rows auto-expand; NO sanitize poisoning)
             ctx_size = target.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
@@ -7855,11 +7996,14 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
         stderr_data = bytearray()
 
         async def read_stream(stream, out, label="stdout"):
+            capture_limit = MAX_EXEC_STDERR_CAPTURE_BYTES if label == "stderr" else MAX_EXEC_STDOUT_CAPTURE_BYTES
             while True:
                 chunk = await stream.read(4096)
                 if not chunk:
                     break
-                out.extend(chunk)
+                remaining = capture_limit - len(out)
+                if remaining > 0:
+                    out.extend(chunk[:remaining])
                 # Real-time streaming: push each chunk to the WebSocket
                 if on_output:
                     try:
