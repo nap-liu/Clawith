@@ -59,6 +59,8 @@ from app.services.workspace_collaboration import (
 from app.core.permissions import evaluate_agent_relationship_status, evaluate_human_relationship_status
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.config import get_settings
+from app.services.sandbox_mcp_host import SandboxMcpHost
+from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
 
 _settings = get_settings()
@@ -4079,6 +4081,23 @@ async def _execute_mcp_tool(
                 ctx = await build_placeholder_context_for_call(
                     db, agent_id, user_id, session_id=session_id,
                 )
+
+                # stdio branch: route through aio-sandbox hub instead of HTTP.
+                if cfg.transport == "stdio":
+                    try:
+                        r_cmd = render(cfg.command_template or "", ctx, ALL_ROOTS, on_unknown="raise")
+                        r_args = [render(a, ctx, ALL_ROOTS, on_unknown="raise") for a in (cfg.args_template or [])]
+                        r_env = render_dict(cfg.env_template or {}, ctx, ALL_ROOTS, on_unknown="raise")
+                    except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
+                        return f"❌ MCP tool {tool_name}: stdio placeholder error — {e}"
+                    _settings_now = get_settings()
+                    host = SandboxMcpHost(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
+                    entry = await host.ensure_registered(
+                        srv.name, str(agent_id), {"command": r_cmd, "args": r_args, "env": r_env}
+                    )
+                    hub = SandboxMcpHubClient(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
+                    return await hub.call_tool(entry, tool.mcp_tool_name or tool_name, arguments)
+                # else: existing http path continues below.
 
                 # Render — MCP connection-time gets the FULL ALL_ROOTS context.
                 # Unknown placeholders fail loudly so the LLM sees the config error.
