@@ -32,6 +32,17 @@ async with client_context as (read_stream, write_stream, *_):
 never re-read. Changed to plain `@property` so the small JSON file is re-read
 on each access, enabling hot-reload without a server restart.
 
+### 3. mcp-hub.json not writable by the API user (`run.sh`)
+
+The sandbox HTTP API (`/v1/shell/*`, `/v1/file/*`) runs as the unprivileged
+`gem` user, but `run.sh` (root) generates `/opt/gem/mcp-hub.json` root-owned in
+a root-only directory. Clawith registers stdio MCP servers at runtime by
+overwriting that file **in place** through the API (`cat > file`, never
+`.tmp`+`mv` — `gem` cannot create files in the root-owned dir). So `run.sh` is
+patched to `chmod 666 /opt/gem/mcp-hub.json` right after generating it (the only
+change vs the upstream run.sh). Without this, runtime registration fails with
+`Permission denied`.
+
 ## Build
 
 ### Local (Mac / development):

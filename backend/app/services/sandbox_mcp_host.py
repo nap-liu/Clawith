@@ -161,19 +161,22 @@ class SandboxMcpHost:
         b64 = base64.b64encode(json.dumps(entry).encode()).decode()
 
         # Shell command breakdown:
-        # 1. Ensure the directory exists and the hub JSON is initialised.
-        # 2. Decode base64 entry to a temp file (so jq can --slurpfile it).
-        # 3. flock + jq: atomically update .mcpServers[name] = entry.
-        # 4. Move tmp file over original (atomic rename).
-        tmp_entry = f"/tmp/{name}.json"
+        # 1. Decode base64 entry to a temp file in /tmp (so jq can --slurpfile it).
+        # 2. flock + jq: merge .mcpServers[name] = entry into a /tmp result.
+        # 3. Overwrite the hub JSON IN PLACE (`cat > file`), NOT via `.tmp`+`mv`.
+        # The sandbox API runs as the unprivileged `gem` user, which cannot create
+        # files in the root-owned /opt/gem dir (so `.tmp`+`mv` fails with EACCES).
+        # `cat > {_HUB_JSON}` truncates+writes the EXISTING file, needing only
+        # file-write perm — the patched image makes mcp-hub.json group/world
+        # writable for exactly this. /tmp is always writable by `gem`.
+        tmp_entry = f"/tmp/{name}.entry.json"
+        tmp_hub = f"/tmp/{name}.hub.json"
         merge_cmd = (
-            f"mkdir -p $(dirname {_HUB_JSON}); "
-            f"[ -f {_HUB_JSON} ] || echo '{{\"mcpServers\":{{}}}}' > {_HUB_JSON}; "
             f"echo {b64} | base64 -d > {tmp_entry}; "
             f"flock {_LOCK_FILE} -c "
             f"'jq --arg n \"{name}\" --slurpfile e {tmp_entry} "
-            f"\".mcpServers[\\$n] = \\$e[0]\" {_HUB_JSON} > {_HUB_JSON}.tmp "
-            f"&& mv {_HUB_JSON}.tmp {_HUB_JSON}'"
+            f"\".mcpServers[\\$n] = \\$e[0]\" {_HUB_JSON} > {tmp_hub} "
+            f"&& cat {tmp_hub} > {_HUB_JSON}'"
         )
 
         res = await self._exec_admin_shell(merge_cmd)
@@ -200,10 +203,13 @@ class SandboxMcpHost:
                 f"entry name {name!r} contains unsafe characters; only [a-z0-9_-] allowed"
             )
 
+        # In-place overwrite (see ensure_registered): the API runs as `gem`, which
+        # cannot create files in /opt/gem, so write to /tmp then `cat > {_HUB_JSON}`.
+        tmp_hub = f"/tmp/{name}.del.json"
         del_cmd = (
             f"flock {_LOCK_FILE} -c "
             f"'jq --arg n \"{name}\" \"del(.mcpServers[\\$n])\" "
-            f"{_HUB_JSON} > {_HUB_JSON}.tmp "
-            f"&& mv {_HUB_JSON}.tmp {_HUB_JSON}'"
+            f"{_HUB_JSON} > {tmp_hub} "
+            f"&& cat {tmp_hub} > {_HUB_JSON}'"
         )
         await self._exec_admin_shell(del_cmd)
