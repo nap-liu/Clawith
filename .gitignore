@@ -75,3 +75,4 @@ wt-alembic.sh
 Dockerfile.test
 .aio-test/
 docs/superpowers/
+backend/tests/test_agent_api_live.py

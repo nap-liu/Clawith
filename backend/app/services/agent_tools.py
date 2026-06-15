@@ -864,7 +864,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "execute_code",
-            "description": "Execute code (Python, Bash, or Node.js) in a local sandboxed subprocess within the agent's root directory. Useful for data processing, calculations, file transformations, and automation scripts. Code runs with the agent root as the working directory, so you can access skills/, workspace/, memory/ etc. directly. Security restrictions apply: no network access commands, no system-level operations, 30-second timeout.",
+            "description": "Execute code (Python, Bash, or Node.js) in a local sandboxed subprocess within the agent's root directory. Useful for data processing, calculations, file transformations, and automation scripts. Code runs with the agent root as the working directory, so you can access skills/, workspace/, memory/ etc. directly. Security restrictions apply: no system-level operations, 30-second default timeout.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -875,11 +875,11 @@ AGENT_TOOLS = [
                     },
                     "code": {
                         "type": "string",
-                        "description": "Code to execute. For Python, you can import standard libraries (json, csv, math, re, collections, etc.). Working directory is the agent root (skills/, workspace/, memory/ are accessible).",
+                        "description": "Code to execute. If a Python import fails due to a missing package, install it first via execute_code with language='bash' and code='pip install <package>'. Working directory is the agent root (skills/, workspace/, memory/ are accessible).",
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "Max execution time in seconds (default 30, max 60)",
+                        "description": "Max execution time in seconds (default 60, max 3600)",
                     },
                 },
                 "required": ["language", "code"],
@@ -2601,6 +2601,7 @@ async def execute_tool(
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
     session_id: str = "",
+    on_output=None,
 ) -> str:
     """Execute a tool call and return the result as a string.
 
@@ -2949,7 +2950,7 @@ async def execute_tool(
         elif tool_name in _CODE_EXEC_TOOL_NAMES:
             logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
             result = await _execute_code(
-                agent_id, ws, arguments, tool_name=tool_name, user_id=user_id, session_id=session_id
+                agent_id, ws, arguments, tool_name=tool_name, user_id=user_id, session_id=session_id, on_output=on_output
             )
         elif tool_name == "sql_execute":
             result = await _sql_execute(arguments)
@@ -7621,6 +7622,7 @@ async def _execute_code(
     user_id: Optional[uuid.UUID] = None,
     cli_injection: Optional[dict] = None,
     session_id: Optional[str] = None,
+    on_output=None,
 ) -> str:
     """Execute code using the configured sandbox backend.
 
@@ -7638,10 +7640,7 @@ async def _execute_code(
     """
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
-    # Platform safety cap (~5 min). The agent is expected to choose its own
-    # timeout based on the task; this is just the upper bound so a runaway
-    # pip-install / git-clone / data-crunch can't hold the WS open forever.
-    timeout = min(arguments.get("timeout", 30), 300)
+    requested_timeout = arguments.get("timeout", 30)
 
     if not code.strip():
         return "❌ No code provided"
@@ -7676,8 +7675,11 @@ async def _execute_code(
             sandbox_config = fallback_config
             logger.info(f"[Sandbox] No per-agent config found for '{tool_name}', using fallback")
 
+        # Clamp timeout by configured max_timeout (default 60s, up to 3600s)
+        timeout = min(requested_timeout, sandbox_config.max_timeout)
+
         backend = get_sandbox_backend(sandbox_config)
-        logger.info(f"[Sandbox] Executing code with backend: {backend.__class__.__name__} (tool={tool_name})")
+        logger.info(f"[Sandbox] Executing code with backend: {backend.__class__.__name__} (tool={tool_name}, timeout={timeout}s)")
         injection = None
         if cli_injection is not None:
             # Caller already built it (e.g. _execute_cli_tool, scoped to its own
@@ -7695,6 +7697,7 @@ async def _execute_code(
             agent_id=str(agent_id) if agent_id else None,
             conversation_id=session_id or None,
             inject=injection,
+            on_output=on_output,
         )
 
         # Format result for user display
@@ -7706,7 +7709,7 @@ async def _execute_code(
             # Do not silently fall back — surface the config error to the user
             return f"❌ Sandbox configuration error: {str(e)[:300]}\nPlease check the tool settings."
         logger.warning(f"[Sandbox] Config issue, falling back to legacy subprocess: {e}")
-        return await _execute_code_legacy(ws, arguments, allow_network=fallback_config.allow_network)
+        return await _execute_code_legacy(ws, arguments, allow_network=fallback_config.allow_network, max_timeout=fallback_config.max_timeout, on_output=on_output)
 
     except Exception as e:
         logger.exception(f"[Sandbox] Execution failed for agent {agent_id} (tool={tool_name})")
@@ -7715,7 +7718,7 @@ async def _execute_code(
             return f"❌ Sandbox execution error: {str(e)[:200]}"
         # For local tool: try legacy subprocess as last resort
         try:
-            return await _execute_code_legacy(ws, arguments, allow_network=sandbox_config.allow_network)
+            return await _execute_code_legacy(ws, arguments, allow_network=sandbox_config.allow_network, max_timeout=sandbox_config.max_timeout, on_output=on_output)
         except Exception:
             logger.exception(f"[Sandbox] Fallback also failed for agent {agent_id}")
             return f"❌ Execution error: {str(e)[:200]}"
@@ -7793,14 +7796,13 @@ async def _execute_cli_tool(
     )
 
 
-async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = False) -> str:
+async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = False, max_timeout: int = 60, on_output=None) -> str:
     """Legacy subprocess-based code execution (fallback)."""
     import asyncio
 
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
-    # Platform safety cap aligned with the primary _execute_code path.
-    timeout = min(arguments.get("timeout", 30), 300)
+    timeout = min(arguments.get("timeout", 30), max_timeout)
 
     if not code.strip():
         return "❌ No code provided"
@@ -7849,21 +7851,50 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
             env=safe_env,
         )
 
+        stdout_data = bytearray()
+        stderr_data = bytearray()
+
+        async def read_stream(stream, out, label="stdout"):
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    break
+                out.extend(chunk)
+                # Real-time streaming: push each chunk to the WebSocket
+                if on_output:
+                    try:
+                        text = chunk.decode("utf-8", errors="replace")
+                        await on_output(text, label)
+                    except Exception:
+                        pass
+
+        task1 = asyncio.create_task(read_stream(proc.stdout, stdout_data, "stdout"))
+        task2 = asyncio.create_task(read_stream(proc.stderr, stderr_data, "stderr"))
+
+        is_timeout = False
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             proc.kill()
-            await proc.communicate()
-            return f"❌ Code execution timed out after {timeout}s"
+            is_timeout = True
 
-        stdout_str = stdout.decode("utf-8", errors="replace")[:10000]
-        stderr_str = stderr.decode("utf-8", errors="replace")[:5000]
+        await asyncio.gather(task1, task2)
+        stdout = bytes(stdout_data)
+        stderr = bytes(stderr_data)
+
+        stdout_str = stdout.decode("utf-8", errors="replace")[:10000] if stdout else ""
+        stderr_str = stderr.decode("utf-8", errors="replace")[:5000] if stderr else ""
 
         result_parts = []
         if stdout_str.strip():
             result_parts.append(f"📤 Output:\n{stdout_str}")
         if stderr_str.strip():
             result_parts.append(f"⚠️ Stderr:\n{stderr_str}")
+
+        if is_timeout:
+            result_parts.append(f"❌ Code execution timed out after {timeout}s. If you expect this code to take longer, try calling the tool again with a higher 'timeout' parameter (up to 3600s).")
+            return "\n\n".join(result_parts)
+
         if proc.returncode != 0:
             result_parts.append(f"Exit code: {proc.returncode}")
 
