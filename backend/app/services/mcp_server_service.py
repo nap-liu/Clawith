@@ -27,6 +27,10 @@ class ResolvedMCPConfig:
     headers_template: dict
     credential_template: str | None
     prompt_blocks: list[str]
+    transport: str = "http"
+    command_template: str | None = None
+    args_template: list | None = None
+    env_template: dict | None = None
 
 
 def _override_pick(*candidates):
@@ -67,11 +71,35 @@ def compose_runtime_config(
         server.credential_template,
     )
 
+    transport = getattr(server, "transport", "http") or "http"
+    command_template = _override_pick(
+        getattr(agent_override, "command_template", None) if agent_override else None,
+        getattr(tenant_override, "command_template", None) if tenant_override else None,
+        getattr(server, "command_template", None),
+    )
+    args_template = _override_pick(
+        getattr(agent_override, "args_template", None) if agent_override else None,
+        getattr(tenant_override, "args_template", None) if tenant_override else None,
+        getattr(server, "args_template", None),
+    )
+    env_template = (
+        _override_pick(
+            getattr(agent_override, "env_template", None) if agent_override else None,
+            getattr(tenant_override, "env_template", None) if tenant_override else None,
+            getattr(server, "env_template", None),
+        )
+        or {}
+    )
+
     return ResolvedMCPConfig(
         url_template=url_template,
         headers_template=headers_template,
         credential_template=credential_template,
         prompt_blocks=prompt_blocks,
+        transport=transport,
+        command_template=command_template,
+        args_template=args_template,
+        env_template=env_template,
     )
 
 
