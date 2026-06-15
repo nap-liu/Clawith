@@ -8149,6 +8149,8 @@ async def _handle_set_trigger(
                 f'   <script src="/sdk/clawith.js" data-hook="{hook_token}"></script>\n'
                 "   Reader identity: window.Clawith.onReady(u => ...)  // {userId, userName, mobile}\n"
                 "   Send info back:  window.Clawith.triggerHook(window.Clawith.hook, { ...any fields })\n"
+                "   Anti-leak watermark: add data-watermark to that same <script> to tile the "
+                "viewer's name + mobile tail across the page.\n"
                 "   Works for ANY reader-to-you collection (survey, confirmation, choice, sign-up, "
                 "feedback, ...), not just feedback. Each call wakes you once "
                 "(use webhook_mode=queue to process them one-by-one)."
@@ -11144,7 +11146,12 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         f"Published successfully!\n\n"
         f"Public URL: {url}\n"
         f"Title: {title}\n\n"
-        f"Anyone can access this page without logging in.{url_note}"
+        f"Anyone can access this page without logging in.{url_note}\n\n"
+        "Optional — to stamp each viewer's identity (name + mobile tail) as an anti-leak "
+        "watermark tiled across the page, include the Clawith SDK with the data-watermark "
+        "attribute in the HTML <head>:\n"
+        '   <script src="/sdk/clawith.js" data-watermark></script>\n'
+        "The viewer signs in via company OAuth on open, then their watermark renders on top."
     )
 
 
