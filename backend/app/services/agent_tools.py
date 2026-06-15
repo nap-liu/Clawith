@@ -704,7 +704,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_message_to_agent",
-            "description": "Send a message to a digital employee colleague. The recipient is another AI agent, not a human. Your relationships.md lists available digital employees under 'Digital Employee Colleagues'.\n\nDECISION GUIDE for msg_type:\nAsk yourself: does the target agent need to DO WORK (analyze, research, summarize, write, compare, plan, etc.) and RETURN RESULTS to you or the user?\n\n- If YES, the target needs to do work → use task_delegate. Examples: 'summarize X', 'analyze Y', 'check Z', 'prepare a report', 'review and give feedback', 'find out X', 'confirm with X and report back'. The target works asynchronously and you will be woken when they finish.\n\n- If the target just needs to KNOW something → use notify. Examples: 'meeting cancelled', 'I updated the doc', 'heads up about X', 'FYI'. No reply expected.\n\n- If you need a quick factual answer right now → use consult. Examples: 'what is X?', 'do you know Y?'. Synchronous, blocks until reply.\n\nWhen in doubt between notify and task_delegate, prefer task_delegate — it is safer because it guarantees the user gets a result.\n\nRESET: If an ongoing conversation with a colleague gets stuck — the same tool failing over and over, repeated identical errors, looping, or visibly corrupted/garbled context — set new_conversation=true to discard the stale history and start a fresh, clean thread, then continue.",
+            "description": "Send a message to a digital employee colleague. The recipient is another AI agent, not a human. Refer to the 'Relationships' section in your system prompt for available digital employees.\n\nDECISION GUIDE for msg_type:\nAsk yourself: does the target agent need to DO WORK (analyze, research, summarize, write, compare, plan, etc.) and RETURN RESULTS to you or the user?\n\n- If YES, the target needs to do work → use task_delegate. Examples: 'summarize X', 'analyze Y', 'check Z', 'prepare a report', 'review and give feedback', 'find out X', 'confirm with X and report back'. The target works asynchronously and you will be woken when they finish.\n\n- If the target just needs to KNOW something → use notify. Examples: 'meeting cancelled', 'I updated the doc', 'heads up about X', 'FYI'. No reply expected.\n\n- If you need a quick factual answer right now → use consult. Examples: 'what is X?', 'do you know Y?'. Synchronous, blocks until reply.\n\nWhen in doubt between notify and task_delegate, prefer task_delegate — it is safer because it guarantees the user gets a result.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -11785,8 +11785,8 @@ async def _get_email_config(agent_id: uuid.UUID) -> dict:
         )
         at = at_r.scalar_one_or_none()
         agent_config = (at.config or {}) if at else {}
-        # Merge global + agent override
-        return {**(tool.config or {}), **agent_config}
+        merged = {**(tool.config or {}), **agent_config}
+        return _decrypt_sensitive_fields(merged, tool.config_schema)
 
 
 # ── Pages: public HTML hosting ──────────────────────────
@@ -11804,20 +11804,19 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     if not path.lower().endswith((".html", ".htm")):
         return "Only .html and .htm files can be published"
 
-    # Resolve and check file exists
-    full_path = (ws / path).resolve()
-    if not str(full_path).startswith(str(ws.resolve())):
-        return "Path traversal not allowed"
-    if not full_path.exists() or not full_path.is_file():
+    # Resolve via storage backend (supports local FS and S3)
+    storage = get_storage_backend()
+    storage_key = normalize_storage_key(f"{agent_id}/{path}")
+    if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
         return f"File not found: {path}"
 
     # Extract title from HTML
     try:
-        content = full_path.read_text(encoding="utf-8", errors="replace")
+        content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
         title_match = re.search(r"<title[^>]*>(.*?)</title>", content, re.IGNORECASE | re.DOTALL)
-        title = title_match.group(1).strip()[:200] if title_match else full_path.stem
+        title = title_match.group(1).strip()[:200] if title_match else Path(path).stem
     except Exception:
-        title = full_path.stem
+        title = Path(path).stem
 
     # Generate short_id
     short_id = secrets.token_urlsafe(6)[:8]  # 8-char URL-safe string
@@ -15395,7 +15394,7 @@ async def _vercel_set_env(agent_id: uuid.UUID, arguments: dict) -> str:
     payload = {
         "key": key,
         "value": value,
-        "type": "secret" if key == "DATABASE_URL" else "plain",
+        "type": "encrypted" if key == "DATABASE_URL" else "plain",
         "target": target
     }
     

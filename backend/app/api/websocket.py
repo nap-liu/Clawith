@@ -1151,6 +1151,18 @@ class WebSocketChatHandler:
             evt=data,
         )
         try:
+            from app.services.chat_session_service import save_tool_call_log
+            await save_tool_call_log(
+                agent_id=self.agent_id,
+                user_id=self.user.id,
+                conversation_id=self.conv_id,
+                tool_name=data.get("name", ""),
+                arguments=data.get("args"),
+                result=(data.get("result") or "")[:500],
+                status="done",
+                tool_call_id=data.get("call_id"),
+                reasoning_content=data.get("reasoning_content"),
+            )
             async with async_session() as _tc_db:
                 await maybe_mark_session_read_for_active_viewer(
                     _tc_db,

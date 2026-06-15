@@ -16,6 +16,7 @@ from croniter import croniter
 from loguru import logger
 from sqlalchemy import select
 
+from app.core.logging_config import new_trace_id
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
@@ -1004,6 +1005,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
 
 async def _tick():
     """One daemon tick: evaluate all triggers, group by agent, invoke."""
+    new_trace_id()
     now = datetime.now(timezone.utc)
 
     async with async_session() as db:
@@ -1011,6 +1013,12 @@ async def _tick():
             select(AgentTrigger).where(AgentTrigger.is_enabled == True)
         )
         all_triggers = result.scalars().all()
+        # Expunge each object before session.close() is called.
+        # session.close() expires all objects still in the identity map;
+        # explicit expunge() detaches them WITHOUT expiry so their scalar
+        # attributes remain readable outside the session context.
+        for _t in all_triggers:
+            db.expunge(_t)
 
     if not all_triggers:
         return
