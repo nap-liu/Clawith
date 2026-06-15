@@ -36,8 +36,12 @@ def _from_server_spec(spec: dict, name_hint: str | None = None) -> dict:
     if "command" in spec and "url" not in spec:
         return {
             "url": None,
+            "transport": "stdio",
             "name": name_hint or spec.get("name"),
-            "error": "stdio MCP servers (command/args) are not supported in this deployment — pass a remote `url` instead",
+            "command": spec.get("command"),
+            "args": spec.get("args") or [],
+            "env": spec.get("env") or {},
+            "error": None,
         }
 
     url = spec.get("url") or spec.get("endpoint")
@@ -57,6 +61,7 @@ def _from_server_spec(spec: dict, name_hint: str | None = None) -> dict:
 
     return {
         "url": url.strip(),
+        "transport": "http",
         "name": name_hint or spec.get("name"),
         "headers": headers,
         "api_key": api_key,

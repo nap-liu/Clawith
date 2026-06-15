@@ -79,14 +79,17 @@ def test_mcpServers_multiple_entries_picks_first_with_warning():
     assert "_warning" in out
 
 
-def test_mcpServers_stdio_command_unsupported():
+def test_mcpServers_stdio_command_parsed():
+    # stdio servers (command/args) are now supported — parser returns transport=stdio
     out = parse_mcp_input({
         "mcpServers": {
             "fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"]}
         }
     })
     assert out["url"] is None
-    assert "stdio" in (out.get("error") or "").lower()
+    assert out.get("error") is None
+    assert out.get("transport") == "stdio"
+    assert out.get("command") == "npx"
 
 
 # ── JSON-stringified inputs (LLM tool-calling habit) ──────────────
