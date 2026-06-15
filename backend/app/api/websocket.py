@@ -27,7 +27,6 @@ from app.services.activity_logger import log_activity
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.llm import call_llm_with_failover
-from app.services.llm.utils import convert_chat_messages_to_llm_format, truncate_messages_with_pair_integrity
 from app.services.onboarding import is_onboarded, mark_onboarding_phase, resolve_onboarding_prompt
 from app.services.quota_guard import (
     AgentExpired,

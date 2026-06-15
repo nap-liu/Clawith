@@ -28,7 +28,6 @@ from app.services.trigger_runtime.evaluator import (
     mark_trigger_skipped as mark_trigger_skipped_runtime,
     should_skip_non_workday as should_skip_non_workday_runtime,
 )
-from app.services.trigger_runtime.invoker import invoke_agent_for_triggers as invoke_agent_for_triggers_runtime
 from app.services.trigger_runtime import (
     claim_ready_trigger_invocations,
     enqueue_due_trigger,
