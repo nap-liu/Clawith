@@ -7924,6 +7924,9 @@ async def _import_mcp_server(agent_id: uuid.UUID, arguments: dict) -> str:
     if parsed:
         if parsed.get("error") and not parsed.get("url"):
             return f"❌ {parsed['error']}"
+        if parsed.get("transport") == "stdio":          # stdio self-install via aio-sandbox hub
+            from app.services.resource_discovery import import_mcp_stdio_direct
+            return await import_mcp_stdio_direct(agent_id, parsed)
         if parsed.get("url"):
             from app.services.resource_discovery import import_mcp_direct
             server_name = (
