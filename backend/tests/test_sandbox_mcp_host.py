@@ -11,6 +11,26 @@ from app.services.sandbox_mcp_host import SandboxMcpHost, entry_name
 pytestmark = pytest.mark.asyncio
 
 
+def _find_entry_json(decoded_blobs: list[str]) -> dict:
+    """Find the hub entry dict among base64-decoded shell tokens.
+
+    The merge command contains several whitespace tokens; only one decodes to the
+    entry JSON. Picking ``[0]`` is fragile because operators like ``&&`` decode to
+    an empty string, so search for the blob that parses as a dict with a
+    ``command`` key (the stdio entry).
+    """
+    for blob in decoded_blobs:
+        if not blob:
+            continue
+        try:
+            obj = json.loads(blob)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(obj, dict) and "command" in obj:
+            return obj
+    raise AssertionError(f"No entry JSON (dict with 'command') found in: {decoded_blobs!r}")
+
+
 def test_entry_name_deterministic_and_per_agent():
     a = entry_name("yunxiao", "agentA", {"command": "npx", "args": ["-y", "p"], "env": {"T": "1"}})
     b = entry_name("yunxiao", "agentA", {"command": "npx", "args": ["-y", "p"], "env": {"T": "1"}})
@@ -127,6 +147,26 @@ async def test_ensure_registered_raises_on_failure(monkeypatch):
     host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
     with pytest.raises(Exception, match="hub register failed"):
         await host.ensure_registered("srv", "agent1", {"command": "npx", "args": [], "env": {}})
+
+
+async def test_ensure_registered_raises_on_nonzero_exit_code(monkeypatch):
+    """A non-zero shell exit (e.g. mkdir/merge failed) must surface at registration.
+
+    The sandbox API returns success=True (command was dispatched) even when the
+    shell command itself exits non-zero — the real status is in data.exit_code.
+    ensure_registered must inspect it so a failed mkdir/decode/merge raises here
+    instead of being deferred into an opaque hub HTTP 500 on the next tool call.
+    """
+    async def fake_exec(self, command: str):
+        return {"success": True, "data": {"exit_code": 1, "output": "mkdir: cannot create"}}
+
+    monkeypatch.setattr(SandboxMcpHost, "_exec_admin_shell", fake_exec)
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    with pytest.raises(Exception, match="exit_code=1"):
+        await host.ensure_registered(
+            "srv", "agent1", {"command": "npx", "args": [], "env": {}},
+            cwd="/data/agents/agent1",
+        )
 
 
 async def test_ensure_registered_no_restart(monkeypatch):
@@ -296,8 +336,7 @@ async def test_ensure_registered_includes_cwd_in_entry(monkeypatch):
         {"command": "npx", "args": ["-y", "pkg"], "env": {"K": "v"}},
         cwd="/data/agents/agent-xyz",
     )
-    assert captured_b64, "No base64 blob found in shell command"
-    entry_obj = json.loads(captured_b64[0])
+    entry_obj = _find_entry_json(captured_b64)
     assert "cwd" in entry_obj, f"Entry JSON missing 'cwd' key: {entry_obj}"
     assert entry_obj["cwd"] == "/data/agents/agent-xyz"
 
@@ -322,6 +361,5 @@ async def test_ensure_registered_no_cwd_key_when_cwd_is_none(monkeypatch):
         "agent-xyz",
         {"command": "npx", "args": [], "env": {}},
     )
-    assert captured_b64, "No base64 blob found in shell command"
-    entry_obj = json.loads(captured_b64[0])
+    entry_obj = _find_entry_json(captured_b64)
     assert "cwd" not in entry_obj, f"Entry JSON must not contain 'cwd' when None: {entry_obj}"

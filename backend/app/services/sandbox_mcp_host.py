@@ -193,10 +193,15 @@ class SandboxMcpHost:
         # ("No such file or directory"). ``mkdir -p`` is idempotent — a harmless
         # no-op when the shared mount already provides the directory — so it makes
         # per-agent cwd isolation robust regardless of mount topology.
-        mkdir_prefix = f"mkdir -p {shlex.quote(cwd)}; " if cwd else ""
+        #
+        # Every step is chained with ``&&`` (fail-fast): if the mkdir, the entry
+        # decode, or the jq merge fails, the whole command exits non-zero so the
+        # failure surfaces at registration time (see exit-code check below) rather
+        # than being deferred into an opaque hub HTTP 500 on the next tool call.
+        mkdir_prefix = f"mkdir -p {shlex.quote(cwd)} && " if cwd else ""
         merge_cmd = (
             f"{mkdir_prefix}"
-            f"echo {b64} | base64 -d > {tmp_entry}; "
+            f"echo {b64} | base64 -d > {tmp_entry} && "
             f"flock {_LOCK_FILE} -c "
             f"'jq --arg n \"{name}\" --slurpfile e {tmp_entry} "
             f"\".mcpServers[\\$n] = \\$e[0]\" {_HUB_JSON} > {tmp_hub} "
@@ -204,8 +209,14 @@ class SandboxMcpHost:
         )
 
         res = await self._exec_admin_shell(merge_cmd)
-        if not res.get("success"):
-            raise Exception(f"hub register failed: {res}")
+        # ``success`` is the sandbox API-level flag (command was dispatched); the
+        # shell command's own exit status lives in ``data.exit_code``. Check BOTH
+        # so a non-zero mkdir/decode/merge is caught here, not deferred. Default
+        # exit_code to 0 when the field is absent (keeps lightweight test doubles
+        # that return only ``{"success": True}`` working).
+        exit_code = (res.get("data") or {}).get("exit_code", 0)
+        if not res.get("success") or exit_code != 0:
+            raise Exception(f"hub register failed (exit_code={exit_code}): {res}")
 
         # No restart or reload required — the patched sandbox image reads
         # mcp-hub.json on every request (@property instead of @cached_property).
