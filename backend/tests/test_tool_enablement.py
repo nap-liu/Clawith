@@ -56,6 +56,8 @@ def test_backfill_computes_missing_default_rows_per_agent():
     assert len(rows) == 3
 
 
-def test_resolution_has_no_is_default_fallback():
-    assert agent_tool_enabled(None) is False
-    assert agent_tool_enabled(SimpleNamespace(enabled=False)) is False
+def test_resolution_ignores_is_default_attribute():
+    # Even if the assignment object carries is_default=True, only the explicit
+    # enabled flag decides. This is the EXPLICIT-ONLY regression guard.
+    assert agent_tool_enabled(SimpleNamespace(enabled=False, is_default=True)) is False
+    assert agent_tool_enabled(SimpleNamespace(enabled=True, is_default=False)) is True

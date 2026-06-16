@@ -27,8 +27,8 @@ def agent_tool_enabled(assignment: Any | None) -> bool:
 
 def default_tool_ids_to_seed(
     default_tools: Iterable[Any],
-    existing_tool_ids: set,
-) -> list:
+    existing_tool_ids: set[Any],
+) -> list[Any]:
     """Tool ids that should get a fresh ``enabled=True`` AgentTool row.
 
     A tool qualifies when it is ``is_default=True`` and the agent does not
@@ -41,8 +41,8 @@ def default_tool_ids_to_seed(
 def compute_backfill_rows(
     agents: Iterable[Any],
     default_tools: Iterable[Any],
-    existing_pairs: set,
-) -> list:
+    existing_pairs: set[Any],
+) -> list[tuple[Any, Any]]:
     """(agent_id, tool_id) pairs needing an ``enabled=True`` row at cutover.
 
     Preserves current ``is_default`` behavior: for every agent, every
@@ -54,9 +54,12 @@ def compute_backfill_rows(
     ``.is_default``; ``existing_pairs`` is a set of ``(agent_id, tool_id)``.
     """
     default_tools = list(default_tools)
-    rows: list = []
+    existing_by_agent: dict[Any, set[Any]] = {}
+    for aid, tid in existing_pairs:
+        existing_by_agent.setdefault(aid, set()).add(tid)
+    rows: list[tuple[Any, Any]] = []
     for a in agents:
-        existing_ids = {tid for (aid, tid) in existing_pairs if aid == a.id}
+        existing_ids = existing_by_agent.get(a.id, set())
         for tid in default_tool_ids_to_seed(default_tools, existing_ids):
             rows.append((a.id, tid))
     return rows
