@@ -41,7 +41,7 @@ def default_tool_ids_to_seed(
 def compute_backfill_rows(
     agents: Iterable[Any],
     default_tools: Iterable[Any],
-    existing_pairs: set[Any],
+    existing_pairs: set[tuple[Any, Any]],
 ) -> list[tuple[Any, Any]]:
     """(agent_id, tool_id) pairs needing an ``enabled=True`` row at cutover.
 

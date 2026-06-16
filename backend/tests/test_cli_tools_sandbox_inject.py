@@ -388,26 +388,39 @@ async def test_cli_tool_is_standalone_function_not_folded(llm_tools_session):
 
 @pytest.mark.asyncio
 async def test_cli_tool_without_binary_not_surfaced(llm_tools_session):
-    """A CLI tool with no uploaded binary does not appear as an LLM function."""
-    from app.models.tool import Tool
+    """A CLI tool with no uploaded binary does not appear as an LLM function.
+
+    The AgentTool row is explicitly present (enabled=True) so this test proves
+    the no-binary guard — not the absence-of-row path — is what excludes it.
+    """
+    from app.models.tool import Tool, AgentTool
     from app.services.agent_tools import get_agent_tools_for_llm
 
+    agent_id = _uuid.uuid4()
+
     async with llm_tools_session() as s:
-        s.add(Tool(
+        svc_tool = Tool(
             name="svc", display_name="svc", description="no binary yet",
             type="cli", category="cli", icon="🔧", source="admin", enabled=True,
             is_default=True, parameters_schema={}, config={}, config_schema={},
-        ))
-        s.add(Tool(
+        )
+        aio_tool = Tool(
             name="execute_code_aio", display_name="Sandbox",
             description="Run code in sandbox.", type="builtin", category="code",
             icon="💻", source="builtin", enabled=True, is_default=True,
             parameters_schema={"type": "object", "properties": {}},
             config={}, config_schema={},
-        ))
+        )
+        s.add(svc_tool)
+        s.add(aio_tool)
+        await s.flush()
+        # Explicit AgentTool row — the cli tool IS enabled for this agent so that
+        # the no-binary guard (not the no-row path) is what excludes it from LLM tools.
+        s.add(AgentTool(agent_id=agent_id, tool_id=svc_tool.id, enabled=True))
+        s.add(AgentTool(agent_id=agent_id, tool_id=aio_tool.id, enabled=True))
         await s.commit()
 
-    tools = await get_agent_tools_for_llm(_uuid.uuid4())
+    tools = await get_agent_tools_for_llm(agent_id)
     names = [t["function"]["name"] for t in tools]
     assert "svc" not in names
 
@@ -614,20 +627,31 @@ async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkey
 async def test_cli_tool_no_aio_graceful_degrade(llm_tools_session):
     """When an agent has a cli tool enabled but execute_code_aio is NOT in the
     tool list, get_agent_tools_for_llm must not raise and must not surface the
-    cli tool as an LLM function (graceful degrade, D3-1)."""
-    from app.models.tool import Tool
+    cli tool as an LLM function (graceful degrade, D3-1).
+
+    The AgentTool row is explicitly present (enabled=True) so this test proves
+    the missing-aio guard — not the absence-of-row path — is what excludes it.
+    """
+    from app.models.tool import Tool, AgentTool
     from app.services.agent_tools import get_agent_tools_for_llm
 
+    agent_id = _uuid.uuid4()
+
     async with llm_tools_session() as s:
-        s.add(Tool(
+        svc_tool = Tool(
             name="svc", display_name="svc", description="CLI only, no aio in this agent",
             type="cli", category="cli", icon="🔧", source="admin", enabled=True,
             is_default=True, parameters_schema={}, config={}, config_schema={},
-        ))
+        )
+        s.add(svc_tool)
         # Intentionally do NOT add execute_code_aio.
+        await s.flush()
+        # Explicit AgentTool row — the cli tool IS enabled for this agent so that
+        # the missing-aio guard (not the no-row path) is what excludes it from LLM tools.
+        s.add(AgentTool(agent_id=agent_id, tool_id=svc_tool.id, enabled=True))
         await s.commit()
 
-    tools = await get_agent_tools_for_llm(_uuid.uuid4())
+    tools = await get_agent_tools_for_llm(agent_id)
     names = [t["function"]["name"] for t in tools]
     assert "svc" not in names, "cli tool must not appear as an LLM function"
     # execute_code_aio is absent — no description to check; just verify no crash.

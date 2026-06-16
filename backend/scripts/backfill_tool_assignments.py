@@ -9,6 +9,8 @@ already produced), so it is safe to run on prod ahead of the code deploy.
 Guarded by a SystemSetting flag so it runs once: future is_default tools will
 NOT be auto-propagated to existing agents (that is the whole point — opt-in).
 
+An existing AgentTool row with enabled=False is an intentional admin disable and is left untouched — that agent stays without the tool after the flip.
+
 Run inside a backend container:
     python -m scripts.backfill_tool_assignments            # run once
     python -m scripts.backfill_tool_assignments --dry-run  # report only
