@@ -488,7 +488,7 @@ async def get_agent_tools(
         at = assignments.get(tid)
         if not _tool_record_visible_to_agent(t, agent_obj.tenant_id, assignments):
             continue
-        # If no explicit assignment, use is_default
+        # No explicit AgentTool row → not enabled (no is_default fallback)
         enabled = agent_tool_enabled(at)
         result.append({
             "id": tid,
