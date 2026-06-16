@@ -61,3 +61,11 @@ def test_resolution_ignores_is_default_attribute():
     # enabled flag decides. This is the EXPLICIT-ONLY regression guard.
     assert agent_tool_enabled(SimpleNamespace(enabled=False, is_default=True)) is False
     assert agent_tool_enabled(SimpleNamespace(enabled=True, is_default=False)) is True
+
+
+def test_new_agent_seeds_all_default_tools():
+    t1 = _tool(True)
+    t2 = _tool(True)
+    t3 = _tool(False)
+    ids = default_tool_ids_to_seed([t1, t2, t3], existing_tool_ids=set())
+    assert set(ids) == {t1.id, t2.id}
