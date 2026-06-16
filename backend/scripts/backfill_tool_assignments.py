@@ -12,7 +12,7 @@ NOT be auto-propagated to existing agents (that is the whole point — opt-in).
 Run inside a backend container:
     python -m scripts.backfill_tool_assignments            # run once
     python -m scripts.backfill_tool_assignments --dry-run  # report only
-    python -m scripts.backfill_tool_assignments --force    # ignore the flag
+    python -m scripts.backfill_tool_assignments --force    # ignore the run-once flag (already-existing AgentTool rows are still skipped)
 """
 from __future__ import annotations
 

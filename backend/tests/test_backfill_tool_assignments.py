@@ -253,6 +253,11 @@ async def test_flag_already_set_but_force_proceeds():
     assert agent_tool_adds[0].tool_id == t1.id
     assert db.committed is True
 
+    # force bypasses the early-exit guard but does NOT re-insert the flag row
+    # (the inner `if not await _flag_set(db):` guard still holds)
+    flag_adds = [o for o in db.added if isinstance(o, SystemSetting)]
+    assert len(flag_adds) == 0
+
 
 @pytest.mark.asyncio
 async def test_existing_pair_not_duplicated():
@@ -273,3 +278,8 @@ async def test_existing_pair_not_duplicated():
     assert result == 0
     agent_tool_adds = [o for o in db.added if isinstance(o, AgentTool)]
     assert len(agent_tool_adds) == 0
+
+    # script still commits and sets the flag even when zero rows are inserted
+    assert db.committed is True
+    flag_adds = [o for o in db.added if isinstance(o, SystemSetting)]
+    assert len(flag_adds) == 1
