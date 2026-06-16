@@ -71,6 +71,7 @@ async def main():
     import app.models.task           # noqa
     import app.models.llm            # noqa
     import app.models.tool           # noqa
+    import app.models.mcp_server     # noqa  # FK target of tools.mcp_server_id; fresh DB create_all needs it registered
     import app.models.audit          # noqa
     import app.models.skill          # noqa
     import app.models.channel_config # noqa

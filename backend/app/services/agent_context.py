@@ -341,6 +341,103 @@ async def _collect_extension_prompts(agent_id: uuid.UUID) -> list[str]:
     return mcp_blocks + channel_blocks
 
 
+async def _load_relationships_from_db(db, agent_id: uuid.UUID) -> str:
+    """Query relationships directly from the database and format as a markdown list."""
+    from app.models.org import AgentRelationship, AgentAgentRelationship, OrgMember
+    from app.models.identity import IdentityProvider
+    from app.core.permissions import evaluate_human_relationship_status, evaluate_agent_relationship_status
+    from sqlalchemy.orm import selectinload
+    from sqlalchemy import select
+
+    RELATION_LABELS = {
+        "direct_leader": "直属上级",
+        "collaborator": "协作伙伴",
+        "stakeholder": "利益相关者",
+        "team_member": "团队成员",
+        "subordinate": "下属",
+        "mentor": "导师",
+        "other": "其他",
+    }
+
+    AGENT_RELATION_LABELS = {
+        "peer": "同级协作",
+        "supervisor": "上级数字员工",
+        "assistant": "助手",
+        "collaborator": "协作伙伴",
+        "other": "其他",
+    }
+
+    # Load human relationships
+    h_result = await db.execute(
+        select(
+            AgentRelationship,
+            IdentityProvider.name.label("provider_name"),
+            IdentityProvider.provider_type.label("provider_type"),
+        )
+        .outerjoin(OrgMember, AgentRelationship.member_id == OrgMember.id)
+        .outerjoin(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
+        .where(AgentRelationship.agent_id == agent_id)
+        .options(selectinload(AgentRelationship.member))
+    )
+    human_rows = []
+    for rel, provider_name, provider_type in h_result.all():
+        status_info = await evaluate_human_relationship_status(db, rel)
+        if status_info["access_status"] == "active":
+            def _display_provider_name(pn, pt):
+                if not pn and not pt:
+                    return None
+                if (pt or "").lower() in ("web", "platform") or (pn or "").lower() == "web":
+                    return "Platform"
+                return pn
+            human_rows.append((rel, _display_provider_name(provider_name, provider_type)))
+
+    # Load agent relationships
+    a_result = await db.execute(
+        select(AgentAgentRelationship)
+        .where(AgentAgentRelationship.agent_id == agent_id)
+        .options(selectinload(AgentAgentRelationship.target_agent))
+    )
+    agent_rels = []
+    for rel in a_result.scalars().all():
+        status_info = await evaluate_agent_relationship_status(db, rel)
+        if status_info["access_status"] == "active":
+            agent_rels.append(rel)
+
+    if not human_rows and not agent_rels:
+        return ""
+
+    lines = []
+
+    # Human relationships
+    if human_rows:
+        lines.append("## 人类同事\n")
+        for r, provider_name in human_rows:
+            m = r.member
+            if not m:
+                continue
+            label = RELATION_LABELS.get(r.relation, r.relation)
+            source = f"（通过 {provider_name} 同步）" if provider_name else ""
+            lines.append(f"### {m.name} — {m.title or '未设置职位'}{source}")
+            if r.description:
+                lines.append(f"- {r.description}")
+            lines.append("")
+
+    # Agent relationships
+    if agent_rels:
+        lines.append("## 🤖 数字员工同事\n")
+        for r in agent_rels:
+            a = r.target_agent
+            if not a:
+                continue
+            label = AGENT_RELATION_LABELS.get(r.relation, r.relation)
+            lines.append(f"### {a.name} — {a.role_description or '数字员工'}")
+            if r.description:
+                lines.append(f"- {r.description}")
+            lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 async def build_agent_context(
     agent_id: uuid.UUID,
     agent_name: str,
@@ -354,7 +451,7 @@ async def build_agent_context(
     - soul.md → personality
     - memory.md → long-term memory
     - skills/ → skill names + summaries
-    - relationships.md → relationship descriptions
+    - relationships → colleague list (composed live from the database)
     """
     # --- Soul ---
     # Soul is the agent's full author-curated identity; detailed souls (e.g.
@@ -378,10 +475,19 @@ async def build_agent_context(
     # --- Skills index (progressive disclosure) ---
     skills_text = await _load_skills_index(agent_id)
 
-    # --- Relationships ---
-    relationships = await _read_file_safe(normalize_storage_key(f"{agent_id}/relationships.md"), 2000)
-    if relationships.startswith("# "):
-        relationships = "\n".join(relationships.split("\n")[1:]).strip()
+    # --- Relationships (read live from the database) ---
+    # relationships.md is no longer generated (api/relationships.py:_regenerate_
+    # relationships_file is a no-op); the colleague list is composed directly from
+    # AgentRelationship / AgentAgentRelationship so it always reflects current org
+    # state. Best-effort: a DB hiccup must not abort the whole context assembly.
+    relationships = ""
+    try:
+        from app.database import async_session
+        async with async_session() as _rel_db:
+            relationships = await _load_relationships_from_db(_rel_db, agent_id)
+    except Exception as _rel_err:
+        from loguru import logger as _ctx_logger
+        _ctx_logger.warning(f"[agent_context] failed to load relationships for agent {agent_id}: {_rel_err}")
 
     # --- Compose static and dynamic system prompt blocks ---
     from datetime import datetime, timezone as _tz  # noqa: F401
@@ -515,7 +621,7 @@ You have a dedicated workspace with this structure:
   - memory/reflections.md → Your autonomous thinking journal
   - skills/        → Your skill definition files (one .md per skill)
   - workspace/     → Your work files (reports, documents, etc.)
-  - relationships.md → Your relationship list
+  - relationships → Your colleague list (shown under "## Relationships"; managed in the platform, not a file)
   - enterprise_info/ → Shared company information
   - secrets.md       → PRIVATE credentials store (passwords, API keys, connection strings)
 

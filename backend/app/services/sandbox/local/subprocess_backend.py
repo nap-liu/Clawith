@@ -441,9 +441,9 @@ class SubprocessBackend(BaseSandboxBackend):
                     env=safe_env,
                 )
             else:
-                self._ensure_workspace_venv(work_path)
-                sandbox_command = self._build_command(language, f"/workspace/{script_path.name}", work_path)
-                bwrap_command = self._build_bwrap_command(sandbox_command, work_path)
+                self._ensure_workspace_venv(venv_path)
+                sandbox_command = self._build_command(language, f"/workspace/{script_path.name}")
+                bwrap_command = self._build_bwrap_command(sandbox_command, work_path, venv_path)
                 if not bwrap_command:
                     if not self.config.allow_unsafe_fallback_when_bwrap_missing:
                         duration_ms = int((time.time() - start_time) * 1000)

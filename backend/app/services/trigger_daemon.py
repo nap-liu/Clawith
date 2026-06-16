@@ -596,6 +596,22 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     from app.models.participant import Participant
     from app.services.audit_logger import write_audit_log
 
+    # Each runtime trigger carries the id of the leased TriggerExecution it was
+    # claimed from (build_execution_runtime_trigger injects `_execution_id`). The
+    # lease is held in status="processing" with a 5-minute expiry; if we never
+    # finalize it, claim_pending_trigger_executions re-grabs the expired lease and
+    # the trigger re-fires forever. Finalize every claimed execution below.
+    execution_ids: list[uuid.UUID] = []
+    for _t in triggers:
+        _cfg = _t.config if isinstance(_t.config, dict) else {}
+        _eid = _cfg.get("_execution_id")
+        if _eid:
+            try:
+                execution_ids.append(uuid.UUID(str(_eid)))
+            except (ValueError, TypeError):
+                pass
+    invocation_error: str | None = None
+
     try:
         async with async_session() as db:
             # Load agent
@@ -1008,9 +1024,26 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
         logger.info(f"⚡ Triggers fired for {agent.name}: {[t.name for t in triggers]}")
 
     except Exception as e:
+        invocation_error = str(e)
         logger.error(f"Failed to invoke agent {agent_id} for triggers: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        # Release the lease on every claimed execution so it is not re-fired.
+        # Runs on success, on early return (agent expired / model disabled), and
+        # on exception. Early returns leave invocation_error=None → completed,
+        # which is correct: the trigger was handled (decided to skip), so re-firing
+        # would not help.
+        if execution_ids:
+            try:
+                if invocation_error is None:
+                    await mark_trigger_executions_completed(execution_ids)
+                else:
+                    await mark_trigger_executions_failed(execution_ids, invocation_error)
+            except Exception as _mark_err:
+                logger.warning(
+                    f"Failed to finalize trigger executions {execution_ids} for agent {agent_id}: {_mark_err}"
+                )
 
 
 # ── Main Tick Loop ──────────────────────────────────────────────────
