@@ -89,6 +89,15 @@ async def main():
     import app.models.gateway_message # noqa
     import app.models.chat_compaction # noqa  # FK target of chat_messages.compacted_into; fresh DB create_all needs it registered
     import app.models.focus          # noqa  # v1.9.3 AgentFocusItem table; fresh DB create_all needs it registered
+    # Mirror the main.py lifespan create_all set exactly so a fresh-DB bootstrap
+    # via this entrypoint registers every table (no NoReferencedTableError, no
+    # coverage drift vs the app's own startup path).
+    import app.models.tenant_setting     # noqa
+    import app.models.trigger_execution  # noqa
+    import app.models.agent_credential   # noqa
+    import app.models.okr                # noqa
+    import app.models.onboarding         # noqa
+    import app.models.identity           # noqa
 
     # Create all tables that don't exist yet (safe to run on every startup)
     async with engine.begin() as conn:

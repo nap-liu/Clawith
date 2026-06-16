@@ -418,6 +418,7 @@ async def _load_relationships_from_db(db, agent_id: uuid.UUID) -> str:
             label = RELATION_LABELS.get(r.relation, r.relation)
             source = f"（通过 {provider_name} 同步）" if provider_name else ""
             lines.append(f"### {m.name} — {m.title or '未设置职位'}{source}")
+            lines.append(f"- 关系：{label}")
             if r.description:
                 lines.append(f"- {r.description}")
             lines.append("")
@@ -431,6 +432,7 @@ async def _load_relationships_from_db(db, agent_id: uuid.UUID) -> str:
                 continue
             label = AGENT_RELATION_LABELS.get(r.relation, r.relation)
             lines.append(f"### {a.name} — {a.role_description or '数字员工'}")
+            lines.append(f"- 关系：{label}")
             if r.description:
                 lines.append(f"- {r.description}")
             lines.append("")
