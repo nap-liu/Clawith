@@ -208,6 +208,34 @@ async def test_import_mcp_stdio_direct_list_tools_error():
     assert "npx failed" in result
 
 
+async def test_import_mcp_stdio_direct_discovery_timeout():
+    """A discovery timeout gets a dedicated retry message, not the generic error."""
+    import httpx
+    agent_id, _, _ = await _make_agent()
+
+    with patch("app.services.resource_discovery.get_settings", return_value=_SettingsWithSandbox()), \
+         patch("app.services.resource_discovery.SandboxMcpHost") as MockHost, \
+         patch("app.services.resource_discovery.SandboxMcpHubClient") as MockHub, \
+         patch("app.services.resource_discovery.ensure_workspace") as mock_ws:
+        mock_host_inst = MagicMock()
+        mock_host_inst.ensure_registered = AsyncMock(return_value="entry__abc")
+        mock_host_inst.deregister = AsyncMock()
+        MockHost.return_value = mock_host_inst
+
+        mock_hub_inst = MagicMock()
+        mock_hub_inst.list_tools = AsyncMock(side_effect=httpx.TimeoutException("timed out"))
+        MockHub.return_value = mock_hub_inst
+
+        from pathlib import Path
+        mock_ws.return_value = Path("/tmp/fake-ws")
+
+        from app.services.resource_discovery import import_mcp_stdio_direct
+        result = await import_mcp_stdio_direct(agent_id, {"transport": "stdio", "command": "npx", "args": [], "env": {}})
+
+    assert "超时" in result
+    assert "重试" in result
+
+
 async def test_import_mcp_stdio_direct_zero_tools():
     agent_id, _, _ = await _make_agent()
 

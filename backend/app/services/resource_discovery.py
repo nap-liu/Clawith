@@ -982,6 +982,11 @@ async def import_mcp_stdio_direct(agent_id, parsed: dict) -> str:
             return f"❌ 注册到沙箱失败:{e}"
         try:
             tools = await hub.list_tools(entry)
+        except httpx.TimeoutException:
+            return (
+                "⏱️ 工具发现超时:npx 包可能较大或网络较慢(首次安装尤甚),"
+                "请稍后用相同配置重试。"
+            )
         except Exception as e:
             return f"❌ 启动/发现工具失败(可能是包名错误或网络不通):{e}"
         finally:

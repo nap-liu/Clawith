@@ -1577,24 +1577,32 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "import_mcp_server",
-            "description": "Import an MCP server from Smithery registry into the platform. The server's tools become available for use. Use discover_resources first to find the server ID. If previously imported tools stopped working (e.g. OAuth expired), set reauthorize=true to re-run the authorization flow.",
+            "description": "Import an MCP server so its tools become available to you. Provide ONE of: (1) mcp_config — a standard `mcpServers` JSON config, which works for both HTTP MCP servers (entry has a `url`) and stdio/npx MCP servers (entry has a `command`, e.g. `npx -y <package>`); stdio servers are hosted and started automatically in the sandbox under your own workspace. (2) mcp_url — the full http/https endpoint of a single HTTP MCP server. (3) server_id — a Smithery registry ID (use discover_resources first to find it). If previously imported tools stopped working (e.g. OAuth expired), set reauthorize=true.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "mcp_config": {
+                        "type": "object",
+                        "description": "Standard MCP config (object or JSON string). HTTP form: {\"mcpServers\":{\"<name>\":{\"url\":\"https://...\",\"headers\":{...}}}}. stdio/npx form: {\"mcpServers\":{\"<name>\":{\"command\":\"npx\",\"args\":[\"-y\",\"<package>\"],\"env\":{\"<KEY>\":\"<value>\"}}}}.",
+                    },
+                    "mcp_url": {
+                        "type": "string",
+                        "description": "Full http/https endpoint of a single HTTP MCP server (shortcut for the HTTP form of mcp_config).",
+                    },
                     "server_id": {
                         "type": "string",
-                        "description": "Smithery server ID, e.g. '@anthropic/brave-search' or '@anthropic/fetch'",
+                        "description": "Smithery server ID, e.g. '@anthropic/brave-search' or '@anthropic/fetch' (advanced — only for the Smithery registry path).",
                     },
                     "config": {
                         "type": "object",
-                        "description": "Optional server configuration (e.g. API keys required by the server)",
+                        "description": "Optional server configuration for the Smithery path (e.g. API keys required by the server)",
                     },
                     "reauthorize": {
                         "type": "boolean",
                         "description": "Set to true to force re-authorization of existing tools (e.g. when OAuth token has expired)",
                     },
                 },
-                "required": ["server_id"],
+                "required": [],
             },
         },
     },
