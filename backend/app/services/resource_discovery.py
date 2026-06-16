@@ -971,9 +971,8 @@ async def import_mcp_stdio_direct(agent_id, parsed: dict) -> str:
         srv = await get_or_create_agent_stdio_server(db, agent_id, tenant_id, cfg)
 
         # 发现:按 agent workspace cwd 注册临时条目 → list → 持久化 → 注销
-        _s = get_settings()
-        host = SandboxMcpHost(_s.SANDBOX_API_URL, _s.SANDBOX_API_KEY)
-        hub = SandboxMcpHubClient(_s.SANDBOX_API_URL, _s.SANDBOX_API_KEY)
+        host = SandboxMcpHost(_settings.SANDBOX_API_URL, _settings.SANDBOX_API_KEY)
+        hub = SandboxMcpHubClient(_settings.SANDBOX_API_URL, _settings.SANDBOX_API_KEY)
         ws = await ensure_workspace(_uuid.UUID(str(agent_id)), tenant_id=str(tenant_id) if tenant_id else None)
         work_dir = str(ws.resolve())
         try:

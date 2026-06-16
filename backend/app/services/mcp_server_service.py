@@ -343,9 +343,6 @@ async def upsert_mcp_server_from_tools(
     return new_srv.id
 
 
-import re as _re  # noqa: E402 — appended section
-
-
 async def get_or_create_agent_stdio_server(db, agent_id, tenant_id, cfg: dict):
     """Create-or-reuse an agent-private stdio MCPServer from a parsed stdio cfg.
 
@@ -359,12 +356,16 @@ async def get_or_create_agent_stdio_server(db, agent_id, tenant_id, cfg: dict):
     # Derive a package slug from the most descriptive arg (last non-flag) or command.
     args = cfg.get("args") or []
     pkg = next((a for a in reversed(args) if not str(a).startswith("-")), cfg.get("command", "mcp"))
-    pkg_slug = _re.sub(r"[^a-z0-9]+", "-", str(pkg).lower()).strip("-")[:40] or "mcp"
+    pkg_slug = re.sub(r"[^a-z0-9]+", "-", str(pkg).lower()).strip("-")[:40] or "mcp"
     agent8 = str(agent_id).replace("-", "")[:8]
     name = f"{pkg_slug}-a{agent8}"
 
     existing = (await db.execute(
-        select(MCPServer).where(MCPServer.name == name)
+        select(MCPServer).where(
+            MCPServer.name == name,
+            (MCPServer.tenant_id == tenant_id) if tenant_id is not None
+            else MCPServer.tenant_id.is_(None),
+        )
     )).scalar_one_or_none()
     if existing is not None:
         # Refresh command/args/env in case the agent changed creds/args.
