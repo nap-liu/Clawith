@@ -65,6 +65,48 @@ async def test_ensure_registered_writes_merge(monkeypatch):
     assert "tok" not in joined
 
 
+async def test_ensure_registered_mkdirs_cwd_on_sandbox(monkeypatch):
+    """When a cwd is given, ensure_registered must create it on the sandbox.
+
+    The per-agent cwd (e.g. /data/agents/{agent_id}) must exist before the stdio
+    process is spawned there. On deployments where backend and sandbox do not
+    share the /data/agents volume mount, the directory would otherwise be missing
+    and npx would fail to start. mkdir -p is idempotent (no-op with shared mount).
+    """
+    calls = []
+
+    async def fake_exec(self, command: str):
+        calls.append(command)
+        return {"success": True}
+
+    monkeypatch.setattr(SandboxMcpHost, "_exec_admin_shell", fake_exec)
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    cwd = "/data/agents/8cc7693d-7bf7-4d0b-a739-238ea32e08bd"
+    await host.ensure_registered(
+        "yunxiao", "agentA",
+        {"command": "npx", "args": ["-y", "pkg"], "env": {}},
+        cwd=cwd,
+    )
+    joined = " ".join(calls)
+    assert f"mkdir -p {cwd}" in joined, f"Expected mkdir -p of cwd in: {joined}"
+    # mkdir must precede the jq merge (dir exists before the entry references it).
+    assert joined.index("mkdir -p") < joined.index("jq")
+
+
+async def test_ensure_registered_no_mkdir_without_cwd(monkeypatch):
+    """Without a cwd, ensure_registered must NOT emit a mkdir (nothing to create)."""
+    calls = []
+
+    async def fake_exec(self, command: str):
+        calls.append(command)
+        return {"success": True}
+
+    monkeypatch.setattr(SandboxMcpHost, "_exec_admin_shell", fake_exec)
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    await host.ensure_registered("srv", "agent1", {"command": "npx", "args": [], "env": {}})
+    assert "mkdir" not in " ".join(calls)
+
+
 async def test_ensure_registered_returns_entry_name(monkeypatch):
     async def fake_exec(self, command: str):
         return {"success": True}

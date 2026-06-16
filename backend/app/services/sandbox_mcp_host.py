@@ -36,6 +36,7 @@ import base64
 import hashlib
 import json
 import re
+import shlex
 
 import httpx
 
@@ -182,7 +183,19 @@ class SandboxMcpHost:
         # writable for exactly this. /tmp is always writable by `gem`.
         tmp_entry = f"/tmp/{name}.entry.json"
         tmp_hub = f"/tmp/{name}.hub.json"
+        # When a cwd is requested, ensure it exists ON THE SANDBOX before the
+        # stdio process is ever spawned there. The cwd value (e.g.
+        # ``/data/agents/{agent_id}``) is normally created by the backend's
+        # ``ensure_workspace`` and made visible to the sandbox through a shared
+        # ``/data/agents`` volume mount (see docker-compose.aio-sandbox.yml). On
+        # deployments where backend and sandbox do NOT share that mount, the
+        # directory would be missing and the stdio process would fail to start
+        # ("No such file or directory"). ``mkdir -p`` is idempotent — a harmless
+        # no-op when the shared mount already provides the directory — so it makes
+        # per-agent cwd isolation robust regardless of mount topology.
+        mkdir_prefix = f"mkdir -p {shlex.quote(cwd)}; " if cwd else ""
         merge_cmd = (
+            f"{mkdir_prefix}"
             f"echo {b64} | base64 -d > {tmp_entry}; "
             f"flock {_LOCK_FILE} -c "
             f"'jq --arg n \"{name}\" --slurpfile e {tmp_entry} "
