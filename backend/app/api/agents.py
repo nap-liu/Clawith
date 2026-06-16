@@ -371,6 +371,24 @@ async def create_agent(
     await db.flush()
     await ensure_access_granted_platform_relationships(db, agent, created_by_user_id=current_user.id)
 
+    # Seed explicit AgentTool rows from the platform default set so this agent's
+    # toolset is materialized data, not a query-time is_default fallback.
+    from app.models.tool import Tool, AgentTool
+    from app.services.tool_enablement import default_tool_ids_to_seed
+
+    _default_tools = (
+        await db.execute(
+            select(Tool).where(
+                Tool.enabled == True,            # noqa: E712
+                Tool.source == "builtin",
+                Tool.is_default == True,          # noqa: E712
+            )
+        )
+    ).scalars().all()
+    for _tool_id in default_tool_ids_to_seed(_default_tools, existing_tool_ids=set()):
+        db.add(AgentTool(agent_id=agent.id, tool_id=_tool_id, enabled=True))
+    await db.flush()
+
     # For OpenClaw agents: skip file system and container setup, generate API key
     if agent.agent_type == "openclaw":
         raw_key = f"oc-{secrets.token_urlsafe(32)}"

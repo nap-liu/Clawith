@@ -58,6 +58,7 @@ from app.services.workspace_collaboration import (
 )
 from app.core.permissions import evaluate_agent_relationship_status, evaluate_human_relationship_status
 from app.services.access_relationships import ensure_access_granted_platform_relationships
+from app.services.tool_enablement import agent_tool_enabled
 from app.config import get_settings
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
@@ -2266,7 +2267,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             for t in all_tools:
                 tid = str(t.id)
                 at = assignments.get(tid)
-                enabled = at.enabled if at else t.is_default
+                enabled = agent_tool_enabled(at)
                 if not enabled:
                     continue
 
@@ -7572,7 +7573,7 @@ async def build_cli_injection(
         wrappers: list[dict] = []
         for tool in cli_tools:
             at = assignments.get(str(tool.id))
-            if not (at.enabled if at else tool.is_default):
+            if not agent_tool_enabled(at):
                 continue
             # Skip tools whose name isn't a safe shell/env identifier (would be
             # an unsafe wrapper filename / export key).
