@@ -341,3 +341,51 @@ async def upsert_mcp_server_from_tools(
     db.add(new_srv)
     await db.flush()
     return new_srv.id
+
+
+import re as _re  # noqa: E402 — appended section
+
+
+async def get_or_create_agent_stdio_server(db, agent_id, tenant_id, cfg: dict):
+    """Create-or-reuse an agent-private stdio MCPServer from a parsed stdio cfg.
+
+    Name = "{pkgslug}-a{agent8}" so two agents installing the same package get
+    distinct servers (distinct creds, no Tool.name collision). Idempotent on name.
+    cfg keys: command(str), args(list), env(dict).
+    """
+    from app.models.mcp_server import MCPServer
+    from sqlalchemy import select
+
+    # Derive a package slug from the most descriptive arg (last non-flag) or command.
+    args = cfg.get("args") or []
+    pkg = next((a for a in reversed(args) if not str(a).startswith("-")), cfg.get("command", "mcp"))
+    pkg_slug = _re.sub(r"[^a-z0-9]+", "-", str(pkg).lower()).strip("-")[:40] or "mcp"
+    agent8 = str(agent_id).replace("-", "")[:8]
+    name = f"{pkg_slug}-a{agent8}"
+
+    existing = (await db.execute(
+        select(MCPServer).where(MCPServer.name == name)
+    )).scalar_one_or_none()
+    if existing is not None:
+        # Refresh command/args/env in case the agent changed creds/args.
+        existing.command_template = cfg.get("command")
+        existing.args_template = cfg.get("args") or []
+        existing.env_template = cfg.get("env") or {}
+        await db.flush()
+        return existing
+
+    srv = MCPServer(
+        name=name,
+        display_name=pkg_slug,
+        tenant_id=tenant_id,
+        transport="stdio",
+        command_template=cfg.get("command"),
+        args_template=cfg.get("args") or [],
+        env_template=cfg.get("env") or {},
+        base_url_template="",
+        headers_template={},
+        created_by_user_id=None,
+    )
+    db.add(srv)
+    await db.flush()
+    return srv
