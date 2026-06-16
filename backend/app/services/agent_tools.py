@@ -1577,7 +1577,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "import_mcp_server",
-            "description": "Import an MCP server so its tools become available to you. Provide ONE of: (1) mcp_config — a standard `mcpServers` JSON config, which works for both HTTP MCP servers (entry has a `url`) and stdio/npx MCP servers (entry has a `command`, e.g. `npx -y <package>`); stdio servers are hosted and started automatically in the sandbox under your own workspace. (2) mcp_url — the full http/https endpoint of a single HTTP MCP server. (3) server_id — a Smithery registry ID (use discover_resources first to find it). If previously imported tools stopped working (e.g. OAuth expired), set reauthorize=true.",
+            "description": "Import an MCP server so its tools become available to you. Provide ONE of: (1) mcp_config — a standard `mcpServers` JSON config, which works for both HTTP MCP servers (entry has a `url`) and stdio/npx MCP servers (entry has a `command`, e.g. `npx -y <package>`); stdio servers are hosted and started automatically in the sandbox under your own workspace. (2) mcp_url — the full http/https endpoint of a single HTTP MCP server. (3) server_id — a Smithery registry ID (use discover_resources first to find it). If previously imported tools stopped working (e.g. OAuth expired), set reauthorize=true. IMPORTANT: newly imported tools only enter your available-tools list on your NEXT turn — they are NOT callable in the same turn you import them. After a successful import, end your turn and tell the user the tools are ready; have them ask you to use the tools in their next message.",
             "parameters": {
                 "type": "object",
                 "properties": {

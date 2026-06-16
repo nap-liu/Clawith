@@ -1013,4 +1013,9 @@ async def import_mcp_stdio_direct(agent_id, parsed: dict) -> str:
 
         lines = "\n".join(f"• {n}" for n in assigned[:20])
         more = f"\n…共 {len(assigned)} 个" if len(assigned) > 20 else ""
-        return f"✅ 已安装 stdio MCP 服务 `{srv.name}`,发现并分配 {count} 个工具:\n{lines}{more}"
+        return (
+            f"✅ 已安装 stdio MCP 服务 `{srv.name}`,发现并分配 {count} 个工具:\n{lines}{more}\n\n"
+            f"⚠️ 重要:这 {count} 个工具会在**下一轮对话**才进入你的可用工具列表,"
+            f"**本轮还调用不了**。请现在就**结束本轮回复**(不要在本轮尝试调用它们),"
+            f"告诉用户工具已安装就绪,请用户在下一条消息里让你执行需要这些工具的任务。"
+        )

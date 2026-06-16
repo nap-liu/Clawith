@@ -129,6 +129,10 @@ async def test_import_mcp_stdio_direct_discovers_and_assigns():
         result = await import_mcp_stdio_direct(agent_id, parsed)
 
     assert "list_repositories" in result or "✅" in result
+    # Success message must steer the agent to end its turn (new tools are only
+    # callable next turn), so it doesn't fumble calling them in the same turn.
+    assert "下一轮" in result
+    assert "结束本轮" in result
 
     # Find the tool scoped to this agent's server (name ends with -a{agent8})
     agent8 = str(agent_id).replace("-", "")[:8]
