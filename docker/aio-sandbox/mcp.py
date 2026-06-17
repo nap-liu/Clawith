@@ -140,14 +140,26 @@ async def execute_mcp_tool(
         logger.error(
             f"Error executing tool '{tool_name}' on MCP server '{server_name}': {e}"
         )
+        # Patch (clawith): surface the REAL underlying error instead of masking it.
+        # The MCP call runs inside an anyio TaskGroup, so a JSON-RPC error from the
+        # server (carrying the upstream API message, e.g. "Yunxiao API error (400):
+        # invalid workitemTypeId") arrives wrapped as an ExceptionGroup whose str is
+        # just "unhandled errors in a TaskGroup". Recursively flatten to the leaf
+        # exceptions so the actual reason reaches the caller — Clawith forwards this
+        # 500 body to the LLM, which can then self-correct instead of guessing args.
+        def _flatten_exc(exc):
+            subs = getattr(exc, 'exceptions', None)
+            if subs:
+                out = []
+                for s in subs:
+                    out.extend(_flatten_exc(s))
+                return out
+            return [f'{type(exc).__name__}: {exc}']
+
+        real_error = '; '.join(_flatten_exc(e)) or str(e)
         raise HTTPException(
             status_code=500,
-            # Patch (clawith): surface the REAL underlying error (e.g. the MCP
-            # server's JSON-RPC error carrying the upstream API message like
-            # "Yunxiao API error (400): invalid workitemTypeId"). Upstream only
-            # returned a generic message and logged {e}, so the real reason was
-            # masked from the caller — the LLM flew blind and kept guessing args.
-            detail=f"Failed to execute tool '{tool_name}' on MCP server '{server_name}': {e}",
+            detail=f"Failed to execute tool '{tool_name}' on MCP server '{server_name}': {real_error}",
         )
 
 
