@@ -37,7 +37,8 @@ from app.services.session_query import (
     resolve_scope,
 )
 
-pytestmark = pytest.mark.asyncio
+# asyncio_mode = "auto" (pyproject) auto-collects async tests; no module marker
+# needed (and a marker would warn on the sync formatting test).
 
 
 @pytest.fixture(autouse=True)
@@ -259,3 +260,154 @@ async def test_fetch_messages_by_conversation_id_excludes_tool_call_and_compacte
     roles = [m.role for m in msgs]
     assert roles == ["user", "assistant"]  # ascending, tool_call + compacted excluded
     assert all("folded" not in m.content for m in msgs)
+
+
+# ── Task 3: formatting (pure, no DB) ───────────────────────────────────────
+
+
+def test_render_messages_truncates_and_caps():
+    from app.services.tools.session_introspection.formatting import (
+        TOTAL_CHARS,
+        render_messages,
+    )
+
+    class _M:
+        def __init__(self, content, ca, mid):
+            self.role = "user"
+            self.content = content
+            self.created_at = ca
+            self.id = mid
+            self.user_id = None
+            self.agent_id = None
+            self.participant_id = None
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    msgs = [_M("x" * 5000, base + timedelta(seconds=i), uuid.uuid4()) for i in range(50)]
+    out = render_messages(msgs, {"users": {}, "agents": {}, "participants": {}}, more_available=True)
+
+    assert len(out) <= TOTAL_CHARS + 3000  # total cap honored (with format slack)
+    assert "truncated" in out               # per-message truncation marker
+    assert "before=" in out                 # older-page cursor hint
+
+
+# ── Task 4 + 7: handlers + permission matrix (security regressions) ─────────
+
+from app.services.session_query import DENIAL_MSG  # noqa: E402
+from app.services.tools.session_introspection import (  # noqa: E402
+    handle_list_sessions,
+    handle_read_session_messages,
+    handle_search_sessions,
+)
+
+
+async def test_member_list_sees_only_own_human_sessions():
+    t = await _seed_tenant()
+    owner = await _seed_user(role="member", tenant_id=t.id)  # agent creator (manage)
+    member = await _seed_user(role="member", tenant_id=t.id)  # plain user (use -> OWN)
+    other = await _seed_user(role="member", tenant_id=t.id)
+    agent = await _seed_agent(owner.id, tenant_id=t.id, access_mode="company")
+    peer = await _seed_agent(owner.id, tenant_id=t.id, name="Peer")
+    mine = await _seed_session(agent.id, member.id, channel="web")
+    theirs = await _seed_session(agent.id, other.id, channel="web")
+    a2a = await _seed_session(agent.id, member.id, channel="agent", peer=peer.id)
+    trig = await _seed_session(agent.id, member.id, channel="trigger")
+
+    out = await handle_list_sessions(agent.id, member.id, str(mine.id), {})
+    assert str(mine.id) in out
+    assert str(theirs.id) not in out
+    assert str(a2a.id) not in out and str(trig.id) not in out
+
+
+async def test_admin_list_sees_all_including_a2a_and_trigger():
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id)
+    member = await _seed_user(role="member", tenant_id=t.id)
+    agent = await _seed_agent(admin.id, tenant_id=t.id, access_mode="company")
+    peer = await _seed_agent(admin.id, tenant_id=t.id, name="Peer")
+    admin_web = await _seed_session(agent.id, admin.id, channel="web")
+    member_web = await _seed_session(agent.id, member.id, channel="web")
+    a2a = await _seed_session(agent.id, admin.id, channel="agent", peer=peer.id)
+    trig = await _seed_session(agent.id, admin.id, channel="trigger")
+
+    out = await handle_list_sessions(agent.id, admin.id, str(admin_web.id), {"limit": 50})
+    for s in (admin_web, member_web, a2a, trig):
+        assert str(s.id) in out
+
+
+async def test_autonomous_context_excludes_human_archive_even_for_admin_creator():
+    """CRITICAL-2: an admin-created agent in a trigger turn must NOT inherit the
+    admin's cross-user reach into human conversations."""
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id)
+    enduser = await _seed_user(role="member", tenant_id=t.id)
+    agent = await _seed_agent(admin.id, tenant_id=t.id, access_mode="company")
+    human = await _seed_session(agent.id, enduser.id, channel="web")
+    trig = await _seed_session(agent.id, admin.id, channel="trigger")
+
+    # ctx is the trigger session -> autonomous, regardless of admin user_id
+    out = await handle_list_sessions(agent.id, admin.id, str(trig.id), {"limit": 50})
+    assert str(trig.id) in out
+    assert str(human.id) not in out  # human archive stays hidden in unattended turns
+
+
+async def test_read_other_agents_session_denied_even_for_admin():
+    """Per-agent isolation: a1 cannot read a2's session even as platform_admin."""
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id)
+    a1 = await _seed_agent(admin.id, tenant_id=t.id, name="A1")
+    a2 = await _seed_agent(admin.id, tenant_id=t.id, name="A2")
+    a1_ctx = await _seed_session(a1.id, admin.id, channel="web")
+    foreign = await _seed_session(a2.id, admin.id, channel="web")
+    await _seed_message(a2.id, admin.id, foreign.id, "user", "secret of a2")
+
+    out = await handle_read_session_messages(
+        a1.id, admin.id, str(a1_ctx.id), {"session_id": str(foreign.id)}
+    )
+    assert out == DENIAL_MSG
+
+
+async def test_member_cannot_read_other_users_session():
+    t = await _seed_tenant()
+    owner = await _seed_user(role="member", tenant_id=t.id)
+    member = await _seed_user(role="member", tenant_id=t.id)
+    other = await _seed_user(role="member", tenant_id=t.id)
+    agent = await _seed_agent(owner.id, tenant_id=t.id, access_mode="company")
+    mine = await _seed_session(agent.id, member.id, channel="web")
+    theirs = await _seed_session(agent.id, other.id, channel="web")
+    await _seed_message(agent.id, other.id, theirs.id, "user", "private to other")
+
+    out = await handle_read_session_messages(
+        agent.id, member.id, str(mine.id), {"session_id": str(theirs.id)}
+    )
+    assert out == DENIAL_MSG
+
+
+async def test_read_in_scope_returns_messages():
+    t = await _seed_tenant()
+    member = await _seed_user(role="member", tenant_id=t.id)
+    agent = await _seed_agent(member.id, tenant_id=t.id, access_mode="company")
+    mine = await _seed_session(agent.id, member.id, channel="web")
+    base = datetime.now(timezone.utc)
+    await _seed_message(agent.id, member.id, mine.id, "user", "hello there", created_at=base)
+    await _seed_message(agent.id, member.id, mine.id, "assistant", "general kenobi", created_at=base + timedelta(seconds=1))
+
+    out = await handle_read_session_messages(
+        agent.id, member.id, str(mine.id), {"session_id": str(mine.id)}
+    )
+    assert "hello there" in out and "general kenobi" in out
+
+
+async def test_search_scoped_to_own_sessions():
+    t = await _seed_tenant()
+    owner = await _seed_user(role="member", tenant_id=t.id)
+    member = await _seed_user(role="member", tenant_id=t.id)
+    other = await _seed_user(role="member", tenant_id=t.id)
+    agent = await _seed_agent(owner.id, tenant_id=t.id, access_mode="company")
+    mine = await _seed_session(agent.id, member.id, channel="web")
+    theirs = await _seed_session(agent.id, other.id, channel="web")
+    await _seed_message(agent.id, member.id, mine.id, "user", "find the WIDGET here")
+    await _seed_message(agent.id, other.id, theirs.id, "user", "another WIDGET secret")
+
+    out = await handle_search_sessions(agent.id, member.id, str(mine.id), {"query": "WIDGET"})
+    assert str(mine.id) in out
+    assert str(theirs.id) not in out

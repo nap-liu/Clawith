@@ -26,6 +26,7 @@ Key invariants enforced structurally here:
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from sqlalchemy import String, and_, cast, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,6 +56,22 @@ DENIAL_MSG = "❌ 无法访问：该会话不存在，或你无权查看。"
 # Message roles surfaced to the introspecting LLM by default (tool_call rows are
 # raw JSON noise; system rows are internal).
 _VISIBLE_ROLES = ("user", "assistant")
+
+
+def encode_cursor(msg) -> str:
+    """``before`` cursor for read pagination: ``<iso_created_at>|<message_uuid>``."""
+    return f"{msg.created_at.isoformat()}|{msg.id}"
+
+
+def decode_cursor(value: str | None):
+    """Parse a cursor back to ``(created_at, id)``; None on anything malformed."""
+    if not value:
+        return None
+    try:
+        ts, mid = value.split("|", 1)
+        return (datetime.fromisoformat(ts), uuid.UUID(mid))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def _as_uuid(value) -> uuid.UUID | None:
@@ -318,6 +335,7 @@ async def fetch_sessions(
     where,
     *,
     channel: str | None = None,
+    title_query: str | None = None,
     since=None,
     until=None,
     limit: int = 20,
@@ -327,6 +345,14 @@ async def fetch_sessions(
     conds = [where]
     if channel and channel != "all":
         conds.append(ChatSession.source_channel == channel)
+    if title_query:
+        pat = f"%{_escape_like(title_query)}%"
+        conds.append(
+            or_(
+                ChatSession.title.ilike(pat, escape="\\"),
+                ChatSession.group_name.ilike(pat, escape="\\"),
+            )
+        )
     if since is not None:
         conds.append(ChatSession.last_message_at >= since)
     if until is not None:
