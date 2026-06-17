@@ -15,8 +15,9 @@ function fmtDate(iso: string | null): string {
 function CopyButton({ text, label }: { text: string; label: string }) {
     const [copied, setCopied] = useState(false);
     const { t } = useTranslation();
+    const toast = useToast();
     const handleCopy = async () => {
-        try { await navigator.clipboard.writeText(text); } catch { return; }
+        try { await navigator.clipboard.writeText(text); } catch { toast.error(t('pat.copyFailed')); return; }
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
     };
@@ -73,9 +74,10 @@ Authorization = "Bearer ${tok}"`;
 
 function SnippetBlock({ label, code, lang }: { label: string; code: string; lang: string }) {
     const { t } = useTranslation();
+    const toast = useToast();
     const [copied, setCopied] = useState(false);
     const handleCopy = async () => {
-        try { await navigator.clipboard.writeText(code); } catch { return; }
+        try { await navigator.clipboard.writeText(code); } catch { toast.error(t('pat.copyFailed')); return; }
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
     };
@@ -135,7 +137,7 @@ function CreateModal({ onClose, onCreated }: CreateModalProps) {
             toast.success(t('pat.tokenCreated'));
             onCreated(data);
         },
-        onError: (e: any) => toast.error(e.message || 'Failed'),
+        onError: (e: any) => toast.error(e.message || t('pat.actionFailed')),
     });
 
     const labelStyle: React.CSSProperties = { display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px', color: 'var(--text-secondary)' };
@@ -152,7 +154,7 @@ function CreateModal({ onClose, onCreated }: CreateModalProps) {
             >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
                     <h3 style={{ margin: 0, fontSize: '15px' }}>{t('pat.newToken')}</h3>
-                    <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', fontSize: '18px', cursor: 'pointer', padding: '2px 6px' }}>
+                    <button onClick={onClose} aria-label={t('pat.close')} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', fontSize: '18px', cursor: 'pointer', padding: '2px 6px' }}>
                         <IconX size={16} stroke={1.75} />
                     </button>
                 </div>
@@ -217,7 +219,7 @@ function RevealModal({ pat, onClose }: RevealModalProps) {
             >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                     <h3 style={{ margin: 0, fontSize: '15px' }}>{t('pat.tokenCreated')}</h3>
-                    <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', padding: '2px 6px' }}>
+                    <button onClick={onClose} aria-label={t('pat.close')} style={{ background: 'none', border: 'none', color: 'var(--text-tertiary)', cursor: 'pointer', padding: '2px 6px' }}>
                         <IconX size={16} stroke={1.75} />
                     </button>
                 </div>
@@ -250,8 +252,7 @@ function RevealModal({ pat, onClose }: RevealModalProps) {
 
                 <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '16px' }}>
                     <button className="btn btn-primary" style={{ padding: '6px 18px', fontSize: '12px' }} onClick={onClose}>
-                        {/* Close after saving */}
-                        OK
+                        {t('pat.close')}
                     </button>
                 </div>
             </div>
@@ -279,7 +280,7 @@ export default function PatManager() {
             toast.success(t('pat.tokenRevoked'));
             queryClient.invalidateQueries({ queryKey: ['pats'] });
         },
-        onError: (e: any) => toast.error(e.message || 'Failed'),
+        onError: (e: any) => toast.error(e.message || t('pat.actionFailed')),
     });
 
     const handleRevoke = (pat: Pat) => {
