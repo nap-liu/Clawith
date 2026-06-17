@@ -24,7 +24,6 @@ from app.models.org import AgentRelationship, AgentAgentRelationship, OrgMember
 from app.models.user import Identity, User
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.org_sync_adapter import derive_member_department_paths
-from app.services.storage import store_agent_bytes
 
 router = APIRouter(prefix="/agents/{agent_id}/relationships", tags=["relationships"])
 
@@ -57,10 +56,6 @@ def _display_provider_name(provider_name: str | None, provider_type: str | None)
     if (provider_type or "").lower() in ("web", "platform") or (provider_name or "").lower() == "web":
         return "Platform"
     return provider_name
-
-
-async def _can_manage_agent(db: AsyncSession, user_id: uuid.UUID, agent: Agent) -> bool:
-    return (await get_agent_access_level_for_user_id(db, user_id, agent)) == "manage"
 
 
 async def _get_valid_member_user_id(

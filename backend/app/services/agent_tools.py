@@ -67,11 +67,8 @@ from app.core.permissions import evaluate_agent_relationship_status, evaluate_hu
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.config import get_settings
 from app.services.llm.finish import (
-    FINISH_PROTOCOL_REMINDER,
     FINISH_TOOL_DEFINITION,
     FINISH_TOOL_NAME,
-    find_finish_call,
-    parse_tool_arguments,
 )
 
 

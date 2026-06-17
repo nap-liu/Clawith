@@ -21,7 +21,6 @@ from app.database import async_session
 from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
 from app.services.trigger_runtime.evaluator import (
-    evaluate_trigger as evaluate_trigger_runtime,
     handle_okr_collection_trigger as handle_okr_collection_trigger_runtime,
     handle_okr_report_trigger as handle_okr_report_trigger_runtime,
     mark_trigger_fired as mark_trigger_fired_runtime,
