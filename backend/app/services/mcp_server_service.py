@@ -27,6 +27,10 @@ class ResolvedMCPConfig:
     headers_template: dict
     credential_template: str | None
     prompt_blocks: list[str]
+    transport: str = "http"
+    command_template: str | None = None
+    args_template: list | None = None
+    env_template: dict | None = None
 
 
 def _override_pick(*candidates):
@@ -67,11 +71,32 @@ def compose_runtime_config(
         server.credential_template,
     )
 
+    transport = getattr(server, "transport", "http") or "http"
+    command_template = _override_pick(
+        getattr(agent_override, "command_template", None) if agent_override else None,
+        getattr(tenant_override, "command_template", None) if tenant_override else None,
+        getattr(server, "command_template", None),
+    )
+    args_template = _override_pick(
+        getattr(agent_override, "args_template", None) if agent_override else None,
+        getattr(tenant_override, "args_template", None) if tenant_override else None,
+        getattr(server, "args_template", None),
+    )
+    env_template = _override_pick(
+        getattr(agent_override, "env_template", None) if agent_override else None,
+        getattr(tenant_override, "env_template", None) if tenant_override else None,
+        getattr(server, "env_template", None),
+    )
+
     return ResolvedMCPConfig(
         url_template=url_template,
         headers_template=headers_template,
         credential_template=credential_template,
         prompt_blocks=prompt_blocks,
+        transport=transport,
+        command_template=command_template,
+        args_template=args_template,
+        env_template=env_template,
     )
 
 
@@ -186,6 +211,68 @@ def _slugify_server_name(name: str) -> str:
     return s or "mcp_server"
 
 
+async def persist_stdio_discovered_tools(
+    db,
+    srv,
+    tools: list[dict],
+) -> int:
+    """Upsert Tool rows for tools discovered from a stdio MCP server.
+
+    Idempotent: keyed on (mcp_server_id, mcp_tool_name).  Re-running discovery
+    updates description/parameters_schema but never creates duplicates.
+
+    Naming scheme: ``mcp_{srv.name}_{raw_tool_name}`` — matches the convention
+    used by the HTTP MCP flow (see test_tools_mcp_server_bridge.py fixture).
+    ``Tool.name`` is globally unique, so srv.name (unique per tenant in
+    mcp_servers) makes collisions across servers impossible.
+
+    Returns the number of tools persisted.
+    """
+    from app.models.tool import Tool
+    from sqlalchemy import select
+
+    upserted = 0
+    for t in tools:
+        raw_name: str = t.get("name") or ""
+        description: str = t.get("description") or ""
+        input_schema: dict = t.get("inputSchema") or {}
+        if not raw_name:
+            continue
+
+        tool_name = f"mcp_{srv.name}_{raw_name}"
+        display_name = raw_name.replace("_", " ").title()
+
+        existing = (await db.execute(
+            select(Tool).where(
+                Tool.mcp_server_id == srv.id,
+                Tool.mcp_tool_name == raw_name,
+            )
+        )).scalar_one_or_none()
+
+        if existing is not None:
+            # Update mutable fields; do not reset name to avoid breakage
+            existing.description = description
+            existing.parameters_schema = input_schema
+        else:
+            new_tool = Tool(
+                name=tool_name,
+                display_name=display_name,
+                description=description,
+                type="mcp",
+                source="admin",
+                tenant_id=srv.tenant_id,
+                mcp_server_id=srv.id,
+                mcp_server_name=srv.name,
+                mcp_tool_name=raw_name,
+                parameters_schema=input_schema,
+            )
+            db.add(new_tool)
+        upserted += 1
+
+    await db.flush()
+    return upserted
+
+
 async def upsert_mcp_server_from_tools(
     db,
     tenant_id: uuid.UUID | None,
@@ -254,3 +341,52 @@ async def upsert_mcp_server_from_tools(
     db.add(new_srv)
     await db.flush()
     return new_srv.id
+
+
+async def get_or_create_agent_stdio_server(db, agent_id, tenant_id, cfg: dict):
+    """Create-or-reuse an agent-private stdio MCPServer from a parsed stdio cfg.
+
+    Name = "{pkgslug}-a{agent8}" so two agents installing the same package get
+    distinct servers (distinct creds, no Tool.name collision). Idempotent on name.
+    cfg keys: command(str), args(list), env(dict).
+    """
+    from app.models.mcp_server import MCPServer
+    from sqlalchemy import select
+
+    # Derive a package slug from the most descriptive arg (last non-flag) or command.
+    args = cfg.get("args") or []
+    pkg = next((a for a in reversed(args) if not str(a).startswith("-")), cfg.get("command", "mcp"))
+    pkg_slug = re.sub(r"[^a-z0-9]+", "-", str(pkg).lower()).strip("-")[:40] or "mcp"
+    agent8 = str(agent_id).replace("-", "")[:8]
+    name = f"{pkg_slug}-a{agent8}"
+
+    existing = (await db.execute(
+        select(MCPServer).where(
+            MCPServer.name == name,
+            (MCPServer.tenant_id == tenant_id) if tenant_id is not None
+            else MCPServer.tenant_id.is_(None),
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        # Refresh command/args/env in case the agent changed creds/args.
+        existing.command_template = cfg.get("command")
+        existing.args_template = cfg.get("args") or []
+        existing.env_template = cfg.get("env") or {}
+        await db.flush()
+        return existing
+
+    srv = MCPServer(
+        name=name,
+        display_name=pkg_slug,
+        tenant_id=tenant_id,
+        transport="stdio",
+        command_template=cfg.get("command"),
+        args_template=cfg.get("args") or [],
+        env_template=cfg.get("env") or {},
+        base_url_template="",
+        headers_template={},
+        created_by_user_id=None,
+    )
+    db.add(srv)
+    await db.flush()
+    return srv

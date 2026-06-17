@@ -169,16 +169,19 @@ async def cli_inject_session(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_build_inject_for_agent_renders_cli_tools(cli_inject_session, monkeypatch, tmp_path):
+async def test_build_inject_for_agent_renders_cli_tools(cli_inject_session_agents, monkeypatch, tmp_path):
+    import uuid as _uuid_mod
     from app.models.user import Identity, User
-    from app.models.tool import Tool
+    from app.models.tool import Tool, AgentTool
     from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
 
     monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
     monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
 
-    async with cli_inject_session() as s:
+    agent_id = _uuid_mod.uuid4()
+
+    async with cli_inject_session_agents() as s:
         # User model uses association_proxy → Identity for email/phone.
         identity = Identity(email="u@x.com", phone="13800000000", password_hash="x")
         s.add(identity)
@@ -203,10 +206,18 @@ async def test_build_inject_for_agent_renders_cli_tools(cli_inject_session, monk
             config_schema={},
         )
         s.add(tool)
-        await s.commit()
+        await s.flush()
         tid = tool.id
+        # Raw-insert the agent row (TEXT columns, hex UUID format for SQLite).
+        await s.execute(
+            text("INSERT INTO agents (id, tenant_id) VALUES (:id, :tid)"),
+            {"id": agent_id.hex, "tid": None},
+        )
+        # Explicit AgentTool row — explicit-only model: no row = not enabled.
+        s.add(AgentTool(agent_id=agent_id, tool_id=tid, enabled=True))
+        await s.commit()
 
-    injection = await build_cli_injection(agent_id=None, user_id=uid)
+    injection = await build_cli_injection(agent_id=agent_id, user_id=uid)
     assert injection is not None
     # Per-session isolation shape: each wrapper carries its OWN tool's identity
     # env (no merged top-level env that would leak across tools/conversations).
@@ -222,16 +233,19 @@ async def test_build_inject_for_agent_renders_cli_tools(cli_inject_session, monk
 
 
 @pytest.mark.asyncio
-async def test_build_cli_injection_only_tool_names_filters(cli_inject_session, monkeypatch, tmp_path):
+async def test_build_cli_injection_only_tool_names_filters(cli_inject_session_agents, monkeypatch, tmp_path):
+    import uuid as _uuid_mod
     from app.models.user import Identity, User
-    from app.models.tool import Tool
+    from app.models.tool import Tool, AgentTool
     from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
 
     monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
     monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
 
-    async with cli_inject_session() as s:
+    agent_id = _uuid_mod.uuid4()
+
+    async with cli_inject_session_agents() as s:
         identity = Identity(email="u2@x.com", phone="13800000001", password_hash="x")
         s.add(identity)
         await s.flush()
@@ -239,8 +253,9 @@ async def test_build_cli_injection_only_tool_names_filters(cli_inject_session, m
         s.add(user)
         await s.flush()
         uid = user.id
+        tool_ids = {}
         for nm in ("svc", "foo"):
-            s.add(Tool(
+            t = Tool(
                 name=nm, display_name=nm, description=f"{nm} CLI", type="cli",
                 category="cli", icon="🔧", source="admin", enabled=True, is_default=True,
                 parameters_schema={},
@@ -249,14 +264,25 @@ async def test_build_cli_injection_only_tool_names_filters(cli_inject_session, m
                     "env": {"YYBPC_CLI_USER_PHONE": "$user.phone"},
                 },
                 config_schema={},
-            ))
+            )
+            s.add(t)
+            await s.flush()
+            tool_ids[nm] = t.id
+        # Raw-insert agent row.
+        await s.execute(
+            text("INSERT INTO agents (id, tenant_id) VALUES (:id, :tid)"),
+            {"id": agent_id.hex, "tid": None},
+        )
+        # Explicit AgentTool rows for both tools — filtering is independent of enablement.
+        for nm in ("svc", "foo"):
+            s.add(AgentTool(agent_id=agent_id, tool_id=tool_ids[nm], enabled=True))
         await s.commit()
 
-    injection_all = await build_cli_injection(agent_id=None, user_id=uid)
+    injection_all = await build_cli_injection(agent_id=agent_id, user_id=uid)
     all_names = [w["name"] for w in injection_all["wrappers"]]
     assert "svc" in all_names and "foo" in all_names
 
-    injection_one = await build_cli_injection(agent_id=None, user_id=uid, only_tool_names={"svc"})
+    injection_one = await build_cli_injection(agent_id=agent_id, user_id=uid, only_tool_names={"svc"})
     one_names = [w["name"] for w in injection_one["wrappers"]]
     assert "svc" in one_names and "foo" not in one_names
 
@@ -317,28 +343,36 @@ async def llm_tools_session(monkeypatch):
 async def test_cli_tool_is_standalone_function_not_folded(llm_tools_session):
     """A CLI tool with a binary surfaces as its own LLM function (with a
     `command` param) and is NOT folded into execute_code_aio's description."""
-    from app.models.tool import Tool
+    from app.models.tool import Tool, AgentTool
     from app.services.agent_tools import get_agent_tools_for_llm
 
+    agent_id = _uuid.uuid4()
+
     async with llm_tools_session() as s:
-        s.add(Tool(
+        svc_tool = Tool(
             name="svc", display_name="黄鹤楼主档",
             description="数据查询 CLI。report 是唯一数据来源。",
             type="cli", category="cli", icon="🔧", source="admin", enabled=True,
             is_default=True, parameters_schema={},
             config={"binary": {"sha256": "a" * 64, "size": 10, "original_name": "svc"}},
             config_schema={},
-        ))
-        s.add(Tool(
+        )
+        aio_tool = Tool(
             name="execute_code_aio", display_name="Sandbox",
             description="Run code in sandbox.", type="builtin", category="code",
             icon="💻", source="builtin", enabled=True, is_default=True,
             parameters_schema={"type": "object", "properties": {}},
             config={}, config_schema={},
-        ))
+        )
+        s.add(svc_tool)
+        s.add(aio_tool)
+        await s.flush()
+        # Explicit AgentTool rows — explicit-only model: no row = not enabled.
+        s.add(AgentTool(agent_id=agent_id, tool_id=svc_tool.id, enabled=True))
+        s.add(AgentTool(agent_id=agent_id, tool_id=aio_tool.id, enabled=True))
         await s.commit()
 
-    tools = await get_agent_tools_for_llm(_uuid.uuid4())
+    tools = await get_agent_tools_for_llm(agent_id)
     names = [t["function"]["name"] for t in tools]
     # svc is now a standalone LLM function, not folded into aio.
     assert "svc" in names
@@ -354,37 +388,51 @@ async def test_cli_tool_is_standalone_function_not_folded(llm_tools_session):
 
 @pytest.mark.asyncio
 async def test_cli_tool_without_binary_not_surfaced(llm_tools_session):
-    """A CLI tool with no uploaded binary does not appear as an LLM function."""
-    from app.models.tool import Tool
+    """A CLI tool with no uploaded binary does not appear as an LLM function.
+
+    The AgentTool row is explicitly present (enabled=True) so this test proves
+    the no-binary guard — not the absence-of-row path — is what excludes it.
+    """
+    from app.models.tool import Tool, AgentTool
     from app.services.agent_tools import get_agent_tools_for_llm
 
+    agent_id = _uuid.uuid4()
+
     async with llm_tools_session() as s:
-        s.add(Tool(
+        svc_tool = Tool(
             name="svc", display_name="svc", description="no binary yet",
             type="cli", category="cli", icon="🔧", source="admin", enabled=True,
             is_default=True, parameters_schema={}, config={}, config_schema={},
-        ))
-        s.add(Tool(
+        )
+        aio_tool = Tool(
             name="execute_code_aio", display_name="Sandbox",
             description="Run code in sandbox.", type="builtin", category="code",
             icon="💻", source="builtin", enabled=True, is_default=True,
             parameters_schema={"type": "object", "properties": {}},
             config={}, config_schema={},
-        ))
+        )
+        s.add(svc_tool)
+        s.add(aio_tool)
+        await s.flush()
+        # Explicit AgentTool row — the cli tool IS enabled for this agent so that
+        # the no-binary guard (not the no-row path) is what excludes it from LLM tools.
+        s.add(AgentTool(agent_id=agent_id, tool_id=svc_tool.id, enabled=True))
+        s.add(AgentTool(agent_id=agent_id, tool_id=aio_tool.id, enabled=True))
         await s.commit()
 
-    tools = await get_agent_tools_for_llm(_uuid.uuid4())
+    tools = await get_agent_tools_for_llm(agent_id)
     names = [t["function"]["name"] for t in tools]
     assert "svc" not in names
 
 
 @pytest.mark.asyncio
-async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session, monkeypatch, tmp_path):
+async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session_agents, monkeypatch, tmp_path):
     """Trigger/cron and A2A pass the agent creator's User PK as user_id;
     svc binds to the creator's phone (digital employee acts on its owner's
     behalf). Confirmed product semantics — NOT identity-less for autonomous
     origins. Guards against regressing to the old (wrong) NOT_LOGGED_IN spec."""
-    from app.models.tool import Tool
+    import uuid as _uuid_mod
+    from app.models.tool import Tool, AgentTool
     from app.models.user import Identity, User
     from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
@@ -392,7 +440,9 @@ async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session, 
     monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
     monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
 
-    async with cli_inject_session() as s:
+    agent_id = _uuid_mod.uuid4()
+
+    async with cli_inject_session_agents() as s:
         # User model uses association_proxy → Identity for email/phone.
         identity = Identity(email="creator@x.com", phone="13900000000", password_hash="x")
         s.add(identity)
@@ -401,18 +451,27 @@ async def test_creator_identity_bound_for_autonomous_origin(cli_inject_session, 
         s.add(creator)
         await s.flush()
         creator_id = creator.id
-        s.add(Tool(
+        tool = Tool(
             name="svc", display_name="svc", description="d", type="cli",
             category="cli", icon="🔧", source="admin", enabled=True, is_default=True,
             parameters_schema={},
             config={"binary": {"sha256": "a" * 64, "size": 1, "original_name": "svc"},
                     "env": {"YYBPC_CLI_USER_PHONE": "$user.phone", "YYBPC_CLI_HOME": "$state.dir"}},
             config_schema={},
-        ))
+        )
+        s.add(tool)
+        await s.flush()
+        # Raw-insert agent row (hex UUID for SQLite TEXT column).
+        await s.execute(
+            text("INSERT INTO agents (id, tenant_id) VALUES (:id, :tid)"),
+            {"id": agent_id.hex, "tid": None},
+        )
+        # Explicit AgentTool row — explicit-only model: no row = not enabled.
+        s.add(AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True))
         await s.commit()
 
     # Autonomous origin passes the creator's User PK (as heartbeat.py / A2A do).
-    injection = await build_cli_injection(agent_id=None, user_id=creator_id)
+    injection = await build_cli_injection(agent_id=agent_id, user_id=creator_id)
     assert injection is not None
     # creator identity must be bound (on the svc wrapper), not dropped
     svc_wrapper = next(w for w in injection["wrappers"] if w["name"] == "svc")
@@ -518,7 +577,7 @@ async def test_cross_tenant_admin_tool_not_injected(cli_inject_session_agents, m
 async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkeypatch, tmp_path):
     """Admin cli tool scoped to tenant A IS injected into an agent from tenant A."""
     import uuid as _uuid_mod
-    from app.models.tool import Tool
+    from app.models.tool import Tool, AgentTool
     from app.services.agent_tools import build_cli_injection
     from app.services.cli_tools import state_storage as ss_mod
 
@@ -529,7 +588,7 @@ async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkey
     agent_a_id = _uuid_mod.uuid4()
 
     async with cli_inject_session_agents() as s:
-        s.add(Tool(
+        tool_a = Tool(
             name="svc_a", display_name="svc_a", description="tenant-A CLI",
             type="cli", category="cli", icon="🔧", source="admin", enabled=True,
             is_default=True, parameters_schema={},
@@ -539,13 +598,17 @@ async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkey
             },
             config_schema={},
             tenant_id=tenant_a,
-        ))
-        await s.commit()
+        )
+        s.add(tool_a)
+        await s.flush()
+        tool_a_id = tool_a.id
         # Use hex format so the UUID column lookup finds the row.
         await s.execute(
             text("INSERT INTO agents (id, tenant_id) VALUES (:id, :tid)"),
             {"id": agent_a_id.hex, "tid": tenant_a.hex},
         )
+        # Explicit AgentTool row — explicit-only model: no row = not enabled.
+        s.add(AgentTool(agent_id=agent_a_id, tool_id=tool_a_id, enabled=True))
         await s.commit()
 
     injection_a = await build_cli_injection(agent_id=agent_a_id, user_id=None)
@@ -564,20 +627,31 @@ async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkey
 async def test_cli_tool_no_aio_graceful_degrade(llm_tools_session):
     """When an agent has a cli tool enabled but execute_code_aio is NOT in the
     tool list, get_agent_tools_for_llm must not raise and must not surface the
-    cli tool as an LLM function (graceful degrade, D3-1)."""
-    from app.models.tool import Tool
+    cli tool as an LLM function (graceful degrade, D3-1).
+
+    The AgentTool row is explicitly present (enabled=True) so this test proves
+    the missing-aio guard — not the absence-of-row path — is what excludes it.
+    """
+    from app.models.tool import Tool, AgentTool
     from app.services.agent_tools import get_agent_tools_for_llm
 
+    agent_id = _uuid.uuid4()
+
     async with llm_tools_session() as s:
-        s.add(Tool(
+        svc_tool = Tool(
             name="svc", display_name="svc", description="CLI only, no aio in this agent",
             type="cli", category="cli", icon="🔧", source="admin", enabled=True,
             is_default=True, parameters_schema={}, config={}, config_schema={},
-        ))
+        )
+        s.add(svc_tool)
         # Intentionally do NOT add execute_code_aio.
+        await s.flush()
+        # Explicit AgentTool row — the cli tool IS enabled for this agent so that
+        # the missing-aio guard (not the no-row path) is what excludes it from LLM tools.
+        s.add(AgentTool(agent_id=agent_id, tool_id=svc_tool.id, enabled=True))
         await s.commit()
 
-    tools = await get_agent_tools_for_llm(_uuid.uuid4())
+    tools = await get_agent_tools_for_llm(agent_id)
     names = [t["function"]["name"] for t in tools]
     assert "svc" not in names, "cli tool must not appear as an LLM function"
     # execute_code_aio is absent — no description to check; just verify no crash.

@@ -17,6 +17,7 @@ import OkrTab from './enterprise-settings/tabs/OkrTab';
 import LlmTab from './enterprise-settings/tabs/LlmTab';
 import EnterpriseKBBrowser from './enterprise-settings/components/EnterpriseKBBrowser';
 import { A2AAsyncToggle, CompanyLogoEditor, CompanyNameEditor, CompanyTimezoneEditor } from './enterprise-settings/components/CompanyInfoEditors';
+import { mcpServersApi } from '../services/mcpServers';
 import {
     IconBrowser,
     IconBulb,
@@ -226,6 +227,8 @@ export default function EnterpriseSettings() {
     const [mcpRawInput, setMcpRawInput] = useState('');
     const [mcpTestResult, setMcpTestResult] = useState<any>(null);
     const [mcpTesting, setMcpTesting] = useState(false);
+    // Parsed stdio entries from the textarea: [{name, command, args, env}]
+    const [mcpStdioEntries, setMcpStdioEntries] = useState<Array<{name: string; command: string; args: string[]; env: Record<string, string>}>>([]);
     // Edit Server modal state — null when closed, otherwise the server to edit.
     // server_id is the FK from tools.mcp_server_id; using it directly avoids fragile
     // base_url_template string matching (host.docker.internal vs in-cluster names diverge).
@@ -947,69 +950,141 @@ export default function EnterpriseSettings() {
                                             <textarea className="form-input" value={mcpRawInput} onChange={e => {
                                                 const val = e.target.value;
                                                 setMcpRawInput(val);
-                                                // Auto-parse JSON config format
+                                                setMcpStdioEntries([]);
+                                                // Auto-detect and parse MCP config
+                                                const slugify = (s: string) => s.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'mcp-server';
                                                 try {
                                                     const parsed = JSON.parse(val);
-                                                    const servers = parsed.mcpServers || parsed;
+                                                    const servers = parsed.mcpServers || (typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {});
                                                     const names = Object.keys(servers);
                                                     if (names.length > 0) {
-                                                        const name = names[0];
-                                                        const cfg = servers[name];
-                                                        const url = cfg.url || cfg.uri || '';
-                                                        setMcpForm(p => ({ ...p, server_name: name, server_url: url }));
+                                                        // Check first entry to detect type; multi-entry handled at submit
+                                                        const firstCfg = servers[names[0]];
+                                                        const hasCommand = typeof firstCfg?.command === 'string' && !firstCfg?.url;
+                                                        if (hasCommand) {
+                                                            // stdio — collect all entries
+                                                            const entries = names.map(n => ({
+                                                                name: slugify(n),
+                                                                command: servers[n].command as string,
+                                                                args: Array.isArray(servers[n].args) ? servers[n].args as string[] : [],
+                                                                env: (servers[n].env && typeof servers[n].env === 'object') ? servers[n].env as Record<string, string> : {},
+                                                            }));
+                                                            setMcpStdioEntries(entries);
+                                                            // Show first entry name so the preview badge appears
+                                                            setMcpForm(p => ({ ...p, server_name: entries[0].name, server_url: '' }));
+                                                        } else {
+                                                            // http/sse
+                                                            const name = names[0];
+                                                            const cfg = servers[name];
+                                                            const url = cfg.url || cfg.uri || '';
+                                                            setMcpStdioEntries([]);
+                                                            setMcpForm(p => ({ ...p, server_name: name, server_url: url }));
+                                                        }
                                                     }
                                                 } catch {
                                                     // Not JSON — treat as plain URL
-                                                    setMcpForm(p => ({ ...p, server_url: val }));
+                                                    setMcpStdioEntries([]);
+                                                    setMcpForm(p => ({ ...p, server_url: val.trim() }));
                                                 }
-                                            }} placeholder={'{\n  "mcpServers": {\n    "server-name": {\n      "type": "sse",\n      "url": "https://mcp.example.com/sse"\n    }\n  }\n}\n\nor paste a URL directly'} style={{ minHeight: '120px', fontFamily: 'var(--font-mono)', fontSize: '12px', resize: 'vertical' }} />
+                                            }} placeholder={'{\n  "mcpServers": {\n    "server-name": {\n      "command": "npx",\n      "args": ["-y", "some-mcp-server"]\n    }\n  }\n}\n\n粘贴 MCP 配置(URL 或 npx 命令 JSON 均可,平台自动识别类型)'} style={{ minHeight: '120px', fontFamily: 'var(--font-mono)', fontSize: '12px', resize: 'vertical' }} />
                                         </div>
-                                        {mcpForm.server_name && (
+                                        {mcpStdioEntries.length > 0 && (
+                                            <div style={{ padding: '8px 12px', background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.18)', borderRadius: '6px', fontSize: '12px' }}>
+                                                <span style={{ color: 'var(--text-primary)', fontWeight: 600 }}>检测到 stdio/npx 服务器 ({mcpStdioEntries.length} 个):</span>
+                                                {mcpStdioEntries.map((e, i) => (
+                                                    <div key={i} style={{ marginTop: '4px', color: 'var(--text-secondary)' }}>
+                                                        <strong>{e.name}</strong> — <code style={{ fontSize: '11px' }}>{e.command} {e.args.slice(0, 3).join(' ')}</code>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                        {mcpStdioEntries.length === 0 && mcpForm.server_name && (
                                             <div style={{ display: 'flex', gap: '12px', fontSize: '12px', color: 'var(--text-secondary)', padding: '8px 12px', background: 'var(--bg-tertiary)', borderRadius: '6px' }}>
                                                 <span>Name: <strong>{mcpForm.server_name}</strong></span>
                                                 <span>URL: <strong>{mcpForm.server_url}</strong></span>
                                             </div>
                                         )}
-                                        {!mcpForm.server_name && (
+                                        {mcpStdioEntries.length === 0 && !mcpForm.server_name && (
                                             <div>
                                                 <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>{t('enterprise.tools.mcpServerName')}</label>
                                                 <input className="form-input" value={mcpForm.server_name} onChange={e => setMcpForm(p => ({ ...p, server_name: e.target.value }))} placeholder="My MCP Server" />
                                             </div>
                                         )}
 
-                                        {/* Optional standalone API Key — sent as Authorization: Bearer */}
-                                        <div>
-                                            <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>
-                                                API Key <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>(optional)</span>
-                                            </label>
-                                            <input
-                                                type="password"
-                                                className="form-input"
-                                                value={mcpForm.api_key}
-                                                onChange={e => setMcpForm(p => ({ ...p, api_key: e.target.value }))}
-                                                placeholder="Leave blank if the key is already embedded in the URL"
-                                                autoComplete="new-password"
-                                            />
-                                        </div>
+                                        {/* Optional standalone API Key — only relevant for http/sse servers */}
+                                        {mcpStdioEntries.length === 0 && (
+                                            <>
+                                                <div>
+                                                    <label style={{ display: 'block', fontSize: '12px', marginBottom: '4px' }}>
+                                                        API Key <span style={{ color: 'var(--text-tertiary)', fontWeight: 400 }}>(optional)</span>
+                                                    </label>
+                                                    <input
+                                                        type="password"
+                                                        className="form-input"
+                                                        value={mcpForm.api_key}
+                                                        onChange={e => setMcpForm(p => ({ ...p, api_key: e.target.value }))}
+                                                        placeholder="Leave blank if the key is already embedded in the URL"
+                                                        autoComplete="new-password"
+                                                    />
+                                                </div>
 
-                                        {/* Auth explanation for non-obvious behavior */}
-                                        <div style={{ padding: '10px 12px', background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.18)', borderRadius: '6px', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.65' }}>
-                                            <div style={{ fontWeight: 600, marginBottom: '4px', color: 'var(--text-primary)' }}>How authentication works</div>
-                                            <div>- If your MCP server embeds the key in the URL (e.g. Tavily uses <code style={{ background: 'rgba(0,0,0,0.06)', padding: '0 3px', borderRadius: '3px' }}>?tavilyApiKey=xxx</code>), leave the field above blank.</div>
-                                            <div>- For servers that use <strong>Bearer token</strong> auth, enter the key here. It is sent as <code style={{ background: 'rgba(0,0,0,0.06)', padding: '0 3px', borderRadius: '3px' }}>Authorization: Bearer ...</code> on every request.</div>
-                                            <div>- If both are provided, the API Key field takes priority. All keys are stored encrypted.</div>
-                                        </div>
+                                                {/* Auth explanation for non-obvious behavior */}
+                                                <div style={{ padding: '10px 12px', background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.18)', borderRadius: '6px', fontSize: '11px', color: 'var(--text-secondary)', lineHeight: '1.65' }}>
+                                                    <div style={{ fontWeight: 600, marginBottom: '4px', color: 'var(--text-primary)' }}>How authentication works</div>
+                                                    <div>- If your MCP server embeds the key in the URL (e.g. Tavily uses <code style={{ background: 'rgba(0,0,0,0.06)', padding: '0 3px', borderRadius: '3px' }}>?tavilyApiKey=xxx</code>), leave the field above blank.</div>
+                                                    <div>- For servers that use <strong>Bearer token</strong> auth, enter the key here. It is sent as <code style={{ background: 'rgba(0,0,0,0.06)', padding: '0 3px', borderRadius: '3px' }}>Authorization: Bearer ...</code> on every request.</div>
+                                                    <div>- If both are provided, the API Key field takes priority. All keys are stored encrypted.</div>
+                                                </div>
+                                            </>
+                                        )}
 
                                         <div style={{ display: 'flex', gap: '8px' }}>
-                                            <button className="btn btn-secondary" disabled={mcpTesting || !mcpForm.server_url} onClick={async () => {
-                                                setMcpTesting(true); setMcpTestResult(null);
-                                                try {
-                                                    const r = await fetchJson<any>('/tools/test-mcp', { method: 'POST', body: JSON.stringify({ server_url: mcpForm.server_url, api_key: mcpForm.api_key || undefined }) });
-                                                    setMcpTestResult(r);
-                                                } catch (e: any) { setMcpTestResult({ ok: false, error: e.message }); }
-                                                setMcpTesting(false);
-                                            }}>{mcpTesting ? t('enterprise.tools.testing') : t('enterprise.tools.testConnection')}</button>
-                                            <button className="btn btn-secondary" onClick={() => { setShowAddMCP(false); setMcpTestResult(null); setMcpForm({ server_url: '', server_name: '', api_key: '' }); setMcpRawInput(''); }}>{t('common.cancel')}</button>
+                                            {mcpStdioEntries.length > 0 ? (
+                                                <button className="btn btn-primary" disabled={mcpTesting} onClick={async () => {
+                                                    setMcpTesting(true);
+                                                    const results: string[] = [];
+                                                    for (const entry of mcpStdioEntries) {
+                                                        try {
+                                                            const created = await mcpServersApi.create({
+                                                                name: entry.name,
+                                                                display_name: entry.name,
+                                                                transport: 'stdio',
+                                                                base_url_template: '',
+                                                                command_template: entry.command,
+                                                                args_template: entry.args,
+                                                                env_template: entry.env,
+                                                                tenant_id: selectedTenantId || undefined,
+                                                            });
+                                                            // Best-effort discovery — never blocks create
+                                                            try {
+                                                                const conn = await mcpServersApi.testConnection(created.id);
+                                                                if (conn.success) {
+                                                                    results.push(`✓ ${entry.name}: 已创建,发现工具`);
+                                                                } else {
+                                                                    results.push(`✓ ${entry.name}: 已创建;沙箱暂不可达,工具将在沙箱就绪后出现`);
+                                                                }
+                                                            } catch {
+                                                                results.push(`✓ ${entry.name}: 已创建;沙箱暂不可达,工具将在沙箱就绪后出现`);
+                                                            }
+                                                        } catch (e: any) {
+                                                            results.push(`✗ ${entry.name}: ${e.message}`);
+                                                        }
+                                                    }
+                                                    setMcpTesting(false);
+                                                    setShowAddMCP(false); setMcpTestResult(null); setMcpForm({ server_url: '', server_name: '', api_key: '' }); setMcpRawInput(''); setMcpStdioEntries([]);
+                                                    toast.success(results.join('\n'));
+                                                }}>{mcpTesting ? '创建中...' : `创建 MCP 服务器 (${mcpStdioEntries.length})`}</button>
+                                            ) : (
+                                                <button className="btn btn-secondary" disabled={mcpTesting || !mcpForm.server_url} onClick={async () => {
+                                                    setMcpTesting(true); setMcpTestResult(null);
+                                                    try {
+                                                        const r = await fetchJson<any>('/tools/test-mcp', { method: 'POST', body: JSON.stringify({ server_url: mcpForm.server_url, api_key: mcpForm.api_key || undefined }) });
+                                                        setMcpTestResult(r);
+                                                    } catch (e: any) { setMcpTestResult({ ok: false, error: e.message }); }
+                                                    setMcpTesting(false);
+                                                }}>{mcpTesting ? t('enterprise.tools.testing') : t('enterprise.tools.testConnection')}</button>
+                                            )}
+                                            <button className="btn btn-secondary" onClick={() => { setShowAddMCP(false); setMcpTestResult(null); setMcpForm({ server_url: '', server_name: '', api_key: '' }); setMcpRawInput(''); setMcpStdioEntries([]); }}>{t('common.cancel')}</button>
                                         </div>
                                         {mcpTestResult && (
                                             <div className="card" style={{ padding: '12px', background: mcpTestResult.ok ? 'rgba(0,200,100,0.1)' : 'rgba(255,0,0,0.1)' }}>

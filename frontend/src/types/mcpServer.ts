@@ -3,12 +3,16 @@ export interface MCPServer {
   tenant_id: string | null;
   name: string;
   display_name: string;
+  transport?: 'http' | 'stdio';
   base_url_template: string;
   headers_template: Record<string, string>;
   credential_state: 'set' | 'unset';
   system_prompt_block: string | null;
   instructions: string | null;
   instructions_captured_at: string | null;
+  command_template?: string | null;
+  args_template?: string[] | null;
+  env_template?: Record<string, string> | null;
   created_at: string;
   updated_at: string;
 }
@@ -16,19 +20,27 @@ export interface MCPServer {
 export interface MCPServerCreatePayload {
   name: string;
   display_name: string;
-  base_url_template: string;
-  headers_template?: Record<string, string>;
-  credential_template?: string | null;
-  system_prompt_block?: string | null;
-  tenant_id?: string | null;
-}
-
-export interface MCPServerUpdatePayload {
-  display_name?: string;
+  transport?: 'http' | 'stdio';
   base_url_template?: string;
   headers_template?: Record<string, string>;
   credential_template?: string | null;
   system_prompt_block?: string | null;
+  tenant_id?: string | null;
+  command_template?: string | null;
+  args_template?: string[] | null;
+  env_template?: Record<string, string> | null;
+}
+
+export interface MCPServerUpdatePayload {
+  display_name?: string;
+  transport?: 'http' | 'stdio';
+  base_url_template?: string;
+  headers_template?: Record<string, string>;
+  credential_template?: string | null;
+  system_prompt_block?: string | null;
+  command_template?: string | null;
+  args_template?: string[] | null;
+  env_template?: Record<string, string> | null;
 }
 
 export interface TestConnectionResult {
@@ -62,6 +74,9 @@ export interface MCPServerOverridePutPayload {
   url_template?: string | null;
   headers_template?: Record<string, string> | null;
   credential_template?: string | null;
+  command_template?: string | null;
+  args_template?: string[] | null;
+  env_template?: Record<string, string> | null;
 }
 
 export interface DraftOverrides {

@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
-import { IconPlus, IconTrash } from '@tabler/icons-react';
 import { mcpServersApi } from '../../services/mcpServers';
 import type { MCPServer } from '../../types/mcpServer';
 import type { EditorRole } from './types';
 import PlaceholderField from './PlaceholderField';
+import KeyValueEditor from './KeyValueEditor';
 import { useResolvedPreview } from './useResolvedPreview';
 
 interface Props {
@@ -14,22 +14,18 @@ interface Props {
 }
 
 export default function AdvancedTab({ server, agentId, onSaved }: Props) {
-  const [headers, setHeaders] = useState<{ k: string; v: string }[]>(
-    Object.entries(server.headers_template || {}).map(([k, v]) => ({ k, v }))
+  const [headers, setHeaders] = useState<Record<string, string>>(
+    server.headers_template || {}
   );
   const [systemPrompt, setSystemPrompt] = useState(server.system_prompt_block || '');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const headersObj: Record<string, string> = Object.fromEntries(
-    headers.filter(h => h.k.trim()).map(h => [h.k, h.v])
-  );
-
   const { data: preview } = useResolvedPreview({
     serverId: server.id,
     agentId,
     draftOverrides: {
-      headers_template: headersObj,
+      headers_template: headers,
       system_prompt_block: systemPrompt !== (server.system_prompt_block || '') ? systemPrompt : null,
     },
   });
@@ -39,7 +35,7 @@ export default function AdvancedTab({ server, agentId, onSaved }: Props) {
     setErr(null);
     try {
       await mcpServersApi.update(server.id, {
-        headers_template: headersObj,
+        headers_template: headers,
         system_prompt_block: systemPrompt || null,
       });
       onSaved();
@@ -52,69 +48,29 @@ export default function AdvancedTab({ server, agentId, onSaved }: Props) {
 
   return (
     <div>
-      <div style={{ marginBottom: 14 }}>
-        <label style={{ display: 'block', marginBottom: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
-          Headers Template
-        </label>
-        {headers.map((h, i) => (
-          <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
-            <input
-              value={h.k}
-              placeholder="Header-Name"
-              onChange={(e) => setHeaders((arr) => arr.map((x, j) => j === i ? { ...x, k: e.target.value } : x))}
-              style={{
-                flex: '0 0 200px', padding: 6, fontSize: 12,
-                background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
-                borderRadius: 4, color: 'var(--text-primary)',
-              }}
-            />
-            <input
-              value={h.v}
-              placeholder="value or ${user.email}"
-              onChange={(e) => setHeaders((arr) => arr.map((x, j) => j === i ? { ...x, v: e.target.value } : x))}
-              style={{
-                flex: 1, padding: 6, fontSize: 12,
-                background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
-                borderRadius: 4, color: 'var(--text-primary)',
-              }}
-            />
-            <button
-              onClick={() => setHeaders((arr) => arr.filter((_, j) => j !== i))}
-              aria-label="remove header"
-              style={{
-                background: 'none', border: '1px solid var(--border-subtle)',
-                borderRadius: 4, padding: '0 8px', cursor: 'pointer',
-              }}
-            >
-              <IconTrash size={12} />
-            </button>
-          </div>
-        ))}
-        <button
-          onClick={() => setHeaders((arr) => [...arr, { k: '', v: '' }])}
-          style={{
-            marginTop: 4, fontSize: 11,
-            background: 'none', border: '1px dashed var(--border-subtle)',
-            borderRadius: 4, padding: '4px 10px', cursor: 'pointer',
-            color: 'var(--text-secondary)',
-            display: 'inline-flex', alignItems: 'center', gap: 4,
-          }}
-        >
-          <IconPlus size={12} stroke={1.8} /> 新增 Header
-        </button>
-        {preview?.resolved_headers && Object.keys(preview.resolved_headers).length > 0 && (
-          <div style={{
-            marginTop: 8, padding: 8,
-            background: 'var(--bg-tertiary)', borderRadius: 4,
-            fontSize: 11, color: 'var(--text-tertiary)',
-          }}>
-            <div style={{ marginBottom: 4, color: 'var(--text-secondary)' }}>↳ 解析后实际发送：</div>
-            {Object.entries(preview.resolved_headers).map(([k, v]) => (
-              <div key={k}><code style={{ color: 'var(--text-secondary)' }}>{k}: {v}</code></div>
-            ))}
-          </div>
-        )}
-      </div>
+      <KeyValueEditor
+        label="Headers Template"
+        value={headers}
+        onChange={setHeaders}
+        keyPlaceholder="Header-Name"
+        valuePlaceholder="value or ${user.email}"
+        addLabel="+ 新增 Header"
+      />
+
+      {preview?.resolved_headers && Object.keys(preview.resolved_headers).length > 0 && (
+        <div style={{
+          marginTop: -8, marginBottom: 14,
+          padding: 8,
+          background: 'var(--bg-tertiary)', borderRadius: 4,
+          fontSize: 11, color: 'var(--text-tertiary)',
+        }}>
+          <div style={{ marginBottom: 4, color: 'var(--text-secondary)' }}>↳ 解析后实际发送：</div>
+          {Object.entries(preview.resolved_headers).map(([k, v]) => (
+            <div key={k}><code style={{ color: 'var(--text-secondary)' }}>{k}: {v}</code></div>
+          ))}
+        </div>
+      )}
+
       <PlaceholderField
         label="System Prompt Block (追加到 LLM 系统提示词)"
         value={systemPrompt}

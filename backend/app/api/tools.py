@@ -13,6 +13,7 @@ from app.database import get_db
 from app.models.mcp_server import MCPServer
 from app.models.tool import Tool, AgentTool
 from app.models.user import User
+from app.services.tool_enablement import agent_tool_enabled
 from app.services.tool_config import (
     SENSITIVE_FIELD_KEYS,
     delete_tenant_tool_config,
@@ -519,8 +520,8 @@ async def get_agent_tools(
         at = assignments.get(tid)
         if not _tool_record_visible_to_agent(t, agent_obj.tenant_id, assignments):
             continue
-        # If no explicit assignment, use is_default
-        enabled = at.enabled if at else t.is_default
+        # No explicit AgentTool row → not enabled (no is_default fallback)
+        enabled = agent_tool_enabled(at)
         result.append({
             "id": tid,
             "name": t.name,
@@ -822,7 +823,7 @@ async def get_agent_tools_with_config(
         at = assignments.get(tid)
         if not _tool_record_visible_to_agent(t, agent_obj2.tenant_id, assignments):
             continue
-        enabled = at.enabled if at else t.is_default
+        enabled = agent_tool_enabled(at)
 
         # Decrypt tenant/company config for the frontend. Builtin tool configs
         # are tenant-scoped via tenant_settings, not shared Tool.config.

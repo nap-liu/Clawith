@@ -346,7 +346,11 @@ async def seed_default_agents(tenant_id=None, creator_id=None, db=None):
 
         # ── Assign all default tools ──
         default_tools_result = await db.execute(
-            select(Tool).where(Tool.is_default == True)
+            select(Tool).where(
+                Tool.enabled == True,            # noqa: E712
+                Tool.source == "builtin",
+                Tool.is_default == True,          # noqa: E712
+            )
         )
         default_tools = default_tools_result.scalars().all()
 
@@ -528,7 +532,11 @@ async def seed_okr_agent():
         # ── Assign default tools + OKR-specific tools ──
         # Default tools: all tools where is_default=True
         default_tools_result = await db.execute(
-            select(Tool).where(Tool.is_default == True)
+            select(Tool).where(
+                Tool.enabled == True,            # noqa: E712
+                Tool.source == "builtin",
+                Tool.is_default == True,          # noqa: E712
+            )
         )
         default_tools = default_tools_result.scalars().all()
         for tool in default_tools:
@@ -986,7 +994,11 @@ async def seed_okr_agent_for_tenant(tenant_id: uuid.UUID, creator_id: uuid.UUID)
 
         # ── Assign default tools ──
         default_tools_result = await db.execute(
-            select(Tool).where(Tool.is_default == True)  # noqa: E712
+            select(Tool).where(
+                Tool.enabled == True,            # noqa: E712
+                Tool.source == "builtin",
+                Tool.is_default == True,          # noqa: E712
+            )
         )
         for tool in default_tools_result.scalars().all():
             db.add(AgentTool(agent_id=okr_agent.id, tool_id=tool.id, enabled=True))

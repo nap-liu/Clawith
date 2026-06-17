@@ -65,11 +65,14 @@ from app.services.storage_runtime.base import WriteCondition, content_hash_bytes
 from app.services.workspace_locking import workspace_locks
 from app.core.permissions import evaluate_agent_relationship_status, evaluate_human_relationship_status
 from app.services.access_relationships import ensure_access_granted_platform_relationships
+from app.services.tool_enablement import agent_tool_enabled
 from app.config import get_settings
 from app.services.llm.finish import (
     FINISH_TOOL_DEFINITION,
     FINISH_TOOL_NAME,
 )
+from app.services.sandbox_mcp_host import SandboxMcpHost
+from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
 
 _settings = get_settings()
@@ -1597,24 +1600,32 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "import_mcp_server",
-            "description": "Import an MCP server from Smithery registry into the platform. The server's tools become available for use. Use discover_resources first to find the server ID. If previously imported tools stopped working (e.g. OAuth expired), set reauthorize=true to re-run the authorization flow.",
+            "description": "Import an MCP server so its tools become available to you. Provide ONE of: (1) mcp_config — a standard `mcpServers` JSON config, which works for both HTTP MCP servers (entry has a `url`) and stdio/npx MCP servers (entry has a `command`, e.g. `npx -y <package>`); stdio servers are hosted and started automatically in the sandbox under your own workspace. (2) mcp_url — the full http/https endpoint of a single HTTP MCP server. (3) server_id — a Smithery registry ID (use discover_resources first to find it). If previously imported tools stopped working (e.g. OAuth expired), set reauthorize=true. IMPORTANT: newly imported tools only enter your available-tools list on your NEXT turn — they are NOT callable in the same turn you import them. After a successful import, end your turn and tell the user the tools are ready; have them ask you to use the tools in their next message.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "mcp_config": {
+                        "type": "object",
+                        "description": "Standard MCP config (object or JSON string). HTTP form: {\"mcpServers\":{\"<name>\":{\"url\":\"https://...\",\"headers\":{...}}}}. stdio/npx form: {\"mcpServers\":{\"<name>\":{\"command\":\"npx\",\"args\":[\"-y\",\"<package>\"],\"env\":{\"<KEY>\":\"<value>\"}}}}.",
+                    },
+                    "mcp_url": {
+                        "type": "string",
+                        "description": "Full http/https endpoint of a single HTTP MCP server (shortcut for the HTTP form of mcp_config).",
+                    },
                     "server_id": {
                         "type": "string",
-                        "description": "Smithery server ID, e.g. '@anthropic/brave-search' or '@anthropic/fetch'",
+                        "description": "Smithery server ID, e.g. '@anthropic/brave-search' or '@anthropic/fetch' (advanced — only for the Smithery registry path).",
                     },
                     "config": {
                         "type": "object",
-                        "description": "Optional server configuration (e.g. API keys required by the server)",
+                        "description": "Optional server configuration for the Smithery path (e.g. API keys required by the server)",
                     },
                     "reauthorize": {
                         "type": "boolean",
                         "description": "Set to true to force re-authorization of existing tools (e.g. when OAuth token has expired)",
                     },
                 },
-                "required": ["server_id"],
+                "required": [],
             },
         },
     },
@@ -2281,19 +2292,10 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             # (have an AgentTool record with enabled=False). These must NOT
             # be re-added by the _always_tools fallback below.
             explicitly_disabled_names = set()
-            # Track tools included via is_default fallback (no AgentTool record)
-            default_included_names = []
-
             for t in all_tools:
                 tid = str(t.id)
                 at = assignments.get(tid)
-
-                # If no explicit assignment, fallback to t.is_default
-                enabled = at.enabled if at is not None else t.is_default
-
-                if at is None and t.is_default:
-                    default_included_names.append(t.name)
-
+                enabled = agent_tool_enabled(at)
                 if not enabled:
                     if at and not at.enabled:
                         explicitly_disabled_names.add(t.name)
@@ -2379,12 +2381,6 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 result.append(tool_def)
                 db_tool_names.add(t.name)
 
-            if default_included_names:
-                logger.info(
-                    f"[Tools] agent={agent_id} included via default fallback (no AgentTool record): "
-                    f"{sorted(default_included_names)}"
-                )
-
             if result:
                 # Append always-available system tools that aren't already in
                 # the DB list — but respect explicit user disabling.
@@ -2408,8 +2404,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 logger.info(
                     f"[Tools] agent={agent_id} FINAL {len(result)} tools "
                     f"(assignments={len(assignments)}, "
-                    f"disabled={len(explicitly_disabled_names)}, "
-                    f"default_fallback={len(default_included_names)}): "
+                    f"disabled={len(explicitly_disabled_names)}): "
                     f"{final_names}"
                 )
                 return result
@@ -4433,6 +4428,39 @@ async def _execute_mcp_tool(
                 ctx = await build_placeholder_context_for_call(
                     db, agent_id, user_id, session_id=session_id,
                 )
+
+                # stdio branch: route through aio-sandbox hub instead of HTTP.
+                if cfg.transport == "stdio":
+                    _settings_now = get_settings()
+                    if not _settings_now.SANDBOX_API_URL:
+                        return f"❌ MCP tool {tool_name}: stdio MCP unavailable — SANDBOX_API_URL not configured"
+                    try:
+                        r_cmd = render(cfg.command_template or "", ctx, ALL_ROOTS, on_unknown="raise")
+                        r_args = [render(a, ctx, ALL_ROOTS, on_unknown="raise") for a in (cfg.args_template or [])]
+                        r_env = render_dict(cfg.env_template or {}, ctx, ALL_ROOTS, on_unknown="raise")
+                    except (DisallowedPlaceholderError, UnknownPlaceholderError) as e:
+                        return f"❌ MCP tool {tool_name}: stdio placeholder error — {e}"
+                    # Resolve the agent's per-agent workspace so the stdio process
+                    # runs in the same isolated directory as code execution.
+                    work_dir: str | None = None
+                    if agent_id:
+                        try:
+                            # ensure_workspace was removed in the v1.10 storage refactor;
+                            # _agent_workspace_root is the merged equivalent (path only),
+                            # so create-if-missing here to preserve the prior semantics.
+                            ws = _agent_workspace_root(uuid.UUID(str(agent_id)))
+                            ws.mkdir(parents=True, exist_ok=True)
+                            work_dir = str(ws.resolve())
+                        except Exception:
+                            pass  # non-fatal — fall back to no cwd
+                    host = SandboxMcpHost(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
+                    entry = await host.ensure_registered(
+                        srv.name, str(agent_id), {"command": r_cmd, "args": r_args, "env": r_env},
+                        cwd=work_dir,
+                    )
+                    hub = SandboxMcpHubClient(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
+                    return await hub.call_tool(entry, tool.mcp_tool_name or tool_name, arguments)
+                # else: existing http path continues below.
 
                 # Render — MCP connection-time gets the FULL ALL_ROOTS context.
                 # Unknown placeholders fail loudly so the LLM sees the config error.
@@ -8211,7 +8239,7 @@ async def build_cli_injection(
         wrappers: list[dict] = []
         for tool in cli_tools:
             at = assignments.get(str(tool.id))
-            if not (at.enabled if at else tool.is_default):
+            if not agent_tool_enabled(at):
                 continue
             # Skip tools whose name isn't a safe shell/env identifier (would be
             # an unsafe wrapper filename / export key).
@@ -8604,6 +8632,9 @@ async def _import_mcp_server(agent_id: uuid.UUID, arguments: dict) -> str:
     if parsed:
         if parsed.get("error") and not parsed.get("url"):
             return f"❌ {parsed['error']}"
+        if parsed.get("transport") == "stdio":          # stdio self-install via aio-sandbox hub
+            from app.services.resource_discovery import import_mcp_stdio_direct
+            return await import_mcp_stdio_direct(agent_id, parsed)
         if parsed.get("url"):
             from app.services.resource_discovery import import_mcp_direct
             server_name = (
@@ -8869,6 +8900,8 @@ async def _handle_set_trigger(
                 f'   <script src="/sdk/clawith.js" data-hook="{hook_token}"></script>\n'
                 "   Reader identity: window.Clawith.onReady(u => ...)  // {userId, userName, mobile}\n"
                 "   Send info back:  window.Clawith.triggerHook(window.Clawith.hook, { ...any fields })\n"
+                "   Anti-leak watermark: add data-watermark to that same <script> to tile the "
+                "viewer's name + mobile tail across the page.\n"
                 "   Works for ANY reader-to-you collection (survey, confirmation, choice, sign-up, "
                 "feedback, ...), not just feedback. Each call wakes you once "
                 "(use webhook_mode=queue to process them one-by-one)."
@@ -11875,7 +11908,12 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         f"Published successfully!\n\n"
         f"Public URL: {url}\n"
         f"Title: {title}\n\n"
-        f"Anyone can access this page without logging in.{url_note}"
+        f"Anyone can access this page without logging in.{url_note}\n\n"
+        "Optional — to stamp each viewer's identity (name + mobile tail) as an anti-leak "
+        "watermark tiled across the page, include the Clawith SDK with the data-watermark "
+        "attribute in the HTML <head>:\n"
+        '   <script src="/sdk/clawith.js" data-watermark></script>\n'
+        "The viewer signs in via company OAuth on open, then their watermark renders on top."
     )
 
 

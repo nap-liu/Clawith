@@ -6,12 +6,16 @@ Accepts:
   • {"mcpServers": {"<name>": {"url"|"command", ...}}}       standard MCP config
   • JSON-stringified versions of any of the above
 
-Returns a dict with keys: url, name, headers, api_key, error.
-- url      : str | None — the remote endpoint (None for stdio servers)
-- name     : str | None — display hint
-- headers  : dict | None — extra HTTP headers
-- api_key  : str | None — bearer token (auto-extracted from headers when present)
-- error    : str | None — set when input is recognized but unsupported (e.g. stdio)
+Returns a dict with keys: url, name, headers, api_key, transport, command, args, env, error.
+- url       : str | None — the remote endpoint (None for stdio servers)
+- name      : str | None — display hint
+- headers   : dict | None — extra HTTP headers
+- api_key   : str | None — bearer token (auto-extracted from headers when present)
+- transport : str — "http" or "stdio"
+- command   : str | None — executable for transport=stdio
+- args      : list | None — argument list for transport=stdio
+- env       : dict | None — environment variables for transport=stdio
+- error     : str | None — set when input is unrecognizable or structurally invalid
 """
 
 import json
@@ -36,8 +40,12 @@ def _from_server_spec(spec: dict, name_hint: str | None = None) -> dict:
     if "command" in spec and "url" not in spec:
         return {
             "url": None,
+            "transport": "stdio",
             "name": name_hint or spec.get("name"),
-            "error": "stdio MCP servers (command/args) are not supported in this deployment — pass a remote `url` instead",
+            "command": spec.get("command"),
+            "args": spec.get("args") or [],
+            "env": spec.get("env") or {},
+            "error": None,
         }
 
     url = spec.get("url") or spec.get("endpoint")
@@ -57,6 +65,7 @@ def _from_server_spec(spec: dict, name_hint: str | None = None) -> dict:
 
     return {
         "url": url.strip(),
+        "transport": "http",
         "name": name_hint or spec.get("name"),
         "headers": headers,
         "api_key": api_key,
@@ -79,7 +88,7 @@ def parse_mcp_input(value) -> dict | None:
         if not s:
             return None
         if _is_url(s):
-            return {"url": s, "name": None, "headers": None, "api_key": None, "error": None}
+            return {"url": s, "transport": "http", "name": None, "headers": None, "api_key": None, "error": None}
         if s[:1] in ("{", "["):
             try:
                 value = json.loads(s)

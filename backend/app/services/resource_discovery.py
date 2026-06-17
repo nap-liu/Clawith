@@ -7,6 +7,14 @@ from sqlalchemy import select
 from app.database import async_session
 from app.models.tool import Tool, AgentTool
 from app.services.tool_config import decrypt_sensitive_fields, get_tenant_tool_config
+# Module-level bindings for patchability in tests — no circular import risk
+# since agent_tools only imports resource_discovery inside function bodies.
+# ensure_workspace was removed in the v1.10 storage refactor; _agent_workspace_root
+# is the merged equivalent (returns the per-agent path without creating it).
+from app.services.agent_tools import _agent_workspace_root
+from app.services.sandbox_mcp_host import SandboxMcpHost
+from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
+from app.config import get_settings
 
 
 # ── Smithery Registry Search ────────────────────────────────────
@@ -929,3 +937,88 @@ async def refresh_atlassian_rovo_api_key(api_key: str) -> None:
         )
         await db.commit()
     logger.info("[AtlassianRovo] API key refreshed for all Rovo tools")
+
+
+# ── Agent Self-Install: stdio MCP via aio-sandbox hub ─────────────────────────
+
+async def import_mcp_stdio_direct(agent_id, parsed: dict) -> str:
+    """Agent self-install of a stdio/npx MCP server (fully open — no allowlist).
+
+    Mirrors import_mcp_direct (http) but hosts the process via the aio-sandbox hub.
+    `parsed` is the dict from mcp_config_parser (transport=stdio, command/args/env).
+    """
+    import uuid as _uuid
+    from app.services.mcp_server_service import (
+        get_or_create_agent_stdio_server, persist_stdio_discovered_tools,
+    )
+    from app.models.agent import Agent
+    from sqlalchemy import select
+
+    _settings = get_settings()
+    if not _settings.SANDBOX_API_URL:
+        return "❌ 无法自助安装 stdio MCP:本环境未配置 SANDBOX_API_URL(需要 aio-sandbox)。"
+
+    cfg = {"command": parsed.get("command"),
+           "args": parsed.get("args") or [],
+           "env": parsed.get("env") or {}}
+    if not cfg["command"]:
+        return "❌ stdio MCP 配置缺少 command。"
+
+    async with async_session() as db:
+        agent_row = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one_or_none()
+        if agent_row is None:
+            return "❌ 找不到当前 agent。"
+        tenant_id = agent_row.tenant_id
+
+        srv = await get_or_create_agent_stdio_server(db, agent_id, tenant_id, cfg)
+
+        # 发现:按 agent workspace cwd 注册临时条目 → list → 持久化 → 注销
+        host = SandboxMcpHost(_settings.SANDBOX_API_URL, _settings.SANDBOX_API_KEY)
+        hub = SandboxMcpHubClient(_settings.SANDBOX_API_URL, _settings.SANDBOX_API_KEY)
+        ws = _agent_workspace_root(_uuid.UUID(str(agent_id)))
+        ws.mkdir(parents=True, exist_ok=True)
+        work_dir = str(ws.resolve())
+        try:
+            entry = await host.ensure_registered(srv.name, str(agent_id), cfg, cwd=work_dir)
+        except Exception as e:
+            return f"❌ 注册到沙箱失败:{e}"
+        try:
+            tools = await hub.list_tools(entry)
+        except httpx.TimeoutException:
+            return (
+                "⏱️ 工具发现超时:npx 包可能较大或网络较慢(首次安装尤甚),"
+                "请稍后用相同配置重试。"
+            )
+        except Exception as e:
+            return f"❌ 启动/发现工具失败(可能是包名错误或网络不通):{e}"
+        finally:
+            try:
+                await host.deregister(entry)
+            except Exception:
+                pass
+
+        if not tools:
+            return f"⚠️ 已创建 stdio 服务 `{srv.name}`,但未发现任何工具(检查包名/参数/凭证)。"
+
+        count = await persist_stdio_discovered_tools(db, srv, tools)
+
+        # 分配给当前 agent
+        assigned = []
+        rows = (await db.execute(select(Tool).where(Tool.mcp_server_id == srv.id))).scalars().all()
+        for tool in rows:
+            at = (await db.execute(select(AgentTool).where(
+                AgentTool.agent_id == agent_id, AgentTool.tool_id == tool.id))).scalar_one_or_none()
+            if at is None:
+                db.add(AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True,
+                                 source="user_installed", installed_by_agent_id=agent_id, config={}))
+            assigned.append(tool.mcp_tool_name)
+        await db.commit()
+
+        lines = "\n".join(f"• {n}" for n in assigned[:20])
+        more = f"\n…共 {len(assigned)} 个" if len(assigned) > 20 else ""
+        return (
+            f"✅ 已安装 stdio MCP 服务 `{srv.name}`,发现并分配 {count} 个工具:\n{lines}{more}\n\n"
+            f"⚠️ 重要:这 {count} 个工具会在**下一轮对话**才进入你的可用工具列表,"
+            f"**本轮还调用不了**。请现在就**结束本轮回复**(不要在本轮尝试调用它们),"
+            f"告诉用户工具已安装就绪,请用户在下一条消息里让你执行需要这些工具的任务。"
+        )

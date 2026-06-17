@@ -38,9 +38,17 @@ class MCPServer(Base):
     placeholder_allowlist: Mapped[list[str] | None] = mapped_column(
         JSONB, nullable=True, default=None,
     )
+    transport: Mapped[str] = mapped_column(String(10), server_default="http", default="http")
+    command_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    args_template: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    env_template: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("transport IN ('http', 'stdio')", name="ck_mcp_servers_transport"),
     )
 
 
@@ -58,6 +66,9 @@ class MCPServerOverride(Base):
     url_template: Mapped[str | None] = mapped_column(Text, nullable=True)
     headers_template: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     credential_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    command_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    args_template: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    env_template: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     last_modified_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
