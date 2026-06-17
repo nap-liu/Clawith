@@ -73,23 +73,42 @@ class PrefixOnlyStorage(StorageBackend):
         )
 
 
+def _make_access_user_and_check(agent_id):
+    """Build a (user, check_agent_access) pair matching the (Agent, access) contract.
+
+    list_files / read_file unpack ``agent, _access = await check_agent_access(...)``
+    and then compare ``agent.creator_id == current_user.id`` for the CREATOR_ONLY
+    filter, so the mock must return a 2-tuple and the user must carry an id/role.
+    """
+    user = SimpleNamespace(id=uuid.uuid4(), role="member", tenant_id=None)
+    agent = SimpleNamespace(id=agent_id, creator_id=uuid.uuid4())
+
+    async def allow_access(*args, **kwargs):
+        return agent, "manage"
+
+    return user, allow_access
+
+
 @pytest.mark.asyncio
 async def test_list_files_accepts_s3_prefix_directory(monkeypatch):
     agent_id = uuid.uuid4()
-    storage = PrefixOnlyStorage({f"{agent_id}/focus.md": b"# Focus\n"})
+    # Use a regular file: focus.md / agenda.md are intentionally hidden from the
+    # root file tree (focus is DB-backed) in both upstream and our code, so they
+    # would never surface here.
+    storage = PrefixOnlyStorage({f"{agent_id}/notes.md": b"# Notes\n"})
     monkeypatch.setattr(files, "get_storage_backend", lambda: storage)
 
-    async def allow_access(*args, **kwargs):
-        return None
-
+    user, allow_access = _make_access_user_and_check(agent_id)
     monkeypatch.setattr(files, "check_agent_access", allow_access)
-    user = SimpleNamespace(tenant_id=None)
 
     result = await files.list_files(agent_id, path="", current_user=user, db=None)
 
-    assert [item.name for item in result] == ["focus.md"]
-    assert result[0].path == "focus.md"
-    assert result[0].version_token == "v:8"
+    assert [item.name for item in result] == ["notes.md"]
+    assert result[0].path == "notes.md"
+    # list_dir entries carry no version_id/etag/content_hash and an empty
+    # modified_at, so _entry_version_token falls back to f"{modified_at}:{size}"
+    # — i.e. ":8" (8 = len(b"# Notes\n")). No "v" prefix exists in that path.
+    assert result[0].version_token == ":8"
 
 
 @pytest.mark.asyncio
@@ -97,11 +116,8 @@ async def test_list_files_allows_empty_agent_root(monkeypatch):
     agent_id = uuid.uuid4()
     monkeypatch.setattr(files, "get_storage_backend", lambda: PrefixOnlyStorage())
 
-    async def allow_access(*args, **kwargs):
-        return None
-
+    user, allow_access = _make_access_user_and_check(agent_id)
     monkeypatch.setattr(files, "check_agent_access", allow_access)
-    user = SimpleNamespace(tenant_id=None)
 
     assert await files.list_files(agent_id, path="", current_user=user, db=None) == []
 
@@ -109,16 +125,14 @@ async def test_list_files_allows_empty_agent_root(monkeypatch):
 @pytest.mark.asyncio
 async def test_read_file_returns_version_token(monkeypatch):
     agent_id = uuid.uuid4()
-    storage = PrefixOnlyStorage({f"{agent_id}/focus.md": b"# Focus\n"})
+    # focus.md is special-cased (410 GONE, DB-backed) on read_file; use a regular file.
+    storage = PrefixOnlyStorage({f"{agent_id}/notes.md": b"# Notes\n"})
     monkeypatch.setattr(files, "get_storage_backend", lambda: storage)
 
-    async def allow_access(*args, **kwargs):
-        return None
-
+    user, allow_access = _make_access_user_and_check(agent_id)
     monkeypatch.setattr(files, "check_agent_access", allow_access)
-    user = SimpleNamespace(tenant_id=None)
 
-    result = await files.read_file(agent_id, path="focus.md", current_user=user, db=None)
+    result = await files.read_file(agent_id, path="notes.md", current_user=user, db=None)
 
     assert result.version_token == "v:8"
 

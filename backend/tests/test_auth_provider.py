@@ -80,7 +80,11 @@ async def test_feishu_auth_provider_get_user_info():
         with patch.object(provider, "get_app_access_token", AsyncMock(return_value="app-token")):
             user_info = await provider.get_user_info("user-token")
 
-    assert user_info.provider_user_id is None
+    # get_user_info now tries to resolve the org-stable employee user_id via the
+    # contact API (a second client.get). Here only the userinfo response is
+    # stubbed, so that lookup fails and provider_user_id gracefully falls back
+    # to the open_id (info_data has no "user_id").
+    assert user_info.provider_user_id == "ou_open_123"
     assert user_info.provider_union_id == "on_union_456"
     assert user_info.name == "Alice"
     assert user_info.email == "alice@example.com"

@@ -96,16 +96,14 @@ async def test_receive_webhook_success(monkeypatch, client):
 
     monkeypatch.setattr(webhooks_api, "_record_and_count_hits", fake_record_and_count_hits)
 
-    # Mock enqueue_webhook_execution
-    async def fake_enqueue_webhook_execution(db, trigger, body, payload_text, payload_obj, request_headers):
-        return SimpleNamespace(id=uuid.uuid4()), True
-
-    monkeypatch.setattr(webhooks_api, "enqueue_webhook_execution", fake_enqueue_webhook_execution)
-
+    # receive_webhook no longer calls enqueue_webhook_execution. The merged flow
+    # stores the payload directly into the trigger config (legacy mode here writes
+    # _webhook_pending/_webhook_payload via an UPDATE), and the trigger_daemon
+    # later polls those flags. A successful receive just persists (commit) and
+    # returns {"ok": True}.
     async with await client() as ac:
         response = await ac.post("/api/webhooks/t/valid_token", json={"event": "test"})
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
-    assert trigger in session.expunged
-    assert agent in session.expunged
+    assert session.committed is True

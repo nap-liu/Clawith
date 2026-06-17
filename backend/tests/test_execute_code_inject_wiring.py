@@ -29,11 +29,18 @@ class _FakeResult:
 
 
 class _FakeSandboxConfig:
-    """Minimal stub so SandboxConfig.from_dict/get_sandbox_backend won't fail."""
+    """Minimal stub so SandboxConfig.from_dict/get_sandbox_backend won't fail.
+
+    Mirrors the real SandboxConfig fields that _execute_code reads directly:
+    - max_timeout (added upstream 395f3fa6) — used in min(requested_timeout, ...)
+    - allow_network (added upstream b31b9778) — read on the legacy fallback path
+    """
     enabled = True
     type = "aio_sandbox"
     api_url = "http://fake"
     api_key = ""
+    max_timeout = 60
+    allow_network = False
 
 
 def _make_mock_backend(result_sentinel=""):

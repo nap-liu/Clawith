@@ -16,6 +16,7 @@ What this test locks in:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -50,8 +51,26 @@ class _FakeClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         })
-        # No tool calls -> caller.call_llm returns this content and exits loop.
-        return LLMResponse(content="ok-final", tool_calls=[], usage=None)
+        # finish() is the only clean stop signal under the merged
+        # finish-protocol loop: a plain-text response no longer ends the
+        # turn (the loop would inject FINISH_PROTOCOL_REMINDER and re-stream).
+        # Returning a valid finish() makes caller.call_llm return its content
+        # and exit after exactly one round. (See test_finish_protocol.)
+        return LLMResponse(
+            content="",
+            tool_calls=[
+                {
+                    "id": "call_finish",
+                    "type": "function",
+                    "function": {
+                        "name": "finish",
+                        "arguments": json.dumps({"content": "ok-final"}),
+                    },
+                }
+            ],
+            finish_reason="tool_calls",
+            usage=None,
+        )
 
     async def close(self):
         self.closed = True

@@ -187,6 +187,11 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
     messages = await chat_sessions_api.get_session_messages(
         agent_id=agent_id,
         session_id=session_id,
+        # Calling the handler directly bypasses FastAPI's dependency resolution,
+        # so the `limit`/`before` Query(...) defaults are NOT coerced to plain
+        # values. Pass the resolved defaults explicitly to mirror a real request.
+        limit=20,
+        before=None,
         current_user=current_user,
         db=db,
     )
@@ -238,6 +243,9 @@ async def test_creator_can_view_other_users_session_messages(monkeypatch):
     messages = await chat_sessions_api.get_session_messages(
         agent_id=agent_id,
         session_id=session_id,
+        # See note above: direct handler calls must supply the Query defaults.
+        limit=20,
+        before=None,
         current_user=current_user,
         db=db,
     )

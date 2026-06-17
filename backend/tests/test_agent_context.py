@@ -141,12 +141,19 @@ async def test_static_message_sender_tag_section_documents_stable_user_id():
     assert "NOT a session-scoped" in static_p or "not a session-scoped" in static_p.lower()
 
 
-async def test_build_agent_context_reads_focus_from_storage_key():
-    """Focus.md is read from the storage backend ({agent_id}/focus.md) and
-    surfaced into the dynamic context (v1.9.3 DB/storage-backed focus)."""
+async def test_build_agent_context_does_not_inject_focus_block():
+    """Focus is no longer injected into the dynamic context.
+
+    Injecting completed/stale focus items into the system prompt was reinforcing
+    old workflow patterns over updated soul.md instructions, so the ## Focus
+    block injection is disabled (agents query focus via list_focus_items, and
+    focus is DB-backed, not read from focus.md). This guards against anyone
+    re-introducing focus.md → dynamic-context leakage.
+    """
     agent_id = uuid.uuid4()
 
     async def fake_read_file(key, _max_chars=3000):
+        # Even if focus.md existed in storage, it must NOT surface in context.
         if key == f"{agent_id}/focus.md":
             return "# Focus\n\n- [ ] follow_up: Check the deployment"
         return ""
@@ -158,5 +165,5 @@ async def test_build_agent_context_reads_focus_from_storage_key():
     ):
         _static, dynamic = await build_agent_context(agent_id, "TestAgent")
 
-    assert "## Focus" in dynamic
-    assert "follow_up: Check the deployment" in dynamic
+    assert "## Focus" not in dynamic
+    assert "follow_up: Check the deployment" not in dynamic

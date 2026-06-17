@@ -9,7 +9,7 @@ from starlette.background import BackgroundTasks
 
 from app.api import auth as auth_api
 from app.api.notification import BroadcastRequest, broadcast_notification
-from app.core.security import verify_password
+from app.core.security import hash_password, verify_password
 from app.models.user import User
 from app.schemas.schemas import ForgotPasswordRequest, ResetPasswordRequest
 from app.services import password_reset_service, system_email_service
@@ -335,7 +335,7 @@ def test_send_system_email_uses_configured_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_reset_password_updates_user(monkeypatch):
-    identity = make_identity(password_hash=auth_api.hash_password("old-password"))
+    identity = make_identity(password_hash=hash_password("old-password"))
     db = RecordingDB([DummyResult(identity)])
 
     async def fake_consume_password_reset_token(*_args, **_kwargs):

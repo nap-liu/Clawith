@@ -139,6 +139,10 @@ async def test_group_messages_api_returns_sender_user_id_and_sender_name():
         out = await get_session_messages(
             agent_id=agent_id,
             session_id=sess_id,
+            # Direct handler call: FastAPI isn't resolving the limit/before
+            # Query(...) defaults, so pass the resolved values explicitly.
+            limit=20,
+            before=None,
             current_user=owner,
             db=db,
         )
@@ -192,6 +196,7 @@ async def test_group_member_non_owner_can_read_group_messages(monkeypatch):
     async with async_session() as db:
         out = await get_session_messages(
             agent_id=agent_id, session_id=sess_id,
+            limit=20, before=None,
             current_user=alice, db=db,
         )
 
@@ -233,6 +238,7 @@ async def test_group_non_member_non_admin_is_forbidden(monkeypatch):
         async with async_session() as db:
             await get_session_messages(
                 agent_id=agent_id, session_id=sess_id,
+                limit=20, before=None,
                 current_user=bob, db=db,
             )
     assert exc.value.status_code == 403
@@ -285,6 +291,7 @@ async def test_p2p_non_owner_non_admin_still_forbidden(monkeypatch):
         async with async_session() as db:
             await get_session_messages(
                 agent_id=agent_id, session_id=sess_id,
+                limit=20, before=None,
                 current_user=other, db=db,
             )
     assert exc.value.status_code == 403
@@ -327,6 +334,8 @@ async def test_p2p_messages_api_does_not_add_sender_user_id_field():
         out = await get_session_messages(
             agent_id=agent_id,
             session_id=sess_id,
+            limit=20,
+            before=None,
             current_user=owner,
             db=db,
         )

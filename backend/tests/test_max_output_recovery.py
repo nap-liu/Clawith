@@ -25,6 +25,7 @@ E. If the re-streamed (resumed) response carries ``tool_calls``, the outer
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -37,6 +38,27 @@ from app.services.llm.caller import (
     call_llm,
 )
 from app.services.llm.client import LLMMessage, LLMResponse
+
+
+def _finish_response(content: str) -> LLMResponse:
+    """A finish() tool-call response — the only clean stop signal the
+    merged finish-protocol loop accepts. A plain ``stop`` text response is
+    no longer terminal: the loop injects FINISH_PROTOCOL_REMINDER and
+    re-streams, so scripts must end with finish() (see test_finish_protocol)."""
+    return LLMResponse(
+        content="",
+        tool_calls=[
+            {
+                "id": "call_finish",
+                "type": "function",
+                "function": {
+                    "name": "finish",
+                    "arguments": json.dumps({"content": content}),
+                },
+            }
+        ],
+        finish_reason="tool_calls",
+    )
 
 
 # ─── Fakes ────────────────────────────────────────────────────────────────────
@@ -152,11 +174,7 @@ def test_predicate_rejects_normal_finish_reasons():
 @pytest.mark.asyncio
 async def test_case_a_no_truncation_returns_direct(monkeypatch):
     client = _ScriptedClient([
-        LLMResponse(
-            content="all-done",
-            tool_calls=[],
-            finish_reason="stop",
-        ),
+        _finish_response("all-done"),
     ])
     _patch_caller_collaborators(monkeypatch, client)
 
@@ -177,10 +195,13 @@ async def test_case_a_no_truncation_returns_direct(monkeypatch):
 @pytest.mark.asyncio
 async def test_case_b_single_recovery_concatenates_content(monkeypatch):
     # First stream: partial text, cut off by length.
-    # Second stream: remainder with clean stop.
+    # Second stream: the resume completes — and since plain text no longer
+    # stops the loop under the finish-protocol, the resumed response delivers
+    # the full answer via finish(). The recovery still runs (1 resume = 2
+    # stream calls); the loop then returns finish()'s content.
     client = _ScriptedClient([
         LLMResponse(content="half-one ", finish_reason="length"),
-        LLMResponse(content="half-two", finish_reason="stop"),
+        _finish_response("half-one half-two"),
     ])
     _patch_caller_collaborators(monkeypatch, client)
 
@@ -191,7 +212,7 @@ async def test_case_b_single_recovery_concatenates_content(monkeypatch):
         agent_id="agent-x", user_id="user-x", session_id="s",
     )
 
-    # Returned string is the full concatenation.
+    # Returned string is the full concatenation, delivered via finish().
     assert result == "half-one half-two"
     # We made exactly 2 stream calls: the initial + 1 resume.
     assert len(client.stream_calls) == 2
@@ -230,11 +251,12 @@ async def test_case_c_exhausted_retries_returns_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_case_d_dispatched_messages_carry_resume_pair(monkeypatch):
-    # Two recoveries then clean finish — three stream calls total.
+    # Two recoveries then a clean finish() — three stream calls total. The
+    # final resumed response delivers the full answer through finish().
     client = _ScriptedClient([
         LLMResponse(content="part-a ", finish_reason="length"),
         LLMResponse(content="part-b ", finish_reason="length"),
-        LLMResponse(content="part-c", finish_reason="stop"),
+        _finish_response("part-a part-b part-c"),
     ])
     _patch_caller_collaborators(monkeypatch, client)
 
@@ -290,8 +312,8 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
             }],
             finish_reason="tool_calls",
         ),
-        # Round 1 (after tool result): final clean response
-        LLMResponse(content="done-after-tool", finish_reason="stop"),
+        # Round 1 (after tool result): final answer via finish()
+        _finish_response("done-after-tool"),
     ])
     _patch_caller_collaborators(monkeypatch, client, tools=[
         {"type": "function", "function": {"name": "read_file", "description": "r"}},

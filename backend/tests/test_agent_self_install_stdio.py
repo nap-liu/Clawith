@@ -108,7 +108,7 @@ async def test_import_mcp_stdio_direct_discovers_and_assigns():
     with patch("app.services.resource_discovery.get_settings", return_value=_SettingsWithSandbox()), \
          patch("app.services.resource_discovery.SandboxMcpHost") as MockHost, \
          patch("app.services.resource_discovery.SandboxMcpHubClient") as MockHub, \
-         patch("app.services.resource_discovery.ensure_workspace") as mock_ws:
+         patch("app.services.resource_discovery._agent_workspace_root") as mock_ws:
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(return_value="entry__abc")
         mock_host_inst.deregister = AsyncMock(return_value=None)
@@ -171,7 +171,7 @@ async def test_import_mcp_stdio_direct_registration_error():
     with patch("app.services.resource_discovery.get_settings", return_value=_SettingsWithSandbox()), \
          patch("app.services.resource_discovery.SandboxMcpHost") as MockHost, \
          patch("app.services.resource_discovery.SandboxMcpHubClient"), \
-         patch("app.services.resource_discovery.ensure_workspace") as mock_ws:
+         patch("app.services.resource_discovery._agent_workspace_root") as mock_ws:
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(side_effect=Exception("sandbox unreachable"))
         MockHost.return_value = mock_host_inst
@@ -192,7 +192,7 @@ async def test_import_mcp_stdio_direct_list_tools_error():
     with patch("app.services.resource_discovery.get_settings", return_value=_SettingsWithSandbox()), \
          patch("app.services.resource_discovery.SandboxMcpHost") as MockHost, \
          patch("app.services.resource_discovery.SandboxMcpHubClient") as MockHub, \
-         patch("app.services.resource_discovery.ensure_workspace") as mock_ws:
+         patch("app.services.resource_discovery._agent_workspace_root") as mock_ws:
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(return_value="entry__abc")
         mock_host_inst.deregister = AsyncMock()
@@ -220,7 +220,7 @@ async def test_import_mcp_stdio_direct_discovery_timeout():
     with patch("app.services.resource_discovery.get_settings", return_value=_SettingsWithSandbox()), \
          patch("app.services.resource_discovery.SandboxMcpHost") as MockHost, \
          patch("app.services.resource_discovery.SandboxMcpHubClient") as MockHub, \
-         patch("app.services.resource_discovery.ensure_workspace") as mock_ws:
+         patch("app.services.resource_discovery._agent_workspace_root") as mock_ws:
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(return_value="entry__abc")
         mock_host_inst.deregister = AsyncMock()
@@ -246,7 +246,7 @@ async def test_import_mcp_stdio_direct_zero_tools():
     with patch("app.services.resource_discovery.get_settings", return_value=_SettingsWithSandbox()), \
          patch("app.services.resource_discovery.SandboxMcpHost") as MockHost, \
          patch("app.services.resource_discovery.SandboxMcpHubClient") as MockHub, \
-         patch("app.services.resource_discovery.ensure_workspace") as mock_ws:
+         patch("app.services.resource_discovery._agent_workspace_root") as mock_ws:
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(return_value="entry__abc")
         mock_host_inst.deregister = AsyncMock()
@@ -278,7 +278,7 @@ async def test_import_mcp_stdio_direct_idempotent():
         with patch("app.services.resource_discovery.get_settings", return_value=_SettingsWithSandbox()), \
              patch("app.services.resource_discovery.SandboxMcpHost") as MockHost, \
              patch("app.services.resource_discovery.SandboxMcpHubClient") as MockHub, \
-             patch("app.services.resource_discovery.ensure_workspace") as mock_ws:
+             patch("app.services.resource_discovery._agent_workspace_root") as mock_ws:
             mock_host_inst = MagicMock()
             mock_host_inst.ensure_registered = AsyncMock(return_value="entry__abc")
             mock_host_inst.deregister = AsyncMock()
@@ -332,7 +332,7 @@ async def test_two_agents_tool_names_no_collision():
         with patch("app.services.resource_discovery.get_settings", return_value=_SettingsWithSandbox()), \
              patch("app.services.resource_discovery.SandboxMcpHost") as MockHost, \
              patch("app.services.resource_discovery.SandboxMcpHubClient") as MockHub, \
-             patch("app.services.resource_discovery.ensure_workspace") as mock_ws:
+             patch("app.services.resource_discovery._agent_workspace_root") as mock_ws:
             mock_host_inst = MagicMock()
             mock_host_inst.ensure_registered = AsyncMock(return_value=f"entry__{str(agent_id)[:6]}")
             mock_host_inst.deregister = AsyncMock()

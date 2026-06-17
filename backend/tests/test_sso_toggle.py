@@ -44,7 +44,7 @@ async def test_get_platform_settings_sso_toggle_disabled():
 async def test_resolve_tenant_by_domain_sso_toggle():
     """Verify that resolve_tenant_by_domain respects the sso_custom_domain_redirect_enabled toggle."""
     # When enabled, custom domain lookup should match the tenant by domain
-    active_tenant = SimpleNamespace(id="tenant-id", name="Acme", slug="acme", sso_enabled=True, sso_domain="https://acme.com", is_active=True)
+    active_tenant = SimpleNamespace(id="tenant-id", name="Acme", slug="acme", sso_enabled=True, sso_domain="https://acme.com", subdomain_prefix=None, is_active=True)
     
     # Check 1: SSO toggle enabled, matches tenant
     db_enabled = RecordingDB(responses=[
@@ -101,13 +101,20 @@ async def test_switch_tenant_sso_toggle():
     current_user = SimpleNamespace(identity_id=uuid.uuid4())
     data = TenantSwitchRequest(tenant_id=target_tenant_id)
     request = MagicMock()
+    # switch_tenant resolves the redirect via core.domain.resolve_base_url, whose
+    # final fallback level is the request origin (str(request.base_url)). Give the
+    # MagicMock a real, joinable base_url so the redirect contains a usable host.
+    request.base_url = "https://acme.com/"
 
     # Case 1: Toggle enabled -> redirect_url is returned
     db_enabled = RecordingDB(responses=[
         DummyResult(values=[target_user]), # user check
         DummyResult(values=[tenant]),      # tenant details
         DummyResult(),                     # auth_api setting check (default True)
-        DummyResult(),                     # platform_service setting check (default True)
+        # resolve_base_url: tenant lookup (None) → global platform setting (None)
+        # → falls back to request.base_url above.
+        DummyResult(),                     # resolve_base_url tenant lookup -> None
+        DummyResult(),                     # resolve_base_url global platform -> None
     ])
     with patch("app.api.auth.create_access_token", return_value="jwt-token"):
         res = await auth_api.switch_tenant(data, request, current_user, db_enabled)

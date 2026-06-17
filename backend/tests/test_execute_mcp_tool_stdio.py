@@ -261,18 +261,24 @@ async def test_stdio_returns_clear_error_when_sandbox_url_empty():
 # ---------------------------------------------------------------------------
 
 
-async def test_stdio_ensure_registered_receives_agent_workspace_cwd():
+async def test_stdio_ensure_registered_receives_agent_workspace_cwd(tmp_path):
     """ensure_registered must be called with cwd = the agent's workspace path.
 
-    The expected path is /data/agents/{agent_id} — matching the pattern used by
-    code execution (_execute_code). Patch ensure_workspace to avoid actual FS
-    access and inspect the cwd kwarg forwarded to ensure_registered.
+    cwd matches the pattern used by code execution (_execute_code): the per-agent
+    workspace root, resolved to an absolute path. The v1.10 storage refactor
+    removed ensure_workspace; the stdio branch now derives the path from
+    _agent_workspace_root(agent_id), then mkdir+resolve. Patch
+    _agent_workspace_root to a writable tmp dir so mkdir/resolve succeed (a
+    non-writable path like /data/agents would be swallowed by the branch's
+    `except Exception: pass`, leaving work_dir=None), and assert the resolved
+    string is forwarded as the cwd kwarg.
     """
-    from pathlib import Path
-    from unittest.mock import AsyncMock as _AsyncMock
+    from unittest.mock import MagicMock as _MagicMock
 
     agent_id, user_id, tool_name = await _make_stdio_fixture()
-    expected_cwd = f"/data/agents/{agent_id}"
+    ws_path = tmp_path / str(agent_id)
+    # Production calls ws.resolve(); compare against the same resolved form.
+    expected_cwd = str(ws_path.resolve())
 
     mock_host_inst = MagicMock()
     mock_host_inst.ensure_registered = AsyncMock(return_value="yx__cwd_entry")
@@ -282,7 +288,7 @@ async def test_stdio_ensure_registered_receives_agent_workspace_cwd():
     with patch("app.services.agent_tools.SandboxMcpHost") as MockHost, \
          patch("app.services.agent_tools.SandboxMcpHubClient") as MockHub, \
          patch("app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()), \
-         patch("app.services.agent_tools.ensure_workspace", new=_AsyncMock(return_value=Path(expected_cwd))):
+         patch("app.services.agent_tools._agent_workspace_root", new=_MagicMock(return_value=ws_path)):
         MockHost.return_value = mock_host_inst
         MockHub.return_value = mock_hub_inst
 

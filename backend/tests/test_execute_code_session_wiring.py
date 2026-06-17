@@ -11,10 +11,15 @@ import pytest
 
 
 class _FakeSandboxConfig:
+    # max_timeout (upstream 395f3fa6) + allow_network (upstream b31b9778) are read
+    # directly by _execute_code; the stub must carry them or the read raises
+    # AttributeError before backend.execute is ever called.
     enabled = True
     type = "aio_sandbox"
     api_url = "http://fake"
     api_key = ""
+    max_timeout = 60
+    allow_network = False
 
 
 def _make_mock_backend():
@@ -84,7 +89,16 @@ async def test_execute_code_without_session_passes_none(tmp_path):
 
 @pytest.mark.asyncio
 async def test_dispatch_code_exec_passes_session_id(tmp_path):
-    """execute_tool's code-exec branch must forward its session_id."""
+    """execute_tool's code-exec branch must forward its session_id.
+
+    Merge-interface notes:
+    - ensure_workspace was removed in the v1.10 storage refactor; the dispatch no
+      longer resolves a workspace directly. The _CODE_EXEC branch now wraps the
+      runner in _run_with_temp_workspace(...). We stub that wrapper so it just
+      invokes the runner with a tmp dir (its real contract: runner(temp.root)),
+      keeping the test off the DB/FS while still exercising the dispatch's
+      runner-construction — which is where session_id must be threaded.
+    """
     from app.services import agent_tools
 
     captured = {}
@@ -93,9 +107,12 @@ async def test_dispatch_code_exec_passes_session_id(tmp_path):
         captured["session_id"] = session_id
         return "ok"
 
+    async def fake_run_with_temp_ws(agent_id, tenant_id, runner, *, paths=None, sync_back=False):
+        return await runner(tmp_path)
+
     with (
         patch.object(agent_tools, "_execute_code", new=fake_execute_code),
-        patch.object(agent_tools, "ensure_workspace", new=AsyncMock(return_value=tmp_path)),
+        patch.object(agent_tools, "_run_with_temp_workspace", new=fake_run_with_temp_ws),
         patch.object(agent_tools, "_get_agent_tenant_id", new=AsyncMock(return_value=None)),
         # Keep the test off the DB: skip the autonomy check and activity log.
         patch.dict(agent_tools._TOOL_AUTONOMY_MAP, clear=True),

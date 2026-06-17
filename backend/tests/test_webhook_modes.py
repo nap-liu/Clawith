@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 import pytest
 import httpx
 from sqlalchemy import select
+from app.api import webhooks as webhooks_api
 from app.database import async_session, engine
 from app.main import app
 from app.models.agent import Agent
@@ -20,9 +21,73 @@ from app.models.audit import AuditLog
 pytestmark = pytest.mark.asyncio
 
 
+class _FakeRedisZSetPipeline:
+    """In-memory stand-in for the redis pipeline used by webhook rate limiting.
+
+    Mirrors the zremrangebyscore/zadd/zcard/expire sequence in
+    ``webhooks._record_and_count_hits`` and returns the four results from
+    ``execute()`` in order, so the rolling-60s hit count stays deterministic.
+    """
+
+    def __init__(self, parent):
+        self._parent = parent
+        self._results = []
+
+    def zremrangebyscore(self, key, low, high):
+        z = self._parent._data.setdefault(key, {})
+        removed = [m for m, s in z.items() if low <= s <= high]
+        for m in removed:
+            z.pop(m, None)
+        self._results.append(len(removed))
+
+    def zadd(self, key, mapping):
+        z = self._parent._data.setdefault(key, {})
+        z.update(mapping)
+        self._results.append(len(mapping))
+
+    def zcard(self, key):
+        self._results.append(len(self._parent._data.get(key, {})))
+
+    def expire(self, key, ttl):
+        self._results.append(True)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    async def execute(self):
+        return list(self._results)
+
+
+class _FakeRedis:
+    """Minimal in-memory redis exposing only ``pipeline`` for rate limiting.
+
+    A fresh instance is bound per test (function-scoped event loop), avoiding
+    the module-cached real client that otherwise leaks across loops and raises
+    ``RuntimeError: Event loop is closed``.
+    """
+
+    def __init__(self):
+        self._data = {}
+
+    def pipeline(self, transaction=True):
+        return _FakeRedisZSetPipeline(self)
+
+
 @pytest.fixture(autouse=True)
-async def _isolate():
+async def _isolate(monkeypatch):
     await engine.dispose()
+    fake_redis = _FakeRedis()
+
+    async def _fake_get_redis():
+        return fake_redis
+
+    # receive_webhook's rate limiter calls get_redis() (imported into the
+    # webhooks module). Patch it to a per-test in-memory fake so no real redis
+    # client is cached against a dying event loop.
+    monkeypatch.setattr(webhooks_api, "get_redis", _fake_get_redis)
     yield
     await engine.dispose()
 

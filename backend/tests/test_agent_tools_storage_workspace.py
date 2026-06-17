@@ -4,7 +4,57 @@ import pytest
 
 from app.services import agent_tools
 from app.services import workspace_collaboration
+from app.services import workspace_locking
 from app.services.storage_runtime.base import StorageBackend, StorageEntry, StorageVersion, WriteCondition, ConditionalWriteResult
+
+
+class _FakeRedis:
+    """Minimal in-memory redis covering the surface workspace_locking touches.
+
+    ``acquire_workspace_lock`` calls ``set(key, val, ex=, nx=True)`` and
+    ``release_workspace_lock`` calls ``eval(script, 1, key, owner)``. A fresh
+    instance is bound per test, avoiding the module-cached real client that
+    otherwise leaks across function-scoped event loops and raises
+    ``RuntimeError: Event loop is closed``.
+    """
+
+    def __init__(self):
+        self._data: dict[str, str] = {}
+
+    async def set(self, key, value, *, ex=None, nx=False, **_kwargs):
+        if nx and key in self._data:
+            return None
+        self._data[key] = value
+        return True
+
+    async def get(self, key):
+        return self._data.get(key)
+
+    async def delete(self, *keys):
+        removed = 0
+        for key in keys:
+            if self._data.pop(key, None) is not None:
+                removed += 1
+        return removed
+
+    async def eval(self, _script, _numkeys, key, owner):
+        # Mirror the release-if-owner Lua: delete only when the caller owns it.
+        if self._data.get(key) == owner:
+            return await self.delete(key)
+        return 0
+
+
+@pytest.fixture(autouse=True)
+def _fake_workspace_lock_redis(monkeypatch):
+    fake_redis = _FakeRedis()
+
+    async def _fake_get_redis():
+        return fake_redis
+
+    # workspace_locking imports get_redis from app.core.events at module level;
+    # patch it there so the distributed lock uses a per-test in-memory fake
+    # instead of the real client cached against a dying event loop.
+    monkeypatch.setattr(workspace_locking, "get_redis", _fake_get_redis)
 
 
 class MemoryStorageBackend(StorageBackend):
