@@ -81,6 +81,19 @@ class _FakeCtx:
         self.request_context = _FakeRequestContext(headers or {})
 
 
+class _FakeRequest:
+    def __init__(self, headers: dict):
+        self.headers = headers
+
+
+class _FakeCtxRequestOnly:
+    """Ctx with no transport headers — exercises the ctx.request.headers fallback."""
+
+    def __init__(self, headers: dict | None = None):
+        self.request_context = None  # forces the fallback branch in _bearer_from_ctx
+        self.request = _FakeRequest(headers or {})
+
+
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 
@@ -173,3 +186,24 @@ async def test_revoked_token_returns_none_none():
 
     assert u is None
     assert t is None
+
+
+async def test_request_headers_fallback_resolves_user():
+    """When transport headers are absent, ctx.request.headers is used (fallback)."""
+    from app.services.pat_service import issue_pat
+    from app.mcp_server.auth import resolve_pat_user
+
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+
+    async with async_session() as db:
+        token, _ = await issue_pat(db, user=user, name="mcp-fallback")
+
+    ctx = _FakeCtxRequestOnly(headers={"authorization": f"Bearer {token}"})
+
+    async with async_session() as db:
+        returned_user, returned_tenant_id = await resolve_pat_user(ctx, db)
+
+    assert returned_user is not None, "fallback path must resolve the user"
+    assert returned_user.id == user.id
+    assert returned_tenant_id == tenant.id
