@@ -14,7 +14,6 @@ Signature contract: ``(agent_id, user_id, ctx_session_id, arguments) -> str``
 from __future__ import annotations
 
 import time
-import uuid
 from datetime import datetime
 
 from loguru import logger

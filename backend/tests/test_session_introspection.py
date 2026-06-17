@@ -411,3 +411,74 @@ async def test_search_scoped_to_own_sessions():
     out = await handle_search_sessions(agent.id, member.id, str(mine.id), {"query": "WIDGET"})
     assert str(mine.id) in out
     assert str(theirs.id) not in out
+
+
+# ── Task 5: seeded schema ──────────────────────────────────────────────────
+
+
+def test_builtin_tools_seeded():
+    from app.services.tool_seeder import BUILTIN_TOOLS
+
+    by_name = {t["name"]: t for t in BUILTIN_TOOLS}
+    for name in ("list_sessions", "read_session_messages", "search_sessions"):
+        assert name in by_name, f"{name} missing from BUILTIN_TOOLS"
+        t = by_name[name]
+        assert t["is_default"] is True
+        assert t["category"] == "discovery"
+        assert t["parameters_schema"]["type"] == "object"
+    assert by_name["read_session_messages"]["parameters_schema"]["required"] == ["session_id"]
+    assert by_name["search_sessions"]["parameters_schema"]["required"] == ["query"]
+
+
+# ── Task 6: dispatch routing ───────────────────────────────────────────────
+
+
+async def test_execute_tool_routes_to_session_handlers(monkeypatch):
+    import app.services.tools.session_introspection as pkg
+
+    captured = {}
+
+    async def fake(agent_id, user_id, ctx_session_id, arguments):
+        captured.update(agent_id=agent_id, user_id=user_id, ctx=ctx_session_id, args=arguments)
+        return "ROUTED-OK"
+
+    monkeypatch.setattr(pkg, "handle_list_sessions", fake)
+
+    from app.services.agent_tools import execute_tool
+
+    t = await _seed_tenant()
+    u = await _seed_user(tenant_id=t.id)
+    agent = await _seed_agent(u.id, tenant_id=t.id)
+    out = await execute_tool(
+        "list_sessions", {"limit": 5}, agent_id=agent.id, user_id=u.id, session_id="sess-xyz"
+    )
+    assert out == "ROUTED-OK"
+    assert captured["user_id"] == u.id
+    assert captured["ctx"] == "sess-xyz"
+    assert captured["args"]["limit"] == 5
+
+
+async def test_execute_tool_end_to_end_real_path():
+    """No monkeypatch: dispatch -> real handler -> real DB -> rendered string."""
+    from app.services.agent_tools import execute_tool
+
+    t = await _seed_tenant()
+    owner = await _seed_user(role="member", tenant_id=t.id)
+    member = await _seed_user(role="member", tenant_id=t.id)
+    agent = await _seed_agent(owner.id, tenant_id=t.id, access_mode="company")
+    mine = await _seed_session(agent.id, member.id, channel="web", title="My Chat")
+    await _seed_message(agent.id, member.id, mine.id, "user", "remember the launch date")
+
+    listed = await execute_tool(
+        "list_sessions", {"limit": 50}, agent_id=agent.id, user_id=member.id, session_id=str(mine.id)
+    )
+    assert "My Chat" in listed and str(mine.id) in listed
+
+    read = await execute_tool(
+        "read_session_messages",
+        {"session_id": str(mine.id)},
+        agent_id=agent.id,
+        user_id=member.id,
+        session_id=str(mine.id),
+    )
+    assert "remember the launch date" in read
