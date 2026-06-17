@@ -3230,7 +3230,7 @@ async def execute_tool(
             result = await _run_with_temp_workspace(
                 agent_id,
                 _agent_tenant_id,
-                lambda temp_ws: _execute_code(agent_id, temp_ws, arguments, tool_name=tool_name, on_output=on_output),
+                lambda temp_ws: _execute_code(agent_id, temp_ws, arguments, tool_name=tool_name, user_id=user_id, session_id=session_id, on_output=on_output),
                 sync_back=True,
             )
         elif tool_name == "sql_execute":
