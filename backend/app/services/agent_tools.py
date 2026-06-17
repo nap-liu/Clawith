@@ -2727,6 +2727,15 @@ async def execute_tool(
         elif tool_name == "read_image":
             from app.services.tools.read_image import handle_read_image
             return await handle_read_image(agent_id, arguments)
+        elif tool_name == "list_sessions":
+            from app.services.tools.session_introspection import handle_list_sessions
+            return await handle_list_sessions(agent_id, user_id, session_id, arguments)
+        elif tool_name == "read_session_messages":
+            from app.services.tools.session_introspection import handle_read_session_messages
+            return await handle_read_session_messages(agent_id, user_id, session_id, arguments)
+        elif tool_name == "search_sessions":
+            from app.services.tools.session_introspection import handle_search_sessions
+            return await handle_search_sessions(agent_id, user_id, session_id, arguments)
         elif tool_name == "write_file":
             path = arguments.get("path")
             content = arguments.get("content")
