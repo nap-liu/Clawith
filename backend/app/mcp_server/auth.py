@@ -10,19 +10,33 @@ from __future__ import annotations
 from app.services.pat_service import verify_pat
 
 
-def _bearer_from_ctx(ctx) -> str | None:
-    """Extract the raw Bearer token string from an MCP tool Context.
+def _headers_from_ctx(ctx):
+    """Locate the HTTP request headers on an MCP tool Context.
 
-    Tries ctx.request_context.transport.headers first (StreamableHTTP
-    transport), then falls back to ctx.request.headers (older path).
-    Both Starlette Headers and plain dicts are supported via .get().
+    Primary path (verified against the mcp SDK's StreamableHTTP transport):
+    ``ctx.request_context.request`` is the Starlette ``Request`` whose
+    ``.headers`` carry the inbound HTTP headers. Two defensive fallbacks cover
+    SDK-shape differences (``request_context.transport.headers`` and a direct
+    ``ctx.request``); the unit tests exercise the primary path.
     """
     rc = getattr(ctx, "request_context", None)
-    transport = getattr(rc, "transport", None) if rc else None
-    headers = getattr(transport, "headers", None)
+    # Primary: request_context.request (Starlette Request) -> .headers
+    req = getattr(rc, "request", None) if rc else None
+    headers = getattr(req, "headers", None)
+    # Fallback 1: request_context.transport.headers
+    if headers is None and rc is not None:
+        transport = getattr(rc, "transport", None)
+        headers = getattr(transport, "headers", None)
+    # Fallback 2: a direct ctx.request
     if headers is None:
-        req = getattr(ctx, "request", None)
-        headers = getattr(req, "headers", None)
+        direct = getattr(ctx, "request", None)
+        headers = getattr(direct, "headers", None)
+    return headers
+
+
+def _bearer_from_ctx(ctx) -> str | None:
+    """Extract the raw Bearer token string from an MCP tool Context."""
+    headers = _headers_from_ctx(ctx)
     if not headers:
         return None
     # Starlette Headers are case-insensitive; plain dicts are not — try both.

@@ -64,30 +64,28 @@ async def _seed_user(tenant_id=None, name: str = "U") -> User:
 # ── minimal fake MCP Context ─────────────────────────────────────────────────
 
 
-class _FakeTransport:
+class _FakeRequest:
+    """Stands in for the Starlette Request the SDK exposes at request_context.request."""
+
     def __init__(self, headers: dict):
         self.headers = headers
 
 
 class _FakeRequestContext:
     def __init__(self, headers: dict):
-        self.transport = _FakeTransport(headers)
+        # Real SDK shape (verified e2e): ctx.request_context.request.headers.
+        self.request = _FakeRequest(headers)
 
 
 class _FakeCtx:
-    """Minimal stand-in for mcp.server.fastmcp.Context."""
+    """Minimal stand-in for mcp.server.fastmcp.Context (primary header path)."""
 
     def __init__(self, headers: dict | None = None):
         self.request_context = _FakeRequestContext(headers or {})
 
 
-class _FakeRequest:
-    def __init__(self, headers: dict):
-        self.headers = headers
-
-
 class _FakeCtxRequestOnly:
-    """Ctx with no transport headers — exercises the ctx.request.headers fallback."""
+    """Ctx with no request_context — exercises the ctx.request.headers fallback."""
 
     def __init__(self, headers: dict | None = None):
         self.request_context = None  # forces the fallback branch in _bearer_from_ctx

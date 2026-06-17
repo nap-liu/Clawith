@@ -42,14 +42,17 @@ async def _isolate_async_engine_between_tests():
 # ── fake MCP Context ──────────────────────────────────────────────────────────
 
 
-class _FakeTransport:
+class _FakeRequest:
+    """Stands in for the Starlette Request the SDK exposes at request_context.request."""
+
     def __init__(self, headers: dict):
         self.headers = headers
 
 
 class _FakeRequestContext:
     def __init__(self, headers: dict):
-        self.transport = _FakeTransport(headers)
+        # Real SDK shape: ctx.request_context.request.headers (Starlette Request).
+        self.request = _FakeRequest(headers)
 
 
 class _FakeCtx:
