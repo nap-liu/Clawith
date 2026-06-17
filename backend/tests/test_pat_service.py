@@ -215,7 +215,7 @@ async def test_verify_pat_expired_token_returns_none():
     """An expired PAT returns (None, None) even if not revoked."""
     from app.services.pat_service import issue_pat, verify_pat
     from app.models.personal_access_token import PersonalAccessToken
-    from sqlalchemy import select, update
+    from sqlalchemy import update
 
     tenant = await _seed_tenant()
     user = await _seed_user(tenant_id=tenant.id)
@@ -277,3 +277,28 @@ async def test_list_pats_excludes_revoked():
     ids = [p.id for p in pats]
     assert row1.id in ids, "Non-revoked token should appear in list"
     assert row2.id not in ids, "Revoked token must not appear in list"
+
+
+async def test_verify_pat_inactive_user_returns_none():
+    """A valid token whose owner was deactivated returns (None, None)."""
+    from sqlalchemy import update
+
+    from app.models.user import User
+    from app.services.pat_service import issue_pat, verify_pat
+
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+
+    async with async_session() as db:
+        token, _ = await issue_pat(db, user=user, name="active-then-not")
+
+    # Deactivate the owner after issuing the token
+    async with async_session() as db:
+        await db.execute(update(User).where(User.id == user.id).values(is_active=False))
+        await db.commit()
+
+    async with async_session() as db:
+        u, t = await verify_pat(db, token)
+
+    assert u is None, "Inactive user's token must not verify"
+    assert t is None

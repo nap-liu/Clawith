@@ -30,7 +30,6 @@ def upgrade():
                 UUID(as_uuid=True),
                 sa.ForeignKey("users.id"),
                 nullable=False,
-                index=True,
             ),
             sa.Column("tenant_id", UUID(as_uuid=True), nullable=False),
             sa.Column("name", sa.String(100), nullable=False),
@@ -46,18 +45,24 @@ def upgrade():
             sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
         )
 
-        op.create_unique_constraint(
-            "uq_personal_access_tokens_token_hash",
-            "personal_access_tokens",
-            ["token_hash"],
-        )
+        # token_hash: single unique index (matches model unique=True, index=True);
+        # one index, not a redundant unique-constraint + plain-index pair.
         op.create_index(
             "ix_personal_access_tokens_token_hash",
             "personal_access_tokens",
             ["token_hash"],
+            unique=True,
+        )
+        # user_id: explicit index (column-level index=True is ignored by
+        # op.create_table — must be created here to match the model).
+        op.create_index(
+            "ix_personal_access_tokens_user_id",
+            "personal_access_tokens",
+            ["user_id"],
         )
 
 
 def downgrade():
+    op.drop_index("ix_personal_access_tokens_user_id", table_name="personal_access_tokens")
     op.drop_index("ix_personal_access_tokens_token_hash", table_name="personal_access_tokens")
     op.drop_table("personal_access_tokens")
