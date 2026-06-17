@@ -24,4 +24,4 @@ mcp = FastMCP(
 # /mcp the endpoint is reachable at /mcp, not /mcp/mcp.
 mcp.settings.streamable_http_path = "/"
 
-# TODO(G5): from app.mcp_server import tools  # noqa — registers @mcp.tool() definitions
+from app.mcp_server import tools  # noqa: F401,E402 — registers @mcp.tool() definitions
