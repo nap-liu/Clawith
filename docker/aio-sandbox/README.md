@@ -43,6 +43,19 @@ patched to `chmod 666 /opt/gem/mcp-hub.json` right after generating it (the only
 change vs the upstream run.sh). Without this, runtime registration fails with
 `Permission denied`.
 
+### 4. Real tool errors masked as a generic 500 (`mcp.py`)
+
+`app/api/v1/mcp.py`'s tool-call endpoint caught any exception from the MCP
+server and returned a generic `Failed to execute tool '<tool>' on MCP server
+'<server>'` with HTTP 500, while only *logging* the real error. So when an
+stdio MCP server returned a JSON-RPC error carrying the upstream API message
+(e.g. `Yunxiao API error (400): invalid workitemTypeId` / missing required
+field), that message never reached Clawith or the LLM — the agent flew blind and
+kept retrying with guessed arguments. Patched to append `: {e}` to the 500
+`detail` so the real reason is surfaced (Clawith already forwards the 500 body to
+the LLM, which can then self-correct). The only change vs upstream is that one
+f-string.
+
 ## Build
 
 ### Local (Mac / development):
