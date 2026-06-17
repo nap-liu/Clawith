@@ -654,3 +654,81 @@ async def test_chat_session_id_deny_wrong_user():
     )
     # user is a plain member on a company agent → SCOPE_OWN → can't access other user's session
     assert result == _DENY
+
+
+# ── A2A two-sided permission (the subtlest get_session logic) ──────────────────
+
+
+async def test_get_session_a2a_peer_side_manage_grants_access():
+    """A2A session anchored on agent X (viewer has NO access) but peer is agent Y
+    the viewer manages → _session_max_scope picks the peer side → read allowed."""
+    from app.mcp_server.tools import get_session, _DENY
+
+    tenant = await _seed_tenant()
+    viewer = await _seed_user(tenant_id=tenant.id, name="Viewer")
+    other = await _seed_user(tenant_id=tenant.id, name="Other")
+    token = await _issue_pat_for(viewer)
+
+    # Anchor X: created by other, private → viewer access = None.
+    agent_x = await _seed_agent(other.id, tenant_id=tenant.id, access_mode="private", name="AnchorX")
+    # Peer Y: created by viewer → viewer manages it.
+    agent_y = await _seed_agent(viewer.id, tenant_id=tenant.id, access_mode="private", name="PeerY")
+
+    sess = await _seed_session(agent_x.id, other.id, channel="agent", peer=agent_y.id)
+    await _seed_message(agent_x.id, other.id, sess.id, "user", "a2a hello world")
+
+    result = await get_session(_ctx(token), str(sess.id))
+    assert result != _DENY, "manage on the peer-side agent must grant read access"
+    assert "a2a hello world" in result
+
+
+async def test_get_session_a2a_no_access_either_side_denied():
+    """A2A session where the viewer manages neither side → uniform _DENY."""
+    from app.mcp_server.tools import get_session, _DENY
+
+    tenant = await _seed_tenant()
+    viewer = await _seed_user(tenant_id=tenant.id, name="Viewer")
+    other = await _seed_user(tenant_id=tenant.id, name="Other")
+    token = await _issue_pat_for(viewer)
+
+    agent_x = await _seed_agent(other.id, tenant_id=tenant.id, access_mode="private", name="X2")
+    agent_y = await _seed_agent(other.id, tenant_id=tenant.id, access_mode="private", name="Y2")
+    sess = await _seed_session(agent_x.id, other.id, channel="agent", peer=agent_y.id)
+    await _seed_message(agent_x.id, other.id, sess.id, "user", "secret a2a")
+
+    result = await get_session(_ctx(token), str(sess.id))
+    assert result == _DENY
+
+
+# ── chat_with_agent cross-agent session_id mismatch ───────────────────────────
+
+
+async def test_chat_with_agent_cross_agent_session_id_mismatch(monkeypatch):
+    """Explicit agent that doesn't match the session's agent → mismatch error,
+    and the LLM is never invoked."""
+    from app.mcp_server import tools
+
+    tenant = await _seed_tenant()
+    viewer = await _seed_user(tenant_id=tenant.id, name="V")
+    creator = await _seed_user(tenant_id=tenant.id, name="C")
+    token = await _issue_pat_for(viewer)
+
+    # AgentX must exist & be visible so it resolves by name (then mismatches the session's agent).
+    await _seed_agent(creator.id, tenant_id=tenant.id, access_mode="company", name="AgentX")
+    agent_y = await _seed_agent(creator.id, tenant_id=tenant.id, access_mode="company", name="AgentY")
+    # Session owned by Y that the viewer participated in (so scope passes before mismatch).
+    sess_y = await _seed_session(agent_y.id, viewer.id, channel="web")
+
+    called = {"n": 0}
+
+    async def _boom(*a, **k):
+        called["n"] += 1
+        return "must not be called"
+
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", _boom)
+
+    result = await tools.chat_with_agent(
+        _ctx(token), message="hi", agent="AgentX", session_id=str(sess_y.id)
+    )
+    assert "不一致" in result
+    assert called["n"] == 0, "LLM must not run when session_id's agent != requested agent"
