@@ -1,7 +1,7 @@
 """Clawith Backend — FastAPI Application Entry Point."""
 
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
 import shutil
 
@@ -327,7 +327,25 @@ async def lifespan(app: FastAPI):
     ss_task = asyncio.create_task(_start_ss_local(), name="ss-local-proxy")
     ss_task.add_done_callback(_bg_task_error)
 
+    # Start the MCP session manager (required for /mcp streamable-HTTP endpoint).
+    # Starlette does not propagate lifespan into mounted sub-apps, so we enter
+    # the context manually here.  A startup failure is logged but non-fatal so
+    # the rest of the platform keeps running.
+    _mcp_stack = AsyncExitStack()
+    _mcp_available = False
+    try:
+        from app.mcp_server import mcp as _mcp
+        await _mcp_stack.enter_async_context(_mcp.session_manager.run())
+        _mcp_available = True
+        logger.info("[startup] MCP session manager started — /mcp endpoint is live")
+    except Exception as _mcp_exc:
+        logger.error(f"[startup] MCP session manager failed to start: {_mcp_exc} — /mcp requests will fail")
+
     yield
+
+    # Shutdown MCP session manager if it was successfully started
+    if _mcp_available:
+        await _mcp_stack.aclose()
 
     # Shutdown
     await realtime_router.stop()
@@ -353,6 +371,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount MCP server sub-app at /mcp
+# The FastMCP instance sets streamable_http_path="/" so the endpoint is
+# reachable at /mcp (not /mcp/mcp).
+from app.mcp_server import mcp as _mcp_server
+app.mount("/mcp", _mcp_server.streamable_http_app())
 
 # Register API routes
 from app.api.auth import router as auth_router
@@ -402,6 +426,7 @@ from app.api.okr import router as okr_router
 from app.api.mcp_servers import router as mcp_servers_router
 from app.api.sdk_auth import router as sdk_auth_router
 from app.api.onboarding import router as onboarding_router
+from app.api.personal_access_tokens import router as personal_access_tokens_router
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
@@ -465,6 +490,7 @@ app.include_router(okr_router)  # OKR — self-prefixed at /api/okr
 app.include_router(mcp_servers_router, prefix=settings.API_PREFIX)
 app.include_router(sdk_auth_router, prefix=settings.API_PREFIX)
 app.include_router(onboarding_router, prefix=settings.API_PREFIX)
+app.include_router(personal_access_tokens_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])

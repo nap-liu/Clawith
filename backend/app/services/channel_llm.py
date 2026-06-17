@@ -27,6 +27,18 @@ _LLM_ERROR_PREFIXES = ("[LLM Error]", "[LLM call error]", "[Error]")
 _IM_LLM_RECOVERY_HINT = "\n\n———\n如果反复出现此问题，请发送 /new 开启新对话后重试。"
 
 
+def _apply_recovery_hint(reply: str, hint: str | None) -> str:
+    """Append a recovery hint to an LLM-error reply, if a hint is given.
+
+    IM channels pass the default ``_IM_LLM_RECOVERY_HINT`` (guides the user to
+    ``/new``). Non-IM callers (e.g. the MCP channel, which has no ``/new``) pass
+    ``hint=None`` to opt out. Non-error replies are never touched.
+    """
+    if hint and reply and any(reply.startswith(p) for p in _LLM_ERROR_PREFIXES):
+        return reply + hint
+    return reply
+
+
 async def _broadcast_to_web_session(agent_id, session_id, payload: dict) -> None:
     """Best-effort mirror of one event to every web client viewing this session.
 
@@ -92,6 +104,7 @@ async def _call_agent_llm(
     on_thinking=None,
     on_tool_call=None,
     is_group: bool = False,
+    recovery_hint: str | None = _IM_LLM_RECOVERY_HINT,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -275,5 +288,4 @@ async def _call_agent_llm(
             f"[Channel] LLM error surfaced on IM channel "
             f"(agent_id={agent_id}, model={getattr(model, 'model', 'unknown')}): {reply[:200]}"
         )
-        return reply + _IM_LLM_RECOVERY_HINT
-    return reply
+    return _apply_recovery_hint(reply, recovery_hint)

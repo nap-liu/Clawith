@@ -604,3 +604,27 @@ export const controlApi = {
     unlock: (agentId: string, data: { session_id: string; export_cookies?: boolean; platform_hint?: string }) =>
         request<any>(`/agents/${agentId}/control/unlock`, { method: 'POST', body: JSON.stringify(data) }),
 };
+
+// ─── Personal Access Tokens ───────────────────────────
+export interface Pat {
+    id: string;
+    name: string;
+    token_prefix: string;
+    created_at: string;
+    last_used_at: string | null;
+    expires_at: string | null;
+}
+
+export interface PatCreated extends Pat {
+    token: string;
+}
+
+export const patApi = {
+    list: () => request<Pat[]>('/personal-access-tokens'),
+
+    create: (data: { name: string; expires_at?: string }) =>
+        request<PatCreated>('/personal-access-tokens', { method: 'POST', body: JSON.stringify(data) }),
+
+    revoke: (id: string) =>
+        request<{ ok: boolean }>(`/personal-access-tokens/${id}`, { method: 'DELETE' }),
+};

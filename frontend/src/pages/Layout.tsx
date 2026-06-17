@@ -35,6 +35,7 @@ import {
 } from '@tabler/icons-react';
 import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
+import PatManager from '../components/PatManager';
 
 /* ────── Tabler Icons ────── */
 const SidebarIcons = {
@@ -222,6 +223,10 @@ function AccountSettingsModal({ user, onClose, isChinese }: { user: any; onClose
                     <div><label style={labelStyle}>{isChinese ? '新密码' : 'New Password'}</label><input className="form-input" type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder={isChinese ? '至少 6 个字符' : 'Min 6 characters'} style={inputStyle} /></div>
                     <div><label style={labelStyle}>{isChinese ? '确认新密码' : 'Confirm New Password'}</label><input className="form-input" type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} style={inputStyle} /></div>
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}><button className="btn btn-primary" onClick={handleChangePassword} disabled={saving} style={{ padding: '6px 16px', fontSize: '12px' }}>{saving ? '...' : (isChinese ? '修改密码' : 'Change Password')}</button></div>
+                </div>
+                {/* PAT */}
+                <div style={{ borderTop: '1px solid var(--border-subtle)', marginTop: '20px', paddingTop: '20px' }}>
+                    <PatManager />
                 </div>
             </div>
         </div>
