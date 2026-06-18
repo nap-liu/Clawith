@@ -142,3 +142,55 @@ async def test_edit_agent_soul_no_fields_noop():
     token = await _pat(user, scope="write")
     out = await edit_agent_soul_impl(_ctx(token), agent=str(agent.id))
     assert "未提供" in out
+
+
+async def test_set_agent_relationships_a2a_merge():
+    from app.services.agent_manager import agent_manager
+    from app.mcp_server.tools_config import set_agent_relationships_impl
+    from app.models.org import AgentAgentRelationship
+    from sqlalchemy import select
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    a = await _seed_agent(user, name=f"Lead_{uuid.uuid4().hex[:6]}")
+    b = await _seed_agent(user, name=f"Helper_{uuid.uuid4().hex[:6]}")
+    agent_manager._agent_dir(a.id).mkdir(parents=True, exist_ok=True)
+    token = await _pat(user, scope="write")
+    out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
+              agent_links=[{"target_agent": b.name, "relation": "collaborator"}])
+    assert "✅" in out, out
+    async with async_session() as db:
+        row = (await db.execute(select(AgentAgentRelationship).where(
+            AgentAgentRelationship.agent_id == a.id,
+            AgentAgentRelationship.target_agent_id == b.id))).scalar_one_or_none()
+    assert row is not None
+
+
+async def test_set_agent_relationships_human_platform_user():
+    from app.services.agent_manager import agent_manager
+    from app.mcp_server.tools_config import set_agent_relationships_impl
+    from app.models.org import AgentRelationship
+    from sqlalchemy import select
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    colleague = await _seed_user(tenant_id=tenant.id)   # same tenant → has company access to a company agent
+    a = await _seed_agent(owner, name=f"Boss_{uuid.uuid4().hex[:6]}")  # company access_mode by default
+    agent_manager._agent_dir(a.id).mkdir(parents=True, exist_ok=True)
+    token = await _pat(owner, scope="write")
+    out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
+              human_links=[{"user": f"platform-user:{colleague.id}", "relation": "manager"}])
+    assert "✅" in out, out
+    async with async_session() as db:
+        rows = (await db.execute(select(AgentRelationship).where(
+            AgentRelationship.agent_id == a.id))).scalars().all()
+    assert len(rows) >= 1
+
+
+async def test_set_agent_relationships_requires_write():
+    from app.mcp_server.tools_config import set_agent_relationships_impl
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    a = await _seed_agent(user)
+    token = await _pat(user, scope="read")
+    out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
+              agent_links=[{"target_agent": "whatever"}])
+    assert "需要 write" in out
