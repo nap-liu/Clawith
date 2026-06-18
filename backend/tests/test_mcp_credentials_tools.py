@@ -264,3 +264,41 @@ async def test_credentials_requires_write():
     )
 
     assert "需要 write" in out, f"Expected write-scope error, got: {out}"
+
+
+async def test_set_credential_accepts_list_cookies():
+    """cookies delivered as a native list (the MCP transport form) must be accepted.
+
+    Regression: the str-only signature rejected lists over the real /mcp transport
+    (clients/transport deliver JSON arrays as Python lists) — found in prod e2e.
+    """
+    from app.mcp_server.tools_credentials import set_agent_credential_impl
+
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    token = await _pat(user)
+
+    out = await set_agent_credential_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        credential_type="cookie",
+        platform="list.example",
+        cookies_json=[{"name": "k", "value": "secretval"}],  # NATIVE LIST, not a string
+        confirm=True,
+    )
+    assert "✅" in out, f"native list cookies should be accepted, got: {out}"
+
+    async with async_session() as db:
+        row = (
+            await db.execute(
+                select(AgentCredential).where(
+                    AgentCredential.agent_id == agent.id,
+                    AgentCredential.platform == "list.example",
+                )
+            )
+        ).scalar_one_or_none()
+
+    assert row is not None, "credential row should be created from a list input"
+    assert bool(row.cookies_json), "cookies should be stored"
+    assert "secretval" not in str(row.cookies_json), "cookies stored in plaintext — encryption not applied"
