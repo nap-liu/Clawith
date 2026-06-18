@@ -133,6 +133,24 @@ def _own_participated_where(agent_id: uuid.UUID, viewer_id):
     )
 
 
+def scope_predicate_for(scope_kind: str, agent_id, viewer_id):
+    """Public entry: map a SCOPE_* kind to its session WHERE predicate for ONE agent.
+
+    ``SCOPE_ALL`` -> every session the agent owns; ``SCOPE_OWN`` -> only sessions
+    the viewer personally participated in; ``SCOPE_DENY`` (and any unknown kind) -> None.
+
+    Lets cross-module callers (the MCP channel — always a human viewer — and
+    future REST) compose scope predicates without importing the private
+    ``_*_where`` helpers. ``SCOPE_AUTONOMOUS`` is intentionally not exposed here:
+    it is an agent-tool concept (see ``resolve_scope``), not a human-viewer scope.
+    """
+    if scope_kind == SCOPE_ALL:
+        return _all_sessions_where(agent_id)
+    if scope_kind == SCOPE_OWN:
+        return _own_participated_where(agent_id, viewer_id)
+    return None
+
+
 def _autonomous_where(agent_id: uuid.UUID, ctx_session_id):
     """Non-human turn: the agent's own trigger reflections + its A2A sessions +
     whatever the current turn's session is. NOT the human conversation archive."""
