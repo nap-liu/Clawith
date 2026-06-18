@@ -1825,7 +1825,7 @@
         "run": "运行",
         "running": "运行中…",
         "commandLabel": "命令",
-        "commandPlaceholder": "svc --version",
+        "commandPlaceholder": "{{name}} --version",
         "needBinary": "请先上传二进制。",
         "exitCode": "退出码",
         "duration": "毫秒",

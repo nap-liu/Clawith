@@ -623,6 +623,141 @@ async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkey
 # execute_code_aio description must not contain cli suffix.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Hyphenated CLI tool names (e.g. `my-cli`) — the canonical CLI name carries a
+# dash. A tool NAME / wrapper filename / LLM function name may contain a hyphen
+# (valid Unix command, valid OpenAI/Anthropic/qwen function name), but an ENV KEY
+# must stay a strict shell identifier (it becomes `export KEY=` / `env KEY=`).
+# These guard the split: relax the name rule, keep the env-key rule strict.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_build_wrapper_write_sh_accepts_hyphenated_name():
+    """A hyphenated tool name (canonical `my-cli`) is a valid wrapper filename
+    and must not be rejected."""
+    text = build_wrapper_write_sh(
+        name="my-cli",
+        binary_path="/data/cli_binaries/_global/t1/aa.bin",
+        env={"YYBPC_CLI_HOME": "/data/cli_state/x"},
+        bindir='"$HOME/.clawith-bin/abc123"',
+    )
+    assert '"$HOME/.clawith-bin/abc123"/my-cli' in text
+    decoded = _decode_wrapper(text)
+    assert "#!/bin/sh" in decoded
+    assert (
+        "exec env YYBPC_CLI_HOME='/data/cli_state/x' "
+        "'/data/cli_binaries/_global/t1/aa.bin' \"$@\"" in decoded
+    )
+
+
+def test_build_python_prelude_accepts_hyphenated_name():
+    """The python-exec prelude must write a wrapper for a hyphenated tool name."""
+    wrappers = [{"name": "my-cli", "binary_path": "/data/cli_binaries/x.bin", "env": {}}]
+    prelude = build_python_prelude(wrappers, bindir="~/.clawith-bin/abc123")
+    assert "my-cli" in prelude
+
+
+def test_build_wrapper_write_sh_still_rejects_hyphenated_env_key():
+    """Relaxing the NAME rule must NOT relax env-key validation: an env key with a
+    hyphen is invalid as `export`/`env KEY=` and must still raise."""
+    with pytest.raises(ValueError):
+        build_wrapper_write_sh(
+            name="my-cli",
+            binary_path="/x",
+            env={"BAD-KEY": "v"},
+            bindir='"$HOME/b"',
+        )
+
+
+@pytest.mark.asyncio
+async def test_cli_tool_with_hyphenated_name_is_standalone_function(llm_tools_session):
+    """A CLI tool named `my-cli` (hyphen) with a binary surfaces as its own LLM
+    function under that exact name — it must not be skipped as an 'unsafe name'."""
+    from app.models.tool import Tool, AgentTool
+    from app.services.agent_tools import get_agent_tools_for_llm
+
+    agent_id = _uuid.uuid4()
+
+    async with llm_tools_session() as s:
+        cli_tool = Tool(
+            name="my-cli", display_name="黄鹤楼主档",
+            description="数据查询 CLI。report 是唯一数据来源。",
+            type="cli", category="cli", icon="🔧", source="admin", enabled=True,
+            is_default=True, parameters_schema={},
+            config={"binary": {"sha256": "a" * 64, "size": 10, "original_name": "my-cli"}},
+            config_schema={},
+        )
+        aio_tool = Tool(
+            name="execute_code_aio", display_name="Sandbox",
+            description="Run code in sandbox.", type="builtin", category="code",
+            icon="💻", source="builtin", enabled=True, is_default=True,
+            parameters_schema={"type": "object", "properties": {}},
+            config={}, config_schema={},
+        )
+        s.add(cli_tool)
+        s.add(aio_tool)
+        await s.flush()
+        s.add(AgentTool(agent_id=agent_id, tool_id=cli_tool.id, enabled=True))
+        s.add(AgentTool(agent_id=agent_id, tool_id=aio_tool.id, enabled=True))
+        await s.commit()
+
+    tools = await get_agent_tools_for_llm(agent_id)
+    names = [t["function"]["name"] for t in tools]
+    assert "my-cli" in names
+    cli = next(t for t in tools if t["function"]["name"] == "my-cli")
+    assert "command" in cli["function"]["parameters"]["properties"]
+    # The auto-generated command description embeds the (hyphenated) program name.
+    assert "my-cli" in cli["function"]["parameters"]["properties"]["command"]["description"]
+
+
+@pytest.mark.asyncio
+async def test_build_cli_injection_renders_hyphenated_tool(cli_inject_session_agents, monkeypatch, tmp_path):
+    """build_cli_injection must inject a wrapper for a hyphenated tool name."""
+    import uuid as _uuid_mod
+    from app.models.user import Identity, User
+    from app.models.tool import Tool, AgentTool
+    from app.services.agent_tools import build_cli_injection
+    from app.services.cli_tools import state_storage as ss_mod
+
+    monkeypatch.setattr(ss_mod.os, "chown", lambda p, u, g: None)
+    monkeypatch.setenv("CLI_STATE_ROOT", str(tmp_path))
+
+    agent_id = _uuid_mod.uuid4()
+
+    async with cli_inject_session_agents() as s:
+        identity = Identity(email="u@x.com", phone="13800000000", password_hash="x")
+        s.add(identity)
+        await s.flush()
+        user = User(identity_id=identity.id, display_name="U", role="member", is_active=True)
+        s.add(user)
+        await s.flush()
+        uid = user.id
+        tool = Tool(
+            name="my-cli", display_name="my-cli", description="数据查询 CLI", type="cli",
+            category="cli", icon="🔧", source="admin", enabled=True, is_default=True,
+            parameters_schema={},
+            config={
+                "binary": {"sha256": "a" * 64, "size": 1, "original_name": "my-cli"},
+                "env": {"YYBPC_CLI_USER_PHONE": "$user.phone"},
+            },
+            config_schema={},
+        )
+        s.add(tool)
+        await s.flush()
+        tid = tool.id
+        await s.execute(
+            text("INSERT INTO agents (id, tenant_id) VALUES (:id, :tid)"),
+            {"id": agent_id.hex, "tid": None},
+        )
+        s.add(AgentTool(agent_id=agent_id, tool_id=tid, enabled=True))
+        await s.commit()
+
+    injection = await build_cli_injection(agent_id=agent_id, user_id=uid)
+    assert injection is not None
+    wrapper_names = [w["name"] for w in injection["wrappers"]]
+    assert "my-cli" in wrapper_names
+
+
 @pytest.mark.asyncio
 async def test_cli_tool_no_aio_graceful_degrade(llm_tools_session):
     """When an agent has a cli tool enabled but execute_code_aio is NOT in the

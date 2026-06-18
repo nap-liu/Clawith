@@ -50,7 +50,7 @@ export function TestRunPanel({ tool }: { tool: CliTool }) {
           className="form-input"
           value={command}
           onChange={(e) => setCommand(e.target.value)}
-          placeholder={k('commandPlaceholder', 'svc --version')}
+          placeholder={t('enterprise.cliTools.testRun.commandPlaceholder', { defaultValue: '{{name}} --version', name: tool.name })}
           style={{ fontFamily: 'monospace' }}
         />
       </div>
