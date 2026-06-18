@@ -2261,7 +2261,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             )
             all_tools = all_tools_r.scalars().all()
 
-            from app.services.cli_tools.sandbox_inject import _FUNC_NAME_RE
+            from app.services.cli_tools.sandbox_inject import _TOOL_NAME_RE
             result = []
             db_tool_names = set()
             for t in all_tools:
@@ -2282,7 +2282,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                         continue  # no binary uploaded yet (tolerate legacy null/non-dict)
                     _always_names = {a["function"]["name"] for a in _always_tools}
                     if (
-                        not _FUNC_NAME_RE.fullmatch(t.name)
+                        not _TOOL_NAME_RE.fullmatch(t.name)
                         or t.name in db_tool_names
                         or t.name in _always_names
                     ):
@@ -7524,7 +7524,7 @@ async def build_cli_injection(
         from app.models.tool import Tool, AgentTool
         from app.models.user import User
         from app.services.cli_tools.placeholders import PlaceholderContext
-        from app.services.cli_tools.sandbox_inject import _FUNC_NAME_RE, render_env
+        from app.services.cli_tools.sandbox_inject import _FUNC_NAME_RE, _TOOL_NAME_RE, render_env
         from app.services.cli_tools.schema import CliToolConfig
         from app.services.cli_tools.state_storage import StateStorage
 
@@ -7584,9 +7584,10 @@ async def build_cli_injection(
             at = assignments.get(str(tool.id))
             if not agent_tool_enabled(at):
                 continue
-            # Skip tools whose name isn't a safe shell/env identifier (would be
-            # an unsafe wrapper filename / export key).
-            if not _FUNC_NAME_RE.fullmatch(tool.name) or any(
+            # Skip tools whose name isn't a safe PATH/function name, or whose env
+            # keys aren't strict shell identifiers (env keys → `export KEY=`, so
+            # they stay dash-free; the tool name may carry a dash, e.g. my-cli).
+            if not _TOOL_NAME_RE.fullmatch(tool.name) or any(
                 not _FUNC_NAME_RE.fullmatch(k) for k in (CliToolConfig.model_validate(tool.config or {}).env or {})
             ):
                 logger.warning(f"[CLI Inject] skip tool {tool.name}: unsafe name or env key")

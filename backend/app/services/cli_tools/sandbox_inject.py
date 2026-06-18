@@ -55,9 +55,15 @@ import re
 
 from app.services.cli_tools.placeholders import PlaceholderContext, resolve
 
-# Shell-identifier-safe names (no dashes) — used for both CLI tool/wrapper names
-# and env keys (so they're safe as `export KEY=` and as a filename on PATH).
+# Strict shell-identifier — for ENV KEYS, which become `export KEY=` / `env KEY=`
+# on the wrapper exec line and so must be valid shell identifiers (no dashes).
 _FUNC_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# CLI tool / wrapper / LLM-function names. A hyphen is allowed here (e.g. a tool
+# named `my-cli`): it is a valid PATH command + filename, and a valid
+# OpenAI/Anthropic/qwen function name (`^[a-zA-Z0-9_-]{1,64}$`). The leading char
+# is still restricted so the name can never be parsed as a flag (`-x`).
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
 # Per-conversation wrapper directories live under this dir in the sandbox user's
 # home (resolved at runtime — bash: $HOME; python: expanduser). The leaf is a
@@ -96,7 +102,7 @@ def render_env(env: dict[str, str], ctx: PlaceholderContext) -> dict[str, str]:
 
 
 def _validate_name(name: str) -> None:
-    if not _FUNC_NAME_RE.fullmatch(name):
+    if not _TOOL_NAME_RE.fullmatch(name):
         raise ValueError(f"unsafe CLI tool name: {name!r}")
 
 
