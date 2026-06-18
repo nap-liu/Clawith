@@ -19,10 +19,19 @@ from app.core.permissions import is_agent_creator, is_agent_expired
 from app.models.schedule import AgentSchedule
 from app.services.scheduler import compute_next_run
 
-_NOT_CREATOR = "❌ 仅创建者或管理员可管理 schedules。"
-_NOT_FOUND = "❌ 找不到该 schedule。"
-_INVALID_CRON = "❌ 无效 cron 表达式：{}"
-_AGENT_EXPIRED = "❌ Agent 已过期，无法触发执行。"
+_NOT_CREATOR = (
+    "❌ 仅创建者或管理员可管理 schedules。"
+    "请以 agent 创建者身份或 platform_admin/org_admin 角色重试。"
+)
+_NOT_FOUND = (
+    "❌ 找不到该 schedule。"
+    "用 list_agent_schedules 查看该 agent 的 schedule 列表及其 id，再重试。"
+)
+_INVALID_CRON = (
+    "❌ 无效 cron 表达式：{}。"
+    "请使用标准 5 字段 cron 格式，例如 '0 9 * * *'（每天 9 点）或 '*/30 * * * *'（每 30 分钟）。"
+)
+_AGENT_EXPIRED = "❌ Agent 已过期，无法触发执行。请联系管理员更新 agent 的 expires_at 后再试。"
 
 
 def _is_creator_or_admin(user, agent) -> bool:
@@ -95,7 +104,10 @@ async def set_agent_schedule_impl(
             try:
                 sid = _uuid.UUID(str(schedule_id))
             except (ValueError, TypeError):
-                return f"❌ schedule_id 不是合法 UUID：{schedule_id}"
+                return (
+                    f"❌ schedule_id 不是合法 UUID（你传入了 {schedule_id!r}）。"
+                    "用 list_agent_schedules 查看该 agent 的 schedule 列表及其 id（UUID 格式）。"
+                )
 
             result = await db.execute(
                 select(AgentSchedule).where(

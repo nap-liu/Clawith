@@ -50,7 +50,10 @@ async def set_agent_tools_impl(ctx, agent, enable=None, disable=None) -> str:
         await db.commit()
         msg = f"✅ 已更新「{ag.name}」工具：{', '.join(applied) or '（无变化）'}。"
         if missing:
-            msg += f"\n⚠ 找不到这些工具（用 list_available_tools 查看）：{', '.join(missing)}"
+            msg += (
+                f"\n⚠ 找不到这些工具（已跳过）：{', '.join(missing)}。"
+                "用 list_available_tools 查看可用工具的名字或 id，并重试。"
+            )
         return msg
 
 
@@ -93,7 +96,10 @@ async def delete_agent_trigger_impl(ctx, agent, trigger) -> str:
         except (ValueError, TypeError):
             row = (await db.execute(q.where(AgentTrigger.name == trigger))).scalar_one_or_none()
         if row is None:
-            return "❌ 找不到该触发器（按 name 或 id 指定）。"
+            return (
+                f"❌ 找不到该触发器（你传入了 {trigger!r}，按 name 或 id 指定）。"
+                "用 list_agent_triggers 查看该 agent 的触发器及其 id/名字，再重试。"
+            )
         tname = row.name
         await db.delete(row)
         await db.commit()
@@ -280,9 +286,12 @@ async def set_agent_relationships_impl(ctx, agent, agent_links=None, human_links
     agent_links = agent_links or []
     human_links = human_links or []
     if mode not in ("merge", "replace"):
-        return "❌ mode 只能是 merge 或 replace。"
+        return (
+            f"❌ mode 取值无效（你传入了 {mode!r}），只能是 merge（增量 upsert，默认）"
+            "或 replace（整组替换）。"
+        )
     if not agent_links and not human_links:
-        return "（未提供任何关系）"
+        return "（未提供任何关系：请在 agent_links 或 human_links 中至少传一项。）"
     async with async_session() as db:
         pc, err = await authed_write(ctx, db)
         if err:
@@ -334,7 +343,10 @@ async def set_agent_access_impl(ctx, agent, access_mode, access_level="use",
 
     grant_user_ids = grant_user_ids or []
     if access_mode not in ("company", "private", "custom"):
-        return "❌ access_mode 只能是 company、private 或 custom。"
+        return (
+            f"❌ access_mode 取值无效（你传入了 {access_mode!r}），"
+            "只能是 company（全员）、private（创建者专属）或 custom（指定用户）。"
+        )
 
     async with async_session() as db:
         pc, err = await authed_write(ctx, db)
@@ -369,7 +381,10 @@ async def set_agent_access_impl(ctx, agent, access_mode, access_level="use",
             try:
                 parsed_grant_ids.append(_uuid_mod.UUID(str(uid_str)))
             except (ValueError, TypeError):
-                return f"❌ grant_user_ids 包含无效 UUID：{uid_str}"
+                return (
+                    f"❌ grant_user_ids 包含无效 UUID：{uid_str!r}。"
+                    "请传入标准 UUID 格式（如 550e8400-e29b-41d4-a716-446655440000）。"
+                )
 
         # Delete existing permissions
         await db.execute(sql_delete(AgentPermission).where(AgentPermission.agent_id == ag.id))
@@ -456,7 +471,10 @@ async def list_agent_triggers_impl(ctx, agent) -> str:
             return "❌ 未鉴权：请在 MCP 客户端配置 Authorization: Bearer <clw_...> 令牌。"
         ag = await _resolve_visible_agent(db, pc.user, agent)
         if ag is None:
-            return "❌ 找不到该 agent，或你无权访问。"
+            return (
+                "❌ 找不到该 agent，或你无权访问。"
+                "请用 list_agents 查看你可访问的 agent 列表，并以其 id 或准确名字重试。"
+            )
         result = await db.execute(
             select(AgentTrigger)
             .where(AgentTrigger.agent_id == ag.id)
@@ -511,7 +529,10 @@ async def update_agent_trigger_impl(ctx, agent, trigger, is_enabled=None, config
         except (ValueError, TypeError):
             row = (await db.execute(q.where(AgentTrigger.name == trigger))).scalar_one_or_none()
         if row is None:
-            return "❌ 找不到该触发器（按 name 或 id 指定）。"
+            return (
+                f"❌ 找不到该触发器（你传入了 {trigger!r}，按 name 或 id 指定）。"
+                "用 list_agent_triggers 查看该 agent 的触发器及其 id/名字，再重试。"
+            )
 
         # Capture before-values of fields being changed
         changes: list[str] = []
@@ -556,7 +577,10 @@ async def update_agent_trigger_impl(ctx, agent, trigger, is_enabled=None, config
             revert_parts.append(f"expires_at={old_str!r}")
 
         if not changes:
-            return f"（未提供任何更改字段：触发器「{row.name}」未变动）"
+            return (
+                f"（未提供任何更改字段：触发器「{row.name}」未变动。"
+                "请至少传一个要修改的字段，如 is_enabled、config 或 reason。）"
+            )
 
         await db.commit()
 
@@ -605,10 +629,16 @@ async def set_agent_tool_config_impl(ctx, agent, tool, config) -> str:
         if err:
             return err
         if "allow_network" in config and pc.user.role not in ("platform_admin", "org_admin"):
-            return "❌ 仅管理员可修改 allow_network（网络访问）设置。"
+            return (
+                "❌ 仅管理员可修改 allow_network（网络访问）设置。"
+                "请联系 platform_admin 或 org_admin 进行操作。"
+            )
         tool_row = await resolve_tenant_tool(db, ag.tenant_id, tool)
         if tool_row is None:
-            return "❌ 找不到该工具（用 list_available_tools 查看）。"
+            return (
+                f"❌ 找不到该工具（你传入了 {tool!r}）。"
+                "用 list_available_tools 查看可用工具的名字或 id，并重试。"
+            )
         # Capture prior config keys for rollback hint (do NOT decrypt/echo secret values)
         at = (await db.execute(select(AgentTool).where(
             AgentTool.agent_id == ag.id, AgentTool.tool_id == tool_row.id))).scalar_one_or_none()

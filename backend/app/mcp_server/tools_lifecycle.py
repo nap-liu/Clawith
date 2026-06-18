@@ -64,9 +64,12 @@ async def delete_agent_impl(ctx, agent, confirm=False) -> str:
             return err
         # Stricter gate: only the creator or a tenant/platform admin may delete.
         if not (is_agent_creator(pc.user, ag) or pc.user.role in _ADMIN_ROLES):
-            return "❌ 仅创建者或管理员可删除该 agent。"
+            return (
+                "❌ 仅创建者或管理员可删除该 agent。"
+                "请以 agent 创建者身份或 platform_admin/org_admin 角色重试，或联系管理员操作。"
+            )
         if ag.is_system:
-            return "❌ 系统 agent 不可删除。"
+            return "❌ 系统 agent 不可删除。系统 agent 为平台内置，不支持删除操作。"
         guidance = needs_confirm(confirm, f"将软删除「{ag.name}」(可用 restore_agent 恢复)")
         if guidance:
             return guidance
@@ -95,16 +98,25 @@ async def restore_agent_impl(ctx, agent, confirm=False) -> str:
         try:
             aid = _uuid.UUID(str(agent))
         except (ValueError, TypeError):
-            return "❌ 找不到该 agent。"
+            return (
+                f"❌ 找不到该 agent（{agent!r} 不是合法 UUID）。"
+                "restore_agent 需要传入 agent 的 UUID（从 delete_agent 的响应中获取）。"
+            )
         ag = (await db.execute(select(Agent).where(Agent.id == aid))).scalar_one_or_none()
         if ag is None or ag.tenant_id != pc.tenant_id:
-            return "❌ 找不到该 agent。"
+            return (
+                f"❌ 找不到该 agent（id={agent}）。"
+                "请确认 UUID 来自 delete_agent 的响应，且该 agent 属于你的租户。"
+            )
         # Manage check (mirror delete's gate): creator/admin or explicit manage level.
         level = await get_agent_access_level_for_user_id(db, pc.user.id, ag)
         if not (level == "manage" or is_agent_creator(pc.user, ag) or pc.user.role in _ADMIN_ROLES):
-            return "❌ 无权恢复该 agent（需要 manage 权限）。"
+            return (
+                "❌ 无权恢复该 agent（需要 manage 权限）。"
+                "请以 agent 创建者身份或 platform_admin/org_admin 角色重试，或联系管理员授予 manage 权限。"
+            )
         if not ag.is_deleted:
-            return f"（「{ag.name}」未被删除）"
+            return f"（「{ag.name}」未被删除，无需恢复。若要修改其配置，请直接使用 update_agent 等工具。）"
         ag.is_deleted = False
         ag.deleted_at = None
         # Best-effort restart — restore must succeed even if Docker errors.

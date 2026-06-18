@@ -118,7 +118,10 @@ async def set_agent_credential_impl(
             try:
                 cid = _uuid.UUID(str(credential_id))
             except (ValueError, TypeError):
-                return "❌ credential_id 格式无效（需为 UUID）。"
+                return (
+                    f"❌ credential_id 格式无效（你传入了 {credential_id!r}，需为 UUID）。"
+                    "请用 list_agent_credentials 查看该 agent 的凭证列表及其 id。"
+                )
 
             result = await db.execute(
                 select(AgentCredential).where(
@@ -128,7 +131,10 @@ async def set_agent_credential_impl(
             )
             cred = result.scalar_one_or_none()
             if cred is None:
-                return f"❌ 找不到凭证 {credential_id}（或不属于该 agent）。"
+                return (
+                    f"❌ 找不到凭证 {credential_id}（或不属于该 agent）。"
+                    "用 list_agent_credentials 查看该 agent 的凭证列表，并以正确 id 重试。"
+                )
 
             # Update provided fields
             cred.credential_type = credential_type
@@ -196,7 +202,10 @@ async def delete_agent_credential_impl(
         try:
             cid = _uuid.UUID(str(credential_id))
         except (ValueError, TypeError):
-            return "❌ credential_id 格式无效（需为 UUID）。"
+            return (
+                f"❌ credential_id 格式无效（你传入了 {credential_id!r}，需为 UUID）。"
+                "请用 list_agent_credentials 查看该 agent 的凭证列表及其 id。"
+            )
 
         result = await db.execute(
             select(AgentCredential).where(
@@ -206,7 +215,10 @@ async def delete_agent_credential_impl(
         )
         cred = result.scalar_one_or_none()
         if cred is None:
-            return f"❌ 找不到凭证 {credential_id}（或不属于该 agent）。"
+            return (
+                f"❌ 找不到凭证 {credential_id}（或不属于该 agent）。"
+                "用 list_agent_credentials 查看该 agent 的凭证列表，并以正确 id 重试。"
+            )
 
         platform = cred.platform
         await db.delete(cred)

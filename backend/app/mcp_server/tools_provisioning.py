@@ -60,15 +60,24 @@ async def create_agent_impl(
         if err:
             return err
         if access_mode not in _VALID_ACCESS:
-            return f"❌ access_mode 取值非法（可选：{', '.join(sorted(_VALID_ACCESS))}）。"
+            return (
+                f"❌ access_mode 取值非法（你传入了 {access_mode!r}，可选：{', '.join(sorted(_VALID_ACCESS))}）。"
+                "请修正后重试。"
+            )
         if not name or len(name) < 2:
-            return "❌ name 至少 2 个字符。"
+            return "❌ name 太短（至少 2 个字符）：请提供 2 个字符以上的名字。"
         pm = await _resolve_model_id(db, pc.tenant_id, primary_model)
         if primary_model and pm is None:
-            return "❌ 找不到 primary_model（用 list_models 查看可用模型）。"
+            return (
+                f"❌ 找不到 primary_model（你传入了 {primary_model!r}）。"
+                "用 list_models 查看可用模型，并以其 id 或 label 重试。"
+            )
         fm = await _resolve_model_id(db, pc.tenant_id, fallback_model)
         if fallback_model and fm is None:
-            return "❌ 找不到 fallback_model（用 list_models 查看可用模型）。"
+            return (
+                f"❌ 找不到 fallback_model（你传入了 {fallback_model!r}）。"
+                "用 list_models 查看可用模型，并以其 id 或 label 重试。"
+            )
 
         # Map access_mode to permission_scope_type
         if access_mode == "private":
@@ -82,7 +91,7 @@ async def create_agent_impl(
                 try:
                     scope_ids.append(_uuid.UUID(str(uid_str)))
                 except (ValueError, TypeError):
-                    return f"❌ grant_user_ids 中包含无效 UUID：{uid_str}"
+                    return f"❌ grant_user_ids 中包含无效 UUID：{uid_str!r}（需为标准 UUID 格式，如 550e8400-e29b-41d4-a716-446655440000）。"
         else:
             scope_type = "company"
             scope_ids = []
@@ -93,7 +102,10 @@ async def create_agent_impl(
             try:
                 parsed_template_id = _uuid.UUID(str(template_id))
             except (ValueError, TypeError):
-                return f"❌ template_id 无效 UUID：{template_id}"
+                return (
+                    f"❌ template_id 无效 UUID：{template_id!r}。"
+                    "请传入标准 UUID 格式（如 550e8400-e29b-41d4-a716-446655440000）。"
+                )
 
         # Parse skill_ids
         parsed_skill_ids = []
@@ -101,7 +113,10 @@ async def create_agent_impl(
             try:
                 parsed_skill_ids.append(_uuid.UUID(str(sid_str)))
             except (ValueError, TypeError):
-                return f"❌ skill_ids 中包含无效 UUID：{sid_str}"
+                return (
+                    f"❌ skill_ids 中包含无效 UUID：{sid_str!r}。"
+                    "请传入标准 UUID 格式（如 550e8400-e29b-41d4-a716-446655440000）。"
+                )
 
         inp = AgentProvisionInput(
             name=name,
@@ -176,14 +191,20 @@ async def update_agent_impl(
         # ── expires_at (admin only) ─────────────────────────────────────────
         if expires_at is not None:
             if not is_admin:
-                return "❌ 仅管理员可修改过期时间（expires_at 为管理员专属字段）。"
+                return (
+                    "❌ 仅管理员可修改过期时间（expires_at 为管理员专属字段）。"
+                    "如需变更请联系 platform_admin 或 org_admin 操作。"
+                )
             try:
                 parsed_expires = datetime.fromisoformat(expires_at)
                 # Ensure tz-aware
                 if parsed_expires.tzinfo is None:
                     parsed_expires = parsed_expires.replace(tzinfo=_tz.utc)
             except (ValueError, TypeError):
-                return "❌ expires_at 格式无效，请使用 ISO8601（如 2030-01-01T00:00:00+00:00）。"
+                return (
+                    f"❌ expires_at 格式无效（你传入了 {expires_at!r}）。"
+                    "请使用 ISO8601 格式，例如 2030-01-01T00:00:00+00:00。"
+                )
             # Re-activate if new expiry is future or cleared
             if parsed_expires > datetime.now(_tz.utc):
                 if ag.is_expired:
@@ -225,12 +246,18 @@ async def update_agent_impl(
         if primary_model is not None:
             pm = await _resolve_model_id(db, pc.tenant_id, primary_model)
             if pm is None:
-                return "❌ 找不到 primary_model（用 list_models 查看）。"
+                return (
+                    f"❌ 找不到 primary_model（你传入了 {primary_model!r}）。"
+                    "用 list_models 查看可用模型，并以其 id 或 label 重试。"
+                )
             planned.append(("primary_model_id", ag.primary_model_id, pm))
         if fallback_model is not None:
             fm = await _resolve_model_id(db, pc.tenant_id, fallback_model)
             if fm is None:
-                return "❌ 找不到 fallback_model（用 list_models 查看）。"
+                return (
+                    f"❌ 找不到 fallback_model（你传入了 {fallback_model!r}）。"
+                    "用 list_models 查看可用模型，并以其 id 或 label 重试。"
+                )
             planned.append(("fallback_model_id", ag.fallback_model_id, fm))
 
         # ── Tenant clamps ───────────────────────────────────────────────────
@@ -275,7 +302,7 @@ async def update_agent_impl(
             planned.append(("webhook_rate_limit", old_wrl, new_wrl))
 
         if not planned:
-            return "（未提供任何要修改的字段）"
+            return "（未提供任何要修改的字段：请至少传一个字段，如 name 或 role_description。）"
 
         # ── Apply changes ───────────────────────────────────────────────────
         for field, _old, new_val in planned:

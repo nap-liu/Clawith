@@ -11,9 +11,18 @@ from app.models.agent import Agent  # noqa: F401  (kept for type clarity / futur
 from app.models.tool import Tool
 
 _UNAUTH = "❌ 未鉴权：请在 MCP 客户端配置 Authorization: Bearer <clw_...> 令牌。"
-_NEED_WRITE = "❌ 权限不足：此操作需要 write 范围的 PAT（当前令牌为只读）。请在账户设置中签发 write 令牌。"
-_NO_MANAGE = "❌ 无权管理该 agent（需要 manage 权限）。"
-_NO_AGENT = "❌ 找不到该 agent，或你无权访问。"
+_NEED_WRITE = (
+    "❌ 权限不足：此操作需要 write 范围的 PAT（当前令牌为只读）。"
+    "请在账户设置 → 个人访问令牌中签发 write 令牌，并更新 MCP 客户端配置。"
+)
+_NO_MANAGE = (
+    "❌ 无权管理该 agent（需要 manage 权限）。"
+    "你当前对该 agent 只有查看权限——请让其创建者或管理员授予 manage，或改用你有管理权的 agent。"
+)
+_NO_AGENT = (
+    "❌ 找不到该 agent，或你无权访问。"
+    "请用 list_agents 查看你可访问的 agent 列表，并以其 id 或准确名字重试。"
+)
 
 
 async def authed_write(ctx, db):

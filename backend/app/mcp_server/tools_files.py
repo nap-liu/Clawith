@@ -30,26 +30,35 @@ async def read_agent_file_impl(ctx, agent: str, path: str) -> str:
 
         ag = await _resolve_visible_agent(db, pc.user, agent)
         if ag is None:
-            return "❌ 找不到该 agent，或你无权访问。"
+            return (
+                "❌ 找不到该 agent，或你无权访问。"
+                "请用 list_agents 查看你可访问的 agent 列表，并以其 id 或准确名字重试。"
+            )
 
         filename = Path(path).name
         is_creator = ag.creator_id == pc.user.id or pc.user.role == "platform_admin"
 
         # secrets.md is creator-only
         if filename in CREATOR_ONLY_FILES and not is_creator:
-            return f"❌ 拒绝访问：{filename} 仅 agent 创建者或平台管理员可读。"
+            return (
+                f"❌ 拒绝访问：{filename} 仅 agent 创建者或平台管理员可读。"
+                "请以创建者身份重试，或联系管理员。"
+            )
 
         # Focus files live in the system database, not in workspace files
         if is_focus_file_path(path):
-            return "❌ Focus 不在文件里：Focus 存储在系统数据库中，请使用 Focus API 查询。"
+            return "❌ Focus 不在文件里：Focus 存储在系统数据库中，请使用 Focus API 查询（而非文件路径）。"
 
         try:
             target, _rel_root, _is_enterprise = _visible_path(ag.id, path, pc.tenant_id)
         except Exception:
-            return f"❌ 路径无效：{path}"
+            return f"❌ 路径无效：{path}。请使用相对于 agent 工作区根目录的路径，如 soul.md 或 memory/notes.md。"
 
         if not target.exists() or not target.is_file():
-            return f"❌ 文件不存在：{path}"
+            return (
+                f"❌ 文件不存在：{path}。"
+                "请确认路径拼写；如需创建，请使用 write_agent_file。"
+            )
 
         try:
             raw = target.read_bytes()
@@ -104,23 +113,29 @@ async def write_agent_file_impl(
 
         # secrets.md is creator-only
         if filename in CREATOR_ONLY_FILES and not is_creator:
-            return f"❌ 拒绝访问：{filename} 仅 agent 创建者或平台管理员可写。"
+            return (
+                f"❌ 拒绝访问：{filename} 仅 agent 创建者或平台管理员可写。"
+                "请以创建者身份重试，或联系管理员。"
+            )
 
         # enterprise_info is admin-only
         if path.startswith("enterprise_info"):
             if pc.user.role not in ("platform_admin", "org_admin"):
-                return "❌ 企业知识库仅管理员可编辑（需要 platform_admin 或 org_admin 角色）。"
+                return (
+                    "❌ 企业知识库仅管理员可编辑（需要 platform_admin 或 org_admin 角色）。"
+                    "请联系管理员进行编辑，或使用 soul.md 等 agent 专属文件。"
+                )
             if path.strip("/") == "enterprise_info":
-                return "❌ 无法覆盖 enterprise_info 根目录。"
+                return "❌ 无法覆盖 enterprise_info 根目录。请传入具体文件路径，如 enterprise_info/intro.md。"
 
         # Focus files are managed via Focus API, not workspace writes
         if is_focus_file_path(path):
-            return "❌ Focus 不在文件里：Focus 存储在系统数据库中，请使用 Focus API 管理。"
+            return "❌ Focus 不在文件里：Focus 存储在系统数据库中，请使用 Focus API 管理（而非文件写入）。"
 
         try:
             target, _rel_root, _is_enterprise = _visible_path(ag.id, path, pc.tenant_id)
         except Exception:
-            return f"❌ 路径无效：{path}"
+            return f"❌ 路径无效：{path}。请使用相对于 agent 工作区根目录的路径，如 soul.md 或 memory/notes.md。"
 
         # Capture BEFORE content if the file already exists (overwrite scenario)
         before_content: str | None = None

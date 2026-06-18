@@ -26,7 +26,7 @@ async def list_available_tools_impl(ctx, keyword: str | None = None) -> str:
             k = keyword.lower()
             rows = [t for t in rows if k in (t.name or "").lower() or k in (t.description or "").lower()]
         if not rows:
-            return "（没有可用的工具）"
+            return "（没有可用的工具）若有期望的工具，请联系 org_admin 启用后再查询。"
         lines = [
             f"- {t.name} (id={t.id}) — {t.description or '—'} [{t.category}]"
             f"{' ·默认' if getattr(t, 'is_default', False) else ''}"
@@ -47,7 +47,7 @@ async def list_models_impl(ctx) -> str:
             )
         )).scalars().all()
         if not rows:
-            return "（没有可用的模型）"
+            return "（没有可用的模型）请联系 org_admin 在系统中启用 LLM 模型后再查询。"
         lines = [f"- {m.label} (id={m.id}) — {m.provider}/{m.model} · ctx={m.context_window}" for m in rows]
         return "可用模型：\n" + "\n".join(lines)
 

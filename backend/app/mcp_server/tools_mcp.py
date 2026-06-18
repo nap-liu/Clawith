@@ -107,7 +107,10 @@ async def uninstall_agent_mcp_server_impl(
         pairs = (await db.execute(at_q)).all()
 
         if not pairs:
-            return f"❌ 该 agent 未安装名为 '{server}' 的 MCP server。"
+            return (
+                f"❌ 该 agent 未安装名为 '{server}' 的 MCP server。"
+                "请检查 server 名字是否正确，或先调用 install_agent_mcp_server 安装它。"
+            )
 
         agent_tool_ids = [at.id for at, _t in pairs]
         tool_ids = list({t.id for _at, t in pairs})

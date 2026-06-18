@@ -17,7 +17,10 @@ from app.mcp_server._common import authed_write, needs_confirm, resolve_manageab
 
 _ADMIN_ROLES = ("platform_admin", "org_admin")
 
-_CREATOR_ONLY_MSG = "❌ 仅创建者或管理员可配置渠道（需要 creator / platform_admin / org_admin）。"
+_CREATOR_ONLY_MSG = (
+    "❌ 仅创建者或管理员可配置渠道（需要 creator / platform_admin / org_admin）。"
+    "请以 agent 创建者身份或 platform_admin/org_admin 角色重试，或联系管理员操作。"
+)
 
 
 def _check_creator_or_admin(pc, ag) -> str | None:
@@ -57,7 +60,10 @@ async def get_agent_channel_config_impl(ctx, agent: str, channel: str) -> str:
         config = result.scalar_one_or_none()
 
     if config is None:
-        return f"（未配置该渠道）agent=「{ag.name}」 channel={channel}"
+        return (
+            f"（该渠道未配置）agent=「{ag.name}」 channel={channel}。"
+            f"请使用 set_agent_channel_config(agent=..., channel={channel!r}, config={{...}}) 配置后再查询。"
+        )
 
     # Build a display dict — decrypt so we can describe keys, then mask secrets
     full = {
