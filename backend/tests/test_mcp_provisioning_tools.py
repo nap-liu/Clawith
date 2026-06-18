@@ -95,3 +95,117 @@ async def test_update_agent_denied_without_manage():
     token = await _pat(other, scope="write")
     out = await update_agent_impl(_ctx(token), agent=str(private_agent.id), role_description="x")
     assert ("无权" in out) or ("找不到" in out)
+
+
+async def _seed_admin_user(tenant_id=None) -> "User":
+    """Seed a user with org_admin role."""
+    async with async_session() as db:
+        import uuid as _uuid2
+        s = _uuid2.uuid4().hex[:12]
+        from app.models.user import Identity, User
+        ident = Identity(username=f"admin_{s}", email=f"admin_{s}@t.local", password_hash="x")
+        db.add(ident); await db.flush()
+        u = User(identity_id=ident.id, display_name="Admin", role="org_admin", is_active=True, tenant_id=tenant_id)
+        db.add(u); await db.commit(); await db.refresh(u); return u
+
+
+async def test_update_agent_sets_many_fields():
+    """update_agent_impl with multiple new fields: persists values + reports before→after + revert hint."""
+    from app.mcp_server.tools_provisioning import update_agent_impl
+    from app.models.agent import Agent
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user, name="OrigName")
+    token = await _pat(user, scope="write")
+
+    out = await update_agent_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        name="NewName",
+        welcome_message="Hello!",
+        autonomy_policy={"read_files": "L1"},
+        max_tokens_per_day=5000,
+        timezone="Asia/Shanghai",
+        heartbeat_enabled=True,
+    )
+
+    assert "✅" in out
+    # before→after reporting
+    assert "→" in out
+    # revert hint
+    assert "回滚" in out or "↩" in out
+
+    # Verify DB
+    async with async_session() as db:
+        a = (await db.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+    assert a.name == "NewName"
+    assert a.welcome_message == "Hello!"
+    assert a.autonomy_policy == {"read_files": "L1"}
+    assert a.max_tokens_per_day == 5000
+    assert a.timezone == "Asia/Shanghai"
+    assert a.heartbeat_enabled is True
+
+
+async def test_update_agent_expires_at_admin_only():
+    """Non-admin user cannot set expires_at."""
+    from app.mcp_server.tools_provisioning import update_agent_impl
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)  # role=member
+    agent = await _seed_agent(user)
+    token = await _pat(user, scope="write")
+
+    out = await update_agent_impl(_ctx(token), agent=str(agent.id), expires_at="2030-01-01T00:00:00+00:00")
+    # Must deny non-admin
+    assert "管理员" in out or "admin" in out.lower() or "❌" in out
+    # Must NOT be a success
+    assert "✅" not in out
+
+
+async def test_update_agent_name_syncs_participant():
+    """Changing agent name must update the Participant.display_name."""
+    from app.mcp_server.tools_provisioning import update_agent_impl
+    from app.models.participant import Participant
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user, name="OldParticipantName")
+    token = await _pat(user, scope="write")
+
+    out = await update_agent_impl(_ctx(token), agent=str(agent.id), name="NewParticipantName")
+    assert "✅" in out
+
+    async with async_session() as db:
+        p = (await db.execute(
+            select(Participant).where(Participant.type == "agent", Participant.ref_id == agent.id)
+        )).scalar_one_or_none()
+    assert p is not None
+    assert p.display_name == "NewParticipantName"
+
+
+async def test_create_agent_with_autonomy_and_tokens():
+    """create_agent_impl accepts autonomy_policy + max_tokens_per_day + access_mode=private."""
+    from app.mcp_server.tools_provisioning import create_agent_impl
+    from app.models.agent import Agent
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    token = await _pat(user, scope="write")
+
+    autonomy = {"read_files": "L1", "write_workspace_files": "L2"}
+    out = await create_agent_impl(
+        _ctx(token),
+        name="AutonomyAgent",
+        autonomy_policy=autonomy,
+        max_tokens_per_day=9999,
+        access_mode="private",
+    )
+
+    assert "✅" in out
+    assert "AutonomyAgent" in out
+
+    async with async_session() as db:
+        a = (await db.execute(
+            select(Agent).where(Agent.name == "AutonomyAgent", Agent.creator_id == user.id)
+        )).scalar_one_or_none()
+    assert a is not None
+    assert a.autonomy_policy == autonomy
+    assert a.max_tokens_per_day == 9999
+    assert a.access_mode == "private"
