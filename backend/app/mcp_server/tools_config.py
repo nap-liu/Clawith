@@ -126,42 +126,6 @@ async def delete_agent_trigger(ctx: Context, agent: str, trigger: str) -> str:  
     return await delete_agent_trigger_impl(ctx, agent=agent, trigger=trigger)
 
 
-# ── E5: edit_agent_soul ──
-async def edit_agent_soul_impl(ctx, agent, personality=None, boundaries=None) -> str:
-    from app.services.agent_manager import agent_manager, replace_or_append_section
-    async with async_session() as db:
-        pc, err = await authed_write(ctx, db)
-        if err:
-            return err
-        ag, err = await resolve_manageable_agent(db, pc, agent)
-        if err:
-            return err
-        if personality is None and boundaries is None:
-            return "（未提供 personality 或 boundaries）"
-        soul_path = agent_manager._agent_dir(ag.id) / "soul.md"
-        if not soul_path.exists():
-            return "❌ 该 agent 还没有 soul.md（可能是 openclaw 节点或尚未初始化）。"
-        content = soul_path.read_text(encoding="utf-8")
-        changed = []
-        if personality is not None:
-            content = replace_or_append_section(content, "Personality", personality)
-            changed.append("Personality")
-        if boundaries is not None:
-            content = replace_or_append_section(content, "Boundaries", boundaries)
-            changed.append("Boundaries")
-        soul_path.write_text(content, encoding="utf-8")
-        return f"✅ 已更新「{ag.name}」soul.md 的：{', '.join(changed)}。"
-
-
-@mcp.tool()
-async def edit_agent_soul(ctx: Context, agent: str, personality: str | None = None,  # noqa: D401
-                          boundaries: str | None = None) -> str:
-    """Edit an agent's soul.md Personality / Boundaries sections (write scope + manage).
-    agent: id or name. Pass personality and/or boundaries to replace those sections
-    (created if absent). Other soul.md content is left untouched."""
-    return await edit_agent_soul_impl(ctx, agent=agent, personality=personality, boundaries=boundaries)
-
-
 # ── E4: set_agent_relationships ──
 async def _apply_a2a_links(db, current_user, source_agent, links, mode, added, errors):
     """Wire agent-to-agent (A2A) relationships. Mutates added/errors in place."""

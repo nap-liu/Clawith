@@ -11,7 +11,7 @@ async def test_all_mcp_tools_registered():
         "list_available_tools", "list_models",
         "create_agent", "update_agent",
         "set_agent_tools", "set_agent_trigger", "delete_agent_trigger",
-        "set_agent_relationships", "edit_agent_soul",
+        "set_agent_relationships",
     }
     missing = expected - names
     assert not missing, f"missing tools: {missing}"

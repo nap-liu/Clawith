@@ -113,37 +113,6 @@ async def test_delete_agent_trigger_removes():
     assert row is None
 
 
-async def test_edit_agent_soul_updates_personality():
-    from app.services.agent_manager import agent_manager
-    from app.mcp_server.tools_config import edit_agent_soul_impl
-    tenant = await _seed_tenant()
-    user = await _seed_user(tenant_id=tenant.id)
-    agent = await _seed_agent(user)
-    # create a soul.md for the agent (the bare DB seed doesn't initialize files)
-    soul_path = agent_manager._agent_dir(agent.id) / "soul.md"
-    soul_path.parent.mkdir(parents=True, exist_ok=True)
-    soul_path.write_text("# Soul\n## Personality\nold\n", encoding="utf-8")
-    token = await _pat(user, scope="write")
-    out = await edit_agent_soul_impl(_ctx(token), agent=str(agent.id), personality="curious and concise")
-    assert "✅" in out
-    content = soul_path.read_text(encoding="utf-8")
-    assert "curious and concise" in content and "old" not in content
-
-
-async def test_edit_agent_soul_no_fields_noop():
-    from app.services.agent_manager import agent_manager
-    from app.mcp_server.tools_config import edit_agent_soul_impl
-    tenant = await _seed_tenant()
-    user = await _seed_user(tenant_id=tenant.id)
-    agent = await _seed_agent(user)
-    soul_path = agent_manager._agent_dir(agent.id) / "soul.md"
-    soul_path.parent.mkdir(parents=True, exist_ok=True)
-    soul_path.write_text("# Soul\n", encoding="utf-8")
-    token = await _pat(user, scope="write")
-    out = await edit_agent_soul_impl(_ctx(token), agent=str(agent.id))
-    assert "未提供" in out
-
-
 async def test_set_agent_relationships_a2a_merge():
     from app.services.agent_manager import agent_manager
     from app.mcp_server.tools_config import set_agent_relationships_impl
