@@ -12,12 +12,38 @@ function fmtDate(iso: string | null): string {
     return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
+// Robust copy: the async Clipboard API only works in a secure context
+// (HTTPS or localhost). Over plain http on a custom host it throws, so fall
+// back to the legacy execCommand path which works there too.
+async function copyText(text: string): Promise<boolean> {
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch { /* fall through to legacy path */ }
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        ta.setAttribute('readonly', '');
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+    } catch {
+        return false;
+    }
+}
+
 function CopyButton({ text, label }: { text: string; label: string }) {
     const [copied, setCopied] = useState(false);
     const { t } = useTranslation();
     const toast = useToast();
     const handleCopy = async () => {
-        try { await navigator.clipboard.writeText(text); } catch { toast.error(t('pat.copyFailed')); return; }
+        if (!(await copyText(text))) { toast.error(t('pat.copyFailed')); return; }
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
     };
@@ -77,7 +103,7 @@ function SnippetBlock({ label, code, lang }: { label: string; code: string; lang
     const toast = useToast();
     const [copied, setCopied] = useState(false);
     const handleCopy = async () => {
-        try { await navigator.clipboard.writeText(code); } catch { toast.error(t('pat.copyFailed')); return; }
+        if (!(await copyText(code))) { toast.error(t('pat.copyFailed')); return; }
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
     };
