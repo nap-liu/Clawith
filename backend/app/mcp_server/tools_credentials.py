@@ -89,14 +89,6 @@ async def set_agent_credential_impl(
     cookies_json (optional) must be a JSON array of Playwright-compatible cookie objects.
     The value is encrypted before storage and is NEVER returned.
     """
-    action_verb = "更新" if credential_id else "创建"
-    guidance = needs_confirm(
-        confirm,
-        f"将{action_verb}「{agent}」的凭证（platform={platform}）— 含注入的密钥",
-    )
-    if guidance:
-        return guidance
-
     async with async_session() as db:
         pc, err = await authed_write(ctx, db)
         if err:
@@ -104,6 +96,14 @@ async def set_agent_credential_impl(
         ag, err = await resolve_manageable_agent(db, pc, agent)
         if err:
             return err
+
+        action_verb = "更新" if credential_id else "创建"
+        guidance = needs_confirm(
+            confirm,
+            f"将{action_verb}「{ag.name}」的凭证（platform={platform}）— 含注入的密钥",
+        )
+        if guidance:
+            return guidance
 
         # Validate cookies_json if provided
         if cookies_json is not None:
@@ -181,10 +181,6 @@ async def delete_agent_credential_impl(
     The secret value is not echoed — if a rollback is needed, re-supply it via
     set_agent_credential.
     """
-    guidance = needs_confirm(confirm, f"将删除凭证 {credential_id}")
-    if guidance:
-        return guidance
-
     async with async_session() as db:
         pc, err = await authed_write(ctx, db)
         if err:
@@ -192,6 +188,10 @@ async def delete_agent_credential_impl(
         ag, err = await resolve_manageable_agent(db, pc, agent)
         if err:
             return err
+
+        guidance = needs_confirm(confirm, f"将删除「{ag.name}」的凭证 {credential_id}")
+        if guidance:
+            return guidance
 
         try:
             cid = _uuid.UUID(str(credential_id))
