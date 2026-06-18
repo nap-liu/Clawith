@@ -194,3 +194,67 @@ async def test_set_agent_relationships_requires_write():
     out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
               agent_links=[{"target_agent": "whatever"}])
     assert "需要 write" in out
+
+
+# ── New tests: set_agent_access, list_agent_triggers, update_agent_trigger ──
+
+async def test_set_agent_access_requires_confirm():
+    from app.mcp_server.tools_config import set_agent_access_impl
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user, access_mode="company")
+    token = await _pat(user, scope="write")
+    out = await set_agent_access_impl(_ctx(token), agent=str(agent.id), access_mode="private")
+    assert "confirm=true" in out.lower() or "confirm=True" in out
+    # Agent access_mode must NOT have changed
+    async with async_session() as db:
+        from app.models.agent import Agent
+        a = (await db.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+    assert a.access_mode == "company"
+
+
+async def test_set_agent_access_confirmed():
+    from app.mcp_server.tools_config import set_agent_access_impl
+    from app.models.agent import Agent
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user, access_mode="company")
+    token = await _pat(user, scope="write")
+    out = await set_agent_access_impl(_ctx(token), agent=str(agent.id), access_mode="private", confirm=True)
+    assert "✅" in out
+    async with async_session() as db:
+        a = (await db.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+    assert a.access_mode == "private"
+
+
+async def test_list_agent_triggers():
+    from app.mcp_server.tools_config import set_agent_trigger_impl, list_agent_triggers_impl
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    token = await _pat(user, scope="write")
+    await set_agent_trigger_impl(_ctx(token), agent=str(agent.id), name="morning_cron",
+                                 type="cron", config={"expr": "0 9 * * *"}, reason="daily brief")
+    out = await list_agent_triggers_impl(_ctx(token), agent=str(agent.id))
+    assert "morning_cron" in out
+
+
+async def test_update_agent_trigger_disables():
+    from app.mcp_server.tools_config import set_agent_trigger_impl, update_agent_trigger_impl
+    from app.models.trigger import AgentTrigger
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    token = await _pat(user, scope="write")
+    await set_agent_trigger_impl(_ctx(token), agent=str(agent.id), name="to_disable",
+                                 type="cron", config={"expr": "0 8 * * *"}, reason="wake up")
+    out = await update_agent_trigger_impl(_ctx(token), agent=str(agent.id),
+                                          trigger="to_disable", is_enabled=False)
+    assert "✅" in out
+    # before→after should be visible
+    assert "True" in out or "true" in out.lower()
+    assert "False" in out or "false" in out.lower()
+    async with async_session() as db:
+        row = (await db.execute(select(AgentTrigger).where(
+            AgentTrigger.agent_id == agent.id, AgentTrigger.name == "to_disable"))).scalar_one_or_none()
+    assert row is not None and row.is_enabled is False

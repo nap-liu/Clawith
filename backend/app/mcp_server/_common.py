@@ -48,6 +48,16 @@ def _tenant_tool_clause(tenant_id):
     return or_(*clauses)
 
 
+def needs_confirm(confirm: bool, action_desc: str) -> str | None:
+    """Tool-layer confirmation guidance for sensitive ops. Returns a guidance string
+    to return-to-caller when not yet confirmed, or None when confirm=True.
+    No server-side state — the calling agent re-invokes with confirm=True."""
+    if confirm:
+        return None
+    return ("⚠ 敏感操作需二次确认：" + action_desc +
+            "\n此调用未执行任何更改。确认无误后，请用相同参数再次调用并加 confirm=True 执行。")
+
+
 async def resolve_tenant_tool(db, tenant_id, tool_ref: str):
     """Resolve a tool by UUID or name within the tenant's enablable set, or None."""
     base = select(Tool).where(Tool.enabled == True, _tenant_tool_clause(tenant_id))  # noqa: E712
