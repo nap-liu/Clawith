@@ -13,6 +13,7 @@ class PATCreate(BaseModel):
 
     name: str
     expires_at: datetime | None = None
+    scope: str = "read"
 
 
 class PATCreated(BaseModel):
@@ -24,6 +25,7 @@ class PATCreated(BaseModel):
     name: str
     token: str  # plaintext — only present on creation
     token_prefix: str
+    scope: str
     created_at: datetime
     expires_at: datetime | None
 
@@ -36,6 +38,7 @@ class PATOut(BaseModel):
     id: uuid.UUID
     name: str
     token_prefix: str
+    scope: str
     created_at: datetime
     last_used_at: datetime | None
     expires_at: datetime | None

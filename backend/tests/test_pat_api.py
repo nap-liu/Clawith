@@ -237,3 +237,35 @@ async def test_unauthenticated_list_returns_401_or_403(client):
     """No Authorization header → 401 or 403 on GET."""
     resp = await client.get("/api/personal-access-tokens")
     assert resp.status_code in (401, 403), resp.text
+
+
+async def test_create_pat_with_write_scope(client):
+    tenant = await _seed_tenant()
+    user, jwt = await _seed_user(tenant_id=tenant.id)
+    r = await client.post("/api/personal-access-tokens",
+                          json={"name": "ci", "scope": "write"},
+                          headers={"Authorization": f"Bearer {jwt}"})
+    assert r.status_code in (200, 201), r.text
+    assert r.json()["scope"] == "write"
+    lst = await client.get("/api/personal-access-tokens",
+                           headers={"Authorization": f"Bearer {jwt}"})
+    assert any(p["scope"] == "write" for p in lst.json())
+
+
+async def test_create_pat_defaults_scope_read(client):
+    tenant = await _seed_tenant()
+    user, jwt = await _seed_user(tenant_id=tenant.id)
+    r = await client.post("/api/personal-access-tokens",
+                          json={"name": "ro"},
+                          headers={"Authorization": f"Bearer {jwt}"})
+    assert r.status_code in (200, 201), r.text
+    assert r.json()["scope"] == "read"
+
+
+async def test_create_pat_invalid_scope_400(client):
+    tenant = await _seed_tenant()
+    user, jwt = await _seed_user(tenant_id=tenant.id)
+    r = await client.post("/api/personal-access-tokens",
+                          json={"name": "x", "scope": "admin"},
+                          headers={"Authorization": f"Bearer {jwt}"})
+    assert r.status_code == 400, r.text

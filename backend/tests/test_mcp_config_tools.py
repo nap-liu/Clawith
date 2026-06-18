@@ -1,0 +1,252 @@
+from __future__ import annotations
+import uuid
+import pytest
+from types import SimpleNamespace
+from sqlalchemy import select
+from app.database import async_session, engine
+from app.models.tenant import Tenant
+from app.models.user import Identity, User
+from app.models.mcp_server import MCPServer  # noqa: F401  (resolve Tool.mcp_server_id FK metadata)
+
+
+@pytest.fixture(autouse=True)
+async def _isolate():
+    await engine.dispose(); yield; await engine.dispose()
+
+
+def _ctx(token):
+    h = {"authorization": f"Bearer {token}"} if token else {}
+    return SimpleNamespace(request_context=SimpleNamespace(request=SimpleNamespace(headers=h)))
+
+
+async def _seed_tenant():
+    async with async_session() as db:
+        t = Tenant(name="T", slug=f"t-{uuid.uuid4().hex[:10]}")
+        db.add(t); await db.commit(); await db.refresh(t); return t
+
+
+async def _seed_user(tenant_id=None):
+    async with async_session() as db:
+        s = uuid.uuid4().hex[:12]
+        ident = Identity(username=f"u_{s}", email=f"{s}@t.local", password_hash="x")
+        db.add(ident); await db.flush()
+        u = User(identity_id=ident.id, display_name="U", role="member", is_active=True, tenant_id=tenant_id)
+        db.add(u); await db.commit(); await db.refresh(u); return u
+
+
+async def _pat(user, scope="write"):
+    from app.services.pat_service import issue_pat
+    async with async_session() as db:
+        token, _ = await issue_pat(db, user=user, name="t", scope=scope)
+    return token
+
+
+async def _seed_agent(creator, name="Agent", access_mode="company"):
+    from app.models.agent import Agent
+    from app.models.participant import Participant
+    async with async_session() as db:
+        a = Agent(name=name, creator_id=creator.id, tenant_id=creator.tenant_id,
+                  agent_type="native", access_mode=access_mode, status="idle")
+        db.add(a); await db.flush()
+        db.add(Participant(type="agent", ref_id=a.id, display_name=a.name))
+        await db.commit(); await db.refresh(a); return a
+
+
+async def _seed_builtin_tool(name=None):
+    from app.models.tool import Tool
+    name = name or f"tool_{uuid.uuid4().hex[:8]}"
+    async with async_session() as db:
+        t = Tool(name=name, display_name=name, description="", category="custom",
+                 source="builtin", enabled=True, is_default=False)
+        db.add(t); await db.commit(); await db.refresh(t); return t
+
+
+async def test_set_agent_tools_enables():
+    from app.mcp_server.tools_config import set_agent_tools_impl
+    from app.models.tool import AgentTool
+    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user); tool = await _seed_builtin_tool()
+    token = await _pat(user)
+    out = await set_agent_tools_impl(_ctx(token), agent=str(agent.id), enable=[tool.name])
+    assert "✅" in out
+    async with async_session() as db:
+        row = (await db.execute(select(AgentTool).where(
+            AgentTool.agent_id == agent.id, AgentTool.tool_id == tool.id))).scalar_one_or_none()
+    assert row is not None and row.enabled is True
+
+
+async def test_set_agent_tools_requires_write():
+    from app.mcp_server.tools_config import set_agent_tools_impl
+    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    token = await _pat(user, scope="read")
+    out = await set_agent_tools_impl(_ctx(token), agent=str(agent.id), enable=["x"])
+    assert "需要 write" in out
+
+
+async def test_set_agent_trigger_creates_cron():
+    from app.mcp_server.tools_config import set_agent_trigger_impl
+    from app.models.trigger import AgentTrigger
+    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user); token = await _pat(user)
+    out = await set_agent_trigger_impl(_ctx(token), agent=str(agent.id), name="daily",
+                                       type="cron", config={"expr": "0 9 * * *"}, reason="morning brief")
+    assert "❌" not in out, out
+    async with async_session() as db:
+        row = (await db.execute(select(AgentTrigger).where(
+            AgentTrigger.agent_id == agent.id, AgentTrigger.name == "daily"))).scalar_one_or_none()
+    assert row is not None
+
+
+async def test_delete_agent_trigger_removes():
+    from app.mcp_server.tools_config import set_agent_trigger_impl, delete_agent_trigger_impl
+    from app.models.trigger import AgentTrigger
+    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user); token = await _pat(user)
+    await set_agent_trigger_impl(_ctx(token), agent=str(agent.id), name="todelete",
+                                 type="cron", config={"expr": "0 9 * * *"}, reason="r")
+    out = await delete_agent_trigger_impl(_ctx(token), agent=str(agent.id), trigger="todelete")
+    assert "✅" in out
+    async with async_session() as db:
+        row = (await db.execute(select(AgentTrigger).where(
+            AgentTrigger.agent_id == agent.id, AgentTrigger.name == "todelete"))).scalar_one_or_none()
+    assert row is None
+
+
+async def test_set_agent_relationships_a2a_merge():
+    from app.services.agent_manager import agent_manager
+    from app.mcp_server.tools_config import set_agent_relationships_impl
+    from app.models.org import AgentAgentRelationship
+    from sqlalchemy import select
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    a = await _seed_agent(user, name=f"Lead_{uuid.uuid4().hex[:6]}")
+    b = await _seed_agent(user, name=f"Helper_{uuid.uuid4().hex[:6]}")
+    agent_manager._agent_dir(a.id).mkdir(parents=True, exist_ok=True)
+    token = await _pat(user, scope="write")
+    out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
+              agent_links=[{"target_agent": b.name, "relation": "collaborator"}])
+    assert "✅" in out, out
+    async with async_session() as db:
+        row = (await db.execute(select(AgentAgentRelationship).where(
+            AgentAgentRelationship.agent_id == a.id,
+            AgentAgentRelationship.target_agent_id == b.id))).scalar_one_or_none()
+    assert row is not None
+
+
+async def test_set_agent_relationships_human_platform_user():
+    from app.services.agent_manager import agent_manager
+    from app.mcp_server.tools_config import set_agent_relationships_impl
+    from app.models.org import AgentRelationship
+    from sqlalchemy import select
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    colleague = await _seed_user(tenant_id=tenant.id)   # same tenant → has company access to a company agent
+    a = await _seed_agent(owner, name=f"Boss_{uuid.uuid4().hex[:6]}")  # company access_mode by default
+    agent_manager._agent_dir(a.id).mkdir(parents=True, exist_ok=True)
+    token = await _pat(owner, scope="write")
+    out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
+              human_links=[{"user": f"platform-user:{colleague.id}", "relation": "manager"}])
+    assert "✅" in out, out
+    async with async_session() as db:
+        rows = (await db.execute(select(AgentRelationship).where(
+            AgentRelationship.agent_id == a.id))).scalars().all()
+    assert len(rows) >= 1
+
+
+async def test_set_agent_relationships_requires_write():
+    from app.mcp_server.tools_config import set_agent_relationships_impl
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    a = await _seed_agent(user)
+    token = await _pat(user, scope="read")
+    out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
+              agent_links=[{"target_agent": "whatever"}])
+    assert "需要 write" in out
+
+
+# ── New tests: set_agent_access, list_agent_triggers, update_agent_trigger ──
+
+async def test_set_agent_access_requires_confirm():
+    from app.mcp_server.tools_config import set_agent_access_impl
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user, access_mode="company")
+    token = await _pat(user, scope="write")
+    out = await set_agent_access_impl(_ctx(token), agent=str(agent.id), access_mode="private")
+    assert "confirm=true" in out.lower() or "confirm=True" in out
+    # Agent access_mode must NOT have changed
+    async with async_session() as db:
+        from app.models.agent import Agent
+        a = (await db.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+    assert a.access_mode == "company"
+
+
+async def test_set_agent_access_confirmed():
+    from app.mcp_server.tools_config import set_agent_access_impl
+    from app.models.agent import Agent
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user, access_mode="company")
+    token = await _pat(user, scope="write")
+    out = await set_agent_access_impl(_ctx(token), agent=str(agent.id), access_mode="private", confirm=True)
+    assert "✅" in out
+    async with async_session() as db:
+        a = (await db.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+    assert a.access_mode == "private"
+
+
+async def test_list_agent_triggers():
+    from app.mcp_server.tools_config import set_agent_trigger_impl, list_agent_triggers_impl
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    token = await _pat(user, scope="write")
+    await set_agent_trigger_impl(_ctx(token), agent=str(agent.id), name="morning_cron",
+                                 type="cron", config={"expr": "0 9 * * *"}, reason="daily brief")
+    out = await list_agent_triggers_impl(_ctx(token), agent=str(agent.id))
+    assert "morning_cron" in out
+
+
+async def test_update_agent_trigger_disables():
+    from app.mcp_server.tools_config import set_agent_trigger_impl, update_agent_trigger_impl
+    from app.models.trigger import AgentTrigger
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user)
+    token = await _pat(user, scope="write")
+    await set_agent_trigger_impl(_ctx(token), agent=str(agent.id), name="to_disable",
+                                 type="cron", config={"expr": "0 8 * * *"}, reason="wake up")
+    out = await update_agent_trigger_impl(_ctx(token), agent=str(agent.id),
+                                          trigger="to_disable", is_enabled=False)
+    assert "✅" in out
+    # before→after should be visible
+    assert "True" in out or "true" in out.lower()
+    assert "False" in out or "false" in out.lower()
+    async with async_session() as db:
+        row = (await db.execute(select(AgentTrigger).where(
+            AgentTrigger.agent_id == agent.id, AgentTrigger.name == "to_disable"))).scalar_one_or_none()
+    assert row is not None and row.is_enabled is False
+
+
+async def test_set_agent_tool_config_sets_config():
+    from app.mcp_server.tools_config import set_agent_tool_config_impl
+    from app.models.tool import AgentTool
+    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user); tool = await _seed_builtin_tool()
+    token = await _pat(user)
+    out = await set_agent_tool_config_impl(_ctx(token), agent=str(agent.id), tool=tool.name, config={"foo": "bar"})
+    assert "✅" in out
+    async with async_session() as db:
+        row = (await db.execute(select(AgentTool).where(
+            AgentTool.agent_id == agent.id, AgentTool.tool_id == tool.id))).scalar_one_or_none()
+    assert row is not None and row.config and "foo" in row.config
+
+
+async def test_set_agent_tool_config_allow_network_admin_only():
+    from app.mcp_server.tools_config import set_agent_tool_config_impl
+    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)  # role member
+    agent = await _seed_agent(user); tool = await _seed_builtin_tool()
+    token = await _pat(user)
+    out = await set_agent_tool_config_impl(_ctx(token), agent=str(agent.id), tool=tool.name, config={"allow_network": True})
+    assert "管理员" in out  # admin-only denial

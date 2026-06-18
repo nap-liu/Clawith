@@ -613,6 +613,7 @@ export interface Pat {
     created_at: string;
     last_used_at: string | null;
     expires_at: string | null;
+    scope: 'read' | 'write';
 }
 
 export interface PatCreated extends Pat {
@@ -622,7 +623,7 @@ export interface PatCreated extends Pat {
 export const patApi = {
     list: () => request<Pat[]>('/personal-access-tokens'),
 
-    create: (data: { name: string; expires_at?: string }) =>
+    create: (data: { name: string; scope?: 'read' | 'write'; expires_at?: string }) =>
         request<PatCreated>('/personal-access-tokens', { method: 'POST', body: JSON.stringify(data) }),
 
     revoke: (id: string) =>

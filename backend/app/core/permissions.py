@@ -32,7 +32,7 @@ def build_visible_agents_query(
     - Regular users: own creations + ``company`` agents + agents
       explicitly added to a ``custom`` roster they're on.
     """
-    stmt = select(Agent)
+    stmt = select(Agent).where(Agent.is_deleted.is_(False))
 
     target_tenant_id = tenant_id if tenant_id is not None else user.tenant_id
     if target_tenant_id is None:
