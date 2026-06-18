@@ -1754,7 +1754,7 @@
         "run": "Run",
         "running": "Running…",
         "commandLabel": "Command",
-        "commandPlaceholder": "svc --version",
+        "commandPlaceholder": "{{name}} --version",
         "needBinary": "Upload a binary first.",
         "exitCode": "exit_code",
         "duration": "ms",
