@@ -105,3 +105,55 @@ async def test_verify_pat_still_returns_two_tuple():
     async with async_session() as db:
         result = await verify_pat(db, token)
     assert len(result) == 2 and result[0].id == user.id
+
+
+# ── Task A3: MCP auth-layer PatContext ────────────────────────────────────────
+
+from types import SimpleNamespace
+
+
+def _ctx(token):
+    # primary header path: ctx.request_context.request.headers
+    headers = {"authorization": f"Bearer {token}"} if token else {}
+    return SimpleNamespace(request_context=SimpleNamespace(request=SimpleNamespace(headers=headers)))
+
+
+async def test_resolve_pat_context_carries_scope():
+    from app.services.pat_service import issue_pat
+    from app.mcp_server.auth import resolve_pat_context
+
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    async with async_session() as db:
+        token, _ = await issue_pat(db, user=user, name="w", scope="write")
+    async with async_session() as db:
+        pc = await resolve_pat_context(_ctx(token), db)
+    assert pc is not None and pc.scope == "write" and pc.user.id == user.id and pc.tenant_id == tenant.id
+
+
+async def test_resolve_pat_user_still_two_tuple():
+    from app.services.pat_service import issue_pat
+    from app.mcp_server.auth import resolve_pat_user
+
+    tenant = await _seed_tenant()
+    user = await _seed_user(tenant_id=tenant.id)
+    async with async_session() as db:
+        token, _ = await issue_pat(db, user=user, name="r")
+    async with async_session() as db:
+        result = await resolve_pat_user(_ctx(token), db)
+    assert len(result) == 2 and result[0].id == user.id
+
+
+async def test_resolve_pat_context_none_when_unauth():
+    from app.mcp_server.auth import resolve_pat_context
+
+    async with async_session() as db:
+        assert await resolve_pat_context(_ctx(None), db) is None
+
+
+def test_require_write_gate():
+    from types import SimpleNamespace
+    from app.mcp_server.auth import require_write
+
+    assert require_write(SimpleNamespace(scope="write")) is True
+    assert require_write(SimpleNamespace(scope="read")) is False
