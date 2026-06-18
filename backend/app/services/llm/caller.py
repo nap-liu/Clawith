@@ -157,12 +157,21 @@ class FailoverGuard:
         return True
 
 
+def is_error_result(result: str) -> bool:
+    """True when *result* is an error sentinel string, not a normal model reply.
+
+    The LLM/tool layer signals failures by returning a string prefixed with one
+    of these markers instead of raising, so a successful reply never matches.
+    """
+    return result.startswith(("[LLM Error]", "[LLM call error]", "[Error]"))
+
+
 def is_retryable_error(result: str) -> bool:
     """Check if an error result is retryable.
 
     Uses unified classification from failover.py.
     """
-    if not (result.startswith("[LLM Error]") or result.startswith("[LLM call error]") or result.startswith("[Error]")):
+    if not is_error_result(result):
         return False
 
     return classify_error(Exception(result)) != FailoverErrorType.NON_RETRYABLE
@@ -1111,7 +1120,11 @@ async def call_llm_with_failover(
 
     # Check if we need to failover
     if not is_retryable_error(primary_result):
-        logger.warning(f"[Failover] Canceled: Primary model returned a non-retryable error: {primary_result[:150]}")
+        # A non-error result is just a normal reply — no failover needed, and
+        # nothing to warn about. Only a genuine error string that classifies as
+        # non-retryable is worth surfacing.
+        if is_error_result(primary_result):
+            logger.warning(f"[Failover] Skipped: primary model returned a non-retryable error: {primary_result[:150]}")
         return primary_result
 
     # Check guard conditions
