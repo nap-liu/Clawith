@@ -589,3 +589,47 @@ async def update_agent_trigger(ctx: Context, agent: str, trigger: str,  # noqa: 
                                            reason=reason, max_fires=max_fires,
                                            cooldown_seconds=cooldown_seconds,
                                            expires_at=expires_at)
+
+
+# ── E9: set_agent_tool_config ──
+async def set_agent_tool_config_impl(ctx, agent, tool, config) -> str:
+    from app.api.tools import _encrypt_sensitive_fields
+    from app.models.tool import Tool  # noqa: F401  (Tool loaded via resolve_tenant_tool)
+    if not isinstance(config, dict):
+        return "❌ config 必须是对象（键值对）。"
+    async with async_session() as db:
+        pc, err = await authed_write(ctx, db)
+        if err:
+            return err
+        ag, err = await resolve_manageable_agent(db, pc, agent)
+        if err:
+            return err
+        if "allow_network" in config and pc.user.role not in ("platform_admin", "org_admin"):
+            return "❌ 仅管理员可修改 allow_network（网络访问）设置。"
+        tool_row = await resolve_tenant_tool(db, ag.tenant_id, tool)
+        if tool_row is None:
+            return "❌ 找不到该工具（用 list_available_tools 查看）。"
+        # Capture prior config keys for rollback hint (do NOT decrypt/echo secret values)
+        at = (await db.execute(select(AgentTool).where(
+            AgentTool.agent_id == ag.id, AgentTool.tool_id == tool_row.id))).scalar_one_or_none()
+        prior_keys = sorted((at.config or {}).keys()) if at and at.config else []
+        encrypted = _encrypt_sensitive_fields(config, tool_row.config_schema)
+        if at:
+            at.config = encrypted
+        else:
+            db.add(AgentTool(agent_id=ag.id, tool_id=tool_row.id, enabled=True, config=encrypted))
+        await db.commit()
+        new_keys = sorted(config.keys())
+        return (f"✅ 已设置「{ag.name}」工具 {tool_row.name} 的配置：键 {new_keys}。"
+                f"\n↩ 回滚：之前的配置键为 {prior_keys or '（无）'}；用 set_agent_tool_config 传回旧值即可"
+                f"（敏感值出于安全未回显，需自行重填）。")
+
+
+@mcp.tool()
+async def set_agent_tool_config(ctx: Context, agent: str, tool: str, config: dict) -> str:  # noqa: D401
+    """Set a per-agent config override for an enabled tool (write scope + manage).
+    agent: id or name. tool: tool id or name (see list_available_tools). config: a dict of
+    config keys → values (e.g. API keys, params). Sensitive fields are encrypted at rest.
+    'allow_network' is admin-only. Returns changed keys + a rollback hint (secret values are
+    not echoed back for security)."""
+    return await set_agent_tool_config_impl(ctx, agent=agent, tool=tool, config=config)

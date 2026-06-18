@@ -227,3 +227,26 @@ async def test_update_agent_trigger_disables():
         row = (await db.execute(select(AgentTrigger).where(
             AgentTrigger.agent_id == agent.id, AgentTrigger.name == "to_disable"))).scalar_one_or_none()
     assert row is not None and row.is_enabled is False
+
+
+async def test_set_agent_tool_config_sets_config():
+    from app.mcp_server.tools_config import set_agent_tool_config_impl
+    from app.models.tool import AgentTool
+    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(user); tool = await _seed_builtin_tool()
+    token = await _pat(user)
+    out = await set_agent_tool_config_impl(_ctx(token), agent=str(agent.id), tool=tool.name, config={"foo": "bar"})
+    assert "✅" in out
+    async with async_session() as db:
+        row = (await db.execute(select(AgentTool).where(
+            AgentTool.agent_id == agent.id, AgentTool.tool_id == tool.id))).scalar_one_or_none()
+    assert row is not None and row.config and "foo" in row.config
+
+
+async def test_set_agent_tool_config_allow_network_admin_only():
+    from app.mcp_server.tools_config import set_agent_tool_config_impl
+    tenant = await _seed_tenant(); user = await _seed_user(tenant_id=tenant.id)  # role member
+    agent = await _seed_agent(user); tool = await _seed_builtin_tool()
+    token = await _pat(user)
+    out = await set_agent_tool_config_impl(_ctx(token), agent=str(agent.id), tool=tool.name, config={"allow_network": True})
+    assert "管理员" in out  # admin-only denial
