@@ -2180,6 +2180,11 @@
     "codex": "Codex (~/.codex/config.toml)",
     "stdioFallback": "stdio clients (mcp-remote)",
     "copySnippet": "Copy",
-    "snippetCopied": "Snippet copied!"
+    "snippetCopied": "Snippet copied!",
+    "scope": "Scope",
+    "scopeRead": "Read",
+    "scopeWrite": "Write",
+    "scopeHint": "Read: list/read/chat with agents. Write: also create and configure agents.",
+    "colScope": "Scope"
   }
 }
