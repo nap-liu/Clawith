@@ -4,6 +4,7 @@ Tools are registered in G5 (app/mcp_server/tools.py).
 """
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 mcp = FastMCP(
     "Clawith",
@@ -18,6 +19,12 @@ mcp = FastMCP(
         "- list_sessions: list chat sessions for a given agent\n"
         "- get_session: retrieve the message history for a specific session\n"
     ),
+    # FastMCP otherwise auto-enables DNS-rebinding Host validation that only allows
+    # localhost, which 421-rejects every real domain (e.g. ai.yeyecha.com or a
+    # local-* host). This server is reached via a configurable public domain behind
+    # nginx/TLS, authenticated by per-user PAT, and consumed by CLI MCP clients (not
+    # browsers) — so Host allow-listing adds no security here; the PAT bearer check does.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 # Set the streamable HTTP path to "/" so that when the sub-app is mounted at
