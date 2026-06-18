@@ -99,6 +99,11 @@ class Agent(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_expired: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Soft-delete control — soft-deleted agents are hidden from all listings
+    # (see build_visible_agents_query) and stopped, but remain restorable.
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # System agent flag — system agents (e.g. OKR Agent) cannot be deleted by users
     # and their system triggers are protected from user deletion.
     is_system: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

@@ -27,6 +27,9 @@ mcp = FastMCP(
         "- set_agent_trigger / delete_agent_trigger: manage autonomous triggers\n"
         "- set_agent_relationships: wire up A2A / human collaboration\n"
         "- edit_agent_soul: edit Personality / Boundaries\n"
+        "- start_agent / stop_agent: control an agent's runtime (confirm-guided)\n"
+        "- delete_agent: soft-delete an agent (confirm-guided, restorable) / "
+        "restore_agent: undo a soft-delete (pass the agent id)\n"
     ),
     # FastMCP otherwise auto-enables DNS-rebinding Host validation that only allows
     # localhost, which 421-rejects every real domain (e.g. ai.yeyecha.com or a
@@ -45,3 +48,4 @@ from app.mcp_server import tools  # noqa: F401,E402  read/chat tools
 from app.mcp_server import tools_discovery  # noqa: F401,E402  list_available_tools / list_models
 from app.mcp_server import tools_provisioning  # noqa: F401,E402  create_agent / update_agent
 from app.mcp_server import tools_config  # noqa: F401,E402  set_agent_* / edit_agent_soul
+from app.mcp_server import tools_lifecycle  # noqa: F401,E402  start/stop/delete/restore_agent
