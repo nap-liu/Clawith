@@ -18,6 +18,15 @@ mcp = FastMCP(
         "pass new_conversation=true to start fresh, or session_id to resume a specific session\n"
         "- list_sessions: list chat sessions for a given agent\n"
         "- get_session: retrieve the message history for a specific session\n"
+        "\n"
+        "With a write-scope PAT you can also provision agents:\n"
+        "- list_available_tools / list_models: discover enablable tools / pick a model\n"
+        "- create_agent: create a new native agent in your tenant\n"
+        "- update_agent: change model, role, autonomy and other settings\n"
+        "- set_agent_tools: enable/disable tools\n"
+        "- set_agent_trigger / delete_agent_trigger: manage autonomous triggers\n"
+        "- set_agent_relationships: wire up A2A / human collaboration\n"
+        "- edit_agent_soul: edit Personality / Boundaries\n"
     ),
     # FastMCP otherwise auto-enables DNS-rebinding Host validation that only allows
     # localhost, which 421-rejects every real domain (e.g. ai.yeyecha.com or a
@@ -31,4 +40,8 @@ mcp = FastMCP(
 # /mcp the endpoint is reachable at /mcp, not /mcp/mcp.
 mcp.settings.streamable_http_path = "/"
 
-from app.mcp_server import tools  # noqa: F401,E402 — registers @mcp.tool() definitions
+# Register tool definitions (import for @mcp.tool() side-effects).
+from app.mcp_server import tools  # noqa: F401,E402  read/chat tools
+from app.mcp_server import tools_discovery  # noqa: F401,E402  list_available_tools / list_models
+from app.mcp_server import tools_provisioning  # noqa: F401,E402  create_agent / update_agent
+from app.mcp_server import tools_config  # noqa: F401,E402  set_agent_* / edit_agent_soul
