@@ -34,15 +34,25 @@ def _safe_row(cred: AgentCredential) -> str:
     )
 
 
-def _validate_cookies_json(cookies_json: str) -> str | None:
-    """Return an error string if cookies_json is not a valid JSON array, else None."""
-    try:
-        parsed = json.loads(cookies_json)
-        if not isinstance(parsed, list):
-            return "cookies_json 必须是 JSON 数组（array），例如 [{\"name\":\"...\",\"value\":\"...\"}]。"
-    except json.JSONDecodeError as exc:
-        return f"cookies_json JSON 格式有误：{exc}"
-    return None
+def _normalize_cookies(cookies) -> tuple[str | None, str | None]:
+    """Normalize cookies input to a JSON-array string for storage.
+
+    Accepts a native list (the natural MCP form — clients/transports deliver JSON
+    arrays as Python lists, so a str-only param is rejected as a list) OR a
+    JSON-array string. Returns ``(json_string_or_None, error_or_None)``.
+    """
+    if cookies is None:
+        return None, None
+    if isinstance(cookies, str):
+        try:
+            parsed = json.loads(cookies)
+        except json.JSONDecodeError as exc:
+            return None, f"cookies JSON 格式有误：{exc}。需为数组，例如 [{{\"name\":\"...\",\"value\":\"...\"}}]。"
+    else:
+        parsed = cookies
+    if not isinstance(parsed, list):
+        return None, "cookies 必须是数组（array），例如 [{\"name\":\"...\",\"value\":\"...\"}]。"
+    return json.dumps(parsed, ensure_ascii=False), None
 
 
 # ── impl functions ────────────────────────────────────────────────────────────
@@ -79,7 +89,7 @@ async def set_agent_credential_impl(
     credential_type: str,
     platform: str,
     display_name: str = "",
-    cookies_json: str | None = None,
+    cookies_json: list | str | None = None,
     credential_id: str | None = None,
     confirm: bool = False,
 ) -> str:
@@ -105,11 +115,10 @@ async def set_agent_credential_impl(
         if guidance:
             return guidance
 
-        # Validate cookies_json if provided
-        if cookies_json is not None:
-            err_msg = _validate_cookies_json(cookies_json)
-            if err_msg:
-                return f"❌ {err_msg}"
+        # Normalize cookies (accepts a native list — the MCP form — or a JSON-array string).
+        cookies_str, err_msg = _normalize_cookies(cookies_json)
+        if err_msg:
+            return f"❌ {err_msg}"
 
         settings = get_settings()
 
@@ -141,8 +150,8 @@ async def set_agent_credential_impl(
             cred.platform = platform
             if display_name:
                 cred.display_name = display_name
-            if cookies_json is not None:
-                cred.cookies_json = encrypt_data(cookies_json, settings.SECRET_KEY)
+            if cookies_str is not None:
+                cred.cookies_json = encrypt_data(cookies_str, settings.SECRET_KEY)
                 cred.cookies_updated_at = datetime.now(timezone.utc)
                 cred.status = "active"
 
@@ -162,8 +171,8 @@ async def set_agent_credential_impl(
                 display_name=display_name or "",
                 status="active",
             )
-            if cookies_json is not None:
-                cred.cookies_json = encrypt_data(cookies_json, settings.SECRET_KEY)
+            if cookies_str is not None:
+                cred.cookies_json = encrypt_data(cookies_str, settings.SECRET_KEY)
                 cred.cookies_updated_at = datetime.now(timezone.utc)
 
             db.add(cred)
@@ -250,11 +259,14 @@ async def set_agent_credential(  # noqa: D401
     credential_type: str,
     platform: str,
     display_name: str = "",
-    cookies_json: str | None = None,
+    cookies_json: list | str | None = None,
     credential_id: str | None = None,
     confirm: bool = False,
 ) -> str:
     """Create or update an agent credential (write scope + MANAGE required, confirm-guided).
+
+    cookies_json: a list/array of cookie objects, e.g. [{"name":"...","value":"..."}]
+    (a JSON-array string is also accepted). Encrypted at rest, never returned.
 
     Provide credential_id to update an existing record; omit to create a new one.
     cookies_json must be a JSON array of Playwright-compatible cookie objects if supplied.
