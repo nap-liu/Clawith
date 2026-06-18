@@ -26,6 +26,8 @@ from app.models.user import User
 if TYPE_CHECKING:
     import uuid
 
+_VALID_SCOPES = frozenset({"read", "write"})
+
 
 def _sha256(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
@@ -41,6 +43,7 @@ async def issue_pat(
     user: User,
     name: str,
     expires_at: datetime | None = None,
+    scope: str = "read",
 ) -> tuple[str, PersonalAccessToken]:
     """Issue a new PAT for *user*.
 
@@ -49,9 +52,14 @@ async def issue_pat(
 
     Raises ``ValueError`` when ``user.tenant_id`` is ``None`` — PATs are
     always tenant-scoped.
+
+    Raises ``ValueError`` when ``scope`` is not one of ``_VALID_SCOPES``.
     """
     if user.tenant_id is None:
         raise ValueError("Cannot issue a PAT for a user with no tenant_id")
+
+    if scope not in _VALID_SCOPES:
+        raise ValueError(f"Invalid scope {scope!r}; must be one of {sorted(_VALID_SCOPES)}")
 
     token = "clw_" + secrets.token_urlsafe(32)
 
@@ -62,6 +70,7 @@ async def issue_pat(
         token_hash=_sha256(token),
         token_prefix=token[:8],
         expires_at=expires_at,
+        scope=scope,
     )
     db.add(row)
     await db.commit()
@@ -69,20 +78,13 @@ async def issue_pat(
     return token, row
 
 
-async def verify_pat(
+async def _resolve_valid_pat(
     db: AsyncSession,
     token: str,
-) -> tuple[User | None, "uuid.UUID | None"]:
-    """Verify *token* and return ``(user, tenant_id)`` or ``(None, None)``.
+) -> tuple[PersonalAccessToken | None, User | None]:
+    """Shared core: return (pat_row, user) for a valid token, else (None, None).
 
-    Fast-path rejections (no DB hit):
-    - Empty string or does not start with ``clw_``.
-
-    Single-hash lookup:
-    - Revoked or expired rows → ``(None, None)``.
-    - Missing user or inactive user → ``(None, None)``.
-
-    On success: refreshes ``last_used_at`` and commits.
+    Refreshes last_used_at and commits on success (same side effects as before).
     """
     if not token or not token.startswith("clw_"):
         return None, None
@@ -94,10 +96,7 @@ async def verify_pat(
     )
     pat = result.scalar_one_or_none()
 
-    if pat is None:
-        return None, None
-
-    if pat.revoked_at is not None:
+    if pat is None or pat.revoked_at is not None:
         return None, None
 
     now = _now_utc()
@@ -122,7 +121,43 @@ async def verify_pat(
         return None, None
 
     await db.commit()
+    return pat, user
+
+
+async def verify_pat(
+    db: AsyncSession,
+    token: str,
+) -> tuple[User | None, "uuid.UUID | None"]:
+    """Verify *token* and return ``(user, tenant_id)`` or ``(None, None)``.
+
+    Fast-path rejections (no DB hit):
+    - Empty string or does not start with ``clw_``.
+
+    Single-hash lookup:
+    - Revoked or expired rows → ``(None, None)``.
+    - Missing user or inactive user → ``(None, None)``.
+
+    On success: refreshes ``last_used_at`` and commits.
+    """
+    pat, user = await _resolve_valid_pat(db, token)
+    if user is None:
+        return None, None
     return user, pat.tenant_id
+
+
+async def verify_pat_with_scope(
+    db: AsyncSession,
+    token: str,
+) -> tuple[User | None, "uuid.UUID | None", str | None]:
+    """Verify *token* and return ``(user, tenant_id, scope)`` or ``(None, None, None)``.
+
+    Same validation logic as ``verify_pat``; additionally returns the token's
+    scope (``"read"`` or ``"write"``).
+    """
+    pat, user = await _resolve_valid_pat(db, token)
+    if user is None:
+        return None, None, None
+    return user, pat.tenant_id, pat.scope
 
 
 async def revoke_pat(

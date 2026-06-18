@@ -156,9 +156,10 @@ function CreateModal({ onClose, onCreated }: CreateModalProps) {
     const toast = useToast();
     const [name, setName] = useState('');
     const [expiresAt, setExpiresAt] = useState('');
+    const [scope, setScope] = useState<'read' | 'write'>('read');
 
     const mutation = useMutation({
-        mutationFn: () => patApi.create({ name: name.trim(), ...(expiresAt ? { expires_at: new Date(expiresAt).toISOString() } : {}) }),
+        mutationFn: () => patApi.create({ name: name.trim(), scope, ...(expiresAt ? { expires_at: new Date(expiresAt).toISOString() } : {}) }),
         onSuccess: (data) => {
             toast.success(t('pat.tokenCreated'));
             onCreated(data);
@@ -208,6 +209,15 @@ function CreateModal({ onClose, onCreated }: CreateModalProps) {
                             min={new Date().toISOString().slice(0, 10)}
                         />
                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('pat.expiresAtHint')}</div>
+                    </div>
+                    <div>
+                        <label style={labelStyle}>{t('pat.scope')}</label>
+                        <select className="form-input" style={inputStyle} value={scope}
+                                onChange={e => setScope(e.target.value as 'read' | 'write')}>
+                            <option value="read">{t('pat.scopeRead')}</option>
+                            <option value="write">{t('pat.scopeWrite')}</option>
+                        </select>
+                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('pat.scopeHint')}</div>
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '4px' }}>
                         <button
@@ -349,7 +359,7 @@ export default function PatManager() {
                         <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
                             <thead>
                                 <tr style={{ borderBottom: '1px solid var(--border-subtle)' }}>
-                                    {[t('pat.colName'), t('pat.colPrefix'), t('pat.colCreated'), t('pat.colLastUsed'), t('pat.colExpires'), ''].map((h, i) => (
+                                    {[t('pat.colName'), t('pat.colPrefix'), t('pat.colCreated'), t('pat.colLastUsed'), t('pat.colExpires'), t('pat.colScope'), ''].map((h, i) => (
                                         <th key={i} style={{ ...labelStyle, textAlign: 'left', padding: '6px 8px 6px 0', fontWeight: 600, whiteSpace: 'nowrap' }}>{h}</th>
                                     ))}
                                 </tr>
@@ -364,6 +374,14 @@ export default function PatManager() {
                                         <td style={{ padding: '8px 8px 8px 0', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>{fmtDate(pat.created_at)}</td>
                                         <td style={{ padding: '8px 8px 8px 0', color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>{pat.last_used_at ? fmtDate(pat.last_used_at) : '—'}</td>
                                         <td style={{ padding: '8px 8px 8px 0', color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>{pat.expires_at ? fmtDate(pat.expires_at) : t('pat.never')}</td>
+                                        <td style={{ padding: '8px 8px 8px 0' }}>
+                                            <span style={{
+                                                fontSize: '10px', padding: '2px 7px', borderRadius: '4px', fontWeight: 600,
+                                                background: pat.scope === 'write' ? 'rgba(255,170,0,0.12)' : 'var(--bg-tertiary)',
+                                                color: pat.scope === 'write' ? 'var(--warning)' : 'var(--text-tertiary)',
+                                                border: '1px solid var(--border-subtle)',
+                                            }}>{pat.scope === 'write' ? t('pat.scopeWrite') : t('pat.scopeRead')}</span>
+                                        </td>
                                         <td style={{ padding: '8px 0', textAlign: 'right' }}>
                                             <button
                                                 type="button"

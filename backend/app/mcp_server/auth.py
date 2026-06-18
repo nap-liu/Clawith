@@ -7,7 +7,9 @@ token is absent, malformed, revoked, or expired.
 
 from __future__ import annotations
 
-from app.services.pat_service import verify_pat
+from dataclasses import dataclass
+
+from app.services.pat_service import verify_pat, verify_pat_with_scope
 
 
 def _headers_from_ctx(ctx):
@@ -52,3 +54,23 @@ async def resolve_pat_user(ctx, db):
     The MCP viewer is always the human who owns the PAT.
     """
     return await verify_pat(db, _bearer_from_ctx(ctx))
+
+
+@dataclass
+class PatContext:
+    user: object          # app.models.user.User
+    tenant_id: object     # uuid.UUID
+    scope: str            # "read" | "write"
+
+
+async def resolve_pat_context(ctx, db) -> "PatContext | None":
+    """Return a PatContext for a valid PAT, or None when unauthenticated."""
+    user, tid, scope = await verify_pat_with_scope(db, _bearer_from_ctx(ctx))
+    if user is None:
+        return None
+    return PatContext(user=user, tenant_id=tid, scope=scope or "read")
+
+
+def require_write(pc: "PatContext") -> bool:
+    """True iff the PAT scope permits mutations."""
+    return getattr(pc, "scope", "read") == "write"

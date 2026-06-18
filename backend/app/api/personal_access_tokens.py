@@ -39,6 +39,7 @@ async def create_pat(
             user=current_user,
             name=body.name,
             expires_at=body.expires_at,
+            scope=body.scope,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -48,6 +49,7 @@ async def create_pat(
         name=row.name,
         token=token_plaintext,
         token_prefix=row.token_prefix,
+        scope=row.scope,
         created_at=row.created_at,
         expires_at=row.expires_at,
     )
