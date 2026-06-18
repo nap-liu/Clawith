@@ -226,25 +226,34 @@ async def provision_agent(db, *, creator, tenant_id, data: AgentProvisionInput) 
     all_skill_ids = set(data.skill_ids or []) | default_ids | template_skill_ids
 
     if all_skill_ids:
-        agent_dir = agent_manager._agent_dir(agent.id)
-        skills_dir = agent_dir / "skills"
-        skills_dir.mkdir(parents=True, exist_ok=True)
+        # Write skills through the storage backend (not the local FS) so they
+        # persist to shared storage — exactly like initialize_agent_files above.
+        # Under STORAGE_BACKEND=s3 a local-only write never reaches S3 and is
+        # lost when start_container re-materializes the agent dir from storage,
+        # leaving template/default skills missing (the agent then silently falls
+        # back to web search). Mirrors the storage path the REST route uses.
+        import asyncio
 
-        for sid in all_skill_ids:
-            result = await db.execute(
-                select(Skill).where(Skill.id == sid).options(selectinload(Skill.files))
-            )
-            skill = result.scalar_one_or_none()
-            if not skill:
-                continue
-            # Create folder: skills/<folder_name>/
-            skill_folder = skills_dir / skill.folder_name
-            skill_folder.mkdir(parents=True, exist_ok=True)
-            # Write each file
-            for sf in skill.files:
-                file_path = skill_folder / sf.path
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                file_path.write_text(sf.content, encoding="utf-8")
+        from app.services.storage import get_storage_backend
+
+        storage = get_storage_backend()
+        agent_prefix = agent_manager._agent_storage_prefix(agent.id)
+
+        skills_result = await db.execute(
+            select(Skill).where(Skill.id.in_(all_skill_ids)).options(selectinload(Skill.files))
+        )
+        skills = skills_result.scalars().all()
+
+        file_specs = [
+            (f"{agent_prefix}/skills/{skill.folder_name}/{sf.path}", sf.content)
+            for skill in skills
+            for sf in skill.files
+        ]
+        if file_specs:
+            await asyncio.gather(*[
+                storage.write_text(key, content, encoding="utf-8")
+                for key, content in file_specs
+            ])
 
     # Auto-install template-declared MCP servers using the system Smithery key.
     # For trading agents, this means shibui/finance lands in the agent's tool
