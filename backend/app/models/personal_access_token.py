@@ -33,6 +33,9 @@ class PersonalAccessToken(Base):
     token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
     token_prefix: Mapped[str] = mapped_column(String(16), nullable=False)
 
+    # Authorization scope: "read" (list/get/chat) or "write" (read + create/configure).
+    scope: Mapped[str] = mapped_column(String(16), nullable=False, default="read", server_default="read")
+
     # Lifecycle timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
