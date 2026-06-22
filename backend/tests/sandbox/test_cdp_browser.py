@@ -1,10 +1,9 @@
 """Unit tests for the CDP JSON-RPC connection wrapper. No sandbox required."""
-import asyncio
 import json
 
 import pytest
 
-from app.services.sandbox.remote.cdp_browser import CdpConnection, CdpError
+from app.services.sandbox.remote.cdp_browser import CdpConnection, CdpError, open_and_extract
 
 
 class FakeWs:
@@ -64,9 +63,6 @@ async def test_wait_for_event_returns_params():
     conn = CdpConnection(ws)
     params = await conn.wait_for_event("Page.loadEventFired", timeout=2.0)
     assert params == {"timestamp": 1.0}
-
-
-from app.services.sandbox.remote.cdp_browser import open_and_extract
 
 
 class ScriptedWs:
