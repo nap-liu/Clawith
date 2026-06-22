@@ -1,5 +1,9 @@
 import json
-from app.services.llm.confirmation_tool import find_request_confirmation_call
+from app.services.llm.confirmation_tool import (
+    REQUEST_CONFIRMATION_TOOL_SEED,
+    find_request_confirmation_call,
+)
+from app.models.tool import Tool
 
 
 def _tc(name, args):
@@ -37,3 +41,21 @@ def test_invalid_malformed_json_args():
     call = find_request_confirmation_call([tc])
     assert call is not None and call.valid is False
     assert "JSON" in call.error
+
+
+def test_seed_string_fields_fit_tools_table_columns():
+    """The seed is INSERTed verbatim into `tools`; over-long values fail the INSERT
+    at startup seeding (icon is varchar(10) — the 12-char 'shield-check' overflowed
+    and the tool was never seeded). Validate against the real model column limits."""
+    limits = {
+        col.name: col.type.length
+        for col in Tool.__table__.columns
+        if getattr(col.type, "length", None) is not None
+    }
+    for field in ("name", "display_name", "category", "icon", "source", "type"):
+        val = REQUEST_CONFIRMATION_TOOL_SEED.get(field)
+        if val is None or field not in limits:
+            continue
+        assert len(val) <= limits[field], (
+            f"seed[{field!r}]={val!r} ({len(val)} chars) exceeds tools.{field} varchar({limits[field]})"
+        )

@@ -61,7 +61,9 @@ REQUEST_CONFIRMATION_TOOL_SEED: dict[str, Any] = {
     "display_name": "Request Confirmation",
     "description": REQUEST_CONFIRMATION_TOOL_DEFINITION["function"]["description"],
     "category": "system",
-    "icon": "shield-check",
+    # NB: tools.icon is varchar(10) — keep the name short (lucide "shield"; the
+    # 12-char "shield-check" overflows the column and the seed INSERT fails).
+    "icon": "shield",
     "is_default": True,  # 默认下发给新 agent;存量 agent 走 Task 8 的 fan-out
     "parameters_schema": REQUEST_CONFIRMATION_TOOL_DEFINITION["function"]["parameters"],
     "config": {},
