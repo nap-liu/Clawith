@@ -110,7 +110,20 @@ async def create_confirmation(
 
     payload = {"type": "confirmation_card", **serialize_confirmation_for_display(c)}
     await _broadcast(agent_id, conversation_id, payload)
-    # Non-web channel text fallback: see Task 8
+    # Non-web channel text fallback (Phase 1 minimal — defensive, must never raise).
+    # Phase 1 main path: all confirmations are source_channel="web"; this block is
+    # purely defensive for future non-web callers. Task 8 will add real channel delivery.
+    if source_channel and source_channel != "web":
+        try:
+            logger.info(
+                "Confirmation card %s created for non-web channel %r (conversation %s). "
+                "Web UI required to action. Task 8 will add channel text delivery.",
+                c.id,
+                source_channel,
+                conversation_id,
+            )
+        except Exception:
+            pass
     return c
 
 

@@ -12,10 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
+from app.models.agent_confirmation import AgentConfirmation
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.agent import Agent
 from app.models.user import User
+from app.services.confirmation_service import serialize_confirmation_for_display
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
@@ -535,6 +537,23 @@ async def get_session_messages(
             if sender_user_id:
                 entry["sender_user_id"] = sender_user_id
             out.append(entry)
+
+    # Merge AgentConfirmation rows for this session into the message list so
+    # the frontend can replay confirmation cards after a page refresh.
+    # conversation_id == str(session_id) per the ChatMessage query convention above.
+    conf_rows = (
+        await db.execute(
+            select(AgentConfirmation)
+            .where(AgentConfirmation.conversation_id == str(session_id))
+            .order_by(AgentConfirmation.created_at)
+        )
+    ).scalars().all()
+    for c in conf_rows:
+        out.append(serialize_confirmation_for_display(c))
+    # Re-sort by created_at so confirmations interleave correctly with messages.
+    # Messages already carry created_at as an ISO string; serialize_confirmation_for_display
+    # also produces a created_at ISO string — so the key is uniform.
+    out.sort(key=lambda m: m.get("created_at") or "")
 
     return out
 
