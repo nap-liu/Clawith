@@ -2924,6 +2924,13 @@ async def _execute_tool_direct(
                 lambda temp_ws: _execute_code(agent_id, temp_ws, arguments, tool_name=tool_name),
                 sync_back=True,
             )
+        elif tool_name == "browse":
+            return await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _browse(agent_id, temp_ws, arguments, user_id=None, session_id=None),
+                sync_back=True,
+            )
         elif tool_name == "sql_execute":
             return await _sql_execute(arguments)
         elif tool_name == "web_search":
@@ -3342,6 +3349,14 @@ async def execute_tool(
             result = await _publish_page(agent_id, user_id, ws, arguments)
         elif tool_name == "list_published_pages":
             result = await _list_published_pages(agent_id)
+        # ── aio-sandbox Browser ──
+        elif tool_name == "browse":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _browse(agent_id, temp_ws, arguments, user_id=user_id, session_id=session_id),
+                sync_back=True,
+            )
         # ── AgentBay Tools ──
         elif tool_name == "agentbay_browser_navigate":
             result = await _agentbay_browser_navigate(agent_id, ws, arguments)
@@ -8296,6 +8311,71 @@ async def build_cli_injection(
     except Exception:
         logger.exception("[CLI Inject] injection build failed; continuing without CLI")
         return None
+
+
+async def _browse(
+    agent_id: Optional[uuid.UUID],
+    ws: Path,
+    arguments: dict,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Browse a URL via the aio-sandbox backend and return an LLM-facing summary.
+
+    Resolves the sandbox backend from the 'browse' tool config (falling back to
+    the platform-level config), calls AioSandboxBackend.browse(), writes any
+    screenshot into the agent workspace, and returns a text summary.
+    """
+    import base64
+
+    from app.config import get_sandbox_config
+    from app.services.sandbox.config import SandboxConfig
+    from app.services.sandbox.registry import get_sandbox_backend
+
+    url = (arguments.get("url") or "").strip()
+    if not url:
+        return "❌ browse: 'url' is required."
+    extract = arguments.get("extract", True)
+    screenshot = bool(arguments.get("screenshot", False))
+
+    fallback_config = get_sandbox_config()
+    tool_config = await _get_tool_config(agent_id, "browse")
+    sandbox_config = (
+        SandboxConfig.from_dict(tool_config, fallback_config) if tool_config else fallback_config
+    )
+    try:
+        backend = get_sandbox_backend(sandbox_config)
+    except ValueError as e:
+        return f"❌ browse: sandbox not configured: {str(e)[:200]}"
+
+    result = await backend.browse(
+        agent_id=str(agent_id) if agent_id else None,
+        conversation_id=session_id or None,
+        url=url,
+        extract=bool(extract),
+        screenshot=screenshot,
+        timeout=sandbox_config.max_timeout,
+    )
+    if not result.get("success"):
+        return f"❌ browse failed: {result.get('error') or 'unknown error'}"
+
+    lines = [f"# {result.get('title') or url}", f"URL: {result.get('url') or url}"]
+    if screenshot and result.get("screenshot_b64"):
+        slug = re.sub(r"[^a-z0-9]+", "-", url.lower()).strip("-")[:40] or "page"
+        name = f"screenshot-{slug}.png"
+        try:
+            (ws / name).write_bytes(base64.b64decode(result["screenshot_b64"]))
+            lines.append(f"Screenshot saved to workspace: {name}")
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"(screenshot save failed: {str(e)[:100]})")
+    if extract:
+        text = result.get("text") or "(no extractable text)"
+        if result.get("truncated"):
+            text += "\n…[truncated]"
+        lines.append("")
+        lines.append(text)
+    return "\n".join(lines)
 
 
 async def _execute_code(
