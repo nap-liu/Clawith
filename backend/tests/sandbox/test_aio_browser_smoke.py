@@ -62,3 +62,22 @@ async def test_browse_extracts_text_from_example_com(backend):
     assert "example" in (out["title"] + out["text"]).lower()
     # context is cached for the anchor
     assert backend._browser_contexts.get("smoke-agent:conv-browse-1")
+
+
+async def test_each_conversation_gets_distinct_browser_context(backend):
+    # Two conversations under the same agent must land in different CDP browser
+    # contexts — distinct contexts are what isolate cookies/storage.
+    out1 = await backend.browse(
+        agent_id="iso-agent", conversation_id="iso-conv1",
+        url="https://example.com", extract=True, screenshot=False, timeout=30,
+    )
+    assert out1["success"], out1.get("error")
+    out2 = await backend.browse(
+        agent_id="iso-agent", conversation_id="iso-conv2",
+        url="https://example.com", extract=True, screenshot=False, timeout=30,
+    )
+    assert out2["success"], out2.get("error")
+    ctx1 = backend._browser_contexts.get("iso-agent:iso-conv1")
+    ctx2 = backend._browser_contexts.get("iso-agent:iso-conv2")
+    assert ctx1 and ctx2
+    assert ctx1 != ctx2  # distinct CDP browser contexts == isolated cookies/storage
