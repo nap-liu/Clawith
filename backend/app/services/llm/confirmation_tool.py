@@ -69,7 +69,7 @@ REQUEST_CONFIRMATION_TOOL_SEED: dict[str, Any] = {
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class ConfirmationCall:
     valid: bool
     title: str
@@ -79,14 +79,18 @@ class ConfirmationCall:
     error: str | None = None
 
 
-def _parse_args(tc: dict) -> dict:
+def _parse_args(tc: dict) -> dict | None:
+    """Parse tool call arguments. Return None if JSON is invalid, {} if absent."""
     raw = (tc.get("function") or {}).get("arguments")
     if isinstance(raw, dict):
         return raw
-    try:
-        return json.loads(raw) if raw else {}
-    except (json.JSONDecodeError, TypeError):
+    if not raw:
         return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return None
 
 
 def find_request_confirmation_call(tool_calls: list[dict] | None) -> ConfirmationCall | None:
@@ -94,6 +98,10 @@ def find_request_confirmation_call(tool_calls: list[dict] | None) -> Confirmatio
         if ((tc.get("function") or {}).get("name") or "") != REQUEST_CONFIRMATION_TOOL_NAME:
             continue
         args = _parse_args(tc)
+        if args is None:
+            return ConfirmationCall(
+                False, "", "", None, "medium", "request_confirmation arguments must be valid JSON"
+            )
         title = (args.get("title") or "").strip()
         summary = (args.get("summary") or "").strip()
         action = args.get("action")

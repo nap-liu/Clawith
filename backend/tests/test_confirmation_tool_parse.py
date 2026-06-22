@@ -29,3 +29,11 @@ def test_invalid_nested_action():
     call = find_request_confirmation_call([_tc("request_confirmation", {
         "title": "t", "summary": "s", "action": {"tool": "request_confirmation", "args": {}}})])
     assert call.valid is False
+
+
+def test_invalid_malformed_json_args():
+    # Construct a tool call with malformed JSON arguments directly (bypassing json.dumps)
+    tc = {"id": "c1", "function": {"name": "request_confirmation", "arguments": '{"title": "t", "summary":'}}
+    call = find_request_confirmation_call([tc])
+    assert call is not None and call.valid is False
+    assert "JSON" in call.error
