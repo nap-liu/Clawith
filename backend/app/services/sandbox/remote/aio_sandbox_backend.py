@@ -68,6 +68,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+import websockets
 from loguru import logger
 
 from app.services.sandbox.base import (
@@ -76,6 +77,7 @@ from app.services.sandbox.base import (
     SandboxCapabilities,
 )
 from app.services.sandbox.config import SandboxConfig
+from app.services.sandbox.remote.cdp_browser import CdpConnection, open_and_extract
 
 # Maximum stdout/stderr we surface to the caller. aio-sandbox itself caps
 # raw output at 30 KB per call; we tighten that for LLM consumption.
@@ -144,7 +146,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         self._anchor_had_wrappers: set[str] = set()
         # anchor -> CDP browserContextId for the per-conversation isolated
         # browser context. Lives on this cached instance like _jupyter_sessions;
-        # disposed in _evict_anchor.
+        # will be disposed in _evict_anchor (Task 5).
         self._browser_contexts: dict[str, str] = {}
 
     # ------------------------------------------------------------------ Public API
@@ -877,13 +879,6 @@ class AioSandboxBackend(BaseSandboxBackend):
         screenshot: bool = False,
         timeout: int = 30,
     ) -> dict[str, Any]:
-        import websockets
-
-        from app.services.sandbox.remote.cdp_browser import (
-            CdpConnection,
-            open_and_extract,
-        )
-
         anchor = compute_session_anchor(agent_id, conversation_id)
         try:
             async with httpx.AsyncClient() as client:
