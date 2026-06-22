@@ -3772,10 +3772,56 @@ DEPLOY_BUILTIN_TOOLS = [
     }
 ]
 
+BROWSER_BUILTIN_TOOLS = [
+    {
+        "name": "browse",
+        "display_name": "Browse Web Page",
+        "description": (
+            "Open a web page in an isolated, per-conversation browser running "
+            "inside the aio-sandbox container, and return its readable text.\n"
+            "Use this to research a URL, read an article, or check a page's "
+            "current contents. Each conversation has its own browser context, "
+            "so cookies and logins are isolated and persist within the "
+            "conversation.\n"
+            "Set screenshot=true to also save a PNG of the page to your "
+            "workspace. Returns the page title and visible text (long pages "
+            "are truncated)."
+        ),
+        "category": "browser",
+        "icon": "🌐",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The full URL to open (must include http:// or https://)."},
+                "extract": {"type": "boolean", "description": "Return the page title and visible text. Default true."},
+                "screenshot": {"type": "boolean", "description": "Also save a PNG screenshot of the page to your workspace. Default false."},
+            },
+            "required": ["url"],
+        },
+        "config": {
+            "sandbox_type": "aio_sandbox",
+            "api_url": "http://aio-sandbox:8080",
+            "api_key": "",
+            "default_timeout": 30,
+            "max_timeout": 60,
+        },
+        "config_schema": {
+            "fields": [
+                {"key": "api_url", "label": "Sandbox URL", "type": "text", "default": "http://aio-sandbox:8080", "placeholder": "http://aio-sandbox:8080", "required": True},
+                {"key": "api_key", "label": "Bearer Token (optional)", "type": "password", "default": "", "placeholder": "Only set if the sandbox is auth-protected", "required": False},
+                {"key": "default_timeout", "label": "Default Timeout (seconds)", "type": "number", "default": 30, "min": 5, "max": 120},
+                {"key": "max_timeout", "label": "Max Timeout (seconds)", "type": "number", "default": 60, "min": 10, "max": 120},
+            ]
+        },
+    },
+]
+
 BUILTIN_TOOLS = [
     *BUILTIN_TOOLS,
     *OKR_BUILTIN_TOOLS,
     *DEPLOY_BUILTIN_TOOLS,
+    *BROWSER_BUILTIN_TOOLS,
 ]
 
 
