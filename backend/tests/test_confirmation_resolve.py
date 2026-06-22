@@ -9,6 +9,7 @@ Covers:
 6. expired (expires_at < now, status pending) → status==expired, no execution
 """
 
+import asyncio
 import uuid
 import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -316,3 +317,75 @@ async def test_expired_returns_expired_status():
     mock_exec.assert_not_awaited()
     mock_cont.assert_not_awaited()
     mock_broadcast.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Test 7: B1 regression — two concurrent resolves execute the action exactly once
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_resolve_executes_action_once():
+    """SELECT ... FOR UPDATE must serialize concurrent resolves of the same pending
+    card so the carried (dangerous) action runs exactly once — not once per click."""
+    agent_id, user_id = await _make_agent()
+    c = await _insert_pending(
+        agent_id,
+        action={"tool": "sql_execute", "args": {"sql": "INSERT INTO orders VALUES (1)"}},
+    )
+
+    exec_mock = AsyncMock(return_value="ok rows=1")
+    with (
+        patch("app.services.confirmation_service._execute_tool_direct", new=exec_mock),
+        patch("app.services.confirmation_service._broadcast", new=AsyncMock()),
+        patch("app.services.confirmation_service._run_continuation", new=AsyncMock()),
+    ):
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                confirmation_service.resolve_confirmation(
+                    confirmation_id=c.id, agent_id=agent_id, decision="confirm", resolving_user_id=user_id
+                ),
+                confirmation_service.resolve_confirmation(
+                    confirmation_id=c.id, agent_id=agent_id, decision="confirm", resolving_user_id=user_id
+                ),
+            ),
+            timeout=20,
+        )
+
+    # The dangerous action executed exactly once despite two concurrent resolves.
+    assert exec_mock.await_count == 1, f"expected exactly one execution, got {exec_mock.await_count}"
+    assert all(r.status == "executed" for r in results)
+
+    # The persisted row is in a single terminal state.
+    from sqlalchemy import select as _select
+
+    async with async_session() as db:
+        fresh = (
+            await db.execute(_select(AgentConfirmation).where(AgentConfirmation.id == c.id))
+        ).scalar_one()
+    assert fresh.status == "executed"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: M2 — unsupported-tool sentinel is classified as failed, not executed
+# ---------------------------------------------------------------------------
+
+
+async def test_unsupported_tool_marked_failed():
+    agent_id, user_id = await _make_agent()
+    c = await _insert_pending(agent_id, action={"tool": "some_unmapped_tool", "args": {}})
+
+    sentinel = "Tool some_unmapped_tool does not support post-approval execution"
+    with (
+        patch(
+            "app.services.confirmation_service._execute_tool_direct",
+            new=AsyncMock(return_value=sentinel),
+        ),
+        patch("app.services.confirmation_service._broadcast", new=AsyncMock()),
+        patch("app.services.confirmation_service._run_continuation", new=AsyncMock()),
+    ):
+        result_c = await confirmation_service.resolve_confirmation(
+            confirmation_id=c.id, agent_id=agent_id, decision="confirm", resolving_user_id=user_id
+        )
+
+    assert result_c.status == "failed"
+    assert result_c.result == sentinel
