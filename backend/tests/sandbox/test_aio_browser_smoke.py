@@ -47,3 +47,18 @@ async def test_browser_ws_url_round_trips_get_version(backend):
                 break
     assert "result" in msg
     assert "product" in msg["result"]  # e.g. "Chrome/146.0.0.0"
+
+
+async def test_browse_extracts_text_from_example_com(backend):
+    out = await backend.browse(
+        agent_id="smoke-agent",
+        conversation_id="conv-browse-1",
+        url="https://example.com",
+        extract=True,
+        screenshot=False,
+        timeout=30,
+    )
+    assert out["success"] is True, out.get("error")
+    assert "example" in (out["title"] + out["text"]).lower()
+    # context is cached for the anchor
+    assert backend._browser_contexts.get("smoke-agent:conv-browse-1")

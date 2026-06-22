@@ -142,6 +142,10 @@ class AioSandboxBackend(BaseSandboxBackend):
         # under a stale identity. Pure non-CLI anchors stay out of this set so
         # they never pay the reset (and python execs keep clean line numbers).
         self._anchor_had_wrappers: set[str] = set()
+        # anchor -> CDP browserContextId for the per-conversation isolated
+        # browser context. Lives on this cached instance like _jupyter_sessions;
+        # disposed in _evict_anchor.
+        self._browser_contexts: dict[str, str] = {}
 
     # ------------------------------------------------------------------ Public API
 
@@ -850,6 +854,64 @@ class AioSandboxBackend(BaseSandboxBackend):
         cdp = urlsplit(cdp_url)
         scheme = "wss" if base.scheme == "https" else "ws"
         return urlunsplit((scheme, base.netloc, cdp.path, cdp.query, ""))
+
+    async def _ensure_browser_context(self, conn, anchor: str, *, timeout: float) -> str:
+        """Get-or-create the CDP browserContextId for an anchor."""
+        ctx = self._browser_contexts.get(anchor)
+        if ctx:
+            return ctx
+        created = await conn.call(
+            "Target.createBrowserContext", {"disposeOnDetach": False}, timeout=timeout
+        )
+        ctx = created["browserContextId"]
+        self._browser_contexts[anchor] = ctx
+        return ctx
+
+    async def browse(
+        self,
+        *,
+        agent_id: str | None,
+        conversation_id: str | None,
+        url: str,
+        extract: bool = True,
+        screenshot: bool = False,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        import websockets
+
+        from app.services.sandbox.remote.cdp_browser import (
+            CdpConnection,
+            open_and_extract,
+        )
+
+        anchor = compute_session_anchor(agent_id, conversation_id)
+        try:
+            async with httpx.AsyncClient() as client:
+                ws_url = await self._browser_ws_url(client)
+            async with websockets.connect(ws_url, max_size=20_000_000) as ws_conn:
+                conn = CdpConnection(ws_conn)
+                ctx = await self._ensure_browser_context(conn, anchor, timeout=float(timeout))
+                out = await open_and_extract(
+                    conn,
+                    browser_context_id=ctx,
+                    url=url,
+                    want_text=extract,
+                    want_screenshot=screenshot,
+                    text_limit=_STDOUT_LIMIT,
+                    timeout=float(timeout),
+                )
+            return {"success": True, "error": None, **out}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[AioSandbox] browse error")
+            return {
+                "success": False,
+                "error": f"browse failed: {str(e)[:200]}",
+                "url": url,
+                "title": "",
+                "text": "",
+                "screenshot_b64": None,
+                "truncated": False,
+            }
 
     @staticmethod
     def _is_session_missing(body: dict[str, Any]) -> bool:
