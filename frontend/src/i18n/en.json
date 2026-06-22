@@ -7,10 +7,10 @@
     "hero": {
       "badge": "Open Source · Multi-Agent Collaboration",
       "title": "Digital Employee Platform",
-      "subtitle": "OpenClaw for Teams",
-      "welcome": "Welcome,",
+      "subtitle": "Enterprise Digital Employee Platform",
+      "welcome": "Welcome to the Digital Employee Platform",
       "founder": "Founder",
-      "description": "OpenClaw empowers individuals.<br>The Digital Employee Platform scales it to frontier organizations.",
+      "description": "A digital employee platform built for frontier organizations — AI employees that collaborate and evolve autonomously.",
       "mark": "Digital Employee Platform",
       "features": {
         "multiAgent": {

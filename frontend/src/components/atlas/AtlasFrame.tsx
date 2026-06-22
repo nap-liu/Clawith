@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
 import { IconWorld } from '@tabler/icons-react';
-import ClawithWordmark from './ClawithWordmark';
 
 interface Props {
     /** When provided, replaces the Clawith brand with a "← BACK" pill button */
@@ -13,7 +13,12 @@ interface Props {
 }
 
 export default function AtlasFrame({ onBack, onToggleLang, className, children }: Props) {
+    const { t } = useTranslation();
     const pageClass = ['atlas-page', className].filter(Boolean).join(' ');
+    // Theme-aware brand mark: white logo on Night Atlas (dark), black on Paper Atlas (light) — mirrors Layout.
+    const logoSrc = (typeof window !== 'undefined' && localStorage.getItem('theme') === 'dark')
+        ? '/logo-white.png'
+        : '/logo-black.png';
     return (
         <div className={pageClass}>
             <header className="atlas-frame-top">
@@ -23,7 +28,10 @@ export default function AtlasFrame({ onBack, onToggleLang, className, children }
                             <span aria-hidden="true">←</span> Back
                         </button>
                     ) : (
-                        <ClawithWordmark height={28} className="atlas-brand-wordmark" />
+                        <span className="atlas-brand-wordmark" style={{ display: 'inline-flex', alignItems: 'center', gap: 9 }}>
+                            <img src={logoSrc} alt="" style={{ height: 26, width: 26, display: 'block' }} />
+                            <span style={{ fontSize: 17, fontWeight: 700, letterSpacing: '0.02em' }}>{t('app.name')}</span>
+                        </span>
                     )}
                 </div>
                 {onToggleLang && (

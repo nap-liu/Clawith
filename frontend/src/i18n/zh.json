@@ -7,10 +7,10 @@
     "hero": {
       "badge": "开源 · 多智能体协作",
       "title": "数字员工平台",
-      "subtitle": "OpenClaw for Teams",
-      "welcome": "欢迎，",
+      "subtitle": "企业数字员工平台",
+      "welcome": "欢迎使用数字员工平台",
       "founder": "创始人",
-      "description": "OpenClaw 赋能个人。<br>数字员工平台将其扩展到前沿组织。",
+      "description": "为前沿组织打造的数字员工平台 —— 让 AI 员工自主协作、持续进化。",
       "mark": "数字员工平台",
       "features": {
         "multiAgent": {

@@ -407,14 +407,10 @@ export default function Login() {
                 {/* ── Left: Hero with compass ── */}
                 <div className="atlas-screen-plate atlas-login-hero">
                     <div className="atlas-login-compass">
-                        <OriginPlate size={620} />
+                        <OriginPlate size={620} topLabel={t('login.hero.mark')} />
                     </div>
                     <div className="atlas-login-welcome">
-                        <h1 className="atlas-h1">
-                            {isZh
-                                ? '欢迎，创始人。'
-                                : `${t('login.hero.welcome')} ${t('login.hero.founder')}.`}
-                        </h1>
+                        <h1 className="atlas-h1">{t('login.hero.welcome')}</h1>
                         <p className="atlas-body atlas-body--muted">{t('login.hero.description')}</p>
                     </div>
                 </div>
