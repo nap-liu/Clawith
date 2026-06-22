@@ -81,3 +81,19 @@ async def test_each_conversation_gets_distinct_browser_context(backend):
     ctx2 = backend._browser_contexts.get("iso-agent:iso-conv2")
     assert ctx1 and ctx2
     assert ctx1 != ctx2  # distinct CDP browser contexts == isolated cookies/storage
+
+
+async def test_browse_only_anchors_are_lru_evicted(backend):
+    agent = "lru-browse-agent"
+    cap = backend._max_anchors_per_agent
+    for i in range(cap + 1):
+        out = await backend.browse(
+            agent_id=agent, conversation_id=f"c{i}",
+            url="about:blank", extract=False, screenshot=False, timeout=30,
+        )
+        assert out["success"], out.get("error")
+    # the oldest anchor (c0) must have been evicted from the context cache,
+    # and the per-agent retained contexts must not exceed the cap.
+    assert backend._browser_contexts.get(f"{agent}:c0") is None
+    retained = [k for k in backend._browser_contexts if k.startswith(f"{agent}:")]
+    assert len(retained) <= cap

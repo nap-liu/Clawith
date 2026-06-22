@@ -896,19 +896,24 @@ class AioSandboxBackend(BaseSandboxBackend):
         anchor = compute_session_anchor(agent_id, conversation_id)
         try:
             async with httpx.AsyncClient() as client:
+                # Register in the same per-agent LRU as execute() so browse-only
+                # conversations are bounded and their browser contexts get disposed
+                # on eviction (otherwise they leak until process restart).
+                for stale in self._register_anchor(agent_id or "default", anchor):
+                    await self._evict_anchor(client, stale)
                 ws_url = await self._browser_ws_url(client)
-            async with websockets.connect(ws_url, max_size=20_000_000) as ws_conn:
-                conn = CdpConnection(ws_conn)
-                ctx = await self._ensure_browser_context(conn, anchor, timeout=float(timeout))
-                out = await open_and_extract(
-                    conn,
-                    browser_context_id=ctx,
-                    url=url,
-                    want_text=extract,
-                    want_screenshot=screenshot,
-                    text_limit=_STDOUT_LIMIT,
-                    timeout=float(timeout),
-                )
+                async with websockets.connect(ws_url, max_size=20_000_000) as ws_conn:
+                    conn = CdpConnection(ws_conn)
+                    ctx = await self._ensure_browser_context(conn, anchor, timeout=float(timeout))
+                    out = await open_and_extract(
+                        conn,
+                        browser_context_id=ctx,
+                        url=url,
+                        want_text=extract,
+                        want_screenshot=screenshot,
+                        text_limit=_STDOUT_LIMIT,
+                        timeout=float(timeout),
+                    )
             return {"success": True, "error": None, **out}
         except Exception as e:  # noqa: BLE001
             logger.exception("[AioSandbox] browse error")
