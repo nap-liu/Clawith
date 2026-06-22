@@ -1,18 +1,22 @@
-"""Confirmation service — create, serialize, and broadcast confirmation cards.
+"""Confirmation service — create, serialize, broadcast, and resolve confirmation cards.
 
 create_confirmation: insert AgentConfirmation into DB, broadcast confirmation_card
     event to web WebSocket clients.
 serialize_confirmation_for_display: produce the dict shape consumed by the frontend card.
+resolve_confirmation: handle user approve/reject; execute carried action; resume agent loop.
+_run_continuation: resume the agent's LLM loop with the resolution outcome text.
 
-Task 6 will add resolve_confirmation (approve/reject + resume agent loop).
 Task 8 will add non-web channel text fallbacks.
 """
 
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import select
+
 from app.database import async_session
 from app.models.agent_confirmation import AgentConfirmation
+from app.services.agent_tools import _execute_tool_direct  # no circular dep: agent_tools never imports confirmation_service
 
 CONFIRMATION_EXPIRY_HOURS = 24
 
@@ -94,3 +98,185 @@ async def create_confirmation(
     await _broadcast(agent_id, conversation_id, payload)
     # Non-web channel text fallback: see Task 8
     return c
+
+
+async def resolve_confirmation(
+    *,
+    confirmation_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    decision: str,
+    resolving_user_id: uuid.UUID,
+) -> AgentConfirmation:
+    """Process a user's approve or cancel decision on a pending confirmation card.
+
+    - Fetches the AgentConfirmation row (LookupError if not found).
+    - Idempotent: if already resolved (not pending), returns current state unchanged.
+    - Expired (expires_at < now while still pending): marks expired, broadcasts, returns.
+    - confirm + action: executes the carried tool via _execute_tool_direct; stores result;
+      sets status to "executed" or "failed" depending on whether the result starts with "error".
+    - confirm + no action (pure gate): sets result="用户已确认", status="executed".
+    - cancel: sets status="cancelled", no tool execution.
+    - After any resolution: commits, broadcasts confirmation_update, then fires
+      _run_continuation so the agent gets a follow-up LLM turn.
+    """
+    now = datetime.now(timezone.utc)
+
+    async with async_session() as db:
+        row = await db.execute(
+            select(AgentConfirmation).where(
+                AgentConfirmation.id == confirmation_id,
+                AgentConfirmation.agent_id == agent_id,
+            )
+        )
+        c = row.scalar_one_or_none()
+        if c is None:
+            raise LookupError(f"AgentConfirmation {confirmation_id} not found for agent {agent_id}")
+
+        # Idempotent: already resolved
+        if c.status != "pending":
+            return c
+
+        # Expired
+        if c.expires_at and c.expires_at < now:
+            c.status = "expired"
+            await db.commit()
+            await db.refresh(c)
+
+        if c.status == "expired":
+            await _broadcast(
+                agent_id,
+                c.conversation_id,
+                {
+                    "type": "confirmation_update",
+                    "confirmation_id": str(c.id),
+                    "status": c.status,
+                    "result": (c.result or "")[:500],
+                },
+            )
+            return c
+
+        # Set resolver metadata
+        c.resolved_by = resolving_user_id
+        c.resolved_at = now
+
+        title = c.title or ""
+        action = c.action  # {"tool": str, "args": dict} or None
+
+        if decision == "cancel":
+            c.status = "cancelled"
+            cont_text = f"用户拒绝了操作「{title}」。"
+        else:  # confirm
+            if action:
+                tool_name = action.get("tool", "")
+                arguments = action.get("args") or {}
+                try:
+                    result = await _execute_tool_direct(tool_name, arguments, agent_id)
+                except Exception as e:
+                    result = f"Error executing {tool_name}: {e}"
+                c.result = str(result)
+                c.status = "failed" if c.result.lower().startswith("error") else "executed"
+                cont_text = f"用户已确认操作「{title}」。执行结果:\n{result}"
+            else:
+                # Pure confirmation gate — no action to execute
+                c.result = "用户已确认"
+                c.status = "executed"
+                cont_text = f"用户已确认操作「{title}」。执行结果:\n{c.result}"
+
+        await db.commit()
+        await db.refresh(c)
+
+    await _broadcast(
+        agent_id,
+        c.conversation_id,
+        {
+            "type": "confirmation_update",
+            "confirmation_id": str(c.id),
+            "status": c.status,
+            "result": (c.result or "")[:500],
+        },
+    )
+
+    await _run_continuation(
+        agent_id=agent_id,
+        conversation_id=c.conversation_id,
+        chat_session_id=c.chat_session_id,
+        text=cont_text,
+        resolving_user_id=resolving_user_id,
+    )
+
+    return c
+
+
+async def _run_continuation(
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    chat_session_id: uuid.UUID | None,
+    text: str,
+    resolving_user_id: uuid.UUID,
+) -> None:
+    """Resume the agent's LLM loop with the confirmation resolution outcome.
+
+    Uses run_channel_message for per-session lock + connection-independent execution.
+    _call_agent_llm does NOT self-persist ChatMessage; callers must save user + assistant
+    messages manually (per wecom_stream.py pattern). This function does that.
+    """
+    from app.models.audit import ChatMessage
+    from app.services.channel_dispatch import ChannelReactions, run_channel_message
+    from app.services.channel_llm import _call_agent_llm
+    from app.services.chat_history import load_history_for_llm, persist_assistant_reply
+
+    async def _work() -> str:
+        async with async_session() as db:
+            # Persist the continuation user message so the agent sees it in history
+            db.add(
+                ChatMessage(
+                    agent_id=agent_id,
+                    user_id=resolving_user_id,
+                    role="user",
+                    content=text,
+                    conversation_id=conversation_id,
+                )
+            )
+            await db.commit()
+
+            # Load full history for LLM context
+            from app.models.agent import Agent as AgentModel, DEFAULT_CONTEXT_WINDOW_SIZE
+            from sqlalchemy import select as _select
+            agent_row = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
+            agent_obj = agent_row.scalar_one_or_none()
+            ctx_size = (agent_obj.context_window_size if agent_obj else None) or DEFAULT_CONTEXT_WINDOW_SIZE
+
+            history = await load_history_for_llm(
+                db,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                ctx_size=ctx_size,
+            )
+
+            reply = await _call_agent_llm(
+                db,
+                agent_id,
+                text,
+                session_id=conversation_id,
+                user_id=resolving_user_id,
+                history=history,
+                recovery_hint=None,
+            )
+
+        # Persist the assistant reply via its own session (timestamps after tool loop)
+        await persist_assistant_reply(
+            async_session,
+            agent_id=agent_id,
+            user_id=resolving_user_id,
+            conversation_id=conversation_id,
+            content=reply,
+        )
+        return reply
+
+    await run_channel_message(
+        str(conversation_id),
+        is_command=False,
+        reactions=ChannelReactions(),
+        work=_work,
+    )
