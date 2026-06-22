@@ -35,8 +35,15 @@ class CdpConnection:
         if session_id:
             frame["sessionId"] = session_id
         await self._ws.send(json.dumps(frame))
+        deadline = asyncio.get_running_loop().time() + timeout
         while True:
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise CdpError(f"{method}: timed out after {timeout}s")
+            try:
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise CdpError(f"{method}: timed out after {timeout}s")
             msg = json.loads(raw)
             if msg.get("id") != msg_id:
                 continue  # event, or a different in-flight call
@@ -51,7 +58,7 @@ class CdpConnection:
         session_id: str | None = None,
         timeout: float = 15.0,
     ) -> dict:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while True:
             remaining = deadline - loop.time()
