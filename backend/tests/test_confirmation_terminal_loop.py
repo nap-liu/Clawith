@@ -304,6 +304,7 @@ async def test_request_confirmation_disabled_tool_does_not_terminate(monkeypatch
     class _FakeClient2:
         closed = False
         captured_tool_messages: list[LLMMessage] = []
+        captured_messages: list[LLMMessage] = []
 
         async def stream(self, messages, tools=None, temperature=None,
                          max_tokens=None, on_chunk=None, on_tool_delta=None,
@@ -325,7 +326,8 @@ async def test_request_confirmation_disabled_tool_does_not_terminate(monkeypatch
                     usage=None,
                 )
             if _round[0] == 2:
-                # Capture what error messages arrived in api_messages
+                # Capture what messages arrived in api_messages
+                _FakeClient2.captured_messages = list(messages)
                 _FakeClient2.captured_tool_messages = [
                     m for m in messages if m.role == "tool"
                 ]
@@ -373,6 +375,23 @@ async def test_request_confirmation_disabled_tool_does_not_terminate(monkeypatch
     error_msgs = [m for m in _FakeClient2.captured_tool_messages if "❌" in (m.content or "")]
     assert len(error_msgs) >= 1, "Expected at least one ❌ error tool message in round 2"
     assert "sql_execute" in error_msgs[0].content, f"Error should mention sql_execute: {error_msgs[0].content}"
+
+    # The error tool message must be preceded by an assistant message carrying the
+    # matching tool_calls — an orphaned role="tool" reply gets rejected (HTTP 400)
+    # by strict providers on the next round. This guards the B1 regression.
+    msgs = _FakeClient2.captured_messages
+    err = error_msgs[0]
+    err_idx = next(i for i, m in enumerate(msgs) if m is err)
+    preceding_tc_ids = {
+        tc.get("id")
+        for m in msgs[:err_idx]
+        if m.role == "assistant" and getattr(m, "tool_calls", None)
+        for tc in (m.tool_calls or [])
+    }
+    assert err.tool_call_id in preceding_tc_ids, (
+        "orphaned tool message: error tool_call_id has no matching tool_calls in any "
+        f"preceding assistant message (got ids={preceding_tc_ids}, need={err.tool_call_id})"
+    )
 
     # Final reply is from finish()
     assert reply == "抱歉,无法执行该操作"

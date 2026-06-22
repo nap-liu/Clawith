@@ -77,6 +77,7 @@ class ConfirmationCall:
     action: dict | None
     risk_level: str
     error: str | None = None
+    call_id: str = ""
 
 
 def _parse_args(tc: dict) -> dict | None:
@@ -97,10 +98,11 @@ def find_request_confirmation_call(tool_calls: list[dict] | None) -> Confirmatio
     for tc in tool_calls or []:
         if ((tc.get("function") or {}).get("name") or "") != REQUEST_CONFIRMATION_TOOL_NAME:
             continue
+        cid = tc.get("id") or ""
         args = _parse_args(tc)
         if args is None:
             return ConfirmationCall(
-                False, "", "", None, "medium", "request_confirmation arguments must be valid JSON"
+                False, "", "", None, "medium", "request_confirmation arguments must be valid JSON", cid
             )
         title = (args.get("title") or "").strip()
         summary = (args.get("summary") or "").strip()
@@ -108,14 +110,18 @@ def find_request_confirmation_call(tool_calls: list[dict] | None) -> Confirmatio
         risk = args.get("risk_level") or "medium"
         if not title or not summary:
             return ConfirmationCall(
-                False, title, summary, None, risk, "request_confirmation 需要非空 title 和 summary"
+                False, title, summary, None, risk, "request_confirmation 需要非空 title 和 summary", cid
             )
         if action is not None:
             if not isinstance(action, dict) or not (action.get("tool") or "").strip():
-                return ConfirmationCall(False, title, summary, None, risk, "action 必须是 {tool, args} 且 tool 非空")
+                return ConfirmationCall(
+                    False, title, summary, None, risk, "action 必须是 {tool, args} 且 tool 非空", cid
+                )
             if action.get("tool") == REQUEST_CONFIRMATION_TOOL_NAME:
                 return ConfirmationCall(
-                    False, title, summary, None, risk, "action.tool 不能是 request_confirmation 自身"
+                    False, title, summary, None, risk, "action.tool 不能是 request_confirmation 自身", cid
                 )
-        return ConfirmationCall(True, title, summary, action, risk if risk in ("low", "medium", "high") else "medium")
+        return ConfirmationCall(
+            True, title, summary, action, risk if risk in ("low", "medium", "high") else "medium", None, cid
+        )
     return None

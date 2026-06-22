@@ -961,14 +961,6 @@ async def call_llm(
         # surface error back to model and loop.
         conf_call = find_request_confirmation_call(sanitized_tool_calls)
         if conf_call is not None:
-            _conf_tc_id = next(
-                (
-                    tc.get("id", "")
-                    for tc in (sanitized_tool_calls or [])
-                    if (tc.get("function") or {}).get("name") == "request_confirmation"
-                ),
-                "",
-            )
             _conf_action_tool = (conf_call.action or {}).get("tool") if conf_call.action else None
             if conf_call.valid and (_conf_action_tool is None or _conf_action_tool in allowed_tool_names):
                 from app.services import confirmation_service  # lazy import — avoid circular
@@ -992,10 +984,19 @@ async def call_llm(
                     _conf_reason = conf_call.error or "request_confirmation 参数无效"
                 else:
                     _conf_reason = f"工具 {_conf_action_tool} 未对该 agent 启用,无法挟带"
+                # Mirror the finish-invalid branch: a role="tool" reply must be
+                # preceded by the assistant message carrying its tool_calls, or
+                # strict providers reject the orphaned tool message next round.
+                api_messages.append(LLMMessage(
+                    role="assistant",
+                    content=response.content or None,
+                    tool_calls=sanitized_tool_calls,
+                    reasoning_content=response.reasoning_content,
+                ))
                 api_messages.append(LLMMessage(
                     role="tool",
                     content=f"❌ {_conf_reason}",
-                    tool_call_id=_conf_tc_id,
+                    tool_call_id=conf_call.call_id,
                 ))
                 continue
 
@@ -1455,14 +1456,6 @@ async def call_agent_llm_with_tools(
                 # not enabled → surface error back to model and loop.
                 conf_call = find_request_confirmation_call(sanitized_tool_calls)
                 if conf_call is not None:
-                    _conf_tc_id = next(
-                        (
-                            tc.get("id", "")
-                            for tc in (sanitized_tool_calls or [])
-                            if (tc.get("function") or {}).get("name") == "request_confirmation"
-                        ),
-                        "",
-                    )
                     _conf_action_tool = (conf_call.action or {}).get("tool") if conf_call.action else None
                     if conf_call.valid and (_conf_action_tool is None or _conf_action_tool in allowed_tool_names):
                         from app.services import confirmation_service  # lazy import — avoid circular
@@ -1486,10 +1479,19 @@ async def call_agent_llm_with_tools(
                             _conf_reason = conf_call.error or "request_confirmation 参数无效"
                         else:
                             _conf_reason = f"工具 {_conf_action_tool} 未对该 agent 启用,无法挟带"
+                        # Mirror the finish-invalid branch: a role="tool" reply must
+                        # be preceded by the assistant message carrying its tool_calls,
+                        # or strict providers reject the orphaned tool message.
+                        api_messages.append(LLMMessage(
+                            role="assistant",
+                            content=response.content or None,
+                            tool_calls=sanitized_tool_calls,
+                            reasoning_content=response.reasoning_content,
+                        ))
                         api_messages.append(LLMMessage(
                             role="tool",
                             content=f"❌ {_conf_reason}",
-                            tool_call_id=_conf_tc_id,
+                            tool_call_id=conf_call.call_id,
                         ))
                         continue
 
