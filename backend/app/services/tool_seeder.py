@@ -2,11 +2,13 @@
 
 from loguru import logger
 from sqlalchemy import select
+
+from app.config import get_settings
 from app.database import async_session
 from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
 from app.models.tool import Tool
-from app.config import get_settings
+from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
 from app.services.llm.finish import FINISH_TOOL_SEED
 from app.services.tool_config import meaningful_config, tenant_tool_config_key
 
@@ -67,6 +69,7 @@ def _global_builtin_config(tool_data: dict) -> dict:
 # Builtin tool definitions — these map to the hardcoded AGENT_TOOLS
 BUILTIN_TOOLS = [
     FINISH_TOOL_SEED,
+    REQUEST_CONFIRMATION_TOOL_SEED,
     {
         "name": "list_files",
         "display_name": "List Files",
