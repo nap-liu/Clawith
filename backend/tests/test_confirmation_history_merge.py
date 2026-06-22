@@ -254,6 +254,54 @@ async def test_confirmation_status_reflects_db_update():
 
 
 # ---------------------------------------------------------------------------
+# Test 1c — pagination: a card in an older page appears on that page only (B2)
+# ---------------------------------------------------------------------------
+
+
+async def test_confirmation_merge_respects_pagination():
+    """A confirmation older than the newest page must NOT be re-injected into
+    every page — it belongs to exactly one page (B2 regression guard)."""
+    agent, user = await _seed_agent_and_user()
+    session = await _seed_session(agent, user)
+
+    # m0(t0) m1(t1) [conf t1.5] m2(t2) m3(t3)
+    await _seed_message(agent, user, session, "user", "m0", _ts(0))
+    await _seed_message(agent, user, session, "assistant", "m1", _ts(1))
+    conf = await _seed_confirmation(agent, session, _ts(1.5))
+    await _seed_message(agent, user, session, "user", "m2", _ts(2))
+    await _seed_message(agent, user, session, "assistant", "m3", _ts(3))
+
+    current_user = SimpleNamespace(
+        id=user.id, role="org_admin", tenant_id=user.tenant_id, is_active=True
+    )
+
+    async def _fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    with patch("app.api.chat_sessions.check_agent_access", side_effect=_fake_check_agent_access):
+        async with async_session() as db:
+            page1 = await get_session_messages(
+                agent_id=agent.id, session_id=session.id,
+                limit=2, before=None, current_user=current_user, db=db,
+            )
+        # Newest page = m2,m3; the older confirmation (t1.5) must NOT appear here.
+        assert [m["role"] for m in page1] == ["user", "assistant"], page1
+        before_cursor = page1[0]["created_at"]  # oldest row of page 1 → next cursor
+
+        with patch("app.api.chat_sessions.check_agent_access", side_effect=_fake_check_agent_access):
+            async with async_session() as db:
+                page2 = await get_session_messages(
+                    agent_id=agent.id, session_id=session.id,
+                    limit=2, before=before_cursor, current_user=current_user, db=db,
+                )
+
+    # Older page = m0,m1 + the confirmation, exactly once.
+    conf_items = [m for m in page2 if m["role"] == "confirmation"]
+    assert len(conf_items) == 1, page2
+    assert conf_items[0]["confirmation_id"] == str(conf.id)
+
+
+# ---------------------------------------------------------------------------
 # Test 2 — non-web fallback does not raise
 # ---------------------------------------------------------------------------
 

@@ -538,25 +538,36 @@ async def get_session_messages(
                 entry["sender_user_id"] = sender_user_id
             out.append(entry)
 
-    # Merge AgentConfirmation rows for this session into the message list so
-    # the frontend can replay confirmation cards after a page refresh.
+    # Merge AgentConfirmation rows for this session into the message list so the
+    # frontend can replay confirmation cards after a page refresh.
     # conversation_id == str(session_id) per the ChatMessage query convention above.
-    conf_rows = (
-        await db.execute(
+    #
+    # Bound to THIS page's time window so each card lands in exactly one page:
+    #   lower = oldest message in the page (inclusive); upper = the `before` cursor
+    #   (exclusive) when paginating, else open (so trailing cards after the last
+    #   message still show on the newest page). Without this bound, every "load
+    #   more" page re-injects the full confirmation set → duplicated cards.
+    if messages:
+        conf_q = (
             select(AgentConfirmation)
-            .where(AgentConfirmation.conversation_id == str(session_id))
+            .where(
+                AgentConfirmation.conversation_id == str(session_id),
+                AgentConfirmation.created_at >= messages[0].created_at,
+            )
             .order_by(AgentConfirmation.created_at)
         )
-    ).scalars().all()
-    # Only when there are confirmations to interleave do we re-sort. Sorting
-    # unconditionally would reorder existing messages (e.g. inline tool_code parts
-    # that carry no created_at), changing behavior for sessions with no cards.
-    if conf_rows:
-        for c in conf_rows:
-            out.append(serialize_confirmation_for_display(c))
-        # Messages already carry created_at as an ISO string; serialize_confirmation_for_display
-        # also produces a created_at ISO string — so the sort key is uniform.
-        out.sort(key=lambda m: m.get("created_at") or "")
+        if before:
+            conf_q = conf_q.where(AgentConfirmation.created_at < before_dt)
+        conf_rows = (await db.execute(conf_q)).scalars().all()
+        # Only re-sort when there are cards to interleave — an unconditional sort
+        # would reorder existing messages (e.g. inline tool_code parts carry no
+        # created_at), changing behavior for sessions with no cards.
+        if conf_rows:
+            for c in conf_rows:
+                out.append(serialize_confirmation_for_display(c))
+            # Messages carry created_at as an ISO string; serialize_confirmation_for_display
+            # also produces a created_at ISO string — so the sort key is uniform.
+            out.sort(key=lambda m: m.get("created_at") or "")
 
     return out
 

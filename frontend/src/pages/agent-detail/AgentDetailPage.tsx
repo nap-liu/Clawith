@@ -2426,6 +2426,13 @@ export default function AgentDetailPage() {
                 ...(m.sender_name && { sender_name: m.sender_name }),
                 ...(m.sender_user_id && { sender_user_id: m.sender_user_id }),
                 ...(m.participant_id && { participant_id: m.participant_id }),
+                // Confirmation cards replay from history: backend emits snake_case;
+                // map to the camelCase fields ConfirmationCard reads, else the card
+                // renders blank with dead buttons after a refresh.
+                ...(m.role === 'confirmation' && {
+                    confirmationId: m.confirmation_id, title: m.title, summary: m.summary,
+                    actionPreview: m.action_preview, riskLevel: m.risk_level, status: m.status,
+                }),
             }));
             setHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
             // Backend returns the page oldest-first, so msgs[0] is the oldest
@@ -3513,6 +3520,12 @@ export default function AgentDetailPage() {
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
+                // Confirmation cards on older pages: map snake_case → camelCase
+                // (same gap as the initial-load path) so the card stays actionable.
+                ...(m.role === 'confirmation' && {
+                    confirmationId: m.confirmation_id, title: m.title, summary: m.summary,
+                    actionPreview: m.action_preview, riskLevel: m.risk_level, status: m.status,
+                }),
             }));
             // Save current scroll position
             const el = historyContainerRef.current;
