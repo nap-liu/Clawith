@@ -289,6 +289,20 @@ class AioSandboxBackend(BaseSandboxBackend):
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[AioSandbox] evict jupyter kernel for {anchor!r} failed: {e}")
+        browser_ctx = self._browser_contexts.pop(anchor, None)
+        if browser_ctx:
+            try:
+                ws_url = await self._browser_ws_url(client)
+                async with websockets.connect(ws_url, max_size=1_000_000) as ws_conn:
+                    await CdpConnection(ws_conn).call(
+                        "Target.disposeBrowserContext",
+                        {"browserContextId": browser_ctx},
+                        timeout=5.0,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[AioSandbox] evict browser context for {anchor!r} failed: {e}"
+                )
 
     # ------------------------------------------------------------------ Shell path
 

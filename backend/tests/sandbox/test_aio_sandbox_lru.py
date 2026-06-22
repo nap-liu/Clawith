@@ -170,3 +170,14 @@ async def test_execute_without_conversation_never_evicts():
             await b.execute(code="echo hi", language="bash", agent_id="A")
 
     client.delete.assert_not_awaited()
+
+
+async def test_evict_anchor_disposes_browser_context():
+    b = _backend()
+    b._browser_contexts["A:c1"] = "CTX-1"
+    client = MagicMock()
+    client.delete = AsyncMock()
+
+    await b._evict_anchor(client, "A:c1")
+
+    assert "A:c1" not in b._browser_contexts
