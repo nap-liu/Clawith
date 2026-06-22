@@ -65,6 +65,7 @@ import json
 import time
 from collections import OrderedDict
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from loguru import logger
@@ -810,6 +811,45 @@ class AioSandboxBackend(BaseSandboxBackend):
         if self.config.api_key:
             h["Authorization"] = f"Bearer {self.config.api_key}"
         return h
+
+    async def _browser_ws_url(self, client: httpx.AsyncClient) -> str:
+        """Resolve the browser-level CDP WebSocket URL, reachable from the backend.
+
+        aio-sandbox exposes the bundled Chrome's CDP through its 8080 endpoint.
+        `/v1/browser/info` returns a `cdp_url`; `/json/version` returns a
+        `webSocketDebuggerUrl`. Either may carry an in-container host
+        (localhost/127.0.0.1/0.0.0.0) that the backend cannot reach, so we
+        always rewrite the host:port to our own `self.base_url`.
+        """
+        cdp_url = ""
+        try:
+            resp = await client.get(
+                f"{self.base_url}/v1/browser/info",
+                headers=self._headers(),
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                cdp_url = (resp.json().get("data") or resp.json()).get("cdp_url", "") or ""
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[AioSandbox] /v1/browser/info failed: {e}")
+        if not cdp_url:
+            resp = await client.get(
+                f"{self.base_url}/json/version",
+                headers=self._headers(),
+                timeout=5.0,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"browser CDP not reachable: /json/version HTTP {resp.status_code}"
+                )
+            cdp_url = resp.json().get("webSocketDebuggerUrl", "") or ""
+        if not cdp_url:
+            raise RuntimeError("browser CDP endpoint returned no ws url")
+        # Rewrite host:port to the backend-reachable base_url; keep ws path.
+        base = urlsplit(self.base_url)
+        cdp = urlsplit(cdp_url)
+        scheme = "wss" if base.scheme == "https" else "ws"
+        return urlunsplit((scheme, base.netloc, cdp.path, cdp.query, ""))
 
     @staticmethod
     def _is_session_missing(body: dict[str, Any]) -> bool:
