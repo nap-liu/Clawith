@@ -470,7 +470,13 @@
       "provider": "来源",
       "toolName": "工具名",
       "inProgress": "进行中",
-      "done": "完成"
+      "done": "完成",
+      "confirmCardTitle": "需要确认",
+      "confirmWillRun": "将执行",
+      "confirmAction": "确认",
+      "cancelAction": "取消",
+      "confirmResolved": "已确认",
+      "confirmCancelled": "已取消"
     },
     "activityLog": {
       "title": "工作日志",

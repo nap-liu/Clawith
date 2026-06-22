@@ -16,6 +16,7 @@ import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/Wor
 import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import type { FocusApiItem } from '../../services/api';
 import ModelSwitcher from '../../components/ModelSwitcher';
+import ConfirmationCard from '../../components/ConfirmationCard';
 import { useAppStore } from '../../stores';
 import { useAuthStore } from '../../stores';
 import { copyToClipboard } from '../../utils/clipboard';
@@ -3851,6 +3852,14 @@ export default function AgentDetailPage() {
                             />
                         )}
                     </React.Fragment>
+                );
+            }
+            if (msg.role === 'confirmation') {
+                return (
+                    <div key={i} className={`chat-msg-row${v.isLeft ? '' : ' chat-msg-row--user'}`}>
+                        <div className="chat-msg-avatar">{v.avatarText || 'A'}</div>
+                        <ConfirmationCard msg={msg as any} agentId={id!} t={t} />
+                    </div>
                 );
             }
             return (
