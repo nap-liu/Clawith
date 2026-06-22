@@ -548,12 +548,15 @@ async def get_session_messages(
             .order_by(AgentConfirmation.created_at)
         )
     ).scalars().all()
-    for c in conf_rows:
-        out.append(serialize_confirmation_for_display(c))
-    # Re-sort by created_at so confirmations interleave correctly with messages.
-    # Messages already carry created_at as an ISO string; serialize_confirmation_for_display
-    # also produces a created_at ISO string — so the key is uniform.
-    out.sort(key=lambda m: m.get("created_at") or "")
+    # Only when there are confirmations to interleave do we re-sort. Sorting
+    # unconditionally would reorder existing messages (e.g. inline tool_code parts
+    # that carry no created_at), changing behavior for sessions with no cards.
+    if conf_rows:
+        for c in conf_rows:
+            out.append(serialize_confirmation_for_display(c))
+        # Messages already carry created_at as an ISO string; serialize_confirmation_for_display
+        # also produces a created_at ISO string — so the sort key is uniform.
+        out.sort(key=lambda m: m.get("created_at") or "")
 
     return out
 
