@@ -8415,7 +8415,20 @@ async def _execute_code(
 
     # Working directory is the agent's root directory (must be absolute).
     # This allows code to access skills/, workspace/, memory/ etc. directly.
-    work_dir = ws.resolve()
+    #
+    # Remote sandboxes (aio/e2b) run in a SEPARATE container and need a path
+    # that exists INSIDE that container — not the host-only temp workspace the
+    # storage-abstraction layer materializes for local subprocess execution
+    # (that dir lives only on the backend host, so the sandbox's `cd`/jupyter
+    # cwd hits "No such file or directory" / "Working directory does not
+    # exist"). The sandbox shares the agent's REAL workspace root via the
+    # /data/agents bind mount, so point work_dir there. The mkdir below lands
+    # on that shared mount → the dir is real on both sides. Falls back to the
+    # passed-in ws when agent_id is unknown.
+    if tool_name in _REMOTE_SANDBOX_TOOL_NAMES and agent_id is not None:
+        work_dir = _agent_workspace_root(agent_id).resolve()
+    else:
+        work_dir = ws.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # These tools are an explicit choice of a non-subprocess sandbox; if their
