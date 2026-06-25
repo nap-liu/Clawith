@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { agentApi } from '../services/api';
+import { MarkdownRenderer } from './MarkdownRenderer';
 
 interface ConfirmMsg {
     confirmationId?: string;
@@ -47,8 +48,8 @@ const ConfirmationCard: React.FC<Props> = ({ msg, agentId, t }) => {
             <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
                 {msg.title || t('agent.chat.confirmCardTitle', 'Confirmation required')}
             </div>
-            <div style={{ color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', fontSize: 13 }}>
-                {msg.summary}
+            <div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
+                <MarkdownRenderer content={msg.summary || ''} />
             </div>
             {msg.actionPreview ? (
                 <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-tertiary)' }}>
