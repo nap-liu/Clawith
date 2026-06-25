@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import and_, cast, func, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access
+from app.core.permissions import can_view_all_agent_chat_sessions, check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.audit import ChatMessage
@@ -20,12 +20,9 @@ from app.models.user import User
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
 
-def _can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
-    """Admins and the agent creator may list/view/delete other users' chat sessions."""
-    return (
-        user.role in ("platform_admin", "org_admin", "agent_admin")
-        or str(agent.creator_id) == str(user.id)
-    )
+# Single source of truth lives in app.core.permissions; aliased here so the
+# existing call sites (and their "_" private-by-convention name) stay unchanged.
+_can_view_all_agent_chat_sessions = can_view_all_agent_chat_sessions
 
 
 class SessionOut(BaseModel):

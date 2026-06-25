@@ -2176,6 +2176,10 @@ export default function AgentDetailPage() {
     const reconnectAttemptsRef = useRef<Record<SessionRuntimeKey, number>>({});
     const sessionUiStateRef = useRef<Record<SessionRuntimeKey, { isWaiting: boolean; isStreaming: boolean }>>({});
     const activeSessionIdRef = useRef<string | null>(null);
+    // True while the active session is a READ-ONLY monitor view (a session the
+    // viewer may see but does not own). Live broadcasts are then mirrored into
+    // `historyMsgs` (the read-only view's source) instead of `chatMessages`.
+    const activeReadOnlyRef = useRef<boolean>(false);
     const currentAgentIdRef = useRef<string | undefined>(id);
     const sessionMsgAbortRef = useRef<AbortController | null>(null);
     const sessionLoadSeqRef = useRef(0);
@@ -2835,6 +2839,40 @@ export default function AgentDetailPage() {
         return parsed;
     };
 
+    // Fold one live WS broadcast event into the READ-ONLY view's message list
+    // (`historyMsgs`). Mirrors the streaming-bubble logic the writable live view
+    // applies to `chatMessages`, so a monitored session updates live (user msg +
+    // streamed assistant reply) while keeping the read-only view's pagination and
+    // sender attribution intact. Returns the list unchanged for unhandled types.
+    const applyMonitorEvent = (prev: any[], d: any): any[] => {
+        const last = prev[prev.length - 1];
+        const isStreamingAssistant = last && last.role === 'assistant' && (last as any)._streaming;
+        if (d.type === 'channel_user_message') {
+            if (last && last.role === 'user' && last.content === d.content
+                && ((last as any).sender_name || '') === (d.sender_name || '')) return prev;
+            return [...prev, parseChatMsg({
+                role: 'user', content: d.content || '',
+                ...(d.sender_name ? { sender_name: d.sender_name } : {}),
+                ...(d.user_id ? { sender_user_id: String(d.user_id) } : {}),
+                timestamp: new Date().toISOString(),
+            } as any)];
+        }
+        if (d.type === 'thinking') {
+            if (isStreamingAssistant) return [...prev.slice(0, -1), { ...last, thinking: (last.thinking || '') + d.content }];
+            return [...prev, { role: 'assistant', content: '', thinking: d.content, _streaming: true } as any];
+        }
+        if (d.type === 'chunk') {
+            if (isStreamingAssistant) return [...prev.slice(0, -1), { ...last, content: last.content + d.content }];
+            return [...prev, { role: 'assistant', content: d.content, _streaming: true } as any];
+        }
+        if (d.type === 'done') {
+            const thinking = isStreamingAssistant ? (last as any).thinking : undefined;
+            if (isStreamingAssistant) return [...prev.slice(0, -1), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() } as any)];
+            return [...prev, parseChatMsg({ role: d.role || 'assistant', content: d.content, timestamp: new Date().toISOString() } as any)];
+        }
+        return prev;
+    };
+
 
     useEffect(() => {
         currentAgentIdRef.current = id;
@@ -3015,6 +3053,26 @@ export default function AgentDetailPage() {
                 }
                 if (['done', 'error', 'quota_exceeded'].includes(d.type)) {
                     closeSessionSocket(key, true);
+                }
+                return;
+            }
+
+            // Active READ-ONLY monitor: mirror live broadcasts into the read-only
+            // view's list (`historyMsgs`) instead of the writable live view's
+            // `chatMessages`. The composer stays disabled — we only reflect the
+            // conversation as it streams in, so a monitored channel / other-user
+            // session updates live instead of only on reload.
+            if (activeReadOnlyRef.current) {
+                if (['channel_user_message', 'thinking', 'chunk', 'done'].includes(d.type)) {
+                    const hel = historyContainerRef.current;
+                    const nearBottom = !hel || hel.scrollHeight - hel.scrollTop - hel.clientHeight < 120;
+                    setHistoryMsgs(prev => applyMonitorEvent(prev, d));
+                    if (nearBottom) scheduleHistoryScrollToBottom();
+                    if (d.type === 'done') {
+                        const sid = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
+                        if (sid) clearUnreadForSession(sid);
+                        fetchMySessions(true, agentId);
+                    }
                 }
                 return;
             }
@@ -3312,10 +3370,11 @@ export default function AgentDetailPage() {
             return;
         }
         activeSessionIdRef.current = String(activeSession.id);
-        if (!isWritableSession(activeSession)) {
-            syncActiveSocketState(activeSession, id);
-            return;
-        }
+        activeReadOnlyRef.current = !isWritableSession(activeSession);
+        // Open a live socket for ANY visible session — including ones the viewer
+        // does not own (read-only monitor). The backend accepts those read-only
+        // (composer stays disabled), so monitored channel / other-user
+        // conversations update live instead of only on reload.
         ensureSessionSocket(activeSession, id, token);
         syncActiveSocketState(activeSession, id);
     }, [id, token, activeTab, activeSession?.id, chatScope, canViewAllAgentChatSessions]);
@@ -3328,7 +3387,8 @@ export default function AgentDetailPage() {
         const onVisibility = () => {
             if (document.hidden) return;
             if (!id || !token || activeTab !== 'chat') return;
-            if (!activeSession || !isWritableSession(activeSession)) return;
+            // Resume the socket for any visible session, including read-only monitors.
+            if (!activeSession) return;
             const key = buildSessionRuntimeKey(id, String(activeSession.id));
             const ws = wsMapRef.current[key];
             if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;

@@ -79,6 +79,19 @@ def _is_admin(user: User) -> bool:
     return user.role in ("platform_admin", "org_admin")
 
 
+def can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
+    """Whether ``user`` may view/monitor OTHER users' chat sessions for ``agent``.
+
+    Single source of truth for "who can see another user's conversation",
+    shared by the REST session/message APIs (list/read) and the live WebSocket
+    monitor path. Admins (platform/org/agent) and the agent's creator qualify.
+    """
+    return (
+        user.role in ("platform_admin", "org_admin", "agent_admin")
+        or str(agent.creator_id) == str(user.id)
+    )
+
+
 async def get_agent_access_level_for_user_id(
     db: AsyncSession,
     user_id: uuid.UUID | None,

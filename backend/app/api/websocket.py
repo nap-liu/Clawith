@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging_config import set_trace_id
-from app.core.permissions import check_agent_access, is_agent_expired
+from app.core.permissions import can_view_all_agent_chat_sessions, check_agent_access, is_agent_expired
 from app.core.security import decode_access_token
 from app.database import async_session
 from app.models.agent import Agent
@@ -318,6 +318,10 @@ class WebSocketChatHandler:
         self.llm_model: LLMModel | None = None
         self.fallback_llm_model: LLMModel | None = None
         self.conv_id: str | None = None
+        # Read-only monitor: viewer is watching a session they do NOT own but are
+        # allowed to see (admins / agent creator). They subscribe to live
+        # broadcasts but may never drive a turn — enforced in ``message_loop``.
+        self.read_only: bool = False
         self.history_messages: list[ChatMessage] = []
         self.conversation: list[dict] = []
         self.current_user_text: str = ""
@@ -450,7 +454,9 @@ class WebSocketChatHandler:
         logger.info(f"[WS] Ready! Agent={self.agent_name} (live conns for agent: {len(_conns)})")
 
         # Send session_id to frontend
-        await self.websocket.send_json({"type": "connected", "session_id": self.conv_id})
+        await self.websocket.send_json(
+            {"type": "connected", "session_id": self.conv_id, "read_only": self.read_only}
+        )
 
         # Build conversation context
         self.conversation = self._build_conversation_context()
@@ -502,9 +508,17 @@ class WebSocketChatHandler:
                 if not _existing:
                     conv_id = None
                 elif _existing.source_channel != "agent" and str(_existing.user_id) != str(user_id):
-                    await self.websocket.send_json({"type": "error", "content": "Not authorized for this session"})
-                    await self.websocket.close(code=4003)
-                    return None
+                    # Not the owner. Allow a READ-ONLY monitor connection if the
+                    # viewer may see others' sessions (same gate as the REST
+                    # session/message APIs: admins + the agent creator) — so any
+                    # session visible in the web UI also updates live. They only
+                    # subscribe to broadcasts; sending is blocked in message_loop.
+                    if can_view_all_agent_chat_sessions(self.user, self.agent):
+                        self.read_only = True
+                    else:
+                        await self.websocket.send_json({"type": "error", "content": "Not authorized for this session"})
+                        await self.websocket.close(code=4003)
+                        return None
         if not conv_id:
             _sr = await db.execute(
                 select(ChatSession)
@@ -580,6 +594,16 @@ class WebSocketChatHandler:
             logger.info(f"[WS] Received: {content[:50]}" + (" [onboarding]" if is_onboarding_trigger else ""))
 
             if not content and not is_onboarding_trigger:
+                continue
+
+            # Read-only monitor: this viewer is watching a session they do not
+            # own (admin/creator with view rights). They receive live broadcasts
+            # but must never drive a turn or post as the session owner. The UI
+            # also disables the composer, but THIS is the authoritative guard.
+            if self.read_only:
+                await self.websocket.send_json(
+                    {"type": "error", "content": "只读监看会话,无法在此发送消息。"}
+                )
                 continue
 
             if is_onboarding_trigger:
