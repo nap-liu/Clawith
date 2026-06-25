@@ -12,14 +12,17 @@ from app.services.storage import get_storage_backend, normalize_storage_key
 
 settings = get_settings()
 
-async def _read_file_safe(key: str, max_chars: int = 3000) -> str:
-    """Read a storage-backed text file, return empty string if missing."""
+async def _read_file_safe(key: str, max_chars: int | None = 3000) -> str:
+    """Read a storage-backed text file, return empty string if missing.
+
+    max_chars=None disables truncation (inject the full file).
+    """
     storage = get_storage_backend()
     if not await storage.exists(key) or not await storage.is_file(key):
         return ""
     try:
         content = (await storage.read_text(key, encoding="utf-8", errors="replace")).strip()
-        if len(content) > max_chars:
+        if max_chars is not None and len(content) > max_chars:
             content = content[:max_chars] + "\n...(truncated)"
         return content
     except Exception:
@@ -460,17 +463,19 @@ async def build_agent_context(
     # bundle agents) run 4-12k chars. A tight cap silently drops every tail
     # section — rules, boundaries, facts — and the agent then confidently
     # denies things its soul plainly states, with no log of the truncation.
-    # Memory and relationships below keep small caps because they grow
-    # unbounded at runtime; the soul does not (only seeded/explicitly edited).
+    # Soul is seeded/explicitly edited (does not grow unbounded), so it gets a
+    # generous cap. Memory is injected in full (no truncation): truncating it
+    # silently dropped curated notes past the cap. Memory growth is managed by
+    # the agent curating memory.md, not by a hard context cap here.
     soul = await _read_file_safe(normalize_storage_key(f"{agent_id}/soul.md"), 30000)
     # Strip markdown heading if present
     if soul.startswith("# "):
         soul = "\n".join(soul.split("\n")[1:]).strip()
 
-    # --- Memory ---
-    memory = await _read_file_safe(normalize_storage_key(f"{agent_id}/memory/memory.md"), 2000)
+    # --- Memory --- (max_chars=None: never truncate long-term memory)
+    memory = await _read_file_safe(normalize_storage_key(f"{agent_id}/memory/memory.md"), None)
     if not memory:
-        memory = await _read_file_safe(normalize_storage_key(f"{agent_id}/memory.md"), 2000)
+        memory = await _read_file_safe(normalize_storage_key(f"{agent_id}/memory.md"), None)
     if memory.startswith("# "):
         memory = "\n".join(memory.split("\n")[1:]).strip()
 
