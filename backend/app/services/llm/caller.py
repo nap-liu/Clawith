@@ -46,6 +46,7 @@ from .failover import classify_error, FailoverErrorType
 from .json_recovery import canonicalize_tool_arguments
 from .tool_output_store import enforce_message_budget, finalize_tool_output
 from .finish import FINISH_PROTOCOL_REMINDER, FINISH_TOOL_DEFINITION, find_finish_call
+from .confirmation_tool import find_request_confirmation_call
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
 if TYPE_CHECKING:
@@ -955,6 +956,50 @@ async def call_llm(
             ))
             continue
 
+        # request_confirmation handling: valid → create pending confirmation and
+        # terminate the turn (挟带动作不执行); invalid / tool not enabled →
+        # surface error back to model and loop.
+        conf_call = find_request_confirmation_call(sanitized_tool_calls)
+        if conf_call is not None:
+            _conf_action_tool = (conf_call.action or {}).get("tool") if conf_call.action else None
+            if conf_call.valid and (_conf_action_tool is None or _conf_action_tool in allowed_tool_names):
+                from app.services import confirmation_service  # lazy import — avoid circular
+                await confirmation_service.create_confirmation(
+                    agent_id=agent_id,
+                    conversation_id=session_id,
+                    chat_session_id=None,
+                    source_channel="web",
+                    title=conf_call.title,
+                    summary=conf_call.summary,
+                    action=conf_call.action,
+                    risk_level=conf_call.risk_level,
+                    requested_by_user_id=user_id,
+                )
+                if agent_id and _unsaved_usage.total_tokens > 0:
+                    await record_token_usage(agent_id, _unsaved_usage)
+                await client.close()
+                return response.content or ""
+            else:
+                if not conf_call.valid:
+                    _conf_reason = conf_call.error or "request_confirmation 参数无效"
+                else:
+                    _conf_reason = f"工具 {_conf_action_tool} 未对该 agent 启用,无法挟带"
+                # Mirror the finish-invalid branch: a role="tool" reply must be
+                # preceded by the assistant message carrying its tool_calls, or
+                # strict providers reject the orphaned tool message next round.
+                api_messages.append(LLMMessage(
+                    role="assistant",
+                    content=response.content or None,
+                    tool_calls=sanitized_tool_calls,
+                    reasoning_content=response.reasoning_content,
+                ))
+                api_messages.append(LLMMessage(
+                    role="tool",
+                    content=f"❌ {_conf_reason}",
+                    tool_call_id=conf_call.call_id,
+                ))
+                continue
+
         # Remember where this round's appended entries begin. The message-level
         # budget enforcer operates only on items at or beyond this index —
         # historical messages (already sent as prefix bytes in prior rounds) must
@@ -1405,6 +1450,50 @@ async def call_agent_llm_with_tools(
                         content=finish_call.error or "`finish` was invalid.",
                     ))
                     continue
+
+                # request_confirmation handling (twin of the main call_llm loop):
+                # valid → create pending confirmation and terminate; invalid / tool
+                # not enabled → surface error back to model and loop.
+                conf_call = find_request_confirmation_call(sanitized_tool_calls)
+                if conf_call is not None:
+                    _conf_action_tool = (conf_call.action or {}).get("tool") if conf_call.action else None
+                    if conf_call.valid and (_conf_action_tool is None or _conf_action_tool in allowed_tool_names):
+                        from app.services import confirmation_service  # lazy import — avoid circular
+                        await confirmation_service.create_confirmation(
+                            agent_id=agent_id,
+                            conversation_id=session_id,
+                            chat_session_id=None,
+                            source_channel="web",
+                            title=conf_call.title,
+                            summary=conf_call.summary,
+                            action=conf_call.action,
+                            risk_level=conf_call.risk_level,
+                            requested_by_user_id=None,
+                        )
+                        if agent_id and _unsaved_usage.total_tokens > 0:
+                            await record_token_usage(agent_id, _unsaved_usage)
+                        await client.close()
+                        return response.content or "", True, True
+                    else:
+                        if not conf_call.valid:
+                            _conf_reason = conf_call.error or "request_confirmation 参数无效"
+                        else:
+                            _conf_reason = f"工具 {_conf_action_tool} 未对该 agent 启用,无法挟带"
+                        # Mirror the finish-invalid branch: a role="tool" reply must
+                        # be preceded by the assistant message carrying its tool_calls,
+                        # or strict providers reject the orphaned tool message.
+                        api_messages.append(LLMMessage(
+                            role="assistant",
+                            content=response.content or None,
+                            tool_calls=sanitized_tool_calls,
+                            reasoning_content=response.reasoning_content,
+                        ))
+                        api_messages.append(LLMMessage(
+                            role="tool",
+                            content=f"❌ {_conf_reason}",
+                            tool_call_id=conf_call.call_id,
+                        ))
+                        continue
 
                 # Add assistant message with tool calls.
                 # NB: tc["function"] is shared by reference with _canonicalize_tc_arguments's

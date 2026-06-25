@@ -16,6 +16,7 @@ import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/Wor
 import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import type { FocusApiItem } from '../../services/api';
 import ModelSwitcher from '../../components/ModelSwitcher';
+import ConfirmationCard from '../../components/ConfirmationCard';
 import { useAppStore } from '../../stores';
 import { useAuthStore } from '../../stores';
 import { copyToClipboard } from '../../utils/clipboard';
@@ -2429,6 +2430,13 @@ export default function AgentDetailPage() {
                 ...(m.sender_name && { sender_name: m.sender_name }),
                 ...(m.sender_user_id && { sender_user_id: m.sender_user_id }),
                 ...(m.participant_id && { participant_id: m.participant_id }),
+                // Confirmation cards replay from history: backend emits snake_case;
+                // map to the camelCase fields ConfirmationCard reads, else the card
+                // renders blank with dead buttons after a refresh.
+                ...(m.role === 'confirmation' && {
+                    confirmationId: m.confirmation_id, title: m.title, summary: m.summary,
+                    actionPreview: m.action_preview, riskLevel: m.risk_level, status: m.status,
+                }),
             }));
             setHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
             // Backend returns the page oldest-first, so msgs[0] is the oldest
@@ -2539,7 +2547,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error('保存失败', { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call' | 'confirmation'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; confirmationId?: string; title?: string; summary?: string; actionPreview?: string; riskLevel?: 'low' | 'medium' | 'high'; status?: 'pending' | 'confirmed' | 'cancelled' | 'executed' | 'failed' | 'expired'; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -3054,7 +3062,11 @@ export default function AgentDetailPage() {
                 if (['done', 'error', 'quota_exceeded'].includes(d.type)) {
                     closeSessionSocket(key, true);
                 }
-                return;
+                if (['confirmation_card', 'confirmation_update'].includes(d.type)) {
+                    // fall through to handle confirmation events even for inactive runtime
+                } else {
+                    return;
+                }
             }
 
             // Active READ-ONLY monitor: mirror live broadcasts into the read-only
@@ -3267,9 +3279,12 @@ export default function AgentDetailPage() {
                 });
             } else if (d.type === 'done') {
                 setChatMessages(prev => {
-                    const last = prev[prev.length - 1];
-                    const thinking = (last && last.role === 'assistant' && (last as any)._streaming) ? last.thinking : undefined;
-                    if (last && last.role === 'assistant' && (last as any)._streaming) return [...prev.slice(0, -1), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() })];
+                    const revIdx = [...prev].reverse().findIndex(m => m.role === 'assistant' && (m as any)._streaming);
+                    if (revIdx >= 0) {
+                        const realIdx = prev.length - 1 - revIdx;
+                        const thinking = prev[realIdx].thinking;
+                        return [...prev.slice(0, realIdx), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() }), ...prev.slice(realIdx + 1)];
+                    }
                     return [...prev, parseChatMsg({ role: d.role, content: d.content, timestamp: new Date().toISOString() })];
                 });
                 const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
@@ -3310,6 +3325,16 @@ export default function AgentDetailPage() {
                 setChatInfoMsg(d.content || '');
                 if (chatInfoTimerRef.current) clearTimeout(chatInfoTimerRef.current);
                 chatInfoTimerRef.current = setTimeout(() => setChatInfoMsg(null), 6000);
+            } else if (d.type === 'confirmation_card') {
+                setChatMessages(prev => [...prev, {
+                    role: 'confirmation', content: '',
+                    confirmationId: d.confirmation_id, title: d.title, summary: d.summary,
+                    actionPreview: d.action_preview, riskLevel: d.risk_level, status: d.status,
+                    timestamp: d.created_at || new Date().toISOString(),
+                } as ChatMsg]);
+            } else if (d.type === 'confirmation_update') {
+                setChatMessages(prev => prev.map(m =>
+                    (m as any).confirmationId === d.confirmation_id ? { ...m, status: d.status } : m));
             } else if (d.type === 'agentbay_live') {
                 // Real-time streaming from execute_code or other AgentBay envs
                 if ((d.env === 'desktop' || d.env === 'browser') && d.screenshot_url) {
@@ -3555,6 +3580,12 @@ export default function AgentDetailPage() {
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
+                // Confirmation cards on older pages: map snake_case → camelCase
+                // (same gap as the initial-load path) so the card stays actionable.
+                ...(m.role === 'confirmation' && {
+                    confirmationId: m.confirmation_id, title: m.title, summary: m.summary,
+                    actionPreview: m.action_preview, riskLevel: m.risk_level, status: m.status,
+                }),
             }));
             // Save current scroll position
             const el = historyContainerRef.current;
@@ -3894,6 +3925,14 @@ export default function AgentDetailPage() {
                             />
                         )}
                     </React.Fragment>
+                );
+            }
+            if (msg.role === 'confirmation') {
+                return (
+                    <div key={i} className={`chat-msg-row${v.isLeft ? '' : ' chat-msg-row--user'}`}>
+                        <div className="chat-msg-avatar">{v.avatarText || 'A'}</div>
+                        <ConfirmationCard msg={msg as any} agentId={id!} t={t} />
+                    </div>
                 );
             }
             return (

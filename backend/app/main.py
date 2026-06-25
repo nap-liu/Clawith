@@ -181,6 +181,7 @@ async def lifespan(app: FastAPI):
             import app.models.chat_compaction  # noqa  # FK target of chat_messages.compacted_into
 
             import app.models.identity       # noqa
+            import app.models.agent_confirmation  # noqa
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             logger.info("[startup] Database tables ready")
@@ -427,6 +428,7 @@ from app.api.mcp_servers import router as mcp_servers_router
 from app.api.sdk_auth import router as sdk_auth_router
 from app.api.onboarding import router as onboarding_router
 from app.api.personal_access_tokens import router as personal_access_tokens_router
+from app.api.confirmations import router as confirmations_router
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
@@ -491,6 +493,7 @@ app.include_router(mcp_servers_router, prefix=settings.API_PREFIX)
 app.include_router(sdk_auth_router, prefix=settings.API_PREFIX)
 app.include_router(onboarding_router, prefix=settings.API_PREFIX)
 app.include_router(personal_access_tokens_router, prefix=settings.API_PREFIX)
+app.include_router(confirmations_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])

@@ -287,6 +287,9 @@ export const agentApi = {
 
     gatewayMessages: (id: string) =>
         request<any[]>(`/agents/${id}/gateway-messages`),
+
+    resolveConfirmation: (id: string, cid: string, action: 'confirm' | 'cancel') =>
+        request<any>(`/agents/${id}/confirmations/${cid}/resolve`, { method: 'POST', body: JSON.stringify({ action }) }),
 };
 
 // ─── Tasks ────────────────────────────────────────────

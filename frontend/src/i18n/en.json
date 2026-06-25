@@ -470,7 +470,13 @@
       "provider": "Provider",
       "toolName": "Tool",
       "inProgress": "In progress",
-      "done": "Done"
+      "done": "Done",
+      "confirmCardTitle": "Confirmation required",
+      "confirmWillRun": "Will run",
+      "confirmAction": "Confirm",
+      "cancelAction": "Cancel",
+      "confirmResolved": "Confirmed",
+      "confirmCancelled": "Cancelled"
     },
     "activityLog": {
       "title": "Activity Log",

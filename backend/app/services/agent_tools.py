@@ -71,6 +71,7 @@ from app.services.llm.finish import (
     FINISH_TOOL_DEFINITION,
     FINISH_TOOL_NAME,
 )
+from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
@@ -2988,6 +2989,12 @@ async def execute_tool(
     if tool_name == FINISH_TOOL_NAME:
         content = arguments.get("content", "")
         return content if isinstance(content, str) else str(content)
+
+    # Defensive guard: request_confirmation must be intercepted by the caller
+    # loop before reaching execute_tool. If it somehow lands here, return a
+    # clear signal instead of falling through to unknown-tool handling.
+    if tool_name == REQUEST_CONFIRMATION_TOOL_NAME:
+        return "⚠️ request_confirmation 由确认流程处理,不应到达工具执行层"
 
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
 
