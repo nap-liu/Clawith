@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from app.database import async_session
 from app.models.agent_confirmation import AgentConfirmation
-from app.services.agent_tools import _execute_tool_direct  # no circular dep: agent_tools never imports confirmation_service
+from app.services.agent_tools import execute_tool  # no circular dep: agent_tools never imports confirmation_service
 
 logger = logging.getLogger(__name__)
 
@@ -197,13 +197,28 @@ async def resolve_confirmation(
 
         if decision == "cancel":
             c.status = "cancelled"
-            cont_text = f"用户拒绝了操作「{title}」。"
+            # Tell the agent the user explicitly cancelled and let it decide how to
+            # conclude its own loop — we surface accurate intent, not a forced action.
+            cont_text = (
+                f"用户明确取消了操作「{title}」,该操作未执行。"
+                f"请据此自行判断如何回应或结束本轮处理。"
+            )
         else:  # confirm
             if action:
                 tool_name = action.get("tool", "")
                 arguments = action.get("args") or {}
                 try:
-                    result = await _execute_tool_direct(tool_name, arguments, agent_id)
+                    # Execute through the FULL tool dispatch (any tool the agent can
+                    # call), bypassing the autonomy gate since the human already
+                    # approved via the card — not the narrow post-approval whitelist.
+                    result = await execute_tool(
+                        tool_name,
+                        arguments,
+                        agent_id,
+                        user_id=resolving_user_id,
+                        session_id=str(c.conversation_id),
+                        skip_autonomy=True,
+                    )
                 except Exception as e:
                     result = f"Error executing {tool_name}: {e}"
                 c.result = str(result)

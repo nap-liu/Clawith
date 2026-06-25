@@ -124,7 +124,7 @@ async def test_confirm_with_action_executes_tool():
 
     with (
         patch(
-            "app.services.confirmation_service._execute_tool_direct",
+            "app.services.confirmation_service.execute_tool",
             new=AsyncMock(return_value=tool_result),
         ) as mock_exec,
         patch(
@@ -145,7 +145,12 @@ async def test_confirm_with_action_executes_tool():
 
     assert result_c.status == "executed"
     assert result_c.result == tool_result
-    mock_exec.assert_awaited_once_with("sql_execute", {"sql": "SELECT 1"}, agent_id)
+    # Executes through the full dispatch (execute_tool) with autonomy bypassed.
+    mock_exec.assert_awaited_once()
+    _ex_args, _ex_kwargs = mock_exec.await_args
+    assert _ex_args[0] == "sql_execute" and _ex_args[1] == {"sql": "SELECT 1"}
+    assert _ex_args[2] == agent_id
+    assert _ex_kwargs.get("skip_autonomy") is True
     mock_broadcast.assert_awaited()
     mock_cont.assert_awaited_once()
     cont_kwargs = mock_cont.await_args.kwargs
@@ -164,7 +169,7 @@ async def test_confirm_no_action_pure_gate():
 
     with (
         patch(
-            "app.services.confirmation_service._execute_tool_direct",
+            "app.services.confirmation_service.execute_tool",
             new=AsyncMock(),
         ) as mock_exec,
         patch("app.services.confirmation_service._broadcast", new=AsyncMock()),
@@ -200,7 +205,7 @@ async def test_confirm_tool_raises_sets_failed():
 
     with (
         patch(
-            "app.services.confirmation_service._execute_tool_direct",
+            "app.services.confirmation_service.execute_tool",
             new=AsyncMock(side_effect=PermissionError("access denied")),
         ) as mock_exec,
         patch("app.services.confirmation_service._broadcast", new=AsyncMock()),
@@ -233,7 +238,7 @@ async def test_cancel_sets_cancelled_and_no_exec():
 
     with (
         patch(
-            "app.services.confirmation_service._execute_tool_direct",
+            "app.services.confirmation_service.execute_tool",
             new=AsyncMock(),
         ) as mock_exec,
         patch("app.services.confirmation_service._broadcast", new=AsyncMock()),
@@ -253,7 +258,7 @@ async def test_cancel_sets_cancelled_and_no_exec():
     mock_exec.assert_not_awaited()
     mock_cont.assert_awaited_once()
     cont_kwargs = mock_cont.await_args.kwargs
-    assert "拒绝" in cont_kwargs["text"]
+    assert "取消" in cont_kwargs["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +272,7 @@ async def test_idempotent_already_executed():
 
     with (
         patch(
-            "app.services.confirmation_service._execute_tool_direct",
+            "app.services.confirmation_service.execute_tool",
             new=AsyncMock(),
         ) as mock_exec,
         patch("app.services.confirmation_service._broadcast", new=AsyncMock()),
@@ -297,7 +302,7 @@ async def test_expired_returns_expired_status():
 
     with (
         patch(
-            "app.services.confirmation_service._execute_tool_direct",
+            "app.services.confirmation_service.execute_tool",
             new=AsyncMock(),
         ) as mock_exec,
         patch(
@@ -335,7 +340,7 @@ async def test_concurrent_resolve_executes_action_once():
 
     exec_mock = AsyncMock(return_value="ok rows=1")
     with (
-        patch("app.services.confirmation_service._execute_tool_direct", new=exec_mock),
+        patch("app.services.confirmation_service.execute_tool", new=exec_mock),
         patch("app.services.confirmation_service._broadcast", new=AsyncMock()),
         patch("app.services.confirmation_service._run_continuation", new=AsyncMock()),
     ):
@@ -377,7 +382,7 @@ async def test_unsupported_tool_marked_failed():
     sentinel = "Tool some_unmapped_tool does not support post-approval execution"
     with (
         patch(
-            "app.services.confirmation_service._execute_tool_direct",
+            "app.services.confirmation_service.execute_tool",
             new=AsyncMock(return_value=sentinel),
         ),
         patch("app.services.confirmation_service._broadcast", new=AsyncMock()),

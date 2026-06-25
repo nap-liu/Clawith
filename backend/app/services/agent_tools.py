@@ -2968,12 +2968,17 @@ async def execute_tool(
     user_id: uuid.UUID,
     session_id: str = "",
     on_output=None,
+    skip_autonomy: bool = False,
 ) -> str:
     """Execute a tool call and return the result as a string.
 
     Args:
         session_id: The ChatSession ID, used to isolate AgentBay instances
                     per conversation. Passed through to agentbay_* tools.
+        skip_autonomy: Skip the autonomy boundary check. Used when a human has
+                    already approved this exact action (e.g. a confirmation card
+                    the user confirmed) — the card IS the approval, so re-gating
+                    on autonomy would be redundant.
     """
     if not isinstance(tool_name, str):
         tool_name = str(tool_name or "")
@@ -3000,9 +3005,10 @@ async def execute_tool(
 
     ws = _agent_workspace_root(agent_id)
 
-    # ── Autonomy boundary check ──
+    # ── Autonomy boundary check (skipped when a human already approved, e.g. a
+    #    confirmation card the user confirmed) ──
     action_type = _TOOL_AUTONOMY_MAP.get(tool_name)
-    if action_type:
+    if action_type and not skip_autonomy:
         try:
             from app.services.autonomy_service import autonomy_service
             from app.models.agent import Agent as AgentModel
