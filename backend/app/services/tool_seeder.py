@@ -21,6 +21,9 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "jina_search",
     "jina_read",
     "update_objective",
+    # request_confirmation is OPT-IN (is_default=False); it was briefly seeded is_default=True,
+    # so sync the correction to the DB on deploy (otherwise existing rows keep is_default=True).
+    "request_confirmation",
     # AgentBay tools should NOT be is_default=True. Older seeder versions may
     # have set them to True; include them here so the seeder corrects the DB.
     "agentbay_browser_navigate",

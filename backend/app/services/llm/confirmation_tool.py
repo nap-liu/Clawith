@@ -78,11 +78,16 @@ REQUEST_CONFIRMATION_TOOL_SEED: dict[str, Any] = {
     "name": REQUEST_CONFIRMATION_TOOL_NAME,
     "display_name": "Request Confirmation",
     "description": REQUEST_CONFIRMATION_TOOL_DEFINITION["function"]["description"],
-    "category": "system",
+    # NOT category "system": system tools are protocol-level, always-on, and the UI rejects
+    # disabling them (see api/tools.py). The confirmation card is an OPT-IN feature the user
+    # turns on per agent, so it lives in a normal, toggleable category.
+    "category": "communication",
     # NB: tools.icon is varchar(10) — keep the name short (lucide "shield"; the
     # 12-char "shield-check" overflows the column and the seed INSERT fails).
     "icon": "shield",
-    "is_default": True,  # 默认下发给新 agent;存量 agent 走 Task 8 的 fan-out
+    # OPT-IN: NOT default-enabled — a new agent does not get it until the user explicitly
+    # turns it on (request_confirmation is in SYNC_IS_DEFAULT_TOOL_NAMES so this syncs to the DB).
+    "is_default": False,
     "parameters_schema": REQUEST_CONFIRMATION_TOOL_DEFINITION["function"]["parameters"],
     "config": {},
     # Standard builtin-tool config — the ONLY deployment-specific knob is which DingTalk
@@ -99,10 +104,10 @@ REQUEST_CONFIRMATION_TOOL_SEED: dict[str, Any] = {
                 # tools pass through t() unchanged, so this stays consistent.
                 "label": "agent.tools.reqConfirm.cardTemplateId",
                 "type": "string",
-                # Per-AGENT only — the template is registered under each agent's own DingTalk
-                # app, so a single company-wide value is meaningless. Hidden from the global
-                # tool config; set it on each agent's request_confirmation tool config.
-                "agent_only": True,
+                # Configurable at BOTH levels: a company-wide default (the same DingTalk card
+                # template can be reused across apps) and a per-agent override. The existing
+                # _get_tool_config priority (agent → tenant → tool default) handles both, so no
+                # agent_only restriction.
                 "placeholder": "agent.tools.reqConfirm.cardTemplateIdPlaceholder",
                 "help_text": "agent.tools.reqConfirm.cardTemplateIdHelp",
                 "help_url": "/templates/dingtalk-confirmation-card-template.json",
