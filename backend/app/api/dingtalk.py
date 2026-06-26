@@ -752,28 +752,31 @@ async def process_dingtalk_message(
             f"{reply_text[:100]}"
         )
 
-        # Reply via session webhook (markdown)
-        # Note: File/image sending is handled by channel_file_sender ContextVar above.
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(session_webhook, json={
-                    "msgtype": "markdown",
-                    "markdown": {
-                        "title": agent_obj.name or "AI Reply",
-                        "text": reply_text,
-                    },
-                })
-        except Exception as e:
-            logger.error(f"[DingTalk] Failed to reply via webhook: {e}")
-            # Fallback: try plain text
+        # Reply via session webhook (markdown). File/image sending is handled by the
+        # channel_file_sender ContextVar above. If the agent suspended on a confirmation
+        # card this turn, reply_text is "" (suspend_for_confirmation already sent the intro
+        # text + delivered the card in order), so this send is correctly skipped.
+        if reply_text:
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
                     await client.post(session_webhook, json={
-                        "msgtype": "text",
-                        "text": {"content": reply_text},
+                        "msgtype": "markdown",
+                        "markdown": {
+                            "title": agent_obj.name or "AI Reply",
+                            "text": reply_text,
+                        },
                     })
-            except Exception as e2:
-                logger.error(f"[DingTalk] Fallback text reply also failed: {e2}")
+            except Exception as e:
+                logger.error(f"[DingTalk] Failed to reply via webhook: {e}")
+                # Fallback: try plain text
+                try:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        await client.post(session_webhook, json={
+                            "msgtype": "text",
+                            "text": {"content": reply_text},
+                        })
+                except Exception as e2:
+                    logger.error(f"[DingTalk] Fallback text reply also failed: {e2}")
 
         # Save assistant reply via the shared writer. Its own session stamps
         # created_at at save time (after the tool loop), so the reply orders

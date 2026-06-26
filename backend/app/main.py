@@ -181,7 +181,6 @@ async def lifespan(app: FastAPI):
             import app.models.chat_compaction  # noqa  # FK target of chat_messages.compacted_into
 
             import app.models.identity       # noqa
-            import app.models.agent_confirmation  # noqa
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             logger.info("[startup] Database tables ready")

@@ -234,8 +234,11 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
 
     // Company tools = platform presets (builtin) + company admin-added tools (admin)
     // Hide system-internal tools (e.g. finish) — they are protocol-level and not user-facing.
-    const companyTools = tools.filter(t => (t.source === 'builtin' || t.source === 'admin') && t.category !== 'system');
-    const agentInstalledTools = tools.filter(t => t.source === 'agent' && t.category !== 'system');
+    // EXCEPT system tools that expose user config (e.g. request_confirmation's per-agent
+    // DingTalk card template), which must stay configurable here.
+    const isHiddenSystemTool = (t: any) => t.category === 'system' && !(t.config_schema?.fields?.length > 0);
+    const companyTools = tools.filter(t => (t.source === 'builtin' || t.source === 'admin') && !isHiddenSystemTool(t));
+    const agentInstalledTools = tools.filter(t => t.source === 'agent' && !isHiddenSystemTool(t));
 
     const mcpGroupKey = (tool: any) => {
         const serverName = String(tool.mcp_server_name || '').trim();
@@ -718,7 +721,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                                 <div>
                                     <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}><IconSettings size={20} stroke={1.8} /> {title}</h3>
-                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{isCat ? 'Shared category configuration (affects all tools in this category)' : 'Per-agent configuration (overrides global defaults)'}</div>
+                                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>{isCat ? t('agent.tools.sharedCategoryConfig') : t('agent.tools.perAgentConfig')}</div>
                                 </div>
                                 <button onClick={() => { setConfigTool(null); setConfigCategory(null); }} style={{ background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: 'var(--text-secondary)' }}>✕</button>
                             </div>
@@ -734,7 +737,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                             return (
                                                 <div key={field.key}>
                                                     <label style={{ display: 'block', fontSize: '12px', fontWeight: 500, marginBottom: '4px' }}>
-                                                        {field.label}
+                                                        {t(field.label)}
                                                         {isReadOnly && <span style={{ fontWeight: 400, color: 'var(--text-tertiary)', marginLeft: '4px' }}>(Admin only)</span>}
                                                         {/* Show company-configured value as a hint in the label */}
                                                         {(() => {
@@ -791,7 +794,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                                                 <input type="password" autoComplete="new-password" className="form-input"
                                                                     autoFocus={focusedField === field.key}
                                                                     value={configData[field.key] ?? ''}
-                                                                    placeholder={globalVal ? t('agent.tools.usingCompanyKey', 'Using company key ({{val}})', { val: globalVal }) : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
+                                                                    placeholder={globalVal ? t('agent.tools.usingCompanyKey', 'Using company key ({{val}})', { val: globalVal }) : ((field.placeholder ? t(field.placeholder) : t('admin.leaveBlankDefault', 'Leave blank to use global default')))}
                                                                     onBlur={(e) => {
                                                                         if (!e.target.value) setFocusedField(null);
                                                                     }}
@@ -826,7 +829,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                                         <textarea
                                                             className="form-input"
                                                             value={configData[field.key] ?? ''}
-                                                            placeholder={field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default')}
+                                                            placeholder={(field.placeholder ? t(field.placeholder) : t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
                                                             rows={Math.max(3, Math.min(10, String(configData[field.key] ?? field.default ?? field.placeholder ?? '').split('\n').length))}
                                                             style={{ minHeight: '88px', fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)', resize: 'vertical' }}
                                                             onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}
@@ -854,7 +857,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                                                 <input type="text" className="form-input"
                                                                     autoFocus={focusedField === field.key}
                                                                     value={configData[field.key] ?? ''}
-                                                                    placeholder={globalVal ? t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal }) : (field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
+                                                                    placeholder={globalVal ? t('agent.tools.usingCompanyConfig', 'Using company config ({{val}})', { val: globalVal }) : ((field.placeholder ? t(field.placeholder) : t('admin.leaveBlankDefault', 'Leave blank to use global default')))}
                                                                     onBlur={(e) => {
                                                                         if (!e.target.value) setFocusedField(null);
                                                                     }}
@@ -862,6 +865,19 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                                             );
                                                         })()}
                                                         </>
+                                                    )}
+                                                    {(field.help_text || field.help_url) && (
+                                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px', lineHeight: '1.5' }}>
+                                                            {field.help_text ? t(field.help_text) : ''}
+                                                            {field.help_url && (
+                                                                <>
+                                                                    {field.help_text ? ' · ' : ''}
+                                                                    <a href={field.help_url} download target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-primary)', textDecoration: 'none' }}>
+                                                                        {t(field.help_link_label || 'common.download')}
+                                                                    </a>
+                                                                </>
+                                                            )}
+                                                        </div>
                                                     )}
                                                 </div>
                                             );
@@ -913,7 +929,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                                                         className="form-input"
                                                                         value={configData[field.key] ?? field.default ?? ''}
                                                                         disabled={isReadOnly}
-                                                                        placeholder={field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default')}
+                                                                        placeholder={(field.placeholder ? t(field.placeholder) : t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
                                                                         rows={Math.max(3, Math.min(10, String(configData[field.key] ?? field.default ?? field.placeholder ?? '').split('\n').length))}
                                                                         style={{ minHeight: '88px', fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)', resize: 'vertical' }}
                                                                         onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))}
@@ -922,7 +938,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                                                     <input type={field.type === 'password' ? 'password' : 'text'} autoComplete={field.type === 'password' ? 'new-password' : undefined} className="form-input"
                                                                         value={configData[field.key] ?? field.default ?? ''}
                                                                         disabled={isReadOnly}
-                                                                        placeholder={field.placeholder || t('admin.leaveBlankDefault', 'Leave blank to use global default')}
+                                                                        placeholder={(field.placeholder ? t(field.placeholder) : t('admin.leaveBlankDefault', 'Leave blank to use global default'))}
                                                                         onChange={e => setConfigData(p => ({ ...p, [field.key]: e.target.value }))} />
                                                                 )}
                                                             </div>
@@ -991,7 +1007,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                         const token = localStorage.getItem('token');
                                         await fetch(`/api/tools/agents/${agentId}/tool-config/${configTool.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ config: {} }) });
                                         setConfigTool(null); loadTools();
-                                    }}>Reset to Global</button>
+                                    }}>{t('agent.tools.resetToGlobal')}</button>
                                 )}
                                 {isCat && (
                                     <button
@@ -1018,7 +1034,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                         id="cat-test-btn"
                                     >Test Connection</button>
                                 )}
-                                <button className="btn btn-secondary" onClick={() => { setConfigTool(null); setConfigCategory(null); }}>Cancel</button>
+                                <button className="btn btn-secondary" onClick={() => { setConfigTool(null); setConfigCategory(null); }}>{t('common.cancel')}</button>
                                 <button className="btn btn-primary" onClick={saveConfig} disabled={configSaving}>{configSaving ? t('common.saving', 'Saving…') : t('common.save', 'Save')}</button>
                             </div>
                         </div>

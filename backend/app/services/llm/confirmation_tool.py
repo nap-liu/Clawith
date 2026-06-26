@@ -10,9 +10,10 @@ REQUEST_CONFIRMATION_TOOL_DEFINITION: dict[str, Any] = {
         "name": REQUEST_CONFIRMATION_TOOL_NAME,
         "description": (
             "在执行不可逆或有对外副作用的业务操作前(例如创建单据、写入外部系统、对外发送消息),"
-            "用本工具向用户出示一张确认卡片并取得用户手动确认。把要执行的动作作为 action 挟带传入;"
-            "用户点击确认后平台才会执行该动作。调用本工具即把控制权交给用户并结束当前回合——"
-            "调用后不要再自行执行该动作。"
+            "用本工具向用户出示一张确认卡片征求许可。调用即把控制权交给用户并结束当前回合。"
+            "用户点击卡片按钮后,你会在后续回合被告知他点了哪个按钮(按钮文字),"
+            "然后由你自己决定后续——同意就自己去执行该操作,拒绝就据此继续对话。"
+            "平台只忠实地把用户的点击带回给你,不会替你执行任何操作。卡片有效期 24 小时,过期作废。"
         ),
         "parameters": {
             "type": "object",
@@ -27,7 +28,7 @@ REQUEST_CONFIRMATION_TOOL_DEFINITION: dict[str, Any] = {
                 },
                 "action": {
                     "type": "object",
-                    "description": "用户确认后平台代为执行的动作。省略则为纯确认(不执行任何动作,只回收用户的是/否)。",
+                    "description": "(可选,仅展示用)你打算执行的动作,会显示在卡片上让用户知情。平台不会替你执行;确认后由你自己去做。",
                     "properties": {
                         "tool": {
                             "type": "string",
@@ -37,13 +38,30 @@ REQUEST_CONFIRMATION_TOOL_DEFINITION: dict[str, Any] = {
                     },
                     "required": ["tool"],
                 },
-                "confirm_label": {
-                    "type": "string",
-                    "description": "确认按钮文案,默认 '确认'",
-                },
-                "cancel_label": {
-                    "type": "string",
-                    "description": "取消按钮文案,默认 '取消'",
+                "buttons": {
+                    "type": "array",
+                    "description": (
+                        "卡片上的按钮,由你动态定义,数量和行为不限。最常见是两个:确认/取消"
+                        "(不传 buttons 就默认用这两个),但你也可以放任意按钮,如「同意」「驳回」"
+                        "「稍后再说」「方案A」「方案B」等。用户点击后,平台会把该按钮的 value 和文字"
+                        "原样带回给你,由你判断处理。"
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "按钮显示文字"},
+                            "value": {
+                                "type": "string",
+                                "description": "该按钮的回传值,点击后原样带回给你(自定义,如 confirm/cancel/approve/plan_a)",
+                            },
+                            "color": {
+                                "type": "string",
+                                "enum": ["blue", "red", "gray"],
+                                "description": "按钮配色,只能是 blue(主/蓝)、red(危险/红)、gray(次要/灰)三选一,默认 blue。",
+                            },
+                        },
+                        "required": ["text", "value"],
+                    },
                 },
                 "risk_level": {
                     "type": "string",
@@ -67,7 +85,38 @@ REQUEST_CONFIRMATION_TOOL_SEED: dict[str, Any] = {
     "is_default": True,  # 默认下发给新 agent;存量 agent 走 Task 8 的 fan-out
     "parameters_schema": REQUEST_CONFIRMATION_TOOL_DEFINITION["function"]["parameters"],
     "config": {},
-    "config_schema": {},
+    # Standard builtin-tool config — the ONLY deployment-specific knob is which DingTalk
+    # interactive-card template renders the card. The card's FIELD CONTRACT is fixed and
+    # platform-owned (title/summary/action_preview/risk/status/buttons); a configured template
+    # must bind exactly those variables (see docs/dingtalk-confirmation-card-template.md). No
+    # field-mapping config — the template is a skin, the fields are the fixed skeleton.
+    "config_schema": {
+        "fields": [
+            {
+                "key": "card_template_id",
+                # label/placeholder/help_text/help_link_label are i18n KEYS — the frontend
+                # renders them through t() (zh/en in src/i18n). Plain-string labels from other
+                # tools pass through t() unchanged, so this stays consistent.
+                "label": "agent.tools.reqConfirm.cardTemplateId",
+                "type": "string",
+                # Per-AGENT only — the template is registered under each agent's own DingTalk
+                # app, so a single company-wide value is meaningless. Hidden from the global
+                # tool config; set it on each agent's request_confirmation tool config.
+                "agent_only": True,
+                "placeholder": "agent.tools.reqConfirm.cardTemplateIdPlaceholder",
+                "help_text": "agent.tools.reqConfirm.cardTemplateIdHelp",
+                "help_url": "/templates/dingtalk-confirmation-card-template.json",
+                "help_link_label": "agent.tools.reqConfirm.downloadTemplate",
+                "description": (
+                    "用于在钉钉投递确认卡片的互动卡片模板 ID(钉钉开发者后台「卡片平台」创建并发布后获得)。"
+                    "该模板必须绑定以下变量,否则卡片无法正确渲染:title(标题)、summary(markdown 正文)、"
+                    "action_preview(将执行动作预览)、risk(标题颜色,CSS 颜色名)、status(状态文案)、"
+                    "buttons(按钮数组,元素含 text/color/status/action)。字段契约固定、不可配置;"
+                    "详见 docs/dingtalk-confirmation-card-template.md。不配则跳过钉钉发卡,web 卡片不受影响。"
+                ),
+            },
+        ]
+    },
 }
 
 
@@ -80,6 +129,7 @@ class ConfirmationCall:
     risk_level: str
     error: str | None = None
     call_id: str = ""
+    buttons: list | None = None  # agent-defined [{text, value, color}], None → default 确认/取消
 
 
 def _parse_args(tc: dict) -> dict | None:
@@ -123,7 +173,21 @@ def find_request_confirmation_call(tool_calls: list[dict] | None) -> Confirmatio
                 return ConfirmationCall(
                     False, title, summary, None, risk, "action.tool 不能是 request_confirmation 自身", cid
                 )
+        # Dynamic, agent-defined buttons (any number / behavior). None → caller defaults
+        # to 确认/取消. Sanitise to {text, value, color}.
+        raw_buttons = args.get("buttons")
+        buttons = None
+        if isinstance(raw_buttons, list):
+            buttons = [
+                {
+                    "text": str(b.get("text") or ""),
+                    "value": str(b.get("value") or ""),
+                    "color": str(b.get("color") or ""),
+                }
+                for b in raw_buttons
+                if isinstance(b, dict) and (b.get("text") or b.get("value"))
+            ] or None
         return ConfirmationCall(
-            True, title, summary, action, risk if risk in ("low", "medium", "high") else "medium", None, cid
+            True, title, summary, action, risk if risk in ("low", "medium", "high") else "medium", None, cid, buttons
         )
     return None

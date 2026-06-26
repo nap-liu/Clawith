@@ -770,7 +770,13 @@
       "mcpGroupDescription": "来自 {{name}} 的工具",
       "noMatchingTools": "未找到匹配的工具",
       "searchTools": "搜索工具...",
-      "sourceTabs": "工具来源"
+      "sourceTabs": "工具来源",
+      "reqConfirm": {
+        "cardTemplateId": "钉钉确认卡片模板 ID",
+        "cardTemplateIdPlaceholder": "钉钉互动卡片模板 ID;模板须含 title/summary/action_preview/risk/status/buttons 变量",
+        "cardTemplateIdHelp": "需先在钉钉卡片平台创建并发布模板;可下载标准模板导入(字段已对齐):",
+        "downloadTemplate": "下载标准模板"
+      }
     },
     "toolCategories": {
       "file": "文件操作",

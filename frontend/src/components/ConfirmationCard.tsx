@@ -2,34 +2,80 @@ import React, { useState } from 'react';
 import { agentApi } from '../services/api';
 import { MarkdownRenderer } from './MarkdownRenderer';
 
-interface ConfirmMsg {
-    confirmationId?: string;
+// A confirmation card is just the rendering of a suspended `request_confirmation`
+// tool_call: its content is the tool_call args, its state is the tool_call status/result.
+// Clicking a (dynamic) button fills the tool result via resolve, which resumes the agent.
+
+interface CardButton {
+    text?: string;
+    value?: string;
+    color?: string; // blue | red | gray (clamped server-side for DingTalk; CSS-mapped here)
+}
+
+interface CardArgs {
     title?: string;
     summary?: string;
-    actionPreview?: string;
-    riskLevel?: string;
-    status?: string;
+    action?: { tool?: string; args?: Record<string, any> } | null;
+    risk_level?: string;
+    buttons?: CardButton[] | null;
 }
 
 interface Props {
-    msg: ConfirmMsg;
     agentId: string;
+    callId: string;
+    args: CardArgs;
+    resolved: boolean;
+    result?: string;
     t: (k: string, opts?: any) => string;
 }
 
-const ConfirmationCard: React.FC<Props> = ({ msg, agentId, t }) => {
-    const [busy, setBusy] = useState(false);
-    const [localStatus, setLocalStatus] = useState(msg.status || 'pending');
-    const status = msg.status || localStatus; // WS update takes priority, local optimistic fallback
-    const pending = status === 'pending';
-    const danger = msg.riskLevel === 'high';
+const DEFAULT_BUTTONS: CardButton[] = [
+    { text: '取消', value: 'cancel', color: 'gray' },
+    { text: '确认', value: 'confirm', color: 'blue' },
+];
 
-    const act = async (action: 'confirm' | 'cancel') => {
-        if (!msg.confirmationId || busy) return;
+// Concrete one-line preview of the action the agent intends to run (mirrors the backend
+// _action_preview so web and DingTalk show the same thing).
+function actionPreview(action?: CardArgs['action']): string {
+    if (!action || !action.tool) return '';
+    const a = action.args;
+    if (a && typeof a === 'object' && Object.keys(a).length) {
+        const parts = Object.entries(a).map(
+            ([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`,
+        );
+        const preview = `${action.tool}(${parts.join(', ')})`;
+        return preview.length <= 300 ? preview : preview.slice(0, 300) + '…';
+    }
+    return action.tool;
+}
+
+const BTN_CLASS: Record<string, string> = {
+    blue: 'btn btn-primary',
+    red: 'btn btn-danger',
+    gray: 'btn btn-ghost',
+};
+
+const ConfirmationCard: React.FC<Props> = ({ agentId, callId, args, resolved, result, t }) => {
+    const [busy, setBusy] = useState(false);
+    const [localResolved, setLocalResolved] = useState(false);
+    const [localResult, setLocalResult] = useState<string | undefined>(undefined);
+
+    const isResolved = resolved || localResolved;
+    const danger = args.risk_level === 'high';
+    const buttons = (Array.isArray(args.buttons) && args.buttons.length ? args.buttons : DEFAULT_BUTTONS)
+        .filter(b => b && (b.text || b.value));
+    const preview = actionPreview(args.action);
+
+    const click = async (b: CardButton) => {
+        if (!callId || busy || isResolved) return;
+        const value = b.value || b.text || '';
+        const label = b.text || b.value || '';
         setBusy(true);
         try {
-            const r = await agentApi.resolveConfirmation(agentId, msg.confirmationId, action);
-            setLocalStatus(r?.status || (action === 'confirm' ? 'executed' : 'cancelled'));
+            const r = await agentApi.resolveConfirmation(agentId, callId, value, label);
+            // result is null when the card was already resolved elsewhere (stale click) → 已过期.
+            setLocalResult(r && r.result ? `已收到:你点了「${label}」` : '卡片已过期');
+            setLocalResolved(true);
         } finally {
             setBusy(false);
         }
@@ -46,41 +92,32 @@ const ConfirmationCard: React.FC<Props> = ({ msg, agentId, t }) => {
             }}
         >
             <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: 6 }}>
-                {msg.title || t('agent.chat.confirmCardTitle', 'Confirmation required')}
+                {args.title || t('agent.chat.confirmCardTitle', 'Confirmation required')}
             </div>
             <div style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
-                <MarkdownRenderer content={msg.summary || ''} />
+                <MarkdownRenderer content={args.summary || ''} />
             </div>
-            {msg.actionPreview ? (
+            {preview ? (
                 <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-tertiary)' }}>
-                    {t('agent.chat.confirmWillRun', 'Will run')}: <code>{msg.actionPreview}</code>
+                    {t('agent.chat.confirmWillRun', 'Will run')}: <code>{preview}</code>
                 </div>
             ) : null}
-            <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
-                {pending ? (
-                    <>
+            <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {!isResolved ? (
+                    buttons.map((b, idx) => (
                         <button
+                            key={idx}
                             type="button"
-                            className="btn btn-primary"
+                            className={BTN_CLASS[b.color || 'blue'] || BTN_CLASS.blue}
                             disabled={busy}
-                            onClick={() => act('confirm')}
+                            onClick={() => click(b)}
                         >
-                            {t('agent.chat.confirmAction', 'Confirm')}
+                            {b.text || b.value}
                         </button>
-                        <button
-                            type="button"
-                            className="btn btn-ghost"
-                            disabled={busy}
-                            onClick={() => act('cancel')}
-                        >
-                            {t('agent.chat.cancelAction', 'Cancel')}
-                        </button>
-                    </>
+                    ))
                 ) : (
                     <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-                        {status === 'cancelled' || status === 'expired'
-                            ? t('agent.chat.confirmCancelled', 'Cancelled')
-                            : t('agent.chat.confirmResolved', 'Confirmed')}
+                        {localResult || result || t('agent.chat.confirmResolved', 'Resolved')}
                     </span>
                 )}
             </div>

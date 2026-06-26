@@ -956,29 +956,34 @@ async def call_llm(
             ))
             continue
 
-        # request_confirmation handling: valid → create pending confirmation and
-        # terminate the turn (挟带动作不执行); invalid / tool not enabled →
-        # surface error back to model and loop.
+        # request_confirmation handling: valid → SUSPEND the turn on this tool_call (persist
+        # a pending request_confirmation tool_call row + deliver the card; the user's click
+        # later fills the result and resumes the loop). Platform executes nothing. invalid /
+        # tool not enabled → surface error back to model and loop.
         conf_call = find_request_confirmation_call(sanitized_tool_calls)
         if conf_call is not None:
             _conf_action_tool = (conf_call.action or {}).get("tool") if conf_call.action else None
             if conf_call.valid and (_conf_action_tool is None or _conf_action_tool in allowed_tool_names):
                 from app.services import confirmation_service  # lazy import — avoid circular
-                await confirmation_service.create_confirmation(
+                await confirmation_service.suspend_for_confirmation(
                     agent_id=agent_id,
                     conversation_id=session_id,
                     chat_session_id=None,
                     source_channel="web",
+                    user_id=user_id,
+                    intro_text=response.content,
                     title=conf_call.title,
                     summary=conf_call.summary,
                     action=conf_call.action,
                     risk_level=conf_call.risk_level,
-                    requested_by_user_id=user_id,
+                    buttons=conf_call.buttons,
                 )
                 if agent_id and _unsaved_usage.total_tokens > 0:
                     await record_token_usage(agent_id, _unsaved_usage)
                 await client.close()
-                return response.content or ""
+                # Turn suspended: the intro text + card are already persisted/delivered.
+                # Return "" so the channel handler doesn't re-persist a duplicate reply.
+                return ""
             else:
                 if not conf_call.valid:
                     _conf_reason = conf_call.error or "request_confirmation 参数无效"
@@ -1452,28 +1457,32 @@ async def call_agent_llm_with_tools(
                     continue
 
                 # request_confirmation handling (twin of the main call_llm loop):
-                # valid → create pending confirmation and terminate; invalid / tool
-                # not enabled → surface error back to model and loop.
+                # valid → SUSPEND the turn on this tool_call (pending row + card; resumed on
+                # the user's click); invalid / tool not enabled → surface error and loop.
                 conf_call = find_request_confirmation_call(sanitized_tool_calls)
                 if conf_call is not None:
                     _conf_action_tool = (conf_call.action or {}).get("tool") if conf_call.action else None
                     if conf_call.valid and (_conf_action_tool is None or _conf_action_tool in allowed_tool_names):
                         from app.services import confirmation_service  # lazy import — avoid circular
-                        await confirmation_service.create_confirmation(
+                        await confirmation_service.suspend_for_confirmation(
                             agent_id=agent_id,
                             conversation_id=session_id,
                             chat_session_id=None,
                             source_channel="web",
+                            user_id=None,
+                            intro_text=response.content,
                             title=conf_call.title,
                             summary=conf_call.summary,
                             action=conf_call.action,
                             risk_level=conf_call.risk_level,
-                            requested_by_user_id=None,
+                            buttons=conf_call.buttons,
                         )
                         if agent_id and _unsaved_usage.total_tokens > 0:
                             await record_token_usage(agent_id, _unsaved_usage)
                         await client.close()
-                        return response.content or "", True, True
+                        # Suspended: intro text + card already persisted/delivered. Return ""
+                        # so the channel handler doesn't re-persist a duplicate reply.
+                        return "", True, True
                     else:
                         if not conf_call.valid:
                             _conf_reason = conf_call.error or "request_confirmation 参数无效"

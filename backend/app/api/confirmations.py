@@ -1,6 +1,10 @@
 """Confirmation card resolve endpoint.
 
 Human-only: POST /api/agents/{agent_id}/confirmations/{cid}/resolve
+
+A confirmation card is a suspended `request_confirmation` tool_call; `cid` is that tool_call
+row id. Resolving fills the tool result with the clicked button (faithful relay — the
+platform executes nothing) and resumes the agent's loop.
 """
 
 import uuid
@@ -19,7 +23,11 @@ router = APIRouter(prefix="/agents", tags=["confirmations"])
 
 
 class ResolveBody(BaseModel):
-    action: str
+    # The clicked button's value (e.g. "confirm" / "cancel" / "plan_a") and display label.
+    # `action` is accepted as a legacy alias for value (old confirm/cancel-only cards).
+    value: str | None = None
+    label: str | None = None
+    action: str | None = None
 
 
 @router.post("/{agent_id}/confirmations/{cid}/resolve")
@@ -30,28 +38,30 @@ async def resolve_confirmation_endpoint(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Resolve (confirm or cancel) a pending confirmation card.
+    """Resolve a pending confirmation card by recording the clicked button.
 
     Only authenticated human users with access to the agent may call this.
     Service tokens, agents, and triggers have no path to this endpoint.
     """
-    if body.action not in ("confirm", "cancel"):
+    value = (body.value or body.action or "").strip()
+    if not value:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="action must be 'confirm' or 'cancel'",
+            detail="resolve requires a button 'value'",
         )
+    label = body.label or ("确认" if value == "confirm" else "取消" if value == "cancel" else value)
 
     # Raises 404 if agent not found, 403 if no access.
     await check_agent_access(db, current_user, agent_id)
 
-    try:
-        c = await confirmation_service.resolve_confirmation(
-            confirmation_id=cid,
-            agent_id=agent_id,
-            decision=body.action,
-            resolving_user_id=current_user.id,
-        )
-    except LookupError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="confirmation not found")
-
-    return {"status": c.status, "result": c.result}
+    result = await confirmation_service.resolve_confirmation(
+        agent_id=agent_id,
+        call_id=cid,
+        button_value=value,
+        button_label=label,
+        resolving_user_id=current_user.id,
+    )
+    if result is None:
+        # Unknown card, not owned by this agent, or already resolved (idempotent).
+        return {"status": "done", "result": None}
+    return {"status": "done", "result": result}

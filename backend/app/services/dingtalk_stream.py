@@ -677,6 +677,59 @@ class DingTalkStreamManager:
                     conversation_title=conversation_title,
                 )
 
+        class ClawithCardCallbackHandler(dingtalk_stream.CallbackHandler):
+            """Relays interactive-card button clicks to the agent — generic, no coupling."""
+
+            @staticmethod
+            def _extract_button(content) -> "tuple[str, str]":
+                # Faithfully pull the clicked button's value + display label.
+                # value: cardPrivateData.actionIds[0]; label: cardPrivateData.params.text.
+                value, label = "", ""
+                if isinstance(content, dict):
+                    cpd = content.get("cardPrivateData") or {}
+                    if isinstance(cpd, dict):
+                        ids = cpd.get("actionIds")
+                        if isinstance(ids, list) and ids:
+                            value = str(ids[0] or "")
+                        params = cpd.get("params") or {}
+                        if isinstance(params, dict):
+                            label = str(params.get("text") or "")
+                            if not value:
+                                value = str(params.get("action") or params.get("value") or "")
+                if not label:
+                    label = value
+                if not value:
+                    value = label
+                return value, label
+
+            async def process(self, callback: dingtalk_stream.CallbackMessage):
+                try:
+                    cb = dingtalk_stream.CardCallbackMessage.from_dict(callback.data)
+                    out_track_id = cb.card_instance_id or ""
+                    staff_id = cb.user_id or ""
+                    content = cb.content or {}
+                    logger.info(
+                        f"[DingTalk Stream] card callback outTrackId={out_track_id} "
+                        f"user={staff_id} content={content}"
+                    )
+                    value, label = self._extract_button(content)
+                    if (
+                        out_track_id
+                        and (value or label)
+                        and main_loop is not None
+                        and not main_loop.is_closed()
+                    ):
+                        from app.services.confirmation_service import resolve_confirmation_via_dingtalk
+
+                        _fire_and_forget(
+                            main_loop,
+                            resolve_confirmation_via_dingtalk(out_track_id, staff_id, value, label),
+                        )
+                    return dingtalk_stream.AckMessage.STATUS_OK, "ok"
+                except Exception as e:
+                    logger.error(f"[DingTalk Stream] card callback error: {e}")
+                    return dingtalk_stream.AckMessage.STATUS_SYSTEM_EXCEPTION, str(e)
+
         while not stop_event.is_set() and retries <= MAX_RETRIES:
             try:
                 credential = dingtalk_stream.Credential(client_id=app_key, client_secret=app_secret)
@@ -684,6 +737,14 @@ class DingTalkStreamManager:
                 client.register_callback_handler(
                     dingtalk_stream.chatbot.ChatbotMessage.TOPIC,
                     ClawithChatbotHandler(),
+                )
+                client.register_callback_handler(
+                    dingtalk_stream.Card_Callback_Router_Topic,
+                    ClawithCardCallbackHandler(),
+                )
+                logger.info(
+                    f"[DingTalk Stream] registered callback topics for agent {agent_id}: "
+                    f"{list(client.callback_handler_map.keys())}"
                 )
 
                 logger.info(

@@ -12,12 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.permissions import can_view_all_agent_chat_sessions, check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
-from app.models.agent_confirmation import AgentConfirmation
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.agent import Agent
 from app.models.user import User
-from app.services.confirmation_service import serialize_confirmation_for_display
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
@@ -503,6 +501,10 @@ async def get_session_messages(
         if m.role == "tool_call":
             from app.services.chat_history import parse_tool_call_for_display
             entry: dict = {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
+            # The row id is the tool_call's handle on replay (resolve + live-flip key off it):
+            # the persisted JSON has no call_id, so a confirmation card loaded from history can
+            # only be clicked / live-updated if we surface the row id as the toolCallId.
+            entry["toolCallId"] = str(m.id)
             parsed = parse_tool_call_for_display(m.content)
             if parsed:
                 entry["content"] = ""
@@ -535,36 +537,9 @@ async def get_session_messages(
                 entry["sender_user_id"] = sender_user_id
             out.append(entry)
 
-    # Merge AgentConfirmation rows for this session into the message list so the
-    # frontend can replay confirmation cards after a page refresh.
-    # conversation_id == str(session_id) per the ChatMessage query convention above.
-    #
-    # Bound to THIS page's time window so each card lands in exactly one page:
-    #   lower = oldest message in the page (inclusive); upper = the `before` cursor
-    #   (exclusive) when paginating, else open (so trailing cards after the last
-    #   message still show on the newest page). Without this bound, every "load
-    #   more" page re-injects the full confirmation set → duplicated cards.
-    if messages:
-        conf_q = (
-            select(AgentConfirmation)
-            .where(
-                AgentConfirmation.conversation_id == str(session_id),
-                AgentConfirmation.created_at >= messages[0].created_at,
-            )
-            .order_by(AgentConfirmation.created_at)
-        )
-        if before:
-            conf_q = conf_q.where(AgentConfirmation.created_at < before_dt)
-        conf_rows = (await db.execute(conf_q)).scalars().all()
-        # Only re-sort when there are cards to interleave — an unconditional sort
-        # would reorder existing messages (e.g. inline tool_code parts carry no
-        # created_at), changing behavior for sessions with no cards.
-        if conf_rows:
-            for c in conf_rows:
-                out.append(serialize_confirmation_for_display(c))
-            # Messages carry created_at as an ISO string; serialize_confirmation_for_display
-            # also produces a created_at ISO string — so the sort key is uniform.
-            out.sort(key=lambda m: m.get("created_at") or "")
+    # NB: confirmation cards are NOT merged here any more — a card is just a
+    # `request_confirmation` tool_call row, already returned as a normal tool_call
+    # message above (the frontend renders that specific tool as the card).
 
     return out
 

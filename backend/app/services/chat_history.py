@@ -223,6 +223,12 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
     name = payload["name"] or "unknown"
     args = payload["args"] if payload["args"] is not None else {}
     result = payload["result"] or ""
+    # A suspended request_confirmation tool_call (awaiting the user's click) carries no
+    # result yet. Every tool_call still needs a paired tool result or strict providers
+    # reject the orphan — emit a placeholder that also tells the model it's unresolved,
+    # rather than an empty string the model can't interpret.
+    if payload["status"] == "pending" and not result:
+        result = "(用户尚未响应该确认卡,视为未决;在收到明确点击前不要执行该操作)"
     tc_id = f"call_{msg.id}"
 
     asst: dict[str, Any] = {
@@ -341,6 +347,43 @@ async def persist_tool_call(
             await db.commit()
     except Exception as e:
         logger.warning(f"[chat_history] persist_tool_call failed (non-fatal): {e}")
+
+
+async def persist_pending_confirmation(
+    db_session_factory,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    name: str,
+    args: dict | None,
+) -> uuid.UUID:
+    """Persist a SUSPENDED confirmation tool_call and return its row id.
+
+    The agent called ``request_confirmation``; we record it as a normal ``tool_call``
+    row with ``status="pending"`` / empty result and END the turn, waiting for the user.
+    The row id IS the confirmation handle — the web card and the DingTalk ``outTrackId``
+    reference it, and ``resolve`` fills THIS row's result + flips status to ``done`` to
+    resume the loop (``expand_tool_call_row`` replays the pair). Unlike ``persist_tool_call``
+    this is NOT best-effort: the caller needs the id to deliver the card, so errors raise.
+    """
+    content = json.dumps(
+        {"name": name, "args": args, "status": "pending", "result": ""},
+        ensure_ascii=False,
+        default=str,
+    )
+    async with db_session_factory() as db:
+        row = ChatMessage(
+            agent_id=agent_id,
+            user_id=user_id,
+            role="tool_call",
+            content=content,
+            conversation_id=conversation_id,
+        )
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+        return row.id
 
 
 THINKING_MAX_CHARS = 64_000

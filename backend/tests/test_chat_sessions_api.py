@@ -176,7 +176,6 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
         responses=[
             DummyResult([session]),
             DummyResult([message]),
-            DummyResult([]),  # AgentConfirmation merge query (no confirmations)
         ]
     )
 
@@ -233,7 +232,6 @@ async def test_creator_can_view_other_users_session_messages(monkeypatch):
         responses=[
             DummyResult([session]),
             DummyResult([message]),
-            DummyResult([]),  # AgentConfirmation merge query (no confirmations)
         ]
     )
 

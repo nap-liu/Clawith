@@ -105,11 +105,18 @@ async def _call_agent_llm(
     on_tool_call=None,
     is_group: bool = False,
     recovery_hint: str | None = _IM_LLM_RECOVERY_HINT,
+    continue_turn: bool = False,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
     Reuses the same call_llm function as the WebSocket chat endpoint so that
     all providers (OpenRouter, Qwen, etc.) work identically on both channels.
+
+    ``continue_turn``: resume the loop from existing history WITHOUT appending a new
+    user message — used after a confirmation card is resolved, where ``history`` already
+    ends with the request_confirmation assistant(tool_call)+tool(result) pair, so the
+    model continues straight from the user's click (no synthetic user turn). ``user_text``
+    is ignored in this mode.
     """
     from app.models.agent import Agent
     from app.models.llm import LLMModel
@@ -163,7 +170,8 @@ async def _call_agent_llm(
         from app.services.chat_history import strip_leading_orphan_tool_messages
 
         messages.extend(strip_leading_orphan_tool_messages(_normalize_history_messages(history)[-ctx_size:]))
-    messages.append({"role": "user", "content": user_text})
+    if not continue_turn:
+        messages.append({"role": "user", "content": user_text})
 
     # Pre-flight compaction: if the about-to-be-sent prompt is near the model
     # window, compact NOW and reload so THIS request doesn't overflow (the
@@ -192,11 +200,16 @@ async def _call_agent_llm(
                 # (raw text). Restore the per-turn-augmented user_text that was on
                 # the original prompt — sender wrap and the file-upload hint live
                 # only in user_text, not in the persisted row.
-                if rebuilt and rebuilt[-1].get("role") == "user":
+                if continue_turn:
+                    # Resume mode: history already ends with the tool result — don't
+                    # graft a user message onto it.
+                    messages = rebuilt
+                elif rebuilt and rebuilt[-1].get("role") == "user":
                     rebuilt[-1] = {"role": "user", "content": user_text}
+                    messages = rebuilt
                 else:
                     rebuilt.append({"role": "user", "content": user_text})
-                messages = rebuilt
+                    messages = rebuilt
         except Exception as _pf_exc:
             logger.warning(f"[Channel] pre-flight compaction skipped (non-fatal): {_pf_exc}")
 
