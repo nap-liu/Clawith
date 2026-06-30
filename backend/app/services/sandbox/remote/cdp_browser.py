@@ -96,6 +96,72 @@ class CdpConnection:
                 self._event_buf.append(msg)
 
 
+async def attach_page(conn: "CdpConnection", target_id: str, *, timeout: float) -> str:
+    """Attach to a target in flatten mode and enable Page events; return sessionId.
+
+    sessionId is connection-scoped, so callers re-attach on every new websocket
+    even though the targetId persists.
+    """
+    attached = await conn.call(
+        "Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout
+    )
+    sid = attached["sessionId"]
+    await conn.call("Page.enable", session_id=sid, timeout=timeout)
+    return sid
+
+
+async def eval_js(conn: "CdpConnection", session_id: str, expression: str, *, timeout: float) -> Any:
+    """Evaluate JS in the page and return the value.
+
+    awaitPromise lets `await fetch(...)` resolve; userGesture unlocks
+    gesture-gated APIs; returnByValue serializes the result. A JS exception
+    is surfaced as CdpError so the never-raise wrapper reports it as an error.
+    """
+    out = await conn.call(
+        "Runtime.evaluate",
+        {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+            "userGesture": True,
+        },
+        session_id=session_id,
+        timeout=timeout,
+    )
+    exc = out.get("exceptionDetails")
+    if exc:
+        text = (exc.get("exception") or {}).get("description") or exc.get("text") or "JS exception"
+        raise CdpError(f"web_eval JS error: {text}")
+    res = out.get("result") or {}
+    return res.get("value", res.get("description"))
+
+
+async def navigate_page(conn: "CdpConnection", session_id: str, url: str, *, timeout: float) -> None:
+    """Navigate the page and best-effort wait for the load event."""
+    await conn.call("Page.navigate", {"url": url}, session_id=session_id, timeout=timeout)
+    try:
+        await conn.wait_for_event("Page.loadEventFired", session_id=session_id, timeout=timeout)
+    except TimeoutError:
+        logger.warning(f"[CDP] load event timeout for {url}; continuing")
+
+
+async def page_title(conn: "CdpConnection", session_id: str, *, timeout: float) -> str:
+    t = await conn.call(
+        "Runtime.evaluate",
+        {"expression": "document.title", "returnByValue": True},
+        session_id=session_id,
+        timeout=timeout,
+    )
+    return (t.get("result") or {}).get("value") or ""
+
+
+async def capture_screenshot(conn: "CdpConnection", session_id: str, *, timeout: float) -> str:
+    shot = await conn.call(
+        "Page.captureScreenshot", {"format": "png"}, session_id=session_id, timeout=timeout
+    )
+    return shot.get("data") or ""
+
+
 async def open_and_extract(
     conn: "CdpConnection",
     *,
@@ -118,43 +184,21 @@ async def open_and_extract(
     screenshot_b64: str | None = None
     truncated = False
     try:
-        attached = await conn.call(
-            "Target.attachToTarget",
-            {"targetId": target_id, "flatten": True},
-            timeout=timeout,
-        )
-        sid = attached["sessionId"]
-        await conn.call("Page.enable", session_id=sid, timeout=timeout)
-        await conn.call("Page.navigate", {"url": url}, session_id=sid, timeout=timeout)
-        try:
-            await conn.wait_for_event("Page.loadEventFired", session_id=sid, timeout=timeout)
-        except TimeoutError:
-            logger.warning(f"[CDP] load event timeout for {url}; extracting anyway")
+        sid = await attach_page(conn, target_id, timeout=timeout)
+        await navigate_page(conn, sid, url, timeout=timeout)
         if want_text:
-            t = await conn.call(
-                "Runtime.evaluate",
-                {"expression": "document.title", "returnByValue": True},
-                session_id=sid, timeout=timeout,
+            title = await page_title(conn, sid, timeout=timeout)
+            raw_text = await eval_js(
+                conn, sid, "document.body ? document.body.innerText : ''", timeout=timeout
             )
-            title = (t.get("result") or {}).get("value") or ""
-            b = await conn.call(
-                "Runtime.evaluate",
-                {"expression": "document.body ? document.body.innerText : ''",
-                 "returnByValue": True},
-                session_id=sid, timeout=timeout,
-            )
-            raw_text = (b.get("result") or {}).get("value") or ""
+            raw_text = raw_text if isinstance(raw_text, str) else (str(raw_text) if raw_text is not None else "")
             if len(raw_text) > text_limit:
                 text = raw_text[:text_limit]
                 truncated = True
             else:
                 text = raw_text
         if want_screenshot:
-            shot = await conn.call(
-                "Page.captureScreenshot", {"format": "png"},
-                session_id=sid, timeout=timeout,
-            )
-            screenshot_b64 = shot.get("data")
+            screenshot_b64 = await capture_screenshot(conn, sid, timeout=timeout)
     finally:
         try:
             await conn.call("Target.closeTarget", {"targetId": target_id}, timeout=5.0)
