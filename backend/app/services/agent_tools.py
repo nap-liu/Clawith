@@ -11914,33 +11914,55 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     except Exception:
         title = Path(path).stem
 
-    # Generate short_id
-    short_id = secrets.token_urlsafe(6)[:8]  # 8-char URL-safe string
-
-    # Look up tenant_id
-    tenant_id = None
-    try:
-        from app.models.agent import Agent as _AgModel
-        async with async_session() as _db:
-            _r = await _db.execute(select(_AgModel.tenant_id).where(_AgModel.id == agent_id))
-            tenant_id = _r.scalar_one_or_none()
-    except Exception:
-        pass
-
-    # Create record
+    # Stable URL per source file. Re-publishing the SAME file must return the
+    # SAME short_id: the /p/<id> route serves the file live, so one stable link
+    # already reflects every edit. Minting a fresh id on each publish (the old
+    # behavior) scattered views across dozens of equivalent links and left users
+    # asking "which link is current?" — e.g. one report file had 25 distinct
+    # short_ids. So reuse an existing page for this (agent_id, source_path);
+    # only mint a new id when the file was never published before.
     from app.models.published_page import PublishedPage
+    reused = False
     try:
         async with async_session() as db:
-            page = PublishedPage(
-                short_id=short_id,
-                agent_id=agent_id,
-                user_id=user_id,
-                tenant_id=tenant_id,
-                source_path=path,
-                title=title,
-            )
-            db.add(page)
-            await db.commit()
+            existing = (
+                await db.execute(
+                    select(PublishedPage)
+                    .where(
+                        PublishedPage.agent_id == agent_id,
+                        PublishedPage.source_path == path,
+                    )
+                    .order_by(PublishedPage.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                short_id = existing.short_id
+                reused = True
+                if title and existing.title != title:
+                    existing.title = title  # refresh title; same link
+                    await db.commit()
+            else:
+                # New file → mint a short_id and resolve tenant_id for the row.
+                tenant_id = None
+                try:
+                    from app.models.agent import Agent as _AgModel
+                    _r = await db.execute(select(_AgModel.tenant_id).where(_AgModel.id == agent_id))
+                    tenant_id = _r.scalar_one_or_none()
+                except Exception:
+                    tenant_id = None
+                short_id = secrets.token_urlsafe(6)[:8]  # 8-char URL-safe string
+                db.add(
+                    PublishedPage(
+                        short_id=short_id,
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        source_path=path,
+                        title=title,
+                    )
+                )
+                await db.commit()
     except Exception as e:
         return f"Failed to publish: {e}"
 
@@ -11962,8 +11984,14 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         url = f"{public_base}/p/{short_id}"
         url_note = ""
 
+    headline = (
+        "Updated in place — the page already had a public link, so the SAME URL "
+        "now serves the latest content (no new link is created)."
+        if reused
+        else "Published successfully!"
+    )
     return (
-        f"Published successfully!\n\n"
+        f"{headline}\n\n"
         f"Public URL: {url}\n"
         f"Title: {title}\n\n"
         f"Anyone can access this page without logging in.{url_note}\n\n"
