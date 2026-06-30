@@ -122,6 +122,72 @@ def _response_was_truncated_by_length(response) -> bool:
     return reason in _TRUNCATED_FINISH_REASONS
 
 
+# ── Repeated tool-call guard ─────────────────────────────────────────────────
+# DashScope / qwen returns a hard 400 ("Repetitive tool calls detected ... the
+# same tool call with identical name and arguments has been repeated across
+# multiple consecutive rounds") once the conversation history carries several
+# back-to-back identical assistant tool_calls. A model stuck re-issuing one tool
+# that keeps failing the same way (a 500ing API, an unreachable sandbox) would
+# otherwise crash the WHOLE turn — the user sees the raw error + a "/new" prompt
+# and loses all progress. We track per-signature consecutive-round streaks and
+# step in BEFORE the history grows enough to trip that 400:
+#   • at REPEAT_TOOL_CALL_NUDGE identical rounds → inject one corrective nudge,
+#     giving the model a chance to change approach or finish() honestly;
+#   • at REPEAT_TOOL_CALL_BREAK identical rounds → stop the loop gracefully
+#     (before appending/re-sending this Nth call), so the provider never sees
+#     enough repetition to reject. Capping history at BREAK-1 identical calls
+#     keeps us safely under the provider's threshold.
+REPEAT_TOOL_CALL_NUDGE = 2
+REPEAT_TOOL_CALL_BREAK = 3
+
+REPEAT_TOOL_CALL_NUDGE_PROMPT = (
+    "⚠️ 你刚刚用完全相同的参数重复调用了同一个工具，结果不会改变。"
+    "请不要再用相同参数重复调用：换一种方法或参数；如果确实无法完成，"
+    "请用 finish() 如实向用户说明情况和已经掌握的信息。"
+)
+
+REPEAT_TOOL_CALL_BREAK_MESSAGE = (
+    "抱歉，我在用相同的方式反复调用同一个工具，但始终没有得到新的结果，"
+    "为避免无效循环我先停在这里。这通常意味着对应的数据或接口当前不可用。"
+    "你可以换个问法、缩小范围，或稍后再试。"
+)
+
+
+def _tool_call_signature(tc: dict) -> tuple[str, str]:
+    """Stable ``(name, canonical-args)`` identity for a tool call.
+
+    Arguments are JSON-normalised (sorted keys) so semantically identical calls
+    compare equal regardless of key order / whitespace — at least as strict as
+    the provider's own "identical arguments" check. Falls back to the trimmed
+    raw string when the arguments are not valid JSON.
+    """
+    fn = (tc or {}).get("function") or {}
+    name = fn.get("name") or ""
+    raw = fn.get("arguments")
+    if raw is None or raw == "":
+        return (name, "")
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        args_key = json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        args_key = raw.strip() if isinstance(raw, str) else str(raw)
+    return (name, args_key)
+
+
+def _update_repeat_streaks(
+    prev_streaks: dict[tuple[str, str], int],
+    round_signatures: list[tuple[str, str]],
+) -> dict[tuple[str, str], int]:
+    """Consecutive-round streak counts after one round of tool calls.
+
+    A signature seen this round extends its prior streak (+1); any signature NOT
+    seen this round drops out (streak resets to 0). Pure — does not mutate
+    ``prev_streaks``. Identical calls within the *same* round count once (the
+    provider's 400 is about repetition *across* rounds).
+    """
+    return {sig: prev_streaks.get(sig, 0) + 1 for sig in round_signatures}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Failover Guard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -743,6 +809,9 @@ async def call_llm(
     # tool loop into 50×3 redundant resumes on a misconfigured cap.
     max_output_recoveries = 0
 
+    # Repeated tool-call guard state: per-signature consecutive-round streaks.
+    _repeat_streaks: dict[tuple[str, str], int] = {}
+
     # Tool-calling loop
     for round_i in range(_max_tool_rounds):
         # Dynamic tool-call limit warning.
@@ -1005,6 +1074,25 @@ async def call_llm(
                 ))
                 continue
 
+        # Repeated tool-call guard. If the model has now emitted the identical
+        # call (name + args) for REPEAT_TOOL_CALL_BREAK consecutive rounds, stop
+        # BEFORE appending/executing it — sending a history with that much
+        # repetition makes DashScope/qwen 400 ("Repetitive tool calls detected")
+        # and crash the whole turn. Breaking here caps history at BREAK-1
+        # identical calls, safely under the provider's threshold.
+        _round_sigs = [_tool_call_signature(tc) for tc in (sanitized_tool_calls or [])]
+        _repeat_streaks = _update_repeat_streaks(_repeat_streaks, _round_sigs)
+        _max_repeat = max(_repeat_streaks.values(), default=0)
+        if _max_repeat >= REPEAT_TOOL_CALL_BREAK:
+            logger.warning(
+                f"[LLM] Repeated tool-call guard tripped (streak={_max_repeat}, "
+                f"round {round_i + 1}, agent={agent_id}); stopping loop gracefully."
+            )
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client.close()
+            return response.content or REPEAT_TOOL_CALL_BREAK_MESSAGE
+
         # Remember where this round's appended entries begin. The message-level
         # budget enforcer operates only on items at or beyond this index —
         # historical messages (already sent as prefix bytes in prior rounds) must
@@ -1059,6 +1147,13 @@ async def call_llm(
             agent_id=agent_id,
             session_id=session_id,
         )
+
+        # Repeated tool-call nudge. On the 2nd identical-call round, append one
+        # corrective message (append-only → prefix cache stays intact) so the
+        # model gets a chance to change approach or finish() before the guard
+        # above hard-stops it on the 3rd.
+        if _max_repeat == REPEAT_TOOL_CALL_NUDGE:
+            api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))
 
         # Auto-compaction hook (P5).
         # When this round's prompt_tokens crosses the per-model
@@ -1387,6 +1482,8 @@ async def call_agent_llm_with_tools(
 
             # Tool-calling loop
             api_messages = list(messages)
+            # Repeated tool-call guard state: per-signature consecutive-round streaks.
+            _repeat_streaks: dict[tuple[str, str], int] = {}
             for round_i in range(max_rounds):
                 # Check token usage limit mid-loop (every 3 rounds)
                 if round_i > 0 and round_i % 3 == 0:
@@ -1504,6 +1601,23 @@ async def call_agent_llm_with_tools(
                         ))
                         continue
 
+                # Repeated tool-call guard (twin of the streaming call_llm loop).
+                # Stop before re-issuing the identical call for the Nth
+                # consecutive round so the provider never 400s on "Repetitive
+                # tool calls detected" and crashes this turn.
+                _round_sigs = [_tool_call_signature(tc) for tc in (sanitized_tool_calls or [])]
+                _repeat_streaks = _update_repeat_streaks(_repeat_streaks, _round_sigs)
+                _max_repeat = max(_repeat_streaks.values(), default=0)
+                if _max_repeat >= REPEAT_TOOL_CALL_BREAK:
+                    logger.warning(
+                        f"[call_agent_llm_with_tools] Repeated tool-call guard tripped "
+                        f"(streak={_max_repeat}, round {round_i + 1}, agent={agent_id})."
+                    )
+                    if agent_id and _unsaved_usage.total_tokens > 0:
+                        await record_token_usage(agent_id, _unsaved_usage)
+                    await client.close()
+                    return response.content or REPEAT_TOOL_CALL_BREAK_MESSAGE, True, tool_executed
+
                 # Add assistant message with tool calls.
                 # NB: tc["function"] is shared by reference with _canonicalize_tc_arguments's
                 # in-place canonicalization — must stay a reference (no deepcopy), or
@@ -1542,6 +1656,12 @@ async def call_agent_llm_with_tools(
                             content=str(result),
                         )
                     )
+
+                # Repeated tool-call nudge (2nd identical round): one corrective
+                # message so the model can change approach or finish() before the
+                # guard above hard-stops it on the 3rd.
+                if _max_repeat == REPEAT_TOOL_CALL_NUDGE:
+                    api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))
 
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
