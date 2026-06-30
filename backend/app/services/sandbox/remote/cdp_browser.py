@@ -146,13 +146,7 @@ async def navigate_page(conn: "CdpConnection", session_id: str, url: str, *, tim
 
 
 async def page_title(conn: "CdpConnection", session_id: str, *, timeout: float) -> str:
-    t = await conn.call(
-        "Runtime.evaluate",
-        {"expression": "document.title", "returnByValue": True},
-        session_id=session_id,
-        timeout=timeout,
-    )
-    return (t.get("result") or {}).get("value") or ""
+    return (await eval_js(conn, session_id, "document.title", timeout=timeout)) or ""
 
 
 async def capture_screenshot(conn: "CdpConnection", session_id: str, *, timeout: float) -> str:

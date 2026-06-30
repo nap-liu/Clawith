@@ -53,6 +53,7 @@ async def test_eval_js_returns_value():
     assert frame["expression"] == "document.title"
     assert frame["returnByValue"] is True
     assert frame["awaitPromise"] is True
+    assert frame["userGesture"] is True
 
 
 async def test_eval_js_raises_on_js_exception():
