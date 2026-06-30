@@ -1026,6 +1026,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         Browser-global methods are rejected to preserve per-conversation
         isolation in the shared container (see _is_browser_global_method).
         """
+        method = (method or "").strip()
         if _is_browser_global_method(method):
             return {
                 "success": False,

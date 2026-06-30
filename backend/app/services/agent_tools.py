@@ -8564,7 +8564,7 @@ async def _web_screenshot(
     b64 = result.get("screenshot_b64")
     if not b64:
         return "❌ web_screenshot: no image returned."
-    name = "web-screenshot.png"
+    name = f"web-screenshot-{uuid.uuid4().hex[:8]}.png"
     try:
         (ws / name).write_bytes(base64.b64decode(b64))
     except Exception as e:  # noqa: BLE001
