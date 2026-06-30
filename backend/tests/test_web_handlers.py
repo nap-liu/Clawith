@@ -77,3 +77,20 @@ async def test_web_eval_handler_reports_failure():
     with p1, p2:
         out = await agent_tools._web_eval(uuid.uuid4(), Path("/tmp"), {"expression": "x"}, session_id="c")
     assert "boom" in out
+
+
+async def test_web_open_handler_requires_url():
+    out = await agent_tools._web_open(uuid.uuid4(), Path("/tmp"), {}, session_id="c")
+    assert "url" in out
+
+
+async def test_web_cdp_handler_requires_method():
+    out = await agent_tools._web_cdp(uuid.uuid4(), Path("/tmp"), {}, session_id="c")
+    assert "method" in out
+
+
+async def test_web_cdp_handler_rejects_non_dict_params():
+    out = await agent_tools._web_cdp(
+        uuid.uuid4(), Path("/tmp"), {"method": "Page.navigate", "params": ["x"]}, session_id="c"
+    )
+    assert "params" in out

@@ -8500,7 +8500,7 @@ async def _web_eval(
     if value is None:
         return "(no value)"
     if isinstance(value, str):
-        return value or "(empty string)"
+        return (value or "(empty string)")[:_STDOUT_RPA_LIMIT]
     try:
         return json.dumps(value, ensure_ascii=False)[:_STDOUT_RPA_LIMIT]
     except Exception:  # noqa: BLE001
