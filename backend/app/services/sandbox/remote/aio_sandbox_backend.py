@@ -82,7 +82,11 @@ from app.services.sandbox.remote.cdp_browser import (
     CdpConnection,
     CdpError,
     attach_page,
+    capture_screenshot,
+    eval_js,
+    navigate_page,
     open_and_extract,
+    page_title,
 )
 
 # Maximum stdout/stderr we surface to the caller. aio-sandbox itself caps
@@ -995,6 +999,77 @@ class AioSandboxBackend(BaseSandboxBackend):
                 "screenshot_b64": None,
                 "truncated": False,
             }
+
+    async def web_eval(
+        self, *, agent_id: str | None, conversation_id: str | None, expression: str, timeout: int = 30
+    ) -> dict[str, Any]:
+        """Run arbitrary async JS in the conversation's persistent page."""
+        try:
+            async with self._rpa_page(agent_id, conversation_id, timeout=float(timeout)) as (conn, sid):
+                value = await eval_js(conn, sid, expression, timeout=float(timeout))
+            return {"success": True, "error": None, "result": value}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[AioSandbox] web_eval error")
+            return {"success": False, "error": f"web_eval failed: {str(e)[:300]}", "result": None}
+
+    async def web_cdp(
+        self,
+        *,
+        agent_id: str | None,
+        conversation_id: str | None,
+        method: str,
+        params: dict | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        """Raw CDP passthrough, scoped to the conversation's own page session.
+
+        Browser-global methods are rejected to preserve per-conversation
+        isolation in the shared container (see _is_browser_global_method).
+        """
+        if _is_browser_global_method(method):
+            return {
+                "success": False,
+                "error": (
+                    f"web_cdp: method {method!r} is blocked (browser-global; it would break "
+                    f"per-conversation isolation in the shared browser). Use a session-scoped "
+                    f"method such as Page.*, DOM.*, Input.*, Network.*, Emulation.* or Fetch.*."
+                ),
+                "result": None,
+            }
+        if params is not None and not isinstance(params, dict):
+            return {"success": False, "error": "web_cdp: 'params' must be an object.", "result": None}
+        try:
+            async with self._rpa_page(agent_id, conversation_id, timeout=float(timeout)) as (conn, sid):
+                result = await conn.call(method, params or {}, session_id=sid, timeout=float(timeout))
+            return {"success": True, "error": None, "result": result}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[AioSandbox] web_cdp error")
+            return {"success": False, "error": f"web_cdp failed: {str(e)[:300]}", "result": None}
+
+    async def web_open(
+        self, *, agent_id: str | None, conversation_id: str | None, url: str, timeout: int = 30
+    ) -> dict[str, Any]:
+        """Navigate the conversation's persistent page to `url`."""
+        try:
+            async with self._rpa_page(agent_id, conversation_id, timeout=float(timeout)) as (conn, sid):
+                await navigate_page(conn, sid, url, timeout=float(timeout))
+                title = await page_title(conn, sid, timeout=float(timeout))
+            return {"success": True, "error": None, "url": url, "title": title}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[AioSandbox] web_open error")
+            return {"success": False, "error": f"web_open failed: {str(e)[:300]}", "url": url, "title": ""}
+
+    async def web_screenshot(
+        self, *, agent_id: str | None, conversation_id: str | None, timeout: int = 30
+    ) -> dict[str, Any]:
+        """Capture a PNG of the conversation's persistent page."""
+        try:
+            async with self._rpa_page(agent_id, conversation_id, timeout=float(timeout)) as (conn, sid):
+                b64 = await capture_screenshot(conn, sid, timeout=float(timeout))
+            return {"success": True, "error": None, "screenshot_b64": b64 or None}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[AioSandbox] web_screenshot error")
+            return {"success": False, "error": f"web_screenshot failed: {str(e)[:300]}", "screenshot_b64": None}
 
     @staticmethod
     def _is_session_missing(body: dict[str, Any]) -> bool:
