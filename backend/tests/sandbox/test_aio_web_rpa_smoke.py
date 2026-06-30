@@ -42,7 +42,8 @@ async def test_web_eval_can_set_and_read_dom_state():
 async def test_conversations_are_isolated():
     b = _backend()
     await b.web_open(agent_id="a", conversation_id="iso-A", url="https://example.com", timeout=30)
-    await b.web_eval(agent_id="a", conversation_id="iso-A", expression="window.__secret = 'A'", timeout=30)
+    set_a = await b.web_eval(agent_id="a", conversation_id="iso-A", expression="window.__secret = 'A'", timeout=30)
+    assert set_a["success"], set_a
     # A different conversation has its own page/context — it must NOT see __secret.
     await b.web_open(agent_id="a", conversation_id="iso-B", url="https://example.com", timeout=30)
     out = await b.web_eval(agent_id="a", conversation_id="iso-B", expression="window.__secret || 'none'", timeout=30)
@@ -64,6 +65,8 @@ async def test_web_cdp_trusted_input_runs():
 
 
 async def test_web_cdp_target_method_is_blocked_live():
+    # NOTE: the guard is client-side — web_cdp returns "blocked" BEFORE any
+    # sandbox/websocket call, so this asserts the guard, not a live CDP path.
     b = _backend()
     out = await b.web_cdp(agent_id="a", conversation_id="cdp-2", method="Target.getTargets", timeout=30)
     assert out["success"] is False
