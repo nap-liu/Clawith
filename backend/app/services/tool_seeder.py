@@ -3815,6 +3815,150 @@ BROWSER_BUILTIN_TOOLS = [
             ]
         },
     },
+    {
+        "name": "web_open",
+        "display_name": "Open Page (RPA)",
+        "description": (
+            "Navigate the conversation's PERSISTENT browser page to a URL inside the "
+            "aio-sandbox container. Unlike `browse` (one-shot read), the page stays open "
+            "across tool calls, so you can then use web_eval / web_cdp to interact with it "
+            "(click, fill forms, read DOM, scroll) for multi-step web automation. Each "
+            "conversation has its own isolated page (cookies/login persist within it)."
+        ),
+        "category": "browser",
+        "icon": "🌐",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The full URL to open (must include http:// or https://)."},
+            },
+            "required": ["url"],
+        },
+        "config": {
+            "sandbox_type": "aio_sandbox",
+            "api_url": "http://aio-sandbox:8080",
+            "api_key": "",
+            "default_timeout": 30,
+            "max_timeout": 60,
+        },
+        "config_schema": {
+            "fields": [
+                {"key": "api_url", "label": "Sandbox URL", "type": "text", "default": "http://aio-sandbox:8080", "placeholder": "http://aio-sandbox:8080", "required": True},
+                {"key": "api_key", "label": "Bearer Token (optional)", "type": "password", "default": "", "placeholder": "Only set if the sandbox is auth-protected", "required": False},
+                {"key": "default_timeout", "label": "Default Timeout (seconds)", "type": "number", "default": 30, "min": 5, "max": 120},
+                {"key": "max_timeout", "label": "Max Timeout (seconds)", "type": "number", "default": 60, "min": 10, "max": 120},
+            ]
+        },
+    },
+    {
+        "name": "web_eval",
+        "display_name": "Run JS in Page (RPA)",
+        "description": (
+            "Run arbitrary async JavaScript in the conversation's persistent browser page "
+            "(opened via web_open) and return the result. Use this to read or manipulate the "
+            "DOM, click elements (el.click()), fill inputs, scroll, await fetch(...), or "
+            "extract structured data. The value of the expression (or an awaited promise) is "
+            "returned, JSON-serialized. Example: `document.querySelector('h1').innerText`."
+        ),
+        "category": "browser",
+        "icon": "🧩",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "JavaScript to evaluate in the page. May use await. The last expression's value is returned."},
+            },
+            "required": ["expression"],
+        },
+        "config": {
+            "sandbox_type": "aio_sandbox",
+            "api_url": "http://aio-sandbox:8080",
+            "api_key": "",
+            "default_timeout": 30,
+            "max_timeout": 60,
+        },
+        "config_schema": {
+            "fields": [
+                {"key": "api_url", "label": "Sandbox URL", "type": "text", "default": "http://aio-sandbox:8080", "placeholder": "http://aio-sandbox:8080", "required": True},
+                {"key": "api_key", "label": "Bearer Token (optional)", "type": "password", "default": "", "placeholder": "Only set if the sandbox is auth-protected", "required": False},
+                {"key": "default_timeout", "label": "Default Timeout (seconds)", "type": "number", "default": 30, "min": 5, "max": 120},
+                {"key": "max_timeout", "label": "Max Timeout (seconds)", "type": "number", "default": 60, "min": 10, "max": 120},
+            ]
+        },
+    },
+    {
+        "name": "web_cdp",
+        "display_name": "Raw CDP (RPA)",
+        "description": (
+            "Send a raw Chrome DevTools Protocol command to the conversation's persistent "
+            "browser page and return the result. This exposes the full low-level browser "
+            "surface: Input.dispatchMouseEvent / dispatchKeyEvent (OS-trusted clicks & typing "
+            "for anti-bot), Page.* (navigate/captureScreenshot/printToPDF), Network.* "
+            "(setCookie / request interception), Emulation.* (user-agent / viewport / geo / "
+            "timezone), Fetch.*, DOM.*, etc. The command is scoped to THIS conversation's page; "
+            "browser-global methods (Target.* / Browser.*) are rejected to keep conversations "
+            "isolated. Pass `method` (e.g. 'Input.dispatchKeyEvent') and `params` (an object)."
+        ),
+        "category": "browser",
+        "icon": "🛠️",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "description": "CDP method name, e.g. 'Input.dispatchMouseEvent' or 'Page.navigate'."},
+                "params": {"type": "object", "description": "CDP method params object. Optional; defaults to {}."},
+            },
+            "required": ["method"],
+        },
+        "config": {
+            "sandbox_type": "aio_sandbox",
+            "api_url": "http://aio-sandbox:8080",
+            "api_key": "",
+            "default_timeout": 30,
+            "max_timeout": 60,
+        },
+        "config_schema": {
+            "fields": [
+                {"key": "api_url", "label": "Sandbox URL", "type": "text", "default": "http://aio-sandbox:8080", "placeholder": "http://aio-sandbox:8080", "required": True},
+                {"key": "api_key", "label": "Bearer Token (optional)", "type": "password", "default": "", "placeholder": "Only set if the sandbox is auth-protected", "required": False},
+                {"key": "default_timeout", "label": "Default Timeout (seconds)", "type": "number", "default": 30, "min": 5, "max": 120},
+                {"key": "max_timeout", "label": "Max Timeout (seconds)", "type": "number", "default": 60, "min": 10, "max": 120},
+            ]
+        },
+    },
+    {
+        "name": "web_screenshot",
+        "display_name": "Screenshot Page (RPA)",
+        "description": (
+            "Capture a PNG screenshot of the conversation's persistent browser page (opened "
+            "via web_open) and save it to your workspace. Use after interacting with the page "
+            "to see its current state. Does not navigate or change the page."
+        ),
+        "category": "browser",
+        "icon": "📸",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+        "config": {
+            "sandbox_type": "aio_sandbox",
+            "api_url": "http://aio-sandbox:8080",
+            "api_key": "",
+            "default_timeout": 30,
+            "max_timeout": 60,
+        },
+        "config_schema": {
+            "fields": [
+                {"key": "api_url", "label": "Sandbox URL", "type": "text", "default": "http://aio-sandbox:8080", "placeholder": "http://aio-sandbox:8080", "required": True},
+                {"key": "api_key", "label": "Bearer Token (optional)", "type": "password", "default": "", "placeholder": "Only set if the sandbox is auth-protected", "required": False},
+                {"key": "default_timeout", "label": "Default Timeout (seconds)", "type": "number", "default": 30, "min": 5, "max": 120},
+                {"key": "max_timeout", "label": "Max Timeout (seconds)", "type": "number", "default": 60, "min": 10, "max": 120},
+            ]
+        },
+    },
 ]
 
 BUILTIN_TOOLS = [
