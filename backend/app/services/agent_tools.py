@@ -12,6 +12,7 @@ The agent reads/writes these files directly. No per-concept tools needed.
 """
 
 import asyncio
+import base64
 from dataclasses import dataclass
 import fnmatch
 import json
@@ -82,6 +83,9 @@ TOOL_MATERIALIZE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 TEMP_WORKSPACE_DEFAULT_PATHS = ["workspace", "memory", "skills", "focus.md", "soul.md", "HEARTBEAT.md"]
 MAX_EXEC_STDOUT_CAPTURE_BYTES = 1_000_000
 MAX_EXEC_STDERR_CAPTURE_BYTES = 500_000
+
+# Cap web_eval/web_cdp serialized results surfaced to the LLM.
+_STDOUT_RPA_LIMIT = 20000
 
 # Delivery guidance appended to every A2A consult turn (not persisted to history
 # so it does not pollute the stored context).
@@ -2931,6 +2935,34 @@ async def _execute_tool_direct(
                 lambda temp_ws: _browse(agent_id, temp_ws, arguments, user_id=None, session_id=None),
                 sync_back=True,
             )
+        elif tool_name == "web_open":
+            return await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _web_open(agent_id, temp_ws, arguments, user_id=None, session_id=None),
+                sync_back=True,
+            )
+        elif tool_name == "web_eval":
+            return await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _web_eval(agent_id, temp_ws, arguments, user_id=None, session_id=None),
+                sync_back=True,
+            )
+        elif tool_name == "web_cdp":
+            return await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _web_cdp(agent_id, temp_ws, arguments, user_id=None, session_id=None),
+                sync_back=True,
+            )
+        elif tool_name == "web_screenshot":
+            return await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _web_screenshot(agent_id, temp_ws, arguments, user_id=None, session_id=None),
+                sync_back=True,
+            )
         elif tool_name == "sql_execute":
             return await _sql_execute(arguments)
         elif tool_name == "web_search":
@@ -3355,6 +3387,34 @@ async def execute_tool(
                 agent_id,
                 _agent_tenant_id,
                 lambda temp_ws: _browse(agent_id, temp_ws, arguments, user_id=user_id, session_id=session_id),
+                sync_back=True,
+            )
+        elif tool_name == "web_open":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _web_open(agent_id, temp_ws, arguments, user_id=user_id, session_id=session_id),
+                sync_back=True,
+            )
+        elif tool_name == "web_eval":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _web_eval(agent_id, temp_ws, arguments, user_id=user_id, session_id=session_id),
+                sync_back=True,
+            )
+        elif tool_name == "web_cdp":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _web_cdp(agent_id, temp_ws, arguments, user_id=user_id, session_id=session_id),
+                sync_back=True,
+            )
+        elif tool_name == "web_screenshot":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _web_screenshot(agent_id, temp_ws, arguments, user_id=user_id, session_id=session_id),
                 sync_back=True,
             )
         # ── AgentBay Tools ──
@@ -8313,6 +8373,24 @@ async def build_cli_injection(
         return None
 
 
+async def _resolve_sandbox_backend(agent_id: Optional[uuid.UUID], tool_name: str):
+    """Resolve the aio-sandbox backend + config for a browser tool.
+
+    Reads the tool's own config row, falling back to the platform sandbox
+    config. Raises ValueError if no sandbox is configured.
+    """
+    from app.config import get_sandbox_config
+    from app.services.sandbox.config import SandboxConfig
+    from app.services.sandbox.registry import get_sandbox_backend
+
+    fallback_config = get_sandbox_config()
+    tool_config = await _get_tool_config(agent_id, tool_name)
+    sandbox_config = (
+        SandboxConfig.from_dict(tool_config, fallback_config) if tool_config else fallback_config
+    )
+    return get_sandbox_backend(sandbox_config), sandbox_config
+
+
 async def _browse(
     agent_id: Optional[uuid.UUID],
     ws: Path,
@@ -8327,25 +8405,14 @@ async def _browse(
     the platform-level config), calls AioSandboxBackend.browse(), writes any
     screenshot into the agent workspace, and returns a text summary.
     """
-    import base64
-
-    from app.config import get_sandbox_config
-    from app.services.sandbox.config import SandboxConfig
-    from app.services.sandbox.registry import get_sandbox_backend
-
     url = (arguments.get("url") or "").strip()
     if not url:
         return "❌ browse: 'url' is required."
     extract = arguments.get("extract", True)
     screenshot = bool(arguments.get("screenshot", False))
 
-    fallback_config = get_sandbox_config()
-    tool_config = await _get_tool_config(agent_id, "browse")
-    sandbox_config = (
-        SandboxConfig.from_dict(tool_config, fallback_config) if tool_config else fallback_config
-    )
     try:
-        backend = get_sandbox_backend(sandbox_config)
+        backend, sandbox_config = await _resolve_sandbox_backend(agent_id, "browse")
     except ValueError as e:
         return f"❌ browse: sandbox not configured: {str(e)[:200]}"
 
@@ -8376,6 +8443,133 @@ async def _browse(
         lines.append("")
         lines.append(text)
     return "\n".join(lines)
+
+
+async def _web_open(
+    agent_id: Optional[uuid.UUID],
+    ws: Path,
+    arguments: dict,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Navigate the conversation's persistent RPA page to a URL."""
+    url = (arguments.get("url") or "").strip()
+    if not url:
+        return "❌ web_open: 'url' is required."
+    try:
+        backend, cfg = await _resolve_sandbox_backend(agent_id, "web_open")
+    except ValueError as e:
+        return f"❌ web_open: sandbox not configured: {str(e)[:200]}"
+    result = await backend.web_open(
+        agent_id=str(agent_id) if agent_id else None,
+        conversation_id=session_id or None,
+        url=url,
+        timeout=cfg.max_timeout,
+    )
+    if not result.get("success"):
+        return f"❌ web_open failed: {result.get('error') or 'unknown error'}"
+    return f"Opened {result.get('url') or url} — {result.get('title') or '(no title)'}"
+
+
+async def _web_eval(
+    agent_id: Optional[uuid.UUID],
+    ws: Path,
+    arguments: dict,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Run arbitrary JS in the conversation's persistent RPA page."""
+    expression = (arguments.get("expression") or "").strip()
+    if not expression:
+        return "❌ web_eval: 'expression' (JavaScript to run) is required."
+    try:
+        backend, cfg = await _resolve_sandbox_backend(agent_id, "web_eval")
+    except ValueError as e:
+        return f"❌ web_eval: sandbox not configured: {str(e)[:200]}"
+    result = await backend.web_eval(
+        agent_id=str(agent_id) if agent_id else None,
+        conversation_id=session_id or None,
+        expression=expression,
+        timeout=cfg.max_timeout,
+    )
+    if not result.get("success"):
+        return f"❌ web_eval failed: {result.get('error') or 'unknown error'}"
+    value = result.get("result")
+    if value is None:
+        return "(no value)"
+    if isinstance(value, str):
+        return value or "(empty string)"
+    try:
+        return json.dumps(value, ensure_ascii=False)[:_STDOUT_RPA_LIMIT]
+    except Exception:  # noqa: BLE001
+        return str(value)[:_STDOUT_RPA_LIMIT]
+
+
+async def _web_cdp(
+    agent_id: Optional[uuid.UUID],
+    ws: Path,
+    arguments: dict,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Send a raw CDP command to the conversation's persistent RPA page."""
+    method = (arguments.get("method") or "").strip()
+    if not method:
+        return "❌ web_cdp: 'method' (e.g. 'Input.dispatchMouseEvent') is required."
+    params = arguments.get("params")
+    if params is not None and not isinstance(params, dict):
+        return "❌ web_cdp: 'params' must be an object."
+    try:
+        backend, cfg = await _resolve_sandbox_backend(agent_id, "web_cdp")
+    except ValueError as e:
+        return f"❌ web_cdp: sandbox not configured: {str(e)[:200]}"
+    result = await backend.web_cdp(
+        agent_id=str(agent_id) if agent_id else None,
+        conversation_id=session_id or None,
+        method=method,
+        params=params,
+        timeout=cfg.max_timeout,
+    )
+    if not result.get("success"):
+        return f"❌ web_cdp failed: {result.get('error') or 'unknown error'}"
+    try:
+        return json.dumps(result.get("result"), ensure_ascii=False)[:_STDOUT_RPA_LIMIT]
+    except Exception:  # noqa: BLE001
+        return str(result.get("result"))[:_STDOUT_RPA_LIMIT]
+
+
+async def _web_screenshot(
+    agent_id: Optional[uuid.UUID],
+    ws: Path,
+    arguments: dict,
+    *,
+    user_id: Optional[uuid.UUID] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Capture a PNG of the conversation's persistent RPA page into the workspace."""
+    try:
+        backend, cfg = await _resolve_sandbox_backend(agent_id, "web_screenshot")
+    except ValueError as e:
+        return f"❌ web_screenshot: sandbox not configured: {str(e)[:200]}"
+    result = await backend.web_screenshot(
+        agent_id=str(agent_id) if agent_id else None,
+        conversation_id=session_id or None,
+        timeout=cfg.max_timeout,
+    )
+    if not result.get("success"):
+        return f"❌ web_screenshot failed: {result.get('error') or 'unknown error'}"
+    b64 = result.get("screenshot_b64")
+    if not b64:
+        return "❌ web_screenshot: no image returned."
+    name = "web-screenshot.png"
+    try:
+        (ws / name).write_bytes(base64.b64decode(b64))
+    except Exception as e:  # noqa: BLE001
+        return f"❌ web_screenshot: save failed: {str(e)[:100]}"
+    return f"Screenshot saved to workspace: {name}"
 
 
 async def _execute_code(
