@@ -64,6 +64,7 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -77,12 +78,32 @@ from app.services.sandbox.base import (
     SandboxCapabilities,
 )
 from app.services.sandbox.config import SandboxConfig
-from app.services.sandbox.remote.cdp_browser import CdpConnection, open_and_extract
+from app.services.sandbox.remote.cdp_browser import (
+    CdpConnection,
+    CdpError,
+    attach_page,
+    capture_screenshot,
+    eval_js,
+    navigate_page,
+    open_and_extract,
+    page_title,
+)
 
 # Maximum stdout/stderr we surface to the caller. aio-sandbox itself caps
 # raw output at 30 KB per call; we tighten that for LLM consumption.
 _STDOUT_LIMIT = 10000
 _STDERR_LIMIT = 5000
+
+# CDP domains that escape per-conversation isolation in the SHARED container:
+# Target.* can enumerate/attach to other conversations' contexts; Browser.* is
+# a process-global (e.g. Browser.close would kill Chrome for everyone). The
+# agent-facing web_cdp tool rejects these; the backend may still call Target.*
+# internally to manage its own context/page.
+_BROWSER_GLOBAL_CDP_DOMAINS = ("Target.", "Browser.")
+
+
+def _is_browser_global_method(method: str) -> bool:
+    return method.startswith(_BROWSER_GLOBAL_CDP_DOMAINS)
 
 
 def compute_session_anchor(
@@ -148,6 +169,11 @@ class AioSandboxBackend(BaseSandboxBackend):
         # browser context. Lives on this cached instance like _jupyter_sessions;
         # will be disposed in _evict_anchor (Task 5).
         self._browser_contexts: dict[str, str] = {}
+        # anchor -> CDP targetId for the PERSISTENT RPA page. Lives in the
+        # anchor's browserContext and is never closed between calls, so the
+        # page's URL/DOM/cookies/login survive across web_* tool calls. Disposed
+        # together with the context in _evict_anchor.
+        self._browser_pages: dict[str, str] = {}
 
     # ------------------------------------------------------------------ Public API
 
@@ -290,6 +316,9 @@ class AioSandboxBackend(BaseSandboxBackend):
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"[AioSandbox] evict jupyter kernel for {anchor!r} failed: {e}")
         browser_ctx = self._browser_contexts.pop(anchor, None)
+        # The persistent page lives inside browser_ctx; disposing the context
+        # below kills its target, so just drop the stale id.
+        self._browser_pages.pop(anchor, None)
         if browser_ctx:
             try:
                 ws_url = await self._browser_ws_url(client)
@@ -882,6 +911,50 @@ class AioSandboxBackend(BaseSandboxBackend):
         ctx = created["browserContextId"]
         self._browser_contexts[anchor] = ctx
         return ctx
+
+    async def _ensure_browser_page(self, conn, anchor: str, *, timeout: float) -> tuple[str, str]:
+        """Get-or-create the anchor's persistent RPA page; return (targetId, sessionId).
+
+        The target lives in the anchor's browserContext and is never closed, so
+        page state survives across calls. sessionId is connection-scoped, so we
+        re-attach on every new websocket. A stale targetId (e.g. container
+        restart) fails to attach and is transparently recreated.
+        """
+        ctx = await self._ensure_browser_context(conn, anchor, timeout=timeout)
+        target_id = self._browser_pages.get(anchor)
+        if target_id:
+            try:
+                sid = await attach_page(conn, target_id, timeout=timeout)
+                return target_id, sid
+            except CdpError:
+                self._browser_pages.pop(anchor, None)
+        created = await conn.call(
+            "Target.createTarget",
+            {"url": "about:blank", "browserContextId": ctx},
+            timeout=timeout,
+        )
+        target_id = created["targetId"]
+        self._browser_pages[anchor] = target_id
+        sid = await attach_page(conn, target_id, timeout=timeout)
+        return target_id, sid
+
+    @asynccontextmanager
+    async def _rpa_page(self, agent_id: str | None, conversation_id: str | None, *, timeout: float):
+        """Connect, register/evict the anchor, ensure its persistent page, attach.
+
+        Yields (conn, session_id) routed to the anchor's persistent RPA page.
+        Closes the websocket on exit; the page (targetId) and its state survive
+        for the next call.
+        """
+        anchor = compute_session_anchor(agent_id, conversation_id)
+        async with httpx.AsyncClient() as client:
+            for stale in self._register_anchor(agent_id or "default", anchor):
+                await self._evict_anchor(client, stale)
+            ws_url = await self._browser_ws_url(client)
+            async with websockets.connect(ws_url, max_size=20_000_000) as ws_conn:
+                conn = CdpConnection(ws_conn)
+                _, sid = await self._ensure_browser_page(conn, anchor, timeout=timeout)
+                yield conn, sid
 
     async def browse(
         self,
