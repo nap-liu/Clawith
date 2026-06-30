@@ -11865,6 +11865,28 @@ async def _get_email_config(agent_id: uuid.UUID) -> dict:
 
 # ── Pages: public HTML hosting ──────────────────────────
 
+async def _resolve_public_base_url() -> str:
+    """Resolve the platform's public base URL for building shareable links.
+
+    Reads, in priority order, the PUBLIC_BASE_URL env var then the value an admin
+    saved in the web UI (system_settings.platform.public_base_url). Returns an
+    empty string when nothing public is configured — callers then fall back to a
+    relative path rather than emitting a localhost link.
+    """
+    try:
+        from app.services.platform_service import platform_service
+        async with async_session() as db:
+            base = (await platform_service.get_public_base_url(db=db) or "").rstrip("/")
+        # get_public_base_url returns http://localhost:8000 as its last-resort
+        # default; treat that as "not publicly configured" so we don't hand out
+        # links that only resolve on the server itself.
+        if base and base != "http://localhost:8000":
+            return base
+    except Exception:
+        pass
+    return (os.environ.get("PUBLIC_BASE_URL", "") or "").rstrip("/")
+
+
 async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     """Publish an HTML file as a public page."""
     import secrets
@@ -11922,22 +11944,19 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     except Exception as e:
         return f"Failed to publish: {e}"
 
-    # Build public URL from the same settings loader used by the app. Reading
-    # os.environ directly misses values that come from the local .env file.
-    try:
-        from app.config import get_settings as _get_publish_settings
-        public_base = (_get_publish_settings().PUBLIC_BASE_URL or os.environ.get("PUBLIC_BASE_URL", "")).rstrip("/")
-    except Exception:
-        public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    # Build the public URL via the platform service so it picks up the domain
+    # an admin configured in the web UI (system_settings.platform.public_base_url),
+    # not just the PUBLIC_BASE_URL env var. Priority: env → DB → localhost fallback.
+    public_base = await _resolve_public_base_url()
     if not public_base:
-        # Relative path works inside the same deployment; include a note so
-        # the user can configure PUBLIC_BASE_URL for a fully-qualified link.
+        # Nothing public is configured; fall back to a relative path that still
+        # works inside the same deployment, plus a hint for the admin.
         url = f"/p/{short_id}"
         url_note = (
-            "\n\n> Note: PUBLIC_BASE_URL is not configured on this server. "
+            "\n\n> Note: no public base URL is configured on this server. "
             "The link above is a relative path — prepend your server's domain "
-            "to get the full URL. Set PUBLIC_BASE_URL in your .env to have "
-            "the agent generate complete links automatically."
+            "to get the full URL. An admin can set it in the company settings "
+            "(or PUBLIC_BASE_URL in .env) so links come out fully-qualified."
         )
     else:
         url = f"{public_base}/p/{short_id}"
@@ -11960,11 +11979,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
 async def _list_published_pages(agent_id: uuid.UUID) -> str:
     """List all published pages for this agent."""
     from app.models.published_page import PublishedPage
-    try:
-        from app.config import get_settings as _get_publish_settings
-        public_base = (_get_publish_settings().PUBLIC_BASE_URL or os.environ.get("PUBLIC_BASE_URL", "")).rstrip("/")
-    except Exception:
-        public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    public_base = await _resolve_public_base_url()
 
     try:
         async with async_session() as db:
