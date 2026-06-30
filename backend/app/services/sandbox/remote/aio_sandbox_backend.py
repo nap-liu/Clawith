@@ -82,11 +82,7 @@ from app.services.sandbox.remote.cdp_browser import (
     CdpConnection,
     CdpError,
     attach_page,
-    capture_screenshot,
-    eval_js,
-    navigate_page,
     open_and_extract,
-    page_title,
 )
 
 # Maximum stdout/stderr we surface to the caller. aio-sandbox itself caps
