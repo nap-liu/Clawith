@@ -119,6 +119,35 @@ def build_execution_runtime_trigger(trigger: AgentTrigger, execution: TriggerExe
     )
 
 
+def apply_base_trigger_fired_state(trigger: AgentTrigger, now: datetime) -> None:
+    """Single source of truth for the 'this trigger just fired' state transition.
+
+    Applied in place when the lease/execution path claims a trigger for firing.
+    Covers the stamp (last_fired_at / fire_count), single-shot auto-disable, and
+    the legacy-webhook pending clear.
+
+    The legacy-webhook clear is critical: ``_evaluate_trigger`` treats a legacy
+    webhook as due whenever ``_webhook_pending`` is truthy, so if it is never
+    reset the daemon re-fires the same webhook every cooldown forever (the
+    runaway that burned ~1 fire/minute). The clear used to live inline in the
+    daemon tick, but that block became dead code once every runtime trigger
+    carries an ``_execution_id`` (the tick skips it) — so it has to happen here,
+    the one place that now owns post-fire state. queue/merge webhooks advance via
+    a different mechanism (``_webhook_queue`` / ``_advance_webhook_trigger``) and
+    must NOT be touched here.
+    """
+    trigger.last_fired_at = now
+    trigger.fire_count = (trigger.fire_count or 0) + 1
+    if trigger.type == "once":
+        trigger.is_enabled = False
+    if trigger.max_fires and trigger.fire_count >= trigger.max_fires:
+        trigger.is_enabled = False
+    if trigger.type == "webhook":
+        cfg = trigger.config or {}
+        if cfg.get("webhook_mode", "legacy") == "legacy":
+            trigger.config = {**cfg, "_webhook_pending": False, "_webhook_payload": None}
+
+
 async def mark_base_triggers_fired(trigger_ids: list[uuid.UUID], now: datetime) -> None:
     if not trigger_ids:
         return
@@ -127,10 +156,5 @@ async def mark_base_triggers_fired(trigger_ids: list[uuid.UUID], now: datetime) 
             select(AgentTrigger).where(AgentTrigger.id.in_(trigger_ids))
         )
         for trigger in result.scalars().all():
-            trigger.last_fired_at = now
-            trigger.fire_count += 1
-            if trigger.type == "once":
-                trigger.is_enabled = False
-            if trigger.max_fires and trigger.fire_count >= trigger.max_fires:
-                trigger.is_enabled = False
+            apply_base_trigger_fired_state(trigger, now)
         await db.commit()
