@@ -1128,61 +1128,16 @@ async def _tick():
             continue  # Skip — invoked too recently
         _last_invoke[agent_id] = now
 
-        # ── Immediately update trigger state BEFORE launching async task ──
-        # This prevents the next tick from re-evaluating the same trigger as
-        # "should fire" while the LLM call is still running (which can take
-        # minutes). Without this, the 15s tick interval + 30s dedup window
-        # would cause repeated invocations for long-running triggers.
-        try:
-            async with async_session() as db:
-                for t in agent_triggers:
-                    cfg = t.config or {}
-                    if isinstance(cfg, str):
-                        import json
-                        try:
-                            cfg = json.loads(cfg)
-                        except (json.JSONDecodeError, TypeError):
-                            cfg = {}
-                    if cfg.get("_execution_id"):
-                        continue
-                    result = await db.execute(
-                        select(AgentTrigger).where(AgentTrigger.id == t.id)
-                    )
-                    trigger = result.scalar_one_or_none()
-                    if trigger:
-                        trigger.last_fired_at = now
-                        trigger.fire_count += 1
-                        # Auto-disable single-shot types only
-                        if trigger.type == "once":
-                            trigger.is_enabled = False
-                        if trigger.type == "webhook" and trigger.config:
-                            wmode = trigger.config.get("webhook_mode", "legacy")
-                            if wmode == "legacy":
-                                trigger.config = {
-                                    **trigger.config,
-                                    "_webhook_pending": False,
-                                    "_webhook_payload": None,
-                                }
-                            else:
-                                # queue/merge: acquire the serial lock. Do NOT pop the
-                                # queue yet — it is advanced after the async session
-                                # finishes (success OR failure). merge records how many
-                                # entries this batch consumes so the post-step can drop
-                                # exactly that many (entries appended mid-session stay).
-                                new_cfg = {
-                                    **trigger.config,
-                                    "_webhook_active": True,
-                                    "_webhook_active_since": now.isoformat(),
-                                }
-                                if wmode == "merge":
-                                    new_cfg["_webhook_batch_size"] = len(trigger.config.get("_webhook_queue") or [])
-                                trigger.config = new_cfg
-                        if trigger.max_fires and trigger.fire_count >= trigger.max_fires:
-                            trigger.is_enabled = False
-                await db.commit()
-        except Exception as e:
-            logger.warning(f"Failed to pre-update trigger state: {e}")
-
+        # Trigger state (last_fired_at / fire_count / single-shot auto-disable /
+        # legacy-webhook `_webhook_pending` clear) is updated atomically at claim
+        # time by mark_base_triggers_fired → apply_base_trigger_fired_state,
+        # BEFORE this loop runs — which is what stops a long-running trigger from
+        # re-firing on the next tick. Every runtime trigger reaching this point
+        # carries an `_execution_id`, so the old inline pre-update block here was
+        # unreachable dead code (it `continue`d on `_execution_id`). Worse, that
+        # dead copy was the ONLY place clearing legacy `_webhook_pending`, so once
+        # the lease path took over, legacy webhooks re-fired every cooldown
+        # forever. Removed to keep a single source of truth in executions.py.
         asyncio.create_task(_invoke_agent_for_triggers(agent_id, agent_triggers))
 
 

@@ -16,7 +16,17 @@ import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/Wor
 import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import type { FocusApiItem } from '../../services/api';
 import ModelSwitcher from '../../components/ModelSwitcher';
+import ConfirmationCard from '../../components/ConfirmationCard';
 import { useAppStore } from '../../stores';
+
+// A confirmation card is just a `request_confirmation` tool_call rendered specially —
+// the left/right perspective logic stays unaware of it; the renderer keys off the tool name.
+const CONFIRMATION_TOOL = 'request_confirmation';
+const isConfirmationToolCall = (msg: any): boolean => {
+    if (!msg || msg.role !== 'tool_call') return false;
+    const name = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })();
+    return name === CONFIRMATION_TOOL;
+};
 import { useAuthStore } from '../../stores';
 import { copyToClipboard } from '../../utils/clipboard';
 import { formatFileSize } from '../../utils/formatFileSize';
@@ -2176,6 +2186,10 @@ export default function AgentDetailPage() {
     const reconnectAttemptsRef = useRef<Record<SessionRuntimeKey, number>>({});
     const sessionUiStateRef = useRef<Record<SessionRuntimeKey, { isWaiting: boolean; isStreaming: boolean }>>({});
     const activeSessionIdRef = useRef<string | null>(null);
+    // True while the active session is a READ-ONLY monitor view (a session the
+    // viewer may see but does not own). Live broadcasts are then mirrored into
+    // `historyMsgs` (the read-only view's source) instead of `chatMessages`.
+    const activeReadOnlyRef = useRef<boolean>(false);
     const currentAgentIdRef = useRef<string | undefined>(id);
     const sessionMsgAbortRef = useRef<AbortController | null>(null);
     const sessionLoadSeqRef = useRef(0);
@@ -2415,6 +2429,7 @@ export default function AgentDetailPage() {
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
+                ...(m.toolCallId && { toolCallId: m.toolCallId }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -2559,14 +2574,21 @@ export default function AgentDetailPage() {
     const upsertToolCallMessage = (toolMsg: ChatMsg) => {
         setChatMessages(prev => {
             const incomingTarget = getToolTargetKey(toolMsg.toolArgs);
+            // An EXACT toolCallId match is the same tool call — update it in place regardless
+            // of status (e.g. a confirmation card loaded 'pending' from history being flipped
+            // to 'done' by the resolve broadcast; without this it appends a duplicate card).
+            const exactIdMatch = (msg: ChatMsg) =>
+                msg.role === 'tool_call' && !!toolMsg.toolCallId && msg.toolCallId === toolMsg.toolCallId;
             const sameTool = (msg: ChatMsg) => (
-                msg.role === 'tool_call'
-                && msg.toolName === toolMsg.toolName
-                && msg.toolStatus === 'running'
-                && (
-                    (!!toolMsg.toolCallId && !!msg.toolCallId && msg.toolCallId === toolMsg.toolCallId)
-                    || (!!incomingTarget && getToolTargetKey(msg.toolArgs) === incomingTarget)
-                    || (!toolMsg.toolCallId && !incomingTarget)
+                exactIdMatch(msg)
+                || (
+                    msg.role === 'tool_call'
+                    && msg.toolName === toolMsg.toolName
+                    && msg.toolStatus === 'running'
+                    && (
+                        (!!incomingTarget && getToolTargetKey(msg.toolArgs) === incomingTarget)
+                        || (!toolMsg.toolCallId && !incomingTarget)
+                    )
                 )
             );
             const runningIdx = [...prev].reverse().findIndex(sameTool);
@@ -2835,6 +2857,40 @@ export default function AgentDetailPage() {
         return parsed;
     };
 
+    // Fold one live WS broadcast event into the READ-ONLY view's message list
+    // (`historyMsgs`). Mirrors the streaming-bubble logic the writable live view
+    // applies to `chatMessages`, so a monitored session updates live (user msg +
+    // streamed assistant reply) while keeping the read-only view's pagination and
+    // sender attribution intact. Returns the list unchanged for unhandled types.
+    const applyMonitorEvent = (prev: any[], d: any): any[] => {
+        const last = prev[prev.length - 1];
+        const isStreamingAssistant = last && last.role === 'assistant' && (last as any)._streaming;
+        if (d.type === 'channel_user_message') {
+            if (last && last.role === 'user' && last.content === d.content
+                && ((last as any).sender_name || '') === (d.sender_name || '')) return prev;
+            return [...prev, parseChatMsg({
+                role: 'user', content: d.content || '',
+                ...(d.sender_name ? { sender_name: d.sender_name } : {}),
+                ...(d.user_id ? { sender_user_id: String(d.user_id) } : {}),
+                timestamp: new Date().toISOString(),
+            } as any)];
+        }
+        if (d.type === 'thinking') {
+            if (isStreamingAssistant) return [...prev.slice(0, -1), { ...last, thinking: (last.thinking || '') + d.content }];
+            return [...prev, { role: 'assistant', content: '', thinking: d.content, _streaming: true } as any];
+        }
+        if (d.type === 'chunk') {
+            if (isStreamingAssistant) return [...prev.slice(0, -1), { ...last, content: last.content + d.content }];
+            return [...prev, { role: 'assistant', content: d.content, _streaming: true } as any];
+        }
+        if (d.type === 'done') {
+            const thinking = isStreamingAssistant ? (last as any).thinking : undefined;
+            if (isStreamingAssistant) return [...prev.slice(0, -1), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() } as any)];
+            return [...prev, parseChatMsg({ role: d.role || 'assistant', content: d.content, timestamp: new Date().toISOString() } as any)];
+        }
+        return prev;
+    };
+
 
     useEffect(() => {
         currentAgentIdRef.current = id;
@@ -3015,6 +3071,30 @@ export default function AgentDetailPage() {
                 }
                 if (['done', 'error', 'quota_exceeded'].includes(d.type)) {
                     closeSessionSocket(key, true);
+                }
+                if (['confirmation_card', 'confirmation_update'].includes(d.type)) {
+                    // fall through to handle confirmation events even for inactive runtime
+                } else {
+                    return;
+                }
+            }
+
+            // Active READ-ONLY monitor: mirror live broadcasts into the read-only
+            // view's list (`historyMsgs`) instead of the writable live view's
+            // `chatMessages`. The composer stays disabled — we only reflect the
+            // conversation as it streams in, so a monitored channel / other-user
+            // session updates live instead of only on reload.
+            if (activeReadOnlyRef.current) {
+                if (['channel_user_message', 'thinking', 'chunk', 'done'].includes(d.type)) {
+                    const hel = historyContainerRef.current;
+                    const nearBottom = !hel || hel.scrollHeight - hel.scrollTop - hel.clientHeight < 120;
+                    setHistoryMsgs(prev => applyMonitorEvent(prev, d));
+                    if (nearBottom) scheduleHistoryScrollToBottom();
+                    if (d.type === 'done') {
+                        const sid = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
+                        if (sid) clearUnreadForSession(sid);
+                        fetchMySessions(true, agentId);
+                    }
                 }
                 return;
             }
@@ -3209,9 +3289,12 @@ export default function AgentDetailPage() {
                 });
             } else if (d.type === 'done') {
                 setChatMessages(prev => {
-                    const last = prev[prev.length - 1];
-                    const thinking = (last && last.role === 'assistant' && (last as any)._streaming) ? last.thinking : undefined;
-                    if (last && last.role === 'assistant' && (last as any)._streaming) return [...prev.slice(0, -1), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() })];
+                    const revIdx = [...prev].reverse().findIndex(m => m.role === 'assistant' && (m as any)._streaming);
+                    if (revIdx >= 0) {
+                        const realIdx = prev.length - 1 - revIdx;
+                        const thinking = prev[realIdx].thinking;
+                        return [...prev.slice(0, realIdx), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() }), ...prev.slice(realIdx + 1)];
+                    }
                     return [...prev, parseChatMsg({ role: d.role, content: d.content, timestamp: new Date().toISOString() })];
                 });
                 const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
@@ -3312,10 +3395,11 @@ export default function AgentDetailPage() {
             return;
         }
         activeSessionIdRef.current = String(activeSession.id);
-        if (!isWritableSession(activeSession)) {
-            syncActiveSocketState(activeSession, id);
-            return;
-        }
+        activeReadOnlyRef.current = !isWritableSession(activeSession);
+        // Open a live socket for ANY visible session — including ones the viewer
+        // does not own (read-only monitor). The backend accepts those read-only
+        // (composer stays disabled), so monitored channel / other-user
+        // conversations update live instead of only on reload.
         ensureSessionSocket(activeSession, id, token);
         syncActiveSocketState(activeSession, id);
     }, [id, token, activeTab, activeSession?.id, chatScope, canViewAllAgentChatSessions]);
@@ -3328,7 +3412,8 @@ export default function AgentDetailPage() {
         const onVisibility = () => {
             if (document.hidden) return;
             if (!id || !token || activeTab !== 'chat') return;
-            if (!activeSession || !isWritableSession(activeSession)) return;
+            // Resume the socket for any visible session, including read-only monitors.
+            if (!activeSession) return;
             const key = buildSessionRuntimeKey(id, String(activeSession.id));
             const ws = wsMapRef.current[key];
             if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
@@ -3492,6 +3577,7 @@ export default function AgentDetailPage() {
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
+                ...(m.toolCallId && { toolCallId: m.toolCallId }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -3686,7 +3772,7 @@ export default function AgentDetailPage() {
         let hasFutureTool = false;
         for (let i = messages.length - 1; i >= 0; i--) {
             const msg = messages[i];
-            if (msg.role === 'tool_call') {
+            if (msg.role === 'tool_call' && !isConfirmationToolCall(msg)) {
                 msgClass[i] = 'analysis';
                 hasFutureTool = true;
             } else if (msg.role === 'user') {
@@ -3834,6 +3920,30 @@ export default function AgentDetailPage() {
                             />
                         )}
                     </React.Fragment>
+                );
+            }
+            if (msg.role === 'tool_call' && isConfirmationToolCall(msg)) {
+                // A confirmation card is the rich rendering of a suspended request_confirmation
+                // tool_call. Like any tool call it lives on the agent's side (analysis groups
+                // default the same via { isLeft: true }); the left/right viewOf logic stays
+                // unaware of it. Content = the tool_call args; state = its status/result.
+                const parsed = (() => { try { return JSON.parse(msg.content || '{}'); } catch { return {}; } })();
+                const cardArgs = (msg as any).toolArgs || parsed.args || {};
+                const cardStatus = (msg as any).toolStatus || parsed.status;
+                const cardResult = (msg as any).toolResult ?? parsed.result ?? '';
+                const cardAvatar = (((agent as any)?.name || 'Agent')[0]) || 'A';
+                return (
+                    <div key={i} className="chat-msg-row">
+                        <div className="chat-msg-avatar">{cardAvatar}</div>
+                        <ConfirmationCard
+                            agentId={id!}
+                            t={t}
+                            callId={(msg as any).toolCallId || ''}
+                            args={cardArgs}
+                            resolved={cardStatus === 'done'}
+                            result={cardResult}
+                        />
+                    </div>
                 );
             }
             return (

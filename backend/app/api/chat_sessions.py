@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import and_, cast, func, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access
+from app.core.permissions import can_view_all_agent_chat_sessions, check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.audit import ChatMessage
@@ -20,12 +20,9 @@ from app.models.user import User
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
 
-def _can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
-    """Admins and the agent creator may list/view/delete other users' chat sessions."""
-    return (
-        user.role in ("platform_admin", "org_admin", "agent_admin")
-        or str(agent.creator_id) == str(user.id)
-    )
+# Single source of truth lives in app.core.permissions; aliased here so the
+# existing call sites (and their "_" private-by-convention name) stay unchanged.
+_can_view_all_agent_chat_sessions = can_view_all_agent_chat_sessions
 
 
 class SessionOut(BaseModel):
@@ -504,6 +501,10 @@ async def get_session_messages(
         if m.role == "tool_call":
             from app.services.chat_history import parse_tool_call_for_display
             entry: dict = {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
+            # The row id is the tool_call's handle on replay (resolve + live-flip key off it):
+            # the persisted JSON has no call_id, so a confirmation card loaded from history can
+            # only be clicked / live-updated if we surface the row id as the toolCallId.
+            entry["toolCallId"] = str(m.id)
             parsed = parse_tool_call_for_display(m.content)
             if parsed:
                 entry["content"] = ""
@@ -535,6 +536,10 @@ async def get_session_messages(
             if sender_user_id:
                 entry["sender_user_id"] = sender_user_id
             out.append(entry)
+
+    # NB: confirmation cards are NOT merged here any more — a card is just a
+    # `request_confirmation` tool_call row, already returned as a normal tool_call
+    # message above (the frontend renders that specific tool as the card).
 
     return out
 

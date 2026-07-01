@@ -72,6 +72,7 @@ from app.services.llm.finish import (
     FINISH_TOOL_DEFINITION,
     FINISH_TOOL_NAME,
 )
+from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
@@ -3006,12 +3007,17 @@ async def execute_tool(
     user_id: uuid.UUID,
     session_id: str = "",
     on_output=None,
+    skip_autonomy: bool = False,
 ) -> str:
     """Execute a tool call and return the result as a string.
 
     Args:
         session_id: The ChatSession ID, used to isolate AgentBay instances
                     per conversation. Passed through to agentbay_* tools.
+        skip_autonomy: Skip the autonomy boundary check. Used when a human has
+                    already approved this exact action (e.g. a confirmation card
+                    the user confirmed) — the card IS the approval, so re-gating
+                    on autonomy would be redundant.
     """
     if not isinstance(tool_name, str):
         tool_name = str(tool_name or "")
@@ -3028,13 +3034,20 @@ async def execute_tool(
         content = arguments.get("content", "")
         return content if isinstance(content, str) else str(content)
 
+    # Defensive guard: request_confirmation must be intercepted by the caller
+    # loop before reaching execute_tool. If it somehow lands here, return a
+    # clear signal instead of falling through to unknown-tool handling.
+    if tool_name == REQUEST_CONFIRMATION_TOOL_NAME:
+        return "⚠️ request_confirmation 由确认流程处理,不应到达工具执行层"
+
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
 
     ws = _agent_workspace_root(agent_id)
 
-    # ── Autonomy boundary check ──
+    # ── Autonomy boundary check (skipped when a human already approved, e.g. a
+    #    confirmation card the user confirmed) ──
     action_type = _TOOL_AUTONOMY_MAP.get(tool_name)
-    if action_type:
+    if action_type and not skip_autonomy:
         try:
             from app.services.autonomy_service import autonomy_service
             from app.models.agent import Agent as AgentModel
@@ -12126,6 +12139,28 @@ async def _get_email_config(agent_id: uuid.UUID) -> dict:
 
 # ── Pages: public HTML hosting ──────────────────────────
 
+async def _resolve_public_base_url() -> str:
+    """Resolve the platform's public base URL for building shareable links.
+
+    Reads, in priority order, the PUBLIC_BASE_URL env var then the value an admin
+    saved in the web UI (system_settings.platform.public_base_url). Returns an
+    empty string when nothing public is configured — callers then fall back to a
+    relative path rather than emitting a localhost link.
+    """
+    try:
+        from app.services.platform_service import platform_service
+        async with async_session() as db:
+            base = (await platform_service.get_public_base_url(db=db) or "").rstrip("/")
+        # get_public_base_url returns http://localhost:8000 as its last-resort
+        # default; treat that as "not publicly configured" so we don't hand out
+        # links that only resolve on the server itself.
+        if base and base != "http://localhost:8000":
+            return base
+    except Exception:
+        pass
+    return (os.environ.get("PUBLIC_BASE_URL", "") or "").rstrip("/")
+
+
 async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     """Publish an HTML file as a public page."""
     import secrets
@@ -12153,59 +12188,84 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     except Exception:
         title = Path(path).stem
 
-    # Generate short_id
-    short_id = secrets.token_urlsafe(6)[:8]  # 8-char URL-safe string
-
-    # Look up tenant_id
-    tenant_id = None
-    try:
-        from app.models.agent import Agent as _AgModel
-        async with async_session() as _db:
-            _r = await _db.execute(select(_AgModel.tenant_id).where(_AgModel.id == agent_id))
-            tenant_id = _r.scalar_one_or_none()
-    except Exception:
-        pass
-
-    # Create record
+    # Stable URL per source file. Re-publishing the SAME file must return the
+    # SAME short_id: the /p/<id> route serves the file live, so one stable link
+    # already reflects every edit. Minting a fresh id on each publish (the old
+    # behavior) scattered views across dozens of equivalent links and left users
+    # asking "which link is current?" — e.g. one report file had 25 distinct
+    # short_ids. So reuse an existing page for this (agent_id, source_path);
+    # only mint a new id when the file was never published before.
     from app.models.published_page import PublishedPage
+    reused = False
     try:
         async with async_session() as db:
-            page = PublishedPage(
-                short_id=short_id,
-                agent_id=agent_id,
-                user_id=user_id,
-                tenant_id=tenant_id,
-                source_path=path,
-                title=title,
-            )
-            db.add(page)
-            await db.commit()
+            existing = (
+                await db.execute(
+                    select(PublishedPage)
+                    .where(
+                        PublishedPage.agent_id == agent_id,
+                        PublishedPage.source_path == path,
+                    )
+                    .order_by(PublishedPage.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                short_id = existing.short_id
+                reused = True
+                if title and existing.title != title:
+                    existing.title = title  # refresh title; same link
+                    await db.commit()
+            else:
+                # New file → mint a short_id and resolve tenant_id for the row.
+                tenant_id = None
+                try:
+                    from app.models.agent import Agent as _AgModel
+                    _r = await db.execute(select(_AgModel.tenant_id).where(_AgModel.id == agent_id))
+                    tenant_id = _r.scalar_one_or_none()
+                except Exception:
+                    tenant_id = None
+                short_id = secrets.token_urlsafe(6)[:8]  # 8-char URL-safe string
+                db.add(
+                    PublishedPage(
+                        short_id=short_id,
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        source_path=path,
+                        title=title,
+                    )
+                )
+                await db.commit()
     except Exception as e:
         return f"Failed to publish: {e}"
 
-    # Build public URL from the same settings loader used by the app. Reading
-    # os.environ directly misses values that come from the local .env file.
-    try:
-        from app.config import get_settings as _get_publish_settings
-        public_base = (_get_publish_settings().PUBLIC_BASE_URL or os.environ.get("PUBLIC_BASE_URL", "")).rstrip("/")
-    except Exception:
-        public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    # Build the public URL via the platform service so it picks up the domain
+    # an admin configured in the web UI (system_settings.platform.public_base_url),
+    # not just the PUBLIC_BASE_URL env var. Priority: env → DB → localhost fallback.
+    public_base = await _resolve_public_base_url()
     if not public_base:
-        # Relative path works inside the same deployment; include a note so
-        # the user can configure PUBLIC_BASE_URL for a fully-qualified link.
+        # Nothing public is configured; fall back to a relative path that still
+        # works inside the same deployment, plus a hint for the admin.
         url = f"/p/{short_id}"
         url_note = (
-            "\n\n> Note: PUBLIC_BASE_URL is not configured on this server. "
+            "\n\n> Note: no public base URL is configured on this server. "
             "The link above is a relative path — prepend your server's domain "
-            "to get the full URL. Set PUBLIC_BASE_URL in your .env to have "
-            "the agent generate complete links automatically."
+            "to get the full URL. An admin can set it in the company settings "
+            "(or PUBLIC_BASE_URL in .env) so links come out fully-qualified."
         )
     else:
         url = f"{public_base}/p/{short_id}"
         url_note = ""
 
+    headline = (
+        "Updated in place — the page already had a public link, so the SAME URL "
+        "now serves the latest content (no new link is created)."
+        if reused
+        else "Published successfully!"
+    )
     return (
-        f"Published successfully!\n\n"
+        f"{headline}\n\n"
         f"Public URL: {url}\n"
         f"Title: {title}\n\n"
         f"Anyone can access this page without logging in.{url_note}\n\n"
@@ -12221,11 +12281,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
 async def _list_published_pages(agent_id: uuid.UUID) -> str:
     """List all published pages for this agent."""
     from app.models.published_page import PublishedPage
-    try:
-        from app.config import get_settings as _get_publish_settings
-        public_base = (_get_publish_settings().PUBLIC_BASE_URL or os.environ.get("PUBLIC_BASE_URL", "")).rstrip("/")
-    except Exception:
-        public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    public_base = await _resolve_public_base_url()
 
     try:
         async with async_session() as db:

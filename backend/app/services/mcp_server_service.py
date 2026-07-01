@@ -13,6 +13,8 @@ Composition rules (from design spec §3.3):
 
 from __future__ import annotations
 
+import hashlib
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -202,13 +204,24 @@ async def build_placeholder_context_for_call(
 
 # ─── Bridge helper: find-or-create mcp_servers row ─────────────────────────
 
-import re  # noqa: E402 — appended section
 
+def _slugify_server_name(name: str, url_seed: str | None = None) -> str:
+    """e.g. 'My RAGFlow' -> 'my_ragflow'.
 
-def _slugify_server_name(name: str) -> str:
-    """e.g. 'My RAGFlow' -> 'my_ragflow'."""
+    Pure-CJK (or otherwise ASCII-free) names slugify to the empty string. A
+    bare ``"mcp_server"`` fallback would then collapse EVERY such server to the
+    same base name, so their per-server tool names (``mcp_<srv.name>_<tool>``)
+    would all collide on the global ``Tool.name`` — the root of the cross-wiring
+    bug where one agent's MCP call routed to another's server/credential. When a
+    ``url_seed`` is given, fall back to a short stable hash of it instead so each
+    distinct endpoint gets a distinct, order-independent, underscore-only base.
+    """
     s = re.sub(r"[^a-z0-9_-]", "_", name.lower()).strip("_")
-    return s or "mcp_server"
+    if s:
+        return s
+    if url_seed:
+        return f"mcp_{hashlib.sha1(url_seed.encode('utf-8')).hexdigest()[:8]}"
+    return "mcp_server"
 
 
 async def persist_stdio_discovered_tools(
@@ -311,8 +324,9 @@ async def upsert_mcp_server_from_tools(
         await db.flush()
         return existing.id
 
-    # Create new — derive unique name
-    base = _slugify_server_name(server_name)
+    # Create new — derive unique name (seed the fallback from the URL so
+    # ASCII-free names don't all collapse to the same base; see docstring).
+    base = _slugify_server_name(server_name, url_seed=server_url)
     name = base
     suffix = 2
     while True:

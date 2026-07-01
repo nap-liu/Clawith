@@ -1233,7 +1233,11 @@ export default function EnterpriseSettings() {
 
                                 const renderToolRow = (tool: any, category: string, idx: number, total: number) => {
                                     const hasCategoryConfig = !!GLOBAL_CATEGORY_CONFIG_SCHEMAS[category];
-                                    const hasOwnConfig = tool.config_schema?.fields?.length > 0 && !hasCategoryConfig;
+                                    // Count only company-configurable fields — a tool whose fields are all
+                                    // agent_only (e.g. request_confirmation's card template) has nothing to
+                                    // configure globally, so it shows no config entry here.
+                                    const globalFieldCount = (tool.config_schema?.fields || []).filter((f: any) => !f.agent_only).length;
+                                    const hasOwnConfig = globalFieldCount > 0 && !hasCategoryConfig;
                                     const isConfigured = hasMeaningfulConfig(tool.config);
                                     return (
                                         <div key={tool.id} style={{
@@ -1450,6 +1454,9 @@ export default function EnterpriseSettings() {
                                 const tool = allTools.find(t => t.id === editingToolId);
                                 if (!tool) return null;
                                 const visibleFields = (tool.config_schema.fields || []).filter((field: any) => {
+                                    // agent_only fields are configured per-agent (e.g. a DingTalk card
+                                    // template bound to each agent's own app) — never at company level.
+                                    if (field.agent_only) return false;
                                     if (field.depends_on) {
                                         return Object.entries(field.depends_on).every(([k, vals]: [string, any]) =>
                                             vals.includes(editingConfig[k])

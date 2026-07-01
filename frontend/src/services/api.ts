@@ -287,6 +287,10 @@ export const agentApi = {
 
     gatewayMessages: (id: string) =>
         request<any[]>(`/agents/${id}/gateway-messages`),
+
+    // cid is the request_confirmation tool_call row id; value/label are the clicked button.
+    resolveConfirmation: (id: string, cid: string, value: string, label?: string) =>
+        request<any>(`/agents/${id}/confirmations/${cid}/resolve`, { method: 'POST', body: JSON.stringify({ value, label }) }),
 };
 
 // ─── Tasks ────────────────────────────────────────────

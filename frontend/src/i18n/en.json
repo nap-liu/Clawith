@@ -470,7 +470,13 @@
       "provider": "Provider",
       "toolName": "Tool",
       "inProgress": "In progress",
-      "done": "Done"
+      "done": "Done",
+      "confirmCardTitle": "Confirmation required",
+      "confirmWillRun": "Will run",
+      "confirmAction": "Confirm",
+      "cancelAction": "Cancel",
+      "confirmResolved": "Confirmed",
+      "confirmCancelled": "Cancelled"
     },
     "activityLog": {
       "title": "Activity Log",
@@ -709,7 +715,13 @@
       "mcpGroupDescription": "Tools from {{name}}",
       "noMatchingTools": "No matching tools",
       "searchTools": "Search tools...",
-      "sourceTabs": "Tool sources"
+      "sourceTabs": "Tool sources",
+      "reqConfirm": {
+        "cardTemplateId": "DingTalk confirmation card template ID",
+        "cardTemplateIdPlaceholder": "DingTalk interactive-card template ID; the template must include title/summary/action_preview/risk/status/buttons variables",
+        "cardTemplateIdHelp": "Create and publish a template in the DingTalk Card Platform first; you can download the standard template to import (fields aligned):",
+        "downloadTemplate": "Download standard template"
+      }
     },
     "toolCategories": {
       "file": "File Operations",
