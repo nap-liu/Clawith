@@ -30,8 +30,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         client_max_body_size 500m;
-        proxy_read_timeout 120s;
-        proxy_send_timeout 120s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
     }
 
     # Public pages proxy (no auth, served by backend)

@@ -4163,6 +4163,7 @@ export default function AgentDetailPage() {
                     );
                 },
                 id ? { agent_id: id } : undefined,
+                600_000, // large files: align with nginx /api/ 600s so uploads aren't cut at the 120s default
             );
             chatUploadAbortRef.current.set(draft.id, abort);
             try {
@@ -4235,6 +4236,7 @@ export default function AgentDetailPage() {
                     );
                 },
                 id ? { agent_id: id } : undefined,
+                600_000, // large files: align with nginx /api/ 600s so uploads aren't cut at the 120s default
             );
             chatUploadAbortRef.current.set(draft.id, abort);
             try {
@@ -4280,6 +4282,7 @@ export default function AgentDetailPage() {
                         setChatUploadDrafts(prev => prev.map(d => d.id === draftId ? { ...d, percent: pct >= 101 ? 100 : pct } : d));
                     },
                     id ? { agent_id: id } : undefined,
+                    600_000, // large files: align with nginx /api/ 600s
                 );
                 const data = await promise;
                 setAttachedFiles(prev => [...prev, { name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined }]);
