@@ -3823,7 +3823,7 @@ BROWSER_BUILTIN_TOOLS = [
     },
     {
         "name": "web_open",
-        "display_name": "Open Page (RPA)",
+        "display_name": "Open Page",
         "description": (
             "Navigate the conversation's PERSISTENT browser page to a URL inside the "
             "aio-sandbox container. Unlike `browse` (one-shot read), the page stays open "
@@ -3859,7 +3859,7 @@ BROWSER_BUILTIN_TOOLS = [
     },
     {
         "name": "web_eval",
-        "display_name": "Run JS in Page (RPA)",
+        "display_name": "Run JS in Page",
         "description": (
             "Run arbitrary async JavaScript in the conversation's persistent browser page "
             "(opened via web_open) and return the result. Use this to read or manipulate the "
@@ -3895,7 +3895,7 @@ BROWSER_BUILTIN_TOOLS = [
     },
     {
         "name": "web_cdp",
-        "display_name": "Raw CDP (RPA)",
+        "display_name": "Raw CDP",
         "description": (
             "Send a raw Chrome DevTools Protocol command to the conversation's persistent "
             "browser page and return the result. This exposes the full low-level browser "
@@ -3935,7 +3935,7 @@ BROWSER_BUILTIN_TOOLS = [
     },
     {
         "name": "web_screenshot",
-        "display_name": "Screenshot Page (RPA)",
+        "display_name": "Screenshot Page",
         "description": (
             "Capture a PNG screenshot of the conversation's persistent browser page (opened "
             "via web_open) and save it to your workspace. Use after interacting with the page "
