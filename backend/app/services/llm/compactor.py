@@ -78,6 +78,14 @@ COMPACT_LOCK_TTL_SECONDS = 120
 UUID_RECALL_THRESHOLD = 0.7
 MIN_SUMMARY_CHARS = 200
 
+# Futility floor: minimum estimated token mass the selected span must
+# carry for compaction to be worth running. When the trigger fires but
+# the compactable history is tiny, the prompt is dominated by
+# non-compressible content (tool schemas, system prompt) that
+# compaction cannot touch — running the summary LLM would block the
+# turn for tens of seconds every round while never lowering the ratio.
+MIN_COMPACTABLE_SPAN_TOKENS = 2000
+
 # Summary LLM gets this prompt verbatim. Wording is deliberate — the
 # "preserve verbatim" + "drop pleasantries" structure is what keeps
 # the gate's UUID-recall metric high.
@@ -603,6 +611,25 @@ async def _do_compact(
         from_idx, to_idx = span
         span_rows = rows[from_idx:to_idx + 1]
 
+        # 3.5 Futility floor — BEFORE the expensive summary LLM call.
+        # If the span's token mass can't meaningfully dent the prompt,
+        # the trigger is being driven by non-compressible prompt parts;
+        # skip fast instead of blocking the turn on a useless summary.
+        span_est_tokens = int(
+            sum(len(r.content or "") for r in span_rows) / ESTIMATE_CHARS_PER_TOKEN
+        )
+        if span_est_tokens < MIN_COMPACTABLE_SPAN_TOKENS:
+            logger.info(
+                f"[compactor] skip session={session_id}: span mass ~{span_est_tokens} tokens "
+                f"< {MIN_COMPACTABLE_SPAN_TOKENS} cannot dent trigger_prompt_tokens="
+                f"{trigger_prompt_tokens} — prompt is dominated by non-compressible "
+                f"content (tool schemas / system prompt)"
+            )
+            return CompactionResult(
+                triggered=False,
+                skipped_reason="span_mass_too_small_to_matter",
+            )
+
         # 4. Pre-filter and serialize for the summary LLM
         span_text = serialize_span_for_summary(span_rows)
 
@@ -721,7 +748,12 @@ async def _do_compact(
             f"compacted_rows={len(span_rows)} summary_tokens={summary_tokens} "
             f"recall={recall:.2f}"
         )
-        savings = trigger_prompt_tokens - summary_tokens
+        # Real savings = what actually leaves the prompt (the span, plus the
+        # prior epoch's summary this one supersedes) minus what replaces it.
+        # NOT trigger_prompt_tokens — that includes tool schemas and system
+        # prompt, which compaction never touches.
+        prior_summary_tokens = len(prior_summary) // 3 if prior_summary else 0
+        savings = span_est_tokens + prior_summary_tokens - summary_tokens
         if savings > 0:
             notice = (
                 f"🗜 已整理 {len(span_rows)} 条历史消息（epoch={new_epoch}），"
