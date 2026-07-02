@@ -12,6 +12,7 @@ All paths now support:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -92,6 +93,11 @@ TOOLS_REQUIRING_ARGS = frozenset(
 # surface a clear error so the failover layer can decide what to do.
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 
+PROVIDER_THROTTLE_RETRY_DELAYS = (1.0, 2.0)
+PROVIDER_THROTTLE_USER_MESSAGE = (
+    "⚠️ 模型服务当前繁忙或被限流，已自动重试仍未成功，请稍后再试。"
+)
+
 # Claude Code's exact prompt text for the resume nudge. Keep verbatim so we
 # inherit its tuned tone — short, no recap, no apology.
 RESUME_PROMPT = (
@@ -120,6 +126,68 @@ def _response_was_truncated_by_length(response) -> bool:
     if not reason:
         return False
     return reason in _TRUNCATED_FINISH_REASONS
+
+
+class ProviderThrottleExhausted(Exception):
+    """Raised after bounded retries for transient provider throttling."""
+
+
+def _is_provider_throttle_error(error: Exception) -> bool:
+    """Return True for transient provider throttling/capacity errors.
+
+    Quota/token-limit errors are also HTTP 429, but they are not transient
+    throttling and retrying them just burns time/tokens. Keep them distinct.
+    """
+    msg = str(error).lower()
+    if any(
+        kw in msg
+        for kw in (
+            "insufficient_quota",
+            "token-limit",
+            "exceeded your current quota",
+            "quota",
+        )
+    ):
+        return False
+
+    return any(
+        kw in msg
+        for kw in (
+            "limit_burst_rate",
+            "request rate increased too quickly",
+            "too many requests",
+            "throttled due to system capacity",
+            "system capacity limits",
+            "serviceunavailable",
+            "service unavailable",
+            "http 503",
+            "<503>",
+        )
+    )
+
+
+async def _sleep_before_throttle_retry(delay_seconds: float) -> None:
+    await asyncio.sleep(delay_seconds)
+
+
+async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_kwargs):
+    attempts = 1 + len(PROVIDER_THROTTLE_RETRY_DELAYS)
+    for attempt_idx in range(attempts):
+        try:
+            return await client.stream(**stream_kwargs)
+        except LLMError as e:
+            if not _is_provider_throttle_error(e):
+                raise
+            if attempt_idx >= len(PROVIDER_THROTTLE_RETRY_DELAYS):
+                raise ProviderThrottleExhausted(str(e)) from e
+
+            delay = PROVIDER_THROTTLE_RETRY_DELAYS[attempt_idx]
+            logger.warning(
+                f"[LLM] Provider throttle; retrying after {delay:.1f}s "
+                f"(attempt {attempt_idx + 2}/{attempts}, round {round_i}, "
+                f"provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')}): {e}"
+            )
+            await _sleep_before_throttle_retry(delay)
 
 
 # ── Repeated tool-call guard ─────────────────────────────────────────────────
@@ -726,19 +794,15 @@ async def call_llm(
 
     # Auto-assign fallback tool call logger if none provided but conversation context exists
     if on_tool_call is None and session_id:
-        from app.services.chat_session_service import save_tool_call_log
+        from app.services.chat_history import persist_tool_call
         async def _default_on_tool_call(data: dict):
             if data.get("status") == "done" and agent_id:
-                await save_tool_call_log(
+                await persist_tool_call(
+                    async_session,
                     agent_id=agent_id,
                     user_id=user_id or agent_id,
                     conversation_id=session_id,
-                    tool_name=data.get("name", ""),
-                    arguments=data.get("args"),
-                    result=data.get("result"),
-                    status="done",
-                    tool_call_id=data.get("call_id"),
-                    reasoning_content=data.get("reasoning_content"),
+                    evt=data,
                 )
         on_tool_call = _default_on_tool_call
 
@@ -872,7 +936,10 @@ async def call_llm(
                 # Final user-facing text must come through finish(content=...).
                 return None
 
-            response = await client.stream(
+            response = await _stream_with_throttle_retry(
+                client,
+                model=model,
+                round_i=round_i + 1,
                 messages=dispatch_messages,
                 tools=tools_for_llm if tools_for_llm else None,
                 temperature=model.temperature,
@@ -927,7 +994,10 @@ async def call_llm(
                     dynamic_prompt,
                     inject=False,
                 )
-                response = await client.stream(
+                response = await _stream_with_throttle_retry(
+                    client,
+                    model=model,
+                    round_i=round_i + 1,
                     messages=dispatch_messages,
                     tools=tools_for_llm if tools_for_llm else None,
                     temperature=model.temperature,
@@ -958,6 +1028,15 @@ async def call_llm(
                 # Each recovery appended exactly 2 messages.
                 del api_messages[-(2 * recovery_count_this_round) :]
                 response.content = full_content
+        except ProviderThrottleExhausted as e:
+            logger.error(
+                f"[LLM] Provider throttle exhausted: "
+                f"provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')} {e}"
+            )
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client.close()
+            return PROVIDER_THROTTLE_USER_MESSAGE
         except LLMError as e:
             logger.error(f"[LLM] LLMError: provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')} {e}")
             if agent_id and _unsaved_usage.total_tokens > 0:
