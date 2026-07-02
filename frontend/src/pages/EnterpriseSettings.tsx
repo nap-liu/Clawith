@@ -282,9 +282,11 @@ export default function EnterpriseSettings() {
         custom: t('agent.toolCategories.custom'),
         general: t('agent.toolCategories.general'),
         agentbay: t('agent.toolCategories.agentbay', 'AgentBay'),
+        browser: t('agent.toolCategories.browser', 'Browser'),
     };
     const categoryDescriptions: Record<string, string> = {
         agentbay: 'Browser and cloud computer automation',
+        browser: 'Isolated in-sandbox browser: read pages and run multi-step RPA',
         file: 'Read, write, convert, and manage workspace files',
         communication: 'Messages and cross-channel collaboration',
         search: 'Web and knowledge search tools',
@@ -302,6 +304,7 @@ export default function EnterpriseSettings() {
         const style = { color: 'var(--text-tertiary)' };
         switch (category) {
             case 'agentbay': return <IconBrowser size={size} stroke={1.8} style={style} />;
+            case 'browser': return <IconBrowser size={size} stroke={1.8} style={style} />;
             case 'file': return <IconFileText size={size} stroke={1.8} style={style} />;
             case 'communication':
             case 'feishu':

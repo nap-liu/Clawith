@@ -737,6 +737,7 @@
       "discovery": "Discovery",
       "feishu": "Feishu / Lark",
       "agentbay": "AgentBay",
+      "browser": "Browser",
       "okr": "OKR"
     },
     "upload": {
