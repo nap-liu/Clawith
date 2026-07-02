@@ -8,6 +8,9 @@ This module also exports the unified LLM client classes from client.py
 for convenient access.
 """
 
+import json
+from typing import Any
+
 from app.core.security import decrypt_data
 from app.config import get_settings
 from app.models.llm import LLMModel
@@ -81,6 +84,18 @@ def get_tool_params(provider: str) -> dict:
             "tool_choice": "auto",
             "parallel_tool_calls": True,
         }
+    return {}
+
+
+def parse_tool_arguments(raw_args: Any) -> dict[str, Any]:
+    """Parse OpenAI-style function arguments (str or dict) into a dict."""
+    if raw_args is None or raw_args == "":
+        return {}
+    if isinstance(raw_args, dict):
+        return raw_args
+    if isinstance(raw_args, str):
+        parsed = json.loads(raw_args)
+        return parsed if isinstance(parsed, dict) else {}
     return {}
 
 
@@ -230,6 +245,7 @@ __all__ = [
     "get_model_api_key",
     # Message conversion utilities
     "convert_chat_messages_to_llm_format",
+    "parse_tool_arguments",
     "truncate_messages_with_pair_integrity",
     # New client classes
     "LLMClient",

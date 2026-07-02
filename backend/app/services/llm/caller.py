@@ -17,6 +17,7 @@ import json
 import os
 import uuid
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -26,7 +27,7 @@ from app.config import get_settings
 from app.database import async_session
 
 # NOTE: agent_tools imports are deferred to function bodies to avoid circular
-# import: agent_tools → llm.finish → llm/__init__ → caller → agent_tools
+# import: agent_tools → llm/__init__ → caller → agent_tools
 
 async def get_agent_tools_for_llm(*args, **kwargs):
     from app.services.agent_tools import get_agent_tools_for_llm as _impl
@@ -46,7 +47,6 @@ from .client import LLMError
 from .failover import classify_error, FailoverErrorType
 from .json_recovery import canonicalize_tool_arguments
 from .tool_output_store import enforce_message_budget, finalize_tool_output
-from .finish import FINISH_PROTOCOL_REMINDER, FINISH_TOOL_DEFINITION, find_finish_call
 from .confirmation_tool import find_request_confirmation_call
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
@@ -172,9 +172,41 @@ async def _sleep_before_throttle_retry(delay_seconds: float) -> None:
 
 async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_kwargs):
     attempts = 1 + len(PROVIDER_THROTTLE_RETRY_DELAYS)
+
+    # Per-round latency observability: wall time + time-to-first-token (first
+    # content/thinking/tool-args delta from the provider). Callbacks are wrapped
+    # to timestamp the first delta; None callbacks get a marker-only no-op
+    # (safe — clients simply invoke whatever callback is present).
+    _first_token_at: list[float] = []
+
+    def _wrap_first_token(cb):
+        async def _marked(*a, **k):
+            if not _first_token_at:
+                _first_token_at.append(perf_counter())
+            if cb is not None:
+                return await cb(*a, **k)
+        return _marked
+
+    for _cb_key in ("on_chunk", "on_thinking"):
+        stream_kwargs[_cb_key] = _wrap_first_token(stream_kwargs.get(_cb_key))
+    if stream_kwargs.get("on_tool_delta") is not None:
+        stream_kwargs["on_tool_delta"] = _wrap_first_token(stream_kwargs["on_tool_delta"])
+
     for attempt_idx in range(attempts):
+        _first_token_at.clear()
+        _t0 = perf_counter()
         try:
-            return await client.stream(**stream_kwargs)
+            response = await client.stream(**stream_kwargs)
+            _elapsed = perf_counter() - _t0
+            _ttft = f"{_first_token_at[0] - _t0:.2f}s" if _first_token_at else "n/a"
+            _usage = getattr(response, "usage", None)
+            _out_tokens = _usage.get("completion_tokens") if isinstance(_usage, dict) else None
+            _rate = f" ({_out_tokens / _elapsed:.0f} tok/s)" if _out_tokens and _elapsed > 0 else ""
+            logger.info(
+                f"[LLM Timing] round={round_i} model={getattr(model, 'model', '?')} "
+                f"llm_call={_elapsed:.2f}s ttft={_ttft} output_tokens={_out_tokens}{_rate}"
+            )
+            return response
         except LLMError as e:
             if not _is_provider_throttle_error(e):
                 raise
@@ -200,7 +232,7 @@ async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_k
 # and loses all progress. We track per-signature consecutive-round streaks and
 # step in BEFORE the history grows enough to trip that 400:
 #   • at REPEAT_TOOL_CALL_NUDGE identical rounds → inject one corrective nudge,
-#     giving the model a chance to change approach or finish() honestly;
+#     giving the model a chance to change approach or answer honestly;
 #   • at REPEAT_TOOL_CALL_BREAK identical rounds → stop the loop gracefully
 #     (before appending/re-sending this Nth call), so the provider never sees
 #     enough repetition to reject. Capping history at BREAK-1 identical calls
@@ -211,7 +243,7 @@ REPEAT_TOOL_CALL_BREAK = 3
 REPEAT_TOOL_CALL_NUDGE_PROMPT = (
     "⚠️ 你刚刚用完全相同的参数重复调用了同一个工具，结果不会改变。"
     "请不要再用相同参数重复调用：换一种方法或参数；如果确实无法完成，"
-    "请用 finish() 如实向用户说明情况和已经掌握的信息。"
+    "请直接如实向用户说明情况和已经掌握的信息。"
 )
 
 REPEAT_TOOL_CALL_BREAK_MESSAGE = (
@@ -689,6 +721,7 @@ async def _process_tool_call(
 
     # Execute tool — pass on_output for execute_code streaming
     _on_output = on_code_output if tool_name in ("execute_code", "execute_code_e2b") else None
+    _tool_t0 = perf_counter()
     result = await execute_tool(
         tool_name,
         args,
@@ -697,6 +730,7 @@ async def _process_tool_call(
         session_id=session_id,
         on_output=_on_output,
     )
+    logger.info(f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}")
     logger.debug(f"[LLM] Tool result: {result[:100]}")
 
     # Materialize oversize output and produce the canonical llm_view string.
@@ -814,14 +848,15 @@ async def call_llm(
         agent_id, agent_name, role_description, current_user_name=_user_name, is_group=is_group
     )
 
-    # Load tools dynamically from DB. `skip_tools=True` is set by the WS handler
-    # on the onboarding greeting turn; keep the runtime-level `finish` tool so
-    # every turn still has an explicit stop signal.
+    # Load tools dynamically from DB. `skip_tools=True` is set by the WS
+    # handler on the onboarding greeting turn — the bootstrap response is a
+    # structured templated greeting that never needs to call tools, so we
+    # save ~3-5k tokens of prompt and cut TTFT by passing an empty list.
     # Sort by function.name so Anthropic's tools[-1] cache_control lands on a
     # stable tool block across calls — DB iteration-order churn would otherwise
     # invalidate the tools prefix cache every request.
     if skip_tools:
-        tools_for_llm = [FINISH_TOOL_DEFINITION]
+        tools_for_llm = []
     else:
         from app.services.agent_tools import AGENT_TOOLS
         tools_for_llm = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
@@ -867,6 +902,16 @@ async def call_llm(
     max_tokens = get_max_tokens(model.provider, model.model, getattr(model, "max_output_tokens", None))
     _accumulated_usage = TokenUsage()
     _unsaved_usage = TokenUsage()
+
+    # Turn-level latency accounting, logged once at every loop exit so slow
+    # turns can be attributed (how many rounds, how long) straight from logs.
+    _turn_t0 = perf_counter()
+
+    def _log_turn_timing(outcome: str, rounds: int) -> None:
+        logger.info(
+            f"[LLM Timing] turn outcome={outcome} rounds={rounds} "
+            f"total={perf_counter() - _turn_t0:.2f}s agent={agent_id} session={session_id}"
+        )
 
     # P4: per-call resume counter for max_output_tokens truncation.
     # Bounded across the whole call so a runaway agent cannot turn a long
@@ -928,14 +973,11 @@ async def call_llm(
                 if _token_limit_msg:
                     logger.warning(f"[LLM] Token limit exceeded mid-loop: {_token_limit_msg}")
                     await client.close()
+                    _log_turn_timing("token_limit", round_i + 1)
                     return _token_limit_msg
 
         try:
             # Use streaming API for real-time responses
-            async def _buffer_chunk(_text: str) -> None:
-                # Final user-facing text must come through finish(content=...).
-                return None
-
             response = await _stream_with_throttle_retry(
                 client,
                 model=model,
@@ -944,7 +986,7 @@ async def call_llm(
                 tools=tools_for_llm if tools_for_llm else None,
                 temperature=model.temperature,
                 max_tokens=max_tokens,
-                on_chunk=_buffer_chunk,
+                on_chunk=on_chunk,
                 on_tool_delta=on_tool_delta,
                 on_thinking=on_thinking,
             )
@@ -1017,6 +1059,7 @@ async def call_llm(
                 if agent_id and _accumulated_usage.total_tokens > 0:
                     await record_token_usage(agent_id, _accumulated_usage)
                 await client.close()
+                _log_turn_timing("output_limit", round_i + 1)
                 return "[LLM Error] Output token limit exceeded after 3 resume attempts"
 
             # Recovery succeeded (or never happened). If we accumulated any
@@ -1036,18 +1079,21 @@ async def call_llm(
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
             await client.close()
+            _log_turn_timing("throttle_exhausted", round_i + 1)
             return PROVIDER_THROTTLE_USER_MESSAGE
         except LLMError as e:
             logger.error(f"[LLM] LLMError: provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')} {e}")
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
             await client.close()
+            _log_turn_timing("llm_error", round_i + 1)
             return f"[LLM Error] {e}"
         except Exception as e:
             logger.exception(f"[LLM] Unexpected error: {type(e).__name__}: {str(e)[:300]}")
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
             await client.close()
+            _log_turn_timing("call_error", round_i + 1)
             return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
 
         # Track tokens for this round
@@ -1068,40 +1114,19 @@ async def call_llm(
             else:
                 logger.info(_line)
 
-        # Plain assistant text is not a stop condition. The model must finish
-        # explicitly via finish(content=...).
+        # Plain assistant text (no tool calls) ends the turn — it IS the reply.
         if not response.tool_calls:
-            if response.content:
-                api_messages.append(LLMMessage(role="assistant", content=response.content))
-            api_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
-            continue
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client.close()
+            _log_turn_timing("reply", round_i + 1)
+            return response.content or "[LLM returned empty content]"
 
         # Execute tool calls
         logger.info(f"[LLM] Round {round_i + 1}: {len(response.tool_calls)} tool call(s)")
         sanitized_tool_calls, retry_instruction = _sanitize_tool_calls_for_context(response.tool_calls)
         if retry_instruction:
             api_messages.append(LLMMessage(role="user", content=retry_instruction))
-            continue
-
-        finish_call = find_finish_call(sanitized_tool_calls)
-        if finish_call:
-            if finish_call.valid:
-                if agent_id and _unsaved_usage.total_tokens > 0:
-                    await record_token_usage(agent_id, _unsaved_usage)
-                await client.close()
-                return finish_call.content
-
-            api_messages.append(LLMMessage(
-                role="assistant",
-                content=response.content or None,
-                tool_calls=sanitized_tool_calls,
-                reasoning_content=response.reasoning_content,
-            ))
-            api_messages.append(LLMMessage(
-                role="tool",
-                content=finish_call.error or "`finish` was invalid.",
-                tool_call_id=finish_call.call_id,
-            ))
             continue
 
         # request_confirmation handling: valid → SUSPEND the turn on this tool_call (persist
@@ -1131,15 +1156,16 @@ async def call_llm(
                 await client.close()
                 # Turn suspended: the intro text + card are already persisted/delivered.
                 # Return "" so the channel handler doesn't re-persist a duplicate reply.
+                _log_turn_timing("confirmation_suspended", round_i + 1)
                 return ""
             else:
                 if not conf_call.valid:
                     _conf_reason = conf_call.error or "request_confirmation 参数无效"
                 else:
                     _conf_reason = f"工具 {_conf_action_tool} 未对该 agent 启用,无法挟带"
-                # Mirror the finish-invalid branch: a role="tool" reply must be
-                # preceded by the assistant message carrying its tool_calls, or
-                # strict providers reject the orphaned tool message next round.
+                # A role="tool" reply must be preceded by the assistant message
+                # carrying its tool_calls, or strict providers reject the
+                # orphaned tool message next round.
                 api_messages.append(LLMMessage(
                     role="assistant",
                     content=response.content or None,
@@ -1170,6 +1196,7 @@ async def call_llm(
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
             await client.close()
+            _log_turn_timing("repeat_guard", round_i + 1)
             return response.content or REPEAT_TOOL_CALL_BREAK_MESSAGE
 
         # Remember where this round's appended entries begin. The message-level
@@ -1229,7 +1256,7 @@ async def call_llm(
 
         # Repeated tool-call nudge. On the 2nd identical-call round, append one
         # corrective message (append-only → prefix cache stays intact) so the
-        # model gets a chance to change approach or finish() before the guard
+        # model gets a chance to change approach or answer before the guard
         # above hard-stops it on the 3rd.
         if _max_repeat == REPEAT_TOOL_CALL_NUDGE:
             api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))
@@ -1275,6 +1302,7 @@ async def call_llm(
     if agent_id and _unsaved_usage.total_tokens > 0:
         await record_token_usage(agent_id, _unsaved_usage)
     await client.close()
+    _log_turn_timing("round_limit", _max_tool_rounds)
     return "[Error] Too many tool call rounds"
 
 
@@ -1576,11 +1604,16 @@ async def call_agent_llm_with_tools(
                             return _token_limit_msg, False, tool_executed
 
                 try:
+                    _round_t0 = perf_counter()
                     response = await client.complete(
                         messages=api_messages,
                         tools=tools_for_llm if tools_for_llm else None,
                         temperature=model.temperature,
                         max_tokens=max_tokens,
+                    )
+                    logger.info(
+                        f"[LLM Timing] round={round_i + 1} model={getattr(model, 'model', '?')} "
+                        f"llm_call={perf_counter() - _round_t0:.2f}s (complete) agent={agent_id}"
                     )
                 except Exception as e:
                     logger.error(f"[call_agent_llm_with_tools] Agent {agent_id}: LLM call error: {e}")
@@ -1594,13 +1627,12 @@ async def call_agent_llm_with_tools(
                 _accumulated_usage.add(_usage_this_round)
                 _unsaved_usage.add(_usage_this_round)
 
+                # Plain assistant text (no tool calls) ends the turn — it IS the reply.
                 if not response.tool_calls:
-                    # Plain assistant text is not a stop condition — the model must
-                    # finish() explicitly. Nudge with the protocol reminder and loop.
-                    if response.content:
-                        api_messages.append(LLMMessage(role="assistant", content=response.content))
-                    api_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
-                    continue
+                    if agent_id and _unsaved_usage.total_tokens > 0:
+                        await record_token_usage(agent_id, _unsaved_usage)
+                    await client.close()
+                    return response.content or "[Empty response]", True, tool_executed
 
                 # Execute tool calls
                 # Sanitize first — invalid tool args become a retry user message
@@ -1608,28 +1640,6 @@ async def call_agent_llm_with_tools(
                 sanitized_tool_calls, retry_instruction = _sanitize_tool_calls_for_context(response.tool_calls)
                 if retry_instruction:
                     api_messages.append(LLMMessage(role="user", content=retry_instruction))
-                    continue
-
-                # finish() handling: valid → return content; invalid → surface the
-                # error back to the model and loop.
-                finish_call = find_finish_call(sanitized_tool_calls)
-                if finish_call:
-                    if finish_call.valid:
-                        if agent_id and _unsaved_usage.total_tokens > 0:
-                            await record_token_usage(agent_id, _unsaved_usage)
-                        await client.close()
-                        return finish_call.content, True, tool_executed
-                    api_messages.append(LLMMessage(
-                        role="assistant",
-                        content=response.content or None,
-                        tool_calls=sanitized_tool_calls,
-                        reasoning_content=response.reasoning_content,
-                    ))
-                    api_messages.append(LLMMessage(
-                        role="tool",
-                        tool_call_id=finish_call.call_id,
-                        content=finish_call.error or "`finish` was invalid.",
-                    ))
                     continue
 
                 # request_confirmation handling (twin of the main call_llm loop):
@@ -1664,9 +1674,9 @@ async def call_agent_llm_with_tools(
                             _conf_reason = conf_call.error or "request_confirmation 参数无效"
                         else:
                             _conf_reason = f"工具 {_conf_action_tool} 未对该 agent 启用,无法挟带"
-                        # Mirror the finish-invalid branch: a role="tool" reply must
-                        # be preceded by the assistant message carrying its tool_calls,
-                        # or strict providers reject the orphaned tool message.
+                        # A role="tool" reply must be preceded by the assistant
+                        # message carrying its tool_calls, or strict providers
+                        # reject the orphaned tool message.
                         api_messages.append(LLMMessage(
                             role="assistant",
                             content=response.content or None,
@@ -1721,12 +1731,16 @@ async def call_agent_llm_with_tools(
                         )
                         result = _tool_not_enabled_message(tool_name)
                     else:
+                        _tool_t0 = perf_counter()
                         result = await execute_tool(
                             tool_name,
                             args,
                             agent_id=agent_id,
                             user_id=agent.creator_id,
                             session_id=session_id,
+                        )
+                        logger.info(
+                            f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}"
                         )
                     api_messages.append(
                         LLMMessage(
@@ -1737,7 +1751,7 @@ async def call_agent_llm_with_tools(
                     )
 
                 # Repeated tool-call nudge (2nd identical round): one corrective
-                # message so the model can change approach or finish() before the
+                # message so the model can change approach or answer before the
                 # guard above hard-stops it on the 3rd.
                 if _max_repeat == REPEAT_TOOL_CALL_NUDGE:
                     api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))

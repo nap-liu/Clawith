@@ -18,7 +18,9 @@ from app.core.logging_config import new_trace_id
 from sqlalchemy import select, update, or_
 from app.services.storage import agent_storage_key, get_storage_backend
 
-from app.services.llm.finish import FINISH_PROTOCOL_REMINDER, find_finish_call, parse_tool_arguments
+from time import perf_counter
+
+from app.services.llm.utils import parse_tool_arguments
 
 _HEARTBEAT_SEMAPHORE = asyncio.Semaphore(10)
 
@@ -330,11 +332,16 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                         break
 
             try:
+                _round_t0 = perf_counter()
                 response = await client.complete(
                     messages=llm_messages,
                     tools=tools_for_llm,
                     temperature=model_temperature,
                     max_tokens=get_max_tokens(model_provider, model_model, model_max_output_tokens),
+                )
+                logger.info(
+                    f"[LLM Timing] round={round_i + 1} model={model_model} "
+                    f"llm_call={perf_counter() - _round_t0:.2f}s (heartbeat) agent={agent_id}"
                 )
             except LLMError as e:
                 logger.error(f"LLM error in heartbeat: {e}")
@@ -365,18 +372,6 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     } for tc in response.tool_calls],
                     reasoning_content=response.reasoning_content,
                 ))
-
-                finish_call = find_finish_call(response.tool_calls)
-                if finish_call:
-                    if finish_call.valid:
-                        reply = finish_call.content
-                        break
-                    llm_messages.append(LLMMessage(
-                        role="tool",
-                        tool_call_id=finish_call.call_id,
-                        content=finish_call.error or "`finish` was invalid.",
-                    ))
-                    continue
 
                 # Tools that require arguments — if LLM sends empty args, skip and ask to retry
                 # (aligned with call_llm in websocket.py)
@@ -430,10 +425,9 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                         content=str(tool_result),
                     ))
             else:
-                if response.content:
-                    llm_messages.append(LLMMessage(role="assistant", content=response.content))
-                llm_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
-                continue
+                # No more tool calls — agent has finished
+                reply = response.content or ""
+                break
 
         await client.close()
 
@@ -724,11 +718,16 @@ async def run_agent_oneshot(
                         break
 
             try:
+                _round_t0 = perf_counter()
                 response = await client.complete(
                     messages=llm_messages,
                     tools=tools_for_llm,
                     temperature=model_temperature,
                     max_tokens=get_max_tokens(model_provider, model_model, model_max_output_tokens),
+                )
+                logger.info(
+                    f"[LLM Timing] round={round_i + 1} model={model_model} "
+                    f"llm_call={perf_counter() - _round_t0:.2f}s (oneshot) agent={agent_id}"
                 )
             except LLMError as e:
                 logger.error(f"[Oneshot] LLM error (round {round_i}): {e}")
@@ -765,18 +764,6 @@ async def run_agent_oneshot(
                     reasoning_content=response.reasoning_content,
                 ))
 
-                finish_call = find_finish_call(response.tool_calls)
-                if finish_call:
-                    if finish_call.valid:
-                        reply = finish_call.content
-                        break
-                    llm_messages.append(LLMMessage(
-                        role="tool",
-                        tool_call_id=finish_call.call_id,
-                        content=finish_call.error or "`finish` was invalid.",
-                    ))
-                    continue
-
                 for tc in response.tool_calls:
                     fn = tc["function"]
                     tool_name = fn["name"]
@@ -795,10 +782,9 @@ async def run_agent_oneshot(
                         content=str(tool_result),
                     ))
             else:
-                if response.content:
-                    llm_messages.append(LLMMessage(role="assistant", content=response.content))
-                llm_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
-                continue
+                # No more tool calls — agent has finished
+                reply = response.content or ""
+                break
 
         await client.close()
 

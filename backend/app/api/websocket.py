@@ -46,74 +46,6 @@ MAX_LIVE_CODE_STREAM_CHARS = 120_000
 LIVE_CODE_TRUNCATED_NOTICE = "\n\n[... live output truncated; execution continues ...]\n"
 
 
-def extract_partial_content(args_str: str) -> str:
-    """Extract the string value of the 'content' field from a partial JSON tool-arguments string.
-
-    When the LLM streams the finish tool call, arguments arrive as an
-    incrementally-growing JSON fragment like '{"content": "hello \\\\n wor'.
-    This function parses what is available so far, correctly handling JSON
-    escape sequences (\\n, \\", \\\\, \\\\uXXXX, etc.) even when the string is
-    truncated mid-escape.
-    """
-    import re as _re
-
-    s = args_str.strip()
-    match = _re.search(r'"content"\s*:\s*"', s)
-    if not match:
-        return ""
-
-    start_idx = match.end()
-    val_chars: list[str] = []
-    escaped = False
-    i = start_idx
-    n = len(s)
-    while i < n:
-        c = s[i]
-        if escaped:
-            if c == "n":
-                val_chars.append("\n")
-            elif c == "t":
-                val_chars.append("\t")
-            elif c == "r":
-                val_chars.append("\r")
-            elif c == "b":
-                val_chars.append("\b")
-            elif c == "f":
-                val_chars.append("\f")
-            elif c == '"':
-                val_chars.append('"')
-            elif c == "\\":
-                val_chars.append("\\")
-            elif c == "/":
-                val_chars.append("/")
-            elif c == "u":
-                if i + 4 < n:
-                    try:
-                        hex_val = int(s[i + 1 : i + 5], 16)
-                        val_chars.append(chr(hex_val))
-                        i += 4
-                    except ValueError:
-                        val_chars.append("\\")
-                        val_chars.append("u")
-                else:
-                    # Incomplete \uXXXX — wait for more data
-                    val_chars.append("\\")
-                    val_chars.append("u")
-            else:
-                val_chars.append(c)
-            escaped = False
-        else:
-            if c == "\\":
-                escaped = True
-            elif c == '"':
-                # End of the JSON string value
-                break
-            else:
-                val_chars.append(c)
-        i += 1
-    return "".join(val_chars)
-
-
 class ConnectionManager:
     """Manage WebSocket connections per agent."""
 
@@ -827,8 +759,6 @@ class WebSocketChatHandler:
 
             # Accumulate partial content for abort handling
             partial_chunks: list[str] = []
-            # Track how many characters of finish-tool content have been streamed
-            finish_content_sent_len = 0
 
             # Set inside _call_with_failover when an onboarding prompt was injected
             needs_onboarding_mark = False
@@ -893,19 +823,7 @@ class WebSocketChatHandler:
 
             async def tool_delta_to_ws(data: dict):
                 """Stream workspace file-operation drafts while tool args are still arriving."""
-                nonlocal finish_content_sent_len
                 tool_name = data.get("name", "")
-
-                # Stream finish tool content as real-time chunks
-                if tool_name == "finish":
-                    raw_args = data.get("arguments", "")
-                    if isinstance(raw_args, str) and raw_args:
-                        current_content = extract_partial_content(raw_args)
-                        if len(current_content) > finish_content_sent_len:
-                            delta = current_content[finish_content_sent_len:]
-                            finish_content_sent_len = len(current_content)
-                            await stream_to_ws(delta)
-                    return
 
                 _ws_tools = {
                     "write_file",

@@ -25,7 +25,6 @@ E. If the re-streamed (resumed) response carries ``tool_calls``, the outer
 
 from __future__ import annotations
 
-import json
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -40,25 +39,9 @@ from app.services.llm.caller import (
 from app.services.llm.client import LLMMessage, LLMResponse
 
 
-def _finish_response(content: str) -> LLMResponse:
-    """A finish() tool-call response — the only clean stop signal the
-    merged finish-protocol loop accepts. A plain ``stop`` text response is
-    no longer terminal: the loop injects FINISH_PROTOCOL_REMINDER and
-    re-streams, so scripts must end with finish() (see test_finish_protocol)."""
-    return LLMResponse(
-        content="",
-        tool_calls=[
-            {
-                "id": "call_finish",
-                "type": "function",
-                "function": {
-                    "name": "finish",
-                    "arguments": json.dumps({"content": content}),
-                },
-            }
-        ],
-        finish_reason="tool_calls",
-    )
+def _stop_response(content: str) -> LLMResponse:
+    """A plain-text terminal response — no tool calls, so the loop returns it."""
+    return LLMResponse(content=content, finish_reason="stop")
 
 
 # ─── Fakes ────────────────────────────────────────────────────────────────────
@@ -174,7 +157,7 @@ def test_predicate_rejects_normal_finish_reasons():
 @pytest.mark.asyncio
 async def test_case_a_no_truncation_returns_direct(monkeypatch):
     client = _ScriptedClient([
-        _finish_response("all-done"),
+        _stop_response("all-done"),
     ])
     _patch_caller_collaborators(monkeypatch, client)
 
@@ -195,13 +178,12 @@ async def test_case_a_no_truncation_returns_direct(monkeypatch):
 @pytest.mark.asyncio
 async def test_case_b_single_recovery_concatenates_content(monkeypatch):
     # First stream: partial text, cut off by length.
-    # Second stream: the resume completes — and since plain text no longer
-    # stops the loop under the finish-protocol, the resumed response delivers
-    # the full answer via finish(). The recovery still runs (1 resume = 2
-    # stream calls); the loop then returns finish()'s content.
+    # Second stream: the resume continues where the partial left off. The
+    # recovery runs (1 resume = 2 stream calls); the loop stitches the partial
+    # and the continuation and returns the concatenation.
     client = _ScriptedClient([
         LLMResponse(content="half-one ", finish_reason="length"),
-        _finish_response("half-one half-two"),
+        _stop_response("half-two"),
     ])
     _patch_caller_collaborators(monkeypatch, client)
 
@@ -212,7 +194,7 @@ async def test_case_b_single_recovery_concatenates_content(monkeypatch):
         agent_id="agent-x", user_id="user-x", session_id="s",
     )
 
-    # Returned string is the full concatenation, delivered via finish().
+    # Returned string is the full concatenation.
     assert result == "half-one half-two"
     # We made exactly 2 stream calls: the initial + 1 resume.
     assert len(client.stream_calls) == 2
@@ -251,12 +233,12 @@ async def test_case_c_exhausted_retries_returns_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_case_d_dispatched_messages_carry_resume_pair(monkeypatch):
-    # Two recoveries then a clean finish() — three stream calls total. The
-    # final resumed response delivers the full answer through finish().
+    # Two recoveries then a clean stop — three stream calls total. The
+    # final resumed response continues the text; the loop stitches all parts.
     client = _ScriptedClient([
         LLMResponse(content="part-a ", finish_reason="length"),
         LLMResponse(content="part-b ", finish_reason="length"),
-        _finish_response("part-a part-b part-c"),
+        _stop_response("part-c"),
     ])
     _patch_caller_collaborators(monkeypatch, client)
 
@@ -312,8 +294,8 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
             }],
             finish_reason="tool_calls",
         ),
-        # Round 1 (after tool result): final answer via finish()
-        _finish_response("done-after-tool"),
+        # Round 1 (after tool result): final answer as plain text
+        _stop_response("done-after-tool"),
     ])
     _patch_caller_collaborators(monkeypatch, client, tools=[
         {"type": "function", "function": {"name": "read_file", "description": "r"}},

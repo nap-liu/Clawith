@@ -562,8 +562,8 @@ async def update_agent_tools(
         if not tool_obj:
             raise HTTPException(status_code=404, detail="Tool not found")
 
-        # System-category tools (e.g. finish) are protocol-level and
-        # must always remain enabled — reject any attempt to disable them.
+        # System-category tools (e.g. request_confirmation) are protocol-level
+        # and must always remain enabled — reject any attempt to disable them.
         if tool_obj.category == "system" and not u.enabled:
             continue
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -41,21 +40,8 @@ class _FakeModel(SimpleNamespace):
     id = "model-x"
 
 
-def _finish_response(content: str) -> LLMResponse:
-    return LLMResponse(
-        content="",
-        tool_calls=[
-            {
-                "id": "call_finish",
-                "type": "function",
-                "function": {
-                    "name": "finish",
-                    "arguments": json.dumps({"content": content}, ensure_ascii=False),
-                },
-            }
-        ],
-        finish_reason="tool_calls",
-    )
+def _stop_response(content: str) -> LLMResponse:
+    return LLMResponse(content=content, finish_reason="stop")
 
 
 def _patch_call_llm_collaborators(monkeypatch, client):
@@ -90,7 +76,7 @@ async def test_provider_throttle_is_retried_before_returning_success(monkeypatch
                 "Your requests are being throttled due to system capacity limits\","
                 "\"code\":\"ServiceUnavailable\"}}"
             ),
-            _finish_response("重试后成功"),
+            _stop_response("重试后成功"),
         ]
     )
     _patch_call_llm_collaborators(monkeypatch, client)

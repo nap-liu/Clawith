@@ -234,7 +234,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
     if (loading) return <div style={{ color: 'var(--text-tertiary)', padding: '20px' }}>{t('common.loading')}</div>;
 
     // Company tools = platform presets (builtin) + company admin-added tools (admin)
-    // Hide system-internal tools (e.g. finish) — they are protocol-level and not user-facing.
+    // Hide system-internal tools — they are protocol-level and not user-facing.
     // EXCEPT system tools that expose user config (e.g. request_confirmation's per-agent
     // DingTalk card template), which must stay configurable here.
     const isHiddenSystemTool = (t: any) => t.category === 'system' && !(t.config_schema?.fields?.length > 0);

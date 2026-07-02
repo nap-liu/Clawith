@@ -68,10 +68,6 @@ from app.core.permissions import evaluate_agent_relationship_status, evaluate_hu
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.tool_enablement import agent_tool_enabled
 from app.config import get_settings
-from app.services.llm.finish import (
-    FINISH_TOOL_DEFINITION,
-    FINISH_TOOL_NAME,
-)
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
@@ -92,8 +88,6 @@ _STDOUT_RPA_LIMIT = 20000
 # so it does not pollute the stored context).
 A2A_DELIVERY_GUIDANCE = (
     "你正在回复另一位数字员工同事,请简洁、切题地作答。\n"
-    "🔴 必须调用 finish(content=\"...\") 提交完整答复;不要只输出纯文本 —— "
-    "纯文本会被拒绝并要求重做。\n"
     "如果你写了任何文件(报告/文档/分析)需要交付给对方,必须调用 "
     "send_file_to_agent(agent_name=\"<对方名字>\", file_path=\"<路径>\") 投递 —— "
     "对方无法访问你的工作区,绝不能只告诉路径。"
@@ -247,7 +241,6 @@ channel_feishu_sender_open_id: ContextVar = ContextVar('channel_feishu_sender_op
 # ─── Tool Definitions (OpenAI function-calling format) ──────────
 
 AGENT_TOOLS = [
-    FINISH_TOOL_DEFINITION,
     {
         "type": "function",
         "function": {
@@ -2001,7 +1994,6 @@ AGENT_TOOLS = [
 # to avoid sending duplicate tool definitions to the LLM.
 _ALWAYS_INCLUDE_CORE = {
     "complete_focus_item",
-    FINISH_TOOL_NAME,
     "list_focus_items",
     "send_channel_file",
     "send_file_to_agent",
@@ -3030,10 +3022,6 @@ async def execute_tool(
         .replace("\ufeff", "")
         .strip()
     )
-    if tool_name == FINISH_TOOL_NAME:
-        content = arguments.get("content", "")
-        return content if isinstance(content, str) else str(content)
-
     # Defensive guard: request_confirmation must be intercepted by the caller
     # loop before reaching execute_tool. If it somehow lands here, return a
     # clear signal instead of falling through to unknown-tool handling.
@@ -7795,7 +7783,7 @@ async def _send_message_to_agent(
             # 1) The inbound user message is already persisted by the common pre-branch
             #    code (committed at the outer db.commit() above). No second write needed.
             #    Target context is built inside call_llm_with_failover (agent_id=target.id);
-            #    the A2A finish()+file-delivery protocol rides in A2A_DELIVERY_GUIDANCE
+            #    the A2A file-delivery guidance rides in A2A_DELIVERY_GUIDANCE
             #    appended to the turn message below (not a separate inline system prompt).
 
             # 2) Structured history (tool_call rows auto-expand; NO sanitize poisoning)
