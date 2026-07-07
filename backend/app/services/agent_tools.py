@@ -716,6 +716,33 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "remove_contact",
+            "description": (
+                "Remove a person or digital employee from your relationship network using the id and type returned by search_contacts. "
+                "Use target_type=human for people from synced org directories, and target_type=agent for digital employees. "
+                "Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. "
+                "Do not remove contacts proactively or based only on your own intent to stop messaging someone."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_type": {
+                        "type": "string",
+                        "description": "Contact type returned by search_contacts.",
+                        "enum": ["human", "agent"],
+                    },
+                    "target_id": {
+                        "type": "string",
+                        "description": "UUID id returned by search_contacts.",
+                    },
+                },
+                "required": ["target_type", "target_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "send_channel_message",
             "description": (
                 "Send a message to a colleague via their configured external channel "
@@ -2064,6 +2091,7 @@ _ALWAYS_INCLUDE_CORE = {
     "add_contact",
     "complete_focus_item",
     "list_focus_items",
+    "remove_contact",
     "search_contacts",
     "send_channel_file",
     "send_file_to_agent",
@@ -2758,6 +2786,7 @@ _TOOL_AUTONOMY_MAP = {
     "move_file": "write_workspace_files",
     "delete_file": "delete_files",
     "add_contact": "manage_relationships",
+    "remove_contact": "manage_relationships",
     "send_feishu_message": "send_feishu_message",
     "send_message_to_agent": "send_message_to_agent",  # A2A messaging — distinct from feishu
     "send_file_to_agent": "send_file_to_agent",          # A2A file transfer
@@ -3049,6 +3078,8 @@ async def _execute_tool_direct(
             return await _send_feishu_message(agent_id, arguments)
         elif tool_name == "add_contact":
             return await _add_contact_tool(agent_id, arguments, user_id=None)
+        elif tool_name == "remove_contact":
+            return await _remove_contact_tool(agent_id, arguments, user_id=None)
         elif tool_name == "send_message_to_agent":
             return await _send_message_to_agent(
                 agent_id,
@@ -3304,6 +3335,8 @@ async def execute_tool(
             result = await _search_contacts_tool(agent_id, arguments, user_id)
         elif tool_name == "add_contact":
             result = await _add_contact_tool(agent_id, arguments, user_id)
+        elif tool_name == "remove_contact":
+            result = await _remove_contact_tool(agent_id, arguments, user_id)
         elif tool_name == "send_feishu_message":
             result = await _send_feishu_message(agent_id, arguments)
         elif tool_name == "send_platform_message":
@@ -6384,6 +6417,40 @@ async def _add_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID 
             f"Updated relation details. {result.get('send_hint')}"
         )
     return f"❌ Unable to add contact: {result.get('reason', 'unknown_error')}"
+
+
+async def _remove_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID | None) -> str:
+    target_type = (args.get("target_type") or args.get("type") or "").strip().lower()
+    target_id = (args.get("target_id") or args.get("id") or "").strip()
+    if not target_type or not target_id:
+        return "❌ Please provide target_type and target_id from search_contacts"
+
+    from app.services.contact_relationships import remove_contact_for_agent
+
+    async with async_session() as db:
+        result = await remove_contact_for_agent(
+            db,
+            agent_id,
+            target_type=target_type,
+            target_id=target_id,
+            current_user_id=user_id,
+        )
+        if result.get("status") == "removed":
+            await db.commit()
+        else:
+            await db.rollback()
+
+    if result.get("status") == "removed":
+        return (
+            f"✅ Removed {result.get('name')} ({result.get('type')} id={result.get('id')}) "
+            "from your relationship network."
+        )
+    if result.get("status") == "not_found":
+        return (
+            f"ℹ️ {result.get('name')} ({result.get('type')} id={result.get('id')}) "
+            "is not in your relationship network."
+        )
+    return f"❌ Unable to remove contact: {result.get('reason', 'unknown_error')}"
 
 
 async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:

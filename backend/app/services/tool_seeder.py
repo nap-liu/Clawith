@@ -642,6 +642,24 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "remove_contact",
+        "display_name": "Remove Contact",
+        "description": "Remove a person or digital employee from your relationship network using the id and type returned by search_contacts. Use target_type=human for people from synced org directories, and target_type=agent for digital employees. Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. Do not remove contacts proactively or based only on your own intent to stop messaging someone.",
+        "category": "communication",
+        "icon": "minus",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "target_type": {"type": "string", "enum": ["human", "agent"], "description": "Contact type returned by search_contacts."},
+                "target_id": {"type": "string", "description": "UUID id returned by search_contacts."},
+            },
+            "required": ["target_type", "target_id"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "send_message_to_agent",
         "display_name": "Agent Message",
         "description": "Send a message to a digital employee colleague. Decision guide: target needs to DO WORK and return results? → task_delegate. Just FYI? → notify. Quick factual question? → consult. When unsure, prefer task_delegate.\n\nRESET: If an ongoing conversation with a colleague gets stuck — the same tool failing over and over, repeated identical errors, looping, or visibly corrupted/garbled context — set new_conversation=true to discard the stale history and start a fresh, clean thread, then continue.",

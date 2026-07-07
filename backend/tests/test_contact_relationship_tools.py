@@ -11,7 +11,11 @@ from app.models.org import AgentAgentRelationship, AgentRelationship, OrgDepartm
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services import agent_tools
-from app.services.contact_relationships import add_contact_for_agent, search_contacts_for_agent
+from app.services.contact_relationships import (
+    add_contact_for_agent,
+    remove_contact_for_agent,
+    search_contacts_for_agent,
+)
 from app.services.tool_seeder import BUILTIN_TOOLS
 
 
@@ -51,6 +55,18 @@ def test_contact_tool_descriptions_require_user_intent_and_creator_confirmation(
         assert "creator" in normalized
         assert "confirmed" in normalized
         assert "do not add contacts proactively" in normalized
+
+    for description in (
+        _llm_tool_description("remove_contact"),
+        _seed_tool_description("remove_contact"),
+    ):
+        normalized = description.lower()
+        assert "remove" in normalized
+        assert "relationship network" in normalized
+        assert "user explicitly asked" in normalized
+        assert "creator" in normalized
+        assert "confirmed" in normalized
+        assert "do not remove contacts proactively" in normalized
 
 
 @pytest.fixture
@@ -321,6 +337,98 @@ async def test_add_contact_rejects_cross_tenant_targets(contact_session):
     assert agent["reason"] == "contact_not_available"
 
 
+@pytest.mark.asyncio
+async def test_remove_contact_deletes_human_relationship_idempotently(contact_session):
+    ctx = await _seed_contact_graph(contact_session)
+    await add_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="human",
+        target_id=str(ctx["dingtalk_member"].id),
+        current_user_id=ctx["creator_id"],
+    )
+
+    first = await remove_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="human",
+        target_id=str(ctx["dingtalk_member"].id),
+        current_user_id=ctx["creator_id"],
+    )
+    second = await remove_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="human",
+        target_id=str(ctx["dingtalk_member"].id),
+        current_user_id=ctx["creator_id"],
+    )
+
+    assert first == {
+        "status": "removed",
+        "id": str(ctx["dingtalk_member"].id),
+        "type": "human",
+        "name": "刘喜",
+    }
+    assert second == {
+        "status": "not_found",
+        "id": str(ctx["dingtalk_member"].id),
+        "type": "human",
+        "name": "刘喜",
+    }
+    rows = (
+        await contact_session.execute(
+            select(AgentRelationship).where(AgentRelationship.agent_id == ctx["source"].id)
+        )
+    ).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_remove_contact_deletes_agent_relationship_idempotently(contact_session):
+    ctx = await _seed_contact_graph(contact_session)
+    await add_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="agent",
+        target_id=str(ctx["target"].id),
+        current_user_id=ctx["creator_id"],
+    )
+
+    first = await remove_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="agent",
+        target_id=str(ctx["target"].id),
+        current_user_id=ctx["creator_id"],
+    )
+    second = await remove_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="agent",
+        target_id=str(ctx["target"].id),
+        current_user_id=ctx["creator_id"],
+    )
+
+    assert first == {
+        "status": "removed",
+        "id": str(ctx["target"].id),
+        "type": "agent",
+        "name": "Research Agent",
+    }
+    assert second == {
+        "status": "not_found",
+        "id": str(ctx["target"].id),
+        "type": "agent",
+        "name": "Research Agent",
+    }
+    rows = (
+        await contact_session.execute(
+            select(AgentAgentRelationship).where(AgentAgentRelationship.agent_id == ctx["source"].id)
+        )
+    ).scalars().all()
+    assert rows == []
+
+
 class _SameSessionContext:
     def __init__(self, session):
         self.session = session
@@ -427,3 +535,58 @@ async def test_execute_tool_add_contact_creates_human_and_agent_relationships(co
     ).scalars().all()
     assert [row.member_id for row in human_rows] == [ctx["dingtalk_member"].id]
     assert [row.target_agent_id for row in agent_rows] == [ctx["target"].id]
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_remove_contact_removes_human_and_agent_relationships(contact_session, monkeypatch):
+    ctx = await _seed_contact_graph(contact_session)
+    _patch_tool_session(monkeypatch, contact_session)
+    await add_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="human",
+        target_id=str(ctx["dingtalk_member"].id),
+        current_user_id=ctx["creator_id"],
+    )
+    await add_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="agent",
+        target_id=str(ctx["target"].id),
+        current_user_id=ctx["creator_id"],
+    )
+
+    human_result = await agent_tools.execute_tool(
+        "remove_contact",
+        {"target_type": "human", "target_id": str(ctx["dingtalk_member"].id)},
+        ctx["source"].id,
+        ctx["creator_id"],
+        skip_autonomy=True,
+    )
+    agent_result = await agent_tools.execute_tool(
+        "remove_contact",
+        {"target_type": "agent", "target_id": str(ctx["target"].id)},
+        ctx["source"].id,
+        ctx["creator_id"],
+        skip_autonomy=True,
+    )
+
+    assert "✅ Removed 刘喜" in human_result
+    assert "human id=" in human_result
+    assert "human:" not in human_result
+    assert "✅ Removed Research Agent" in agent_result
+    assert "agent id=" in agent_result
+    assert "agent:" not in agent_result
+
+    human_rows = (
+        await contact_session.execute(
+            select(AgentRelationship).where(AgentRelationship.agent_id == ctx["source"].id)
+        )
+    ).scalars().all()
+    agent_rows = (
+        await contact_session.execute(
+            select(AgentAgentRelationship).where(AgentAgentRelationship.agent_id == ctx["source"].id)
+        )
+    ).scalars().all()
+    assert human_rows == []
+    assert agent_rows == []

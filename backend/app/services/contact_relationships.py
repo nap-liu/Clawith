@@ -1,4 +1,4 @@
-"""Agent-facing contact search and relationship creation helpers."""
+"""Agent-facing contact search and relationship management helpers."""
 
 import uuid
 from datetime import datetime, timezone
@@ -436,3 +436,107 @@ async def add_contact_for_agent(
         description=clean_description,
         current_user_id=current_user_id,
     )
+
+
+async def _remove_human_contact(
+    db: AsyncSession,
+    source_agent: Agent,
+    member_id: uuid.UUID,
+) -> dict:
+    member_result = await db.execute(
+        select(OrgMember).where(
+            OrgMember.id == member_id,
+            OrgMember.tenant_id == source_agent.tenant_id,
+        )
+    )
+    member = member_result.scalar_one_or_none()
+    if not member:
+        return {"status": "error", "reason": "contact_not_available"}
+
+    rel_result = await db.execute(
+        select(AgentRelationship).where(
+            AgentRelationship.agent_id == source_agent.id,
+            AgentRelationship.member_id == member.id,
+        )
+    )
+    rel = rel_result.scalar_one_or_none()
+    if not rel:
+        return {
+            "status": "not_found",
+            "id": str(member.id),
+            "type": "human",
+            "name": member.name,
+        }
+
+    await db.delete(rel)
+    await db.flush()
+    return {
+        "status": "removed",
+        "id": str(member.id),
+        "type": "human",
+        "name": member.name,
+    }
+
+
+async def _remove_agent_contact(
+    db: AsyncSession,
+    source_agent: Agent,
+    target_id: uuid.UUID,
+) -> dict:
+    target_result = await db.execute(
+        select(Agent).where(
+            Agent.id == target_id,
+            Agent.tenant_id == source_agent.tenant_id,
+            Agent.is_deleted.is_(False),
+        )
+    )
+    target = target_result.scalar_one_or_none()
+    if not target or target.id == source_agent.id:
+        return {"status": "error", "reason": "contact_not_available"}
+
+    rel_result = await db.execute(
+        select(AgentAgentRelationship).where(
+            AgentAgentRelationship.agent_id == source_agent.id,
+            AgentAgentRelationship.target_agent_id == target.id,
+        )
+    )
+    rel = rel_result.scalar_one_or_none()
+    if not rel:
+        return {
+            "status": "not_found",
+            "id": str(target.id),
+            "type": "agent",
+            "name": target.name,
+        }
+
+    await db.delete(rel)
+    await db.flush()
+    return {
+        "status": "removed",
+        "id": str(target.id),
+        "type": "agent",
+        "name": target.name,
+    }
+
+
+async def remove_contact_for_agent(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    *,
+    target_type: str,
+    target_id: str | uuid.UUID,
+    current_user_id: uuid.UUID | None = None,
+) -> dict:
+    """Remove a human or A2A relationship from an agent."""
+    source_agent = await _load_source_agent(db, agent_id)
+    if not source_agent or not source_agent.tenant_id:
+        return {"status": "error", "reason": "source_agent_not_available"}
+
+    clean_target_type = _normalize_target_type(target_type)
+    parsed_target_id = _parse_target_id(target_id)
+    if not clean_target_type or not parsed_target_id:
+        return {"status": "error", "reason": "invalid_contact_target"}
+
+    if clean_target_type == "human":
+        return await _remove_human_contact(db, source_agent, parsed_target_id)
+    return await _remove_agent_contact(db, source_agent, parsed_target_id)
