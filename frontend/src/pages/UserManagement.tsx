@@ -1,7 +1,7 @@
 /**
  * User Management — admin page to view and manage user quotas and roles.
  */
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '../stores';
 import LinearCopyButton from '../components/LinearCopyButton';
@@ -28,6 +28,13 @@ interface UserInfo {
     source?: string;
 }
 
+interface UserListResponse {
+    items: UserInfo[];
+    total: number;
+    page: number;
+    page_size: number;
+}
+
 const API_PREFIX = '/api';
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
@@ -48,6 +55,24 @@ const PERIOD_OPTIONS = [
 ];
 
 const PAGE_SIZE = 15;
+type PaginationItem = number | 'gap-left' | 'gap-right';
+
+function buildPaginationItems(currentPage: number, totalPages: number): PaginationItem[] {
+    if (totalPages <= 7) {
+        return Array.from({ length: totalPages }, (_, i) => i + 1);
+    }
+
+    const items: PaginationItem[] = [1];
+    const start = Math.max(2, currentPage - 1);
+    const end = Math.min(totalPages - 1, currentPage + 1);
+
+    if (start > 2) items.push('gap-left');
+    for (let p = start; p <= end; p += 1) items.push(p);
+    if (end < totalPages - 1) items.push('gap-right');
+    items.push(totalPages);
+
+    return items;
+}
 
 export default function UserManagement() {
     const { t, i18n } = useTranslation();
@@ -68,6 +93,8 @@ export default function UserManagement() {
     const [toast, setToast] = useState('');
     const [changingRoleUserId, setChangingRoleUserId] = useState<string | null>(null);
     const [editingProfileUser, setEditingProfileUser] = useState<UserInfo | null>(null);
+    const [totalUsers, setTotalUsers] = useState(0);
+    const [reloadToken, setReloadToken] = useState(0);
 
     // Invite modal state
     const [showInviteModal, setShowInviteModal] = useState(false);
@@ -78,22 +105,69 @@ export default function UserManagement() {
 
     // Search, sort & pagination
     const [searchQuery, setSearchQuery] = useState('');
+    const [debouncedSearchQuery, setDebouncedSearchQuery] = useState('');
     const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
     const [page, setPage] = useState(1);
 
-    const loadUsers = async () => {
-        setLoading(true);
-        try {
-            const tenantId = localStorage.getItem('current_tenant_id') || '';
-            const data = await fetchJson<UserInfo[]>(`/users/${tenantId ? `?tenant_id=${tenantId}` : ''}`);
-            setUsers(data);
-        } catch (e) {
-            console.error('Failed to load users', e);
+    const refreshUsers = (resetToFirstPage = false) => {
+        if (resetToFirstPage && page !== 1) {
+            setPage(1);
+            return;
         }
-        setLoading(false);
+        setReloadToken(v => v + 1);
     };
 
-    useEffect(() => { loadUsers(); }, []);
+    useEffect(() => {
+        const timer = window.setTimeout(() => {
+            setDebouncedSearchQuery(searchQuery.trim());
+            setPage(1);
+        }, 300);
+        return () => window.clearTimeout(timer);
+    }, [searchQuery]);
+
+    useEffect(() => {
+        let cancelled = false;
+
+        const loadUsersPage = async () => {
+            setLoading(true);
+            try {
+                const tenantId = localStorage.getItem('current_tenant_id') || '';
+                const params = new URLSearchParams({
+                    page: String(page),
+                    page_size: String(PAGE_SIZE),
+                    sort_order: sortOrder,
+                });
+                if (tenantId) params.set('tenant_id', tenantId);
+                if (debouncedSearchQuery) params.set('search', debouncedSearchQuery);
+
+                const data = await fetchJson<UserListResponse>(`/users/?${params.toString()}`);
+                if (cancelled) return;
+
+                const responseTotalPages = Math.max(1, Math.ceil(data.total / PAGE_SIZE));
+                if (page > responseTotalPages) {
+                    setPage(responseTotalPages);
+                    return;
+                }
+
+                setUsers(data.items);
+                setTotalUsers(data.total);
+            } catch (e: any) {
+                if (!cancelled) {
+                    console.error('Failed to load users', e);
+                    setToast(`Error: ${e.message}`);
+                    setTimeout(() => setToast(''), 3000);
+                }
+            } finally {
+                if (!cancelled) setLoading(false);
+            }
+        };
+
+        loadUsersPage();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [page, debouncedSearchQuery, sortOrder, reloadToken]);
 
     const startEdit = (user: UserInfo) => {
         setEditingUserId(user.id);
@@ -116,7 +190,7 @@ export default function UserManagement() {
             setToast(isChinese ? '配额已更新' : 'Quota updated');
             setTimeout(() => setToast(''), 2000);
             setEditingUserId(null);
-            loadUsers();
+            refreshUsers();
         } catch (e: any) {
             setToast(`Error: ${e.message}`);
             setTimeout(() => setToast(''), 3000);
@@ -138,7 +212,7 @@ export default function UserManagement() {
             if (userId === currentUser?.id) {
                 setUser({ ...currentUser, role: newRole as any });
             }
-            loadUsers();
+            refreshUsers();
         } catch (e: any) {
             const detail = (() => { try { return JSON.parse(e.message)?.detail; } catch { return e.message; } })();
             setToast(`Error: ${detail || e.message}`);
@@ -162,7 +236,7 @@ export default function UserManagement() {
             setInviteResult({ invited: res.invited, message: res.message });
             setInviteEmails('');
             // Refresh user list after invite
-            loadUsers();
+            refreshUsers(true);
         } catch (e: any) {
             setToast(`Error: ${e.message}`);
             setTimeout(() => setToast(''), 3000);
@@ -199,26 +273,13 @@ export default function UserManagement() {
         return d.toLocaleString(isChinese ? 'zh-CN' : 'en-US', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     };
 
-    // Search filter
-    const filtered = searchQuery.trim()
-        ? users.filter(u => {
-            const q = searchQuery.toLowerCase();
-            return (u.username?.toLowerCase().includes(q))
-                || (u.display_name?.toLowerCase().includes(q))
-                || (u.email?.toLowerCase().includes(q));
-        })
-        : users;
-
-    // Sort
-    const sorted = [...filtered].sort((a, b) => {
-        const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
-        const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
-        return sortOrder === 'asc' ? ta - tb : tb - ta;
-    });
-
-    // Paginate
-    const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE));
-    const paged = sorted.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+    const totalPages = Math.max(1, Math.ceil(totalUsers / PAGE_SIZE));
+    const paginationItems = useMemo(() => buildPaginationItems(page, totalPages), [page, totalPages]);
+    const rangeStart = totalUsers === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
+    const rangeEnd = Math.min(page * PAGE_SIZE, totalUsers);
+    const resultCountLabel = debouncedSearchQuery
+        ? (isChinese ? `${totalUsers} 位匹配用户` : `${totalUsers} matching users`)
+        : (isChinese ? `${totalUsers} 位用户` : `${totalUsers} users`);
 
     const toggleSort = () => {
         setSortOrder(o => o === 'asc' ? 'desc' : 'asc');
@@ -241,7 +302,7 @@ export default function UserManagement() {
                 <EditUserModal
                     user={editingProfileUser}
                     onClose={() => setEditingProfileUser(null)}
-                    onUpdated={() => { loadUsers(); setEditingProfileUser(null); }}
+                    onUpdated={() => { refreshUsers(); setEditingProfileUser(null); }}
                 />
             )}
 
@@ -257,9 +318,9 @@ export default function UserManagement() {
                             <input
                                 className="form-input"
                                 type="text"
-                                placeholder={isChinese ? '搜索用户名、显示名或邮箱…' : 'Search username, name or email…'}
+                                placeholder={isChinese ? '搜索用户名、显示名、邮箱或手机号…' : 'Search username, name, email or phone…'}
                                 value={searchQuery}
-                                onChange={e => { setSearchQuery(e.target.value); setPage(1); }}
+                                onChange={e => setSearchQuery(e.target.value)}
                                 style={{
                                     width: '360px', fontSize: '13px',
                                     padding: '8px 12px 8px 12px',
@@ -267,11 +328,9 @@ export default function UserManagement() {
                                     borderRadius: '8px',
                                 }}
                             />
-                            {searchQuery && (
-                                <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
-                                    {isChinese ? `${filtered.length} / ${users.length} 位用户` : `${filtered.length} / ${users.length} users`}
-                                </span>
-                            )}
+                            <span style={{ fontSize: '12px', color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>
+                                {resultCountLabel}
+                            </span>
                         </div>
                         <button
                             className="btn btn-primary"
@@ -307,7 +366,7 @@ export default function UserManagement() {
                         <div></div>
                     </div>
 
-                    {paged.map(user => (
+                    {users.map(user => (
                         <div key={user.id}>
                             <div className="card" style={{
                                 display: 'grid', gridTemplateColumns: '1.4fr 1.4fr 0.8fr 0.7fr 0.7fr 0.8fr 0.8fr 0.8fr 0.8fr 120px',
@@ -472,35 +531,62 @@ export default function UserManagement() {
                         </div>
                     )}
 
-                    {/* Pagination */}
-                    {totalPages > 1 && (
-                        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '8px', marginTop: '16px' }}>
-                            <button
-                                className="btn btn-secondary"
-                                style={{ padding: '4px 10px', fontSize: '12px' }}
-                                disabled={page <= 1}
-                                onClick={() => setPage(p => p - 1)}
-                            >
-                                ‹ {isChinese ? '上一页' : 'Prev'}
-                            </button>
-                            {Array.from({ length: totalPages }, (_, i) => i + 1).map(p => (
-                                <button
-                                    key={p}
-                                    className={`btn ${p === page ? 'btn-primary' : 'btn-secondary'}`}
-                                    style={{ padding: '4px 10px', fontSize: '12px', minWidth: '32px' }}
-                                    onClick={() => setPage(p)}
-                                >
-                                    {p}
-                                </button>
-                            ))}
-                            <button
-                                className="btn btn-secondary"
-                                style={{ padding: '4px 10px', fontSize: '12px' }}
-                                disabled={page >= totalPages}
-                                onClick={() => setPage(p => p + 1)}
-                            >
-                                {isChinese ? '下一页' : 'Next'} ›
-                            </button>
+                    {totalUsers > 0 && (
+                        <div style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            gap: '12px',
+                            flexWrap: 'wrap',
+                            marginTop: '16px',
+                            fontSize: '12px',
+                            color: 'var(--text-tertiary)',
+                        }}>
+                            <span>
+                                {isChinese
+                                    ? `${rangeStart}-${rangeEnd} / 共 ${totalUsers} 位用户`
+                                    : `${rangeStart}-${rangeEnd} of ${totalUsers} users`}
+                            </span>
+                            {totalPages > 1 && (
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+                                    <button
+                                        className="btn btn-secondary"
+                                        style={{ padding: '4px 10px', fontSize: '12px' }}
+                                        disabled={page <= 1}
+                                        onClick={() => setPage(p => Math.max(1, p - 1))}
+                                    >
+                                        ‹ {isChinese ? '上一页' : 'Prev'}
+                                    </button>
+                                    {paginationItems.map((item, index) => (
+                                        typeof item === 'number' ? (
+                                            <button
+                                                key={item}
+                                                className={`btn ${item === page ? 'btn-primary' : 'btn-secondary'}`}
+                                                style={{ padding: '4px 10px', fontSize: '12px', minWidth: '32px' }}
+                                                onClick={() => setPage(item)}
+                                                aria-current={item === page ? 'page' : undefined}
+                                            >
+                                                {item}
+                                            </button>
+                                        ) : (
+                                            <span
+                                                key={`${item}-${index}`}
+                                                style={{ minWidth: '20px', textAlign: 'center', color: 'var(--text-tertiary)' }}
+                                            >
+                                                ...
+                                            </span>
+                                        )
+                                    ))}
+                                    <button
+                                        className="btn btn-secondary"
+                                        style={{ padding: '4px 10px', fontSize: '12px' }}
+                                        disabled={page >= totalPages}
+                                        onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                                    >
+                                        {isChinese ? '下一页' : 'Next'} ›
+                                    </button>
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>

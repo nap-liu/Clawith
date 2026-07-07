@@ -1328,7 +1328,11 @@ from sqlalchemy import or_, and_, case
 from app.models.org import AgentRelationship
 
 
-def _canonical_org_member_id_subquery():
+def _canonical_org_member_id_subquery(
+    *,
+    tenant_id: uuid.UUID | None = None,
+    provider_id: uuid.UUID | None = None,
+):
     """Subquery exposing canonical OrgMember.id per user_id group.
 
     A single platform user (user_id) can have multiple active OrgMember rows
@@ -1344,7 +1348,8 @@ def _canonical_org_member_id_subquery():
     canonical), so they pass through unchanged.
 
     Only status='active' rows participate; soft-deleted rows can't become
-    canonical.
+    canonical. When a provider or tenant scope is supplied, canonical selection
+    happens inside that scope before the outer query applies the same filters.
     """
     rel_count = (
         select(func.count(AgentRelationship.id))
@@ -1373,11 +1378,13 @@ def _canonical_org_member_id_subquery():
             OrgMember.synced_at.asc(),
         ],
     ).label("rn")
-    return (
-        select(OrgMember.id.label("om_id"), rn)
-        .where(OrgMember.status == "active")
-        .subquery()
-    )
+    conditions = [OrgMember.status == "active"]
+    if tenant_id:
+        conditions.append(OrgMember.tenant_id == tenant_id)
+    if provider_id:
+        conditions.append(OrgMember.provider_id == provider_id)
+
+    return select(OrgMember.id.label("om_id"), rn).where(*conditions).subquery()
 
 
 @router.get("/org/members")
@@ -1409,7 +1416,13 @@ async def list_org_members(
         # Auto-scope: use the user's own tenant when available
         tenant_id = effective_tenant_id  # None only for true global admin
 
-    canonical = _canonical_org_member_id_subquery()
+    tenant_uuid = uuid.UUID(tenant_id) if tenant_id else None
+    provider_uuid = uuid.UUID(provider_id) if provider_id else None
+
+    canonical = _canonical_org_member_id_subquery(
+        tenant_id=tenant_uuid,
+        provider_id=provider_uuid,
+    )
     query = (
         select(
             OrgMember,
@@ -1422,8 +1435,8 @@ async def list_org_members(
         .outerjoin(User, OrgMember.user_id == User.id)
         .where(OrgMember.status == "active")
     )
-    if tenant_id:
-        query = query.where(OrgMember.tenant_id == uuid.UUID(tenant_id))
+    if tenant_uuid:
+        query = query.where(OrgMember.tenant_id == tenant_uuid)
     if department_id:
         # Get the department to find its path and then include all sub-departments
         dept_result = await db.execute(select(OrgDepartment).where(OrgDepartment.id == uuid.UUID(department_id)))
@@ -1442,8 +1455,8 @@ async def list_org_members(
         else:
             # Fallback: exact match
             query = query.where(OrgMember.department_id == uuid.UUID(department_id))
-    if provider_id:
-        query = query.where(OrgMember.provider_id == uuid.UUID(provider_id))
+    if provider_uuid:
+        query = query.where(OrgMember.provider_id == provider_uuid)
     if search:
         query = query.where(
             or_(

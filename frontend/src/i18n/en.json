@@ -1434,7 +1434,7 @@
           "step3": "App Info → copy AppKey and AppSecret",
           "step4": "Contacts Permission → enable reading permissions for Departments and Members",
           "step5": "Paste AppKey and AppSecret below → click Save",
-          "step6": "If you need SSO via DingTalk: Turn on the 'SSO Login' switch below, then in DingTalk configure: Login & Sharing → Add the 'Redirect URL' below as the Callback Domain. Share the 'SSO Login URL' with your team."
+          "step6": "Optional DingTalk login: Turn on the 'Enable DingTalk Login' switch only if team members should sign in with DingTalk, then configure Login & Sharing → Callback Domain in DingTalk with the domain from the Redirect URL below. Directory sync does not require this switch."
         },
         "wecom": {
           "step1": "Log in to WeCom Admin Console → Management Tools → Address Book Sync",
@@ -1522,7 +1522,7 @@
       "deleteConfirm": "Are you sure you want to delete this OA provider?",
       "providerHints": {
         "feishu": "Feishu: Requires app_id, app_secret. Optional: encrypt_key, verification_token.",
-        "dingtalk": "DingTalk: Requires app_key, app_secret.",
+        "dingtalk": "DingTalk: Requires app_key and app_secret for directory sync. DingTalk login is optional.",
         "wecom": "WeCom: Requires corp_id, secret, agent_id.",
         "google_workspace": "Google Workspace: one Client ID, one Client Secret, and one Redirect URL for both SSO and admin-authorized directory sync.",
         "oauth2": "OAuth2: Enter App ID, App Secret, Authorize URL, Token URL, User Info URL",
@@ -1556,6 +1556,10 @@
       },
       "ssoLoginToggle": "SSO Login",
       "ssoLoginToggleHint": "Allow users to log in via this identity provider.",
+      "dingtalkSsoLoginToggle": "Enable DingTalk Login",
+      "dingtalkSsoLoginToggleHint": "Only enable this if team members should log in with DingTalk. Directory sync works with AppKey/AppSecret even when this is off.",
+      "dingtalkSyncOnlyNoticeTitle": "Directory sync works without DingTalk login",
+      "dingtalkSyncOnlyNoticeDesc": "Use AppKey/AppSecret to sync DingTalk contacts. Turn on SSO Login only when users also need to sign in with DingTalk.",
       "ssoSubdomain": "SSO Login URL",
       "ssoSubdomainHint": "Share this URL with your team. SSO login buttons will appear when they visit this address.",
       "callbackUrl": "Redirect URL (paste this in your app settings)",

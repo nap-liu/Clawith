@@ -63,6 +63,7 @@ class Agent(Base):
             "write_workspace_files": "L2",
             "send_feishu_message": "L2",
             "send_external_message": "L3",
+            "manage_relationships": "L2",
             "modify_soul": "L3",
             "access_business_system_read": "L2",
             "access_business_system_write": "L3",

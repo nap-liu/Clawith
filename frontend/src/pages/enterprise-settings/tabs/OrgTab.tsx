@@ -85,6 +85,12 @@ function SsoChannelSection({ idpType, existingProvider, tenant, t }: {
     const ssoEnabled = existingProvider ? !!existingProvider.sso_login_enabled : false;
     const domain = liveDomain;
     const callbackUrl = domain ? (domain.startsWith('http') ? `${domain}/api/auth/${idpType}/callback` : `https://${domain}/api/auth/${idpType}/callback`) : '';
+    const ssoLoginLabel = idpType === 'dingtalk'
+        ? t('enterprise.identity.dingtalkSsoLoginToggle', 'Enable DingTalk Login')
+        : t('enterprise.identity.ssoLoginToggle', 'SSO Login');
+    const ssoLoginHint = idpType === 'dingtalk'
+        ? t('enterprise.identity.dingtalkSsoLoginToggleHint', 'Only enable this if team members should log in with DingTalk. Directory sync works with AppKey/AppSecret even when this is off.')
+        : t('enterprise.identity.ssoLoginToggleHint', 'Allow users to log in via this identity provider.');
 
     const handleSsoToggle = async () => {
         if (!existingProvider) {
@@ -119,9 +125,9 @@ function SsoChannelSection({ idpType, existingProvider, tenant, t }: {
             {/* SSO Toggle */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: ssoError ? '8px' : '16px' }}>
                 <div>
-                    <div style={{ fontWeight: 500, fontSize: '13px' }}>{t('enterprise.identity.ssoLoginToggle', 'SSO Login')}</div>
+                    <div style={{ fontWeight: 500, fontSize: '13px' }}>{ssoLoginLabel}</div>
                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '2px' }}>
-                        {t('enterprise.identity.ssoLoginToggleHint', 'Allow users to log in via this identity provider.')}
+                        {ssoLoginHint}
                     </div>
                 </div>
                 <label style={{ position: 'relative', display: 'inline-block', width: '36px', height: '20px', flexShrink: 0, opacity: (existingProvider && !toggling) ? 1 : 0.5 }}>
@@ -704,6 +710,14 @@ export default function OrgTab({ tenant }: { tenant: any }) {
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                         <div className="form-group" style={{ gridColumn: '1 / -1' }}>
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{t('enterprise.identity.providerHints.dingtalk')}</div>
+                            <div style={{ marginTop: '8px', padding: '10px 12px', borderRadius: '6px', border: '1px solid var(--border-subtle)', background: 'var(--bg-primary)' }}>
+                                <div style={{ fontWeight: 500, fontSize: '12px', color: 'var(--text-primary)', marginBottom: '4px' }}>
+                                    {t('enterprise.identity.dingtalkSyncOnlyNoticeTitle', 'Directory sync works without DingTalk login')}
+                                </div>
+                                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+                                    {t('enterprise.identity.dingtalkSyncOnlyNoticeDesc', 'Use AppKey/AppSecret to sync DingTalk contacts. Turn on SSO Login only when users also need to sign in with DingTalk.')}
+                                </div>
+                            </div>
                         </div>
                         <div className="form-group">
                             <label className="form-label">App Key</label>
@@ -1023,4 +1037,3 @@ export default function OrgTab({ tenant }: { tenant: any }) {
         </div>
     );
 }
-

@@ -603,6 +603,63 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "search_contacts",
+        "display_name": "Search Contacts",
+        "description": "Search people and digital employees as candidates for relationship network editing. Only use this tool when the user explicitly asks you to search, review, or edit the relationship network. Do not use it proactively just because you want to contact someone. Results include separate id and type fields; pass them to add_contact as target_id and target_type.",
+        "category": "communication",
+        "icon": "🔎",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Name, department, email, pinyin, or exact phone number to search."},
+                "type": {"type": "string", "enum": ["all", "human", "agent"], "description": "Optional contact type filter."},
+                "limit": {"type": "integer", "description": "Maximum number of results to return, from 1 to 50."},
+            },
+            "required": ["query"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "add_contact",
+        "display_name": "Add Contact",
+        "description": "Add a person or digital employee to your relationship network using the id and type returned by search_contacts. Use target_type=human for people from synced org directories, and target_type=agent for digital employees. Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. Do not add contacts proactively or based only on your own intent to send a message.",
+        "category": "communication",
+        "icon": "➕",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "target_type": {"type": "string", "enum": ["human", "agent"], "description": "Contact type returned by search_contacts."},
+                "target_id": {"type": "string", "description": "UUID id returned by search_contacts."},
+                "relation": {"type": "string", "description": "Relationship label, such as collaborator, stakeholder, peer, team_member, or other."},
+                "description": {"type": "string", "description": "Optional short note explaining why this contact is needed."},
+            },
+            "required": ["target_type", "target_id"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "remove_contact",
+        "display_name": "Remove Contact",
+        "description": "Remove a person or digital employee from your relationship network using the id and type returned by search_contacts. Use target_type=human for people from synced org directories, and target_type=agent for digital employees. Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. Do not remove contacts proactively or based only on your own intent to stop messaging someone.",
+        "category": "communication",
+        "icon": "minus",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "target_type": {"type": "string", "enum": ["human", "agent"], "description": "Contact type returned by search_contacts."},
+                "target_id": {"type": "string", "description": "UUID id returned by search_contacts."},
+            },
+            "required": ["target_type", "target_id"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "send_message_to_agent",
         "display_name": "Agent Message",
         "description": "Send a message to a digital employee colleague. Decision guide: target needs to DO WORK and return results? → task_delegate. Just FYI? → notify. Quick factual question? → consult. When unsure, prefer task_delegate.\n\nRESET: If an ongoing conversation with a colleague gets stuck — the same tool failing over and over, repeated identical errors, looping, or visibly corrupted/garbled context — set new_conversation=true to discard the stale history and start a fresh, clean thread, then continue.",
@@ -4294,11 +4351,11 @@ async def clean_orphaned_mcp_tools():
         assigned_ids = [row[0] for row in all_assigned_r.fetchall()]
         
         # 2. Delete MCP tools that have NO tenant_id AND are NOT in the assigned list
-        # tenant_id == None ensures we don't delete Global Tools manually added by company admins
+        # tenant_id IS NULL ensures we don't delete Global Tools manually added by company admins
         stmt = delete(Tool).where(
             and_(
                 Tool.type == "mcp",
-                Tool.tenant_id == None,
+                Tool.tenant_id.is_(None),
                 ~Tool.id.in_(assigned_ids) if assigned_ids else True
             )
         )

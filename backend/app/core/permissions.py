@@ -325,15 +325,6 @@ async def evaluate_human_relationship_status(
             "access_status": "restricted",
             "access_status_reason": "different_tenant",
         }
-    if member.user_id:
-        access_level = await get_agent_access_level_for_user_id(db, member.user_id, source_agent)
-        if not access_level:
-            return {
-                "access_allowed": False,
-                "access_status": "restricted",
-                "access_status_reason": "platform_user_no_agent_access",
-            }
-
     return {
         "access_allowed": True,
         "access_status": "active",

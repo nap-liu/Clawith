@@ -11,11 +11,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, delete, func, or_, select, update
+from sqlalchemy import or_, select, update
 
 import httpx
 from loguru import logger
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.identity import IdentityProvider
@@ -45,7 +44,7 @@ except ImportError:  # pragma: no cover - lightweight fallback for minimal test 
         return [[ascii_value]]
 
 from app.config import get_settings
-from app.core.security import decrypt_data, hash_password
+from app.core.security import decrypt_data
 from app.services.auth_provider import GoogleWorkspaceAuthProvider
 from app.services.google_workspace_oauth import GOOGLE_HTTP_PROXY
 from jose import jwt
@@ -134,11 +133,21 @@ async def derive_member_department_paths(
     }
 
 
-def _normalize_contact(value: str | None) -> str | None:
+def normalize_contact_for_match(value: str | None) -> str | None:
+    """Normalize synced contact identifiers before matching platform users."""
     if value is None:
         return None
     value = value.strip()
-    return value or None
+    if not value:
+        return None
+    if "@" in value:
+        return value.lower()
+    digits = "".join(ch for ch in value if ch.isdigit())
+    return digits or value
+
+
+def _normalize_contact(value: str | None) -> str | None:
+    return normalize_contact_for_match(value)
 
 
 @dataclass
@@ -242,6 +251,11 @@ class BaseOrgSyncAdapter(ABC):
         dept_count = 0
         member_count = 0
         user_count = 0
+        user_linked_count = 0
+        global_identity_reused_count = 0
+        user_skipped_no_phone_count = 0
+        user_skipped_confirmation_count = 0
+        user_fetch_skipped_dept_count = 0
         profile_count = 0
         sync_start = _utcnow()
         partial_failure = False
@@ -267,6 +281,13 @@ class BaseOrgSyncAdapter(ABC):
 
             # Fetch and sync users (from all departments)
             for dept in departments:
+                if self._should_skip_department_user_fetch(dept):
+                    user_fetch_skipped_dept_count += 1
+                    logger.info(
+                        f"[OrgSync] Skipping user fetch for department {dept.external_id} ({dept.name})"
+                    )
+                    continue
+
                 try:
                     users = await self.fetch_users(dept.external_id)
                 except Exception as e:
@@ -281,6 +302,14 @@ class BaseOrgSyncAdapter(ABC):
                             stats = await self._upsert_member(db, provider, user, dept.external_id)
                             if stats.get("user_created"):
                                 user_count += 1
+                            if stats.get("user_linked"):
+                                user_linked_count += 1
+                            if stats.get("global_identity_matched_no_tenant_user"):
+                                global_identity_reused_count += 1
+                            if stats.get("user_skipped_no_phone"):
+                                user_skipped_no_phone_count += 1
+                            if stats.get("user_skipped_requires_confirmation"):
+                                user_skipped_confirmation_count += 1
                             if stats.get("profile_synced"):
                                 profile_count += 1
                         member_count += 1
@@ -304,6 +333,12 @@ class BaseOrgSyncAdapter(ABC):
                         f"[OrgSync] Skipping reconcile for provider {provider.id} because this sync had partial failures"
                     )
                     errors.append("Reconcile skipped due to partial sync failures")
+                elif user_fetch_skipped_dept_count:
+                    logger.warning(
+                        f"[OrgSync] Skipping reconcile for provider {provider.id} because "
+                        f"{user_fetch_skipped_dept_count} department user fetch(es) were skipped"
+                    )
+                    errors.append("Reconcile skipped because department user fetch was intentionally skipped")
                 else:
                     # Reconciliation: mark records not updated in this sync as deleted
                     await self._reconcile(db, provider.id, sync_start)
@@ -322,11 +357,19 @@ class BaseOrgSyncAdapter(ABC):
             "departments": dept_count,
             "members": member_count,
             "users_created": user_count,
+            "users_linked": user_linked_count,
+            "global_identities_reused": global_identity_reused_count,
+            "users_skipped_no_phone": user_skipped_no_phone_count,
+            "users_skipped_requires_confirmation": user_skipped_confirmation_count,
+            "user_fetch_skipped_departments": user_fetch_skipped_dept_count,
             "profiles_synced": profile_count,
             "errors": errors,
             "provider": self.provider_type,
             "synced_at": _utcnow().isoformat()
         }
+
+    def _should_skip_department_user_fetch(self, dept: ExternalDepartment) -> bool:
+        return False
 
     async def _reconcile(self, db: AsyncSession, provider_id: uuid.UUID, sync_start: datetime):
         """Mark records that were not updated in this sync as deleted."""
@@ -544,7 +587,14 @@ class BaseOrgSyncAdapter(ABC):
         department_external_id: str,
     ) -> dict[str, Any]:
         """Insert or update a member, platform user, and identity."""
-        stats = {"user_created": False, "profile_synced": False}
+        stats = {
+            "user_created": False,
+            "user_linked": False,
+            "global_identity_matched_no_tenant_user": False,
+            "user_skipped_requires_confirmation": False,
+            "user_skipped_no_phone": False,
+            "profile_synced": False,
+        }
         self._validate_member_identifiers(provider, user)
 
         # Find department using user's actual department list.
@@ -577,35 +627,15 @@ class BaseOrgSyncAdapter(ABC):
 
         now = _utcnow()
 
-        # Note: Platform user creation is disabled - just sync OrgMember
-        # Users will be linked to platform users manually or via SSO login
-        
-        # Search for existing platform user by email/phone to associate with this member
-        user_id = None
-        platform_user = None
         email = _normalize_contact(user.email)
         mobile = _normalize_contact(user.mobile)
-
-        if email:
-            user_query = select(User).join(User.identity).where(Identity.email == email)
-            if self.tenant_id:
-                user_query = user_query.where(User.tenant_id == self.tenant_id)
-            user_res = await db.execute(user_query)
-            platform_user = user_res.scalars().first()
-            if platform_user:
-                user_id = platform_user.id
-
-        if not user_id and mobile:
-            user_query = select(User).join(User.identity).where(Identity.phone == mobile)
-            if self.tenant_id:
-                user_query = user_query.where(User.tenant_id == self.tenant_id)
-            user_res = await db.execute(user_query)
-            platform_user = user_res.scalars().first()
-            if platform_user:
-                user_id = platform_user.id
+        provider_type = (provider.provider_type or self.provider_type or "").lower()
+        member_tenant_id = self.tenant_id or provider.tenant_id
 
         # Update/Create OrgMember
         if existing_member:
+            if existing_member.tenant_id is None and member_tenant_id:
+                existing_member.tenant_id = member_tenant_id
             existing_member.name = user.name
             # Generate transliteration using layered strategy:
             # 1. pypinyin converts CJK characters to pinyin
@@ -619,7 +649,9 @@ class BaseOrgSyncAdapter(ABC):
             existing_member.title = user.title
             existing_member.department_id = department.id if department else None
             existing_member.department_path = department.path if department else user.department_path
-            if mobile is not None:
+            if provider_type == "dingtalk":
+                existing_member.phone = mobile
+            elif mobile is not None:
                 existing_member.phone = mobile
             existing_member.status = user.status
             
@@ -630,9 +662,8 @@ class BaseOrgSyncAdapter(ABC):
 
             existing_member.provider_id = provider.id
             existing_member.synced_at = now
-            if user_id and not existing_member.user_id:
-                existing_member.user_id = user_id
             stats["profile_synced"] = True
+            member = existing_member
         else:
             # Generate transliteration using layered strategy:
             # 1. pypinyin converts CJK characters to pinyin
@@ -646,7 +677,7 @@ class BaseOrgSyncAdapter(ABC):
                 unionid=user.unionid,
 
                 provider_id=provider.id,
-                user_id=user_id,
+                user_id=None,
                 name=user.name,
                 name_translit_full=translit_full,
                 name_translit_initial=translit_initial,
@@ -657,24 +688,42 @@ class BaseOrgSyncAdapter(ABC):
                 department_path=department.path if department else user.department_path,
                 phone=mobile,
                 status=user.status,
-                tenant_id=self.tenant_id,
+                tenant_id=member_tenant_id,
                 synced_at=now,
             )
             db.add(new_member)
             stats["profile_synced"] = True
+            member = new_member
 
-        # Sync email/phone from OrgMember to User (if linked)
-        target_user = platform_user
-        if not target_user and (user_id or (existing_member and existing_member.user_id)):
-            target_id = user_id or existing_member.user_id
-            user_res = await db.execute(select(User).where(User.id == target_id))
-            target_user = user_res.scalars().first()
+        auto_create_users = (provider.config or {}).get("auto_create_users_on_sync")
+        if auto_create_users is None:
+            auto_create_users = provider_type == "dingtalk"
 
-        if target_user:
-            if email and target_user.email != email:
-                target_user.email = email
-            if mobile and target_user.primary_mobile != mobile:
-                target_user.primary_mobile = mobile
+        if auto_create_users:
+            from app.services.contact_provisioning import contact_provisioning
+
+            provisioning = await contact_provisioning.ensure_user_for_org_member(
+                db,
+                member,
+                provider=provider,
+            )
+            stats["user_created"] = provisioning.user_created
+            stats["user_linked"] = provisioning.user_linked
+            stats["global_identity_matched_no_tenant_user"] = (
+                provisioning.global_identity_matched_no_tenant_user
+            )
+            stats["user_skipped_requires_confirmation"] = provisioning.skipped_requires_confirmation
+            stats["user_skipped_no_phone"] = provisioning.skipped_missing_mobile
+        else:
+            platform_user = await self._resolve_platform_user(
+                db,
+                user,
+                member_tenant_id,
+                allow_email=provider_type != "dingtalk",
+            )
+            if platform_user and not member.user_id:
+                member.user_id = platform_user.id
+                stats["user_linked"] = True
 
         await db.flush()
         return stats
@@ -743,25 +792,35 @@ class BaseOrgSyncAdapter(ABC):
         result = await db.execute(fallback_query)
         return result.scalars().first()
 
-    async def _resolve_platform_user(self, db: AsyncSession, user: ExternalUser) -> User | None:
+    async def _resolve_platform_user(
+        self,
+        db: AsyncSession,
+        user: ExternalUser,
+        tenant_id: uuid.UUID | None = None,
+        allow_email: bool = True,
+    ) -> User | None:
         """Resolve platform user from external user info."""
         # 1. Try by Email matching (primary way now)
         email = _normalize_contact(user.email)
-        if email:
-            result = await db.execute(
-                select(User).join(User.identity).where(Identity.email == email)
-            )
+        if allow_email and email:
+            query = select(User).join(User.identity).where(Identity.email == email)
+            if tenant_id:
+                query = query.where(User.tenant_id == tenant_id)
+            result = await db.execute(query)
             u = result.scalars().first()
-            if u: return u
+            if u:
+                return u
 
         # 2. Try by mobile matching
         mobile = _normalize_contact(user.mobile)
         if mobile:
-            result = await db.execute(
-                select(User).join(User.identity).where(Identity.phone == mobile)
-            )
+            query = select(User).join(User.identity).where(Identity.phone == mobile)
+            if tenant_id:
+                query = query.where(User.tenant_id == tenant_id)
+            result = await db.execute(query)
             u = result.scalars().first()
-            if u: return u
+            if u:
+                return u
 
         return None
 
@@ -839,7 +898,8 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                     items = res_data.get("items", []) or []
                     for item in items:
                         dept_id = item.get("open_department_id")
-                        if not dept_id: continue
+                        if not dept_id:
+                            continue
                         
                         # Since we fetched using parent_id, we intrinsically know the parent!
                         parent_external = parent_id if parent_id and parent_id != "0" else "0"
@@ -987,8 +1047,15 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
 
     DINGTALK_API_URL = "https://oapi.dingtalk.com"
     DINGTALK_TOKEN_URL = "https://oapi.dingtalk.com/gettoken"
+    DINGTALK_AUTH_SCOPES_URL = "https://oapi.dingtalk.com/topapi/auth/scopes"
+    DINGTALK_AUTH_SCOPES_LEGACY_URL = "https://oapi.dingtalk.com/auth/scopes"
     DINGTALK_DEPT_LIST_URL = "https://oapi.dingtalk.com/topapi/v2/department/listsub"
+    DINGTALK_DEPT_GET_URL = "https://oapi.dingtalk.com/topapi/v2/department/get"
     DINGTALK_USER_LIST_URL = "https://oapi.dingtalk.com/topapi/v2/user/list"
+    DINGTALK_REQUEST_INTERVAL_SECONDS = 0.1
+    DINGTALK_RATE_LIMIT_RETRY_SECONDS = 1.0
+    DINGTALK_MAX_RATE_LIMIT_RETRIES = 5
+    DINGTALK_DEFAULT_USER_FETCH_SKIP_DEPARTMENT_NAMES = ("营运中心", "赋能中心")
 
     def __init__(self, provider: IdentityProvider | None = None, config: dict | None = None, tenant_id: uuid.UUID | None = None):
         super().__init__(provider, config, tenant_id)
@@ -997,6 +1064,27 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
         self._access_token: str | None = None
         self._token_expires_at: datetime | None = None
         self._dept_path_map: dict[str, str] = {}
+
+    def _configured_user_fetch_skip_department_names(self) -> set[str]:
+        raw_names = (self.config or {}).get("skip_user_fetch_department_names")
+        if raw_names is None:
+            raw_names = self.DINGTALK_DEFAULT_USER_FETCH_SKIP_DEPARTMENT_NAMES
+        if isinstance(raw_names, str):
+            raw_names = raw_names.split(",")
+        return {str(name).strip() for name in (raw_names or []) if str(name).strip()}
+
+    def _is_user_fetch_skipped_department_name(self, name: str | None) -> bool:
+        return str(name or "").strip() in self._configured_user_fetch_skip_department_names()
+
+    def _should_skip_department_user_fetch(self, dept: ExternalDepartment) -> bool:
+        skip_names = self._configured_user_fetch_skip_department_names()
+        if not skip_names:
+            return False
+
+        path = self._dept_path_map.get(str(dept.external_id), "")
+        segments = [str(dept.name or "").strip()]
+        segments.extend(part.strip() for part in path.split("/") if part.strip())
+        return any(segment in skip_names for segment in segments)
 
     @property
     def api_base_url(self) -> str:
@@ -1042,31 +1130,84 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
         all_depts: list[ExternalDepartment] = []
         # dept_index: external_id -> (name, parent_external_id_str | None)
         dept_index: dict[str, tuple[str, str | None]] = {}
+        added_dept_ids: set[str] = set()
+
+        def add_department(item: dict) -> int | None:
+            raw_dept_id = item.get("dept_id") or item.get("id")
+            if raw_dept_id is None:
+                return None
+
+            dept_id = int(raw_dept_id)
+            external_id = str(dept_id)
+            dept_name = item.get("name") or f"Department {dept_id}"
+
+            raw_parent_id = item.get("parent_id") or item.get("parentid")
+            if dept_id == 1 or not raw_parent_id or int(raw_parent_id) == dept_id:
+                parent_external = None
+            else:
+                parent_external = str(int(raw_parent_id))
+
+            dept_index[external_id] = (dept_name, parent_external)
+            if external_id not in added_dept_ids:
+                added_dept_ids.add(external_id)
+                all_depts.append(
+                    ExternalDepartment(
+                        external_id=external_id,
+                        name=dept_name,
+                        parent_external_id=parent_external,
+                        member_count=item.get("member_count", 0) or 0,
+                        raw_data=item,
+                    )
+                )
+            return dept_id
 
         seen: set[int] = set()
-        queue: list[int] = [1]  # DingTalk root dept id
+        queue: list[int] = []
         _request_count = 0
 
         async with httpx.AsyncClient() as client:
+            authorized_dept_ids = await self._fetch_authorized_department_ids(client, token)
+            if not authorized_dept_ids:
+                raise RuntimeError(
+                    "DingTalk app has no authorized departments. "
+                    "Please authorize at least one department in DingTalk Contacts permissions."
+                )
+
+            for dept_id in authorized_dept_ids:
+                if dept_id == 1:
+                    dept_detail = {"dept_id": 1, "name": "Root"}
+                else:
+                    dept_detail = await self._fetch_department_detail(client, token, dept_id)
+                    dept_detail = dept_detail or {"dept_id": dept_id, "name": f"Department {dept_id}"}
+                add_department(dept_detail)
+                if not self._is_user_fetch_skipped_department_name(dept_detail.get("name")):
+                    queue.append(dept_id)
+
             while queue:
                 parent_id = queue.pop(0)
                 if parent_id in seen:
                     continue
                 seen.add(parent_id)
 
-                # DingTalk rate limit: ~20 QPS per app per interface.
-                # Sleep 60ms between requests to stay under the limit.
+                # DingTalk has tenant/app-level minute quotas; keep sync conservative.
                 if _request_count > 0:
-                    await asyncio.sleep(0.06)
+                    await asyncio.sleep(self.DINGTALK_REQUEST_INTERVAL_SECONDS)
                 _request_count += 1
 
-                resp = await client.post(
+                data = await self._post_dingtalk_with_retry(
+                    client,
                     self.DINGTALK_DEPT_LIST_URL,
-                    params={"access_token": token},
-                    json={"dept_id": parent_id},
+                    token,
+                    {"dept_id": parent_id},
                 )
-                data = resp.json()
                 if data.get("errcode") != 0:
+                    if self._is_not_in_authorized_scope(data):
+                        logger.warning(
+                            "[OrgSync][DingTalk] Skipping department %s outside app authorization scope: %s",
+                            parent_id,
+                            data.get("errmsg") or data,
+                        )
+                        continue
                     raise RuntimeError(f"DingTalk department list error: {data.get('errmsg') or data}")
 
                 result = data.get("result")
@@ -1078,55 +1219,149 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
                     items = []
 
                 for item in items:
-                    dept_id = int(item.get("dept_id"))
-                    dept_name = item.get("name", "")
-                    # Use actual parent_id from API response to preserve real hierarchy
-                    raw_parent_id = item.get("parent_id")
-                    if dept_id == 1 or not raw_parent_id or int(raw_parent_id) == dept_id:
-                        parent_external = None  # Root has no parent
-                    else:
-                        parent_external = str(int(raw_parent_id))
-                    external_id = str(dept_id)
-                    dept_index[external_id] = (dept_name, parent_external)
-                    all_depts.append(
-                        ExternalDepartment(
-                            external_id=external_id,
-                            name=dept_name,
-                            parent_external_id=parent_external,
-                            member_count=item.get("member_count", 0) or 0,
-                            raw_data=item,
+                    dept_id = add_department(item)
+                    if dept_id is None:
+                        continue
+                    if self._is_user_fetch_skipped_department_name(item.get("name")):
+                        logger.info(
+                            "[OrgSync][DingTalk] Skipping department tree expansion for {} ({})",
+                            dept_id,
+                            item.get("name"),
                         )
-                    )
+                        continue
                     if dept_id not in seen:
                         queue.append(dept_id)
 
-        # Ensure root exists in index (for path building and possible member sync)
-        if "1" not in dept_index:
-            dept_index["1"] = ("Root", None)
-            all_depts.append(ExternalDepartment(external_id="1", name="Root", parent_external_id=None, member_count=0, raw_data={"dept_id": 1, "name": "Root"}))
-
         self._dept_path_map = self._build_dept_paths(dept_index)
         return all_depts
+
+    async def _fetch_authorized_department_ids(self, client: httpx.AsyncClient, token: str) -> list[int]:
+        resp = await client.post(
+            self.DINGTALK_AUTH_SCOPES_URL,
+            params={"access_token": token},
+        )
+        data = resp.json()
+        if data.get("errcode") == 0:
+            dept_ids = self._extract_authorized_department_ids(data)
+            if dept_ids:
+                return dept_ids
+            logger.warning(
+                "[OrgSync][DingTalk] topapi authorization scope returned no departments: {}",
+                data,
+            )
+        else:
+            logger.warning(
+                "[OrgSync][DingTalk] topapi authorization scope failed, trying legacy endpoint: {}",
+                data.get("errmsg") or data,
+            )
+
+        legacy_resp = await client.get(
+            self.DINGTALK_AUTH_SCOPES_LEGACY_URL,
+            params={"access_token": token},
+        )
+        legacy_data = legacy_resp.json()
+        if legacy_data.get("errcode") == 0:
+            return self._extract_authorized_department_ids(legacy_data)
+
+        logger.warning(
+            "[OrgSync][DingTalk] Failed to fetch authorization scope, falling back to root department. "
+            "topapi={}, legacy={}",
+            data.get("errmsg") or data,
+            legacy_data.get("errmsg") or legacy_data,
+        )
+        return [1]
+
+    async def _post_dingtalk_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        token: str,
+        body: dict,
+    ) -> dict:
+        for attempt in range(self.DINGTALK_MAX_RATE_LIMIT_RETRIES + 1):
+            resp = await client.post(
+                url,
+                params={"access_token": token},
+                json=body,
+            )
+            data = resp.json()
+            if not self._is_rate_limited(data):
+                return data
+
+            if attempt >= self.DINGTALK_MAX_RATE_LIMIT_RETRIES:
+                return data
+
+            logger.warning(
+                "[OrgSync][DingTalk] Rate limited by DingTalk API {}; retrying in {}s",
+                url,
+                self.DINGTALK_RATE_LIMIT_RETRY_SECONDS,
+            )
+            await asyncio.sleep(self.DINGTALK_RATE_LIMIT_RETRY_SECONDS)
+
+        return data
+
+    async def _fetch_department_detail(self, client: httpx.AsyncClient, token: str, dept_id: int) -> dict | None:
+        data = await self._post_dingtalk_with_retry(
+            client,
+            self.DINGTALK_DEPT_GET_URL,
+            token,
+            {"dept_id": dept_id},
+        )
+        if data.get("errcode") != 0:
+            logger.warning(
+                "[OrgSync][DingTalk] Failed to fetch department detail for %s: %s",
+                dept_id,
+                data.get("errmsg") or data,
+            )
+            return None
+        result = data.get("result") or {}
+        return result if isinstance(result, dict) else None
+
+    @staticmethod
+    def _extract_authorized_department_ids(data: dict) -> list[int]:
+        payload = data.get("result") if isinstance(data.get("result"), dict) else data
+        auth_org_scopes = payload.get("auth_org_scopes") or {}
+        dept_ids = auth_org_scopes.get("authed_dept") or auth_org_scopes.get("authed_depts") or []
+
+        result: list[int] = []
+        seen: set[int] = set()
+        for dept_id in dept_ids:
+            try:
+                normalized = int(dept_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+        return result
+
+    @staticmethod
+    def _is_not_in_authorized_scope(data: dict) -> bool:
+        message = str(data.get("errmsg") or data)
+        return "不在授权范围" in message or "not in" in message.lower() and "scope" in message.lower()
+
+    @staticmethod
+    def _is_rate_limited(data: dict) -> bool:
+        message = str(data.get("errmsg") or data)
+        return data.get("errcode") == 90002 or "次数过多" in message or "rate limit" in message.lower()
 
     async def fetch_users(self, department_external_id: str) -> list[ExternalUser]:
         token = await self.get_access_token()
         users: list[ExternalUser] = []
         cursor = 0
         dept_id = int(department_external_id)
-        dept_path = self._dept_path_map.get(department_external_id, "")
 
         async with httpx.AsyncClient() as client:
             while True:
-                # DingTalk rate limit: ~20 QPS per app per interface.
-                # Sleep 60ms between requests to stay under the limit.
-                await asyncio.sleep(0.06)
+                # DingTalk has tenant/app-level minute quotas; keep sync conservative.
+                await asyncio.sleep(self.DINGTALK_REQUEST_INTERVAL_SECONDS)
 
-                resp = await client.post(
+                data = await self._post_dingtalk_with_retry(
+                    client,
                     self.DINGTALK_USER_LIST_URL,
-                    params={"access_token": token},
-                    json={"dept_id": dept_id, "cursor": cursor, "size": 100},
+                    token,
+                    {"dept_id": dept_id, "cursor": cursor, "size": 100},
                 )
-                data = resp.json()
                 if data.get("errcode") != 0:
                     raise RuntimeError(f"DingTalk user list error: {data.get('errmsg') or data}")
 

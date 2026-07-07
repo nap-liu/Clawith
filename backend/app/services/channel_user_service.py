@@ -24,6 +24,18 @@ class ChannelUserResolutionError(ValueError):
     """Raised when a channel message cannot be safely attributed to a user."""
 
 
+async def _load_user_with_identity(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    tenant_id: uuid.UUID | None = None,
+) -> User | None:
+    query = select(User).where(User.id == user_id).options(selectinload(User.identity))
+    if tenant_id:
+        query = query.where(User.tenant_id == tenant_id)
+    result = await db.execute(query)
+    return result.scalar_one_or_none()
+
+
 class ChannelUserService:
     """Service for resolving channel users via OrgMember and SSO patterns."""
 
@@ -109,19 +121,70 @@ class ChannelUserService:
 
         # Step 3: Resolve User from OrgMember or other means
         user = None
+        normalized_channel = self._normalize_channel_type(channel_type)
 
-        if org_member and org_member.user_id:
-            # Case 1: OrgMember already linked to User
-            user = await db.get(User, org_member.user_id)
-            if user:
-                logger.debug(
-                    f"[{channel_type}] Found user via linked OrgMember: {user.id}"
+        if org_member:
+            if org_member.tenant_id is None and provider.tenant_id:
+                org_member.tenant_id = provider.tenant_id
+            if normalized_channel == "dingtalk":
+                self._merge_channel_info_into_member(org_member, channel_type, extra_info)
+                provisioned_user = await self._provision_user_from_member(
+                    db,
+                    org_member,
+                    provider,
                 )
-                return user
+                if provisioned_user:
+                    logger.info(
+                        f"[{channel_type}] Provisioned user via OrgMember {org_member.id}: {provisioned_user.id}"
+                    )
+                    return provisioned_user
+
+            if org_member.user_id:
+                user = await _load_user_with_identity(db, org_member.user_id, tenant_id)
+                if user:
+                    logger.debug(
+                        f"[{channel_type}] Found user via linked OrgMember: {user.id}"
+                    )
+                    return user
+
+            if normalized_channel == "dingtalk":
+                raise ChannelUserResolutionError(
+                    f"DingTalk OrgMember {org_member.id} could not be provisioned safely by mobile"
+                )
 
         # Step 4: Try to find User by email/mobile from extra_info
         email = extra_info.get("email")
         mobile = extra_info.get("mobile")
+
+        should_persist_member = True
+
+        if not org_member and should_persist_member and mobile and normalized_channel == "dingtalk":
+            org_member = await self._create_org_member_shell(
+                db,
+                provider,
+                channel_type,
+                external_user_id,
+                extra_info,
+                linked_user_id=None,
+            )
+            provisioned_user = await self._provision_user_from_member(
+                db,
+                org_member,
+                provider,
+            )
+            if provisioned_user:
+                logger.info(
+                    f"[{channel_type}] Provisioned user from mobile payload: {provisioned_user.id}"
+                )
+                return provisioned_user
+            raise ChannelUserResolutionError(
+                f"DingTalk sender {external_user_id} has a mobile number but could not be provisioned safely"
+            )
+
+        if normalized_channel == "dingtalk":
+            raise ChannelUserResolutionError(
+                f"DingTalk sender {external_user_id} cannot be resolved without a mobile number"
+            )
 
         if not user and email:
             user = await sso_service.match_user_by_email(db, email, tenant_id)
@@ -136,8 +199,6 @@ class ChannelUserService:
                 logger.info(
                     f"[{channel_type}] Matched user by mobile: {user.id}"
                 )
-
-        should_persist_member = True
 
         # If found User by email/mobile, link OrgMember if exists
         if user:
@@ -205,6 +266,43 @@ class ChannelUserService:
         )
 
         return user
+
+    def _merge_channel_info_into_member(
+        self,
+        org_member: OrgMember,
+        channel_type: str,
+        extra_info: dict[str, Any],
+    ) -> None:
+        identity_seed = org_member.external_id or org_member.open_id or org_member.id.hex
+        generated_name = f"{channel_type.capitalize()} User {identity_seed[:8]}"
+        incoming_name = (extra_info.get("name") or "").strip()
+        if incoming_name and (not org_member.name or org_member.name == generated_name):
+            org_member.name = incoming_name
+        if extra_info.get("email") and not org_member.email:
+            org_member.email = extra_info["email"]
+        if extra_info.get("mobile") and not org_member.phone:
+            org_member.phone = extra_info["mobile"]
+        if extra_info.get("avatar_url") and not org_member.avatar_url:
+            org_member.avatar_url = extra_info["avatar_url"]
+        if extra_info.get("title") and not org_member.title:
+            org_member.title = extra_info["title"]
+
+    async def _provision_user_from_member(
+        self,
+        db: AsyncSession,
+        org_member: OrgMember,
+        provider: IdentityProvider,
+    ) -> User | None:
+        from app.services.contact_provisioning import contact_provisioning
+
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            org_member,
+            provider=provider,
+        )
+        if not result.user:
+            return None
+        return await _load_user_with_identity(db, result.user.id, org_member.tenant_id)
 
     async def _ensure_provider(
         self, db: AsyncSession, provider_type: str, tenant_id: uuid.UUID | None
@@ -488,21 +586,45 @@ async def get_platform_user_by_org_member(
     Returns:
         Linked/created User instance
     """
-    # Case 1: OrgMember already linked to User
-    if org_member.user_id:
-        query = (
-            select(User)
-            .where(User.id == org_member.user_id)
-            .options(selectinload(User.identity))
-        )
-        if agent_tenant_id:
-            query = query.where(User.tenant_id == agent_tenant_id)
-        user_res = await db.execute(query)
-        user = user_res.scalar_one_or_none()
-        if user:
-            return user
+    from app.models.identity import IdentityProvider
 
-    # Case 2: Try to find User by email/mobile from OrgMember
+    if agent_tenant_id:
+        if org_member.tenant_id and org_member.tenant_id != agent_tenant_id:
+            raise ChannelUserResolutionError(
+                f"OrgMember {org_member.id} belongs to tenant {org_member.tenant_id}, "
+                f"not agent tenant {agent_tenant_id}"
+            )
+        if org_member.tenant_id is None:
+            org_member.tenant_id = agent_tenant_id
+
+    provider = await db.get(IdentityProvider, org_member.provider_id)
+    provider_type = channel_user_service._normalize_channel_type(
+        provider.provider_type if provider else "unknown"
+    )
+
+    if provider_type == "dingtalk":
+        from app.services.contact_provisioning import contact_provisioning
+
+        provisioning = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            org_member,
+            provider=provider,
+        )
+        if provisioning.user:
+            user = await _load_user_with_identity(db, provisioning.user.id, agent_tenant_id)
+            if user:
+                return user
+
+    if org_member.user_id:
+        linked_user = await _load_user_with_identity(db, org_member.user_id, agent_tenant_id)
+        if linked_user:
+            return linked_user
+
+    if provider_type == "dingtalk":
+        raise ChannelUserResolutionError(
+            f"OrgMember {org_member.id} cannot be provisioned safely by DingTalk mobile"
+        )
+
     user = None
     if org_member.email:
         user = await sso_service.match_user_by_email(db, org_member.email, agent_tenant_id)
@@ -510,82 +632,36 @@ async def get_platform_user_by_org_member(
         user = await sso_service.match_user_by_mobile(db, org_member.phone, agent_tenant_id)
 
     if user:
-        # Link existing User to OrgMember
         org_member.user_id = user.id
         await db.flush()
-        # Eagerly load/refresh User.identity before returning
-        user_res = await db.execute(
-            select(User).where(User.id == user.id).options(selectinload(User.identity))
-        )
-        return user_res.scalar_one()
+        loaded_user = await _load_user_with_identity(db, user.id, agent_tenant_id)
+        if loaded_user:
+            return loaded_user
 
-    # Case 3: Create new User and link to OrgMember
-    # Determine channel type from provider
-    from app.models.identity import IdentityProvider
-    provider = await db.get(IdentityProvider, org_member.provider_id)
-    channel_type = provider.provider_type if provider else "unknown"
-    external_seed = org_member.external_id
-
-    # Generate username from OrgMember info
-    email = org_member.email
-    seed_for_name = external_seed or org_member.id.hex
-    name = org_member.name or f"{channel_type.capitalize()} User {seed_for_name[:8]}"
-
-    if email:
-        username = email.split("@")[0]
-    elif external_seed:
-        username = f"{channel_type}_{external_seed[:12]}"
-    else:
-        username = f"{channel_type}_{org_member.id.hex[:12]}"
-
-    # Ensure unique username within tenant
-    query = (
-        select(User)
-        .join(User.identity)
-        .where(Identity.username == username)
-    )
-    if agent_tenant_id:
-        query = query.where(User.tenant_id == agent_tenant_id)
-
-    existing = await db.execute(query)
-    if existing.scalar_one_or_none():
-        username = f"{username}_{external_seed[:6] if external_seed else org_member.id.hex[:6]}"
-
-    email = email or f"{username}@{channel_type}.local"
-
-    # Step 3: Create new User and link to OrgMember
-    from app.services.registration_service import registration_service
-    # Use unified find_or_create_identity with dual lookup (email/phone)
-    identity = await registration_service.find_or_create_identity(
+    extra_info = {
+        "name": org_member.name,
+        "email": org_member.email,
+        "mobile": org_member.phone,
+        "avatar_url": org_member.avatar_url,
+        "title": org_member.title,
+        "external_id": org_member.external_id,
+        "open_id": org_member.open_id,
+        "unionid": org_member.unionid,
+    }
+    user = await channel_user_service._create_channel_user(
         db,
-        email=email,
-        phone=org_member.phone,
-        username=username,
-        password=uuid.uuid4().hex,
+        provider_type,
+        org_member.external_id or org_member.open_id,
+        extra_info,
+        agent_tenant_id,
     )
-
-
-    user = User(
-        identity=identity,
-        display_name=name,
-        avatar_url=org_member.avatar_url,
-        role="member",
-        registration_source=channel_type,
-        tenant_id=agent_tenant_id,
-        is_active=True,
-    )
-
-    db.add(user)
-    await db.flush()
-
-    # Link OrgMember to new User
     org_member.user_id = user.id
     await db.flush()
+    loaded_user = await _load_user_with_identity(db, user.id, agent_tenant_id)
+    if loaded_user:
+        return loaded_user
 
-    logger.info(f"[channel_user_service] Created User {user.id} for OrgMember {org_member.id} ({name})")
-    
-    # Eagerly load/refresh User.identity before returning
-    user_res = await db.execute(
-        select(User).where(User.id == user.id).options(selectinload(User.identity))
+    raise ChannelUserResolutionError(
+        f"OrgMember {org_member.id} cannot be provisioned without a tenant-scoped active user "
+        "or a mobile number"
     )
-    return user_res.scalar_one()

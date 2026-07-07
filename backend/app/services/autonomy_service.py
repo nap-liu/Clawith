@@ -125,7 +125,10 @@ class AutonomyService:
         execution_result = None
         if approval.status == "approved" and approval.details:
             execution_result = await self._execute_approved_action(
-                approval.agent_id, approval.action_type, approval.details
+                approval.agent_id,
+                approval.action_type,
+                approval.details,
+                user.id,
             )
             logger.info(f"Post-approval execution for {approval.action_type}: {execution_result}")
 
@@ -168,7 +171,11 @@ class AutonomyService:
         return approval
 
     async def _execute_approved_action(
-        self, agent_id: uuid.UUID, action_type: str, details: dict
+        self,
+        agent_id: uuid.UUID,
+        action_type: str,
+        details: dict,
+        resolved_by_user_id: uuid.UUID | None = None,
     ) -> str | None:
         """Execute the tool action that was approved.
 
@@ -196,7 +203,12 @@ class AutonomyService:
 
             # Import and call the tool's direct executor (no autonomy re-check)
             from app.services.agent_tools import _execute_tool_direct
-            result = await _execute_tool_direct(tool_name, arguments, agent_id)
+            result = await _execute_tool_direct(
+                tool_name,
+                arguments,
+                agent_id,
+                user_id=resolved_by_user_id,
+            )
             return result
         except Exception as e:
             logger.error(f"Failed to execute approved action {tool_name}: {e}")
