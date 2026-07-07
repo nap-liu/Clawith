@@ -1,15 +1,16 @@
 import uuid
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
-from app.models.user import User
+from app.models.user import Identity, User
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -44,9 +45,29 @@ class UserOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-@router.get("/", response_model=list[UserOut])
+class UserListOut(BaseModel):
+    items: list[UserOut]
+    total: int
+    page: int
+    page_size: int
+
+
+def _parse_tenant_id(value: str | uuid.UUID | None) -> uuid.UUID | None:
+    if value is None or isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid tenant_id")
+
+
+@router.get("/", response_model=UserListOut)
 async def list_users(
     tenant_id: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(15, ge=1, le=100),
+    search: str = "",
+    sort_order: Literal["asc", "desc"] = "desc",
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -55,27 +76,59 @@ async def list_users(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
 
     # Platform admins can view any tenant; org_admins only their own
-    tid = tenant_id if tenant_id and current_user.role == "platform_admin" else str(current_user.tenant_id)
-
-    # Filter users by tenant — platform_admins only shown in their own tenant
-    result = await db.execute(
-        select(User).options(selectinload(User.identity)).where(
-            User.tenant_id == tid
-        ).order_by(User.created_at.asc())
+    target_tenant_id = (
+        _parse_tenant_id(tenant_id)
+        if tenant_id and current_user.role == "platform_admin"
+        else _parse_tenant_id(current_user.tenant_id)
     )
-    users = result.scalars().all()
 
-    out = []
-    for u in users:
-        # Count non-expired agents
-        count_result = await db.execute(
-            select(func.count()).select_from(Agent).where(
-                Agent.creator_id == u.id,
-                Agent.is_expired == False,
+    conditions = [User.tenant_id == target_tenant_id]
+    search_term = search.strip()
+    if search_term:
+        pattern = f"%{search_term}%"
+        conditions.append(
+            or_(
+                User.display_name.ilike(pattern),
+                Identity.username.ilike(pattern),
+                Identity.email.ilike(pattern),
+                Identity.phone.ilike(pattern),
             )
         )
-        agents_count = count_result.scalar() or 0
 
+    count_result = await db.execute(
+        select(func.count())
+        .select_from(User)
+        .outerjoin(Identity, User.identity_id == Identity.id)
+        .where(*conditions)
+    )
+    total = count_result.scalar() or 0
+
+    agent_counts = (
+        select(
+            Agent.creator_id.label("creator_id"),
+            func.count(Agent.id).label("agents_count"),
+        )
+        .where(Agent.is_expired.is_(False))
+        .group_by(Agent.creator_id)
+        .subquery()
+    )
+
+    order_column = User.created_at.asc() if sort_order == "asc" else User.created_at.desc()
+    offset = (page - 1) * page_size
+    rows_result = await db.execute(
+        select(User, func.coalesce(agent_counts.c.agents_count, 0).label("agents_count"))
+        .outerjoin(Identity, User.identity_id == Identity.id)
+        .outerjoin(agent_counts, agent_counts.c.creator_id == User.id)
+        .options(selectinload(User.identity))
+        .where(*conditions)
+        .order_by(order_column, User.id.asc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    rows = rows_result.all()
+
+    out = []
+    for u, agents_count in rows:
         user_dict = {
             "id": u.id,
             "username": u.username or u.email or f"{u.registration_source or 'user'}_{str(u.id)[:8]}",
@@ -89,12 +142,17 @@ async def list_users(
             "quota_messages_used": u.quota_messages_used,
             "quota_max_agents": u.quota_max_agents,
             "quota_agent_ttl_hours": u.quota_agent_ttl_hours,
-            "agents_count": agents_count,
+            "agents_count": int(agents_count or 0),
             "created_at": u.created_at.isoformat() if u.created_at else None,
             "source": (u.registration_source or 'registered'),
         }
         out.append(UserOut(**user_dict))
-    return out
+    return {
+        "items": out,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @router.patch("/{user_id}/quota", response_model=UserOut)
@@ -136,7 +194,7 @@ async def update_user_quota(
     count_result = await db.execute(
         select(func.count()).select_from(Agent).where(
             Agent.creator_id == user.id,
-            Agent.is_expired == False,
+            Agent.is_expired.is_(False),
         )
     )
     agents_count = count_result.scalar() or 0
@@ -301,7 +359,7 @@ async def update_user_profile(
     count_result = await db.execute(
         select(func.count()).select_from(Agent).where(
             Agent.creator_id == target.id,
-            Agent.is_expired == False,
+            Agent.is_expired.is_(False),
         )
     )
     agents_count = count_result.scalar() or 0
