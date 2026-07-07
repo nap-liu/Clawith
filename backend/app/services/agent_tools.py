@@ -6353,9 +6353,10 @@ def _format_contact_search_results(rows: list[dict]) -> str:
         else:
             title = f" — {item.get('title')}" if item.get("title") else ""
             dept = f" | dept={item.get('department_path')}" if item.get("department_path") else ""
+            phone = f" | phone={item.get('phone')}" if item.get("phone") else ""
             lines.append(
                 f"- id={item['id']} | type=human | {item.get('name')}{title} | "
-                f"channel={item.get('channel')}{dept} | relationship={item.get('relationship_status')} | "
+                f"channel={item.get('channel')}{dept}{phone} | relationship={item.get('relationship_status')} | "
                 f"{item.get('send_hint')}"
             )
     return "\n".join(lines)

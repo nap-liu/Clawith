@@ -217,11 +217,11 @@ async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_
             "title": "前端开发",
             "channel": "dingtalk",
             "department_path": "Root/信息技术部/技术部/前端开发",
+            "phone": "13800000000",
             "relationship_status": "not_added",
             "send_hint": '添加后使用 send_channel_message(member_name="刘喜", channel="dingtalk", ...)',
         }
     ]
-    assert "phone" not in human_results[0]
     assert "external_id" not in human_results[0]
 
     agent_results = await search_contacts_for_agent(
@@ -483,7 +483,7 @@ async def test_execute_tool_search_contacts_returns_human_contacts(contact_sessi
     assert "human:" not in result
     assert "刘喜" in result
     assert "dingtalk" in result
-    assert "13800000000" not in result
+    assert "phone=13800000000" in result
     assert "632277911" not in result
 
 

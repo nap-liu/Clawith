@@ -220,6 +220,7 @@ async def search_contacts_for_agent(
                     "title": member.title or "",
                     "channel": channel or "platform",
                     "department_path": member.department_path or "",
+                    "phone": member.phone or "",
                     "relationship_status": await _human_relationship_status(db, source_agent, member),
                     "send_hint": _human_send_hint(member.name, channel),
                 }
