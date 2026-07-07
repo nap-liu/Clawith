@@ -648,6 +648,71 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_contacts",
+            "description": (
+                "Search people and digital employees that can be added to your relationship network. "
+                "Use this before add_contact when you need to contact someone who is not already in your relationships. "
+                "Results include separate id and type fields. Pass them to add_contact as target_id and target_type."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Name, department, email, pinyin, or exact phone number to search.",
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "Optional contact type filter.",
+                        "enum": ["all", "human", "agent"],
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return, from 1 to 50.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_contact",
+            "description": (
+                "Add a person or digital employee to your relationship network using the id and type returned by search_contacts. "
+                "Use target_type=human for people from synced org directories, and target_type=agent for digital employees. "
+                "After adding a human contact, use send_channel_message or send_platform_message. "
+                "After adding a digital employee, use send_message_to_agent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_type": {
+                        "type": "string",
+                        "description": "Contact type returned by search_contacts.",
+                        "enum": ["human", "agent"],
+                    },
+                    "target_id": {
+                        "type": "string",
+                        "description": "UUID id returned by search_contacts.",
+                    },
+                    "relation": {
+                        "type": "string",
+                        "description": "Relationship label, such as collaborator, stakeholder, peer, team_member, or other.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional short note explaining why this contact is needed.",
+                    },
+                },
+                "required": ["target_type", "target_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "send_channel_message",
             "description": (
                 "Send a message to a colleague via their configured external channel "
@@ -1993,8 +2058,10 @@ AGENT_TOOLS = [
 # _CHANNEL_MESSAGE_TOOL_NAMES and is only added when a channel is configured,
 # to avoid sending duplicate tool definitions to the LLM.
 _ALWAYS_INCLUDE_CORE = {
+    "add_contact",
     "complete_focus_item",
     "list_focus_items",
+    "search_contacts",
     "send_channel_file",
     "send_file_to_agent",
     "upsert_focus_item",
@@ -2687,6 +2754,7 @@ _TOOL_AUTONOMY_MAP = {
     "write_file": "write_workspace_files",
     "move_file": "write_workspace_files",
     "delete_file": "delete_files",
+    "add_contact": "manage_relationships",
     "send_feishu_message": "send_feishu_message",
     "send_message_to_agent": "send_message_to_agent",  # A2A messaging — distinct from feishu
     "send_file_to_agent": "send_file_to_agent",          # A2A file transfer
@@ -2976,6 +3044,8 @@ async def _execute_tool_direct(
             return await _bing_search_tool(arguments, agent_id)
         elif tool_name == "send_feishu_message":
             return await _send_feishu_message(agent_id, arguments)
+        elif tool_name == "add_contact":
+            return await _add_contact_tool(agent_id, arguments, user_id=None)
         elif tool_name == "send_message_to_agent":
             return await _send_message_to_agent(
                 agent_id,
@@ -3227,6 +3297,10 @@ async def execute_tool(
             result = await _handle_cancel_trigger(agent_id, arguments)
         elif tool_name == "list_triggers":
             result = await _handle_list_triggers(agent_id)
+        elif tool_name == "search_contacts":
+            result = await _search_contacts_tool(agent_id, arguments, user_id)
+        elif tool_name == "add_contact":
+            result = await _add_contact_tool(agent_id, arguments, user_id)
         elif tool_name == "send_feishu_message":
             result = await _send_feishu_message(agent_id, arguments)
         elif tool_name == "send_platform_message":
@@ -6226,6 +6300,87 @@ async def _manage_tasks(
             return f"✅ Task deleted: {task_title}"
 
         return f"Unknown action: {action}"
+
+
+def _format_contact_search_results(rows: list[dict]) -> str:
+    if not rows:
+        return "No contacts found."
+
+    lines = [f"Found {len(rows)} contact(s):"]
+    for item in rows:
+        if item.get("type") == "agent":
+            role = f" — {item.get('role_description')}" if item.get("role_description") else ""
+            lines.append(
+                f"- id={item['id']} | type=agent | {item.get('name')}{role} | "
+                f"relationship={item.get('relationship_status')} | {item.get('send_hint')}"
+            )
+        else:
+            title = f" — {item.get('title')}" if item.get("title") else ""
+            dept = f" | dept={item.get('department_path')}" if item.get("department_path") else ""
+            lines.append(
+                f"- id={item['id']} | type=human | {item.get('name')}{title} | "
+                f"channel={item.get('channel')}{dept} | relationship={item.get('relationship_status')} | "
+                f"{item.get('send_hint')}"
+            )
+    return "\n".join(lines)
+
+
+async def _search_contacts_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID | None) -> str:
+    query = (args.get("query") or args.get("q") or "").strip()
+    if not query:
+        return "❌ Please provide query"
+
+    contact_type = (args.get("type") or args.get("contact_type") or "all").strip().lower()
+    limit = args.get("limit", 20)
+
+    from app.services.contact_relationships import search_contacts_for_agent
+
+    async with async_session() as db:
+        rows = await search_contacts_for_agent(
+            db,
+            agent_id,
+            query=query,
+            contact_type=contact_type,
+            current_user_id=user_id,
+            limit=limit,
+        )
+    return _format_contact_search_results(rows)
+
+
+async def _add_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID | None) -> str:
+    target_type = (args.get("target_type") or args.get("type") or "").strip().lower()
+    target_id = (args.get("target_id") or args.get("id") or "").strip()
+    if not target_type or not target_id:
+        return "❌ Please provide target_type and target_id from search_contacts"
+
+    from app.services.contact_relationships import add_contact_for_agent
+
+    async with async_session() as db:
+        result = await add_contact_for_agent(
+            db,
+            agent_id,
+            target_type=target_type,
+            target_id=target_id,
+            relation=args.get("relation") or "collaborator",
+            description=args.get("description") or "",
+            current_user_id=user_id,
+        )
+        if result.get("status") in {"added", "already_added"}:
+            await db.commit()
+        else:
+            await db.rollback()
+
+    if result.get("status") == "added":
+        return (
+            f"✅ Added {result.get('name')} ({result.get('type')} id={result.get('id')}) "
+            f"as {result.get('type')} contact. {result.get('send_hint')}"
+        )
+    if result.get("status") == "already_added":
+        return (
+            f"ℹ️ {result.get('name')} ({result.get('type')} id={result.get('id')}) is already in your relationship network. "
+            f"Updated relation details. {result.get('send_hint')}"
+        )
+    return f"❌ Unable to add contact: {result.get('reason', 'unknown_error')}"
 
 
 async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
