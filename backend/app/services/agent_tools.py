@@ -684,9 +684,7 @@ AGENT_TOOLS = [
                 "Add a person or digital employee to your relationship network using the id and type returned by search_contacts. "
                 "Use target_type=human for people from synced org directories, and target_type=agent for digital employees. "
                 "Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. "
-                "Do not add contacts proactively or based only on your own intent to send a message. "
-                "After adding a human contact, use send_channel_message or send_platform_message. "
-                "After adding a digital employee, use send_message_to_agent."
+                "Do not add contacts proactively or based only on your own intent to contact someone."
             ),
             "parameters": {
                 "type": "object",
@@ -6348,7 +6346,7 @@ def _format_contact_search_results(rows: list[dict]) -> str:
             role = f" — {item.get('role_description')}" if item.get("role_description") else ""
             lines.append(
                 f"- id={item['id']} | type=agent | {item.get('name')}{role} | "
-                f"relationship={item.get('relationship_status')} | {item.get('send_hint')}"
+                f"relationship={item.get('relationship_status')}"
             )
         else:
             title = f" — {item.get('title')}" if item.get("title") else ""
@@ -6356,8 +6354,7 @@ def _format_contact_search_results(rows: list[dict]) -> str:
             phone = f" | phone={item.get('phone')}" if item.get("phone") else ""
             lines.append(
                 f"- id={item['id']} | type=human | {item.get('name')}{title} | "
-                f"channel={item.get('channel')}{dept}{phone} | relationship={item.get('relationship_status')} | "
-                f"{item.get('send_hint')}"
+                f"channel={item.get('channel')}{dept}{phone} | relationship={item.get('relationship_status')}"
             )
     return "\n".join(lines)
 
@@ -6410,12 +6407,12 @@ async def _add_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID 
     if result.get("status") == "added":
         return (
             f"✅ Added {result.get('name')} ({result.get('type')} id={result.get('id')}) "
-            f"as {result.get('type')} contact. {result.get('send_hint')}"
+            f"as {result.get('type')} contact."
         )
     if result.get("status") == "already_added":
         return (
             f"ℹ️ {result.get('name')} ({result.get('type')} id={result.get('id')}) is already in your relationship network. "
-            f"Updated relation details. {result.get('send_hint')}"
+            "Updated relation details."
         )
     return f"❌ Unable to add contact: {result.get('reason', 'unknown_error')}"
 

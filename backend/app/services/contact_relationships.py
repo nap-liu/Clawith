@@ -81,14 +81,16 @@ def _is_external_channel(channel: str | None) -> bool:
     return bool(channel and channel not in {"web", "platform"})
 
 
-def _human_send_hint(name: str, channel: str | None) -> str:
-    if channel in {"feishu", "dingtalk", "wecom", "slack", "teams", "wechat"}:
-        return f'添加后使用 send_channel_message(member_name="{name}", channel="{channel}", ...)'
-    return f'添加后使用 send_platform_message(username="{name}", ...)'
-
-
-def _agent_send_hint(name: str) -> str:
-    return f'添加后使用 send_message_to_agent(agent_name="{name}", ...)'
+def _mask_phone_for_display(phone: str | None) -> str:
+    value = (phone or "").strip()
+    if not value:
+        return ""
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if len(digits) >= 8:
+        return f"{digits[:3]}****{digits[-4:]}"
+    if len(digits) > 4:
+        return f"{digits[:1]}****{digits[-2:]}"
+    return "****"
 
 
 async def _human_relationship_status(
@@ -215,9 +217,8 @@ async def search_contacts_for_agent(
                     "title": member.title or "",
                     "channel": channel or "platform",
                     "department_path": member.department_path or "",
-                    "phone": member.phone or "",
+                    "phone": _mask_phone_for_display(member.phone),
                     "relationship_status": await _human_relationship_status(db, source_agent, member),
-                    "send_hint": _human_send_hint(member.name, channel),
                 }
             )
 
@@ -262,7 +263,6 @@ async def search_contacts_for_agent(
                         target,
                         current_user_id,
                     ),
-                    "send_hint": _agent_send_hint(target.name),
                 }
             )
 
@@ -307,19 +307,12 @@ async def _add_human_contact(
 
     rel.member = member
     status_info = await evaluate_human_relationship_status(db, rel, source_agent=source_agent)
-    channel = None
-    if member.provider_id:
-        provider_result = await db.execute(
-            select(IdentityProvider.provider_type).where(IdentityProvider.id == member.provider_id)
-        )
-        channel = _provider_type(provider_result.scalar_one_or_none())
     return {
         "status": status,
         "id": str(member.id),
         "type": "human",
         "name": member.name,
         "relationship_status": status_info["access_status"],
-        "send_hint": _human_send_hint(member.name, channel),
     }
 
 
@@ -388,7 +381,6 @@ async def _add_agent_contact(
         "type": "agent",
         "name": target.name,
         "relationship_status": status_info["access_status"],
-        "send_hint": _agent_send_hint(target.name),
     }
 
 

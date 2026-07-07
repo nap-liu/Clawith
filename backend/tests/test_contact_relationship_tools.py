@@ -45,6 +45,9 @@ def test_contact_tool_descriptions_require_user_intent_and_creator_confirmation(
         assert "do not use" in normalized
         assert "proactively" in normalized
         assert "when you need to contact" not in normalized
+        assert "send_channel_message" not in normalized
+        assert "send_platform_message" not in normalized
+        assert "send_message_to_agent" not in normalized
 
     for description in (
         _llm_tool_description("add_contact"),
@@ -55,6 +58,9 @@ def test_contact_tool_descriptions_require_user_intent_and_creator_confirmation(
         assert "creator" in normalized
         assert "confirmed" in normalized
         assert "do not add contacts proactively" in normalized
+        assert "send_channel_message" not in normalized
+        assert "send_platform_message" not in normalized
+        assert "send_message_to_agent" not in normalized
 
     for description in (
         _llm_tool_description("remove_contact"),
@@ -217,12 +223,12 @@ async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_
             "title": "前端开发",
             "channel": "dingtalk",
             "department_path": "Root/信息技术部/技术部/前端开发",
-            "phone": "13800000000",
+            "phone": "138****0000",
             "relationship_status": "not_added",
-            "send_hint": '添加后使用 send_channel_message(member_name="刘喜", channel="dingtalk", ...)',
         }
     ]
     assert "external_id" not in human_results[0]
+    assert "send_hint" not in human_results[0]
 
     agent_results = await search_contacts_for_agent(
         contact_session,
@@ -233,7 +239,7 @@ async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_
     )
     assert [row["id"] for row in agent_results] == [str(ctx["target"].id)]
     assert agent_results[0]["type"] == "agent"
-    assert agent_results[0]["send_hint"] == '添加后使用 send_message_to_agent(agent_name="Research Agent", ...)'
+    assert "send_hint" not in agent_results[0]
 
 
 @pytest.mark.asyncio
@@ -536,8 +542,12 @@ async def test_execute_tool_search_contacts_returns_human_contacts(contact_sessi
     assert "human:" not in result
     assert "刘喜" in result
     assert "dingtalk" in result
-    assert "phone=13800000000" in result
+    assert "phone=138****0000" in result
+    assert "13800000000" not in result
     assert "632277911" not in result
+    assert "send_channel_message" not in result
+    assert "send_platform_message" not in result
+    assert "send_message_to_agent" not in result
 
 
 @pytest.mark.asyncio
@@ -571,9 +581,14 @@ async def test_execute_tool_add_contact_creates_human_and_agent_relationships(co
     )
 
     assert "✅ Added 刘喜" in human_result
-    assert 'send_channel_message(member_name="刘喜", channel="dingtalk", ...)' in human_result
+    assert "send_channel_message" not in human_result
+    assert "send_platform_message" not in human_result
+    assert "send_message_to_agent" not in human_result
     assert "human:" not in human_result
     assert "✅ Added Research Agent" in agent_result
+    assert "send_channel_message" not in agent_result
+    assert "send_platform_message" not in agent_result
+    assert "send_message_to_agent" not in agent_result
     assert "agent:" not in agent_result
 
     human_rows = (
