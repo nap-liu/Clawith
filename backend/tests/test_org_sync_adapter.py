@@ -12,6 +12,7 @@ from app.services.org_sync_adapter import (
     GoogleWorkspaceOrgSyncAdapter,
     SYNC_ADAPTER_CLASSES,
     build_department_path_map,
+    normalize_contact_for_match,
 )
 
 
@@ -199,3 +200,12 @@ def test_build_department_path_map_treats_external_zero_root_as_empty_path():
 
     assert path_map[root_id] == ""
     assert path_map[child_id] == "研发部"
+
+
+def test_normalize_contact_for_match_strips_common_mobile_formatting():
+    assert normalize_contact_for_match("+86 138-0013-8000") == "8613800138000"
+    assert normalize_contact_for_match(" 138 0013 8000 ") == "13800138000"
+
+
+def test_normalize_contact_for_match_keeps_email_lowercase():
+    assert normalize_contact_for_match(" Alice@Example.COM ") == "alice@example.com"

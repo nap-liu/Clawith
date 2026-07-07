@@ -134,11 +134,21 @@ async def derive_member_department_paths(
     }
 
 
-def _normalize_contact(value: str | None) -> str | None:
+def normalize_contact_for_match(value: str | None) -> str | None:
+    """Normalize synced contact identifiers before matching platform users."""
     if value is None:
         return None
     value = value.strip()
-    return value or None
+    if not value:
+        return None
+    if "@" in value:
+        return value.lower()
+    digits = "".join(ch for ch in value if ch.isdigit())
+    return digits or value
+
+
+def _normalize_contact(value: str | None) -> str | None:
+    return normalize_contact_for_match(value)
 
 
 @dataclass

@@ -1526,7 +1526,7 @@
           "step3": "应用信息 → 复制 AppKey 和 AppSecret",
           "step4": "通讯录权限 → 勾选部门和成员的读取权限",
           "step5": "将 AppKey 和 AppSecret 填入下方 → 点击保存配置",
-          "step6": "如需使用钉钉免登：打开下方的SSO登录开关，然后在钉钉中配置：登录与分享 → 填写回调域名（即下方的 Redirect URL 的域名）。分享下方的 SSO Login URL 给团队成员，他们即可一键登录。"
+          "step6": "可选钉钉登录：只有团队成员需要通过钉钉登录平台时，才打开下方的“启用钉钉登录”开关，并在钉钉中配置：登录与分享 → 回调域名（填写下方 Redirect URL 的域名）。通讯录同步不需要开启此开关。"
         },
         "wecom": {
           "step1": "登录企业微信管理后台 → 管理工具 → 通讯录同步",
@@ -1709,7 +1709,7 @@
       },
       "providerHints": {
         "feishu": "飞书：需填写 app_id, app_secret（可选：encrypt_key, verification_token）",
-        "dingtalk": "钉钉：需填写 app_key, app_secret",
+        "dingtalk": "钉钉：通讯录同步需填写 app_key 和 app_secret；钉钉登录可选开启。",
         "wecom": "企业微信：传统模式需 corp_id, secret, agent_id；智能机器人模式需 bot_id, bot_secret",
         "google_workspace": "Google Workspace：同一套 Client ID、Client Secret 和同一个 Redirect URL 同时用于 SSO 与管理员授权的目录同步",
         "oauth2": "OAuth2：填写 App ID、App Secret、授权地址、Token地址、用户信息地址",
@@ -1718,6 +1718,10 @@
       },
       "ssoLoginToggle": "SSO 登录",
       "ssoLoginToggleHint": "允许用户通过此身份提供商登录。",
+      "dingtalkSsoLoginToggle": "启用钉钉登录",
+      "dingtalkSsoLoginToggleHint": "只有团队成员需要通过钉钉登录平台时才开启。即使关闭此开关，也可以使用 AppKey/AppSecret 同步钉钉通讯录。",
+      "dingtalkSyncOnlyNoticeTitle": "通讯录同步不依赖钉钉登录",
+      "dingtalkSyncOnlyNoticeDesc": "配置 AppKey/AppSecret 即可同步钉钉联系人。只有需要团队成员通过钉钉登录平台时，才打开 SSO 登录开关。",
       "ssoSubdomain": "SSO 登录地址",
       "ssoSubdomainHint": "将此地址分享给团队成员，访问后会出现 SSO 登录按钮。",
       "callbackUrl": "回调地址（粘贴到应用设置中）",
