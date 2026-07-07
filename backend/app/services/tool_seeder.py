@@ -605,7 +605,7 @@ BUILTIN_TOOLS = [
     {
         "name": "search_contacts",
         "display_name": "Search Contacts",
-        "description": "Search people and digital employees that can be added to your relationship network. Use this before add_contact when you need to contact someone who is not already in your relationships. Results include separate id and type fields; pass them to add_contact as target_id and target_type.",
+        "description": "Search people and digital employees as candidates for relationship network editing. Only use this tool when the user explicitly asks you to search, review, or edit the relationship network. Do not use it proactively just because you want to contact someone. Results include separate id and type fields; pass them to add_contact as target_id and target_type.",
         "category": "communication",
         "icon": "🔎",
         "is_default": True,
@@ -624,7 +624,7 @@ BUILTIN_TOOLS = [
     {
         "name": "add_contact",
         "display_name": "Add Contact",
-        "description": "Add a person or digital employee to your relationship network using the id and type returned by search_contacts. Use target_type=human for people from synced org directories, and target_type=agent for digital employees.",
+        "description": "Add a person or digital employee to your relationship network using the id and type returned by search_contacts. Use target_type=human for people from synced org directories, and target_type=agent for digital employees. Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. Do not add contacts proactively or based only on your own intent to send a message.",
         "category": "communication",
         "icon": "➕",
         "is_default": True,

@@ -12,6 +12,45 @@ from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services import agent_tools
 from app.services.contact_relationships import add_contact_for_agent, search_contacts_for_agent
+from app.services.tool_seeder import BUILTIN_TOOLS
+
+
+def _llm_tool_description(tool_name: str) -> str:
+    for tool in agent_tools.AGENT_TOOLS:
+        function = tool.get("function") or {}
+        if function.get("name") == tool_name:
+            return function.get("description") or ""
+    raise AssertionError(f"{tool_name} not found in AGENT_TOOLS")
+
+
+def _seed_tool_description(tool_name: str) -> str:
+    for tool in BUILTIN_TOOLS:
+        if tool.get("name") == tool_name:
+            return tool.get("description") or ""
+    raise AssertionError(f"{tool_name} not found in BUILTIN_TOOLS")
+
+
+def test_contact_tool_descriptions_require_user_intent_and_creator_confirmation():
+    for description in (
+        _llm_tool_description("search_contacts"),
+        _seed_tool_description("search_contacts"),
+    ):
+        normalized = description.lower()
+        assert "user explicitly asks" in normalized
+        assert "relationship network" in normalized
+        assert "do not use" in normalized
+        assert "proactively" in normalized
+        assert "when you need to contact" not in normalized
+
+    for description in (
+        _llm_tool_description("add_contact"),
+        _seed_tool_description("add_contact"),
+    ):
+        normalized = description.lower()
+        assert "user explicitly asked" in normalized
+        assert "creator" in normalized
+        assert "confirmed" in normalized
+        assert "do not add contacts proactively" in normalized
 
 
 @pytest.fixture
