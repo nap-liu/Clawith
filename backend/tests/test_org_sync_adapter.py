@@ -8,6 +8,7 @@ import pytest
 
 from app.services.org_sync_adapter import (
     BaseOrgSyncAdapter,
+    DingTalkOrgSyncAdapter,
     ExternalUser,
     GoogleWorkspaceOrgSyncAdapter,
     SYNC_ADAPTER_CLASSES,
@@ -51,6 +52,129 @@ class _RecordingExecuteDB:
 
     async def execute(self, statement):
         self.statements.append(statement)
+
+
+class _FakeDingTalkResponse:
+    def __init__(self, data):
+        self._data = data
+
+    def json(self):
+        return self._data
+
+
+class _FakeDingTalkClient:
+    def __init__(self):
+        self.department_list_requests = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, params=None, json=None):
+        if url == DingTalkOrgSyncAdapter.DINGTALK_AUTH_SCOPES_URL:
+            return _FakeDingTalkResponse({
+                "errcode": 0,
+                "auth_org_scopes": {
+                    "authed_dept": [42],
+                    "authed_user": [],
+                },
+            })
+
+        if url == DingTalkOrgSyncAdapter.DINGTALK_DEPT_GET_URL:
+            assert json == {"dept_id": 42}
+            return _FakeDingTalkResponse({
+                "errcode": 0,
+                "result": {
+                    "dept_id": 42,
+                    "name": "研发部",
+                    "parent_id": 1,
+                    "member_count": 2,
+                },
+            })
+
+        if url == DingTalkOrgSyncAdapter.DINGTALK_DEPT_LIST_URL:
+            dept_id = json["dept_id"]
+            self.department_list_requests.append(dept_id)
+            if dept_id == 1:
+                return _FakeDingTalkResponse({
+                    "errcode": 50004,
+                    "errmsg": "请求的部门id不在授权范围内",
+                })
+            if dept_id == 42:
+                return _FakeDingTalkResponse({
+                    "errcode": 0,
+                    "result": [
+                        {
+                            "dept_id": 43,
+                            "name": "平台组",
+                            "parent_id": 42,
+                            "member_count": 1,
+                        }
+                    ],
+                })
+            if dept_id == 43:
+                return _FakeDingTalkResponse({"errcode": 0, "result": []})
+
+        raise AssertionError(f"Unexpected DingTalk request: {url} {json}")
+
+
+class _FakeDingTalkScopeFallbackClient:
+    def __init__(self):
+        self.calls = []
+
+    async def post(self, url, params=None, json=None):
+        self.calls.append(("POST", url))
+        assert url == DingTalkOrgSyncAdapter.DINGTALK_AUTH_SCOPES_URL
+        return _FakeDingTalkResponse({
+            "errcode": 15,
+            "errmsg": "Remote service error[submsg=远程服务不存在]",
+        })
+
+    async def get(self, url, params=None):
+        self.calls.append(("GET", url))
+        assert url == "https://oapi.dingtalk.com/auth/scopes"
+        return _FakeDingTalkResponse({
+            "errcode": 0,
+            "errmsg": "ok",
+            "auth_org_scopes": {
+                "authed_dept": [42],
+                "authed_user": [],
+            },
+        })
+
+
+class _FakeDingTalkRateLimitClient:
+    def __init__(self):
+        self.department_list_calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, params=None, json=None):
+        if url == DingTalkOrgSyncAdapter.DINGTALK_AUTH_SCOPES_URL:
+            return _FakeDingTalkResponse({
+                "errcode": 0,
+                "auth_org_scopes": {
+                    "authed_dept": [1],
+                    "authed_user": [],
+                },
+            })
+
+        if url == DingTalkOrgSyncAdapter.DINGTALK_DEPT_LIST_URL:
+            self.department_list_calls += 1
+            if self.department_list_calls == 1:
+                return _FakeDingTalkResponse({
+                    "errcode": 90002,
+                    "errmsg": "当前所有钉钉应用调用该接口次数过多",
+                })
+            return _FakeDingTalkResponse({"errcode": 0, "result": []})
+
+        raise AssertionError(f"Unexpected DingTalk request: {url} {json}")
 
 
 class _SyncAdapterWithFailure(_DummyAdapter):
@@ -167,6 +291,67 @@ def test_google_workspace_adapter_uses_admin_authorization_email_as_primary_iden
 
 def test_google_workspace_adapter_registered():
     assert SYNC_ADAPTER_CLASSES["google_workspace"] is GoogleWorkspaceOrgSyncAdapter
+
+
+def test_dingtalk_fetch_departments_starts_from_authorized_scope(monkeypatch):
+    fake_client = _FakeDingTalkClient()
+    monkeypatch.setattr(
+        "app.services.org_sync_adapter.httpx.AsyncClient",
+        lambda *args, **kwargs: fake_client,
+    )
+
+    adapter = DingTalkOrgSyncAdapter(config={"app_key": "app-key", "app_secret": "app-secret"})
+
+    async def fake_get_access_token():
+        return "access-token"
+
+    adapter.get_access_token = fake_get_access_token
+
+    departments = asyncio.run(adapter.fetch_departments())
+
+    assert [dept.external_id for dept in departments] == ["42", "43"]
+    assert fake_client.department_list_requests == [42, 43]
+    assert adapter._dept_path_map == {"42": "研发部", "43": "研发部/平台组"}
+
+
+def test_dingtalk_authorized_scope_falls_back_to_legacy_auth_scopes():
+    fake_client = _FakeDingTalkScopeFallbackClient()
+    adapter = DingTalkOrgSyncAdapter(config={"app_key": "app-key", "app_secret": "app-secret"})
+
+    dept_ids = asyncio.run(adapter._fetch_authorized_department_ids(fake_client, "access-token"))
+
+    assert dept_ids == [42]
+    assert fake_client.calls == [
+        ("POST", DingTalkOrgSyncAdapter.DINGTALK_AUTH_SCOPES_URL),
+        ("GET", "https://oapi.dingtalk.com/auth/scopes"),
+    ]
+
+
+def test_dingtalk_fetch_departments_retries_rate_limited_department_requests(monkeypatch):
+    fake_client = _FakeDingTalkRateLimitClient()
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(
+        "app.services.org_sync_adapter.httpx.AsyncClient",
+        lambda *args, **kwargs: fake_client,
+    )
+    monkeypatch.setattr("app.services.org_sync_adapter.asyncio.sleep", fake_sleep)
+
+    adapter = DingTalkOrgSyncAdapter(config={"app_key": "app-key", "app_secret": "app-secret"})
+
+    async def fake_get_access_token():
+        return "access-token"
+
+    adapter.get_access_token = fake_get_access_token
+
+    departments = asyncio.run(adapter.fetch_departments())
+
+    assert [dept.external_id for dept in departments] == ["1"]
+    assert fake_client.department_list_calls == 2
+    assert DingTalkOrgSyncAdapter.DINGTALK_RATE_LIMIT_RETRY_SECONDS in sleeps
 
 
 def test_build_department_path_map_reconstructs_name_chain_from_internal_tree():
