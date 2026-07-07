@@ -1,11 +1,55 @@
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy import func, select
 
 from app.services.channel_user_service import ChannelUserService
 from app.services.channel_user_service import ChannelUserResolutionError
+from app.services.channel_user_service import get_platform_user_by_org_member
+from app.database import async_session, engine
+from app.models.identity import IdentityProvider
+from app.models.org import OrgMember
+from app.models.participant import Participant
+from app.models.tenant import Tenant
+from app.models.user import Identity, User
 from app.services.sso_service import sso_service
+
+
+@pytest.fixture(autouse=True)
+async def _isolate_async_engine_between_tests():
+    await engine.dispose()
+    yield
+    await engine.dispose()
+
+
+def _phone() -> str:
+    return f"8613{uuid.uuid4().int % 10**9:09d}"
+
+
+async def _seed_tenant() -> Tenant:
+    async with async_session() as db:
+        tenant = Tenant(name="Channel User Tenant", slug=f"channel-user-{uuid.uuid4().hex[:10]}")
+        db.add(tenant)
+        await db.commit()
+        await db.refresh(tenant)
+        return tenant
+
+
+async def _seed_provider(tenant_id: uuid.UUID, provider_type: str = "dingtalk") -> IdentityProvider:
+    async with async_session() as db:
+        provider = IdentityProvider(
+            provider_type=provider_type,
+            name=f"{provider_type}-{uuid.uuid4().hex[:6]}",
+            is_active=True,
+            config={},
+            tenant_id=tenant_id,
+        )
+        db.add(provider)
+        await db.commit()
+        await db.refresh(provider)
+        return provider
 
 
 def test_sso_identity_lookup_chain_prioritizes_unionid_then_userid_then_openid():
@@ -210,3 +254,337 @@ async def test_channel_user_service_creates_wechat_org_member_shell_for_lazy_reg
         {"external_id": "wx_user_123"},
         linked_user_id="user-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_get_platform_user_by_org_member_uses_contact_provisioning():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id)
+    phone = _phone()
+
+    async with async_session() as db:
+        member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            external_id=f"dt_{uuid.uuid4().hex[:8]}",
+            unionid=f"union_{uuid.uuid4().hex[:8]}",
+            name="主动联系对象",
+            phone=phone,
+            status="active",
+        )
+        db.add(member)
+        await db.commit()
+        member_id = member.id
+
+    async with async_session() as db:
+        member = await db.get(OrgMember, member_id)
+        user = await get_platform_user_by_org_member(db, member, agent_tenant_id=tenant.id)
+        await db.commit()
+
+        assert user.tenant_id == tenant.id
+        assert user.registration_source == "dingtalk_org_sync"
+        assert member.user_id == user.id
+
+        participant_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(Participant)
+                .where(Participant.type == "user", Participant.ref_id == user.id)
+            )
+        ).scalar_one()
+        assert participant_count == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_user_service_uses_org_member_provisioning_before_lazy_registration():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id)
+    phone = _phone()
+    external_id = f"dt_{uuid.uuid4().hex[:8]}"
+    unionid = f"union_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            external_id=external_id,
+            unionid=unionid,
+            name="钉钉未关联成员",
+            phone=phone,
+            status="active",
+        )
+        db.add(member)
+        await db.commit()
+        member_id = member.id
+
+    service = ChannelUserService()
+    agent = SimpleNamespace(tenant_id=tenant.id)
+
+    async with async_session() as db:
+        user = await service.resolve_channel_user(
+            db=db,
+            agent=agent,
+            channel_type="dingtalk",
+            external_user_id=external_id,
+            extra_info={"unionid": unionid, "name": "钉钉未关联成员"},
+        )
+        await db.commit()
+
+        member = await db.get(OrgMember, member_id)
+        assert member.user_id == user.id
+        assert user.registration_source == "dingtalk_org_sync"
+        assert user.primary_mobile == phone
+
+
+@pytest.mark.asyncio
+async def test_channel_user_service_mobile_payload_uses_provisioning_before_email_match():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id)
+    phone = _phone()
+    shared_email = f"shared-{uuid.uuid4().hex[:8]}@example.com"
+
+    async with async_session() as db:
+        identity = Identity(
+            username=f"wrong_{uuid.uuid4().hex[:8]}",
+            email=shared_email,
+            password_hash="x",
+        )
+        db.add(identity)
+        await db.flush()
+        email_identity_user = User(
+            identity_id=identity.id,
+            tenant_id=tenant.id,
+            display_name="Wrong Email Match",
+            role="member",
+            is_active=True,
+        )
+        db.add(email_identity_user)
+        await db.commit()
+        wrong_user_id = email_identity_user.id
+
+    service = ChannelUserService()
+    agent = SimpleNamespace(tenant_id=tenant.id)
+    external_id = f"dt_{uuid.uuid4().hex[:8]}"
+    unionid = f"union_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        user = await service.resolve_channel_user(
+            db=db,
+            agent=agent,
+            channel_type="dingtalk",
+            external_user_id=external_id,
+            extra_info={
+                "unionid": unionid,
+                "name": "手机号优先消息人",
+                "mobile": phone,
+                "email": shared_email,
+            },
+        )
+        await db.commit()
+
+        assert user.id != wrong_user_id
+        assert user.primary_mobile == phone
+        assert user.registration_source == "dingtalk_org_sync"
+        member = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.external_id == external_id,
+                )
+            )
+        ).scalar_one()
+        assert member.user_id == user.id
+
+
+@pytest.mark.asyncio
+async def test_channel_user_service_dingtalk_without_mobile_does_not_bind_by_email():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id)
+    shared_email = f"dingtalk-no-phone-{uuid.uuid4().hex[:8]}@example.com"
+    external_id = f"dt_{uuid.uuid4().hex[:8]}"
+    unionid = f"union_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        identity = Identity(
+            username=f"email_only_{uuid.uuid4().hex[:8]}",
+            email=shared_email,
+            password_hash="x",
+        )
+        db.add(identity)
+        await db.flush()
+        email_user = User(
+            identity_id=identity.id,
+            tenant_id=tenant.id,
+            display_name="Email Only User",
+            role="member",
+            is_active=True,
+        )
+        db.add(email_user)
+        member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            external_id=external_id,
+            unionid=unionid,
+            name="钉钉无手机号",
+            email=shared_email,
+            phone=None,
+            status="active",
+        )
+        db.add(member)
+        await db.commit()
+        member_id = member.id
+
+    service = ChannelUserService()
+    agent = SimpleNamespace(tenant_id=tenant.id)
+
+    async with async_session() as db:
+        with pytest.raises(ChannelUserResolutionError):
+            await service.resolve_channel_user(
+                db=db,
+                agent=agent,
+                channel_type="dingtalk",
+                external_user_id=external_id,
+                extra_info={"unionid": unionid, "email": shared_email},
+            )
+        await db.rollback()
+
+    async with async_session() as db:
+        member = await db.get(OrgMember, member_id)
+        assert member.user_id is None
+
+
+@pytest.mark.asyncio
+async def test_get_platform_user_by_org_member_non_dingtalk_keeps_email_match_compatibility():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id, provider_type="wechat")
+    email = f"wechat-{uuid.uuid4().hex[:8]}@example.com"
+
+    async with async_session() as db:
+        identity = Identity(
+            username=f"wechat_email_{uuid.uuid4().hex[:8]}",
+            email=email,
+            password_hash="x",
+        )
+        db.add(identity)
+        await db.flush()
+        existing_user = User(
+            identity_id=identity.id,
+            tenant_id=tenant.id,
+            display_name="Wechat Existing",
+            role="member",
+            is_active=True,
+        )
+        db.add(existing_user)
+        member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            external_id=f"wx_{uuid.uuid4().hex[:8]}",
+            name="微信联系人",
+            email=email,
+            phone=None,
+            status="active",
+        )
+        db.add(member)
+        await db.commit()
+        user_id = existing_user.id
+        member_id = member.id
+
+    async with async_session() as db:
+        member = await db.get(OrgMember, member_id)
+        user = await get_platform_user_by_org_member(db, member, agent_tenant_id=tenant.id)
+        await db.commit()
+
+        assert user.id == user_id
+        assert member.user_id == user_id
+
+
+@pytest.mark.asyncio
+async def test_get_platform_user_by_org_member_non_dingtalk_keeps_email_create_compatibility():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id, provider_type="wechat")
+    email = f"wechat-create-{uuid.uuid4().hex[:8]}@example.com"
+
+    async with async_session() as db:
+        member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            external_id=f"wx_{uuid.uuid4().hex[:8]}",
+            name="微信新联系人",
+            email=email,
+            phone=None,
+            status="active",
+        )
+        db.add(member)
+        await db.commit()
+        member_id = member.id
+
+    async with async_session() as db:
+        member = await db.get(OrgMember, member_id)
+        user = await get_platform_user_by_org_member(db, member, agent_tenant_id=tenant.id)
+        await db.commit()
+
+        assert user.tenant_id == tenant.id
+        assert user.registration_source == "wechat"
+        assert user.email == email
+        assert member.user_id == user.id
+
+
+@pytest.mark.asyncio
+async def test_get_platform_user_by_org_member_non_dingtalk_keeps_email_before_phone_order():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id, provider_type="wechat")
+    email = f"wechat-priority-{uuid.uuid4().hex[:8]}@example.com"
+    phone = _phone()
+
+    async with async_session() as db:
+        email_identity = Identity(
+            username=f"wechat_email_priority_{uuid.uuid4().hex[:8]}",
+            email=email,
+            password_hash="x",
+        )
+        phone_identity = Identity(
+            username=f"wechat_phone_priority_{uuid.uuid4().hex[:8]}",
+            email=f"wechat-phone-{uuid.uuid4().hex[:8]}@example.com",
+            phone=phone,
+            password_hash="x",
+        )
+        db.add_all([email_identity, phone_identity])
+        await db.flush()
+        email_user = User(
+            identity_id=email_identity.id,
+            tenant_id=tenant.id,
+            display_name="Email Priority User",
+            role="member",
+            is_active=True,
+        )
+        phone_user = User(
+            identity_id=phone_identity.id,
+            tenant_id=tenant.id,
+            display_name="Phone Priority User",
+            role="member",
+            is_active=True,
+        )
+        db.add_all([email_user, phone_user])
+        member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            external_id=f"wx_{uuid.uuid4().hex[:8]}",
+            name="微信联系人优先级",
+            email=email,
+            phone=phone,
+            status="active",
+        )
+        db.add(member)
+        await db.commit()
+        email_user_id = email_user.id
+        phone_user_id = phone_user.id
+        member_id = member.id
+
+    async with async_session() as db:
+        member = await db.get(OrgMember, member_id)
+        user = await get_platform_user_by_org_member(db, member, agent_tenant_id=tenant.id)
+        await db.commit()
+
+        assert user.id == email_user_id
+        assert user.id != phone_user_id
+        assert member.user_id == email_user_id

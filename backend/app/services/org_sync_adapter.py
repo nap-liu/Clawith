@@ -11,11 +11,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, delete, func, or_, select, update
+from sqlalchemy import or_, select, update
 
 import httpx
 from loguru import logger
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.identity import IdentityProvider
@@ -45,7 +44,7 @@ except ImportError:  # pragma: no cover - lightweight fallback for minimal test 
         return [[ascii_value]]
 
 from app.config import get_settings
-from app.core.security import decrypt_data, hash_password
+from app.core.security import decrypt_data
 from app.services.auth_provider import GoogleWorkspaceAuthProvider
 from app.services.google_workspace_oauth import GOOGLE_HTTP_PROXY
 from jose import jwt
@@ -252,6 +251,10 @@ class BaseOrgSyncAdapter(ABC):
         dept_count = 0
         member_count = 0
         user_count = 0
+        user_linked_count = 0
+        global_identity_reused_count = 0
+        user_skipped_no_phone_count = 0
+        user_skipped_confirmation_count = 0
         profile_count = 0
         sync_start = _utcnow()
         partial_failure = False
@@ -291,6 +294,14 @@ class BaseOrgSyncAdapter(ABC):
                             stats = await self._upsert_member(db, provider, user, dept.external_id)
                             if stats.get("user_created"):
                                 user_count += 1
+                            if stats.get("user_linked"):
+                                user_linked_count += 1
+                            if stats.get("global_identity_matched_no_tenant_user"):
+                                global_identity_reused_count += 1
+                            if stats.get("user_skipped_no_phone"):
+                                user_skipped_no_phone_count += 1
+                            if stats.get("user_skipped_requires_confirmation"):
+                                user_skipped_confirmation_count += 1
                             if stats.get("profile_synced"):
                                 profile_count += 1
                         member_count += 1
@@ -332,6 +343,10 @@ class BaseOrgSyncAdapter(ABC):
             "departments": dept_count,
             "members": member_count,
             "users_created": user_count,
+            "users_linked": user_linked_count,
+            "global_identities_reused": global_identity_reused_count,
+            "users_skipped_no_phone": user_skipped_no_phone_count,
+            "users_skipped_requires_confirmation": user_skipped_confirmation_count,
             "profiles_synced": profile_count,
             "errors": errors,
             "provider": self.provider_type,
@@ -554,7 +569,14 @@ class BaseOrgSyncAdapter(ABC):
         department_external_id: str,
     ) -> dict[str, Any]:
         """Insert or update a member, platform user, and identity."""
-        stats = {"user_created": False, "profile_synced": False}
+        stats = {
+            "user_created": False,
+            "user_linked": False,
+            "global_identity_matched_no_tenant_user": False,
+            "user_skipped_requires_confirmation": False,
+            "user_skipped_no_phone": False,
+            "profile_synced": False,
+        }
         self._validate_member_identifiers(provider, user)
 
         # Find department using user's actual department list.
@@ -587,35 +609,15 @@ class BaseOrgSyncAdapter(ABC):
 
         now = _utcnow()
 
-        # Note: Platform user creation is disabled - just sync OrgMember
-        # Users will be linked to platform users manually or via SSO login
-        
-        # Search for existing platform user by email/phone to associate with this member
-        user_id = None
-        platform_user = None
         email = _normalize_contact(user.email)
         mobile = _normalize_contact(user.mobile)
-
-        if email:
-            user_query = select(User).join(User.identity).where(Identity.email == email)
-            if self.tenant_id:
-                user_query = user_query.where(User.tenant_id == self.tenant_id)
-            user_res = await db.execute(user_query)
-            platform_user = user_res.scalars().first()
-            if platform_user:
-                user_id = platform_user.id
-
-        if not user_id and mobile:
-            user_query = select(User).join(User.identity).where(Identity.phone == mobile)
-            if self.tenant_id:
-                user_query = user_query.where(User.tenant_id == self.tenant_id)
-            user_res = await db.execute(user_query)
-            platform_user = user_res.scalars().first()
-            if platform_user:
-                user_id = platform_user.id
+        provider_type = (provider.provider_type or self.provider_type or "").lower()
+        member_tenant_id = self.tenant_id or provider.tenant_id
 
         # Update/Create OrgMember
         if existing_member:
+            if existing_member.tenant_id is None and member_tenant_id:
+                existing_member.tenant_id = member_tenant_id
             existing_member.name = user.name
             # Generate transliteration using layered strategy:
             # 1. pypinyin converts CJK characters to pinyin
@@ -629,7 +631,9 @@ class BaseOrgSyncAdapter(ABC):
             existing_member.title = user.title
             existing_member.department_id = department.id if department else None
             existing_member.department_path = department.path if department else user.department_path
-            if mobile is not None:
+            if provider_type == "dingtalk":
+                existing_member.phone = mobile
+            elif mobile is not None:
                 existing_member.phone = mobile
             existing_member.status = user.status
             
@@ -640,9 +644,8 @@ class BaseOrgSyncAdapter(ABC):
 
             existing_member.provider_id = provider.id
             existing_member.synced_at = now
-            if user_id and not existing_member.user_id:
-                existing_member.user_id = user_id
             stats["profile_synced"] = True
+            member = existing_member
         else:
             # Generate transliteration using layered strategy:
             # 1. pypinyin converts CJK characters to pinyin
@@ -656,7 +659,7 @@ class BaseOrgSyncAdapter(ABC):
                 unionid=user.unionid,
 
                 provider_id=provider.id,
-                user_id=user_id,
+                user_id=None,
                 name=user.name,
                 name_translit_full=translit_full,
                 name_translit_initial=translit_initial,
@@ -667,24 +670,42 @@ class BaseOrgSyncAdapter(ABC):
                 department_path=department.path if department else user.department_path,
                 phone=mobile,
                 status=user.status,
-                tenant_id=self.tenant_id,
+                tenant_id=member_tenant_id,
                 synced_at=now,
             )
             db.add(new_member)
             stats["profile_synced"] = True
+            member = new_member
 
-        # Sync email/phone from OrgMember to User (if linked)
-        target_user = platform_user
-        if not target_user and (user_id or (existing_member and existing_member.user_id)):
-            target_id = user_id or existing_member.user_id
-            user_res = await db.execute(select(User).where(User.id == target_id))
-            target_user = user_res.scalars().first()
+        auto_create_users = (provider.config or {}).get("auto_create_users_on_sync")
+        if auto_create_users is None:
+            auto_create_users = provider_type == "dingtalk"
 
-        if target_user:
-            if email and target_user.email != email:
-                target_user.email = email
-            if mobile and target_user.primary_mobile != mobile:
-                target_user.primary_mobile = mobile
+        if auto_create_users:
+            from app.services.contact_provisioning import contact_provisioning
+
+            provisioning = await contact_provisioning.ensure_user_for_org_member(
+                db,
+                member,
+                provider=provider,
+            )
+            stats["user_created"] = provisioning.user_created
+            stats["user_linked"] = provisioning.user_linked
+            stats["global_identity_matched_no_tenant_user"] = (
+                provisioning.global_identity_matched_no_tenant_user
+            )
+            stats["user_skipped_requires_confirmation"] = provisioning.skipped_requires_confirmation
+            stats["user_skipped_no_phone"] = provisioning.skipped_missing_mobile
+        else:
+            platform_user = await self._resolve_platform_user(
+                db,
+                user,
+                member_tenant_id,
+                allow_email=provider_type != "dingtalk",
+            )
+            if platform_user and not member.user_id:
+                member.user_id = platform_user.id
+                stats["user_linked"] = True
 
         await db.flush()
         return stats
@@ -753,25 +774,35 @@ class BaseOrgSyncAdapter(ABC):
         result = await db.execute(fallback_query)
         return result.scalars().first()
 
-    async def _resolve_platform_user(self, db: AsyncSession, user: ExternalUser) -> User | None:
+    async def _resolve_platform_user(
+        self,
+        db: AsyncSession,
+        user: ExternalUser,
+        tenant_id: uuid.UUID | None = None,
+        allow_email: bool = True,
+    ) -> User | None:
         """Resolve platform user from external user info."""
         # 1. Try by Email matching (primary way now)
         email = _normalize_contact(user.email)
-        if email:
-            result = await db.execute(
-                select(User).join(User.identity).where(Identity.email == email)
-            )
+        if allow_email and email:
+            query = select(User).join(User.identity).where(Identity.email == email)
+            if tenant_id:
+                query = query.where(User.tenant_id == tenant_id)
+            result = await db.execute(query)
             u = result.scalars().first()
-            if u: return u
+            if u:
+                return u
 
         # 2. Try by mobile matching
         mobile = _normalize_contact(user.mobile)
         if mobile:
-            result = await db.execute(
-                select(User).join(User.identity).where(Identity.phone == mobile)
-            )
+            query = select(User).join(User.identity).where(Identity.phone == mobile)
+            if tenant_id:
+                query = query.where(User.tenant_id == tenant_id)
+            result = await db.execute(query)
             u = result.scalars().first()
-            if u: return u
+            if u:
+                return u
 
         return None
 
@@ -849,7 +880,8 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                     items = res_data.get("items", []) or []
                     for item in items:
                         dept_id = item.get("open_department_id")
-                        if not dept_id: continue
+                        if not dept_id:
+                            continue
                         
                         # Since we fetched using parent_id, we intrinsically know the parent!
                         parent_external = parent_id if parent_id and parent_id != "0" else "0"
@@ -1269,7 +1301,6 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
         users: list[ExternalUser] = []
         cursor = 0
         dept_id = int(department_external_id)
-        dept_path = self._dept_path_map.get(department_external_id, "")
 
         async with httpx.AsyncClient() as client:
             while True:

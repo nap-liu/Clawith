@@ -5,7 +5,13 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
+from app.database import async_session, engine
+from app.models.identity import IdentityProvider
+from app.models.org import OrgMember
+from app.models.tenant import Tenant
+from app.models.user import Identity, User
 from app.services.org_sync_adapter import (
     BaseOrgSyncAdapter,
     DingTalkOrgSyncAdapter,
@@ -15,6 +21,13 @@ from app.services.org_sync_adapter import (
     build_department_path_map,
     normalize_contact_for_match,
 )
+
+
+@pytest.fixture(autouse=True)
+async def _isolate_async_engine_between_tests():
+    await engine.dispose()
+    yield
+    await engine.dispose()
 
 
 class _DummyAdapter(BaseOrgSyncAdapter):
@@ -394,3 +407,336 @@ def test_normalize_contact_for_match_strips_common_mobile_formatting():
 
 def test_normalize_contact_for_match_keeps_email_lowercase():
     assert normalize_contact_for_match(" Alice@Example.COM ") == "alice@example.com"
+
+
+async def _seed_tenant() -> Tenant:
+    async with async_session() as db:
+        tenant = Tenant(name="Org Sync Tenant", slug=f"org-sync-{uuid.uuid4().hex[:10]}")
+        db.add(tenant)
+        await db.commit()
+        await db.refresh(tenant)
+        return tenant
+
+
+async def _seed_dingtalk_provider(tenant_id: uuid.UUID) -> IdentityProvider:
+    async with async_session() as db:
+        provider = IdentityProvider(
+            provider_type="dingtalk",
+            name=f"DingTalk {uuid.uuid4().hex[:6]}",
+            is_active=True,
+            config={},
+            tenant_id=tenant_id,
+        )
+        db.add(provider)
+        await db.commit()
+        await db.refresh(provider)
+        return provider
+
+
+async def _seed_provider(tenant_id: uuid.UUID, provider_type: str) -> IdentityProvider:
+    async with async_session() as db:
+        provider = IdentityProvider(
+            provider_type=provider_type,
+            name=f"{provider_type} {uuid.uuid4().hex[:6]}",
+            is_active=True,
+            config={},
+            tenant_id=tenant_id,
+        )
+        db.add(provider)
+        await db.commit()
+        await db.refresh(provider)
+        return provider
+
+
+async def _seed_user(tenant_id: uuid.UUID, *, email: str | None = None, phone: str | None = None) -> User:
+    async with async_session() as db:
+        identity = Identity(
+            username=f"user_{uuid.uuid4().hex[:10]}",
+            email=email,
+            phone=phone,
+            password_hash="x",
+        )
+        db.add(identity)
+        await db.flush()
+        user = User(
+            identity_id=identity.id,
+            tenant_id=tenant_id,
+            display_name=f"User {uuid.uuid4().hex[:6]}",
+            role="member",
+            is_active=True,
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        return user
+
+
+@pytest.mark.asyncio
+async def test_org_sync_auto_creates_user_from_dingtalk_member_mobile():
+    tenant = await _seed_tenant()
+    provider = await _seed_dingtalk_provider(tenant.id)
+    adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
+    phone = f"8613{uuid.uuid4().int % 10**9:09d}"
+
+    external_user = ExternalUser(
+        external_id=f"dt_{uuid.uuid4().hex[:8]}",
+        unionid=f"union_{uuid.uuid4().hex[:8]}",
+        name="钉钉新成员",
+        mobile=phone,
+        email="",
+    )
+
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        stats = await adapter._upsert_member(db, provider, external_user, "1")
+        await db.commit()
+
+        assert stats["user_created"] is True
+        assert stats["profile_synced"] is True
+        member = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.external_id == external_user.external_id,
+                )
+            )
+        ).scalar_one()
+        assert member.user_id is not None
+        created_user = await db.get(User, member.user_id)
+        assert created_user is not None
+        assert created_user.tenant_id == tenant.id
+        assert created_user.registration_source == "dingtalk_org_sync"
+
+
+@pytest.mark.asyncio
+async def test_org_sync_links_existing_user_by_mobile_before_email():
+    tenant = await _seed_tenant()
+    provider = await _seed_dingtalk_provider(tenant.id)
+    adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
+    phone = f"8613{uuid.uuid4().int % 10**9:09d}"
+    shared_email = f"shared-{uuid.uuid4().hex[:8]}@example.com"
+    email_user = await _seed_user(tenant.id, email=shared_email, phone=f"8613{uuid.uuid4().int % 10**9:09d}")
+    mobile_user = await _seed_user(tenant.id, email=f"mobile-{uuid.uuid4().hex[:8]}@example.com", phone=phone)
+
+    external_user = ExternalUser(
+        external_id=f"dt_{uuid.uuid4().hex[:8]}",
+        unionid=f"union_{uuid.uuid4().hex[:8]}",
+        name="手机号优先",
+        mobile=phone,
+        email=shared_email,
+    )
+
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        stats = await adapter._upsert_member(db, provider, external_user, "1")
+        await db.commit()
+
+        member = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.external_id == external_user.external_id,
+                )
+            )
+        ).scalar_one()
+        assert stats["user_created"] is False
+        assert stats["user_linked"] is True
+        assert member.user_id == mobile_user.id
+        assert member.user_id != email_user.id
+
+
+@pytest.mark.asyncio
+async def test_org_sync_reports_missing_mobile_without_creating_user():
+    tenant = await _seed_tenant()
+    provider = await _seed_dingtalk_provider(tenant.id)
+    adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
+
+    external_user = ExternalUser(
+        external_id=f"dt_{uuid.uuid4().hex[:8]}",
+        unionid=f"union_{uuid.uuid4().hex[:8]}",
+        name="无手机号成员",
+        mobile="",
+        email=f"nomobile-{uuid.uuid4().hex[:8]}@example.com",
+    )
+
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        stats = await adapter._upsert_member(db, provider, external_user, "1")
+        await db.commit()
+
+        member = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.external_id == external_user.external_id,
+                )
+            )
+        ).scalar_one()
+        assert stats["user_created"] is False
+        assert stats["user_skipped_no_phone"] is True
+        assert member.user_id is None
+
+
+@pytest.mark.asyncio
+async def test_org_sync_non_dingtalk_still_links_existing_user_by_email():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id, "feishu")
+    adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
+    email = f"feishu-{uuid.uuid4().hex[:8]}@example.com"
+    existing_user = await _seed_user(tenant.id, email=email)
+
+    external_user = ExternalUser(
+        external_id=f"fs_{uuid.uuid4().hex[:8]}",
+        unionid=f"union_{uuid.uuid4().hex[:8]}",
+        name="飞书已有用户",
+        mobile="",
+        email=email,
+    )
+
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        stats = await adapter._upsert_member(db, provider, external_user, "1")
+        await db.commit()
+
+        member = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.external_id == external_user.external_id,
+                )
+            )
+        ).scalar_one()
+        assert stats["user_created"] is False
+        assert stats["user_linked"] is True
+        assert member.user_id == existing_user.id
+
+
+@pytest.mark.asyncio
+async def test_org_sync_dingtalk_existing_member_missing_mobile_clears_old_phone_and_skips_user():
+    tenant = await _seed_tenant()
+    provider = await _seed_dingtalk_provider(tenant.id)
+    adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
+    old_phone = f"8613{uuid.uuid4().int % 10**9:09d}"
+    external_id = f"dt_{uuid.uuid4().hex[:8]}"
+    unionid = f"union_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            external_id=external_id,
+            unionid=unionid,
+            name="历史手机号成员",
+            phone=old_phone,
+            status="active",
+        )
+        db.add(member)
+        await db.commit()
+        member_id = member.id
+
+    external_user = ExternalUser(
+        external_id=external_id,
+        unionid=unionid,
+        name="历史手机号成员",
+        mobile="",
+        email="",
+    )
+
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        stats = await adapter._upsert_member(db, provider, external_user, "1")
+        await db.commit()
+
+        member = await db.get(OrgMember, member_id)
+        assert stats["user_created"] is False
+        assert stats["user_skipped_no_phone"] is True
+        assert member.phone is None
+        assert member.user_id is None
+
+
+@pytest.mark.asyncio
+async def test_org_sync_dingtalk_backfills_legacy_member_tenant_before_provisioning():
+    tenant = await _seed_tenant()
+    provider = await _seed_dingtalk_provider(tenant.id)
+    adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
+    phone = f"8613{uuid.uuid4().int % 10**9:09d}"
+    external_id = f"dt_{uuid.uuid4().hex[:8]}"
+    unionid = f"union_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        member = OrgMember(
+            tenant_id=None,
+            provider_id=provider.id,
+            external_id=external_id,
+            unionid=unionid,
+            name="历史空租户成员",
+            phone=phone,
+            status="active",
+        )
+        db.add(member)
+        await db.commit()
+        member_id = member.id
+
+    external_user = ExternalUser(
+        external_id=external_id,
+        unionid=unionid,
+        name="历史空租户成员",
+        mobile=phone,
+        email="",
+    )
+
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        stats = await adapter._upsert_member(db, provider, external_user, "1")
+        await db.commit()
+
+        member = await db.get(OrgMember, member_id)
+        assert stats["user_created"] is True
+        assert member.tenant_id == tenant.id
+        assert member.user_id is not None
+
+
+@pytest.mark.asyncio
+async def test_org_sync_dingtalk_auto_create_disabled_does_not_link_by_email():
+    tenant = await _seed_tenant()
+    email = f"dingtalk-email-disabled-{uuid.uuid4().hex[:8]}@example.com"
+    existing_user = await _seed_user(tenant.id, email=email)
+
+    async with async_session() as db:
+        provider = IdentityProvider(
+            provider_type="dingtalk",
+            name=f"DingTalk Disabled {uuid.uuid4().hex[:6]}",
+            is_active=True,
+            config={"auto_create_users_on_sync": False},
+            tenant_id=tenant.id,
+        )
+        db.add(provider)
+        await db.commit()
+        await db.refresh(provider)
+
+    adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
+    external_user = ExternalUser(
+        external_id=f"dt_{uuid.uuid4().hex[:8]}",
+        unionid=f"union_{uuid.uuid4().hex[:8]}",
+        name="禁用自动创建",
+        mobile="",
+        email=email,
+    )
+
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        stats = await adapter._upsert_member(db, provider, external_user, "1")
+        await db.commit()
+
+        member = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.external_id == external_user.external_id,
+                )
+            )
+        ).scalar_one()
+        assert stats["user_created"] is False
+        assert stats["user_linked"] is False
+        assert member.user_id is None
+        assert member.user_id != existing_user.id
