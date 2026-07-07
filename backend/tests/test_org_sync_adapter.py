@@ -367,7 +367,8 @@ def test_dingtalk_sync_skips_large_department_user_fetch_by_default():
     assert adapter.fetched_department_ids == ["4"]
     assert result["members"] == 1
     assert result["user_fetch_skipped_departments"] == 2
-    assert adapter.reconcile_called is True
+    assert adapter.reconcile_called is False
+    assert "Reconcile skipped because department user fetch was intentionally skipped" in result["errors"]
 
 
 def test_reconcile_disables_session_synchronization_for_datetime_comparisons():

@@ -333,6 +333,12 @@ class BaseOrgSyncAdapter(ABC):
                         f"[OrgSync] Skipping reconcile for provider {provider.id} because this sync had partial failures"
                     )
                     errors.append("Reconcile skipped due to partial sync failures")
+                elif user_fetch_skipped_dept_count:
+                    logger.warning(
+                        f"[OrgSync] Skipping reconcile for provider {provider.id} because "
+                        f"{user_fetch_skipped_dept_count} department user fetch(es) were skipped"
+                    )
+                    errors.append("Reconcile skipped because department user fetch was intentionally skipped")
                 else:
                     # Reconciliation: mark records not updated in this sync as deleted
                     await self._reconcile(db, provider.id, sync_start)

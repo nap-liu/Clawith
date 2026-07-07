@@ -208,6 +208,16 @@ async def _seed_contact_graph(session):
 async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_session):
     ctx = await _seed_contact_graph(contact_session)
 
+    formatted_phone_results = await search_contacts_for_agent(
+        contact_session,
+        ctx["source"].id,
+        query="+86 138-0000-0000",
+        contact_type="human",
+        current_user_id=ctx["creator_id"],
+    )
+    assert [row["id"] for row in formatted_phone_results] == [str(ctx["dingtalk_member"].id)]
+    assert formatted_phone_results[0]["phone"] == "138****0000"
+
     human_results = await search_contacts_for_agent(
         contact_session,
         ctx["source"].id,
@@ -369,6 +379,84 @@ async def test_add_contact_creates_agent_relationship_idempotently(contact_sessi
     assert rows[0].target_agent_id == ctx["target"].id
     assert rows[0].relation == "collaborator"
     assert rows[0].description == "更新协作关系"
+    assert rows[0].created_by_user_id == ctx["creator_id"]
+
+
+@pytest.mark.asyncio
+async def test_add_contact_rejects_user_who_cannot_manage_source_agent(contact_session):
+    ctx = await _seed_contact_graph(contact_session)
+    use_only_user_id = uuid.uuid4()
+    contact_session.add(
+        User(
+            id=use_only_user_id,
+            identity_id=None,
+            tenant_id=ctx["tenant_id"],
+            display_name="Use Only",
+            role="member",
+            is_active=True,
+        )
+    )
+    await contact_session.flush()
+
+    result = await add_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="agent",
+        target_id=str(ctx["target"].id),
+        relation="peer",
+        current_user_id=use_only_user_id,
+    )
+
+    assert result == {"status": "error", "reason": "source_agent_not_manageable"}
+    rows = (
+        await contact_session.execute(
+            select(AgentAgentRelationship).where(AgentAgentRelationship.agent_id == ctx["source"].id)
+        )
+    ).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_direct_uses_approval_resolver_for_contact_relationship(contact_session, monkeypatch):
+    ctx = await _seed_contact_graph(contact_session)
+    ctx["target"].access_mode = "custom"
+    contact_session.add(
+        AgentPermission(
+            agent_id=ctx["target"].id,
+            scope_type="user",
+            scope_id=ctx["creator_id"],
+            access_level="use",
+        )
+    )
+    await contact_session.flush()
+    await contact_session.commit()
+    _patch_tool_session(monkeypatch, contact_session)
+    source_id = ctx["source"].id
+    target_id = ctx["target"].id
+    creator_id = ctx["creator_id"]
+
+    without_user = await agent_tools._execute_tool_direct(
+        "add_contact",
+        {"target_type": "agent", "target_id": str(target_id)},
+        source_id,
+    )
+    with_resolver = await agent_tools._execute_tool_direct(
+        "add_contact",
+        {"target_type": "agent", "target_id": str(target_id)},
+        source_id,
+        user_id=creator_id,
+    )
+
+    assert "confirmed_creator_required" in without_user
+    assert "✅ Added Research Agent" in with_resolver
+
+    rows = (
+        await contact_session.execute(
+            select(AgentAgentRelationship).where(AgentAgentRelationship.agent_id == source_id)
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].created_by_user_id == creator_id
 
 
 @pytest.mark.asyncio

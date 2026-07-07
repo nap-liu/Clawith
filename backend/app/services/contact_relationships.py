@@ -11,6 +11,7 @@ from app.core.permissions import (
     evaluate_agent_relationship_status,
     evaluate_human_relationship_status,
     is_agent_expired,
+    user_can_manage_agent_id,
 )
 from app.models.agent import Agent
 from app.models.identity import IdentityProvider
@@ -93,6 +94,32 @@ def _mask_phone_for_display(phone: str | None) -> str:
     return "****"
 
 
+def _phone_search_candidates(value: str) -> set[str]:
+    digits = "".join(ch for ch in (value or "") if ch.isdigit())
+    if not digits:
+        return set()
+
+    candidates = {digits}
+    if digits.startswith("86") and len(digits) > 11:
+        candidates.add(digits[2:])
+    if digits.startswith("0086") and len(digits) > 13:
+        candidates.add(digits[4:])
+    return candidates
+
+
+async def _load_relationship_actor(
+    db: AsyncSession,
+    source_agent: Agent,
+    current_user_id: uuid.UUID | None,
+) -> tuple[User | None, str | None]:
+    actor = await _load_actor_user(db, current_user_id)
+    if not actor:
+        return None, "confirmed_creator_required"
+    if not await user_can_manage_agent_id(db, actor.id, source_agent):
+        return None, "source_agent_not_manageable"
+    return actor, None
+
+
 async def _human_relationship_status(
     db: AsyncSession,
     source_agent: Agent,
@@ -160,6 +187,16 @@ async def search_contacts_for_agent(
 
     if wanted in {"all", "human"}:
         pattern = f"%{search_text}%"
+        human_conditions = [
+            OrgMember.name.ilike(pattern),
+            OrgMember.name_translit_full.ilike(pattern),
+            OrgMember.name_translit_initial.ilike(pattern),
+            OrgMember.email.ilike(pattern),
+            OrgMember.department_path.ilike(pattern),
+        ]
+        phone_candidates = _phone_search_candidates(search_text)
+        if phone_candidates:
+            human_conditions.append(OrgMember.phone.in_(phone_candidates))
         human_query = (
             select(
                 OrgMember,
@@ -170,14 +207,7 @@ async def search_contacts_for_agent(
             .where(
                 OrgMember.tenant_id == source_agent.tenant_id,
                 OrgMember.status == "active",
-                or_(
-                    OrgMember.name.ilike(pattern),
-                    OrgMember.name_translit_full.ilike(pattern),
-                    OrgMember.name_translit_initial.ilike(pattern),
-                    OrgMember.email.ilike(pattern),
-                    OrgMember.department_path.ilike(pattern),
-                    OrgMember.phone == search_text,
-                ),
+                or_(*human_conditions),
             )
             .order_by(OrgMember.name)
             .limit(max_rows)
@@ -278,6 +308,10 @@ async def _add_human_contact(
     description: str,
     current_user_id: uuid.UUID | None,
 ) -> dict:
+    actor, reason = await _load_relationship_actor(db, source_agent, current_user_id)
+    if not actor:
+        return {"status": "error", "reason": reason}
+
     member_result = await db.execute(select(OrgMember).where(OrgMember.id == member_id))
     member = member_result.scalar_one_or_none()
     if not member or not await _member_available_to_agent(db, source_agent, member):
@@ -294,11 +328,11 @@ async def _add_human_contact(
     rel = existing or AgentRelationship(
         agent_id=source_agent.id,
         member_id=member.id,
-        created_by_user_id=current_user_id,
+        created_by_user_id=actor.id,
     )
     rel.relation = relation
     rel.description = description
-    rel.updated_by_user_id = current_user_id
+    rel.updated_by_user_id = actor.id
     if existing:
         rel.updated_at = datetime.now(timezone.utc)
     else:
@@ -325,6 +359,10 @@ async def _add_agent_contact(
     description: str,
     current_user_id: uuid.UUID | None,
 ) -> dict:
+    actor, reason = await _load_relationship_actor(db, source_agent, current_user_id)
+    if not actor:
+        return {"status": "error", "reason": reason}
+
     target_result = await db.execute(
         select(Agent).where(
             Agent.id == target_id,
@@ -341,14 +379,10 @@ async def _add_agent_contact(
     ):
         return {"status": "error", "reason": "contact_not_available"}
 
-    actor = await _load_actor_user(db, current_user_id)
-    if actor:
-        visible_result = await db.execute(
-            build_visible_agents_query(actor, tenant_id=source_agent.tenant_id).where(Agent.id == target.id)
-        )
-        if visible_result.scalar_one_or_none() is None:
-            return {"status": "error", "reason": "contact_not_available"}
-    elif target.access_mode != "company":
+    visible_result = await db.execute(
+        build_visible_agents_query(actor, tenant_id=source_agent.tenant_id).where(Agent.id == target.id)
+    )
+    if visible_result.scalar_one_or_none() is None:
         return {"status": "error", "reason": "contact_not_available"}
 
     existing_result = await db.execute(
@@ -362,11 +396,11 @@ async def _add_agent_contact(
     rel = existing or AgentAgentRelationship(
         agent_id=source_agent.id,
         target_agent_id=target.id,
-        created_by_user_id=current_user_id,
+        created_by_user_id=actor.id,
     )
     rel.relation = relation
     rel.description = description
-    rel.updated_by_user_id = current_user_id
+    rel.updated_by_user_id = actor.id
     if existing:
         rel.updated_at = datetime.now(timezone.utc)
     else:
@@ -374,7 +408,12 @@ async def _add_agent_contact(
         await db.flush()
 
     rel.target_agent = target
-    status_info = await evaluate_agent_relationship_status(db, rel, current_user_id=current_user_id)
+    status_info = await evaluate_agent_relationship_status(db, rel, current_user_id=actor.id)
+    if status_info["access_status"] != "active":
+        if not existing:
+            await db.delete(rel)
+            await db.flush()
+        return {"status": "error", "reason": "relationship_not_active"}
     return {
         "status": status,
         "id": str(target.id),
@@ -430,7 +469,13 @@ async def _remove_human_contact(
     db: AsyncSession,
     source_agent: Agent,
     member_id: uuid.UUID,
+    *,
+    current_user_id: uuid.UUID | None,
 ) -> dict:
+    actor, reason = await _load_relationship_actor(db, source_agent, current_user_id)
+    if not actor:
+        return {"status": "error", "reason": reason}
+
     member_result = await db.execute(
         select(OrgMember).where(
             OrgMember.id == member_id,
@@ -470,7 +515,13 @@ async def _remove_agent_contact(
     db: AsyncSession,
     source_agent: Agent,
     target_id: uuid.UUID,
+    *,
+    current_user_id: uuid.UUID | None,
 ) -> dict:
+    actor, reason = await _load_relationship_actor(db, source_agent, current_user_id)
+    if not actor:
+        return {"status": "error", "reason": reason}
+
     target_result = await db.execute(
         select(Agent).where(
             Agent.id == target_id,
@@ -526,5 +577,15 @@ async def remove_contact_for_agent(
         return {"status": "error", "reason": "invalid_contact_target"}
 
     if clean_target_type == "human":
-        return await _remove_human_contact(db, source_agent, parsed_target_id)
-    return await _remove_agent_contact(db, source_agent, parsed_target_id)
+        return await _remove_human_contact(
+            db,
+            source_agent,
+            parsed_target_id,
+            current_user_id=current_user_id,
+        )
+    return await _remove_agent_contact(
+        db,
+        source_agent,
+        parsed_target_id,
+        current_user_id=current_user_id,
+    )

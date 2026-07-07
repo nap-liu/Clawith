@@ -2994,6 +2994,8 @@ async def _execute_tool_direct(
     tool_name: str,
     arguments: dict,
     agent_id: uuid.UUID,
+    *,
+    user_id: uuid.UUID | None = None,
 ) -> str:
     """Execute a tool directly, bypassing autonomy checks.
 
@@ -3075,9 +3077,9 @@ async def _execute_tool_direct(
         elif tool_name == "send_feishu_message":
             return await _send_feishu_message(agent_id, arguments)
         elif tool_name == "add_contact":
-            return await _add_contact_tool(agent_id, arguments, user_id=None)
+            return await _add_contact_tool(agent_id, arguments, user_id=user_id)
         elif tool_name == "remove_contact":
-            return await _remove_contact_tool(agent_id, arguments, user_id=None)
+            return await _remove_contact_tool(agent_id, arguments, user_id=user_id)
         elif tool_name == "send_message_to_agent":
             return await _send_message_to_agent(
                 agent_id,
