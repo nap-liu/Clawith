@@ -186,15 +186,17 @@ class _FakeDingTalkLargeDepartmentClient:
                 return _FakeDingTalkResponse({
                     "errcode": 0,
                     "result": [
-                        {"dept_id": 2, "name": "营运中心", "parent_id": 1},
-                        {"dept_id": 4, "name": "小部门", "parent_id": 1},
+                        {"dept_id": 2, "name": "Large Department", "parent_id": 1},
+                        {"dept_id": 4, "name": "Small Department", "parent_id": 1},
                     ],
                 })
             if dept_id == 2:
                 return _FakeDingTalkResponse({
                     "errcode": 0,
-                    "result": [{"dept_id": 3, "name": "营运一组", "parent_id": 2}],
+                    "result": [{"dept_id": 3, "name": "Large Department Team", "parent_id": 2}],
                 })
+            if dept_id == 3:
+                return _FakeDingTalkResponse({"errcode": 0, "result": []})
             if dept_id == 4:
                 return _FakeDingTalkResponse({"errcode": 0, "result": []})
 
@@ -270,16 +272,20 @@ class _SyncAdapterWithFailure(_DummyAdapter):
 
 class _DingTalkSyncAdapterWithSkippedDepartments(DingTalkOrgSyncAdapter):
     def __init__(self):
-        super().__init__(config={"app_key": "app-key", "app_secret": "app-secret"})
+        super().__init__(config={
+            "app_key": "app-key",
+            "app_secret": "app-secret",
+            "skip_user_fetch_department_names": ["Large Department"],
+        })
         self.provider = SimpleNamespace(id="provider-1", config={})
         self.fetched_department_ids: list[str] = []
         self.member_counts_updated = False
         self.reconcile_called = False
         self._dept_path_map = {
             "1": "Root",
-            "2": "营运中心",
-            "3": "营运中心/营运一组",
-            "4": "小部门",
+            "2": "Large Department",
+            "3": "Large Department/Large Department Team",
+            "4": "Small Department",
         }
 
     async def _ensure_provider(self, db):
@@ -305,9 +311,9 @@ class _DingTalkSyncAdapterWithSkippedDepartments(DingTalkOrgSyncAdapter):
 
     async def fetch_departments(self):
         return [
-            ExternalDepartment(external_id="2", name="营运中心", parent_external_id="1"),
-            ExternalDepartment(external_id="3", name="营运一组", parent_external_id="2"),
-            ExternalDepartment(external_id="4", name="小部门", parent_external_id="1"),
+            ExternalDepartment(external_id="2", name="Large Department", parent_external_id="1"),
+            ExternalDepartment(external_id="3", name="Large Department Team", parent_external_id="2"),
+            ExternalDepartment(external_id="4", name="Small Department", parent_external_id="1"),
         ]
 
     async def fetch_users(self, department_external_id: str):
@@ -358,7 +364,7 @@ def test_sync_org_structure_skips_reconcile_after_member_failure():
     assert "Reconcile skipped due to partial sync failures" in result["errors"]
 
 
-def test_dingtalk_sync_skips_large_department_user_fetch_by_default():
+def test_dingtalk_sync_skips_configured_department_user_fetch():
     adapter = _DingTalkSyncAdapterWithSkippedDepartments()
     db = _FakeDB()
 
@@ -369,6 +375,12 @@ def test_dingtalk_sync_skips_large_department_user_fetch_by_default():
     assert result["user_fetch_skipped_departments"] == 2
     assert adapter.reconcile_called is False
     assert "Reconcile skipped because department user fetch was intentionally skipped" in result["errors"]
+
+
+def test_dingtalk_sync_skip_department_names_default_to_empty():
+    adapter = DingTalkOrgSyncAdapter(config={"app_key": "app-key", "app_secret": "app-secret"})
+
+    assert adapter._configured_user_fetch_skip_department_names() == set()
 
 
 def test_reconcile_disables_session_synchronization_for_datetime_comparisons():
@@ -449,7 +461,7 @@ def test_dingtalk_authorized_scope_falls_back_to_legacy_auth_scopes():
     ]
 
 
-def test_dingtalk_fetch_departments_does_not_expand_skipped_large_departments(monkeypatch):
+def test_dingtalk_fetch_departments_expands_departments_by_default(monkeypatch):
     fake_client = _FakeDingTalkLargeDepartmentClient()
     monkeypatch.setattr(
         "app.services.org_sync_adapter.httpx.AsyncClient",
@@ -465,12 +477,42 @@ def test_dingtalk_fetch_departments_does_not_expand_skipped_large_departments(mo
 
     departments = asyncio.run(adapter.fetch_departments())
 
+    assert [dept.external_id for dept in departments] == ["1", "2", "4", "3"]
+    assert fake_client.department_list_requests == [1, 2, 4, 3]
+    assert adapter._dept_path_map == {
+        "1": "Root",
+        "2": "Root/Large Department",
+        "3": "Root/Large Department/Large Department Team",
+        "4": "Root/Small Department",
+    }
+
+
+def test_dingtalk_fetch_departments_does_not_expand_configured_skipped_departments(monkeypatch):
+    fake_client = _FakeDingTalkLargeDepartmentClient()
+    monkeypatch.setattr(
+        "app.services.org_sync_adapter.httpx.AsyncClient",
+        lambda *args, **kwargs: fake_client,
+    )
+
+    adapter = DingTalkOrgSyncAdapter(config={
+        "app_key": "app-key",
+        "app_secret": "app-secret",
+        "skip_user_fetch_department_names": ["Large Department"],
+    })
+
+    async def fake_get_access_token():
+        return "access-token"
+
+    adapter.get_access_token = fake_get_access_token
+
+    departments = asyncio.run(adapter.fetch_departments())
+
     assert [dept.external_id for dept in departments] == ["1", "2", "4"]
     assert fake_client.department_list_requests == [1, 4]
     assert adapter._dept_path_map == {
         "1": "Root",
-        "2": "Root/营运中心",
-        "4": "Root/小部门",
+        "2": "Root/Large Department",
+        "4": "Root/Small Department",
     }
 
 

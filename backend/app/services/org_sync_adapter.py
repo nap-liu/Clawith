@@ -1055,7 +1055,7 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
     DINGTALK_REQUEST_INTERVAL_SECONDS = 0.1
     DINGTALK_RATE_LIMIT_RETRY_SECONDS = 1.0
     DINGTALK_MAX_RATE_LIMIT_RETRIES = 5
-    DINGTALK_DEFAULT_USER_FETCH_SKIP_DEPARTMENT_NAMES = ("营运中心", "赋能中心")
+    DINGTALK_DEFAULT_USER_FETCH_SKIP_DEPARTMENT_NAMES: tuple[str, ...] = ()
 
     def __init__(self, provider: IdentityProvider | None = None, config: dict | None = None, tenant_id: uuid.UUID | None = None):
         super().__init__(provider, config, tenant_id)
