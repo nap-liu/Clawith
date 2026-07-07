@@ -237,6 +237,32 @@ async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_
 
 
 @pytest.mark.asyncio
+async def test_search_contacts_includes_human_not_rostered_on_custom_agent(contact_session):
+    ctx = await _seed_contact_graph(contact_session)
+    ctx["source"].access_mode = "custom"
+    contact_session.add(
+        AgentPermission(
+            agent_id=ctx["source"].id,
+            scope_type="user",
+            scope_id=ctx["creator_id"],
+            access_level="manage",
+        )
+    )
+    await contact_session.flush()
+
+    human_results = await search_contacts_for_agent(
+        contact_session,
+        ctx["source"].id,
+        query="刘",
+        contact_type="human",
+        current_user_id=ctx["creator_id"],
+    )
+
+    assert [row["id"] for row in human_results] == [str(ctx["dingtalk_member"].id)]
+    assert human_results[0]["relationship_status"] == "not_added"
+
+
+@pytest.mark.asyncio
 async def test_add_contact_creates_human_relationship_idempotently(contact_session):
     ctx = await _seed_contact_graph(contact_session)
 
@@ -272,6 +298,33 @@ async def test_add_contact_creates_human_relationship_idempotently(contact_sessi
     assert rows[0].member_id == ctx["dingtalk_member"].id
     assert rows[0].relation == "stakeholder"
     assert rows[0].description == "更新描述"
+
+
+@pytest.mark.asyncio
+async def test_add_contact_allows_human_not_rostered_on_custom_agent(contact_session):
+    ctx = await _seed_contact_graph(contact_session)
+    ctx["source"].access_mode = "custom"
+    contact_session.add(
+        AgentPermission(
+            agent_id=ctx["source"].id,
+            scope_type="user",
+            scope_id=ctx["creator_id"],
+            access_level="manage",
+        )
+    )
+    await contact_session.flush()
+
+    result = await add_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="human",
+        target_id=str(ctx["dingtalk_member"].id),
+        relation="collaborator",
+        current_user_id=ctx["creator_id"],
+    )
+
+    assert result["status"] == "added"
+    assert result["relationship_status"] == "active"
 
 
 @pytest.mark.asyncio

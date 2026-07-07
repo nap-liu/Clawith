@@ -10,7 +10,6 @@ from app.core.permissions import (
     build_visible_agents_query,
     evaluate_agent_relationship_status,
     evaluate_human_relationship_status,
-    get_agent_access_level_for_user_id,
     is_agent_expired,
 )
 from app.models.agent import Agent
@@ -132,11 +131,7 @@ async def _agent_relationship_status(
 
 
 async def _member_available_to_agent(db: AsyncSession, source_agent: Agent, member: OrgMember) -> bool:
-    if member.tenant_id != source_agent.tenant_id or member.status != "active":
-        return False
-    if member.user_id:
-        return await get_agent_access_level_for_user_id(db, member.user_id, source_agent) is not None
-    return True
+    return member.tenant_id == source_agent.tenant_id and member.status == "active"
 
 
 async def search_contacts_for_agent(
