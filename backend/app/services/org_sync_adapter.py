@@ -255,6 +255,7 @@ class BaseOrgSyncAdapter(ABC):
         global_identity_reused_count = 0
         user_skipped_no_phone_count = 0
         user_skipped_confirmation_count = 0
+        user_fetch_skipped_dept_count = 0
         profile_count = 0
         sync_start = _utcnow()
         partial_failure = False
@@ -280,6 +281,13 @@ class BaseOrgSyncAdapter(ABC):
 
             # Fetch and sync users (from all departments)
             for dept in departments:
+                if self._should_skip_department_user_fetch(dept):
+                    user_fetch_skipped_dept_count += 1
+                    logger.info(
+                        f"[OrgSync] Skipping user fetch for department {dept.external_id} ({dept.name})"
+                    )
+                    continue
+
                 try:
                     users = await self.fetch_users(dept.external_id)
                 except Exception as e:
@@ -347,11 +355,15 @@ class BaseOrgSyncAdapter(ABC):
             "global_identities_reused": global_identity_reused_count,
             "users_skipped_no_phone": user_skipped_no_phone_count,
             "users_skipped_requires_confirmation": user_skipped_confirmation_count,
+            "user_fetch_skipped_departments": user_fetch_skipped_dept_count,
             "profiles_synced": profile_count,
             "errors": errors,
             "provider": self.provider_type,
             "synced_at": _utcnow().isoformat()
         }
+
+    def _should_skip_department_user_fetch(self, dept: ExternalDepartment) -> bool:
+        return False
 
     async def _reconcile(self, db: AsyncSession, provider_id: uuid.UUID, sync_start: datetime):
         """Mark records that were not updated in this sync as deleted."""
@@ -1037,6 +1049,7 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
     DINGTALK_REQUEST_INTERVAL_SECONDS = 0.1
     DINGTALK_RATE_LIMIT_RETRY_SECONDS = 1.0
     DINGTALK_MAX_RATE_LIMIT_RETRIES = 5
+    DINGTALK_DEFAULT_USER_FETCH_SKIP_DEPARTMENT_NAMES = ("营运中心", "赋能中心")
 
     def __init__(self, provider: IdentityProvider | None = None, config: dict | None = None, tenant_id: uuid.UUID | None = None):
         super().__init__(provider, config, tenant_id)
@@ -1045,6 +1058,27 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
         self._access_token: str | None = None
         self._token_expires_at: datetime | None = None
         self._dept_path_map: dict[str, str] = {}
+
+    def _configured_user_fetch_skip_department_names(self) -> set[str]:
+        raw_names = (self.config or {}).get("skip_user_fetch_department_names")
+        if raw_names is None:
+            raw_names = self.DINGTALK_DEFAULT_USER_FETCH_SKIP_DEPARTMENT_NAMES
+        if isinstance(raw_names, str):
+            raw_names = raw_names.split(",")
+        return {str(name).strip() for name in (raw_names or []) if str(name).strip()}
+
+    def _is_user_fetch_skipped_department_name(self, name: str | None) -> bool:
+        return str(name or "").strip() in self._configured_user_fetch_skip_department_names()
+
+    def _should_skip_department_user_fetch(self, dept: ExternalDepartment) -> bool:
+        skip_names = self._configured_user_fetch_skip_department_names()
+        if not skip_names:
+            return False
+
+        path = self._dept_path_map.get(str(dept.external_id), "")
+        segments = [str(dept.name or "").strip()]
+        segments.extend(part.strip() for part in path.split("/") if part.strip())
+        return any(segment in skip_names for segment in segments)
 
     @property
     def api_base_url(self) -> str:
@@ -1135,11 +1169,13 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
 
             for dept_id in authorized_dept_ids:
                 if dept_id == 1:
-                    add_department({"dept_id": 1, "name": "Root"})
+                    dept_detail = {"dept_id": 1, "name": "Root"}
                 else:
                     dept_detail = await self._fetch_department_detail(client, token, dept_id)
-                    add_department(dept_detail or {"dept_id": dept_id, "name": f"Department {dept_id}"})
-                queue.append(dept_id)
+                    dept_detail = dept_detail or {"dept_id": dept_id, "name": f"Department {dept_id}"}
+                add_department(dept_detail)
+                if not self._is_user_fetch_skipped_department_name(dept_detail.get("name")):
+                    queue.append(dept_id)
 
             while queue:
                 parent_id = queue.pop(0)
@@ -1179,6 +1215,13 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
                 for item in items:
                     dept_id = add_department(item)
                     if dept_id is None:
+                        continue
+                    if self._is_user_fetch_skipped_department_name(item.get("name")):
+                        logger.info(
+                            "[OrgSync][DingTalk] Skipping department tree expansion for {} ({})",
+                            dept_id,
+                            item.get("name"),
+                        )
                         continue
                     if dept_id not in seen:
                         queue.append(dept_id)

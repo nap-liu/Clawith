@@ -15,6 +15,7 @@ from app.models.user import Identity, User
 from app.services.org_sync_adapter import (
     BaseOrgSyncAdapter,
     DingTalkOrgSyncAdapter,
+    ExternalDepartment,
     ExternalUser,
     GoogleWorkspaceOrgSyncAdapter,
     SYNC_ADAPTER_CLASSES,
@@ -158,6 +159,48 @@ class _FakeDingTalkScopeFallbackClient:
         })
 
 
+class _FakeDingTalkLargeDepartmentClient:
+    def __init__(self):
+        self.department_list_requests = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, params=None, json=None):
+        if url == DingTalkOrgSyncAdapter.DINGTALK_AUTH_SCOPES_URL:
+            return _FakeDingTalkResponse({
+                "errcode": 0,
+                "auth_org_scopes": {
+                    "authed_dept": [1],
+                    "authed_user": [],
+                },
+            })
+
+        if url == DingTalkOrgSyncAdapter.DINGTALK_DEPT_LIST_URL:
+            dept_id = json["dept_id"]
+            self.department_list_requests.append(dept_id)
+            if dept_id == 1:
+                return _FakeDingTalkResponse({
+                    "errcode": 0,
+                    "result": [
+                        {"dept_id": 2, "name": "营运中心", "parent_id": 1},
+                        {"dept_id": 4, "name": "小部门", "parent_id": 1},
+                    ],
+                })
+            if dept_id == 2:
+                return _FakeDingTalkResponse({
+                    "errcode": 0,
+                    "result": [{"dept_id": 3, "name": "营运一组", "parent_id": 2}],
+                })
+            if dept_id == 4:
+                return _FakeDingTalkResponse({"errcode": 0, "result": []})
+
+        raise AssertionError(f"Unexpected DingTalk request: {url} {json}")
+
+
 class _FakeDingTalkRateLimitClient:
     def __init__(self):
         self.department_list_calls = 0
@@ -225,6 +268,59 @@ class _SyncAdapterWithFailure(_DummyAdapter):
         return [ExternalUser(external_id="user-1", name="Alice", unionid="")]
 
 
+class _DingTalkSyncAdapterWithSkippedDepartments(DingTalkOrgSyncAdapter):
+    def __init__(self):
+        super().__init__(config={"app_key": "app-key", "app_secret": "app-secret"})
+        self.provider = SimpleNamespace(id="provider-1", config={})
+        self.fetched_department_ids: list[str] = []
+        self.member_counts_updated = False
+        self.reconcile_called = False
+        self._dept_path_map = {
+            "1": "Root",
+            "2": "营运中心",
+            "3": "营运中心/营运一组",
+            "4": "小部门",
+        }
+
+    async def _ensure_provider(self, db):
+        return self.provider
+
+    async def _upsert_department(self, db, provider, dept):
+        return None
+
+    async def _upsert_member(self, db, provider, user, department_external_id):
+        return {"profile_synced": True}
+
+    async def _reconcile(self, db, provider_id, sync_start):
+        self.reconcile_called = True
+
+    async def _update_member_counts(self, db, provider_id):
+        self.member_counts_updated = True
+
+    async def _rebuild_department_paths(self, db, provider_id):
+        return {}
+
+    async def _refresh_member_department_paths(self, db, provider_id):
+        return None
+
+    async def fetch_departments(self):
+        return [
+            ExternalDepartment(external_id="2", name="营运中心", parent_external_id="1"),
+            ExternalDepartment(external_id="3", name="营运一组", parent_external_id="2"),
+            ExternalDepartment(external_id="4", name="小部门", parent_external_id="1"),
+        ]
+
+    async def fetch_users(self, department_external_id: str):
+        self.fetched_department_ids.append(department_external_id)
+        return [
+            ExternalUser(
+                external_id=f"user-{department_external_id}",
+                name=f"User {department_external_id}",
+                unionid=f"union-{department_external_id}",
+            )
+        ]
+
+
 def test_validate_member_identifiers_requires_unionid_for_feishu():
     adapter = _DummyAdapter()
     provider = SimpleNamespace(provider_type="feishu")
@@ -260,6 +356,18 @@ def test_sync_org_structure_skips_reconcile_after_member_failure():
     assert adapter.reconcile_called is False
     assert adapter.member_counts_updated is True
     assert "Reconcile skipped due to partial sync failures" in result["errors"]
+
+
+def test_dingtalk_sync_skips_large_department_user_fetch_by_default():
+    adapter = _DingTalkSyncAdapterWithSkippedDepartments()
+    db = _FakeDB()
+
+    result = asyncio.run(adapter.sync_org_structure(db))
+
+    assert adapter.fetched_department_ids == ["4"]
+    assert result["members"] == 1
+    assert result["user_fetch_skipped_departments"] == 2
+    assert adapter.reconcile_called is True
 
 
 def test_reconcile_disables_session_synchronization_for_datetime_comparisons():
@@ -338,6 +446,31 @@ def test_dingtalk_authorized_scope_falls_back_to_legacy_auth_scopes():
         ("POST", DingTalkOrgSyncAdapter.DINGTALK_AUTH_SCOPES_URL),
         ("GET", "https://oapi.dingtalk.com/auth/scopes"),
     ]
+
+
+def test_dingtalk_fetch_departments_does_not_expand_skipped_large_departments(monkeypatch):
+    fake_client = _FakeDingTalkLargeDepartmentClient()
+    monkeypatch.setattr(
+        "app.services.org_sync_adapter.httpx.AsyncClient",
+        lambda *args, **kwargs: fake_client,
+    )
+
+    adapter = DingTalkOrgSyncAdapter(config={"app_key": "app-key", "app_secret": "app-secret"})
+
+    async def fake_get_access_token():
+        return "access-token"
+
+    adapter.get_access_token = fake_get_access_token
+
+    departments = asyncio.run(adapter.fetch_departments())
+
+    assert [dept.external_id for dept in departments] == ["1", "2", "4"]
+    assert fake_client.department_list_requests == [1, 4]
+    assert adapter._dept_path_map == {
+        "1": "Root",
+        "2": "Root/营运中心",
+        "4": "Root/小部门",
+    }
 
 
 def test_dingtalk_fetch_departments_retries_rate_limited_department_requests(monkeypatch):
