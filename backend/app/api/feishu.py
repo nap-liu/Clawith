@@ -25,6 +25,7 @@ from app.services.channel_llm import _call_agent_llm  # noqa: F401
 from app.services.channel_dispatch import ChannelReactions, run_channel_message
 from app.services.channel_commands import is_channel_command, handle_channel_command
 from app.services.feishu_service import feishu_service
+from app.services.im_thinking_output import resolve_im_thinking_enabled
 from app.services.storage import agent_upload_key, get_storage_backend, store_agent_upload
 
 router = APIRouter(tags=["feishu"])
@@ -893,6 +894,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 # ── Streaming card state (intra-turn, orthogonal to the per-session lock) ──
                 _stream_buffer: list[str] = []
                 _thinking_buffer: list[str] = []
+                _thinking_output_enabled = resolve_im_thinking_enabled(agent_obj, _sess)
                 _agent_name = agent_obj.name if agent_obj else "AI 回复"
                 _tool_errors: list[str] = []
                 _tool_status_running: dict[str, str] = {}
@@ -959,7 +961,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                         if not force and now - _last_flush_time < _flush_interval:
                             return
                         accumulated = "".join(_stream_buffer)
-                        thinking_text = "".join(_thinking_buffer)
+                        thinking_text = "".join(_thinking_buffer) if _thinking_output_enabled else ""
                         tool_status_lines = _visible_tool_status_lines()
                         current_hash = hash(accumulated + thinking_text + "\n".join(tool_status_lines))
                         if reason == "heartbeat" and current_hash == _last_flushed_hash:
@@ -1451,6 +1453,7 @@ async def _handle_feishu_file(
             _img_heartbeat_task: asyncio.Task | None = None
             _img_llm_done = False
             _img_last_flushed_hash: int = 0
+            _img_thinking_enabled = resolve_im_thinking_enabled(_ag_obj, _sess_img)
 
             async def _queue_image_patch(_card: dict, _stage: str):
                 if not _patch_msg_id:
@@ -1470,8 +1473,15 @@ async def _handle_feishu_file(
                 now = time.time()
                 if not force and now - _img_last_flush < _img_flush_interval:
                     return
-                _card = _build_card("".join(_img_stream_buf), streaming=True, agent_name=_agent_name_img)
-                current_hash = hash("".join(_img_stream_buf))
+                _answer_text = "".join(_img_stream_buf)
+                _thinking_text = "".join(_img_thinking_chunks) if _img_thinking_enabled else ""
+                _card = _build_card(
+                    _answer_text,
+                    thinking_text=_thinking_text,
+                    streaming=True,
+                    agent_name=_agent_name_img,
+                )
+                current_hash = hash(_answer_text + _thinking_text)
                 if reason == "heartbeat" and current_hash == _img_last_flushed_hash:
                     return
                 _img_last_flushed_hash = current_hash
@@ -1487,6 +1497,8 @@ async def _handle_feishu_file(
 
             async def _img_on_thinking(text: str):
                 _img_thinking_chunks.append(text)
+                if _patch_msg_id:
+                    await _flush_image_stream("thinking")
 
             async def _img_heartbeat():
                 while not _img_llm_done:

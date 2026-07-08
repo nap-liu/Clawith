@@ -23,6 +23,7 @@ from app.services.channel_commands import is_channel_command
 from app.services.channel_dispatch import ChannelReactions, run_channel_message
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
+from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
 
 
 WECHAT_ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -304,18 +305,40 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                 sender_name=None, user_id=platform_user_id,
             )
 
-            reply_text = await _call_agent_llm(
-                db=db,
-                agent_id=agent_id,
-                user_text=user_text,
-                history=history,
-                user_id=platform_user_id,
-                session_id=session_conv_id,
-            )
-
             token = str((config.extra_config or {}).get("bot_token") or "").strip()
             base_url = str((config.extra_config or {}).get("baseurl") or WECHAT_ILINK_BASE_URL).strip()
             route_tag = str((config.extra_config or {}).get("route_tag") or "").strip() or None
+
+            _thinking_chunks: list[str] = []
+            _thinking_sender = BufferedIMThinkingSender(
+                enabled=resolve_im_thinking_enabled(agent_obj, sess),
+                send_text=lambda text: send_wechat_text_message(
+                    token=token,
+                    base_url=base_url,
+                    to_user_id=from_user_id,
+                    context_token=context_token,
+                    text=text,
+                    route_tag=route_tag,
+                ),
+            )
+
+            async def _collect_thinking(text: str) -> None:
+                _thinking_chunks.append(text)
+                await _thinking_sender.push(text)
+
+            try:
+                reply_text = await _call_agent_llm(
+                    db=db,
+                    agent_id=agent_id,
+                    user_text=user_text,
+                    history=history,
+                    user_id=platform_user_id,
+                    session_id=session_conv_id,
+                    on_thinking=_collect_thinking,
+                )
+            finally:
+                await _thinking_sender.flush()
+
             await send_wechat_text_message(
                 token=token,
                 base_url=base_url,
@@ -333,6 +356,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             await persist_assistant_reply(
                 _areply_session, agent_id=agent_id, user_id=platform_user_id,
                 conversation_id=session_conv_id, content=reply_text,
+                thinking="".join(_thinking_chunks) or None,
             )
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()

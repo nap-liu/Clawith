@@ -197,3 +197,140 @@ async def test_different_keys_run_concurrently():
     # 不同 key 并发 → 两个 start 都先于两个 end
     assert order[:2] == ["A-start", "B-start"] or order[:2] == ["B-start", "A-start"]
     assert set(order[2:]) == {"A-end", "B-end"}
+
+
+async def test_cancel_running_turn_cancels_registered_work():
+    """普通 IM turn 执行期间应可被 /stop 通过 lock_key 取消。"""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def work():
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "should-not-return"
+
+    task = asyncio.create_task(
+        cd.run_channel_message("k:cancel", is_command=False, reactions=cd.ChannelReactions(), work=work)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert await cd.cancel_running_turn("k:cancel") is True
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+    assert await cd.cancel_running_turn("k:cancel") is False
+
+
+async def test_cancel_running_turn_only_affects_matching_key():
+    """`/stop` 必须只取消同一 IM 会话,不能误杀其他会话的 turn。"""
+    started_a = asyncio.Event()
+    started_b = asyncio.Event()
+    cancelled_a = asyncio.Event()
+    finished_b = asyncio.Event()
+
+    async def work_a():
+        started_a.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled_a.set()
+            raise
+
+    async def work_b():
+        started_b.set()
+        await asyncio.sleep(0.05)
+        finished_b.set()
+        return "b"
+
+    task_a = asyncio.create_task(
+        cd.run_channel_message("k:cancel-a", is_command=False, reactions=cd.ChannelReactions(), work=work_a)
+    )
+    task_b = asyncio.create_task(
+        cd.run_channel_message("k:cancel-b", is_command=False, reactions=cd.ChannelReactions(), work=work_b)
+    )
+    await asyncio.wait_for(started_a.wait(), timeout=1)
+    await asyncio.wait_for(started_b.wait(), timeout=1)
+
+    assert await cd.cancel_running_turn("k:cancel-a") is True
+    with pytest.raises(asyncio.CancelledError):
+        await task_a
+    assert await task_b == "b"
+    assert cancelled_a.is_set()
+    assert finished_b.is_set()
+
+
+async def test_cancel_running_turn_cancels_queued_turn_for_same_key():
+    """`/stop` 应取消同一 IM 会话中已排队但尚未开始执行的 turn。"""
+    running_started = asyncio.Event()
+    release_running = asyncio.Event()
+    queued_work_started = asyncio.Event()
+    running_cancelled = asyncio.Event()
+    queued_cancelled = asyncio.Event()
+
+    async def running_work():
+        running_started.set()
+        try:
+            await release_running.wait()
+        except asyncio.CancelledError:
+            running_cancelled.set()
+            raise
+        return "running"
+
+    async def queued_work():
+        queued_work_started.set()
+        return "queued"
+
+    task_running = asyncio.create_task(
+        cd.run_channel_message("k:queued-cancel", is_command=False, reactions=cd.ChannelReactions(), work=running_work)
+    )
+    await asyncio.wait_for(running_started.wait(), timeout=1)
+    task_queued = asyncio.create_task(
+        cd.run_channel_message("k:queued-cancel", is_command=False, reactions=cd.ChannelReactions(), work=queued_work)
+    )
+    await asyncio.sleep(0)
+
+    assert await cd.cancel_running_turn("k:queued-cancel") is True
+    try:
+        await task_queued
+    except asyncio.CancelledError:
+        queued_cancelled.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task_running
+
+    assert running_cancelled.is_set()
+    assert queued_cancelled.is_set()
+    assert not queued_work_started.is_set()
+
+
+async def test_cancelled_turn_runs_error_reaction_before_reraising():
+    """取消当前 turn 时也要触发 on_error,用于 IM 通道立刻清理 loading/reaction。"""
+    started = asyncio.Event()
+    errors: list[BaseException] = []
+
+    async def work():
+        started.set()
+        await asyncio.sleep(10)
+
+    async def on_error(exc: BaseException):
+        errors.append(exc)
+
+    task = asyncio.create_task(
+        cd.run_channel_message(
+            "k:cancel-reaction",
+            is_command=False,
+            reactions=cd.ChannelReactions(on_error=on_error),
+            work=work,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert await cd.cancel_running_turn("k:cancel-reaction") is True
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)

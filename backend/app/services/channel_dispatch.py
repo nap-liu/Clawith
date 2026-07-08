@@ -47,6 +47,8 @@ class ChannelReactions:
 # Independent from compactor._session_locks (see module docstring).
 _session_locks: dict[str, asyncio.Lock] = {}
 _session_locks_guard = asyncio.Lock()
+_running_turns: dict[str, set[asyncio.Task]] = {}
+_running_turns_guard = asyncio.Lock()
 
 
 async def _get_session_lock(lock_key: str) -> asyncio.Lock:
@@ -72,6 +74,32 @@ async def _safe(hook: Callable[..., Awaitable[None]] | None, *args: object) -> N
         logger.warning(f"[channel_dispatch] reaction hook failed (ignored): {exc}")
 
 
+async def _register_running_turn(lock_key: str, task: asyncio.Task) -> None:
+    async with _running_turns_guard:
+        _running_turns.setdefault(lock_key, set()).add(task)
+
+
+async def _clear_running_turn(lock_key: str, task: asyncio.Task) -> None:
+    async with _running_turns_guard:
+        tasks = _running_turns.get(lock_key)
+        if not tasks:
+            return
+        tasks.discard(task)
+        if not tasks:
+            _running_turns.pop(lock_key, None)
+
+
+async def cancel_running_turn(lock_key: str) -> bool:
+    """Cancel all running or queued non-command IM turns for this lock key."""
+    async with _running_turns_guard:
+        tasks = [task for task in _running_turns.get(lock_key, set()) if not task.done()]
+        if not tasks:
+            return False
+        for task in tasks:
+            task.cancel()
+        return True
+
+
 async def run_channel_message(
     lock_key: str,
     *,
@@ -94,13 +122,20 @@ async def run_channel_message(
     if is_command:
         return await work()
 
-    lock = await _get_session_lock(lock_key)
-    async with lock:
-        await _safe(reactions.on_consume)
-        try:
-            reply = await work()
-        except Exception as exc:
-            await _safe(reactions.on_error, exc)
-            raise
-        await _safe(reactions.on_complete, reply)
-        return reply
+    current_task = asyncio.current_task()
+    if current_task is not None:
+        await _register_running_turn(lock_key, current_task)
+    try:
+        lock = await _get_session_lock(lock_key)
+        async with lock:
+            await _safe(reactions.on_consume)
+            try:
+                reply = await work()
+            except BaseException as exc:
+                await _safe(reactions.on_error, exc)
+                raise
+            await _safe(reactions.on_complete, reply)
+            return reply
+    finally:
+        if current_task is not None:
+            await _clear_running_turn(lock_key, current_task)

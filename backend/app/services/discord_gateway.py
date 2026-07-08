@@ -187,6 +187,7 @@ class DiscordGatewayManager:
             from app.models.agent import Agent as AgentModel
             from app.services.channel_llm import _call_agent_llm
             from app.services.channel_session import find_or_create_channel_session
+            from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
             from app.models.user import User as _User
             from app.core.security import hash_password as _hp
             from datetime import datetime, timezone
@@ -278,10 +279,24 @@ class DiscordGatewayManager:
                 )
 
                 # Call LLM
-                reply_text = await _call_agent_llm(
-                    db, agent_id, user_text,
-                    history=history, user_id=platform_user_id, session_id=session_conv_id,
+                _thinking_chunks: list[str] = []
+                _thinking_sender = BufferedIMThinkingSender(
+                    enabled=resolve_im_thinking_enabled(agent_obj, sess),
+                    send_text=message.channel.send,
                 )
+
+                async def _collect_thinking(text: str) -> None:
+                    _thinking_chunks.append(text)
+                    await _thinking_sender.push(text)
+
+                try:
+                    reply_text = await _call_agent_llm(
+                        db, agent_id, user_text,
+                        history=history, user_id=platform_user_id, session_id=session_conv_id,
+                        on_thinking=_collect_thinking,
+                    )
+                finally:
+                    await _thinking_sender.flush()
                 logger.info(f"[Discord GW] LLM reply for {agent_id}: {reply_text[:80]}")
 
                 # Save assistant reply via the shared writer. Its own session stamps
@@ -293,6 +308,7 @@ class DiscordGatewayManager:
                 await persist_assistant_reply(
                     _areply_session, agent_id=agent_id, user_id=platform_user_id,
                     conversation_id=session_conv_id, content=reply_text,
+                    thinking="".join(_thinking_chunks) or None,
                 )
                 sess.last_message_at = datetime.now(timezone.utc)
                 await db.commit()

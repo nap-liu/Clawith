@@ -181,6 +181,83 @@ async def load_messages_for_session(
     return rows
 
 
+def _trim_incomplete_user_turn_tail_rows(rows: list[Any]) -> list[Any]:
+    """Drop a trailing interrupted user turn before replaying history to LLMs.
+
+    IM ``/stop`` cancels the running coroutine, but the current user row is
+    persisted before the LLM call and the assistant row is persisted only after
+    a clean finish. If cancellation leaves ``user`` (and possibly completed
+    ``tool_call`` rows) after the last real assistant reply, the next turn
+    should start from the last complete exchange instead of replaying that
+    half-finished tail.
+
+    Pending confirmation cards are preserved: they append a ``tool_call`` row
+    after an assistant intro without a trailing user row, and that is a valid
+    suspended state.
+    """
+    if not rows:
+        return []
+
+    last_assistant_idx = -1
+    for idx, row in enumerate(rows):
+        if getattr(row, "role", None) == "assistant":
+            last_assistant_idx = idx
+
+    if last_assistant_idx < 0 and not any(getattr(row, "role", None) == "tool_call" for row in rows):
+        return rows
+
+    scan_start = last_assistant_idx + 1
+    for idx in range(scan_start, len(rows)):
+        row = rows[idx]
+        if isinstance(row, _SyntheticSummaryMessage):
+            continue
+        if getattr(row, "role", None) == "user":
+            if idx < len(rows):
+                logger.info(
+                    "[chat_history] dropped incomplete stopped-turn tail "
+                    f"from LLM replay: {len(rows) - idx} row(s)"
+                )
+            return rows[:idx]
+    return rows
+
+
+async def cleanup_incomplete_session_tail(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+) -> int:
+    """Delete persisted rows belonging to an interrupted trailing user turn.
+
+    This is intentionally conservative: only rows after the first trailing
+    real ``user`` row that appears after the latest assistant reply are removed.
+    Completed history and suspended confirmation cards are left untouched.
+    """
+    result = await db.execute(
+        select(ChatMessage)
+        .where(
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.conversation_id == conversation_id,
+            ChatMessage.compacted_into.is_(None),
+        )
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+    )
+    rows = list(result.scalars().all())
+    trimmed = _trim_incomplete_user_turn_tail_rows(rows)
+    if len(trimmed) == len(rows):
+        return 0
+
+    stale_rows = rows[len(trimmed) :]
+    for row in stale_rows:
+        await db.delete(row)
+    await db.flush()
+    logger.info(
+        "[chat_history] cleaned incomplete stopped-turn tail "
+        f"conversation_id={conversation_id} rows={len(stale_rows)}"
+    )
+    return len(stale_rows)
+
+
 def _parse_tool_call_payload(content: str) -> dict[str, Any] | None:
     """Normalize a stored ``tool_call`` row's JSON into one shape that both
     readers build on — ``expand_tool_call_row`` (LLM replay) and
@@ -533,6 +610,7 @@ async def load_history_for_llm(
     # Build the LLM-ready history via the shared row→message builder (tool_call
     # rows expand to the same assistant+tool pair the web client replays, so IM
     # channels preserve identical tool-call continuity).
+    rows = _trim_incomplete_user_turn_tail_rows(rows)
     history = build_llm_messages_from_rows(rows, wrap_user_names=wrap_users, name_map=name_map)
 
     if rehydrate_images_max is not None:

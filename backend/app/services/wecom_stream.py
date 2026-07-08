@@ -6,6 +6,7 @@ No callback URL or domain verification needed.
 
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Dict
 
 from loguru import logger
@@ -181,14 +182,19 @@ class WeComStreamManager:
                     # 在闭包内(inline),确保使用当前回调持有的 frame/client 上下文,
                     # 避免在 WebSocket 重连后 frame 失效。
                     async def _work():
+                        _stream_id = generate_req_id("stream")
+
+                        async def _send_thinking_text(text: str) -> None:
+                            await client.reply_stream(frame, _stream_id, text, finish=False)
+
                         reply_text = await _process_wecom_stream_message(
                             agent_id=agent_id,
                             sender_id=sender_id,
                             user_text=user_text,
                             chat_id=chat_id,
                             chat_type=chat_type,
+                            send_thinking_text=_send_thinking_text,
                         )
-                        _stream_id = generate_req_id("stream")
                         await client.reply_stream(frame, _stream_id, reply_text, finish=True)
                         logger.info(f"[WeCom Stream] Replied to {sender_id}: {reply_text[:80]}")
                         return reply_text or ""
@@ -363,6 +369,7 @@ async def _process_wecom_stream_message(
     user_text: str,
     chat_id: str = "",
     chat_type: str = "single",
+    send_thinking_text: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """Process a WeCom message through the LLM pipeline and return the reply text."""
     from datetime import datetime, timezone
@@ -373,6 +380,7 @@ async def _process_wecom_stream_message(
     from app.services.channel_session import find_or_create_channel_session
     from app.services.channel_user_service import channel_user_service
     from app.services.channel_llm import _call_agent_llm
+    from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
 
     async with async_session() as db:
         # Load agent
@@ -439,11 +447,29 @@ async def _process_wecom_stream_message(
         )
 
         # Call LLM
-        reply_text = await _call_agent_llm(
-            db, agent_id, user_text,
-            history=history, user_id=platform_user_id,
-            session_id=session_conv_id,
+        _thinking_chunks: list[str] = []
+
+        async def _noop_thinking_sender(_: str) -> None:
+            return None
+
+        _thinking_sender = BufferedIMThinkingSender(
+            enabled=send_thinking_text is not None and resolve_im_thinking_enabled(agent_obj, sess),
+            send_text=send_thinking_text or _noop_thinking_sender,
         )
+
+        async def _collect_thinking(text: str) -> None:
+            _thinking_chunks.append(text)
+            await _thinking_sender.push(text)
+
+        try:
+            reply_text = await _call_agent_llm(
+                db, agent_id, user_text,
+                history=history, user_id=platform_user_id,
+                session_id=session_conv_id,
+                on_thinking=_collect_thinking,
+            )
+        finally:
+            await _thinking_sender.flush()
         logger.info(f"[WeCom Stream] LLM reply: {reply_text[:100]}")
 
         # Save assistant reply via the shared writer. Its own session stamps
@@ -455,6 +481,7 @@ async def _process_wecom_stream_message(
         await persist_assistant_reply(
             _areply_session, agent_id=agent_id, user_id=platform_user_id,
             conversation_id=session_conv_id, content=reply_text,
+            thinking="".join(_thinking_chunks) or None,
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()

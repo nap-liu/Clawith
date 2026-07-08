@@ -2715,6 +2715,7 @@ export default function AgentDetailPage() {
         max_triggers: 20,
         min_poll_interval_min: 5,
         webhook_rate_limit: 5,
+        im_thinking_output_enabled: false,
     });
     const [settingsSaving, setSettingsSaving] = useState(false);
     const [settingsSaved, setSettingsSaved] = useState(false);
@@ -2734,6 +2735,7 @@ export default function AgentDetailPage() {
                 max_triggers: (agent as any).max_triggers ?? 20,
                 min_poll_interval_min: (agent as any).min_poll_interval_min ?? 5,
                 webhook_rate_limit: (agent as any).webhook_rate_limit ?? 5,
+                im_thinking_output_enabled: (agent as any).im_thinking_output_enabled ?? false,
             });
             settingsInitRef.current = true;
         }
@@ -2753,7 +2755,8 @@ export default function AgentDetailPage() {
         String(settingsForm.max_tokens_per_month) !== String(agent?.max_tokens_per_month || '') ||
         settingsForm.max_triggers !== ((agent as any)?.max_triggers ?? 20) ||
         settingsForm.min_poll_interval_min !== ((agent as any)?.min_poll_interval_min ?? 5) ||
-        settingsForm.webhook_rate_limit !== ((agent as any)?.webhook_rate_limit ?? 5)
+        settingsForm.webhook_rate_limit !== ((agent as any)?.webhook_rate_limit ?? 5) ||
+        settingsForm.im_thinking_output_enabled !== ((agent as any)?.im_thinking_output_enabled ?? false)
     );
 
     const handleSaveSettings = async () => {
@@ -2770,6 +2773,7 @@ export default function AgentDetailPage() {
                 max_triggers: settingsForm.max_triggers,
                 min_poll_interval_min: settingsForm.min_poll_interval_min,
                 webhook_rate_limit: settingsForm.webhook_rate_limit,
+                im_thinking_output_enabled: settingsForm.im_thinking_output_enabled,
             } as any);
             queryClient.invalidateQueries({ queryKey: ['agent', id] });
             settingsInitRef.current = false;

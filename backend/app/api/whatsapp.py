@@ -266,6 +266,7 @@ async def whatsapp_event_webhook(
                     continue
 
                 from app.services.channel_llm import _call_agent_llm
+                from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
                 from app.models.agent import Agent as AgentModel, DEFAULT_CONTEXT_WINDOW_SIZE
                 from app.models.audit import ChatMessage
                 from app.services.channel_session import find_or_create_channel_session
@@ -343,8 +344,15 @@ async def whatsapp_event_webhook(
                     )
 
                     _thinking_chunks: list[str] = []
+                    _thinking_sender = BufferedIMThinkingSender(
+                        enabled=resolve_im_thinking_enabled(agent_obj, sess),
+                        send_text=lambda text: _send_whatsapp_messages(config, _sender_phone, text),
+                    )
+
                     async def _collect_thinking(text: str):
                         _thinking_chunks.append(text)
+                        await _thinking_sender.push(text)
+
                     try:
                         reply_text = await _call_agent_llm(
                             db, agent_id, user_text,
@@ -354,6 +362,8 @@ async def whatsapp_event_webhook(
                     except Exception as exc:
                         logger.exception(f"[WhatsApp] LLM failed for agent {agent_id}: {exc}")
                         reply_text = "Sorry, I encountered an error processing your message."
+                    finally:
+                        await _thinking_sender.flush()
 
                     try:
                         await _send_whatsapp_messages(config, _sender_phone, reply_text)

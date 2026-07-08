@@ -34,9 +34,10 @@ Known limitation — quoted reply (Phase 2 #3, 2026-05-08):
     DingTalk replies stay plain.
 """
 
+import asyncio
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,10 +50,6 @@ from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
 
 router = APIRouter(tags=["dingtalk"])
-
-# --- DingTalk Corp API helpers -----------------------------------------
-import time as _time
-
 
 async def _get_corp_access_token(app_key: str, app_secret: str) -> str | None:
     """Get corp access_token via global DingTalkTokenManager (shared with stream/reaction)."""
@@ -289,6 +286,7 @@ async def process_dingtalk_message(
     message_id: str = "",
     sender_id: str = "",
     conversation_title: str = "",
+    channel_reactions=None,
 ):
     """Process an incoming DingTalk bot message and reply via session webhook.
 
@@ -301,7 +299,6 @@ async def process_dingtalk_message(
         logger.info(f"[DingTalk] Skipping duplicate message_id={message_id}")
         return
 
-    import json
     import httpx
     from datetime import datetime, timezone
     from sqlalchemy import select as _select
@@ -311,8 +308,8 @@ async def process_dingtalk_message(
     from sqlalchemy.orm import selectinload as _selectinload
     from app.models.audit import ChatMessage
     from app.services.channel_session import find_or_create_channel_session
-    from app.services.channel_user_service import channel_user_service
     from app.services.channel_llm import _call_agent_llm
+    from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
 
     async with async_session() as db:
         sender_staff_id = (sender_staff_id or "").strip()
@@ -326,7 +323,6 @@ async def process_dingtalk_message(
         if not sender_staff_id:
             logger.warning("[DingTalk] Skip message attribution because sender_staff_id is empty")
             return
-        creator_id = agent_obj.creator_id
         from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
         ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
@@ -359,7 +355,6 @@ async def process_dingtalk_message(
         dt_unionid = ""
         dt_mobile = ""
         dt_email = ""
-        matched_via = ""
 
         # Find the DingTalk identity provider for this tenant
         _ip_r = await db.execute(
@@ -384,7 +379,6 @@ async def process_dingtalk_message(
                 _u_r = await db.execute(_select(UserModel).where(UserModel.id == _om.user_id).options(_selectinload(UserModel.identity)))
                 platform_user = _u_r.scalar_one_or_none()
                 if platform_user:
-                    matched_via = "org_member.external_id(staff_id)"
                     logger.info(f"[DingTalk] Step1: Matched user via staff_id {sender_staff_id}: {platform_user.username}")
 
         # Step 2: Match via username = dingtalk_{staffId} (兼容旧用户)
@@ -396,7 +390,6 @@ async def process_dingtalk_message(
             )
             platform_user = _u_r.scalar_one_or_none()
             if platform_user:
-                matched_via = "username"
                 logger.info(f"[DingTalk] Step2: Matched user via username {dt_username}")
 
         # Step 3: Call DingTalk API to get unionId/mobile/email (仅首次未匹配时)
@@ -427,7 +420,6 @@ async def process_dingtalk_message(
                         _u_r = await db.execute(_select(UserModel).where(UserModel.id == _om.user_id).options(_selectinload(UserModel.identity)))
                         platform_user = _u_r.scalar_one_or_none()
                         if platform_user:
-                            matched_via = "org_member.unionid"
                             logger.info(f"[DingTalk] Step3a: Matched user via unionid {dt_unionid}: {platform_user.username}")
 
                 # 3b: mobile 匹配
@@ -440,7 +432,6 @@ async def process_dingtalk_message(
                     )
                     platform_user = _u_r.scalar_one_or_none()
                     if platform_user:
-                        matched_via = "mobile"
                         logger.info(f"[DingTalk] Step3b: Matched user via mobile: {platform_user.username}")
 
                 # 3c: email 匹配
@@ -453,7 +444,6 @@ async def process_dingtalk_message(
                     )
                     platform_user = _u_r.scalar_one_or_none()
                     if platform_user:
-                        matched_via = "email"
                         logger.info(f"[DingTalk] Step3c: Matched user via email: {platform_user.username}")
 
 
@@ -481,7 +471,6 @@ async def process_dingtalk_message(
             db.add(platform_user)
             await db.flush()
             platform_user.identity = _identity
-            matched_via = "created"
             logger.info(f"[DingTalk] Step4: Created new user: {dt_username}")
         else:
             # Update display_name, source, mobile, email for existing users
@@ -730,17 +719,65 @@ async def process_dingtalk_message(
 
         # Call LLM
         _thinking_chunks: list[str] = []
+
+        async def _send_thinking_text(text: str) -> None:
+            if not session_webhook:
+                return
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(session_webhook, json={
+                    "msgtype": "text",
+                    "text": {"content": text},
+                })
+
+        _thinking_sender = BufferedIMThinkingSender(
+            enabled=resolve_im_thinking_enabled(agent_obj, sess),
+            send_text=_send_thinking_text,
+        )
+
+        async def _cleanup_cancelled_tail() -> None:
+            from app.services.chat_history import cleanup_incomplete_session_tail
+
+            try:
+                await cleanup_incomplete_session_tail(
+                    db,
+                    agent_id=agent_id,
+                    conversation_id=session_conv_id,
+                )
+                await db.commit()
+            except Exception as exc:  # noqa: BLE001 - cancellation cleanup is best-effort
+                logger.warning(f"[DingTalk] Failed to clean cancelled turn tail: {exc}")
+
         async def _collect_thinking(text: str):
             _thinking_chunks.append(text)
+            if channel_reactions and channel_reactions.on_thinking:
+                try:
+                    await channel_reactions.on_thinking(text)
+                except Exception as exc:  # noqa: BLE001 - reaction feedback is best-effort
+                    logger.warning(f"[DingTalk] Thinking reaction update failed: {exc}")
+            await _thinking_sender.push(text)
+
+        async def _notify_tool_call(evt: dict):
+            if channel_reactions and channel_reactions.on_tool_call:
+                try:
+                    await channel_reactions.on_tool_call(evt)
+                except Exception as exc:  # noqa: BLE001 - reaction feedback is best-effort
+                    logger.warning(f"[DingTalk] Tool reaction update failed: {exc}")
+
         try:
-            reply_text = await _call_agent_llm(
-                db, agent_id, llm_user_text,
-                history=history, user_id=platform_user_id,
-                session_id=session_conv_id,
-                is_group=(conversation_type == "2"),
-                on_thinking=_collect_thinking,
-            )
+            try:
+                reply_text = await _call_agent_llm(
+                    db, agent_id, llm_user_text,
+                    history=history, user_id=platform_user_id,
+                    session_id=session_conv_id,
+                    is_group=(conversation_type == "2"),
+                    on_thinking=_collect_thinking,
+                    on_tool_call=_notify_tool_call,
+                )
+            except asyncio.CancelledError:
+                await _cleanup_cancelled_tail()
+                raise
         finally:
+            await _thinking_sender.flush()
             # Reset ContextVar. (Thinking-reaction recall now fires via the
             # channel_dispatch on_complete hook, after the turn fully completes.)
             if _cfs_token is not None:
@@ -840,7 +877,7 @@ async def dingtalk_callback(
         access_token = token_data.get("access_token")
         if not access_token:
             logger.error(f"DingTalk token exchange failed: {token_data}")
-            return HTMLResponse(f"Auth failed: Token exchange error")
+            return HTMLResponse("Auth failed: Token exchange error")
 
         # Step 2: Get user info using modern v1.0 API
         user_info = await auth_provider.get_user_info(access_token)

@@ -133,6 +133,9 @@ class Agent(Base):
     # Timezone (IANA format, e.g. "Asia/Shanghai"). None = inherit from tenant.
     timezone: Mapped[str | None] = mapped_column(String(50), default=None, nullable=True)
 
+    # External IM channels can optionally show model thinking progress.
+    im_thinking_output_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="false")
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

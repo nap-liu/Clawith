@@ -186,9 +186,194 @@ async def test_handle_channel_command_archives_old_session():
 async def test_is_channel_command_recognises_slash_commands():
     assert channel_commands.is_channel_command("/new") is True
     assert channel_commands.is_channel_command("/reset") is True
+    assert channel_commands.is_channel_command("/help") is True
+    assert channel_commands.is_channel_command("/stop") is True
+    assert channel_commands.is_channel_command("/thinking on") is True
+    assert channel_commands.is_channel_command("/thinking off") is True
+    assert channel_commands.is_channel_command("/thinking status") is True
+    assert channel_commands.is_channel_command("/think on") is True
     assert channel_commands.is_channel_command("  /NEW  ") is True
     assert channel_commands.is_channel_command("/RESET") is True
     # Non-commands
     assert channel_commands.is_channel_command("hello") is False
     assert channel_commands.is_channel_command("/newish") is False
+    assert channel_commands.is_channel_command("/thinking maybe") is False
     assert channel_commands.is_channel_command("") is False
+
+
+@pytest.mark.asyncio
+async def test_help_command_lists_available_im_commands():
+    agent_id = uuid.uuid4()
+    db = FakeDB()
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/help",
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_p2p_staff_1",
+        source_channel="dingtalk",
+    )
+
+    assert result["action"] == "help"
+    assert "/new" in result["message"]
+    assert "/thinking on" in result["message"]
+    assert "/thinking off" in result["message"]
+    assert "/thinking status" in result["message"]
+    assert "/stop" in result["message"]
+    assert "/help" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_thinking_on_updates_agent_im_config(monkeypatch):
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id, im_thinking_output_enabled=False)
+    db = FakeDB(lookup_result=agent)
+
+    async def fake_can_manage(_db, _user_id, _agent):
+        return True
+
+    monkeypatch.setattr(channel_commands, "user_can_manage_agent_id", fake_can_manage)
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/thinking on",
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_p2p_staff_1",
+        source_channel="dingtalk",
+    )
+
+    assert result["action"] == "thinking_output"
+    assert agent.im_thinking_output_enabled is True
+    assert db.flushes == 1
+    assert "数字员工" in result["message"]
+    assert "开启" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_thinking_off_updates_agent_im_config(monkeypatch):
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id, im_thinking_output_enabled=True)
+    db = FakeDB(lookup_result=agent)
+
+    async def fake_can_manage(_db, _user_id, _agent):
+        return True
+
+    monkeypatch.setattr(channel_commands, "user_can_manage_agent_id", fake_can_manage)
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/think off",
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        external_conv_id="feishu_p2p_ou_1",
+        source_channel="feishu",
+    )
+
+    assert result["action"] == "thinking_output"
+    assert agent.im_thinking_output_enabled is False
+    assert db.flushes == 1
+    assert "数字员工" in result["message"]
+    assert "关闭" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_thinking_status_reports_agent_config():
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id, im_thinking_output_enabled=False)
+    db = FakeDB(lookup_result=agent)
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/thinking status",
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        external_conv_id="wecom_p2p_1",
+        source_channel="wecom",
+    )
+
+    assert result["action"] == "thinking_output_status"
+    assert "数字员工" in result["message"]
+    assert "关闭" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_thinking_toggle_requires_agent_manage_permission(monkeypatch):
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id, im_thinking_output_enabled=False)
+    db = FakeDB(lookup_result=agent)
+
+    async def fake_can_manage(_db, _user_id, _agent):
+        return False
+
+    monkeypatch.setattr(channel_commands, "user_can_manage_agent_id", fake_can_manage)
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/thinking on",
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        external_conv_id="wecom_p2p_1",
+        source_channel="wecom",
+    )
+
+    assert result["action"] == "thinking_output_denied"
+    assert agent.im_thinking_output_enabled is False
+    assert db.flushes == 0
+    assert "没有权限" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_stop_command_cancels_running_turn(monkeypatch):
+    agent_id = uuid.uuid4()
+    calls: list[str] = []
+    cleanup_calls: list[tuple[uuid.UUID, str]] = []
+    session = SimpleNamespace(id=uuid.uuid4())
+
+    async def fake_cancel(lock_key: str) -> bool:
+        calls.append(lock_key)
+        return True
+
+    async def fake_cleanup(_db, *, agent_id: uuid.UUID, conversation_id: str) -> int:
+        cleanup_calls.append((agent_id, conversation_id))
+        return 1
+
+    monkeypatch.setattr(channel_commands, "cancel_running_turn", fake_cancel)
+    monkeypatch.setattr(channel_commands, "cleanup_incomplete_session_tail", fake_cleanup)
+    db = FakeDB(lookup_result=session)
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/stop",
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_p2p_staff_1",
+        source_channel="dingtalk",
+    )
+
+    assert result["action"] == "stop_turn"
+    assert calls == ["dingtalk:dingtalk_p2p_staff_1"]
+    assert cleanup_calls == [(agent_id, str(session.id))]
+    assert "已请求停止" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_stop_command_reports_when_no_turn_is_running(monkeypatch):
+    async def fake_cancel(lock_key: str) -> bool:
+        return False
+
+    monkeypatch.setattr(channel_commands, "cancel_running_turn", fake_cancel)
+    db = FakeDB()
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/stop",
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        external_conv_id="slack_D123",
+        source_channel="slack",
+    )
+
+    assert result["action"] == "stop_turn"
+    assert "没有正在执行" in result["message"]

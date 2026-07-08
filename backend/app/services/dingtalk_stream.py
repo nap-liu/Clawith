@@ -9,6 +9,7 @@ import base64
 import json
 import threading
 import uuid
+from concurrent.futures import CancelledError as FutureCancelledError
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -417,20 +418,26 @@ def _dingtalk_lock_key(conversation_type: str, conversation_id: str, sender_staf
 
 
 def _make_dingtalk_reactions(app_key: str, app_secret: str, message_id: str, conversation_id: str) -> ChannelReactions:
-    """钉钉的整轮 reaction:开始消费时加 thinking 表情;成功或失败都撤回。
+    """钉钉的整轮 reaction:按 thinking/tool 事件动态切换,完成或失败时撤回。"""
+    from app.services.dingtalk_reaction import DingTalkReactionController, add_reaction, recall_reaction
 
-    on_complete(reply) 与 on_error(exc) 共用同一个撤回函数(用 *_args 兼容两种签名),
-    保证无论成功失败 thinking 表情都会被撤回(等价于原先的 finally 语义)。
-    """
-    from app.services.dingtalk_reaction import add_thinking_reaction, recall_thinking_reaction
+    async def _attach(reaction: str, _ak=app_key, _as=app_secret, _mid=message_id, _cid=conversation_id) -> bool:
+        return await add_reaction(_ak, _as, _mid, _cid, reaction)
 
-    async def _on_consume(_ak=app_key, _as=app_secret, _mid=message_id, _cid=conversation_id):
-        await add_thinking_reaction(_ak, _as, _mid, _cid)
+    async def _recall(reaction: str, _ak=app_key, _as=app_secret, _mid=message_id, _cid=conversation_id) -> None:
+        await recall_reaction(_ak, _as, _mid, _cid, reaction)
 
-    async def _recall(*_args, _ak=app_key, _as=app_secret, _mid=message_id, _cid=conversation_id):
-        await recall_thinking_reaction(_ak, _as, _mid, _cid)
-
-    return ChannelReactions(on_consume=_on_consume, on_complete=_recall, on_error=_recall)
+    controller = DingTalkReactionController(
+        attach_reaction=_attach,
+        recall_reaction=_recall,
+    )
+    return ChannelReactions(
+        on_consume=controller.on_consume,
+        on_complete=controller.on_complete,
+        on_error=controller.on_error,
+        on_tool_call=controller.on_tool_call,
+        on_thinking=controller.on_thinking,
+    )
 
 
 def _fire_and_forget(loop, coro):
@@ -439,6 +446,8 @@ def _fire_and_forget(loop, coro):
     def _on_done(f):
         try:
             f.result()
+        except FutureCancelledError:
+            logger.debug("[DingTalk Stream] fire-and-forget coroutine was cancelled")
         except Exception:
             logger.exception("[DingTalk Stream] Unhandled error in fire-and-forget coroutine")
     future.add_done_callback(_on_done)
@@ -559,7 +568,7 @@ class DingTalkStreamManager:
                                             _cid=conversation_id, _ctype=conversation_type,
                                             _wh=session_webhook, _nick=sender_nick,
                                             _mid=message_id, _sid=sender_id,
-                                            _title=conversation_title):
+                                            _title=conversation_title, _reactions=reactions):
                                 await process_dingtalk_message(
                                     agent_id=agent_id,
                                     sender_staff_id=_ssid,
@@ -571,6 +580,7 @@ class DingTalkStreamManager:
                                     message_id=_mid,
                                     sender_id=_sid,
                                     conversation_title=_title,
+                                    channel_reactions=_reactions,
                                 )
                                 return ""
 
@@ -596,7 +606,8 @@ class DingTalkStreamManager:
                                                   _ssid=sender_staff_id, _cid=conversation_id,
                                                   _ctype=conversation_type, _wh=session_webhook,
                                                   _nick=sender_nick, _mid=message_id,
-                                                  _sid=sender_id, _title=conversation_title):
+                                                  _sid=sender_id, _title=conversation_title,
+                                                  _reactions=reactions):
                                 await self._handle_media_and_dispatch(
                                     msg_data=_md,
                                     app_key=_ak,
@@ -610,6 +621,7 @@ class DingTalkStreamManager:
                                     message_id=_mid,
                                     sender_id=_sid,
                                     conversation_title=_title,
+                                    channel_reactions=_reactions,
                                 )
                                 return ""
 
@@ -647,6 +659,7 @@ class DingTalkStreamManager:
                 message_id: str = "",
                 sender_id: str = "",
                 conversation_title: str = "",
+                channel_reactions: ChannelReactions | None = None,
             ):
                 """Download media, then dispatch to process_dingtalk_message."""
                 from app.api.dingtalk import process_dingtalk_message
@@ -675,6 +688,7 @@ class DingTalkStreamManager:
                     message_id=message_id,
                     sender_id=sender_id,
                     conversation_title=conversation_title,
+                    channel_reactions=channel_reactions,
                 )
 
         class ClawithCardCallbackHandler(dingtalk_stream.CallbackHandler):
@@ -844,7 +858,7 @@ class DingTalkStreamManager:
         async with async_session() as db:
             result = await db.execute(
                 select(ChannelConfig).where(
-                    ChannelConfig.is_configured == True,
+                    ChannelConfig.is_configured.is_(True),
                     ChannelConfig.channel_type == "dingtalk",
                 )
             )

@@ -277,6 +277,7 @@ class AgentOut(BaseModel):
     heartbeat_active_hours: str = "09:00-18:00"
     last_heartbeat_at: datetime | None = None
     timezone: str | None = None
+    im_thinking_output_enabled: bool = False
     expires_at: datetime | None = None
     is_expired: bool = False
     is_system: bool = False
@@ -321,6 +322,7 @@ class AgentUpdate(BaseModel):
     heartbeat_interval_minutes: int | None = None
     heartbeat_active_hours: str | None = None
     timezone: str | None = None
+    im_thinking_output_enabled: bool | None = None
     expires_at: datetime | None = None  # Admin only — extend agent expiry
 
 

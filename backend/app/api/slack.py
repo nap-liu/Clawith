@@ -455,15 +455,31 @@ async def slack_event_webhook(
 
         # Call LLM
         from app.services.channel_llm import _call_agent_llm
+        from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
         _thinking_chunks: list[str] = []
+
+        async def _send_thinking_text(text: str) -> None:
+            bot_token = config.app_secret or ""
+            if bot_token and channel_id:
+                await _send_slack_messages(bot_token, channel_id, text)
+
+        _thinking_sender = BufferedIMThinkingSender(
+            enabled=resolve_im_thinking_enabled(agent_obj, sess),
+            send_text=_send_thinking_text,
+        )
+
         async def _collect_thinking(text: str):
             _thinking_chunks.append(text)
-        reply_text = await _call_agent_llm(
-            db, agent_id, user_text,
-            history=history, user_id=platform_user_id, session_id=session_conv_id,
-            on_thinking=_collect_thinking,
-        )
-        _cfs_s.reset(_cfs_s_token)
+            await _thinking_sender.push(text)
+        try:
+            reply_text = await _call_agent_llm(
+                db, agent_id, user_text,
+                history=history, user_id=platform_user_id, session_id=session_conv_id,
+                on_thinking=_collect_thinking,
+            )
+        finally:
+            await _thinking_sender.flush()
+            _cfs_s.reset(_cfs_s_token)
         logger.info(f"[Slack] LLM reply: {reply_text[:80]}")
 
         # Save assistant reply via the shared writer. Its own session stamps

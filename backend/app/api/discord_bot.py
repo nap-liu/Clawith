@@ -286,6 +286,7 @@ async def discord_interaction_webhook(
             from app.services.channel_session import find_or_create_channel_session
             from app.services.channel_dispatch import ChannelReactions, run_channel_message
             from app.services.channel_commands import handle_channel_command
+            from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
             from app.database import async_session
             from datetime import datetime, timezone
 
@@ -386,13 +387,35 @@ async def discord_interaction_webhook(
 
                     # Call LLM
                     _thinking_chunks: list[str] = []
+                    cfg_r = await bg_db.execute(select(ChannelConfig).where(
+                        ChannelConfig.agent_id == agent_id,
+                        ChannelConfig.channel_type == "discord",
+                    ))
+                    cfg = cfg_r.scalar_one_or_none()
+                    bot_token_bg = cfg.app_secret if cfg else ""
+                    app_id_bg = cfg.app_id if cfg else ""
+
+                    async def _send_thinking_text(text: str) -> None:
+                        if bot_token_bg and interaction_token and app_id_bg:
+                            await _send_discord_followup(app_id_bg, bot_token_bg, interaction_token, text)
+
+                    _thinking_sender = BufferedIMThinkingSender(
+                        enabled=resolve_im_thinking_enabled(agent_obj, sess),
+                        send_text=_send_thinking_text,
+                    )
+
                     async def _collect_thinking(text: str):
                         _thinking_chunks.append(text)
-                    reply_text = await _call_agent_llm(
-                        bg_db, agent_id, user_text,
-                        history=history, user_id=platform_user_id, session_id=session_conv_id,
-                        on_thinking=_collect_thinking,
-                    )
+                        await _thinking_sender.push(text)
+
+                    try:
+                        reply_text = await _call_agent_llm(
+                            bg_db, agent_id, user_text,
+                            history=history, user_id=platform_user_id, session_id=session_conv_id,
+                            on_thinking=_collect_thinking,
+                        )
+                    finally:
+                        await _thinking_sender.flush()
                     logger.info(f"[Discord] LLM reply: {reply_text[:80]}")
 
                     # Save assistant reply via the shared writer. Its own session stamps
@@ -408,16 +431,6 @@ async def discord_interaction_webhook(
                     )
                     sess.last_message_at = datetime.now(timezone.utc)
                     await bg_db.commit()
-
-                    # Bot token stored in config — read from DB to avoid detached ORM issues
-                    from sqlalchemy import select as _sel
-                    cfg_r = await bg_db.execute(_sel(ChannelConfig).where(
-                        ChannelConfig.agent_id == agent_id,
-                        ChannelConfig.channel_type == "discord",
-                    ))
-                    cfg = cfg_r.scalar_one_or_none()
-                    bot_token_bg = cfg.app_secret if cfg else ""
-                    app_id_bg = cfg.app_id if cfg else ""
 
                     # Send chunked reply via Discord follow-up
                     if bot_token_bg and interaction_token and app_id_bg:

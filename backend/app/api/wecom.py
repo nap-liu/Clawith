@@ -37,6 +37,7 @@ from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
 from app.services.platform_service import platform_service
 from app.services.channel_llm import _call_agent_llm
+from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
 from app.schemas.schemas import ChannelConfigOut
 from app.services.wecom_stream import wecom_stream_manager
 
@@ -648,47 +649,62 @@ async def _process_wecom_text(
                 sender_name=None, user_id=platform_user_id,
             )
 
+            wecom_agent_id = (config.extra_config or {}).get("wecom_agent_id", "")
+
+            async def _send_wecom_text(text: str) -> None:
+                access_token = await _get_wecom_token_cached(config.app_id, config.app_secret)
+                if not access_token:
+                    return
+                async with httpx.AsyncClient(timeout=10) as client:
+                    if is_kf and open_kfid:
+                        # KF 消息需先转接状态再发送
+                        res_state = await client.post(
+                            f"https://qyapi.weixin.qq.com/cgi-bin/kf/service_state/trans?access_token={access_token}",
+                            json={"open_kfid": open_kfid, "external_userid": from_user, "service_state": 1},
+                        )
+                        logger.info(f"[WeCom KF] trans state result: {res_state.json()}")
+                        res_send = await client.post(
+                            f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token={access_token}",
+                            json={"touser": from_user, "open_kfid": open_kfid, "msgtype": "text", "text": {"content": text}},
+                        )
+                        logger.info(f"[WeCom KF] send_msg result: {res_send.json()}")
+                    else:
+                        # 默认发送文本消息
+                        await client.post(
+                            f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}",
+                            json={
+                                "touser": from_user,
+                                "msgtype": "text",
+                                "agentid": int(wecom_agent_id) if wecom_agent_id else 0,
+                                "text": {"content": text},
+                            },
+                        )
+
             # 调用 LLM
             _thinking_chunks: list[str] = []
+            _thinking_sender = BufferedIMThinkingSender(
+                enabled=resolve_im_thinking_enabled(agent_obj, sess),
+                send_text=_send_wecom_text,
+            )
+
             async def _collect_thinking(text: str):
                 _thinking_chunks.append(text)
-            reply_text = await _call_agent_llm(
-                db, agent_id, user_text,
-                history=history, user_id=platform_user_id,
-                session_id=session_conv_id,
-                on_thinking=_collect_thinking,
-            )
+                await _thinking_sender.push(text)
+
+            try:
+                reply_text = await _call_agent_llm(
+                    db, agent_id, user_text,
+                    history=history, user_id=platform_user_id,
+                    session_id=session_conv_id,
+                    on_thinking=_collect_thinking,
+                )
+            finally:
+                await _thinking_sender.flush()
             logger.info(f"[WeCom] LLM reply: {reply_text[:100]}")
 
             # 通过企微 API 发送回复
-            wecom_agent_id = (config.extra_config or {}).get("wecom_agent_id", "")
             try:
-                access_token = await _get_wecom_token_cached(config.app_id, config.app_secret)
-                async with httpx.AsyncClient(timeout=10) as client:
-                    if access_token:
-                        if is_kf and open_kfid:
-                            # KF 消息需先转接状态再发送
-                            res_state = await client.post(
-                                f"https://qyapi.weixin.qq.com/cgi-bin/kf/service_state/trans?access_token={access_token}",
-                                json={"open_kfid": open_kfid, "external_userid": from_user, "service_state": 1}
-                            )
-                            logger.info(f"[WeCom KF] trans state result: {res_state.json()}")
-                            res_send = await client.post(
-                                f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token={access_token}",
-                                json={"touser": from_user, "open_kfid": open_kfid, "msgtype": "text", "text": {"content": reply_text}}
-                            )
-                            logger.info(f"[WeCom KF] send_msg result: {res_send.json()}")
-                        else:
-                            # 默认发送文本消息
-                            await client.post(
-                                f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}",
-                                json={
-                                    "touser": from_user,
-                                    "msgtype": "text",
-                                    "agentid": int(wecom_agent_id) if wecom_agent_id else 0,
-                                    "text": {"content": reply_text},
-                                },
-                            )
+                await _send_wecom_text(reply_text)
             except Exception as e:
                 logger.error(f"[WeCom] Failed to send reply: {e}")
 

@@ -25,6 +25,7 @@ from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_llm import _call_agent_llm
+from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
 from app.services.agent_tools import channel_file_sender as _cfs_s
 from app.core.security import hash_password as _hp
 from pathlib import Path as _Path
@@ -554,19 +555,55 @@ async def teams_event_webhook(
 
             # Call LLM
             _thinking_chunks: list[str] = []
+
+            async def _send_thinking_text(text: str) -> None:
+                use_managed_identity = config.extra_config.get("use_managed_identity", False)
+                has_credentials = (config.app_id and config.app_secret) or use_managed_identity
+                if not has_credentials or not conversation_id:
+                    return
+                bot_channel_account = activity.get("recipient", {})
+                if not bot_channel_account.get("id"):
+                    if config.app_id:
+                        bot_channel_account = {"id": config.app_id}
+                    else:
+                        return
+                user_account = activity.get("from", {})
+                if not user_account.get("id"):
+                    user_account = {"id": sender_id, "name": sender_name}
+                await _send_teams_message(
+                    config,
+                    conversation_id,
+                    {
+                        "type": "message",
+                        "from": bot_channel_account,
+                        "conversation": {"id": conversation_id},
+                        "recipient": user_account,
+                        "replyToId": reply_to_id,
+                        "text": text,
+                    },
+                )
+
+            _thinking_sender = BufferedIMThinkingSender(
+                enabled=resolve_im_thinking_enabled(agent_obj, sess),
+                send_text=_send_thinking_text,
+            )
+
             async def _collect_thinking(text: str):
                 _thinking_chunks.append(text)
+                await _thinking_sender.push(text)
+
             try:
                 reply_text = await _call_agent_llm(
                     db, agent_id, user_text,
                     history=history, user_id=platform_user_id, session_id=session_conv_id,
                     on_thinking=_collect_thinking,
                 )
-                _cfs_s.reset(_cfs_s_token)
                 logger.info(f"Teams: LLM reply generated: {reply_text[:80]}")
             except Exception as e:
                 logger.exception(f"Teams: Failed to call LLM for agent {agent_id}: {e}")
                 reply_text = "Sorry, I encountered an error processing your message."
+            finally:
+                await _thinking_sender.flush()
                 _cfs_s.reset(_cfs_s_token)
 
             # Save reply
