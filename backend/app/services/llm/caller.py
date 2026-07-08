@@ -358,6 +358,54 @@ def _usage_from_response_or_estimate(response, api_messages: list[LLMMessage]) -
     return estimate_token_usage_from_chars(round_chars)
 
 
+def _coerce_uuid(value) -> uuid.UUID | None:
+    if value is None:
+        return None
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _persist_tool_call_events_strict(
+    events: list[dict],
+    *,
+    agent_id,
+    user_id,
+    session_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> bool:
+    """Durably append tool-call markers before the loop relies on them.
+
+    Returns False for non-persistable test/background calls without UUID ids.
+    For real chat turns, DB errors propagate and stop execution before side
+    effects can happen without a recovery marker.
+    """
+    if not events or not session_id:
+        return False
+    agent_uuid = _coerce_uuid(agent_id)
+    user_uuid = _coerce_uuid(user_id or agent_id)
+    if agent_uuid is None or user_uuid is None:
+        return False
+
+    from app.services.chat_history import persist_tool_call_row
+
+    async with async_session() as db:
+        for evt in events:
+            await persist_tool_call_row(
+                db,
+                agent_id=agent_uuid,
+                user_id=user_uuid,
+                conversation_id=session_id,
+                evt=evt,
+                turn_anchor_id=turn_anchor_id,
+            )
+        await db.commit()
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helper Functions
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -665,6 +713,8 @@ async def _process_tool_call(
     full_reasoning_content: str,
     allowed_tool_names: set[str],
     on_code_output=None,
+    emit_running: bool = True,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Process a single tool call and return result."""
     raw_args = tc["function"].get("arguments", "{}")
@@ -704,18 +754,31 @@ async def _process_tool_call(
         )
         return ""
 
-    # Notify client about tool call (in-progress)
-    if on_tool_call:
+    # Notify client about tool call (in-progress). The normal multi-tool loop
+    # pre-emits running markers for the whole round before executing any tool;
+    # direct helper callers keep the historical behavior through emit_running=True.
+    if emit_running:
+        running_evt = {
+            "name": tool_name,
+            "call_id": tc.get("id", ""),
+            "args": args,
+            "status": "running",
+            "reasoning_content": full_reasoning_content,
+        }
+        if await _persist_tool_call_events_strict(
+            [running_evt],
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id=session_id,
+            turn_anchor_id=turn_anchor_id,
+        ):
+            running_evt["_durable_persisted"] = True
+    else:
+        running_evt = None
+
+    if running_evt is not None and on_tool_call:
         try:
-            await on_tool_call(
-                {
-                    "name": tool_name,
-                    "call_id": tc.get("id", ""),
-                    "args": args,
-                    "status": "running",
-                    "reasoning_content": full_reasoning_content,
-                }
-            )
+            await on_tool_call(running_evt)
         except Exception:
             pass
 
@@ -763,18 +826,26 @@ async def _process_tool_call(
     # Notify client (for WS live stream and DB persistence) with the
     # llm_view — never the raw result. Three-way consistency: DB view,
     # LLM replay view, and the value the frontend receives all match.
+    done_evt = {
+        "name": tool_name,
+        "call_id": tc.get("id", ""),
+        "args": args,
+        "status": "done",
+        "result": llm_view,
+        "reasoning_content": full_reasoning_content,
+    }
+    if await _persist_tool_call_events_strict(
+        [done_evt],
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=session_id,
+        turn_anchor_id=turn_anchor_id,
+    ):
+        done_evt["_durable_persisted"] = True
+
     if on_tool_call:
         try:
-            await on_tool_call(
-                {
-                    "name": tool_name,
-                    "call_id": tc.get("id", ""),
-                    "args": args,
-                    "status": "done",
-                    "result": llm_view,
-                    "reasoning_content": full_reasoning_content,
-                }
-            )
+            await on_tool_call(done_evt)
         except Exception:
             pass
 
@@ -811,6 +882,7 @@ async def call_llm(
     is_group: bool = False,
     on_code_output=None,
     current_user_name_override: str | None = None,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     # Get agent config for tool rounds
@@ -830,13 +902,14 @@ async def call_llm(
     if on_tool_call is None and session_id:
         from app.services.chat_history import persist_tool_call
         async def _default_on_tool_call(data: dict):
-            if data.get("status") == "done" and agent_id:
+            if data.get("status") in {"running", "done"} and agent_id:
                 await persist_tool_call(
                     async_session,
                     agent_id=agent_id,
                     user_id=user_id or agent_id,
                     conversation_id=session_id,
                     evt=data,
+                    turn_anchor_id=turn_anchor_id,
                 )
         on_tool_call = _default_on_tool_call
 
@@ -1150,6 +1223,7 @@ async def call_llm(
                     action=conf_call.action,
                     risk_level=conf_call.risk_level,
                     buttons=conf_call.buttons,
+                    turn_anchor_id=turn_anchor_id,
                 )
                 if agent_id and _unsaved_usage.total_tokens > 0:
                     await record_token_usage(agent_id, _unsaved_usage)
@@ -1221,19 +1295,73 @@ async def call_llm(
 
         full_reasoning_content = response.reasoning_content or ""
 
+        running_events: list[dict] = []
         for tc in sanitized_tool_calls or []:
-            tool_error = await _process_tool_call(
-                tc=tc,
-                api_messages=api_messages,
+            args = _canonicalize_tc_arguments(tc, session_id)
+            tool_name = tc["function"]["name"]
+            should_execute, _error_msg = _check_tool_requires_args(tool_name, args)
+            if not should_execute or tool_name not in allowed_tool_names:
+                continue
+            running_events.append(
+                {
+                    "name": tool_name,
+                    "call_id": tc.get("id", ""),
+                    "args": args,
+                    "status": "running",
+                    "reasoning_content": full_reasoning_content,
+                }
+            )
+
+        try:
+            running_persisted = await _persist_tool_call_events_strict(
+                running_events,
                 agent_id=agent_id,
                 user_id=user_id,
                 session_id=session_id,
-                supports_vision=supports_vision,
-                on_tool_call=on_tool_call,
-                on_code_output=on_code_output,
-                full_reasoning_content=full_reasoning_content,
-                allowed_tool_names=allowed_tool_names,
+                turn_anchor_id=turn_anchor_id,
             )
+        except Exception as e:
+            logger.exception(f"[LLM] Failed to persist running tool markers before execution: {e}")
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client.close()
+            _log_turn_timing("tool_marker_persist_error", round_i + 1)
+            return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
+
+        if running_persisted:
+            for evt in running_events:
+                evt["_durable_persisted"] = True
+
+        for evt in running_events:
+            if on_tool_call:
+                try:
+                    await on_tool_call(evt)
+                except Exception:
+                    pass
+
+        for tc in sanitized_tool_calls or []:
+            try:
+                tool_error = await _process_tool_call(
+                    tc=tc,
+                    api_messages=api_messages,
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    supports_vision=supports_vision,
+                    on_tool_call=on_tool_call,
+                    on_code_output=on_code_output,
+                    full_reasoning_content=full_reasoning_content,
+                    allowed_tool_names=allowed_tool_names,
+                    emit_running=False,
+                    turn_anchor_id=turn_anchor_id,
+                )
+            except Exception as e:
+                logger.exception(f"[LLM] Tool execution or durable result persistence failed: {e}")
+                if agent_id and _unsaved_usage.total_tokens > 0:
+                    await record_token_usage(agent_id, _unsaved_usage)
+                await client.close()
+                _log_turn_timing("tool_result_persist_error", round_i + 1)
+                return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
             if tool_error:
                 api_messages.append(
                     LLMMessage(
@@ -1325,6 +1453,7 @@ async def call_llm_with_failover(
     is_group: bool = False,
     on_code_output=None,
     current_user_name_override: str | None = None,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -1345,7 +1474,7 @@ async def call_llm_with_failover(
             await on_chunk(text)
 
     async def _wrapped_on_tool_call(data: dict):
-        if data.get("status") == "done":
+        if data.get("status") in {"running", "done"}:
             guard.mark_tool_executed()
         if on_tool_call:
             await on_tool_call(data)
@@ -1368,6 +1497,7 @@ async def call_llm_with_failover(
         is_group=is_group,
         on_code_output=on_code_output,
         current_user_name_override=current_user_name_override,
+        turn_anchor_id=turn_anchor_id,
     )
 
     # Check if we need to failover
@@ -1415,7 +1545,7 @@ async def call_llm_with_failover(
             await on_chunk(text)
 
     async def _fallback_on_tool_call(data: dict):
-        if data.get("status") == "done":
+        if data.get("status") in {"running", "done"}:
             fallback_guard.mark_tool_executed()
         if on_tool_call:
             await on_tool_call(data)
@@ -1437,6 +1567,7 @@ async def call_llm_with_failover(
         is_group=is_group,
         on_code_output=on_code_output,
         current_user_name_override=current_user_name_override,
+        turn_anchor_id=turn_anchor_id,
     )
 
     # Combine error messages if fallback also failed
@@ -1517,6 +1648,7 @@ async def call_agent_llm(
             on_chunk=on_chunk,
             on_thinking=on_thinking,
             supports_vision=supports_vision or getattr(primary_model, "supports_vision", False),
+            turn_anchor_id=None,
         )
         return reply
     except Exception as e:
@@ -1662,6 +1794,7 @@ async def call_agent_llm_with_tools(
                             action=conf_call.action,
                             risk_level=conf_call.risk_level,
                             buttons=conf_call.buttons,
+                            turn_anchor_id=None,
                         )
                         if agent_id and _unsaved_usage.total_tokens > 0:
                             await record_token_usage(agent_id, _unsaved_usage)

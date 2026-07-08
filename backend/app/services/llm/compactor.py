@@ -42,7 +42,6 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 from loguru import logger
 from sqlalchemy import select, update
@@ -794,7 +793,7 @@ async def _load_active_rows(
             ChatMessage.conversation_id == conversation_id,
             ChatMessage.compacted_into.is_(None),
         )
-        .order_by(ChatMessage.created_at.asc())
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
     )
     return list(result.scalars().all())
 

@@ -124,6 +124,21 @@ async def _make_pending(agent_id, user_id, *, conv=None, args=None) -> tuple[str
     return conv, row_id
 
 
+async def _make_turn_anchor(agent_id, user_id, conv: str) -> uuid.UUID:
+    from app.services.chat_history import persist_incoming_user_message
+
+    async with async_session() as db:
+        row = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conv,
+            content="请执行危险操作",
+        )
+        await db.commit()
+        return row.id
+
+
 async def _row_payload(row_id) -> dict:
     async with async_session() as db:
         row = (await db.execute(select(ChatMessage).where(ChatMessage.id == row_id))).scalar_one()
@@ -156,6 +171,266 @@ async def test_resolve_fills_tool_result_and_reenters():
     reenter.assert_awaited_once()
     broadcast.assert_awaited()  # live web card flip
     origin_card.assert_awaited_once()  # origin IM (DingTalk) card kept in sync
+
+
+async def test_confirmation_pending_tool_call_is_the_suspended_state():
+    """A confirmation turn is suspended by the pending tool_call row itself."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    conv = str(uuid.uuid4())
+    anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
+
+    with patch.object(cs, "_broadcast", new=AsyncMock()):
+        row_id = await cs.suspend_for_confirmation(
+            agent_id=agent_id,
+            conversation_id=conv,
+            chat_session_id=None,
+            source_channel="web",
+            user_id=user_id,
+            intro_text=None,
+            title="删库确认",
+            summary="清理历史订单",
+            action=None,
+            risk_level="high",
+            buttons=[{"text": "确认", "value": "confirm"}],
+            turn_anchor_id=anchor_id,
+        )
+
+    payload = await _row_payload(row_id)
+    assert payload["status"] == "pending"
+    assert "turn_anchor_id" not in payload
+
+    with (
+        patch.object(cs, "_reenter_loop", new=AsyncMock()) as reenter,
+        patch.object(cs, "_broadcast", new=AsyncMock()),
+        patch.object(cs, "_update_origin_card", new=AsyncMock()),
+    ):
+        result = await cs.resolve_confirmation(
+            agent_id=agent_id,
+            call_id=row_id,
+            button_value="confirm",
+            button_label="确认",
+            resolving_user_id=user_id,
+        )
+
+    assert result is not None
+    reenter.assert_awaited_once()
+    assert "turn_anchor_id" not in reenter.await_args.kwargs
+
+
+async def test_suspend_confirmation_persists_intro_before_pending_card():
+    """Intro and pending card are persisted in order as ordinary append-only messages."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    conv = str(uuid.uuid4())
+    anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
+
+    with patch.object(cs, "_broadcast", new=AsyncMock()):
+        row_id = await cs.suspend_for_confirmation(
+            agent_id=agent_id,
+            conversation_id=conv,
+            chat_session_id=None,
+            source_channel="web",
+            user_id=user_id,
+            intro_text="需要你确认",
+            title="删库确认",
+            summary="清理历史订单",
+            action=None,
+            risk_level="high",
+            buttons=[{"text": "确认", "value": "confirm"}],
+            turn_anchor_id=anchor_id,
+        )
+
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == conv,
+                    ChatMessage.role.in_(["assistant", "tool_call"]),
+                )
+                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            )
+        ).scalars().all()
+    assert [row.role for row in rows] == ["assistant", "tool_call"]
+    assert rows[0].content == "需要你确认"
+    assert rows[1].id == row_id
+    assert json.loads(rows[1].content)["status"] == "pending"
+
+
+async def test_reenter_loop_marks_turn_completed_after_final_reply(monkeypatch):
+    """After a confirmation click completes normally, the original turn is completed."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    conv = str(uuid.uuid4())
+    anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
+    captured: dict = {}
+
+    async def fake_call_agent_llm(*_args, **kwargs):
+        captured.update(kwargs)
+        return "最终已完成"
+
+    async def fake_run_channel_message(_conversation_id, *, work, **_kwargs):
+        return await work()
+
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_call_agent_llm)
+    monkeypatch.setattr("app.services.channel_dispatch.run_channel_message", fake_run_channel_message)
+    monkeypatch.setattr(cs, "_deliver_reply_to_channel", AsyncMock())
+
+    await cs._reenter_loop(agent_id, conv, user_id, turn_anchor_id=anchor_id)
+
+    assert captured["continue_turn"] is True
+    assert captured["turn_anchor_id"] == anchor_id
+    async with async_session() as db:
+        replies = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == conv,
+                    ChatMessage.role == "assistant",
+                    ChatMessage.content == "最终已完成",
+                )
+            )
+        ).scalars().all()
+    assert len(replies) == 1
+
+
+async def test_reenter_loop_does_not_complete_turn_when_final_persist_fails(monkeypatch):
+    """If the durable final reply write fails, startup recovery must be able to retry."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    conv = str(uuid.uuid4())
+    anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
+
+    async def fake_call_agent_llm(*_args, **_kwargs):
+        return "最终已完成"
+
+    async def fake_run_channel_message(_conversation_id, *, work, **_kwargs):
+        return await work()
+
+    async def fail_finalizer(*_args, **_kwargs):
+        raise RuntimeError("persist failed")
+
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_call_agent_llm)
+    monkeypatch.setattr("app.services.channel_dispatch.run_channel_message", fake_run_channel_message)
+    monkeypatch.setattr("app.services.chat_history.persist_assistant_reply_and_complete_turn", fail_finalizer)
+
+    with pytest.raises(RuntimeError, match="persist failed"):
+        await cs._reenter_loop(agent_id, conv, user_id, turn_anchor_id=anchor_id)
+
+    async with async_session() as db:
+        replies = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == conv,
+                    ChatMessage.role == "assistant",
+                    ChatMessage.content == "最终已完成",
+                )
+            )
+        ).scalars().all()
+    assert replies == []
+
+
+async def test_call_llm_confirmation_tool_suspends_turn_anchor(monkeypatch):
+    """The unified LLM caller must attach the active turn anchor to request_confirmation."""
+    from app.services import confirmation_service as cs
+    from app.services.llm.caller import call_llm
+    from app.services.llm.client import LLMResponse
+
+    class FakeClient:
+        async def stream(self, **_kwargs):
+            return LLMResponse(
+                content="需要你确认",
+                tool_calls=[
+                    {
+                        "id": "confirm-1",
+                        "type": "function",
+                        "function": {
+                            "name": "request_confirmation",
+                            "arguments": json.dumps(
+                                {
+                                    "title": "删库确认",
+                                    "summary": "清理历史订单",
+                                    "risk_level": "high",
+                                    "buttons": [{"text": "确认", "value": "confirm"}],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+                finish_reason="tool_calls",
+            )
+
+        async def close(self):
+            pass
+
+    class FakeModel:
+        provider = "qwen"
+        model = "qwen-turbo"
+        base_url = "https://example.invalid"
+        api_key_encrypted = ""
+        temperature = 0.7
+        max_output_tokens = None
+        request_timeout = 30.0
+        id = "model-x"
+        supports_vision = False
+
+    agent_id, user_id = await _make_agent()
+    conv = str(uuid.uuid4())
+    anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
+
+    monkeypatch.setattr("app.services.llm.caller.create_llm_client", lambda **_kwargs: FakeClient())
+    monkeypatch.setattr("app.services.llm.caller.get_max_tokens", lambda *_args, **_kwargs: 1024)
+    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda _model: "fake-key")
+    monkeypatch.setattr("app.services.llm.caller._get_agent_config", AsyncMock(return_value=(50, None)))
+    monkeypatch.setattr("app.services.llm.caller._get_user_name", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "app.services.agent_context.build_agent_context",
+        AsyncMock(return_value=("STATIC", "DYN")),
+    )
+    monkeypatch.setattr(
+        "app.services.llm.caller.get_agent_tools_for_llm",
+        AsyncMock(
+            return_value=[
+                {
+                    "type": "function",
+                    "function": {"name": "request_confirmation", "description": "ask for confirmation"},
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr("app.services.llm.caller.record_token_usage", AsyncMock(return_value=None))
+    monkeypatch.setattr(cs, "_broadcast", AsyncMock())
+
+    result = await call_llm(
+        model=FakeModel(),
+        messages=[{"role": "user", "content": "请执行危险操作"}],
+        agent_name="Agent",
+        role_description="",
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=conv,
+        turn_anchor_id=anchor_id,
+    )
+
+    assert result == ""
+    async with async_session() as db:
+        pending = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == conv,
+                    ChatMessage.role == "tool_call",
+                )
+            )
+        ).scalar_one()
+
+    payload = json.loads(pending.content)
+    assert payload["name"] == "request_confirmation"
+    assert payload["status"] == "pending"
+    assert "turn_anchor_id" not in payload
 
 
 async def test_resolve_idempotent_on_already_done():

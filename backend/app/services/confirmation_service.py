@@ -130,6 +130,7 @@ async def suspend_for_confirmation(
     action: dict | None,
     risk_level: str,
     buttons: list | None = None,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Suspend the turn on a request_confirmation tool_call and return the row id.
 
@@ -138,7 +139,7 @@ async def suspend_for_confirmation(
     ends the turn (returns ""); the loop resumes later in resolve_confirmation.
     """
     from app.models.audit import ChatMessage
-    from app.services.chat_history import persist_pending_confirmation
+    from app.services.chat_history import persist_pending_confirmation_row
 
     args = _build_card_args(title, summary, action, risk_level, buttons)
     resolved_channel, ext_conv_id, is_group = await _resolve_session_channel(
@@ -146,10 +147,12 @@ async def suspend_for_confirmation(
     )
 
     # Intro text first (live web already streamed it; persisted here so it precedes the
-    # card on reload). Separate commit → strictly earlier timestamp than the tool_call row.
+    # card on reload). The pending tool_call row is the durable suspended state;
+    # startup recovery sees it and leaves the turn waiting for the user's click.
     has_intro = bool(intro_text and intro_text.strip())
-    if has_intro:
-        async with async_session() as db:
+    created_at = datetime.now(timezone.utc)
+    async with async_session() as db:
+        if has_intro:
             db.add(
                 ChatMessage(
                     agent_id=agent_id,
@@ -157,18 +160,20 @@ async def suspend_for_confirmation(
                     role="assistant",
                     content=intro_text,
                     conversation_id=str(conversation_id),
+                    created_at=created_at,
                 )
             )
-            await db.commit()
-
-    row_id = await persist_pending_confirmation(
-        async_session,
-        agent_id=agent_id,
-        user_id=user_id,
-        conversation_id=str(conversation_id),
-        name=REQUEST_CONFIRMATION_TOOL_NAME,
-        args=args,
-    )
+        row_id = await persist_pending_confirmation_row(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=str(conversation_id),
+            name=REQUEST_CONFIRMATION_TOOL_NAME,
+            args=args,
+            turn_anchor_id=turn_anchor_id,
+            created_at=created_at + timedelta(microseconds=1) if has_intro else None,
+        )
+        await db.commit()
 
     # ALWAYS mirror the card to live web viewers — the card IS a tool_call, so broadcast it
     # as one regardless of origin channel (a web viewer watching a DingTalk session sees it
@@ -291,7 +296,11 @@ async def resolve_confirmation(
 
 
 async def _reenter_loop(
-    agent_id: uuid.UUID, conversation_id: str, resolving_user_id: uuid.UUID
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    resolving_user_id: uuid.UUID,
+    *,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> None:
     """Resume the agent's LLM loop from existing history (which now ends with the filled
     request_confirmation tool result) WITHOUT injecting a user message. Per-session lock via
@@ -299,7 +308,11 @@ async def _reenter_loop(
     from app.models.agent import Agent as AgentModel, DEFAULT_CONTEXT_WINDOW_SIZE
     from app.services.channel_dispatch import ChannelReactions, run_channel_message
     from app.services.channel_llm import _call_agent_llm
-    from app.services.chat_history import load_history_for_llm, persist_assistant_reply
+    from app.services.chat_history import (
+        load_history_for_llm,
+        persist_assistant_reply,
+        persist_assistant_reply_and_complete_turn,
+    )
 
     async def _work() -> str:
         async with async_session() as db:
@@ -319,17 +332,28 @@ async def _reenter_loop(
                 history=history,
                 recovery_hint=None,
                 continue_turn=True,
+                turn_anchor_id=turn_anchor_id,
             )
         # An empty reply means the agent suspended AGAIN (chained confirmation) and the new
         # suspend already persisted/delivered everything — nothing to add here.
         if reply and reply.strip():
-            await persist_assistant_reply(
-                async_session,
-                agent_id=agent_id,
-                user_id=resolving_user_id,
-                conversation_id=conversation_id,
-                content=reply,
-            )
+            if turn_anchor_id is not None:
+                await persist_assistant_reply_and_complete_turn(
+                    async_session,
+                    agent_id=agent_id,
+                    user_id=resolving_user_id,
+                    conversation_id=conversation_id,
+                    content=reply,
+                    turn_anchor_id=turn_anchor_id,
+                )
+            else:
+                await persist_assistant_reply(
+                    async_session,
+                    agent_id=agent_id,
+                    user_id=resolving_user_id,
+                    conversation_id=conversation_id,
+                    content=reply,
+                )
             await _deliver_reply_to_channel(agent_id, conversation_id, reply)
         return reply
 

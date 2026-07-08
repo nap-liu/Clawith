@@ -20,8 +20,8 @@ class _AsyncSessionCtx:
         return False
 
 
-async def test_completed_websocket_tool_call_uses_single_canonical_writer(monkeypatch):
-    """A completed WS tool call must create exactly one replayable history row.
+async def test_websocket_tool_call_uses_single_canonical_writer(monkeypatch):
+    """A WS tool call marker must create exactly one canonical history row.
 
     The canonical writer is ``persist_tool_call``. Calling the legacy
     ``save_tool_call_log`` as well writes a second ``role='tool_call'`` row for
@@ -58,7 +58,7 @@ async def test_completed_websocket_tool_call_uses_single_canonical_writer(monkey
         "reasoning_content": "need file",
     }
 
-    await handler._save_completed_tool_call_to_db(evt)
+    await handler._save_tool_call_to_db(evt)
 
     persist_tool_call.assert_awaited_once()
     _, kwargs = persist_tool_call.await_args
@@ -67,6 +67,7 @@ async def test_completed_websocket_tool_call_uses_single_canonical_writer(monkey
         "user_id": user_id,
         "conversation_id": conversation_id,
         "evt": evt,
+        "turn_anchor_id": None,
     }
     save_tool_call_log.assert_not_awaited()
     maybe_mark_read.assert_awaited_once()

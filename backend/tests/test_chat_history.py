@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 from unittest.mock import patch
 
 # Import the full model graph so FK references resolve at table-mapping time.
@@ -173,6 +173,171 @@ async def test_load_history_p2p_unchanged():
     assert len(user_msgs) == 2
     for m in user_msgs:
         assert not m["content"].startswith("<sender ")
+
+
+async def test_persist_incoming_user_message_persists_plain_user_row():
+    """Incoming user persistence is plain append-only history, with no explicit turn marker."""
+    from app.services.chat_history import persist_incoming_user_message
+
+    agent_id = uuid.uuid4()
+    u_alice, _u_bob = await _seed_two_users()
+    conv_id = f"resume_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        await db.execute(text("SET session_replication_role = replica"))
+        row = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=u_alice.id,
+            conversation_id=conv_id,
+            content="帮我查一下数据",
+        )
+        await db.commit()
+        await db.execute(text("SET session_replication_role = DEFAULT"))
+        await db.commit()
+
+    async with async_session() as db:
+        saved = (await db.execute(select(ChatMessage).where(ChatMessage.id == row.id))).scalar_one()
+
+    assert saved.role == "user"
+    assert saved.content == "帮我查一下数据"
+    assert not hasattr(saved, "turn_status")
+    assert not hasattr(saved, "turn_context")
+
+
+async def test_completed_turn_is_represented_by_appended_assistant_row():
+    """A turn is complete when an assistant reply is appended after the user row."""
+    from app.services.chat_history import persist_assistant_reply_row, persist_incoming_user_message
+
+    agent_id = uuid.uuid4()
+    u_alice, _u_bob = await _seed_two_users()
+    conv_id = f"resume_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        await db.execute(text("SET session_replication_role = replica"))
+        await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=u_alice.id,
+            conversation_id=conv_id,
+            content="hi",
+        )
+        await db.commit()
+        await db.execute(text("SET session_replication_role = DEFAULT"))
+        await db.commit()
+
+    async with async_session() as db:
+        await db.execute(text("SET session_replication_role = replica"))
+        await persist_assistant_reply_row(
+            db,
+            agent_id=agent_id,
+            user_id=u_alice.id,
+            conversation_id=conv_id,
+            content="hello",
+        )
+        await db.commit()
+        await db.execute(text("SET session_replication_role = DEFAULT"))
+        await db.commit()
+
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == conv_id)
+                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            )
+        ).scalars().all()
+
+    assert [saved.role for saved in rows] == ["user", "assistant"]
+    assert [saved.content for saved in rows] == ["hi", "hello"]
+
+
+async def test_recoverable_history_preserves_processing_user_tail_that_normal_loader_trims():
+    """Startup recovery needs the interrupted user tail that normal replay trims."""
+    from app.services.chat_history import load_recoverable_history_for_turn
+
+    agent_id = uuid.uuid4()
+    u_alice, _u_bob = await _seed_two_users()
+    conv_id = f"resume_{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    anchor_id = uuid.uuid4()
+    await _insert_messages_bypass_fk(
+        [
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "user_id": u_alice.id,
+                "role": "user",
+                "content": "old question",
+                "conversation_id": conv_id,
+                "created_at": now - timedelta(minutes=3),
+            },
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "user_id": u_alice.id,
+                "role": "assistant",
+                "content": "old answer",
+                "conversation_id": conv_id,
+                "created_at": now - timedelta(minutes=2),
+            },
+            {
+                "id": anchor_id,
+                "agent_id": agent_id,
+                "user_id": u_alice.id,
+                "role": "user",
+                "content": "interrupted question",
+                "conversation_id": conv_id,
+                "created_at": now - timedelta(minutes=1),
+            },
+        ]
+    )
+
+    async with async_session() as db:
+        normal = await load_history_for_llm(db, agent_id=agent_id, conversation_id=conv_id, ctx_size=20)
+        recoverable = await load_recoverable_history_for_turn(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv_id,
+            turn_anchor_id=anchor_id,
+            ctx_size=1,
+        )
+
+    assert [m["content"] for m in normal] == ["old question", "old answer"]
+    assert [m["content"] for m in recoverable] == ["old answer", "interrupted question"]
+
+
+async def test_recoverable_history_skips_when_anchor_is_not_active():
+    """Recovery must not guess from a normal tail if the anchor row is unavailable."""
+    from app.services.chat_history import load_recoverable_history_for_turn
+
+    agent_id = uuid.uuid4()
+    u_alice, _u_bob = await _seed_two_users()
+    conv_id = f"resume_{uuid.uuid4().hex[:8]}"
+    await _insert_messages_bypass_fk(
+        [
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "user_id": u_alice.id,
+                "role": "user",
+                "content": "old question",
+                "conversation_id": conv_id,
+                "created_at": datetime.now(timezone.utc),
+            },
+        ]
+    )
+
+    async with async_session() as db:
+        recoverable = await load_recoverable_history_for_turn(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv_id,
+            turn_anchor_id=uuid.uuid4(),
+            ctx_size=20,
+        )
+
+    assert recoverable == []
 
 
 async def test_load_history_group_wraps_user_messages():
@@ -459,22 +624,37 @@ async def test_persist_assistant_reply_skips_empty_content():
     assert history == []
 
 
-async def test_persist_tool_call_running_status_is_not_stored():
-    """Only completed (done) tool calls are persisted; running is a no-op."""
+async def test_persist_tool_call_running_status_is_durable_but_not_replayed_to_llm():
+    """Running tool calls are durable recovery markers, not LLM replay context."""
     from app.services.chat_history import persist_tool_call
 
     agent_id = uuid.uuid4()
     conv_id = f"test_persist_run_{uuid.uuid4().hex[:8]}"
+    call_id = "call_running_1"
     await persist_tool_call(
         _fk_bypass_session,
         agent_id=agent_id,
         user_id=uuid.uuid4(),
         conversation_id=conv_id,
-        evt={"name": "x", "args": {}, "status": "running"},
+        evt={"name": "read_file", "call_id": call_id, "args": {"path": "a.txt"}, "status": "running"},
     )
     async with async_session() as db:
         history = await load_history_for_llm(db, agent_id=agent_id, conversation_id=conv_id, ctx_size=50)
+        rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.agent_id == agent_id,
+                    ChatMessage.conversation_id == conv_id,
+                    ChatMessage.role == "tool_call",
+                )
+            )
+        ).scalars().all()
     assert history == []
+    assert len(rows) == 1
+    payload = json.loads(rows[0].content)
+    assert payload["status"] == "running"
+    assert payload["call_id"] == call_id
+    assert payload["args"] == {"path": "a.txt"}
 
 
 async def test_assistant_reply_stamped_after_tool_calls():

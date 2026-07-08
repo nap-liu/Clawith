@@ -71,7 +71,12 @@ def _log_bwrap_startup_status() -> None:
 
 async def _start_ss_local() -> None:
     """Start ss-local SOCKS5 proxy for Discord API calls. Tries nodes in priority order."""
-    import asyncio, json, os, shutil, tempfile
+    import asyncio
+    import json
+    import os
+    import shutil
+    import tempfile
+
     if not shutil.which("ss-local"):
         logger.info("[Proxy] ss-local not found — Discord proxy disabled")
         return
@@ -101,7 +106,8 @@ async def _start_ss_local() -> None:
         cfg = {"server": node["server"], "server_port": node["port"], "local_address": "127.0.0.1",
                "local_port": 1080, "password": node["password"], "method": node["method"], "timeout": 10}
         tf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-        json.dump(cfg, tf); tf.close()
+        json.dump(cfg, tf)
+        tf.close()
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ss-local", "-c", tf.name,
@@ -135,7 +141,6 @@ async def lifespan(app: FastAPI):
         )
 
     import asyncio
-    import sys
     import os
     from app.services.trigger_daemon import start_trigger_daemon
     from app.services.tool_seeder import seed_builtin_tools
@@ -193,7 +198,7 @@ async def lifespan(app: FastAPI):
         try:
             from app.models.tenant import Tenant
             from app.database import async_session as _session
-            from sqlalchemy import select as _select, update as _update
+            from sqlalchemy import select as _select
             async with _session() as _db:
                 _existing = await _db.execute(_select(Tenant).where(Tenant.slug == "default"))
                 if not _existing.scalar_one_or_none():
@@ -285,6 +290,19 @@ async def lifespan(app: FastAPI):
         logger.info("[startup] starting background tasks...")
         from app.services.audit_logger import write_audit_log
         await write_audit_log("server_startup", {"pid": os.getpid()})
+
+        if os.environ.get("TURN_RECOVERY_ENABLED", "true").lower() not in {"0", "false", "no", "off"}:
+            try:
+                from app.services.turn_recovery import startup_turn_resume_once
+
+                recovery_stats = await startup_turn_resume_once()
+                logger.info(f"[startup] turn recovery complete: {recovery_stats}")
+            except Exception as e:
+                logger.error(f"[startup] turn recovery failed: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            logger.info("[startup] turn recovery disabled (TURN_RECOVERY_ENABLED is not enabled)")
 
         def _bg_task_error(t):
             """Callback to surface background task exceptions."""
@@ -509,7 +527,7 @@ async def health_check():
 # ── Version endpoint (public, no auth required) ──
 def _load_version_info() -> dict[str, str]:
     """Read version + commit hash once at startup."""
-    import os, subprocess
+    import subprocess
     version = "unknown"
     for candidate in ["../frontend/VERSION", "frontend/VERSION", "VERSION"]:
         try:

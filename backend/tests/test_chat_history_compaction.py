@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,9 +28,30 @@ from app.services.chat_history import (
     load_history_for_llm,
     load_messages_for_session,
 )
+from app.services.llm.compactor import select_compaction_span
 
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_compaction_span_preserves_recent_turns_by_message_boundary():
+    """Auto-compaction relies on user/assistant message boundaries, not explicit turn markers."""
+    rows = [
+        SimpleNamespace(role="user"),
+        SimpleNamespace(role="assistant"),
+        SimpleNamespace(role="user"),
+        SimpleNamespace(role="assistant"),
+        SimpleNamespace(role="user"),
+        SimpleNamespace(role="assistant"),
+        SimpleNamespace(role="user"),
+        SimpleNamespace(role="tool_call"),
+        SimpleNamespace(role="user"),
+        SimpleNamespace(role="assistant"),
+        SimpleNamespace(role="user"),
+        SimpleNamespace(role="assistant"),
+    ]
+
+    assert select_compaction_span(rows, keep_recent_turns=1) == (0, 9)
 
 
 @pytest.fixture(autouse=True)
