@@ -680,6 +680,39 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "start_dingtalk_channel_provisioning",
+        "display_name": "配置钉钉数字员工",
+        "description": "为当前数字员工发起钉钉机器人通道自动配置。仅在用户明确要求配置钉钉机器人、钉钉消息通道或授权钉钉应用时调用。工具会返回一个钉钉授权链接；用户打开链接完成授权后，平台会自动轮询授权结果并配置好钉钉通道。不要把它用于发送普通消息。",
+        "category": "communication",
+        "icon": "link",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "restart_existing": {"type": "boolean", "description": "如果已经存在未完成的授权流程，是否重新生成授权链接。默认 true。"},
+            },
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "get_dingtalk_channel_provisioning_status",
+        "display_name": "查询钉钉配置状态",
+        "description": "查询当前数字员工钉钉机器人通道自动配置流程的状态。当用户询问钉钉授权是否完成、链接是否过期、或配置是否已经生效时调用。",
+        "category": "communication",
+        "icon": "clock",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "provisioning_id": {"type": "string", "description": "start_dingtalk_channel_provisioning 返回的配置编号。"},
+            },
+            "required": ["provisioning_id"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "send_file_to_agent",
         "display_name": "Agent File Transfer",
         "description": "Send a workspace file to another digital employee. The file is copied to the target agent's workspace/inbox/files/ and an inbox note is created.",

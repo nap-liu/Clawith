@@ -131,6 +131,15 @@ class Settings(BaseSettings):
     PUBLIC_BASE_URL: str = ""
     HTTP_PROXY: str = ""
 
+    # DingTalk automatic channel provisioning
+    DINGTALK_REGISTRATION_SOURCE: str = "openClaw"
+    DINGTALK_REGISTRATION_BASE_URL: str = "https://oapi.dingtalk.com"
+    DINGTALK_PROVISIONING_MAX_TTL_SECONDS: int = 30 * 60
+    DINGTALK_PROVISIONING_MIN_INTERVAL_SECONDS: int = 2
+    DINGTALK_PROVISIONING_MAX_INTERVAL_SECONDS: int = 15
+    DINGTALK_PROVISIONING_MAX_ATTEMPTS: int = 180
+    DINGTALK_PROVISIONING_POLL_BATCH_SIZE: int = 20
+
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 

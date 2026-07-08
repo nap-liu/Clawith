@@ -793,6 +793,46 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "start_dingtalk_channel_provisioning",
+            "description": (
+                "为当前数字员工发起钉钉机器人通道自动配置。仅在用户明确要求配置钉钉机器人、"
+                "钉钉消息通道或授权钉钉应用时调用。工具会返回一个钉钉授权链接；用户打开链接完成授权后，"
+                "平台会自动轮询授权结果并配置好钉钉通道。不要把它用于发送普通消息。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restart_existing": {
+                        "type": "boolean",
+                        "description": "如果已经存在未完成的授权流程，是否重新生成授权链接。默认 true。",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_dingtalk_channel_provisioning_status",
+            "description": (
+                "查询当前数字员工钉钉机器人通道自动配置流程的状态。"
+                "当用户询问钉钉授权是否完成、链接是否过期、或配置是否已经生效时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "provisioning_id": {
+                        "type": "string",
+                        "description": "start_dingtalk_channel_provisioning 返回的配置编号。",
+                    },
+                },
+                "required": ["provisioning_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "send_message_to_agent",
             "description": "Send a message to a digital employee colleague. The recipient is another AI agent, not a human. Refer to the 'Relationships' section in your system prompt for available digital employees.\n\nDECISION GUIDE for msg_type:\nAsk yourself: does the target agent need to DO WORK (analyze, research, summarize, write, compare, plan, etc.) and RETURN RESULTS to you or the user?\n\n- If YES, the target needs to do work → use task_delegate. Examples: 'summarize X', 'analyze Y', 'check Z', 'prepare a report', 'review and give feedback', 'find out X', 'confirm with X and report back'. The target works asynchronously and you will be woken when they finish.\n\n- If the target just needs to KNOW something → use notify. Examples: 'meeting cancelled', 'I updated the doc', 'heads up about X', 'FYI'. No reply expected.\n\n- If you need a quick factual answer right now → use consult. Examples: 'what is X?', 'do you know Y?'. Synchronous, blocks until reply.\n\nWhen in doubt between notify and task_delegate, prefer task_delegate — it is safer because it guarantees the user gets a result.",
             "parameters": {
@@ -3343,6 +3383,10 @@ async def execute_tool(
             result = await _send_platform_message(agent_id, arguments)
         elif tool_name == "send_channel_message":
             result = await _send_channel_message(agent_id, arguments)
+        elif tool_name == "start_dingtalk_channel_provisioning":
+            result = await _start_dingtalk_channel_provisioning_tool(agent_id, user_id, arguments)
+        elif tool_name == "get_dingtalk_channel_provisioning_status":
+            result = await _get_dingtalk_channel_provisioning_status_tool(agent_id, user_id, arguments)
         elif tool_name == "send_message_to_agent":
             result = await _send_message_to_agent(
                 agent_id,
@@ -6596,6 +6640,105 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                 return f"❌ 飞书发送失败：{user_id_err.user_message}"
     except Exception as e:
         return f"❌ Message send error: {str(e)[:200]}"
+
+
+def _parse_uuid(value) -> uuid.UUID | None:
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except Exception:
+        return None
+
+
+async def _start_dingtalk_channel_provisioning_tool(
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    args: dict,
+) -> str:
+    """Start DingTalk robot provisioning for the current digital employee."""
+    if not user_id:
+        return "❌ 需要登录用户上下文才能为数字员工配置钉钉通道。请在用户会话中重新发起。"
+
+    from app.core.permissions import user_can_manage_agent_id
+    from app.models.agent import Agent as AgentModel
+    from app.services.dingtalk_provisioning import start_dingtalk_channel_provisioning
+
+    async with async_session() as db:
+        result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+        agent = result.scalar_one_or_none()
+        if not agent:
+            return "❌ 未找到要配置钉钉通道的数字员工。"
+        if not await user_can_manage_agent_id(db, user_id, agent):
+            return "❌ 只有数字员工创建者或管理员可以发起钉钉机器人授权配置。"
+
+        response = await start_dingtalk_channel_provisioning(
+            db,
+            agent=agent,
+            requested_by_user_id=user_id,
+        )
+        await db.commit()
+
+    return (
+        "已创建钉钉数字员工机器人授权流程。\n"
+        f"授权链接: {response['authorization_url']}\n"
+        f"配置编号: {response['provisioning_id']}\n"
+        f"有效期至: {response['expires_at']}\n"
+        "用户完成授权后，平台会自动配置钉钉通道，并在钉钉中发送配置完成通知，无需手动回复确认。"
+    )
+
+
+async def _get_dingtalk_channel_provisioning_status_tool(
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    args: dict,
+) -> str:
+    """Return DingTalk robot provisioning status for the current digital employee."""
+    if not user_id:
+        return "❌ 需要登录用户上下文才能查询数字员工钉钉通道配置状态。"
+
+    provisioning_id = _parse_uuid((args or {}).get("provisioning_id"))
+    if not provisioning_id:
+        return "❌ 缺少有效的配置编号 provisioning_id。"
+
+    from app.core.permissions import user_can_manage_agent_id
+    from app.models.agent import Agent as AgentModel
+    from app.models.dingtalk_provisioning import DingTalkChannelProvisioningSession
+    from app.services.dingtalk_provisioning import get_dingtalk_provisioning_status_response
+
+    async with async_session() as db:
+        agent_result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+        agent = agent_result.scalar_one_or_none()
+        if not agent:
+            return "❌ 未找到要查询的数字员工。"
+        if not await user_can_manage_agent_id(db, user_id, agent):
+            return "❌ 只有数字员工创建者或管理员可以查询钉钉机器人授权配置状态。"
+
+        session_result = await db.execute(
+            select(DingTalkChannelProvisioningSession).where(
+                DingTalkChannelProvisioningSession.id == provisioning_id,
+                DingTalkChannelProvisioningSession.agent_id == agent_id,
+            )
+        )
+        session = session_result.scalar_one_or_none()
+        if not session:
+            return "❌ 未找到该钉钉数字员工通道配置流程。"
+
+        response = get_dingtalk_provisioning_status_response(session)
+
+    lines = [
+        "钉钉数字员工通道配置状态:",
+        f"状态: {response['status']}",
+        f"配置编号: {response['provisioning_id']}",
+        f"有效期至: {response['expires_at']}",
+    ]
+    if response.get("authorization_url") and response["status"] in {"waiting_for_authorization", "polling"}:
+        lines.append(f"授权链接: {response['authorization_url']}")
+    if response.get("message"):
+        lines.append(response["message"])
+    if response.get("last_error"):
+        lines.append(f"错误: {response['last_error']}")
+    return "\n".join(lines)
 
 
 async def _send_channel_message(agent_id: uuid.UUID, args: dict) -> str:

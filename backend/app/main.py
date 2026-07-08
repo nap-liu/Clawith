@@ -142,6 +142,7 @@ async def lifespan(app: FastAPI):
     from app.services.template_seeder import seed_agent_templates
     from app.services.feishu_ws import feishu_ws_manager
     from app.services.dingtalk_stream import dingtalk_stream_manager
+    from app.services.dingtalk_provisioning import dingtalk_provisioning_poller
     from app.services.wecom_stream import wecom_stream_manager
     from app.services.wechat_channel import wechat_poll_manager
     from app.services.discord_gateway import discord_gateway_manager
@@ -159,6 +160,7 @@ async def lifespan(app: FastAPI):
             import app.models.audit          # noqa
             import app.models.skill          # noqa
             import app.models.channel_config  # noqa
+            import app.models.dingtalk_provisioning  # noqa
             import app.models.schedule       # noqa
             import app.models.plaza          # noqa
             import app.models.activity_log   # noqa
@@ -308,6 +310,7 @@ async def lifespan(app: FastAPI):
             task_specs.extend([
                 ("feishu_ws", feishu_ws_manager.start_all()),
                 ("dingtalk_stream", dingtalk_stream_manager.start_all()),
+                ("dingtalk_provisioning", dingtalk_provisioning_poller.start_all()),
                 ("wecom_stream", wecom_stream_manager.start_all()),
                 ("wechat_poll", wechat_poll_manager.start_all()),
                 ("discord_gw", discord_gateway_manager.start_all()),
@@ -405,6 +408,7 @@ from app.api.chat_sessions import router as chat_sessions_router
 from app.api.slack import router as slack_router
 from app.api.discord_bot import router as discord_router
 from app.api.dingtalk import router as dingtalk_router
+from app.api.dingtalk_provisioning import router as dingtalk_provisioning_router
 from app.api.google_workspace import router as google_workspace_router
 from app.api.wecom import router as wecom_router
 from app.api.wechat import router as wechat_router
@@ -463,6 +467,7 @@ app.include_router(users_router, prefix=settings.API_PREFIX)
 app.include_router(slack_router, prefix=settings.API_PREFIX)
 app.include_router(discord_router, prefix=settings.API_PREFIX)
 app.include_router(dingtalk_router, prefix=settings.API_PREFIX)
+app.include_router(dingtalk_provisioning_router, prefix=settings.API_PREFIX)
 app.include_router(google_workspace_router, prefix=settings.API_PREFIX)
 app.include_router(wecom_router, prefix=settings.API_PREFIX)
 app.include_router(wechat_router, prefix=settings.API_PREFIX)
