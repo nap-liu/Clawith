@@ -583,7 +583,12 @@ class WebSocketChatHandler:
             self.conversation.append({"role": "user", "content": content})
 
             # Save user message to DB
-            await self._save_user_message(content, display_content, file_name, is_onboarding_trigger)
+            turn_anchor_id = await self._save_user_message(
+                content,
+                display_content,
+                file_name,
+                is_onboarding_trigger,
+            )
 
             # OpenClaw routing check
             if self.agent_type == "openclaw":
@@ -600,8 +605,10 @@ class WebSocketChatHandler:
             # Invoke LLM and stream response
             self.client_disconnected = False
             if effective_llm_model:
-                assistant_response, thinking_content, queued_messages = await self._run_llm_and_stream(
-                    effective_llm_model, is_onboarding_trigger
+                assistant_response, thinking_content, _queued_messages = await self._run_llm_and_stream(
+                    effective_llm_model,
+                    is_onboarding_trigger,
+                    turn_anchor_id=turn_anchor_id,
                 )
             else:
                 assistant_response = (
@@ -609,7 +616,17 @@ class WebSocketChatHandler:
                     "Please select a model in the agent's Settings tab."
                 )
                 thinking_content = []
-                queued_messages = []
+                _queued_messages = []
+
+            # request_confirmation suspends the turn inside the unified LLM caller
+            # and persists the intro/card rows there. Keep the turn anchor suspended:
+            # do not add an empty assistant row and do not mark the anchor completed.
+            if assistant_response == "":
+                await self._safe_send({"type": "done", "role": "assistant", "content": ""})
+                if self.client_disconnected:
+                    await manager.disconnect(str(self.agent_id), self.websocket)
+                    break
+                continue
 
             # If task creation detected, create a real Task record
             if task_match:
@@ -619,7 +636,7 @@ class WebSocketChatHandler:
             self.conversation.append({"role": "assistant", "content": assistant_response})
 
             # Save assistant reply
-            await self._save_assistant_reply(assistant_response, thinking_content)
+            await self._save_assistant_reply(assistant_response, thinking_content, turn_anchor_id=turn_anchor_id)
 
             # Final 'done' packet — best-effort broadcast; a client that dropped
             # mid-turn gets the reply via history replay on reconnect instead.
@@ -710,7 +727,13 @@ class WebSocketChatHandler:
             await self.websocket.send_json({"type": "done", "role": "assistant", "content": f"⚠️ {ae.message}"})
             return False
 
-    async def _save_user_message(self, content: str, display_content: str, file_name: str, is_onboarding_trigger: bool):
+    async def _save_user_message(
+        self,
+        content: str,
+        display_content: str,
+        file_name: str,
+        is_onboarding_trigger: bool,
+    ) -> uuid.UUID | None:
         """Saves user message to the database and updates session title/time."""
         has_image_marker = "[image_data:" in content
         if has_image_marker:
@@ -728,16 +751,18 @@ class WebSocketChatHandler:
                 if _s and _s.title.startswith("Session "):
                     _s.title = "Onboarding"
                     await _sdb.commit()
+            return None
         else:
+            from app.services.chat_history import persist_incoming_user_message
+
             async with async_session() as db:
-                user_msg = ChatMessage(
+                user_msg = await persist_incoming_user_message(
+                    db,
                     agent_id=self.agent_id,
                     user_id=self.user.id,
-                    role="user",
                     content=saved_content,
                     conversation_id=self.conv_id,
                 )
-                db.add(user_msg)
                 # Update session
                 _now = datetime.now(tz.utc)
                 _sess_r = await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(self.conv_id)))
@@ -754,6 +779,7 @@ class WebSocketChatHandler:
                         _sess.title = clean_title[:40] if clean_title else content[:40]
                 await db.commit()
             logger.info("[WS] User message saved")
+            return user_msg.id
 
     async def _route_openclaw(self, content: str):
         """Enqueues message for OpenClaw edge node poll."""
@@ -779,7 +805,11 @@ class WebSocketChatHandler:
         )
 
     async def _run_llm_and_stream(
-        self, effective_llm_model: LLMModel, is_onboarding_trigger: bool
+        self,
+        effective_llm_model: LLMModel,
+        is_onboarding_trigger: bool,
+        *,
+        turn_anchor_id: uuid.UUID | None = None,
     ) -> tuple[str, list[str], list[dict]]:
         """Calls the LLM and streams response chunks to WebSocket."""
         start_gen = perf_counter()
@@ -824,21 +854,26 @@ class WebSocketChatHandler:
 
             async def tool_call_to_ws(data: dict):
                 """Send tool call info to client and persist completed ones."""
-                if data.get("status") in {"running", "done"}:
+                public_data = {k: v for k, v in data.items() if not k.startswith("_")}
+                if public_data.get("status") in {"running", "done"}:
                     await maybe_mark_onboarding_progress()
-                if data.get("status") == "done":
+                if public_data.get("status") == "done":
                     # Inject Live Preview & Workspace Activities
-                    await self._inject_live_preview_and_workspace_metadata(data)
+                    await self._inject_live_preview_and_workspace_metadata(public_data)
 
                 # Output boundary: mask secrets for the client. `data` stays raw
                 # below so persist_tool_call stores the real args (the LLM replays
                 # them — masking storage poisons the model).
-                _ws_data = {**data, "args": sanitize_tool_args(data.get("args"))} if "args" in data else data
+                _ws_data = (
+                    {**public_data, "args": sanitize_tool_args(public_data.get("args"))}
+                    if "args" in public_data
+                    else public_data
+                )
                 await self._safe_send({"type": "tool_call", **_ws_data})
 
-                # Save completed tool calls to DB so they persist in chat history
-                if data.get("status") == "done":
-                    await self._save_completed_tool_call_to_db(data)
+                # Save tool-call markers to DB before execution and after completion.
+                if public_data.get("status") in {"running", "done"} and not data.get("_durable_persisted"):
+                    await self._save_tool_call_to_db(public_data, turn_anchor_id=turn_anchor_id)
 
             # Track thinking content for storage
             thinking_content = []
@@ -1010,6 +1045,7 @@ class WebSocketChatHandler:
                     skip_tools=skip_tools_for_greeting,
                     on_code_output=code_output_to_ws,
                     channel_context=self._channel_context(),
+                    turn_anchor_id=turn_anchor_id,
                 )
 
             llm_task = asyncio.create_task(_call_with_failover())
@@ -1108,8 +1144,8 @@ class WebSocketChatHandler:
             }
             logger.info(f"[WS][Workspace] activity: {_done_tool_name} → {_ws_path}")
 
-    async def _save_completed_tool_call_to_db(self, data: dict):
-        """Persist completed tool calls via the shared writer — the SAME canonical
+    async def _save_tool_call_to_db(self, data: dict, *, turn_anchor_id: uuid.UUID | None = None):
+        """Persist tool-call markers via the shared writer — the SAME canonical
         schema every IM channel uses (single source of truth: args stored RAW for
         LLM replay, masked only at output boundaries). Then mark the session read
         (web-only)."""
@@ -1121,6 +1157,7 @@ class WebSocketChatHandler:
             user_id=self.user.id,
             conversation_id=self.conv_id,
             evt=data,
+            turn_anchor_id=turn_anchor_id,
         )
         try:
             async with async_session() as _tc_db:
@@ -1187,7 +1224,13 @@ class WebSocketChatHandler:
             logger.error(f"[WS] Task creation failed: {te}")
         return assistant_response
 
-    async def _save_assistant_reply(self, assistant_response: str, thinking_content: list[str]):
+    async def _save_assistant_reply(
+        self,
+        assistant_response: str,
+        thinking_content: list[str],
+        *,
+        turn_anchor_id: uuid.UUID | None = None,
+    ):
         """Saves assistant reply to DB."""
         async with async_session() as db:
             assistant_msg = ChatMessage(

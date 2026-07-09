@@ -181,6 +181,64 @@ async def load_messages_for_session(
     return rows
 
 
+async def load_recoverable_messages_for_turn(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID,
+    ctx_size: int,
+) -> list[Any]:
+    """Return a compaction-aware history window that preserves a recovery tail.
+
+    Normal LLM history loading trims interrupted user tails. Startup recovery
+    needs the opposite: keep the original compacted prefix shape, bound only the
+    closed history before the anchor, and include every active row from the
+    interrupted user anchor onward.
+    """
+    result = await db.execute(
+        select(ChatMessage)
+        .where(
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.conversation_id == conversation_id,
+            ChatMessage.compacted_into.is_(None),
+        )
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+    )
+    active_rows: list[Any] = list(result.scalars().all())
+
+    anchor_idx = next((idx for idx, row in enumerate(active_rows) if row.id == turn_anchor_id), None)
+    if anchor_idx is None:
+        logger.warning(
+            f"[chat_history] recoverable turn anchor {turn_anchor_id} "
+            f"is not active in conversation {conversation_id}; skipping recovery"
+        )
+        return []
+
+    prefix_budget = max(ctx_size, 0)
+    prefix = active_rows[:anchor_idx]
+    bounded_prefix = prefix[-prefix_budget:] if prefix_budget else []
+    tail: list[Any] = []
+    for row in active_rows[anchor_idx:]:
+        if tail and getattr(row, "role", None) == "user":
+            break
+        tail.append(row)
+    rows = bounded_prefix + tail
+
+    marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)
+    if marker is not None:
+        rows.insert(
+            0,
+            _build_summary_message(
+                marker=marker,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+            ),
+        )
+
+    return rows
+
+
 def _trim_incomplete_user_turn_tail_rows(rows: list[Any]) -> list[Any]:
     """Drop a trailing interrupted user turn before replaying history to LLMs.
 
@@ -281,6 +339,7 @@ def _parse_tool_call_payload(content: str) -> dict[str, Any] | None:
         "status": data.get("status"),
         "result": data.get("result"),
         "reasoning_content": data.get("reasoning_content"),
+        "call_id": data.get("call_id") or data.get("tool_call_id"),
     }
 
 
@@ -299,14 +358,20 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
 
     name = payload["name"] or "unknown"
     args = payload["args"] if payload["args"] is not None else {}
+    status = payload["status"] or "done"
     result = payload["result"] or ""
+    if status != "done":
+        if status == "pending" and name == "request_confirmation":
+            result = "(用户尚未响应该确认卡,视为未决;在收到明确点击前不要执行该操作)"
+        else:
+            return []
     # A suspended request_confirmation tool_call (awaiting the user's click) carries no
     # result yet. Every tool_call still needs a paired tool result or strict providers
     # reject the orphan — emit a placeholder that also tells the model it's unresolved,
     # rather than an empty string the model can't interpret.
-    if payload["status"] == "pending" and not result:
+    if status == "pending" and not result:
         result = "(用户尚未响应该确认卡,视为未决;在收到明确点击前不要执行该操作)"
-    tc_id = f"call_{msg.id}"
+    tc_id = str(payload.get("call_id") or f"call_{msg.id}")
 
     asst: dict[str, Any] = {
         "role": "assistant",
@@ -370,6 +435,33 @@ def build_llm_messages_from_rows(
     return out
 
 
+async def persist_incoming_user_message(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    content: str,
+    participant_id: uuid.UUID | None = None,
+) -> ChatMessage:
+    """Persist an incoming user message.
+
+    Restart recovery treats this ordinary append-only row as the natural turn
+    anchor when it belongs to a recent incomplete message tail.
+    """
+    row = ChatMessage(
+        agent_id=agent_id,
+        user_id=user_id,
+        role="user",
+        content=content,
+        conversation_id=conversation_id,
+        participant_id=participant_id,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
 async def persist_tool_call(
     db_session_factory,
     *,
@@ -377,17 +469,20 @@ async def persist_tool_call(
     user_id: uuid.UUID,
     conversation_id: str,
     evt: dict[str, Any],
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> None:
-    """Persist a completed tool call into chat history using the canonical
+    """Persist a tool-call marker into chat history using the canonical
     ``name`` / ``args`` schema — the single writer shared by the web WebSocket
     path and every IM channel, so the web UI and the LLM-history replay both
     observe it identically.
 
     ``evt`` is the ``on_tool_call`` payload emitted by the LLM caller
     (``name`` / ``call_id`` / ``args`` / ``status`` / ``result`` /
-    ``reasoning_content``). Only ``status == "done"`` is stored; running
-    notifications are ignored. ``args`` are stored RAW — this persisted row is
-    the single source of truth the LLM replays (``expand_tool_call_row``), so
+    ``reasoning_content``). ``running`` is stored as an append-only recovery
+    marker before the tool executes; ``done`` is stored as a later append-only
+    result row. Only done rows replay to the LLM. ``args`` are stored RAW —
+    this persisted row is the single source of truth the LLM replays
+    (``expand_tool_call_row``), so
     masking secrets here poisons the model (it copied ``connection_string:
     "******"`` back into new tool calls and looped on "Unsupported database
     type"). Sanitization is an OUTPUT-BOUNDARY concern, applied only where a
@@ -396,44 +491,110 @@ async def persist_tool_call(
     truncated). Failures are swallowed — a best-effort audit write must never
     break the live conversation.
     """
-    if (evt or {}).get("status") != "done":
+    if (evt or {}).get("_durable_persisted"):
         return
-
-    content = json.dumps(
-        {
-            "name": evt.get("name", ""),
-            "args": evt.get("args"),
-            "status": "done",
-            "result": evt.get("result") or "",
-            "reasoning_content": evt.get("reasoning_content"),
-        },
-        ensure_ascii=False,
-        default=str,
-    )
     try:
         async with db_session_factory() as db:
-            db.add(
-                ChatMessage(
-                    agent_id=agent_id,
-                    user_id=user_id,
-                    role="tool_call",
-                    content=content,
-                    conversation_id=conversation_id,
-                )
+            await persist_tool_call_row(
+                db,
+                agent_id=agent_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                evt=evt,
+                turn_anchor_id=turn_anchor_id,
             )
             await db.commit()
     except Exception as e:
         logger.warning(f"[chat_history] persist_tool_call failed (non-fatal): {e}")
 
 
-async def persist_pending_confirmation(
-    db_session_factory,
+async def persist_tool_call_row(
+    db: AsyncSession,
     *,
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
     conversation_id: str,
+    evt: dict[str, Any],
+    turn_anchor_id: uuid.UUID | None = None,
+) -> uuid.UUID | None:
+    """Persist one tool-call marker in the caller's transaction.
+
+    Unlike ``persist_tool_call`` this is strict: DB errors propagate to the
+    caller. The LLM loop uses it before executing tools so a missing durable
+    marker prevents side effects instead of creating an unrecoverable gap.
+    """
+    status = (evt or {}).get("status")
+    if status not in {"running", "done"}:
+        return None
+
+    content = json.dumps(
+        {
+            "name": evt.get("name", ""),
+            "call_id": evt.get("call_id", ""),
+            "args": evt.get("args"),
+            "status": status,
+            "result": evt.get("result") or "",
+            "reasoning_content": evt.get("reasoning_content"),
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    row = ChatMessage(
+        agent_id=agent_id,
+        user_id=user_id,
+        role="tool_call",
+        content=content,
+        conversation_id=conversation_id,
+    )
+    db.add(row)
+    await db.flush()
+    return row.id
+
+
+def _pending_confirmation_payload(
+    *,
     name: str,
     args: dict | None,
+    turn_anchor_id: uuid.UUID | None,
+) -> str:
+    payload = {"name": name, "args": args, "status": "pending", "result": ""}
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+async def persist_pending_confirmation_row(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    conversation_id: str,
+    name: str,
+    args: dict | None,
+    turn_anchor_id: uuid.UUID | None = None,
+    created_at: datetime | None = None,
+) -> uuid.UUID:
+    content = _pending_confirmation_payload(name=name, args=args, turn_anchor_id=turn_anchor_id)
+    row = ChatMessage(
+        agent_id=agent_id,
+        user_id=user_id,
+        role="tool_call",
+        content=content,
+        conversation_id=conversation_id,
+        created_at=created_at,
+    )
+    db.add(row)
+    await db.flush()
+    return row.id
+
+
+async def persist_pending_confirmation(
+    db_session_factory,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    conversation_id: str,
+    name: str,
+    args: dict | None,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Persist a SUSPENDED confirmation tool_call and return its row id.
 
@@ -444,23 +605,18 @@ async def persist_pending_confirmation(
     resume the loop (``expand_tool_call_row`` replays the pair). Unlike ``persist_tool_call``
     this is NOT best-effort: the caller needs the id to deliver the card, so errors raise.
     """
-    content = json.dumps(
-        {"name": name, "args": args, "status": "pending", "result": ""},
-        ensure_ascii=False,
-        default=str,
-    )
     async with db_session_factory() as db:
-        row = ChatMessage(
+        row_id = await persist_pending_confirmation_row(
+            db,
             agent_id=agent_id,
             user_id=user_id,
-            role="tool_call",
-            content=content,
             conversation_id=conversation_id,
+            name=name,
+            args=args,
+            turn_anchor_id=turn_anchor_id,
         )
-        db.add(row)
         await db.commit()
-        await db.refresh(row)
-        return row.id
+        return row_id
 
 
 THINKING_MAX_CHARS = 64_000
@@ -502,20 +658,72 @@ async def persist_assistant_reply(
         return
     try:
         async with db_session_factory() as db:
-            msg = ChatMessage(
+            await persist_assistant_reply_row(
+                db,
                 agent_id=agent_id,
                 user_id=user_id,
-                role="assistant",
-                content=content,
                 conversation_id=conversation_id,
+                content=content,
+                thinking=thinking,
             )
-            _capped = cap_thinking(thinking)
-            if _capped:
-                msg.thinking = _capped
-            db.add(msg)
             await db.commit()
     except Exception as e:
         logger.warning(f"[chat_history] persist_assistant_reply failed (non-fatal): {e}")
+
+
+async def persist_assistant_reply_row(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    content: str,
+    thinking: str | None = None,
+) -> uuid.UUID:
+    """Persist a non-empty assistant reply in the caller's transaction."""
+    if not (content or "").strip():
+        raise ValueError("assistant reply content must be non-empty")
+    msg = ChatMessage(
+        agent_id=agent_id,
+        user_id=user_id,
+        role="assistant",
+        content=content,
+        conversation_id=conversation_id,
+    )
+    _capped = cap_thinking(thinking)
+    if _capped:
+        msg.thinking = _capped
+    db.add(msg)
+    await db.flush()
+    return msg.id
+
+
+async def persist_assistant_reply_and_complete_turn(
+    db_session_factory,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    content: str,
+    turn_anchor_id: uuid.UUID,
+    thinking: str | None = None,
+) -> uuid.UUID:
+    """Persist final assistant reply.
+
+    Completion is represented by the assistant row itself. ``turn_anchor_id`` is
+    accepted for older callers but no longer persists turn state.
+    """
+    async with db_session_factory() as db:
+        row_id = await persist_assistant_reply_row(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            content=content,
+            thinking=thinking,
+        )
+        await db.commit()
+        return row_id
 
 
 def parse_tool_call_for_display(content: str) -> dict[str, Any]:
@@ -616,6 +824,46 @@ async def load_history_for_llm(
     if rehydrate_images_max is not None:
         # Lazy import: image_context pulls in vision deps that not all
         # deployments need. Only loaded when a vision-capable channel asks.
+        from app.services.image_context import rehydrate_image_messages
+
+        history = rehydrate_image_messages(history, agent_id, max_images=rehydrate_images_max)
+
+    return history
+
+
+async def load_recoverable_history_for_turn(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID,
+    ctx_size: int,
+    rehydrate_images_max: int | None = None,
+    is_group: bool = False,
+) -> list[dict[str, Any]]:
+    """Return LLM-ready history for startup recovery of an interrupted turn."""
+    rows = await load_recoverable_messages_for_turn(
+        db,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        turn_anchor_id=turn_anchor_id,
+        ctx_size=ctx_size,
+    )
+
+    wrap_users = False
+    name_map: dict[uuid.UUID, str] = {}
+    if is_group:
+        user_ids = {m.user_id for m in rows if m.role == "user" and m.user_id is not None}
+        try:
+            name_map = await _batch_load_display_names(db, user_ids)
+            wrap_users = True
+        except Exception as e:
+            logger.warning(f"[chat_history] display_name batch lookup failed, falling back to anonymous history: {e}")
+            wrap_users = False
+
+    history = build_llm_messages_from_rows(rows, wrap_user_names=wrap_users, name_map=name_map)
+
+    if rehydrate_images_max is not None:
         from app.services.image_context import rehydrate_image_messages
 
         history = rehydrate_image_messages(history, agent_id, max_images=rehydrate_images_max)

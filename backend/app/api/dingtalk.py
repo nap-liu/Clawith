@@ -306,7 +306,6 @@ async def process_dingtalk_message(
     from app.models.agent import Agent as AgentModel
     from app.models.user import User as UserModel
     from sqlalchemy.orm import selectinload as _selectinload
-    from app.models.audit import ChatMessage
     from app.services.channel_session import find_or_create_channel_session
     from app.services.channel_llm import _call_agent_llm
     from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
@@ -591,11 +590,16 @@ async def process_dingtalk_message(
             saved_content = f"{_file_prefixes}\n{_clean_text}".strip() if _clean_text else _file_prefixes
         else:
             saved_content = _clean_text or user_text
-        db.add(ChatMessage(
-            agent_id=agent_id, user_id=platform_user_id,
-            role="user", content=saved_content,
+        from app.services.chat_history import persist_incoming_user_message
+
+        turn_anchor = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=platform_user_id,
             conversation_id=session_conv_id,
-        ))
+            content=saved_content,
+        )
+        turn_anchor_id = turn_anchor.id
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
 
@@ -772,6 +776,7 @@ async def process_dingtalk_message(
                     is_group=(conversation_type == "2"),
                     on_thinking=_collect_thinking,
                     on_tool_call=_notify_tool_call,
+                    turn_anchor_id=turn_anchor_id,
                 )
             except asyncio.CancelledError:
                 await _cleanup_cancelled_tail()
@@ -789,11 +794,28 @@ async def process_dingtalk_message(
             f"{reply_text[:100]}"
         )
 
-        # Reply via session webhook (markdown). File/image sending is handled by the
-        # channel_file_sender ContextVar above. If the agent suspended on a confirmation
-        # card this turn, reply_text is "" (suspend_for_confirmation already sent the intro
-        # text + delivered the card in order), so this send is correctly skipped.
         if reply_text:
+            # Persist the final assistant reply before the external side effect.
+            # The assistant row is the durable completion marker for this
+            # append-only message turn.
+            from app.database import async_session as _reply_session_factory
+            from app.services.chat_history import persist_assistant_reply_row
+
+            async with _reply_session_factory() as reply_db:
+                await persist_assistant_reply_row(
+                    reply_db,
+                    agent_id=agent_id,
+                    user_id=platform_user_id,
+                    conversation_id=session_conv_id,
+                    content=reply_text,
+                    thinking="".join(_thinking_chunks) or None,
+                )
+                await reply_db.commit()
+            sess.last_message_at = datetime.now(timezone.utc)
+            await db.commit()
+
+            # Reply via session webhook (markdown). File/image sending is handled by the
+            # channel_file_sender ContextVar above.
             try:
                 async with httpx.AsyncClient(timeout=10) as client:
                     await client.post(session_webhook, json={
@@ -814,21 +836,6 @@ async def process_dingtalk_message(
                         })
                 except Exception as e2:
                     logger.error(f"[DingTalk] Fallback text reply also failed: {e2}")
-
-        # Save assistant reply via the shared writer. Its own session stamps
-        # created_at at save time (after the tool loop), so the reply orders
-        # AFTER the turn's tool calls instead of being folded into the web UI's
-        # analysis card. (The channel's request transaction would stamp it with
-        # the transaction-start time, i.e. before the tool calls.)
-        from app.services.chat_history import persist_assistant_reply
-        from app.database import async_session as _areply_session
-        await persist_assistant_reply(
-            _areply_session, agent_id=agent_id, user_id=platform_user_id,
-            conversation_id=session_conv_id, content=reply_text,
-            thinking="".join(_thinking_chunks) or None,
-        )
-        sess.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
 
         # Log activity
         from app.services.activity_logger import log_activity

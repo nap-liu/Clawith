@@ -106,6 +106,8 @@ async def _call_agent_llm(
     is_group: bool = False,
     recovery_hint: str | None = _IM_LLM_RECOVERY_HINT,
     continue_turn: bool = False,
+    recovery_mode: bool = False,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -169,7 +171,11 @@ async def _call_agent_llm(
         # message (same guard the WebSocket path applies after its slice).
         from app.services.chat_history import strip_leading_orphan_tool_messages
 
-        messages.extend(strip_leading_orphan_tool_messages(_normalize_history_messages(history)[-ctx_size:]))
+        normalized_history = _normalize_history_messages(history)
+        if recovery_mode:
+            messages.extend(strip_leading_orphan_tool_messages(normalized_history))
+        else:
+            messages.extend(strip_leading_orphan_tool_messages(normalized_history[-ctx_size:]))
     if not continue_turn:
         messages.append({"role": "user", "content": user_text})
 
@@ -180,36 +186,48 @@ async def _call_agent_llm(
     # rebuild from the fresh history WITHOUT re-appending user_text. Best-effort:
     # any failure leaves the original messages untouched.
     if session_id:
-        from app.services.chat_history import load_history_for_llm, strip_leading_orphan_tool_messages
+        from app.services.chat_history import (
+            load_history_for_llm,
+            load_recoverable_history_for_turn,
+            strip_leading_orphan_tool_messages,
+        )
         from app.services.llm.compactor import maybe_precompact_prompt
 
         try:
             if await maybe_precompact_prompt(
                 agent_id=agent_id, conversation_id=session_id, model=model, prompt_messages=messages
             ):
-                fresh = await load_history_for_llm(
-                    db,
-                    agent_id=agent_id,
-                    conversation_id=session_id,
-                    ctx_size=ctx_size,
-                    is_group=is_group,
-                    rehydrate_images_max=3,
-                )
-                rebuilt = strip_leading_orphan_tool_messages(_normalize_history_messages(fresh)[-ctx_size:])
-                # The reload ends with the current user message as stored in DB
-                # (raw text). Restore the per-turn-augmented user_text that was on
-                # the original prompt — sender wrap and the file-upload hint live
-                # only in user_text, not in the persisted row.
-                if continue_turn:
-                    # Resume mode: history already ends with the tool result — don't
-                    # graft a user message onto it.
-                    messages = rebuilt
-                elif rebuilt and rebuilt[-1].get("role") == "user":
-                    rebuilt[-1] = {"role": "user", "content": user_text}
-                    messages = rebuilt
+                if recovery_mode and turn_anchor_id is not None:
+                    fresh = await load_recoverable_history_for_turn(
+                        db,
+                        agent_id=agent_id,
+                        conversation_id=session_id,
+                        turn_anchor_id=turn_anchor_id,
+                        ctx_size=ctx_size,
+                        is_group=is_group,
+                        rehydrate_images_max=3,
+                    )
+                    messages = strip_leading_orphan_tool_messages(_normalize_history_messages(fresh))
                 else:
-                    rebuilt.append({"role": "user", "content": user_text})
-                    messages = rebuilt
+                    fresh = await load_history_for_llm(
+                        db,
+                        agent_id=agent_id,
+                        conversation_id=session_id,
+                        ctx_size=ctx_size,
+                        is_group=is_group,
+                        rehydrate_images_max=3,
+                    )
+                    rebuilt = strip_leading_orphan_tool_messages(_normalize_history_messages(fresh)[-ctx_size:])
+                    if continue_turn:
+                        # Resume mode: history already ends with the tool result — don't
+                        # graft a user message onto it.
+                        messages = rebuilt
+                    elif rebuilt and rebuilt[-1].get("role") == "user":
+                        rebuilt[-1] = {"role": "user", "content": user_text}
+                        messages = rebuilt
+                    else:
+                        rebuilt.append({"role": "user", "content": user_text})
+                        messages = rebuilt
         except Exception as _pf_exc:
             logger.warning(f"[Channel] pre-flight compaction skipped (non-fatal): {_pf_exc}")
 
@@ -245,24 +263,30 @@ async def _call_agent_llm(
             await on_thinking(text)
 
     async def _on_tool_call_persisted(evt: dict):
+        public_evt = {k: v for k, v in evt.items() if not k.startswith("_")}
         # Persist only when we have a real session + user (FK-safe). IM channels
         # always pass both; guard keeps stray callers from writing orphan rows.
-        if session_id and user_id is not None:
+        if session_id and user_id is not None and not evt.get("_durable_persisted"):
             await _persist_tool_call(
                 _persist_session_factory,
                 agent_id=agent_id,
                 user_id=user_id,
                 conversation_id=session_id,
-                evt=evt,
+                evt=public_evt,
+                turn_anchor_id=turn_anchor_id,
             )
         # Mirror to web viewers, masking secrets at the output boundary exactly
         # like the WebSocket path (raw args stay in the persisted row for replay).
         from app.utils.sanitize import sanitize_tool_args
 
-        _evt = {**evt, "args": sanitize_tool_args(evt.get("args"))} if "args" in evt else evt
+        _evt = (
+            {**public_evt, "args": sanitize_tool_args(public_evt.get("args"))}
+            if "args" in public_evt
+            else public_evt
+        )
         await _web_broadcast({"type": "tool_call", **_evt})
         if on_tool_call is not None:
-            await on_tool_call(evt)
+            await on_tool_call(public_evt)
 
     # Reuse the unified, failover-aware caller — the SAME path as the WebSocket
     # chat endpoint, so every provider behaves identically on both surfaces.
@@ -287,6 +311,7 @@ async def _call_agent_llm(
         on_tool_call=_on_tool_call_persisted,
         supports_vision=getattr(model, "supports_vision", False),
         is_group=is_group,
+        turn_anchor_id=turn_anchor_id,
     )
 
     # Finalize the streamed bubble for any web client watching this session, so
