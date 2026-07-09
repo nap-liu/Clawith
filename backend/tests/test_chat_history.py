@@ -764,78 +764,28 @@ async def test_load_history_for_llm_drops_cancelled_turn_tail():
         ("assistant", "上一轮回复"),
     ]
 
-
-async def test_cleanup_incomplete_session_tail_deletes_cancelled_turn_rows():
-    from sqlalchemy import select as _select
-
-    from app.services.chat_history import cleanup_incomplete_session_tail
-
-    agent_id = uuid.uuid4()
-    user_id = uuid.uuid4()
-    conv_id = f"test_cleanup_tail_{uuid.uuid4().hex[:8]}"
-    now = datetime.now(timezone.utc)
-    await _insert_messages_bypass_fk(
-        [
-            {
-                "id": uuid.uuid4(),
-                "agent_id": agent_id,
-                "user_id": user_id,
-                "role": "user",
-                "content": "ok user",
-                "conversation_id": conv_id,
-                "created_at": now - timedelta(seconds=40),
-            },
-            {
-                "id": uuid.uuid4(),
-                "agent_id": agent_id,
-                "user_id": user_id,
-                "role": "assistant",
-                "content": "ok assistant",
-                "conversation_id": conv_id,
-                "created_at": now - timedelta(seconds=30),
-            },
-            {
-                "id": uuid.uuid4(),
-                "agent_id": agent_id,
-                "user_id": user_id,
-                "role": "user",
-                "content": "cancelled user",
-                "conversation_id": conv_id,
-                "created_at": now - timedelta(seconds=20),
-            },
-            {
-                "id": uuid.uuid4(),
-                "agent_id": agent_id,
-                "user_id": user_id,
-                "role": "tool_call",
-                "content": json.dumps(
-                    {"name": "read_file", "args": {}, "status": "done", "result": "partial"},
-                    ensure_ascii=False,
-                ),
-                "conversation_id": conv_id,
-                "created_at": now - timedelta(seconds=10),
-            },
-        ]
-    )
-
-    async with async_session() as db:
-        deleted = await cleanup_incomplete_session_tail(
-            db,
-            agent_id=agent_id,
-            conversation_id=conv_id,
-        )
-        await db.commit()
-
-    assert deleted == 2
     async with async_session() as db:
         rows = (
             await db.execute(
-                _select(ChatMessage)
+                select(ChatMessage)
                 .where(ChatMessage.conversation_id == conv_id)
                 .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
             )
         ).scalars().all()
     assert [(row.role, row.content) for row in rows] == [
-        ("user", "ok user"),
-        ("assistant", "ok assistant"),
+        ("user", "上一轮问题"),
+        ("assistant", "上一轮回复"),
+        ("user", "被 /stop 中断的问题"),
+        (
+            "tool_call",
+            json.dumps(
+                {
+                    "name": "web_search",
+                    "args": {"q": "x"},
+                    "status": "done",
+                    "result": "partial",
+                },
+                ensure_ascii=False,
+            ),
+        ),
     ]

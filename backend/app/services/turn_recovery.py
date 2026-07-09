@@ -31,17 +31,6 @@ RECOVERY_ADVISORY_LOCK_KEY = 2026070801
 DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
 DEFAULT_DELIVERY_RETRY_MAX_AGE_MINUTES = 10.0
 ASSISTANT_TAIL_REDELIVERY_CHANNELS = frozenset({"dingtalk"})
-RECOVERY_AUTO_REEXECUTE_TOOL_NAMES = frozenset({
-    "list_files",
-    "read_file",
-    "search_files",
-    "find_files",
-    "list_focus_items",
-    "list_triggers",
-    "web_search",
-    "search_contacts",
-})
-
 
 @dataclass
 class RecoveryStats:
@@ -144,29 +133,22 @@ async def _complete_unfinished_tool_calls(db, anchor: ChatMessage, *, ctx_size: 
             args = payload.get("arguments")
         if args is None:
             args = {}
-        if name in RECOVERY_AUTO_REEXECUTE_TOOL_NAMES:
-            raw_result = await execute_tool(
-                name,
-                args,
-                agent_id=anchor.agent_id,
-                user_id=anchor.user_id,
-                session_id=anchor.conversation_id,
-                on_output=None,
-            )
-            result_text = str(raw_result)
-            llm_view = finalize_tool_output(
-                result_text,
-                tool_name=name,
-                agent_id=anchor.agent_id,
-                session_id=anchor.conversation_id,
-                tool_call_id=key,
-            )
-        else:
-            llm_view = (
-                "Tool execution was interrupted by a service restart and was not "
-                "automatically re-run because it may have external side effects. "
-                "Explain this to the user and ask them to retry or confirm the action."
-            )
+        raw_result = await execute_tool(
+            name,
+            args,
+            agent_id=anchor.agent_id,
+            user_id=anchor.user_id,
+            session_id=anchor.conversation_id,
+            on_output=None,
+        )
+        result_text = str(raw_result)
+        llm_view = finalize_tool_output(
+            result_text,
+            tool_name=name,
+            agent_id=anchor.agent_id,
+            session_id=anchor.conversation_id,
+            tool_call_id=key,
+        )
         async with async_session() as done_db:
             await persist_tool_call_row(
                 done_db,

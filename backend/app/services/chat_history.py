@@ -279,43 +279,6 @@ def _trim_incomplete_user_turn_tail_rows(rows: list[Any]) -> list[Any]:
     return rows
 
 
-async def cleanup_incomplete_session_tail(
-    db: AsyncSession,
-    *,
-    agent_id: uuid.UUID,
-    conversation_id: str,
-) -> int:
-    """Delete persisted rows belonging to an interrupted trailing user turn.
-
-    This is intentionally conservative: only rows after the first trailing
-    real ``user`` row that appears after the latest assistant reply are removed.
-    Completed history and suspended confirmation cards are left untouched.
-    """
-    result = await db.execute(
-        select(ChatMessage)
-        .where(
-            ChatMessage.agent_id == agent_id,
-            ChatMessage.conversation_id == conversation_id,
-            ChatMessage.compacted_into.is_(None),
-        )
-        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
-    )
-    rows = list(result.scalars().all())
-    trimmed = _trim_incomplete_user_turn_tail_rows(rows)
-    if len(trimmed) == len(rows):
-        return 0
-
-    stale_rows = rows[len(trimmed) :]
-    for row in stale_rows:
-        await db.delete(row)
-    await db.flush()
-    logger.info(
-        "[chat_history] cleaned incomplete stopped-turn tail "
-        f"conversation_id={conversation_id} rows={len(stale_rows)}"
-    )
-    return len(stale_rows)
-
-
 def _parse_tool_call_payload(content: str) -> dict[str, Any] | None:
     """Normalize a stored ``tool_call`` row's JSON into one shape that both
     readers build on — ``expand_tool_call_row`` (LLM replay) and

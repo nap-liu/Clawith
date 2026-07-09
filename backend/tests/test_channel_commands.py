@@ -325,23 +325,16 @@ async def test_thinking_toggle_requires_agent_manage_permission(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stop_command_cancels_running_turn(monkeypatch):
+async def test_stop_command_cancels_running_turn_without_deleting_history(monkeypatch):
     agent_id = uuid.uuid4()
     calls: list[str] = []
-    cleanup_calls: list[tuple[uuid.UUID, str]] = []
-    session = SimpleNamespace(id=uuid.uuid4())
 
     async def fake_cancel(lock_key: str) -> bool:
         calls.append(lock_key)
         return True
 
-    async def fake_cleanup(_db, *, agent_id: uuid.UUID, conversation_id: str) -> int:
-        cleanup_calls.append((agent_id, conversation_id))
-        return 1
-
     monkeypatch.setattr(channel_commands, "cancel_running_turn", fake_cancel)
-    monkeypatch.setattr(channel_commands, "cleanup_incomplete_session_tail", fake_cleanup)
-    db = FakeDB(lookup_result=session)
+    db = FakeDB()
 
     result = await channel_commands.handle_channel_command(
         db=db,
@@ -354,7 +347,7 @@ async def test_stop_command_cancels_running_turn(monkeypatch):
 
     assert result["action"] == "stop_turn"
     assert calls == ["dingtalk:dingtalk_p2p_staff_1"]
-    assert cleanup_calls == [(agent_id, str(session.id))]
+    assert db.executed == []
     assert "已请求停止" in result["message"]
 
 

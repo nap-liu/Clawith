@@ -34,7 +34,6 @@ Known limitation — quoted reply (Phase 2 #3, 2026-05-08):
     DingTalk replies stay plain.
 """
 
-import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -738,19 +737,6 @@ async def process_dingtalk_message(
             send_text=_send_thinking_text,
         )
 
-        async def _cleanup_cancelled_tail() -> None:
-            from app.services.chat_history import cleanup_incomplete_session_tail
-
-            try:
-                await cleanup_incomplete_session_tail(
-                    db,
-                    agent_id=agent_id,
-                    conversation_id=session_conv_id,
-                )
-                await db.commit()
-            except Exception as exc:  # noqa: BLE001 - cancellation cleanup is best-effort
-                logger.warning(f"[DingTalk] Failed to clean cancelled turn tail: {exc}")
-
         async def _collect_thinking(text: str):
             _thinking_chunks.append(text)
             if channel_reactions and channel_reactions.on_thinking:
@@ -768,19 +754,15 @@ async def process_dingtalk_message(
                     logger.warning(f"[DingTalk] Tool reaction update failed: {exc}")
 
         try:
-            try:
-                reply_text = await _call_agent_llm(
-                    db, agent_id, llm_user_text,
-                    history=history, user_id=platform_user_id,
-                    session_id=session_conv_id,
-                    is_group=(conversation_type == "2"),
-                    on_thinking=_collect_thinking,
-                    on_tool_call=_notify_tool_call,
-                    turn_anchor_id=turn_anchor_id,
-                )
-            except asyncio.CancelledError:
-                await _cleanup_cancelled_tail()
-                raise
+            reply_text = await _call_agent_llm(
+                db, agent_id, llm_user_text,
+                history=history, user_id=platform_user_id,
+                session_id=session_conv_id,
+                is_group=(conversation_type == "2"),
+                on_thinking=_collect_thinking,
+                on_tool_call=_notify_tool_call,
+                turn_anchor_id=turn_anchor_id,
+            )
         finally:
             await _thinking_sender.flush()
             # Reset ContextVar. (Thinking-reaction recall now fires via the

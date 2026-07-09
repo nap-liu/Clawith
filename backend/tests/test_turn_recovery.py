@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -872,8 +873,8 @@ async def test_resume_turn_executes_unfinished_running_tool_call_before_continui
     assert len(replies) == 1
 
 
-async def test_resume_turn_does_not_reexecute_side_effect_running_tool(monkeypatch):
-    """Interrupted side-effect tools are completed with a safety result, not replayed."""
+async def test_resume_turn_reexecutes_running_tool_without_synthetic_recovery_message(monkeypatch):
+    """Crash recovery should resume the original tool call and replay its real result."""
     from app.services import turn_recovery
     from app.services.chat_history import persist_incoming_user_message
 
@@ -911,19 +912,22 @@ async def test_resume_turn_does_not_reexecute_side_effect_running_tool(monkeypat
         )
         await db.commit()
 
-    async def fail_execute_tool(*_args, **_kwargs):
-        raise AssertionError("side-effect tool must not be re-executed on restart")
+    executed = []
+
+    async def fake_execute_tool(name, args, **kwargs):
+        executed.append((name, args, kwargs))
+        return "sent ok"
 
     captured = {}
 
     async def fake_call_agent_llm(*_args, **kwargs):
         captured.update(kwargs)
-        return "explain retry needed"
+        return "continued after recovered send"
 
     async def fake_deliver(*_args, **_kwargs):
         return True
 
-    monkeypatch.setattr(turn_recovery, "execute_tool", fail_execute_tool, raising=False)
+    monkeypatch.setattr(turn_recovery, "execute_tool", fake_execute_tool, raising=False)
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_call_agent_llm)
     monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", fake_deliver, raising=False)
 
@@ -933,10 +937,17 @@ async def test_resume_turn_does_not_reexecute_side_effect_running_tool(monkeypat
     result = await turn_recovery.resume_turn(anchor)
 
     assert result is True
+    assert executed == [
+        (
+            "send_feishu_message",
+            {"open_id": "ou_x", "text": "hello"},
+            {"agent_id": agent_id, "user_id": user_id, "session_id": conv, "on_output": None},
+        )
+    ]
     assert [msg["role"] for msg in captured["history"]] == ["user", "assistant", "tool"]
     assert captured["history"][1]["tool_calls"][0]["function"]["name"] == "send_feishu_message"
     assert captured["history"][1]["tool_calls"][0]["id"] == call_id
-    assert "not automatically re-run" in captured["history"][2]["content"]
+    assert captured["history"][2]["content"] == "sent ok"
 
     async with async_session() as db:
         payloads = [
@@ -951,7 +962,7 @@ async def test_resume_turn_does_not_reexecute_side_effect_running_tool(monkeypat
         ]
     assert [payload["status"] for payload in payloads] == ["running", "done"]
     assert payloads[1]["call_id"] == call_id
-    assert "not automatically re-run" in payloads[1]["result"]
+    assert payloads[1]["result"] == "sent ok"
 
 
 async def test_resume_turn_does_not_continue_when_recovered_tool_result_persist_fails(monkeypatch):
@@ -1268,6 +1279,73 @@ async def test_dingtalk_natural_entry_creates_and_completes_recoverable_turn(mon
     assert user_msg.content == "natural dingtalk user message"
     assert assistant_msg.content == "natural dingtalk reply"
     assert any(payload["json"]["msgtype"] == "markdown" for _url, payload in posts)
+
+
+async def test_dingtalk_cancelled_turn_preserves_recovery_anchor(monkeypatch):
+    """Backend shutdown cancellation must leave the persisted user row recoverable."""
+    from app.api.dingtalk import process_dingtalk_message
+    from app.models.chat_session import ChatSession
+
+    agent_id, user_id = await _make_agent_with_model(context_window_size=4)
+    sender_staff_id = f"staff_{uuid.uuid4().hex[:8]}"
+    async with async_session() as db:
+        agent = (await db.execute(select(Agent).where(Agent.id == agent_id))).scalar_one()
+        provider = IdentityProvider(
+            tenant_id=agent.tenant_id,
+            name="DingTalk",
+            provider_type="dingtalk",
+            is_active=True,
+        )
+        db.add(provider)
+        await db.flush()
+        db.add(
+            OrgMember(
+                provider_id=provider.id,
+                external_id=sender_staff_id,
+                name="DingTalk Tester",
+                status="active",
+                tenant_id=agent.tenant_id,
+                user_id=user_id,
+            )
+        )
+        await db.commit()
+
+    async def cancelled_call_agent_llm(*_args, **kwargs):
+        assert kwargs["turn_anchor_id"] is not None
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", cancelled_call_agent_llm)
+
+    with pytest.raises(asyncio.CancelledError):
+        await process_dingtalk_message(
+            agent_id=agent_id,
+            sender_staff_id=sender_staff_id,
+            user_text="recover me after shutdown",
+            conversation_id="open-conv-cancel",
+            conversation_type="1",
+            session_webhook="https://example.invalid/dingtalk-webhook",
+            sender_nick="DingTalk Tester",
+            message_id=f"msg-{uuid.uuid4().hex}",
+        )
+
+    async with async_session() as db:
+        session = (
+            await db.execute(
+                select(ChatSession).where(
+                    ChatSession.agent_id == agent_id,
+                    ChatSession.external_conv_id == f"dingtalk_p2p_{sender_staff_id}",
+                )
+            )
+        ).scalar_one()
+        rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == str(session.id))
+                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            )
+        ).scalars().all()
+
+    assert [(row.role, row.content) for row in rows] == [("user", "recover me after shutdown")]
 
 
 async def test_resume_turn_keeps_processing_when_final_persist_fails(monkeypatch):

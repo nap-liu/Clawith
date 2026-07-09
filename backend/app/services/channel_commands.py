@@ -12,7 +12,6 @@ from app.core.permissions import user_can_manage_agent_id
 from app.models.agent import Agent
 from app.models.chat_session import ChatSession
 from app.services.channel_dispatch import cancel_running_turn
-from app.services.chat_history import cleanup_incomplete_session_tail
 from app.services.im_thinking_output import (
     THINKING_OFF,
     THINKING_ON,
@@ -108,19 +107,6 @@ async def handle_channel_command(
 
     if parsed_cmd == "/stop":
         cancelled = await cancel_running_turn(_lock_key(source_channel, external_conv_id))
-        if cancelled:
-            session = await _load_channel_session(
-                db,
-                agent_id=agent_id,
-                external_conv_id=external_conv_id,
-                source_channel=source_channel,
-            )
-            if session is not None:
-                await cleanup_incomplete_session_tail(
-                    db,
-                    agent_id=agent_id,
-                    conversation_id=str(session.id),
-                )
         return {
             "action": "stop_turn",
             "message": "已请求停止当前工作。" if cancelled else "当前没有正在执行的工作。",
