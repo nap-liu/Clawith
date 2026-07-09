@@ -148,7 +148,7 @@ async def _start_ss_local() -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(fastapi_app: FastAPI):
     """Application startup and shutdown events."""
     # Configure logging first
     configure_logging()
@@ -329,14 +329,14 @@ async def lifespan(app: FastAPI):
         # deploy doesn't run every loop on every instance. Our cli_tools GC is a
         # worker-side maintenance loop, so it rides with the worker role.
         task_specs = []
-        app.state.turn_recovery_task = None
+        fastapi_app.state.turn_recovery_task = None
         if _turn_recovery_enabled():
             turn_recovery_task = asyncio.create_task(
                 _run_startup_turn_recovery(),
                 name="turn_recovery",
             )
             turn_recovery_task.add_done_callback(_bg_task_error)
-            app.state.turn_recovery_task = turn_recovery_task
+            fastapi_app.state.turn_recovery_task = turn_recovery_task
             logger.info("[startup] created bg task: turn_recovery")
         else:
             logger.info("[startup] turn recovery disabled (TURN_RECOVERY_ENABLED is not enabled)")
@@ -384,7 +384,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    turn_recovery_task = getattr(app.state, "turn_recovery_task", None)
+    turn_recovery_task = getattr(fastapi_app.state, "turn_recovery_task", None)
     if turn_recovery_task and not turn_recovery_task.done():
         turn_recovery_task.cancel()
         await asyncio.gather(turn_recovery_task, return_exceptions=True)

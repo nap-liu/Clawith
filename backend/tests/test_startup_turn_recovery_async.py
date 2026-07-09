@@ -43,6 +43,47 @@ def _patch_lifespan_side_effects(monkeypatch):
     return main
 
 
+class _FakeScalarResult:
+    def scalar_one_or_none(self):
+        return object()
+
+    def scalar(self):
+        return object()
+
+
+class _FakeDb:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return None
+
+    async def execute(self, *_args, **_kwargs):
+        return _FakeScalarResult()
+
+    async def commit(self):
+        return None
+
+    def add(self, *_args, **_kwargs):
+        return None
+
+
+class _FakeConn:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return None
+
+    async def run_sync(self, fn):
+        return fn(SimpleNamespace())
+
+
+class _FakeEngine:
+    def begin(self):
+        return _FakeConn()
+
+
 async def test_enabled_startup_turn_recovery_does_not_block_lifespan(monkeypatch):
     main = _patch_lifespan_side_effects(monkeypatch)
     monkeypatch.setenv("TURN_RECOVERY_ENABLED", "true")
@@ -93,3 +134,46 @@ async def test_disabled_startup_turn_recovery_creates_no_background_task(monkeyp
     app = SimpleNamespace(state=SimpleNamespace())
     async with main.lifespan(app):
         assert getattr(app.state, "turn_recovery_task", None) is None
+
+
+async def test_startup_turn_recovery_task_uses_fastapi_state_after_bootstrap_imports(monkeypatch):
+    main = _patch_lifespan_side_effects(monkeypatch)
+    monkeypatch.setenv("TURN_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(
+        main,
+        "_role_enabled",
+        lambda *roles: "bootstrap" in roles,
+    )
+
+    import app.database as database
+    import app.services.agent_seeder as agent_seeder
+    import app.services.resource_discovery as resource_discovery
+    import app.services.skill_seeder as skill_seeder
+    import app.services.template_seeder as template_seeder
+    import app.services.tool_seeder as tool_seeder
+    import app.services.turn_recovery as turn_recovery
+
+    async def fake_startup_turn_resume_once():
+        return SimpleNamespace(scanned=0, resumed=0, skipped=0, failed=0)
+
+    monkeypatch.setattr(database, "engine", _FakeEngine())
+    monkeypatch.setattr(database.Base.metadata, "create_all", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(database, "async_session", lambda: _FakeDb())
+    monkeypatch.setattr(tool_seeder, "seed_builtin_tools", _noop_async)
+    monkeypatch.setattr(tool_seeder, "clean_orphaned_mcp_tools", _noop_async)
+    monkeypatch.setattr(tool_seeder, "seed_atlassian_rovo_config", _noop_async)
+    monkeypatch.setattr(tool_seeder, "get_atlassian_api_key", _noop_async)
+    monkeypatch.setattr(resource_discovery, "seed_atlassian_rovo_tools", _noop_async)
+    monkeypatch.setattr(template_seeder, "seed_agent_templates", _noop_async)
+    monkeypatch.setattr(skill_seeder, "seed_skills", _noop_async)
+    monkeypatch.setattr(skill_seeder, "push_default_skills_to_existing_agents", _noop_async)
+    monkeypatch.setattr(agent_seeder, "seed_okr_agent", _noop_async)
+    monkeypatch.setattr(agent_seeder, "patch_existing_okr_agent", _noop_async)
+    monkeypatch.setattr(turn_recovery, "startup_turn_resume_once", fake_startup_turn_resume_once)
+
+    app = SimpleNamespace(state=SimpleNamespace())
+    async with main.lifespan(app):
+        task = getattr(app.state, "turn_recovery_task", None)
+        assert task is not None
+        await asyncio.wait_for(task, timeout=0.2)
+        assert task.done()
