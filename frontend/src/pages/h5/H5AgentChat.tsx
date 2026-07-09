@@ -182,6 +182,12 @@ function buildAgentFileImageUrl(agentId: string, token: string | null | undefine
     return `/api/agents/${agentId}/files/download?path=workspace/uploads/${encodeURIComponent(fileName)}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
 }
 
+function resolveAgentAvatarUrl(avatarUrl: string | null | undefined, token: string | null | undefined) {
+    if (!avatarUrl) return '';
+    if (!avatarUrl.startsWith('/api') || !token) return avatarUrl;
+    return `${avatarUrl}${avatarUrl.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
+}
+
 function normalizeH5SessionSummary(row: any): H5SessionSummary | null {
     if (!row || row.id == null) return null;
     return {
@@ -545,7 +551,7 @@ export default function H5AgentChat() {
         setSessionsLoading(true);
         setSessionsError('');
         try {
-            const rows = await chatSessionApi.list(agentId, { scope: 'mine', source_channel: channel, limit: 50, offset: 0 });
+            const rows = await chatSessionApi.list(agentId, { scope: 'mine' });
             const next = rows.map(normalizeH5SessionSummary).filter(Boolean) as H5SessionSummary[];
             setSessions(next);
         } catch (error: any) {
@@ -553,7 +559,7 @@ export default function H5AgentChat() {
         } finally {
             setSessionsLoading(false);
         }
-    }, [agentId, channel]);
+    }, [agentId]);
 
     const scheduleReconnect = useCallback(() => {
         if (manualCloseRef.current || unmountedRef.current || !token || !agentId) return;
@@ -1121,14 +1127,15 @@ export default function H5AgentChat() {
         || isSwitchingSession
         || uploadDrafts.length > 0
         || attachedFiles.length >= 10;
+    const agentAvatarUrl = resolveAgentAvatarUrl(agent?.avatar_url, token);
 
     return (
         <main className={`h5-chat h5-chat--${theme}`} data-theme={theme}>
             <header className="h5-chat__header">
                 <div className="h5-chat__agent">
                     <div className="h5-chat__avatar">
-                        {agent?.avatar_url
-                            ? <img src={agent.avatar_url} alt={agent.name} />
+                        {agentAvatarUrl
+                            ? <img src={agentAvatarUrl} alt={agent?.name || 'Agent'} />
                             : <span>{(agent?.name || 'A').slice(0, 1).toUpperCase()}</span>}
                     </div>
                     <div className="h5-chat__agent-copy">
