@@ -1,4 +1,4 @@
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from './stores';
 import { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -23,6 +23,7 @@ const AdminCompanies = lazy(() => import('./pages/AdminCompanies'));
 const OAuthCallback = lazy(() => import('./pages/OAuthCallback'));
 const SSOEntry = lazy(() => import('./pages/SSOEntry'));
 const OKR = lazy(() => import('./pages/OKR'));
+const H5AgentChat = lazy(() => import('./pages/h5/H5AgentChat'));
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
@@ -212,6 +213,8 @@ function NotificationBar() {
 export default function App() {
     const { token, setAuth, user } = useAuthStore();
     const [loading, setLoading] = useState(true);
+    const location = useLocation();
+    const isH5Route = location.pathname.startsWith('/h5/');
 
     useEffect(() => {
         // Initialize theme on app mount (ensures login page gets correct theme)
@@ -229,6 +232,7 @@ export default function App() {
         const urlParams = new URLSearchParams(window.location.search);
         const urlToken = urlParams.get('token');
         const currentPath = window.location.pathname;
+        const isH5CodeExchange = currentPath.startsWith('/h5/') && !!urlParams.get('code') && !!urlParams.get('provider');
         const pathsWithOwnToken = ['/reset-password', '/verify-email'];
         let effectiveToken = token;
 
@@ -248,6 +252,10 @@ export default function App() {
             window.history.replaceState({}, '', cleanUrl);
         }
 
+        if (isH5CodeExchange) {
+            setLoading(false);
+            return;
+        }
 
         if (effectiveToken && !user) {
             authApi.me()
@@ -270,9 +278,10 @@ export default function App() {
 
     return (
         <>
-            <NotificationBar />
+            {!isH5Route && <NotificationBar />}
             <Suspense fallback={<div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--text-tertiary)' }}>加载中...</div>}>
             <Routes>
+                <Route path="/h5/agents/:agentId/chat" element={<H5AgentChat />} />
                 <Route path="/login" element={<Login />} />
                 <Route path="/forgot-password" element={<ForgotPassword />} />
                 <Route path="/reset-password" element={<ResetPassword />} />

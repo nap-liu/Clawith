@@ -16,6 +16,7 @@ import base64
 from dataclasses import dataclass
 import fnmatch
 import json
+import mimetypes
 import multiprocessing as mp
 import os
 import queue
@@ -24,7 +25,7 @@ import uuid
 import unicodedata
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional, Any
 import re
 
@@ -4376,18 +4377,24 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     1. If member_name is provided, resolve the recipient across all configured channels
        and deliver via the appropriate one (Feishu, Slack, etc.).
     2. If channel_file_sender ContextVar is set (channel-initiated), use it directly.
-    3. Fall back to web chat download URL when no explicit recipient is requested.
+    3. Fall back to a structured web/H5 file delivery result when no explicit recipient is requested.
     """
-    rel_path = arguments.get("file_path", "").strip()
+    raw_rel_path = arguments.get("file_path", "")
+    rel_path = raw_rel_path.strip() if isinstance(raw_rel_path, str) else ""
     accompany_msg = arguments.get("message", "")
     member_name = (arguments.get("member_name") or "").strip()
     if not rel_path:
         return "Error: file_path is required"
+    rel_path = _normalize_tool_workspace_rel_path(rel_path)
+    if not rel_path:
+        return "Error: Invalid file_path"
 
     # Resolve file path within agent workspace
     file_path = (ws / rel_path).resolve()
     ws_resolved = ws.resolve()
-    if not str(file_path).startswith(str(ws_resolved)):
+    try:
+        file_path.relative_to(ws_resolved)
+    except ValueError:
         file_path = (WORKSPACE_ROOT / str(agent_id) / rel_path).resolve()
         if not file_path.exists():
             return f"Error: File not found: {rel_path}"
@@ -4413,21 +4420,38 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
         except Exception as e:
             return f"Failed to send file: {e}"
 
-    # Priority 3: Web chat fallback — return download URL
-    aid = channel_web_agent_id.get() or str(agent_id)
+    # Priority 3: Web/H5 chat fallback — return a structured platform file
+    # delivery payload. The frontend builds the authenticated download URL.
     base_abs = (WORKSPACE_ROOT / str(agent_id)).resolve()
     try:
-        file_rel = str(file_path.resolve().relative_to(base_abs))
+        file_rel = file_path.resolve().relative_to(base_abs).as_posix()
     except ValueError:
         file_rel = rel_path
-    from app.config import get_settings as _gs
-    _s = _gs()
-    base_url = getattr(_s, 'BASE_URL', '').rstrip('/') or ''
-    download_url = f"{base_url}/api/agents/{aid}/files/download?path={file_rel}"
-    msg = f"File ready: [{file_path.name}]({download_url})"
-    if accompany_msg:
-        msg = accompany_msg + "\n\n" + msg
-    return msg
+    return _platform_file_delivery_result(file_path, file_rel, accompany_msg)
+
+
+def _normalize_tool_workspace_rel_path(raw_path: str) -> str | None:
+    path = raw_path.strip().replace("\\", "/")
+    if not path:
+        return None
+    if path.startswith("/") or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", path):
+        return None
+    normalized = PurePosixPath(path)
+    if normalized.is_absolute() or any(part == ".." for part in normalized.parts):
+        return None
+    return normalized.as_posix()
+
+
+def _platform_file_delivery_result(file_path: Path, rel_path: str, message: str = "") -> str:
+    payload = {
+        "type": "platform_file_delivery",
+        "path": rel_path,
+        "filename": file_path.name,
+        "message": message or "",
+        "mime_type": mimetypes.guess_type(file_path.name)[0] or "application/octet-stream",
+        "size": file_path.stat().st_size,
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 async def _send_file_to_recipient(

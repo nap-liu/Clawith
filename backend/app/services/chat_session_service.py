@@ -16,6 +16,7 @@ async def get_primary_platform_session(
     db: AsyncSession,
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
+    source_channel: str = "web",
 ) -> ChatSession | None:
     """Return the current primary first-party session for a user+agent pair, if any."""
 
@@ -24,7 +25,7 @@ async def get_primary_platform_session(
         .where(
             ChatSession.agent_id == agent_id,
             ChatSession.user_id == user_id,
-            ChatSession.source_channel == "web",
+            ChatSession.source_channel == source_channel,
             ChatSession.is_group == False,
             ChatSession.is_primary == True,
         )
@@ -37,6 +38,7 @@ async def ensure_primary_platform_session(
     db: AsyncSession,
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
+    source_channel: str = "web",
 ) -> ChatSession:
     """Return a guaranteed primary platform session for a given user+agent pair.
 
@@ -46,7 +48,7 @@ async def ensure_primary_platform_session(
     - Only create a brand new primary session when the pair has never talked on-platform.
     """
 
-    primary = await get_primary_platform_session(db, agent_id, user_id)
+    primary = await get_primary_platform_session(db, agent_id, user_id, source_channel=source_channel)
     if primary:
         return primary
 
@@ -67,7 +69,7 @@ async def ensure_primary_platform_session(
         .where(
             ChatSession.agent_id == agent_id,
             ChatSession.user_id == user_id,
-            ChatSession.source_channel == "web",
+            ChatSession.source_channel == source_channel,
             ChatSession.is_group == False,
         )
         .order_by(
@@ -88,7 +90,7 @@ async def ensure_primary_platform_session(
         agent_id=agent_id,
         user_id=user_id,
         title=f"Session {now.strftime('%m-%d %H:%M')}",
-        source_channel="web",
+        source_channel=source_channel,
         is_primary=True,
         created_at=now,
     )
@@ -136,4 +138,3 @@ async def save_tool_call_log(
             await db.commit()
     except Exception as e:
         logger.warning(f"Failed to save tool call log: {e}")
-

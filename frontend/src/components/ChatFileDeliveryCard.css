@@ -1,0 +1,109 @@
+.chat-file-delivery {
+    width: min(420px, 100%);
+    color: var(--text-primary);
+}
+
+.chat-file-delivery__message {
+    margin-bottom: 8px;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.chat-file-delivery__body {
+    min-height: 64px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-sm);
+}
+
+.chat-file-delivery__thumb {
+    width: 44px;
+    height: 44px;
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    overflow: hidden;
+}
+
+.chat-file-delivery__thumb--image {
+    padding: 0;
+    cursor: zoom-in;
+}
+
+.chat-file-delivery__thumb--image img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.chat-file-delivery__meta {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.chat-file-delivery__name {
+    color: var(--text-primary);
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.35;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chat-file-delivery__details {
+    margin-top: 3px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chat-file-delivery__download {
+    width: 36px;
+    height: 36px;
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    color: var(--accent-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    text-decoration: none;
+}
+
+.chat-file-delivery__download:hover {
+    background: var(--bg-tertiary);
+}
+
+.chat-file-delivery__download:focus-visible,
+.chat-file-delivery__thumb:focus-visible {
+    outline: 2px solid var(--accent-primary);
+    outline-offset: 2px;
+}
+
+.chat-file-delivery--h5 {
+    width: min(360px, 100%);
+}
+
+.chat-file-delivery--h5 .chat-file-delivery__body {
+    min-height: 60px;
+    box-shadow: none;
+}

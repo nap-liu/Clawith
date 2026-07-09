@@ -811,6 +811,7 @@ async def call_llm(
     is_group: bool = False,
     on_code_output=None,
     current_user_name_override: str | None = None,
+    channel_context: dict | None = None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     # Get agent config for tool rounds
@@ -845,7 +846,12 @@ async def call_llm(
 
     # Look up current user's display name so the agent knows who it's talking to
     static_prompt, dynamic_prompt = await build_agent_context(
-        agent_id, agent_name, role_description, current_user_name=_user_name, is_group=is_group
+        agent_id,
+        agent_name,
+        role_description,
+        current_user_name=_user_name,
+        is_group=is_group,
+        channel_context=channel_context,
     )
 
     # Load tools dynamically from DB. `skip_tools=True` is set by the WS
@@ -1325,6 +1331,7 @@ async def call_llm_with_failover(
     is_group: bool = False,
     on_code_output=None,
     current_user_name_override: str | None = None,
+    channel_context: dict | None = None,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -1368,6 +1375,7 @@ async def call_llm_with_failover(
         is_group=is_group,
         on_code_output=on_code_output,
         current_user_name_override=current_user_name_override,
+        channel_context=channel_context,
     )
 
     # Check if we need to failover
@@ -1437,6 +1445,7 @@ async def call_llm_with_failover(
         is_group=is_group,
         on_code_output=on_code_output,
         current_user_name_override=current_user_name_override,
+        channel_context=channel_context,
     )
 
     # Combine error messages if fallback also failed

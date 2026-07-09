@@ -16,6 +16,7 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.agent import Agent
 from app.models.user import User
+from app.services.auth_code_exchange import validate_platform_login_channel
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
@@ -51,6 +52,7 @@ class SessionOut(BaseModel):
 
 class CreateSessionIn(BaseModel):
     title: Optional[str] = None
+    source_channel: str = "web"
 
 
 class PatchSessionIn(BaseModel):
@@ -61,6 +63,9 @@ class PatchSessionIn(BaseModel):
 async def list_sessions(
     agent_id: uuid.UUID,
     scope: str = Query("mine", description="'mine' or 'all'"),
+    source_channel: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -71,19 +76,27 @@ async def list_sessions(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     await check_agent_access(db, current_user, agent_id)
+    source_channel = (source_channel or "").strip() or None
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
 
     if scope == "all":
         if not _can_view_all_agent_chat_sessions(current_user, agent):
             raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
 
         # Fetch all sessions (including agent-to-agent where this agent is peer)
+        all_where = (
+            (ChatSession.agent_id == agent_id)
+            | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
+        )
+        query = select(ChatSession).where(all_where)
+        if source_channel:
+            query = query.where(ChatSession.source_channel == source_channel)
         result = await db.execute(
-            select(ChatSession)
-            .where(
-                (ChatSession.agent_id == agent_id)
-                | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
-            )
+            query
             .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
+            .offset(offset)
+            .limit(limit)
         )
         sessions = result.scalars().all()
         out = []
@@ -206,7 +219,7 @@ async def list_sessions(
             .correlate(ChatSession)
             .exists()
         )
-        result = await db.execute(
+        query = (
             select(ChatSession)
             .where(
                 ChatSession.agent_id == agent_id,
@@ -222,7 +235,14 @@ async def list_sessions(
                     ),
                 ),
             )
+        )
+        if source_channel:
+            query = query.where(ChatSession.source_channel == source_channel)
+        result = await db.execute(
+            query
             .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
+            .offset(offset)
+            .limit(limit)
         )
         sessions = result.scalars().all()
         out = []
@@ -298,6 +318,7 @@ async def create_session(
 ):
     """Create a new chat session for the current user."""
     await check_agent_access(db, current_user, agent_id)
+    source_channel = validate_platform_login_channel(body.source_channel)
 
     now = datetime.now(tz.utc)
     new_id = uuid.uuid4()
@@ -306,7 +327,7 @@ async def create_session(
         agent_id=agent_id,
         user_id=current_user.id,
         title=body.title or f"Session {now.strftime('%m-%d %H:%M')}",
-        source_channel="web",
+        source_channel=source_channel,
         is_primary=False,
         created_at=now,
     )

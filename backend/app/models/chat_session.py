@@ -13,7 +13,7 @@ from app.database import Base
 class ChatSession(Base):
     """A named session grouping chat messages between a user and an agent.
 
-    source_channel: 'web' | 'feishu' | 'discord' | 'slack'
+    source_channel: 'web' | 'wechat_miniprogram' | 'feishu' | 'discord' | 'slack'
     external_conv_id: original channel conversation ID (e.g. 'feishu_p2p_ou_xxx').
                       Unique per agent — used for reliable find-or-create without in-process caching.
     is_group: True for group chat sessions (Feishu group, WeCom group, Slack channel, etc.).
@@ -30,6 +30,15 @@ class ChatSession(Base):
             "user_id",
             unique=True,
             postgresql_where=text("is_primary = true AND source_channel = 'web' AND is_group = false"),
+        ),
+        Index(
+            "uq_chat_sessions_primary_h5_platform",
+            "agent_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text(
+                "is_primary = true AND source_channel = 'wechat_miniprogram' AND is_group = false"
+            ),
         ),
     )
 

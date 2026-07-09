@@ -95,6 +95,7 @@ export default function UserManagement() {
     const [editingProfileUser, setEditingProfileUser] = useState<UserInfo | null>(null);
     const [totalUsers, setTotalUsers] = useState(0);
     const [reloadToken, setReloadToken] = useState(0);
+    const [hasLoadedUsersOnce, setHasLoadedUsersOnce] = useState(false);
 
     // Invite modal state
     const [showInviteModal, setShowInviteModal] = useState(false);
@@ -158,7 +159,10 @@ export default function UserManagement() {
                     setTimeout(() => setToast(''), 3000);
                 }
             } finally {
-                if (!cancelled) setLoading(false);
+                if (!cancelled) {
+                    setHasLoadedUsersOnce(true);
+                    setLoading(false);
+                }
             }
         };
 
@@ -280,6 +284,9 @@ export default function UserManagement() {
     const resultCountLabel = debouncedSearchQuery
         ? (isChinese ? `${totalUsers} 位匹配用户` : `${totalUsers} matching users`)
         : (isChinese ? `${totalUsers} 位用户` : `${totalUsers} users`);
+    const showInitialLoading = loading && !hasLoadedUsersOnce;
+    const showRefreshing = loading && hasLoadedUsersOnce;
+    const userGridTemplateColumns = '1.4fr 1.4fr 0.8fr 0.7fr 0.7fr 0.8fr 0.8fr 0.8fr 0.8fr 120px';
 
     const toggleSort = () => {
         setSortOrder(o => o === 'asc' ? 'desc' : 'asc');
@@ -306,44 +313,48 @@ export default function UserManagement() {
                 />
             )}
 
-            {loading ? (
-                <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-tertiary)' }}>
-                    {t('common.loading')}...
-                </div>
-            ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    {/* Search bar + Invite button */}
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                            <input
-                                className="form-input"
-                                type="text"
-                                placeholder={isChinese ? '搜索用户名、显示名、邮箱或手机号…' : 'Search username, name, email or phone…'}
-                                value={searchQuery}
-                                onChange={e => setSearchQuery(e.target.value)}
-                                style={{
-                                    width: '360px', fontSize: '13px',
-                                    padding: '8px 12px 8px 12px',
-                                    background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)',
-                                    borderRadius: '8px',
-                                }}
-                            />
-                            <span style={{ fontSize: '12px', color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>
-                                {resultCountLabel}
-                            </span>
-                        </div>
-                        <button
-                            className="btn btn-primary"
-                            style={{ fontSize: '13px', padding: '6px 16px' }}
-                            onClick={() => { setShowInviteModal(true); setInviteEmails(''); setInviteResult(null); }}
-                        >
-                            {isChinese ? '邀请新用户' : 'Invite Users'}
-                        </button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                {/* Search bar + Invite button */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px', gap: '16px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0 }}>
+                        <input
+                            className="form-input"
+                            type="text"
+                            aria-label={isChinese ? '搜索用户' : 'Search users'}
+                            placeholder={isChinese ? '搜索用户名、显示名、邮箱或手机号…' : 'Search username, name, email or phone…'}
+                            value={searchQuery}
+                            onChange={e => setSearchQuery(e.target.value)}
+                            style={{
+                                width: '360px', maxWidth: 'min(360px, 52vw)', fontSize: '13px',
+                                padding: '8px 12px 8px 12px',
+                                background: 'var(--bg-elevated)', border: '1px solid var(--border-subtle)',
+                                borderRadius: '8px',
+                            }}
+                        />
+                        <span style={{ fontSize: '12px', color: 'var(--text-tertiary)', whiteSpace: 'nowrap' }}>
+                            {resultCountLabel}
+                        </span>
                     </div>
+                    <button
+                        className="btn btn-primary"
+                        style={{ fontSize: '13px', padding: '6px 16px', flexShrink: 0 }}
+                        onClick={() => { setShowInviteModal(true); setInviteEmails(''); setInviteResult(null); }}
+                    >
+                        {isChinese ? '邀请新用户' : 'Invite Users'}
+                    </button>
+                </div>
+
+                <div style={{ position: 'relative', minHeight: '560px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {showInitialLoading ? (
+                        <div style={{ textAlign: 'center', padding: '40px', color: 'var(--text-tertiary)' }}>
+                            {t('common.loading')}...
+                        </div>
+                    ) : (
+                        <>
 
                     {/* Header */}
                     <div style={{
-                        display: 'grid', gridTemplateColumns: '1.4fr 1.4fr 0.8fr 0.7fr 0.7fr 0.8fr 0.8fr 0.8fr 0.8fr 120px',
+                        display: 'grid', gridTemplateColumns: userGridTemplateColumns,
                         gap: '10px', padding: '10px 16px', fontSize: '11px', fontWeight: 600,
                         color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em',
                     }}>
@@ -369,7 +380,7 @@ export default function UserManagement() {
                     {users.map(user => (
                         <div key={user.id}>
                             <div className="card" style={{
-                                display: 'grid', gridTemplateColumns: '1.4fr 1.4fr 0.8fr 0.7fr 0.7fr 0.8fr 0.8fr 0.8fr 0.8fr 120px',
+                                display: 'grid', gridTemplateColumns: userGridTemplateColumns,
                                 gap: '10px', alignItems: 'center', padding: '12px 16px',
                             }}>
                                 <div>
@@ -589,8 +600,27 @@ export default function UserManagement() {
                             )}
                         </div>
                     )}
+                        </>
+                    )}
+                    {showRefreshing && (
+                        <div style={{
+                            position: 'absolute',
+                            top: '8px',
+                            right: '8px',
+                            padding: '4px 10px',
+                            borderRadius: '999px',
+                            border: '1px solid var(--border-subtle)',
+                            background: 'var(--bg-elevated)',
+                            color: 'var(--text-tertiary)',
+                            fontSize: '12px',
+                            boxShadow: 'var(--shadow-sm)',
+                            pointerEvents: 'none',
+                        }}>
+                            {t('common.loading')}...
+                        </div>
+                    )}
                 </div>
-            )}
+            </div>
 
             {/* Invite Users Modal */}
             {showInviteModal && (

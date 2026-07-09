@@ -6940,6 +6940,20 @@ select:focus {
   border-color: rgba(255, 255, 255, 0.08);
 }
 
+.chat-msg-image-preview {
+  display: inline-flex;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: zoom-in;
+}
+
+.chat-msg-image-preview:focus-visible {
+  outline: 2px solid var(--accent-primary);
+  outline-offset: 2px;
+}
+
 /* Empty state */
 .chat-empty-state {
   text-align: center;
@@ -7390,6 +7404,16 @@ select:focus {
   border-radius: 3px;
   object-fit: cover;
   flex-shrink: 0;
+}
+
+.chat-file-pill__thumb-button {
+  display: inline-flex;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  cursor: zoom-in;
 }
 
 .chat-file-pill__name {

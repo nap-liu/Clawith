@@ -32,11 +32,13 @@ class DummyResult:
 class RecordingDB:
     def __init__(self, responses=None):
         self.responses = list(responses or [])
+        self.statements = []
         self.added = []
         self.committed = False
         self.refreshed = []
 
     async def execute(self, _statement, _params=None):
+        self.statements.append(_statement)
         if not self.responses:
             raise AssertionError("unexpected execute() call")
         return self.responses.pop(0)
@@ -148,6 +150,59 @@ async def test_creator_can_list_all_sessions(monkeypatch):
     assert len(sessions) == 1
     assert sessions[0].user_id == str(other_user_id)
     assert sessions[0].username == "Bob"
+
+
+@pytest.mark.asyncio
+async def test_mine_session_list_applies_channel_filter_and_pagination(monkeypatch):
+    user_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    now = datetime.now(UTC)
+
+    current_user = SimpleNamespace(id=user_id, role="member")
+    agent = SimpleNamespace(id=agent_id, creator_id=uuid.uuid4())
+    session = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        user_id=user_id,
+        source_channel="wechat_miniprogram",
+        title="H5 history",
+        created_at=now,
+        last_message_at=now,
+        peer_agent_id=None,
+        is_group=False,
+        group_name=None,
+        is_primary=False,
+    )
+    db = RecordingDB(
+        responses=[
+            DummyResult([agent]),
+            DummyResult([session]),
+            DummyResult([(str(session.id), 1)]),
+            DummyResult([]),
+        ]
+    )
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    sessions = await chat_sessions_api.list_sessions(
+        agent_id=agent_id,
+        scope="mine",
+        source_channel="wechat_miniprogram",
+        limit=10,
+        offset=5,
+        current_user=current_user,
+        db=db,
+    )
+
+    rendered = str(db.statements[1])
+    assert "chat_sessions.source_channel =" in rendered
+    assert "LIMIT" in rendered.upper()
+    assert "OFFSET" in rendered.upper()
+    assert len(sessions) == 1
+    assert sessions[0].source_channel == "wechat_miniprogram"
 
 
 @pytest.mark.asyncio

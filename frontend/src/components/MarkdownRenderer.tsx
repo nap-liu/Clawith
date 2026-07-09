@@ -3,15 +3,9 @@
  * Renders: headings, bold, italic, inline code, code blocks,
  * unordered/ordered lists, blockquotes, horizontal rules, links, tables.
  */
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { createPortal } from 'react-dom';
-import {
-    IconDownload,
-    IconPlus,
-    IconMinus,
-    IconRefresh,
-    IconX,
-} from '@tabler/icons-react';
+import React, { useCallback, useMemo, useState } from 'react';
+import ChatImageLightbox from './ChatImageLightbox';
+import { buildPreviewImage, type ChatPreviewImage } from '../utils/chatAttachments';
 
 function escapeHtml(str: string): string {
     return str
@@ -263,28 +257,12 @@ interface MarkdownRendererProps {
     content: string;
     style?: React.CSSProperties;
     className?: string;
+    imagePreviewMode?: 'desktop' | 'mobile';
 }
 
-export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, style, className }: MarkdownRendererProps) {
+export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, style, className, imagePreviewMode = 'desktop' }: MarkdownRendererProps) {
     const html = useMemo(() => markdownToHtml(content), [content]);
-    const [lightbox, setLightbox] = useState<{ src: string; alt: string; scale: number } | null>(null);
-
-    const closeLightbox = useCallback(() => setLightbox(null), []);
-    const zoomIn = useCallback(() => setLightbox(prev => prev ? { ...prev, scale: Math.min(4, prev.scale + 0.25) } : prev), []);
-    const zoomOut = useCallback(() => setLightbox(prev => prev ? { ...prev, scale: Math.max(0.25, prev.scale - 0.25) } : prev), []);
-    const resetZoom = useCallback(() => setLightbox(prev => prev ? { ...prev, scale: 1 } : prev), []);
-
-    useEffect(() => {
-        if (!lightbox) return;
-        const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === 'Escape') closeLightbox();
-            if (event.key === '+') zoomIn();
-            if (event.key === '-') zoomOut();
-            if (event.key === '0') resetZoom();
-        };
-        window.addEventListener('keydown', onKeyDown);
-        return () => window.removeEventListener('keydown', onKeyDown);
-    }, [closeLightbox, lightbox, resetZoom, zoomIn, zoomOut]);
+    const [preview, setPreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
 
     const handleContainerClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
         const target = event.target as HTMLElement | null;
@@ -305,10 +283,15 @@ export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, 
         if (image) {
             event.preventDefault();
             event.stopPropagation();
-            setLightbox({
-                src: image.dataset.markdownImageSrc || image.src,
-                alt: image.dataset.markdownImageAlt || image.alt || 'image',
-                scale: 1,
+            const imageNodes = Array.from(event.currentTarget.querySelectorAll<HTMLImageElement>('[data-markdown-image-src]'));
+            const images = imageNodes.map((node) => buildPreviewImage(
+                node.dataset.markdownImageSrc || node.src,
+                node.dataset.markdownImageAlt || node.alt || 'image',
+                node.dataset.markdownImageAlt || node.alt || 'image',
+            ));
+            setPreview({
+                images,
+                index: Math.max(0, imageNodes.indexOf(image)),
             });
         }
     }, []);
@@ -321,45 +304,14 @@ export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, 
                 onClick={handleContainerClick}
                 dangerouslySetInnerHTML={{ __html: html }}
             />
-            {lightbox && createPortal(
-                <div className="markdown-image-lightbox" onClick={closeLightbox}>
-                    <div className="markdown-image-lightbox__toolbar" onClick={(event) => event.stopPropagation()}>
-                        <button type="button" className="markdown-image-lightbox__btn" onClick={zoomOut} title="Zoom out">
-                            <IconMinus size={16} stroke={1.9} />
-                        </button>
-                        <button type="button" className="markdown-image-lightbox__btn" onClick={zoomIn} title="Zoom in">
-                            <IconPlus size={16} stroke={1.9} />
-                        </button>
-                        <button type="button" className="markdown-image-lightbox__btn" onClick={resetZoom} title="Reset zoom">
-                            <IconRefresh size={16} stroke={1.9} />
-                        </button>
-                        <button
-                            type="button"
-                            className="markdown-image-lightbox__btn"
-                            onClick={() => triggerImageDownload(lightbox.src, lightbox.alt)}
-                            title="Download image"
-                        >
-                            <IconDownload size={16} stroke={1.9} />
-                        </button>
-                        <button type="button" className="markdown-image-lightbox__btn" onClick={closeLightbox} title="Close preview">
-                            <IconX size={16} stroke={1.9} />
-                        </button>
-                    </div>
-                    <div className="markdown-image-lightbox__stage" onClick={(event) => event.stopPropagation()}>
-                        <img
-                            src={lightbox.src}
-                            alt={lightbox.alt}
-                            className="markdown-image-lightbox__image"
-                            style={{ transform: `scale(${lightbox.scale})` }}
-                        />
-                    </div>
-                    <div className="markdown-image-lightbox__footer" onClick={(event) => event.stopPropagation()}>
-                        <span>{Math.round(lightbox.scale * 100)}%</span>
-                        {lightbox.alt ? <span className="markdown-image-lightbox__alt">{lightbox.alt}</span> : null}
-                    </div>
-                </div>,
-                document.body,
-            )}
+            <ChatImageLightbox
+                open={!!preview}
+                images={preview?.images || []}
+                index={preview?.index || 0}
+                mode={imagePreviewMode}
+                onClose={() => setPreview(null)}
+                onIndexChange={(index) => setPreview(prev => prev ? { ...prev, index } : prev)}
+            />
         </>
     );
 });

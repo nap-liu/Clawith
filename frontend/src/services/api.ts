@@ -17,6 +17,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
         // Auto-logout on expired/invalid token (but not on auth endpoints — let them show errors)
         const isAuthEndpoint = url.startsWith('/auth/login')
             || url.startsWith('/auth/register')
+            || url.startsWith('/auth/code/exchange')
             || url.startsWith('/auth/verify-email')
             || url.startsWith('/auth/resend-verification')
             || url.startsWith('/auth/forgot-password')
@@ -185,6 +186,17 @@ export const authApi = {
 
     switchTenant: (tenantId: string) =>
         request<{ access_token: string; redirect_url?: string; message?: string }>('/auth/switch-tenant', { method: 'POST', body: JSON.stringify({ tenant_id: tenantId }) }),
+
+    exchangeCode: (data: {
+        provider: string;
+        code: string;
+        state?: string | null;
+        redirect_uri: string;
+        purpose: string;
+        channel?: string;
+        context?: Record<string, any>;
+    }) =>
+        request<TokenResponse>('/auth/code/exchange', { method: 'POST', body: JSON.stringify(data) }),
 };
 
 // ─── Tenants ──────────────────────────────────────────
@@ -291,6 +303,23 @@ export const agentApi = {
     // cid is the request_confirmation tool_call row id; value/label are the clicked button.
     resolveConfirmation: (id: string, cid: string, value: string, label?: string) =>
         request<any>(`/agents/${id}/confirmations/${cid}/resolve`, { method: 'POST', body: JSON.stringify({ value, label }) }),
+};
+
+export const chatSessionApi = {
+    list: (agentId: string, options: { scope?: 'mine' | 'all'; source_channel?: string; limit?: number; offset?: number } = {}) => {
+        const params = new URLSearchParams();
+        params.set('scope', options.scope || 'mine');
+        if (options.source_channel) params.set('source_channel', options.source_channel);
+        if (options.limit != null) params.set('limit', String(options.limit));
+        if (options.offset != null) params.set('offset', String(options.offset));
+        return request<any[]>(`/agents/${agentId}/sessions?${params.toString()}`);
+    },
+
+    create: (agentId: string, data: { title?: string; source_channel?: string }) =>
+        request<any>(`/agents/${agentId}/sessions`, { method: 'POST', body: JSON.stringify(data) }),
+
+    messages: (agentId: string, sessionId: string, limit = 200) =>
+        request<any[]>(`/agents/${agentId}/sessions/${sessionId}/messages?limit=${limit}`),
 };
 
 // ─── Tasks ────────────────────────────────────────────

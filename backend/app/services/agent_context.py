@@ -449,6 +449,7 @@ async def build_agent_context(
     role_description: str = "",
     current_user_name: str = None,
     is_group: bool = False,
+    channel_context: dict | None = None,
 ) -> tuple[str, str]:
     """Build a rich system prompt incorporating agent's full context.
 
@@ -822,6 +823,14 @@ Strict rules:
         "_Record important information and knowledge here._",
     ):
         dynamic_parts.append(f"\n## Memory\n{memory}")
+
+    if channel_context:
+        channel_lines = ["\n## Current Channel"]
+        for key in ("source_channel", "display_name", "client_surface"):
+            value = channel_context.get(key)
+            if value:
+                channel_lines.append(f"{key}: {value}")
+        dynamic_parts.append("\n".join(channel_lines))
 
     # --- Focus (working memory) --- DISABLED: injecting completed focus items
     # into the system prompt was reinforcing stale workflow patterns over updated

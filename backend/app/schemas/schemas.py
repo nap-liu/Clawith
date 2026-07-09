@@ -193,6 +193,16 @@ class OAuthCallbackRequest(BaseModel):
     pending_token: str | None = None
 
 
+class AuthCodeExchangeRequest(BaseModel):
+    provider: str
+    code: str
+    state: str | None = None
+    redirect_uri: str
+    purpose: str
+    channel: str = "web"
+    context: dict | None = None
+
+
 class IdentityBindRequest(BaseModel):
     provider_type: str
     code: str  # OAuth code for binding

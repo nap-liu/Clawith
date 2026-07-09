@@ -25,6 +25,7 @@ from app.models.task import Task
 from app.models.user import User
 from app.services.activity_logger import log_activity
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
+from app.services.auth_code_exchange import validate_platform_login_channel
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.llm import call_llm_with_failover
 from app.services.onboarding import is_onboarded, mark_onboarding_phase, resolve_onboarding_prompt
@@ -215,9 +216,10 @@ async def websocket_chat(
     token: str = Query(...),
     session_id: str = Query(None),
     lang: str = Query("en"),
+    channel: str = Query("web"),
 ):
     """WebSocket endpoint for real-time chat with an agent."""
-    handler = WebSocketChatHandler(websocket, agent_id, token, session_id, lang)
+    handler = WebSocketChatHandler(websocket, agent_id, token, session_id, lang, channel)
     await handler.run()
 
 
@@ -231,12 +233,14 @@ class WebSocketChatHandler:
         token: str,
         session_id: str | None = None,
         lang: str = "en",
+        channel: str = "web",
     ):
         self.websocket = websocket
         self.agent_id = agent_id
         self.token = token
         self.session_id_param = session_id
         self.lang = lang
+        self.source_channel = validate_platform_login_channel(channel)
 
         # State fields initialized during setup
         self.user: User | None = None
@@ -387,7 +391,12 @@ class WebSocketChatHandler:
 
         # Send session_id to frontend
         await self.websocket.send_json(
-            {"type": "connected", "session_id": self.conv_id, "read_only": self.read_only}
+            {
+                "type": "connected",
+                "session_id": self.conv_id,
+                "read_only": self.read_only,
+                "source_channel": self.source_channel,
+            }
         )
 
         # Build conversation context
@@ -439,7 +448,9 @@ class WebSocketChatHandler:
                 _existing = _sr.scalar_one_or_none()
                 if not _existing:
                     conv_id = None
-                elif _existing.source_channel != "agent" and str(_existing.user_id) != str(user_id):
+                else:
+                    self.source_channel = _existing.source_channel or self.source_channel
+                if _existing and _existing.source_channel != "agent" and str(_existing.user_id) != str(user_id):
                     # Not the owner. Allow a READ-ONLY monitor connection if the
                     # viewer may see others' sessions (same gate as the REST
                     # session/message APIs: admins + the agent creator) — so any
@@ -457,8 +468,8 @@ class WebSocketChatHandler:
                 .where(
                     ChatSession.agent_id == self.agent_id,
                     ChatSession.user_id == user_id,
-                    ChatSession.source_channel == "web",
-                    not ChatSession.is_group,
+                    ChatSession.source_channel == self.source_channel,
+                    ChatSession.is_group.is_(False),
                     ChatSession.is_primary,
                 )
                 .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
@@ -468,12 +479,30 @@ class WebSocketChatHandler:
             if _latest:
                 conv_id = str(_latest.id)
             else:
-                _new_session = await ensure_primary_platform_session(db, self.agent_id, user_id)
+                _new_session = await ensure_primary_platform_session(
+                    db,
+                    self.agent_id,
+                    user_id,
+                    source_channel=self.source_channel,
+                )
                 await db.commit()
                 await db.refresh(_new_session)
                 conv_id = str(_new_session.id)
                 logger.info(f"[WS] Selected primary session {conv_id}")
         return conv_id
+
+    def _channel_context(self) -> dict:
+        if self.source_channel == "wechat_miniprogram":
+            return {
+                "source_channel": "wechat_miniprogram",
+                "display_name": "微信小程序",
+                "client_surface": "h5 web-view",
+            }
+        return {
+            "source_channel": self.source_channel,
+            "display_name": "Web",
+            "client_surface": "desktop web",
+        }
 
     async def _load_history(self, db: AsyncSession):
         """Loads and prepares history messages for the conversation via the shared
@@ -980,6 +1009,7 @@ class WebSocketChatHandler:
                     on_failover=_on_failover,
                     skip_tools=skip_tools_for_greeting,
                     on_code_output=code_output_to_ws,
+                    channel_context=self._channel_context(),
                 )
 
             llm_task = asyncio.create_task(_call_with_failover())

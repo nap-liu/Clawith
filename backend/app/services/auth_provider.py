@@ -786,9 +786,15 @@ class OAuth2AuthProvider(BaseAuthProvider):
         )
         return f"{self.authorize_url}?{params}"
 
-    async def exchange_code_for_token(self, code: str) -> dict:
+    async def exchange_code_for_token(self, code: str, redirect_uri: str | None = None) -> dict:
         import base64
         credentials = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
+        data = {
+            "grant_type": "authorization_code",
+            "code": code,
+        }
+        if redirect_uri and self.config.get("token_exchange_redirect_uri", True) is not False:
+            data["redirect_uri"] = redirect_uri
         
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -796,10 +802,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
                 headers={
                     "Authorization": f"Basic {credentials}",
                 },
-                data={
-                    "grant_type": "authorization_code",
-                    "code": code,
-                },
+                data=data,
             )
             if resp.status_code != 200:
                 logger.error(f"OAuth2 token exchange failed (HTTP {resp.status_code}): {resp.text}")

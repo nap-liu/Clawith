@@ -4,7 +4,7 @@ import pytest
 from urllib.parse import urlparse, parse_qs
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.api.sdk_auth import sign_sdk_state, verify_sdk_state
 from app.database import async_session, engine
@@ -44,7 +44,13 @@ def test_state_expired_rejected():
 @pytest.fixture(autouse=True)
 async def _isolate():
     await engine.dispose()
+    async with async_session() as db:
+        await db.execute(delete(IdentityProvider))
+        await db.commit()
     yield
+    async with async_session() as db:
+        await db.execute(delete(IdentityProvider))
+        await db.commit()
     await engine.dispose()
 
 
@@ -61,6 +67,27 @@ async def _seed_oauth2_provider():
                 "authorize_url": "https://sso.example.com/oauth2/authorize",
                 "scope": "openid",
                 "field_mapping": {"user_id": "userId", "name": "userName", "mobile": "mobile"},
+            },
+        ))
+        await db.commit()
+
+
+async def _seed_h5_only_oauth2_provider():
+    async with async_session() as db:
+        db.add(IdentityProvider(
+            provider_type="oauth2",
+            name="H5 only OAuth",
+            is_active=True,
+            sso_login_enabled=True,
+            config={
+                "provider_key": "oauth-h5",
+                "app_id": "h5-client",
+                "app_secret": "h5-secret",
+                "token_url": "https://oauth.example.com/token",
+                "user_info_url": "https://oauth.example.com/userinfo",
+                "allowed_purposes": ["h5_agent_chat"],
+                "allowed_redirect_hosts": ["app.example.com"],
+                "allowed_redirect_paths": ["/h5/agents/*/chat"],
             },
         ))
         await db.commit()
@@ -88,6 +115,20 @@ async def test_start_redirects_to_authorize_with_return_to():
     assert q["response_type"] == ["code"]
     assert q["scope"] == ["openid"]
     assert "state" in q
+
+
+async def test_start_ignores_h5_only_code_exchange_provider():
+    await _seed_h5_only_oauth2_provider()
+    await _seed_oauth2_provider()
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(
+            "/api/sdk/auth/start",
+            params={"return_to": "https://ai.yeyecha.com/p/abc123"},
+            follow_redirects=False,
+        )
+    assert resp.status_code == 302
+    assert resp.headers["location"].startswith("https://sso.example.com/oauth2/authorize?")
 
 
 async def test_start_rejects_non_p_path():

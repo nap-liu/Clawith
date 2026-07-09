@@ -20,6 +20,7 @@ from app.schemas.schemas import (
     IdentityUnbindRequest,
     OAuthAuthorizeResponse,
     OAuthCallbackRequest,
+    AuthCodeExchangeRequest,
     TokenResponse,
     UserLogin,
     UserOut,
@@ -981,6 +982,60 @@ async def authorize(
         raise HTTPException(status_code=500, detail="Failed to generate authorization URL")
 
     return OAuthAuthorizeResponse(authorization_url=auth_url)
+
+
+@router.post("/code/exchange", response_model=TokenResponse)
+async def exchange_auth_code(
+    data: AuthCodeExchangeRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Exchange an OAuth authorization code for a platform login token."""
+
+    from app.services.auth_code_exchange import (
+        resolve_platform_login_provider,
+        validate_platform_login_channel,
+    )
+
+    validate_platform_login_channel(data.channel)
+    auth_provider = await resolve_platform_login_provider(
+        db,
+        data.provider,
+        purpose=data.purpose,
+        redirect_uri=data.redirect_uri,
+    )
+
+    try:
+        token_data = await auth_provider.exchange_code_for_token(data.code, data.redirect_uri)
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Failed to get access token from provider")
+
+        user_info = await auth_provider.get_user_info(access_token)
+        if not user_info.provider_user_id:
+            raise HTTPException(status_code=502, detail="userinfo response missing user ID field")
+
+        provider_tenant_id = getattr(getattr(auth_provider, "provider", None), "tenant_id", None)
+        user, _ = await auth_provider.find_or_create_user(
+            db,
+            user_info,
+            tenant_id=str(provider_tenant_id) if provider_tenant_id else None,
+        )
+        if not user:
+            raise HTTPException(status_code=500, detail="Failed to create user")
+        if not user.is_active:
+            raise HTTPException(status_code=403, detail="Account is disabled")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Auth code exchange failed for provider={data.provider}: {e}")
+        raise HTTPException(status_code=500, detail="OAuth authentication failed")
+
+    jwt_token = create_access_token(str(user.id), user.role)
+    return TokenResponse(
+        access_token=jwt_token,
+        user=UserOut.model_validate(user),
+        needs_company_setup=user.tenant_id is None,
+    )
 
 
 @router.post("/{provider}/callback", response_model=Any)

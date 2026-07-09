@@ -7,7 +7,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Form
 from loguru import logger
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
+from app.database import get_db
 from app.models.user import User
 from app.services.storage import ensure_local_path, get_storage_backend, guess_content_type, normalize_storage_key
 
@@ -110,20 +113,29 @@ async def upload_file(
     file: UploadFile = File(...),
     agent_id: str = Form(""),
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Upload a file for chat context. Saves to agent workspace/uploads/ and returns extracted text."""
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename")
 
-    ext = os.path.splitext(file.filename)[1].lower()
+    original_filename = file.filename
+    ext = os.path.splitext(original_filename)[1].lower()
 
     content = await file.read()
 
     # Determine save directory
     workspace_path = ""
+    saved_filename = original_filename
     if agent_id:
+        try:
+            parsed_agent_id = uuid.UUID(agent_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid agent_id")
+        await check_agent_access(db, current_user, parsed_agent_id)
+
         storage = get_storage_backend()
-        filename = file.filename.replace("/", "_").replace("\\", "_")
+        filename = original_filename.replace("/", "_").replace("\\", "_")
         workspace_path = f"workspace/uploads/{filename}"
         key = normalize_storage_key(f"{agent_id}/{workspace_path}")
         counter = 1
@@ -135,13 +147,15 @@ async def upload_file(
             counter += 1
         await storage.write_bytes(key, content, content_type=guess_content_type(filename))
         save_path = await ensure_local_path(key)
+        saved_filename = filename
     else:
         # Fallback: save to /tmp (legacy behavior)
         fallback_dir = Path("/tmp/clawith_uploads")
         fallback_dir.mkdir(exist_ok=True)
         file_id = str(uuid.uuid4())[:8]
-        save_path = fallback_dir / f"{file_id}_{file.filename}"
+        save_path = fallback_dir / f"{file_id}_{original_filename}"
         save_path.write_bytes(content)
+        saved_filename = save_path.name
 
     # Extract text (only for known formats)
     is_image = ext in IMAGE_EXTENSIONS
@@ -153,7 +167,7 @@ async def upload_file(
         mime = MIME_MAP.get(ext, "image/png")
         b64 = base64.b64encode(content).decode("ascii")
         image_data_url = f"data:{mime};base64,{b64}"
-        extracted = f"[图片文件: {file.filename}，需要视觉模型分析]"
+        extracted = f"[图片文件: {saved_filename}，需要视觉模型分析]"
     elif ext in EXTRACTABLE:
         extracted = extract_text(save_path, ext)
     else:
@@ -164,8 +178,9 @@ async def upload_file(
         extracted = extracted[:6000] + "\n\n...[内容已截断，共 " + str(len(extracted)) + " 字]"
 
     return {
-        "filename": file.filename,
-        "saved_filename": save_path.name,
+        "filename": saved_filename,
+        "original_filename": original_filename,
+        "saved_filename": saved_filename,
         "size": len(content),
         "extracted_text": extracted,
         "workspace_path": workspace_path,

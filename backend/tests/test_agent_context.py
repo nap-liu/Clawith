@@ -141,6 +141,28 @@ async def test_static_message_sender_tag_section_documents_stable_user_id():
     assert "NOT a session-scoped" in static_p or "not a session-scoped" in static_p.lower()
 
 
+async def test_channel_context_is_dynamic_not_static():
+    agent_id = await _seed_basic_agent()
+    static_p, dynamic_p = await build_agent_context(
+        agent_id,
+        "Test Agent",
+        "role",
+        current_user_name="Alice",
+        is_group=False,
+        channel_context={
+            "source_channel": "wechat_miniprogram",
+            "display_name": "微信小程序",
+            "client_surface": "h5 web-view",
+        },
+    )
+
+    assert "## Current Channel" in dynamic_p
+    assert "source_channel: wechat_miniprogram" in dynamic_p
+    assert "display_name: 微信小程序" in dynamic_p
+    assert "client_surface: h5 web-view" in dynamic_p
+    assert "## Current Channel" not in static_p
+
+
 async def test_build_agent_context_does_not_inject_focus_block():
     """Focus is no longer injected into the dynamic context.
 

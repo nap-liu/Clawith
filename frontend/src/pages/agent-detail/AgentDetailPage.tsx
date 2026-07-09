@@ -8,6 +8,8 @@ import { useDialog } from '../../components/Dialog/DialogProvider';
 import { useToast } from '../../components/Toast/ToastProvider';
 import type { FileBrowserApi } from '../../components/FileBrowser';
 import FileBrowser from '../../components/FileBrowser';
+import ChatImageLightbox from '../../components/ChatImageLightbox';
+import ChatFileDeliveryCard from '../../components/ChatFileDeliveryCard';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
 import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
@@ -30,6 +32,18 @@ const isConfirmationToolCall = (msg: any): boolean => {
 import { useAuthStore } from '../../stores';
 import { copyToClipboard } from '../../utils/clipboard';
 import { formatFileSize } from '../../utils/formatFileSize';
+import {
+    buildChatAttachmentPayload,
+    buildPreviewImage,
+    buildPreviewImagesFromAttachments,
+    extractChatImageDataMarkers,
+    isPreviewableImageName,
+    splitAttachmentFileNames,
+    stripChatImageDataMarkers,
+    type ChatAttachedFile,
+    type ChatPreviewImage,
+} from '../../utils/chatAttachments';
+import { parseFileDeliveryToolResult, type ChatFileDelivery } from '../../utils/chatFileDelivery';
 import {
     IconBrain,
     IconBrowser,
@@ -68,6 +82,17 @@ import SkillsTab from './tabs/SkillsTab';
 import ToolsTab from './tabs/ToolsTab';
 import { useAgentDetailRoute } from './hooks/useAgentDetailRoute';
 import { fetchAuth } from './utils/fetchAuth';
+
+const fileDeliveryFromToolCall = (msg: any): ChatFileDelivery | null => {
+    if (!msg || msg.role !== 'tool_call') return null;
+    const parsed = (() => { try { return JSON.parse(msg.content || '{}'); } catch { return {}; } })();
+    return parseFileDeliveryToolResult(
+        msg.toolName || parsed.name || '',
+        msg.toolResult || parsed.result || (!parsed.name ? msg.content : undefined),
+        msg.toolArgs ?? parsed.args ?? {},
+        msg.toolCallId || parsed.call_id || parsed.id,
+    );
+};
 
 const WORKSPACE_TOOLS = new Set([
     'write_file',
@@ -2184,7 +2209,7 @@ export default function AgentDetailPage() {
     // to 0 only after a socket proves stable (see onopen) so fast-fail loops back
     // off instead of hammering every 2s (the WebSocket reconnect-storm fix).
     const reconnectAttemptsRef = useRef<Record<SessionRuntimeKey, number>>({});
-    const sessionUiStateRef = useRef<Record<SessionRuntimeKey, { isWaiting: boolean; isStreaming: boolean }>>({});
+    const sessionUiStateRef = useRef<Record<SessionRuntimeKey, { isWaiting: boolean; isStreaming: boolean; isStopping: boolean }>>({});
     const activeSessionIdRef = useRef<string | null>(null);
     // True while the active session is a READ-ONLY monitor view (a session the
     // viewer may see but does not own). Live broadcasts are then mirrored into
@@ -2214,8 +2239,8 @@ export default function AgentDetailPage() {
         delete sessionUiStateRef.current[key];
     };
 
-    const setSessionUiState = (key: SessionRuntimeKey, next: Partial<{ isWaiting: boolean; isStreaming: boolean }>) => {
-        const prev = sessionUiStateRef.current[key] || { isWaiting: false, isStreaming: false };
+    const setSessionUiState = (key: SessionRuntimeKey, next: Partial<{ isWaiting: boolean; isStreaming: boolean; isStopping: boolean }>) => {
+        const prev = sessionUiStateRef.current[key] || { isWaiting: false, isStreaming: false, isStopping: false };
         sessionUiStateRef.current[key] = { ...prev, ...next };
     };
 
@@ -2311,6 +2336,7 @@ export default function AgentDetailPage() {
         setWsConnected(false);
         setIsStreaming(false);
         setIsWaiting(false);
+        setIsStopping(false);
     };
 
     const onAdminTabMine = () => {
@@ -2390,7 +2416,7 @@ export default function AgentDetailPage() {
         const targetAgentId = id;
         if (!targetAgentId) return;
         const runtimeKey = buildSessionRuntimeKey(targetAgentId, String(sess.id));
-        const runtimeState = sessionUiStateRef.current[runtimeKey] || { isWaiting: false, isStreaming: false };
+        const runtimeState = sessionUiStateRef.current[runtimeKey] || { isWaiting: false, isStreaming: false, isStopping: false };
         const writable = isWritableSession(sess, scopeOverride);
         activeSessionIdRef.current = sess.id;
         isFirstLoad.current = true;
@@ -2405,6 +2431,7 @@ export default function AgentDetailPage() {
         setHistoryLoadingMore(false);
         setIsStreaming(runtimeState.isStreaming);
         setIsWaiting(runtimeState.isWaiting);
+        setIsStopping(runtimeState.isStopping);
         setActiveSession(sess);
         setAgentExpired(false);
         syncActiveSocketState(sess, targetAgentId);
@@ -2475,6 +2502,7 @@ export default function AgentDetailPage() {
                 setSessions((prev) => [newSess, ...prev]);
                 setIsStreaming(false);
                 setIsWaiting(false);
+                setIsStopping(false);
                 await selectSession(newSess, 'mine');
             } else {
                 const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
@@ -2506,6 +2534,7 @@ export default function AgentDetailPage() {
                 setWsConnected(false);
                 setIsStreaming(false);
                 setIsWaiting(false);
+                setIsStopping(false);
             }
             await fetchMySessions(false, id);
             if (canViewAllAgentChatSessions) await fetchAllSessions();
@@ -2550,7 +2579,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error('保存失败', { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -2629,18 +2658,21 @@ export default function AgentDetailPage() {
     const [wsConnected, setWsConnected] = useState(false);
     const [isWaiting, setIsWaiting] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
+    const [isStopping, setIsStopping] = useState(false);
     const [chatUploadDrafts, setChatUploadDrafts] = useState<{ id: string; name: string; percent: number; previewUrl?: string; sizeBytes: number }[]>([]);
     const chatUploadAbortRef = useRef<Map<string, () => void>>(new Map());
-    type AttachedFileRef = { name: string; text: string; path?: string; imageUrl?: string; source?: 'upload' | 'workspace_auto' };
     type PendingChatMessage = {
         runtimeKey: SessionRuntimeKey;
         contentForLLM: string;
         userMsg: string;
         fileName: string;
         imageUrl?: string;
+        previewImages: ChatPreviewImage[];
         modelId?: string | null;
     };
-    const [attachedFiles, setAttachedFiles] = useState<AttachedFileRef[]>([]);
+    const [attachedFiles, setAttachedFiles] = useState<ChatAttachedFile[]>([]);
+    const attachedImagePreviews = useMemo(() => buildPreviewImagesFromAttachments(attachedFiles), [attachedFiles]);
+    const [chatImagePreview, setChatImagePreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
     const dismissedWorkspaceRefPath = useRef<string | null>(null);
     const pendingChatSendRef = useRef<PendingChatMessage | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
@@ -2831,7 +2863,6 @@ export default function AgentDetailPage() {
     }, [id]);
 
     // Load chat history + connect websocket when chat tab is active
-    const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'];
     const parseChatMsg = (msg: ChatMsg): ChatMsg => {
         if (msg.role !== 'user') return msg;
         let parsed = { ...msg };
@@ -2851,12 +2882,24 @@ export default function AgentDetailPage() {
             const qMatch = msg.content.match(/\nQuestion: ([\s\S]+)$/);
             parsed = { ...msg, fileName, content: qMatch ? qMatch[1].trim() : '' };
         }
-        // If file is an image and no imageUrl yet, build download URL for preview
-        if (parsed.fileName && !parsed.imageUrl && id) {
-            const ext = parsed.fileName.split('.').pop()?.toLowerCase() || '';
-            if (IMAGE_EXTS.includes(ext)) {
-                parsed.imageUrl = `/api/agents/${id}/files/download?path=workspace/uploads/${encodeURIComponent(parsed.fileName)}&token=${token}`;
-            }
+        const markerImages = extractChatImageDataMarkers(parsed.content || '');
+        if (markerImages.length > 0) {
+            parsed = { ...parsed, content: stripChatImageDataMarkers(parsed.content || '') };
+        }
+        // If files are images and no live data URL was provided, build download URLs for preview.
+        if (parsed.fileName && id) {
+            const previewImages = splitAttachmentFileNames(parsed.fileName)
+                .filter(isPreviewableImageName)
+                .map((name) => buildPreviewImage(
+                    `/api/agents/${id}/files/download?path=workspace/uploads/${encodeURIComponent(name)}&token=${token}`,
+                    name,
+                ));
+            const images = previewImages.length > 0 ? previewImages : markerImages;
+            if (!parsed.previewImages && images.length > 0) parsed.previewImages = images;
+            if (!parsed.imageUrl && images.length === 1) parsed.imageUrl = images[0].src;
+        } else if (!parsed.previewImages && markerImages.length > 0) {
+            parsed.previewImages = markerImages;
+            if (!parsed.imageUrl && markerImages.length === 1) parsed.imageUrl = markerImages[0].src;
         }
         return parsed;
     };
@@ -2892,6 +2935,29 @@ export default function AgentDetailPage() {
             if (isStreamingAssistant) return [...prev.slice(0, -1), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() } as any)];
             return [...prev, parseChatMsg({ role: d.role || 'assistant', content: d.content, timestamp: new Date().toISOString() } as any)];
         }
+        if (d.type === 'tool_call') {
+            const toolMsg = {
+                role: 'tool_call',
+                content: '',
+                toolName: d.name,
+                toolCallId: String(d.call_id || d.id || d.index || ''),
+                toolArgs: d.args,
+                toolStatus: d.status,
+                toolResult: d.result,
+                toolThinking: d.reasoning_content,
+                timestamp: new Date().toISOString(),
+            } as any;
+            const revIdx = [...prev].reverse().findIndex((msg: any) => (
+                msg.role === 'tool_call'
+                && toolMsg.toolCallId
+                && msg.toolCallId === toolMsg.toolCallId
+            ));
+            if (revIdx >= 0) {
+                const realIdx = prev.length - 1 - revIdx;
+                return [...prev.slice(0, realIdx), { ...prev[realIdx], ...toolMsg }, ...prev.slice(realIdx + 1)];
+            }
+            return [...prev, toolMsg];
+        }
         return prev;
     };
 
@@ -2910,6 +2976,7 @@ export default function AgentDetailPage() {
         setHistoryMsgs([]);
         setIsStreaming(false);
         setIsWaiting(false);
+        setIsStopping(false);
         setWsConnected(false);
         wsRef.current = null;
         setWorkspaceLockedPath(null);
@@ -2938,6 +3005,7 @@ export default function AgentDetailPage() {
         setWsConnected(false);
         setIsStreaming(false);
         setIsWaiting(false);
+        setIsStopping(false);
         setSessionsLoading(false);
         setAllSessionsLoading(false);
         Object.keys(reconnectDisabledRef.current).forEach((k) => {
@@ -3023,7 +3091,7 @@ export default function AgentDetailPage() {
             }
             const wasCurrent = wsMapRef.current[key] === ws;
             if (wasCurrent) delete wsMapRef.current[key];
-            setSessionUiState(key, { isWaiting: false, isStreaming: false });
+            setSessionUiState(key, { isWaiting: false, isStreaming: false, isStopping: false });
             // 陈旧连接(已被新连接替换或显式关闭)的 onclose 不应扰动当前 UI 状态，也不应触发重连——
             // 否则活跃连接会被误判为断开，引发无谓的 2s 重连循环。
             if (!wasCurrent) return;
@@ -3033,6 +3101,7 @@ export default function AgentDetailPage() {
                 setWsConnected(false);
                 setIsWaiting(false);
                 setIsStreaming(false);
+                setIsStopping(false);
             }
             if (e.code === 4003 || e.code === 4002) {
                 reconnectDisabledRef.current[key] = true;
@@ -3066,6 +3135,7 @@ export default function AgentDetailPage() {
                 setSessionUiState(key, {
                     isWaiting: false,
                     isStreaming: endStreaming ? false : nextStreaming,
+                    ...(endStreaming ? { isStopping: false } : {}),
                 });
             }
             if (!isActiveRuntime) {
@@ -3089,7 +3159,7 @@ export default function AgentDetailPage() {
             // conversation as it streams in, so a monitored channel / other-user
             // session updates live instead of only on reload.
             if (activeReadOnlyRef.current) {
-                if (['channel_user_message', 'thinking', 'chunk', 'done'].includes(d.type)) {
+                if (['channel_user_message', 'thinking', 'chunk', 'tool_call', 'done'].includes(d.type)) {
                     const hel = historyContainerRef.current;
                     const nearBottom = !hel || hel.scrollHeight - hel.scrollTop - hel.clientHeight < 120;
                     setHistoryMsgs(prev => applyMonitorEvent(prev, d));
@@ -3106,7 +3176,10 @@ export default function AgentDetailPage() {
             if (['thinking', 'chunk', 'workspace_draft', 'tool_call', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
                 setIsWaiting(false);
                 if (['thinking', 'chunk', 'workspace_draft', 'tool_call'].includes(d.type)) setIsStreaming(true);
-                if (['done', 'error', 'quota_exceeded'].includes(d.type)) setIsStreaming(false);
+                if (['done', 'error', 'quota_exceeded'].includes(d.type)) {
+                    setIsStreaming(false);
+                    setIsStopping(false);
+                }
             }
 
             // Capture session_id from the 'connected' message for Take Control
@@ -3376,12 +3449,14 @@ export default function AgentDetailPage() {
     const dispatchChatMessage = (socket: WebSocket, runtimeKey: SessionRuntimeKey, payload: PendingChatMessage) => {
         setIsWaiting(true);
         setIsStreaming(false);
-        setSessionUiState(runtimeKey, { isWaiting: true, isStreaming: false });
+        setIsStopping(false);
+        setSessionUiState(runtimeKey, { isWaiting: true, isStreaming: false, isStopping: false });
         setChatMessages(prev => [...prev, parseChatMsg({
             role: 'user',
             content: payload.userMsg,
             fileName: payload.fileName,
             imageUrl: payload.imageUrl,
+            previewImages: payload.previewImages,
             timestamp: new Date().toISOString()
         })]);
         socket.send(JSON.stringify({
@@ -3654,29 +3729,20 @@ export default function AgentDetailPage() {
         forceSenderLabel?: boolean;
         hideAvatar?: boolean;
     }) => {
-        const fe = msg.fileName?.split('.').pop()?.toLowerCase() ?? '';
-        const isImage = msg.imageUrl && ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(fe);
+        const previewImages: ChatPreviewImage[] = msg.previewImages?.length
+            ? msg.previewImages
+            : (msg.imageUrl ? [buildPreviewImage(msg.imageUrl, msg.fileName)] : []);
+        const previewedImageNames = new Set(previewImages.map(image => image.filename).filter(Boolean));
+        const fileChips = splitAttachmentFileNames(msg.fileName).filter(name => !previewedImageNames.has(name));
         const resolvedSenderLabel = msg.sender_name || senderLabel;
         const resolvedAvatarText = avatarText || (resolvedSenderLabel ? resolvedSenderLabel[0] : (isLeft ? 'A' : 'U'));
         const showSenderLabel = !!resolvedSenderLabel && (forceSenderLabel || !!msg.sender_name);
 
-        // Parse [image_data:data:image/...;base64,...] markers from user message content.
-        // The backend persists these markers in the DB to preserve multimodal context
-        // across turns. They must ALWAYS be stripped from displayContent so users never
-        // see raw base64 strings in the chat bubble.
-        // Guard: only collect extracted images for thumbnail rendering when msg.imageUrl
-        // is NOT already set — otherwise the image is already shown via the isImage path
-        // and rendering again from the marker would display it twice.
-        const IMAGE_DATA_RE = /\[image_data:(data:image\/[^;]+;base64,[^\]]+)\]/g;
-        const inlineImages: string[] = [];
-        let displayContent = msg.content || '';
-        if (displayContent.includes('[image_data:')) {
-            displayContent = displayContent.replace(IMAGE_DATA_RE, (_: string, dataUrl: string) => {
-                // Only collect for thumbnail rendering if not already shown via imageUrl
-                if (!msg.imageUrl) inlineImages.push(dataUrl);
-                return ''; // always strip the marker from displayed text
-            }).trim();
-        }
+        const rawDisplayContent = msg.content || '';
+        const inlineImagePreviews = previewImages.length === 0
+            ? extractChatImageDataMarkers(rawDisplayContent)
+            : [];
+        const displayContent = stripChatImageDataMarkers(rawDisplayContent);
 
         const timestampHtml = msg.timestamp ? (() => {
             const d = new Date(msg.timestamp);
@@ -3692,7 +3758,7 @@ export default function AgentDetailPage() {
             return (
                 <div className="chat-msg-timestamp">
                     {timeStr}
-                    {msg.content && <CopyMessageButton text={msg.content} />}
+                    {displayContent && <CopyMessageButton text={displayContent} />}
                 </div>
             );
         })() : null;
@@ -3709,26 +3775,48 @@ export default function AgentDetailPage() {
                     <div className={isLeft ? '' : 'chat-msg-user-line'}>
                         <div className={`chat-msg-bubble${isLeft ? '' : ' chat-msg-bubble--user'}${(msg as any)._streaming && !msg.content && !msg.thinking ? ' chat-msg-bubble--thinking' : ''}`}>
                             {showSenderLabel && <div className="chat-msg-sender">{resolvedSenderLabel}</div>}
-                            {isImage ? (
-                                <div style={{ marginBottom: '4px' }}>
-                                    <img src={msg.imageUrl} alt={msg.fileName} style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '8px', border: '1px solid var(--border-subtle)' }} loading="lazy" />
+                            {previewImages.length > 0 ? (
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: displayContent ? '6px' : '4px' }}>
+                                    {previewImages.map((image, idx) => (
+                                        <button
+                                            key={`${image.src}-${idx}`}
+                                            type="button"
+                                            className="chat-msg-image-preview"
+                                            onClick={() => setChatImagePreview({ images: previewImages, index: idx })}
+                                            title={t('common.preview', 'Preview')}
+                                        >
+                                            <img src={image.src} alt={image.alt || image.filename || 'image'} style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '8px', border: '1px solid var(--border-subtle)', objectFit: 'cover' }} loading="lazy" />
+                                        </button>
+                                    ))}
                                 </div>
-                            ) : (msg.fileName && (
-                                <div className="chat-msg-file-chip" style={{ marginBottom: msg.content ? '4px' : '0' }}>
-                                    <IconPaperclip size={14} stroke={1.8} />
-                                    <span style={{ fontWeight: 500, color: 'var(--text-primary)', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{msg.fileName}</span>
+                            ) : null}
+                            {fileChips.length > 0 && (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: displayContent ? '4px' : '0' }}>
+                                    {fileChips.map((fileName: string) => (
+                                        <div key={fileName} className="chat-msg-file-chip">
+                                            <IconPaperclip size={14} stroke={1.8} />
+                                            <span style={{ fontWeight: 500, color: 'var(--text-primary)', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fileName}</span>
+                                        </div>
+                                    ))}
                                 </div>
-                            ))}
-                            {inlineImages.length > 0 && (
+                            )}
+                            {inlineImagePreviews.length > 0 && (
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: displayContent ? '6px' : '0' }}>
-                                    {inlineImages.map((url, idx) => (
-                                        <img
+                                    {inlineImagePreviews.map((image, idx) => (
+                                        <button
                                             key={idx}
-                                            src={url}
-                                            alt="attached image"
-                                            style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '8px', border: '1px solid var(--border-subtle)', objectFit: 'cover' }}
-                                            loading="lazy"
-                                        />
+                                            type="button"
+                                            className="chat-msg-image-preview"
+                                            onClick={() => setChatImagePreview({ images: inlineImagePreviews, index: idx })}
+                                            title={t('common.preview', 'Preview')}
+                                        >
+                                            <img
+                                                src={image.src}
+                                                alt={image.alt || 'attached image'}
+                                                style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '8px', border: '1px solid var(--border-subtle)', objectFit: 'cover' }}
+                                                loading="lazy"
+                                            />
+                                        </button>
                                     ))}
                                 </div>
                             )}
@@ -3776,7 +3864,9 @@ export default function AgentDetailPage() {
         let hasFutureTool = false;
         for (let i = messages.length - 1; i >= 0; i--) {
             const msg = messages[i];
-            if (msg.role === 'tool_call' && !isConfirmationToolCall(msg)) {
+            if (fileDeliveryFromToolCall(msg)) {
+                msgClass[i] = 'final';
+            } else if (msg.role === 'tool_call' && !isConfirmationToolCall(msg)) {
                 msgClass[i] = 'analysis';
                 hasFutureTool = true;
             } else if (msg.role === 'user') {
@@ -3795,6 +3885,7 @@ export default function AgentDetailPage() {
         // Pass 2: build grouped entries
         type GroupedEntry =
             | { type: 'analysis_group'; items: AnalysisItem[]; key: number }
+            | { type: 'file_delivery'; delivery: ChatFileDelivery; msg: any; i: number }
             | { type: 'msg'; msg: any; i: number };
         const grouped: GroupedEntry[] = [];
         let currentGroup: AnalysisItem[] | null = null;
@@ -3807,6 +3898,13 @@ export default function AgentDetailPage() {
         };
         for (let i = 0; i < messages.length; i++) {
             const msg = messages[i];
+            const fileDelivery = fileDeliveryFromToolCall(msg);
+            if (fileDelivery) {
+                flushGroup();
+                grouped.push({ type: 'file_delivery', delivery: fileDelivery, msg, i });
+                continue;
+            }
+
             if (msgClass[i] === 'analysis') {
                 // Open a new group if needed
                 if (!currentGroup) { currentGroup = []; groupStartKey = i; }
@@ -3874,7 +3972,7 @@ export default function AgentDetailPage() {
                     it => it.type === 'tool' && it.status === 'running'
                 );
                 const hasToolItems = entry.items.some(it => it.type === 'tool');
-                const groupIsRunning = hasRunningTool || (!hasToolItems && isLastEntry && (isWaiting || isStreaming));
+                const groupIsRunning = hasRunningTool || (!hasToolItems && isLastEntry && (isWaiting || isStreaming || isStopping));
                 // Owner = first final assistant message after this group; its
                 // perspective (left/right + avatar) drives the card alignment.
                 let owner: any = null;
@@ -3895,6 +3993,20 @@ export default function AgentDetailPage() {
                             expanded={toolGroupExpandedRef.current.has(entry.key) ? !!toolGroupExpandedRef.current.get(entry.key) : false}
                             onToggle={() => toggleToolGroup(entry.key)}
                             isGroupRunning={groupIsRunning}
+                        />
+                    </div>
+                );
+            }
+            if (entry.type === 'file_delivery') {
+                const cardAvatar = (((agent as any)?.name || 'Agent')[0]) || 'A';
+                return (
+                    <div key={`file-delivery-${entry.delivery.id}-${entry.i}`} className="chat-msg-row chat-msg-row--file-delivery">
+                        <div className="chat-msg-avatar">{cardAvatar}</div>
+                        <ChatFileDeliveryCard
+                            agentId={id!}
+                            delivery={entry.delivery}
+                            mode="pc"
+                            onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
                         />
                     </div>
                 );
@@ -4067,52 +4179,24 @@ export default function AgentDetailPage() {
     const sendChatMsg = () => {
         if (!id || !activeSession?.id) return;
         if (showNoModelState) return;
+        if (isWaiting || isStreaming || isStopping) return;
         const activeRuntimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
         const activeSocket = wsMapRef.current[activeRuntimeKey];
         if (!chatInput.trim() && attachedFiles.length === 0) return;
 
-        let userMsg = chatInput.trim();
-        let contentForLLM = userMsg;
-        let displayFiles = '';
-
-        if (attachedFiles.length > 0) {
-            let filesPrompt = '';
-            let filesDisplay = '';
-
-            attachedFiles.forEach(file => {
-                filesDisplay += `[Attachment: ${file.name}] `;
-                if (file.imageUrl && supportsVision) {
-                    filesPrompt += `[image_data:${file.imageUrl}]\n`;
-                } else if (file.imageUrl) {
-                    filesPrompt += `[图片文件已上传: ${file.name}，保存在 ${file.path || ''}]\n`;
-                } else {
-                    const wsPath = file.path || '';
-                    const codePath = wsPath.replace(/^workspace\//, '');
-                    const fileLoc = wsPath ? `\nFile location: ${wsPath} (for read_file/read_document tools)\nIn execute_code, use relative path: "${codePath}" (working directory is workspace/)\n` : '';
-                    if (file.source === 'workspace_auto') {
-                        filesPrompt += `[Workspace reference: ${file.name}]${fileLoc}\nUse read_file or read_document if you need the file contents.\n\n`;
-                    } else {
-                        filesPrompt += `[File: ${file.name}]${fileLoc}\n${file.text}\n\n`;
-                    }
-                }
-            });
-
-            if (supportsVision && attachedFiles.some(f => f.imageUrl)) {
-                contentForLLM = userMsg ? `${filesPrompt}\n${userMsg}` : `${filesPrompt}\n请分析这些文件`;
-            } else {
-                contentForLLM = userMsg ? `${filesPrompt}\nQuestion: ${userMsg}` : `Please analyze these files:\n\n${filesPrompt}`;
-            }
-
-            displayFiles = filesDisplay.trim();
-            userMsg = userMsg ? `${displayFiles}\n${userMsg}` : displayFiles;
-        }
+        const attachmentPayload = buildChatAttachmentPayload({
+            input: chatInput.trim(),
+            attachments: attachedFiles,
+            supportsVision,
+        });
 
         const payload: PendingChatMessage = {
             runtimeKey: activeRuntimeKey,
-            contentForLLM,
-            userMsg,
-            fileName: attachedFiles.map(f => f.name).join(', '),
-            imageUrl: attachedFiles.length === 1 ? attachedFiles[0].imageUrl : undefined,
+            contentForLLM: attachmentPayload.contentForLLM,
+            userMsg: attachmentPayload.userMsg,
+            fileName: attachmentPayload.fileName,
+            imageUrl: attachmentPayload.imageUrl,
+            previewImages: attachmentPayload.previewImages,
             modelId: effectiveChatModelId,
         };
 
@@ -4172,12 +4256,13 @@ export default function AgentDetailPage() {
             chatUploadAbortRef.current.set(draft.id, abort);
             try {
                 const data = await promise;
+                const uploadedName = data.saved_filename || data.filename || file.name;
                 if (draft.previewUrl) URL.revokeObjectURL(draft.previewUrl);
                 setChatUploadDrafts((prev) => prev.filter((d) => d.id !== draft.id));
                 chatUploadAbortRef.current.delete(draft.id);
                 setAttachedFiles((prev) =>
                     [...prev, {
-                        name: data.filename,
+                        name: uploadedName,
                         text: data.extracted_text,
                         path: data.workspace_path,
                         imageUrl: data.image_data_url || undefined,
@@ -4245,12 +4330,13 @@ export default function AgentDetailPage() {
             chatUploadAbortRef.current.set(draft.id, abort);
             try {
                 const data = await promise;
+                const uploadedName = data.saved_filename || data.filename || file.name;
                 if (draft.previewUrl) URL.revokeObjectURL(draft.previewUrl);
                 setChatUploadDrafts((prev) => prev.filter((d) => d.id !== draft.id));
                 chatUploadAbortRef.current.delete(draft.id);
                 setAttachedFiles((prev) =>
                     [...prev, {
-                        name: data.filename,
+                        name: uploadedName,
                         text: data.extracted_text,
                         path: data.workspace_path,
                         imageUrl: data.image_data_url || undefined,
@@ -4269,7 +4355,7 @@ export default function AgentDetailPage() {
 
     // ── Drag-and-drop chat file upload ──
     const handleDroppedChatFiles = useCallback(async (files: File[]) => {
-        if (!wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || attachedFiles.length >= 10) return;
+        if (!wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10) return;
         const availableSlots = Math.max(0, 10 - attachedFiles.length);
         const filesToProcess = files.slice(0, availableSlots);
 
@@ -4299,11 +4385,11 @@ export default function AgentDetailPage() {
                 setChatUploadDrafts(prev => prev.filter(d => d.id !== draftId));
             }
         }
-    }, [id, wsConnected, chatUploadDrafts.length, isWaiting, isStreaming, attachedFiles.length, isWritableSession, t]);
+    }, [id, wsConnected, chatUploadDrafts.length, isWaiting, isStreaming, isStopping, attachedFiles.length, isWritableSession, t]);
 
     const { isDragging: isChatDragging, dropZoneProps: chatDropProps } = useDropZone({
         onDrop: handleDroppedChatFiles,
-        disabled: !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || attachedFiles.length >= 10 || !activeSession || !isWritableSession(activeSession),
+        disabled: !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10 || !activeSession || !isWritableSession(activeSession),
     });
 
     // Expandable activity log
@@ -6622,36 +6708,48 @@ export default function AgentDetailPage() {
                                                             </div>
                                                         </div>
                                                     ))}
-                                                    {attachedFiles.map((file, idx) => (
-                                                        <div
-                                                            key={`a-${idx}-${file.name}`}
-                                                            className={`chat-file-pill ${file.source === 'workspace_auto' ? 'chat-file-pill--workspace' : ''}`}
-                                                            title={file.path || file.name}
-                                                        >
-                                                            <div className="chat-file-pill__row">
-                                                                {file.imageUrl ? (
-                                                                    <img className="chat-file-pill__thumb" src={file.imageUrl} alt="" />
-                                                                ) : (
-                                                                    <span className="chat-file-pill__icon">
-                                                                        <IconPaperclip size={14} stroke={1.75} />
-                                                                    </span>
-                                                                )}
-                                                                <span className="chat-file-pill__name">{file.name}</span>
-                                                                {file.source === 'workspace_auto' && <span className="chat-file-pill__source">Workspace</span>}
-                                                                <button
-                                                                    type="button"
-                                                                    className="chat-file-pill__remove"
-                                                                    onClick={() => {
-                                                                        if (file.source === 'workspace_auto' && file.path) dismissedWorkspaceRefPath.current = file.path;
-                                                                        setAttachedFiles((prev) => prev.filter((_, i) => i !== idx));
-                                                                    }}
-                                                                    title="Remove file"
-                                                                >
-                                                                    ×
-                                                                </button>
+                                                    {attachedFiles.map((file, idx) => {
+                                                        const imageIndex = attachedImagePreviews.findIndex((image) => image.src === file.imageUrl);
+                                                        return (
+                                                            <div
+                                                                key={`a-${idx}-${file.name}`}
+                                                                className={`chat-file-pill ${file.source === 'workspace_auto' ? 'chat-file-pill--workspace' : ''}`}
+                                                                title={file.path || file.name}
+                                                            >
+                                                                <div className="chat-file-pill__row">
+                                                                    {file.imageUrl ? (
+                                                                        <button
+                                                                            type="button"
+                                                                            className="chat-file-pill__thumb-button"
+                                                                            onClick={() => {
+                                                                                if (imageIndex >= 0) setChatImagePreview({ images: attachedImagePreviews, index: imageIndex });
+                                                                            }}
+                                                                            title={t('common.preview', 'Preview')}
+                                                                        >
+                                                                            <img className="chat-file-pill__thumb" src={file.imageUrl} alt="" />
+                                                                        </button>
+                                                                    ) : (
+                                                                        <span className="chat-file-pill__icon">
+                                                                            <IconPaperclip size={14} stroke={1.75} />
+                                                                        </span>
+                                                                    )}
+                                                                    <span className="chat-file-pill__name">{file.name}</span>
+                                                                    {file.source === 'workspace_auto' && <span className="chat-file-pill__source">Workspace</span>}
+                                                                    <button
+                                                                        type="button"
+                                                                        className="chat-file-pill__remove"
+                                                                        onClick={() => {
+                                                                            if (file.source === 'workspace_auto' && file.path) dismissedWorkspaceRefPath.current = file.path;
+                                                                            setAttachedFiles((prev) => prev.filter((_, i) => i !== idx));
+                                                                        }}
+                                                                        title="Remove file"
+                                                                    >
+                                                                        ×
+                                                                    </button>
+                                                                </div>
                                                             </div>
-                                                        </div>
-                                                    ))}
+                                                        );
+                                                    })}
                                                 </div>
                                             )}
                                             <div className="chat-composer-input-block">
@@ -6669,7 +6767,7 @@ export default function AgentDetailPage() {
                                                     }}
                                                     onKeyDown={e => {
                                                         // Enter sends the message; Shift+Enter inserts a newline
-                                                        if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isWaiting && !isStreaming) {
+                                                        if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isWaiting && !isStreaming && !isStopping) {
                                                             e.preventDefault();
                                                             sendChatMsg();
                                                         }
@@ -6685,7 +6783,7 @@ export default function AgentDetailPage() {
                                                     type="button"
                                                     className="chat-composer-btn"
                                                     onClick={() => fileInputRef.current?.click()}
-                                                    disabled={showNoModelState || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || attachedFiles.length >= 10}
+                                                    disabled={showNoModelState || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10}
                                                     title={t('agent.workspace.uploadFile')}
                                                 >
                                                     <IconPaperclip size={16} stroke={1.75} />
@@ -6697,7 +6795,7 @@ export default function AgentDetailPage() {
                                                     disabled={showNoModelState || !wsConnected}
                                                 />
                                                 <div style={{ flex: 1 }} />
-                                                {(isStreaming || isWaiting) ? (
+                                                {(isStreaming || isWaiting || isStopping) ? (
                                                     <button
                                                         type="button"
                                                         className="btn btn-stop-generation"
@@ -6707,9 +6805,13 @@ export default function AgentDetailPage() {
                                                             const activeSocket = wsMapRef.current[activeRuntimeKey];
                                                             if (activeSocket?.readyState === WebSocket.OPEN) {
                                                                 activeSocket.send(JSON.stringify({ type: 'abort' }));
+                                                                setIsStopping(true);
+                                                                setSessionUiState(activeRuntimeKey, { isStopping: true });
+                                                            } else {
                                                                 setIsStreaming(false);
                                                                 setIsWaiting(false);
-                                                                setSessionUiState(activeRuntimeKey, { isWaiting: false, isStreaming: false });
+                                                                setIsStopping(false);
+                                                                setSessionUiState(activeRuntimeKey, { isWaiting: false, isStreaming: false, isStopping: false });
                                                             }
                                                         }}
                                                         title={t('chat.stop', 'Stop')}
@@ -7000,6 +7102,15 @@ export default function AgentDetailPage() {
                         }
                     }
                 }}
+            />
+
+            <ChatImageLightbox
+                open={!!chatImagePreview}
+                images={chatImagePreview?.images || []}
+                index={chatImagePreview?.index || 0}
+                mode="desktop"
+                onClose={() => setChatImagePreview(null)}
+                onIndexChange={(index) => setChatImagePreview((prev) => prev ? { ...prev, index } : prev)}
             />
 
             {

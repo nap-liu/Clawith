@@ -72,9 +72,21 @@ async def _load_oauth2_provider(db: AsyncSession) -> OAuth2AuthProvider:
             IdentityProvider.provider_type == "oauth2",
             IdentityProvider.is_active == True,  # noqa: E712
             IdentityProvider.sso_login_enabled == True,  # noqa: E712
-        ).limit(1)
+        ).order_by(IdentityProvider.created_at.asc(), IdentityProvider.id.asc())
     )
-    model = result.scalar_one_or_none()
+    models = list(result.scalars().all())
+
+    sdk_explicit = []
+    legacy = []
+    for candidate in models:
+        config = candidate.config if isinstance(candidate.config, dict) else {}
+        allowed_purposes = config.get("allowed_purposes") or []
+        if "sdk_auth" in allowed_purposes:
+            sdk_explicit.append(candidate)
+        elif not allowed_purposes:
+            legacy.append(candidate)
+
+    model = (sdk_explicit or legacy or [None])[0]
     if not model:
         raise HTTPException(status_code=503, detail="OAuth2 provider not configured")
     return OAuth2AuthProvider(provider=model)

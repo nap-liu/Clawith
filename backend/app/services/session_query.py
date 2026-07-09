@@ -41,7 +41,18 @@ from app.models.user import User
 # Every IM/web channel where a real human is the conversation partner. Anything
 # not in this set (``agent``, ``trigger``) is a non-human / unattended turn.
 HUMAN_CHANNELS = frozenset(
-    {"web", "feishu", "dingtalk", "wecom", "slack", "discord", "teams", "whatsapp", "wechat"}
+    {
+        "web",
+        "wechat_miniprogram",
+        "feishu",
+        "dingtalk",
+        "wecom",
+        "slack",
+        "discord",
+        "teams",
+        "whatsapp",
+        "wechat",
+    }
 )
 
 # Scope kinds returned by resolve_scope.
