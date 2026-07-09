@@ -1,5 +1,6 @@
 """Clawith Backend — FastAPI Application Entry Point."""
 
+import asyncio
 import os
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
@@ -32,6 +33,28 @@ def _role_enabled(*required: str) -> bool:
     if "all" in roles:
         return True
     return any(role in roles for role in required)
+
+
+def _turn_recovery_enabled() -> bool:
+    return os.environ.get("TURN_RECOVERY_ENABLED", "true").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+async def _run_startup_turn_recovery() -> None:
+    try:
+        from app.services.turn_recovery import startup_turn_resume_once
+
+        recovery_stats = await startup_turn_resume_once()
+        logger.info(f"[startup] turn recovery complete: {recovery_stats}")
+    except asyncio.CancelledError:
+        logger.info("[startup] turn recovery task cancelled")
+        raise
+    except Exception as e:
+        logger.exception(f"[startup] turn recovery failed: {e}")
 
 
 def _log_bwrap_startup_status() -> None:
@@ -140,8 +163,6 @@ async def lifespan(app: FastAPI):
             "This is insecure for production. Set unique secrets in your .env file."
         )
 
-    import asyncio
-    import os
     from app.services.trigger_daemon import start_trigger_daemon
     from app.services.tool_seeder import seed_builtin_tools
     from app.services.template_seeder import seed_agent_templates
@@ -291,19 +312,6 @@ async def lifespan(app: FastAPI):
         from app.services.audit_logger import write_audit_log
         await write_audit_log("server_startup", {"pid": os.getpid()})
 
-        if os.environ.get("TURN_RECOVERY_ENABLED", "true").lower() not in {"0", "false", "no", "off"}:
-            try:
-                from app.services.turn_recovery import startup_turn_resume_once
-
-                recovery_stats = await startup_turn_resume_once()
-                logger.info(f"[startup] turn recovery complete: {recovery_stats}")
-            except Exception as e:
-                logger.error(f"[startup] turn recovery failed: {e}")
-                import traceback
-                traceback.print_exc()
-        else:
-            logger.info("[startup] turn recovery disabled (TURN_RECOVERY_ENABLED is not enabled)")
-
         def _bg_task_error(t):
             """Callback to surface background task exceptions."""
             try:
@@ -321,6 +329,18 @@ async def lifespan(app: FastAPI):
         # deploy doesn't run every loop on every instance. Our cli_tools GC is a
         # worker-side maintenance loop, so it rides with the worker role.
         task_specs = []
+        app.state.turn_recovery_task = None
+        if _turn_recovery_enabled():
+            turn_recovery_task = asyncio.create_task(
+                _run_startup_turn_recovery(),
+                name="turn_recovery",
+            )
+            turn_recovery_task.add_done_callback(_bg_task_error)
+            app.state.turn_recovery_task = turn_recovery_task
+            logger.info("[startup] created bg task: turn_recovery")
+        else:
+            logger.info("[startup] turn recovery disabled (TURN_RECOVERY_ENABLED is not enabled)")
+
         if _role_enabled("all", "worker"):
             task_specs.append(("trigger_daemon", start_trigger_daemon()))
             task_specs.append(("cli_tools_gc", cli_tools_gc_loop()))
@@ -363,6 +383,11 @@ async def lifespan(app: FastAPI):
         logger.error(f"[startup] MCP session manager failed to start: {_mcp_exc} — /mcp requests will fail")
 
     yield
+
+    turn_recovery_task = getattr(app.state, "turn_recovery_task", None)
+    if turn_recovery_task and not turn_recovery_task.done():
+        turn_recovery_task.cancel()
+        await asyncio.gather(turn_recovery_task, return_exceptions=True)
 
     # Shutdown MCP session manager if it was successfully started
     if _mcp_available:

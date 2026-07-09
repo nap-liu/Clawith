@@ -300,11 +300,12 @@ async def _tail_has_pending_confirmation(db, anchor: ChatMessage, *, ctx_size: i
 
 
 async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
-    """Resume startup-recoverable turn anchors once before background loops start.
+    """Resume startup-recoverable turn anchors once.
 
-    All app instances should pass through this gate. The advisory lock makes
+    All app instances may pass through this gate. The advisory lock makes
     non-winning instances wait until the winner finishes recovery, preventing
-    trigger/connectors from racing with resumed turns.
+    duplicate recovery work across replicas. Callers may run this synchronously
+    or as a detached startup background task.
     """
     stats = RecoveryStats()
     async with async_session() as db:
