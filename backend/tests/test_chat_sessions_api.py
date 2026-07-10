@@ -1,5 +1,6 @@
+import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -312,6 +313,149 @@ async def test_creator_can_view_other_users_session_messages(monkeypatch):
             "created_at": now.isoformat(),
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_session_messages_fold_append_only_tool_events(monkeypatch):
+    user_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    started_at = datetime.now(UTC)
+    search_call_id = "call_search"
+    remove_call_id = "call_remove"
+
+    current_user = SimpleNamespace(id=user_id, role="member")
+    session = SimpleNamespace(
+        id=session_id,
+        agent_id=agent_id,
+        peer_agent_id=None,
+        user_id=user_id,
+        source_channel="wechat_miniprogram",
+        is_group=False,
+    )
+
+    def message(role, content, offset_seconds):
+        return SimpleNamespace(
+            id=uuid.uuid4(),
+            role=role,
+            content=content,
+            thinking=None,
+            created_at=started_at + timedelta(seconds=offset_seconds),
+            participant_id=None,
+            user_id=user_id,
+        )
+
+    rows = [
+        message("user", "移除联系人", 0),
+        message("tool_call", json.dumps({
+            "name": "search_contacts",
+            "call_id": search_call_id,
+            "args": {"query": "胡云"},
+            "status": "running",
+            "result": "",
+        }), 1),
+        message("tool_call", json.dumps({
+            "name": "search_contacts",
+            "call_id": search_call_id,
+            "args": {"query": "胡云"},
+            "status": "done",
+            "result": "found",
+        }), 2),
+        message("tool_call", json.dumps({
+            "name": "remove_contact",
+            "call_id": remove_call_id,
+            "args": {"target_id": "human-1"},
+            "status": "running",
+            "result": "",
+        }), 3),
+        message("tool_call", json.dumps({
+            "name": "remove_contact",
+            "call_id": remove_call_id,
+            "args": {"target_id": "human-1"},
+            "status": "done",
+            "result": "removed",
+        }), 4),
+        message("assistant", "已完成", 5),
+    ]
+    # The SQL query returns newest-first; the handler reverses it before rendering.
+    db = RecordingDB(responses=[DummyResult([session]), DummyResult(reversed(rows))])
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return SimpleNamespace(id=agent_id, creator_id=uuid.uuid4()), "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    messages = await chat_sessions_api.get_session_messages(
+        agent_id=agent_id,
+        session_id=session_id,
+        limit=200,
+        before=None,
+        current_user=current_user,
+        db=db,
+    )
+
+    tool_messages = [item for item in messages if item["role"] == "tool_call"]
+    assert len(tool_messages) == 2
+    assert [(item["toolName"], item["toolStatus"]) for item in tool_messages] == [
+        ("search_contacts", "done"),
+        ("remove_contact", "done"),
+    ]
+    assert [item["toolCallId"] for item in tool_messages] == [search_call_id, remove_call_id]
+    assert tool_messages[0]["toolResult"] == "found"
+    assert tool_messages[0]["created_at"] == (started_at + timedelta(seconds=1)).isoformat()
+    assert messages[-1]["role"] == "assistant"
+
+
+@pytest.mark.asyncio
+async def test_session_messages_keep_row_id_as_confirmation_handle(monkeypatch):
+    user_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    row_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    current_user = SimpleNamespace(id=user_id, role="member")
+    session = SimpleNamespace(
+        id=session_id,
+        agent_id=agent_id,
+        peer_agent_id=None,
+        user_id=user_id,
+        source_channel="wechat_miniprogram",
+        is_group=False,
+    )
+    pending_confirmation = SimpleNamespace(
+        id=row_id,
+        role="tool_call",
+        content=json.dumps({
+            "name": "request_confirmation",
+            "call_id": "model-confirmation-id",
+            "args": {"title": "确认移除"},
+            "status": "pending",
+            "result": "",
+        }),
+        created_at=now,
+        participant_id=None,
+        user_id=user_id,
+    )
+    db = RecordingDB(responses=[DummyResult([session]), DummyResult([pending_confirmation])])
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return SimpleNamespace(id=agent_id, creator_id=uuid.uuid4()), "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    messages = await chat_sessions_api.get_session_messages(
+        agent_id=agent_id,
+        session_id=session_id,
+        limit=200,
+        before=None,
+        current_user=current_user,
+        db=db,
+    )
+
+    assert len(messages) == 1
+    assert messages[0]["toolName"] == "request_confirmation"
+    assert messages[0]["toolCallId"] == str(row_id)
+    assert messages[0]["toolStatus"] == "pending"
 
 
 @pytest.mark.asyncio

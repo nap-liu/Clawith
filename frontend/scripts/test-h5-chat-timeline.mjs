@@ -87,6 +87,23 @@ const {
 }
 
 {
+    const history = [
+        { role: 'user', content: '移除联系人', created_at: '2026-07-10T01:20:00Z' },
+        { role: 'tool_call', content: '', toolName: 'search_contacts', toolCallId: 'call-search', toolArgs: { query: '胡云' }, toolStatus: 'done', toolResult: 'found' },
+        { role: 'tool_call', content: '', toolName: 'remove_contact', toolCallId: 'call-remove', toolArgs: { target_id: 'human-1' }, toolStatus: 'done', toolResult: 'removed' },
+        { role: 'assistant', content: '已完成', created_at: '2026-07-10T01:20:05Z' },
+    ].map((row, index) => mapHistoryMessage(row, () => `history-${index}`));
+
+    const entries = buildH5ConversationEntries(history);
+    const analysis = entries.find((entry) => entry.type === 'analysis_group');
+    assert.ok(analysis);
+    assert.equal(analysis.running, false);
+    assert.equal(analysis.items.filter((item) => item.type === 'tool').length, 2);
+    assert.equal(entries.at(-1).type, 'message');
+    assert.equal(entries.at(-1).msg.content, '已完成');
+}
+
+{
     const deliveryResult = JSON.stringify({
         type: 'platform_file_delivery',
         path: 'workspace/reports/report.pdf',

@@ -705,13 +705,16 @@ def parse_tool_call_for_display(content: str) -> dict[str, Any]:
     # gets the real connection string; humans/clients must not).
     from app.utils.sanitize import sanitize_tool_args
 
-    return {
+    display = {
         "toolName": payload["name"],
         "toolArgs": sanitize_tool_args(payload["args"]),
         "toolStatus": payload["status"] or "done",
         "toolResult": payload["result"] or "",
         "toolThinking": payload["reasoning_content"] or "",
     }
+    if payload["call_id"]:
+        display["toolCallId"] = str(payload["call_id"])
+    return display
 
 
 def strip_leading_orphan_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

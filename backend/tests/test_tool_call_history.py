@@ -124,6 +124,7 @@ def test_display_parse_web_schema():
         json.dumps(
             {
                 "name": "read_file",
+                "call_id": "call-123",
                 "args": {"path": "a"},
                 "status": "done",
                 "result": "r",
@@ -134,6 +135,7 @@ def test_display_parse_web_schema():
     assert out["toolName"] == "read_file"
     assert out["toolArgs"] == {"path": "a"}
     assert out["toolStatus"] == "done"
+    assert out["toolCallId"] == "call-123"
     assert out["toolResult"] == "r"
     assert out["toolThinking"] == "think"
 
