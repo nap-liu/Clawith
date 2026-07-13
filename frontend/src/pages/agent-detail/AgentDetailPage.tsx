@@ -15,7 +15,7 @@ import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
 import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
-import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
+import { activityApi, agentApi, channelApi, chatSessionApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import type { FocusApiItem } from '../../services/api';
 import ModelSwitcher from '../../components/ModelSwitcher';
 import ConfirmationCard from '../../components/ConfirmationCard';
@@ -44,6 +44,7 @@ import {
     type ChatPreviewImage,
 } from '../../utils/chatAttachments';
 import { parseFileDeliveryToolResult, type ChatFileDelivery } from '../../utils/chatFileDelivery';
+import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import {
     IconBrain,
     IconBrowser,
@@ -2002,6 +2003,18 @@ export default function AgentDetailPage() {
     const { id } = useParams<{ id: string }>();
     const navigate = useNavigate();
     const location = useLocation();
+    const skipNextSessionUrlRestoreRef = useRef(false);
+    const requestedSessionId = useMemo(
+        () => parseChatSessionId(new URLSearchParams(location.search).get('session_id')),
+        [location.search],
+    );
+    const writeSessionIdToUrl = useCallback((sessionId: string | null | undefined) => {
+        const nextHref = writeChatSessionIdToHref(window.location.href, sessionId);
+        const currentHref = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+        if (nextHref === currentHref) return false;
+        navigate(nextHref, { replace: true });
+        return true;
+    }, [navigate]);
     const queryClient = useQueryClient();
     const {
         activeTab,
@@ -2290,7 +2303,7 @@ export default function AgentDetailPage() {
         const pt = String(sess.participant_type || 'user').toLowerCase();
         if (sc === 'agent' || pt === 'agent') return false;
         if (sess.is_group) return false;
-        if (canViewAllAgentChatSessions && scopeOverride === 'all') return false;
+        if (scopeOverride === 'all') return false;
         const su = sessionUserIdStr(sess);
         const vu = viewerUserIdStr();
         if (su && vu && su !== vu) return false;
@@ -2337,6 +2350,8 @@ export default function AgentDetailPage() {
         setIsStreaming(false);
         setIsWaiting(false);
         setIsStopping(false);
+        skipNextSessionUrlRestoreRef.current = true;
+        if (!writeSessionIdToUrl(null)) skipNextSessionUrlRestoreRef.current = false;
     };
 
     const onAdminTabMine = () => {
@@ -2387,7 +2402,7 @@ export default function AgentDetailPage() {
     };
 
     const fetchAllSessions = async () => {
-        if (!id || !canViewAllAgentChatSessions) return;
+        if (!id || !canViewAllAgentChatSessions) return [];
         setAllSessionsLoading(true);
         try {
             const tkn = localStorage.getItem('token');
@@ -2398,6 +2413,7 @@ export default function AgentDetailPage() {
                     .filter((s: any) => String(s.source_channel || 'direct').toLowerCase() !== 'trigger')
                     .map((row: any) => normalizeChatSession(row));
                 setAllSessions(all);
+                return all;
             } else {
                 setAllSessions([]);
                 if (res.status === 403) {
@@ -2409,6 +2425,7 @@ export default function AgentDetailPage() {
         } finally {
             setAllSessionsLoading(false);
         }
+        return [];
     };
 
     const selectSession = async (rawSess: any, scopeOverride: 'mine' | 'all' = chatScope) => {
@@ -2433,6 +2450,7 @@ export default function AgentDetailPage() {
         setIsWaiting(runtimeState.isWaiting);
         setIsStopping(runtimeState.isStopping);
         setActiveSession(sess);
+        writeSessionIdToUrl(String(sess.id));
         setAgentExpired(false);
         syncActiveSocketState(sess, targetAgentId);
         if (writable) scheduleComposerFocus();
@@ -2526,18 +2544,14 @@ export default function AgentDetailPage() {
             await fetch(`/api/agents/${id}/sessions/${sessionId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${tkn}` } });
             if (id) closeSessionSocket(buildSessionRuntimeKey(id, sessionId), true);
             // If deleted the active session, clear it
-            if (activeSession?.id === sessionId) {
-                activeSessionIdRef.current = null;
-                setActiveSession(null);
-                setChatMessages([]);
-                setHistoryMsgs([]);
-                setWsConnected(false);
-                setIsStreaming(false);
-                setIsWaiting(false);
-                setIsStopping(false);
-            }
-            await fetchMySessions(false, id);
+            const deletedActiveSession = String(activeSession?.id || '') === String(sessionId);
+            if (deletedActiveSession) clearChatSelection();
+            const remainingMine = await fetchMySessions(false, id);
             if (canViewAllAgentChatSessions) await fetchAllSessions();
+            if (deletedActiveSession && remainingMine.length > 0) {
+                setChatScope('mine');
+                await selectSession(remainingMine[0], 'mine');
+            }
         } catch (e: any) {
             toast.error('删除失败', { details: String(e?.message || e) });
         }
@@ -3021,12 +3035,70 @@ export default function AgentDetailPage() {
 
     useEffect(() => {
         if (!id || !token || activeTab !== 'chat') return;
-        fetchMySessions(false, id).then((data: any) => {
-            if (currentAgentIdRef.current !== id) return;
+        if (skipNextSessionUrlRestoreRef.current) {
+            skipNextSessionUrlRestoreRef.current = false;
+            return;
+        }
+        if (requestedSessionId && activeSessionIdRef.current === requestedSessionId) return;
+
+        let cancelled = false;
+        const restoreSessionFromUrl = async () => {
+            const mySessions = await fetchMySessions(false, id);
+            if (cancelled || currentAgentIdRef.current !== id) return;
             setSessionsLoading(false);
-            if (data && data.length > 0) selectSession(data[0], 'mine');
-        });
-    }, [id, token, activeTab, currentUser?.id]);
+
+            if (requestedSessionId) {
+                const listedSession = mySessions.find((session: any) => String(session.id) === requestedSessionId);
+                if (listedSession) {
+                    setChatScope('mine');
+                    await selectSession(listedSession, 'mine');
+                    return;
+                }
+
+                try {
+                    const resolvedSession = normalizeChatSession(await chatSessionApi.get(id, requestedSessionId));
+                    if (cancelled || currentAgentIdRef.current !== id) return;
+                    const resolvedScope: 'mine' | 'all' = resolvedSession.view_scope === 'all' ? 'all' : 'mine';
+                    setChatScope(resolvedScope);
+                    if (resolvedScope === 'mine') {
+                        setSessions((prev) => prev.some((item: any) => String(item.id) === requestedSessionId)
+                            ? prev
+                            : [resolvedSession, ...prev]);
+                    } else {
+                        setAllSessions((prev) => prev.some((item: any) => String(item.id) === requestedSessionId)
+                            ? prev
+                            : [resolvedSession, ...prev]);
+                        void fetchAllSessions().then((rows) => {
+                            if (cancelled || currentAgentIdRef.current !== id) return;
+                            if (!rows.some((item: any) => String(item.id) === requestedSessionId)) {
+                                setAllSessions((prev) => prev.some((item: any) => String(item.id) === requestedSessionId)
+                                    ? prev
+                                    : [resolvedSession, ...prev]);
+                            }
+                        });
+                    }
+                    await selectSession(resolvedSession, resolvedScope);
+                    return;
+                } catch (error: any) {
+                    if (cancelled) return;
+                    console.warn('[chat] unable to restore session from URL:', error);
+                    toast.warning(t('chat.sessionLinkUnavailable', 'The linked session is unavailable. Opened your latest session instead.'));
+                }
+            }
+
+            if (mySessions.length > 0) {
+                setChatScope('mine');
+                await selectSession(mySessions[0], 'mine');
+            } else {
+                clearChatSelection();
+            }
+        };
+
+        void restoreSessionFromUrl();
+        return () => {
+            cancelled = true;
+        };
+    }, [id, token, activeTab, currentUser?.id, requestedSessionId]);
 
     const ensureSessionSocket = (sess: any, agentId: string, authToken: string) => {
         const sessionId = String(sess.id);
@@ -4499,7 +4571,7 @@ export default function AgentDetailPage() {
         if (activeTab !== 'chat') return;
         queryClient.refetchQueries({ queryKey: ['llm-models'] });
         queryClient.refetchQueries({ queryKey: ['tenant', 'me'] });
-    }, [activeTab, location.key, queryClient]);
+    }, [activeTab, location.pathname, queryClient]);
 
     const enabledLlmModels = useMemo(
         () => (llmModels as any[]).filter((m: any) => m.enabled),

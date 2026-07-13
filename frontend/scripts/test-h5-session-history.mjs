@@ -17,18 +17,23 @@ assert.match(api, /params\.set\(['"]source_channel['"]/, 'chatSessionApi.list mu
 
 assert.match(
     h5,
-    /parseH5SessionId\(new URLSearchParams\(searchString\)\.get\(['"]session_id['"]\)\)/,
+    /parseChatSessionId\(new URLSearchParams\(searchString\)\.get\(['"]session_id['"]\)\)/,
     'H5 chat must parse session_id from URL',
 );
 assert.match(
     h5,
-    /chatSessionApi\.list\(agentId,\s*\{\s*scope:\s*['"]mine['"],\s*source_channel:\s*channel,\s*limit:\s*50,\s*offset:\s*0,?\s*\}\)/,
-    'H5 history must load current-channel sessions with a bounded page size',
+    /chatSessionApi\.list\(agentId,\s*\{\s*scope:\s*['"]mine['"],\s*limit:\s*50,\s*offset:\s*0,?\s*\}\)/,
+    'H5 history must load all channel types with a bounded page size',
+);
+assert.doesNotMatch(
+    h5,
+    /chatSessionApi\.list\(agentId,[\s\S]{0,160}source_channel:\s*channel/,
+    'H5 history must not hide sessions from other channel types',
 );
 assert.match(h5, /const\s+activateSession\s*=\s*useCallback/, 'H5 chat must implement session activation');
 assert.match(
     h5,
-    /writeH5SessionIdToHref\(window\.location\.href,\s*nextSessionId\)/,
+    /writeChatSessionIdToHref\(window\.location\.href,\s*nextSessionId\)/,
     'H5 chat must write selected session_id back to URL',
 );
 assert.match(h5, /aria-label=["']历史会话["']/, 'H5 header must expose a history session button');

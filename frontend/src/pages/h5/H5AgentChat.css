@@ -1032,7 +1032,8 @@ body.h5-chat-active #root {
     padding: 9px 11px;
     background: var(--bg-secondary);
     color: var(--text-primary);
-    font: inherit;
+    font-family: inherit;
+    font-size: 16px;
     line-height: 1.45;
     outline: none;
 }

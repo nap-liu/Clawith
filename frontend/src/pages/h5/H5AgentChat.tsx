@@ -47,7 +47,8 @@ import {
     type H5AnalysisItem,
     type H5ChatMessage,
 } from './chatTimeline';
-import { parseH5SessionId, parseH5Theme, writeH5SessionIdToHref } from './h5Params';
+import { parseH5Theme } from './h5Params';
+import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import './H5AgentChat.css';
 
 type AuthStatus = 'checking' | 'exchanging' | 'ready' | 'error';
@@ -323,7 +324,7 @@ export default function H5AgentChat() {
     const code = useMemo(() => new URLSearchParams(searchString).get('code') || '', [searchString]);
     const oauthState = useMemo(() => new URLSearchParams(searchString).get('state'), [searchString]);
     const theme = useMemo(() => parseH5Theme(new URLSearchParams(searchString).get('theme')), [searchString]);
-    const initialSessionId = useMemo(() => parseH5SessionId(new URLSearchParams(searchString).get('session_id')), [searchString]);
+    const initialSessionId = useMemo(() => parseChatSessionId(new URLSearchParams(searchString).get('session_id')), [searchString]);
 
     const token = useAuthStore((s) => s.token);
     const setAuth = useAuthStore((s) => s.setAuth);
@@ -551,7 +552,11 @@ export default function H5AgentChat() {
         setSessionsLoading(true);
         setSessionsError('');
         try {
-            const rows = await chatSessionApi.list(agentId, { scope: 'mine' });
+            const rows = await chatSessionApi.list(agentId, {
+                scope: 'mine',
+                limit: 50,
+                offset: 0,
+            });
             const next = rows.map(normalizeH5SessionSummary).filter(Boolean) as H5SessionSummary[];
             setSessions(next);
         } catch (error: any) {
@@ -578,7 +583,7 @@ export default function H5AgentChat() {
             const nextSessionId = String(data.session_id);
             sessionIdRef.current = nextSessionId;
             setSessionId(nextSessionId);
-            window.history.replaceState({}, '', writeH5SessionIdToHref(window.location.href, nextSessionId));
+            window.history.replaceState({}, '', writeChatSessionIdToHref(window.location.href, nextSessionId));
             loadHistory(nextSessionId);
             return;
         }
@@ -741,7 +746,7 @@ export default function H5AgentChat() {
         sessionIdRef.current = nextSessionId;
         setSessionId(nextSessionId);
         setMessages([]);
-        window.history.replaceState({}, '', writeH5SessionIdToHref(window.location.href, nextSessionId));
+        window.history.replaceState({}, '', writeChatSessionIdToHref(window.location.href, nextSessionId));
 
         manualCloseRef.current = true;
         wsRef.current?.close();
@@ -770,7 +775,7 @@ export default function H5AgentChat() {
             setSessionId(nextSessionId);
             setMessages([]);
             setSessionsPanelOpen(false);
-            window.history.replaceState({}, '', writeH5SessionIdToHref(window.location.href, nextSessionId));
+            window.history.replaceState({}, '', writeChatSessionIdToHref(window.location.href, nextSessionId));
             if (summary) {
                 setSessions((prev) => [summary, ...prev.filter((item) => item.id !== summary.id)]);
             }

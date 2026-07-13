@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime, timezone as tz
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -15,7 +15,7 @@ from app.database import get_db
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.agent import Agent
-from app.models.user import User
+from app.models.user import Identity, User
 from app.services.auth_code_exchange import validate_platform_login_channel
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
@@ -50,6 +50,10 @@ class SessionOut(BaseModel):
         from_attributes = True
 
 
+class SessionDetailOut(SessionOut):
+    view_scope: Literal["mine", "all"]
+
+
 class CreateSessionIn(BaseModel):
     title: Optional[str] = None
     source_channel: str = "web"
@@ -57,6 +61,109 @@ class CreateSessionIn(BaseModel):
 
 class PatchSessionIn(BaseModel):
     title: str
+
+
+async def _load_accessible_session(
+    db: AsyncSession,
+    current_user: User,
+    agent_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> tuple[Agent, ChatSession, Literal["mine", "all"]]:
+    """Resolve one session and the web picker scope that can display it."""
+    agent, _ = await check_agent_access(db, current_user, agent_id)
+    result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id,
+            (ChatSession.agent_id == agent_id) | (ChatSession.peer_agent_id == agent_id),
+        )
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    is_owner = str(session.user_id) == str(current_user.id)
+    is_privileged = _can_view_all_agent_chat_sessions(current_user, agent)
+    is_group_member = False
+    if bool(getattr(session, "is_group", False)) and not is_owner and not is_privileged:
+        member_result = await db.execute(
+            select(ChatMessage.id)
+            .where(
+                ChatMessage.conversation_id == str(session_id),
+                ChatMessage.role == "user",
+                ChatMessage.user_id == current_user.id,
+            )
+            .limit(1)
+        )
+        is_group_member = member_result.scalar_one_or_none() is not None
+
+    if not (is_owner or is_privileged or is_group_member):
+        raise HTTPException(status_code=403, detail="Not authorized to view this session")
+
+    source_channel = str(session.source_channel or "web").lower()
+    view_scope: Literal["mine", "all"] = (
+        "mine"
+        if source_channel not in {"agent", "trigger"} and (is_owner or is_group_member)
+        else "all"
+    )
+    return agent, session, view_scope
+
+
+async def _build_session_detail_out(
+    db: AsyncSession,
+    session: ChatSession,
+    view_scope: Literal["mine", "all"],
+) -> SessionDetailOut:
+    count_result = await db.execute(
+        select(func.count(ChatMessage.id)).where(ChatMessage.conversation_id == str(session.id))
+    )
+    message_count = int(count_result.scalar() or 0)
+
+    username: Optional[str] = None
+    peer_agent_id: Optional[str] = None
+    peer_agent_name: Optional[str] = None
+    participant_type = "user"
+
+    if session.source_channel == "agent" and session.peer_agent_id:
+        participant_type = "agent"
+        peer_agent_id = str(session.peer_agent_id)
+        names_result = await db.execute(
+            select(Agent.id, Agent.name).where(Agent.id.in_([session.agent_id, session.peer_agent_id]))
+        )
+        agent_names = {str(row[0]): row[1] or "Agent" for row in names_result.all()}
+        first_name = agent_names.get(str(session.agent_id), "Agent")
+        second_name = agent_names.get(str(session.peer_agent_id), "Agent")
+        peer_agent_name = second_name
+        username = f"Agent {first_name} - {second_name}"
+    elif session.is_group:
+        participant_type = "group"
+        username = session.group_name or session.title or "Group Chat"
+    elif session.user_id:
+        user_result = await db.execute(
+            select(func.coalesce(User.display_name, Identity.username))
+            .outerjoin(Identity, User.identity_id == Identity.id)
+            .where(User.id == session.user_id)
+        )
+        username = user_result.scalar_one_or_none() or "Unknown"
+
+    return SessionDetailOut(
+        id=str(session.id),
+        agent_id=str(session.agent_id),
+        user_id=str(session.user_id),
+        username=username,
+        source_channel=session.source_channel,
+        title=session.title,
+        created_at=session.created_at.isoformat(),
+        last_message_at=session.last_message_at.isoformat() if session.last_message_at else None,
+        message_count=message_count,
+        unread_count=0,
+        is_primary=bool(session.is_primary),
+        peer_agent_id=peer_agent_id,
+        peer_agent_name=peer_agent_name,
+        participant_type=participant_type,
+        is_group=bool(session.is_group),
+        group_name=session.group_name,
+        view_scope=view_scope,
+    )
 
 
 @router.get("/{agent_id}/sessions")
@@ -136,7 +243,6 @@ async def list_sessions(
                 unread_counts[str(row[0])] = int(row[1] or 0)
 
         # Collect IDs to resolve in bulk
-        from app.models.user import Identity
         user_ids = list({s.user_id for s in sessions
                          if not s.is_group and s.source_channel != "agent" and s.user_id})
         user_names: dict[str, str] = {}
@@ -309,6 +415,18 @@ async def list_sessions(
         return out
 
 
+@router.get("/{agent_id}/sessions/{session_id}", response_model=SessionDetailOut)
+async def get_session(
+    agent_id: uuid.UUID,
+    session_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get one accessible session so a URL can restore it without scanning a paged list."""
+    _, session, view_scope = await _load_accessible_session(db, current_user, agent_id, session_id)
+    return await _build_session_detail_out(db, session, view_scope)
+
+
 @router.post("/{agent_id}/sessions", status_code=201)
 async def create_session(
     agent_id: uuid.UUID,
@@ -412,40 +530,7 @@ async def get_session_messages(
     db: AsyncSession = Depends(get_db),
 ):
     """Get chat messages for a specific session."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    # Allow looking up sessions where agent_id OR peer_agent_id matches
-    result = await db.execute(
-        select(ChatSession).where(
-            ChatSession.id == session_id,
-            (ChatSession.agent_id == agent_id) | (ChatSession.peer_agent_id == agent_id),
-        )
-    )
-    session = result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    # Permission:
-    # - non-group: session owner OR admin/creator
-    # - group: same, plus any user with user-role messages in the session
-    #   (mirrors scope=mine membership rule — if you spoke in the group, you
-    #   can read its history; silent observers and non-members stay blocked).
-    is_owner = str(session.user_id) == str(current_user.id)
-    is_privileged = _can_view_all_agent_chat_sessions(current_user, agent)
-    if not (is_owner or is_privileged):
-        is_group_member = False
-        if bool(getattr(session, "is_group", False)):
-            member_r = await db.execute(
-                select(ChatMessage.id)
-                .where(
-                    ChatMessage.conversation_id == str(session_id),
-                    ChatMessage.role == "user",
-                    ChatMessage.user_id == current_user.id,
-                )
-                .limit(1)
-            )
-            is_group_member = member_r.scalar_one_or_none() is not None
-        if not is_group_member:
-            raise HTTPException(status_code=403, detail="Not authorized to view this session")
+    _, session, _ = await _load_accessible_session(db, current_user, agent_id, session_id)
 
     # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
     # Optimized: use a single query with ORDER BY and LIMIT instead of subquery

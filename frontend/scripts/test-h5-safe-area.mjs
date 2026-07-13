@@ -16,6 +16,7 @@ function blockFor(selector) {
 const rootBlock = blockFor('.h5-chat');
 const messagesBlock = blockFor('.h5-chat__messages');
 const composerBlock = blockFor('.h5-chat__composer');
+const composerTextareaBlock = blockFor('.h5-chat__composer textarea');
 
 assert.match(
     html,
@@ -58,6 +59,12 @@ assert.match(
     messagesBlock,
     /scroll-padding-bottom:\s*calc\(18px \+ var\(--h5-safe-area-bottom\)\);/,
     'H5 message scroller must reserve safe-area bottom space when scrolling to the end',
+);
+
+assert.match(
+    composerTextareaBlock,
+    /font-size:\s*16px;/,
+    'H5 composer textarea must stay at 16px so iOS does not zoom the page on focus',
 );
 
 console.log('h5 safe-area tests passed');

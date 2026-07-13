@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 from app.api import chat_sessions as chat_sessions_api
 
@@ -52,6 +53,152 @@ class RecordingDB:
 
     async def refresh(self, value):
         self.refreshed.append(value)
+
+
+def _session_summary(*, agent_id, owner_id, now, session_id=None):
+    return SimpleNamespace(
+        id=session_id or uuid.uuid4(),
+        agent_id=agent_id,
+        user_id=owner_id,
+        source_channel="web",
+        title="URL-restored session",
+        created_at=now,
+        last_message_at=now,
+        peer_agent_id=None,
+        is_group=False,
+        group_name=None,
+        is_primary=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_can_get_session_detail_for_url_restore(monkeypatch):
+    user_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    current_user = SimpleNamespace(id=user_id, role="member")
+    agent = SimpleNamespace(id=agent_id, creator_id=uuid.uuid4())
+    session = _session_summary(agent_id=agent_id, owner_id=user_id, now=now)
+    db = RecordingDB(
+        responses=[
+            DummyResult([session]),
+            DummyResult(scalar_value=7),
+            DummyResult(scalar_value="Alice"),
+        ]
+    )
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    detail = await chat_sessions_api.get_session(
+        agent_id=agent_id,
+        session_id=session.id,
+        current_user=current_user,
+        db=db,
+    )
+
+    assert detail.id == str(session.id)
+    assert detail.message_count == 7
+    assert detail.username == "Alice"
+    assert detail.view_scope == "mine"
+
+
+@pytest.mark.asyncio
+async def test_admin_gets_other_users_session_in_all_scope(monkeypatch):
+    admin_id = uuid.uuid4()
+    owner_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    current_user = SimpleNamespace(id=admin_id, role="org_admin")
+    agent = SimpleNamespace(id=agent_id, creator_id=owner_id)
+    session = _session_summary(agent_id=agent_id, owner_id=owner_id, now=now)
+    db = RecordingDB(
+        responses=[
+            DummyResult([session]),
+            DummyResult(scalar_value=3),
+            DummyResult(scalar_value="Bob"),
+        ]
+    )
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    detail = await chat_sessions_api.get_session(
+        agent_id=agent_id,
+        session_id=session.id,
+        current_user=current_user,
+        db=db,
+    )
+
+    assert detail.id == str(session.id)
+    assert detail.view_scope == "all"
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_resolve_other_users_session(monkeypatch):
+    viewer_id = uuid.uuid4()
+    owner_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    current_user = SimpleNamespace(id=viewer_id, role="member")
+    agent = SimpleNamespace(id=agent_id, creator_id=owner_id)
+    session = _session_summary(agent_id=agent_id, owner_id=owner_id, now=now)
+    db = RecordingDB(responses=[DummyResult([session])])
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    with pytest.raises(HTTPException) as exc:
+        await chat_sessions_api.get_session(
+            agent_id=agent_id,
+            session_id=session.id,
+            current_user=current_user,
+            db=db,
+        )
+
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_group_member_resolves_link_in_mine_scope(monkeypatch):
+    member_id = uuid.uuid4()
+    owner_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    current_user = SimpleNamespace(id=member_id, role="member")
+    agent = SimpleNamespace(id=agent_id, creator_id=owner_id)
+    session = _session_summary(agent_id=agent_id, owner_id=owner_id, now=now)
+    session.is_group = True
+    session.group_name = "Project room"
+    db = RecordingDB(
+        responses=[
+            DummyResult([session]),
+            DummyResult([SimpleNamespace(id=uuid.uuid4())]),
+            DummyResult(scalar_value=5),
+        ]
+    )
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    detail = await chat_sessions_api.get_session(
+        agent_id=agent_id,
+        session_id=session.id,
+        current_user=current_user,
+        db=db,
+    )
+
+    assert detail.view_scope == "mine"
+    assert detail.participant_type == "group"
+    assert detail.username == "Project room"
 
 
 @pytest.mark.asyncio

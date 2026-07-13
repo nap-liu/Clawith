@@ -315,6 +315,9 @@ export const chatSessionApi = {
         return request<any[]>(`/agents/${agentId}/sessions?${params.toString()}`);
     },
 
+    get: (agentId: string, sessionId: string) =>
+        request<Record<string, any> & { view_scope: 'mine' | 'all' }>(`/agents/${agentId}/sessions/${sessionId}`),
+
     create: (agentId: string, data: { title?: string; source_channel?: string }) =>
         request<any>(`/agents/${agentId}/sessions`, { method: 'POST', body: JSON.stringify(data) }),
 
