@@ -775,6 +775,131 @@ async def test_legacy_recovery_keeps_stable_event_cursor_after_processing_time()
     }
 
 
+async def test_legacy_upgrade_floor_skips_pre_cutover_history():
+    """An upgraded legacy trigger starts at cutover, not its historical cursor."""
+    from app.services.trigger_runtime.evaluator import recover_legacy_on_message_events
+
+    agent, user = await _make_agent()
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        session = _session(
+            agent_id=agent.id,
+            user_id=user.id,
+            source_channel="web",
+            external_conv_id=f"legacy-upgrade-{uuid.uuid4()}",
+        )
+        db.add(session)
+        await db.flush()
+        trigger = AgentTrigger(
+            agent_id=agent.id,
+            name=f"legacy-upgrade-{uuid.uuid4().hex[:8]}",
+            type="on_message",
+            reason="do not replay pre-cutover history",
+            config={
+                "from_user_name": user.display_name,
+                "_since_ts": (now - timedelta(minutes=10)).isoformat(),
+                "_legacy_scan_floor": now.isoformat(),
+            },
+            is_enabled=True,
+            fire_count=0,
+            max_fires=10,
+        )
+        db.add_all(
+            [
+                trigger,
+                ChatMessage(
+                    agent_id=agent.id,
+                    user_id=user.id,
+                    role="user",
+                    content="historical legacy event",
+                    conversation_id=str(session.id),
+                    created_at=now - timedelta(minutes=5),
+                ),
+                ChatMessage(
+                    agent_id=agent.id,
+                    user_id=user.id,
+                    role="user",
+                    content="at-cutover legacy event",
+                    conversation_id=str(session.id),
+                    created_at=now,
+                ),
+            ]
+        )
+        await db.commit()
+
+    assert await recover_legacy_on_message_events(trigger) == 1
+    async with async_session() as db:
+        payloads = list(
+            (
+                await db.execute(
+                    select(TriggerExecution.payload).where(
+                        TriggerExecution.trigger_id == trigger.id
+                    )
+                )
+            ).scalars()
+        )
+    assert [payload["_matched_message"] for payload in payloads] == [
+        "at-cutover legacy event"
+    ]
+
+
+async def test_legacy_recovery_ignores_exact_watch_session_trigger():
+    """The compatibility scanner never handles exact session subscriptions."""
+    from app.services.trigger_runtime.evaluator import recover_legacy_on_message_events
+
+    agent, user = await _make_agent()
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        session = _session(
+            agent_id=agent.id,
+            user_id=user.id,
+            source_channel="web",
+            external_conv_id=f"exact-watch-{uuid.uuid4()}",
+        )
+        db.add(session)
+        await db.flush()
+        trigger = AgentTrigger(
+            agent_id=agent.id,
+            name=f"exact-watch-{uuid.uuid4().hex[:8]}",
+            type="on_message",
+            reason="exact session path is not a legacy scan",
+            config={
+                "from_user_name": user.display_name,
+                "_watch_session_id": str(session.id),
+                "_since_ts": (now - timedelta(minutes=1)).isoformat(),
+                "_legacy_scan_floor": now.isoformat(),
+            },
+            is_enabled=True,
+            fire_count=0,
+            max_fires=10,
+        )
+        db.add_all(
+            [
+                trigger,
+                ChatMessage(
+                    agent_id=agent.id,
+                    user_id=user.id,
+                    role="user",
+                    content="exact session event",
+                    conversation_id=str(session.id),
+                    created_at=now,
+                ),
+            ]
+        )
+        await db.commit()
+
+    assert await recover_legacy_on_message_events(trigger) == 0
+    async with async_session() as db:
+        execution_count = (
+            await db.execute(
+                select(func.count(TriggerExecution.id)).where(
+                    TriggerExecution.trigger_id == trigger.id
+                )
+            )
+        ).scalar_one()
+    assert execution_count == 0
+
+
 async def test_legacy_recovery_serializes_max_fire_capacity():
     """Concurrent scanners cannot enqueue two events into one remaining slot."""
     from app.services.trigger_runtime.evaluator import recover_legacy_on_message_events

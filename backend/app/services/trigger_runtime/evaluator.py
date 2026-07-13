@@ -345,6 +345,15 @@ async def recover_legacy_on_message_events(
                     since = since.replace(tzinfo=timezone.utc)
             except (TypeError, ValueError):
                 pass
+        legacy_floor_raw = cfg.get("_legacy_scan_floor")
+        if legacy_floor_raw:
+            try:
+                legacy_floor = datetime.fromisoformat(str(legacy_floor_raw))
+                if legacy_floor.tzinfo is None:
+                    legacy_floor = legacy_floor.replace(tzinfo=timezone.utc)
+                since = max(since, legacy_floor)
+            except (TypeError, ValueError):
+                pass
 
         queued_count = (
             await db.execute(
@@ -402,7 +411,7 @@ async def recover_legacy_on_message_events(
                         ),
                     ),
                     ChatMessage.participant_id == from_participant,
-                    ChatMessage.created_at > since,
+                    ChatMessage.created_at >= since,
                     ChatMessage.role.in_(["assistant", "user"]),
                     ChatSession.source_channel != "trigger",
                 )
@@ -427,7 +436,7 @@ async def recover_legacy_on_message_events(
                 ChatSession.agent_id == trigger.agent_id,
                 ChatSession.source_channel != "trigger",
                 ChatMessage.role == "user",
-                ChatMessage.created_at > since,
+                ChatMessage.created_at >= since,
             ]
             if target_user is not None:
                 user_filters.append(ChatSession.user_id == target_user.id)
