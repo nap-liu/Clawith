@@ -20,6 +20,7 @@ async def enqueue_trigger_execution(
     idempotency_key: str,
     payload_text: str = "",
     payload_obj: dict | None = None,
+    commit: bool = True,
 ) -> tuple[TriggerExecution | None, bool]:
     """Insert a generic trigger execution record."""
     execution = TriggerExecution(
@@ -32,12 +33,16 @@ async def enqueue_trigger_execution(
         payload_text=payload_text[:8000],
         scheduled_at=datetime.now(timezone.utc),
     )
-    db.add(execution)
     try:
-        await db.commit()
+        async with db.begin_nested():
+            db.add(execution)
+            await db.flush()
+        if commit:
+            await db.commit()
         return execution, True
     except IntegrityError:
-        await db.rollback()
+        if commit:
+            await db.rollback()
         return None, False
 
 

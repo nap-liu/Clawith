@@ -139,6 +139,8 @@ async def _complete_unfinished_tool_calls(db, anchor: ChatMessage, *, ctx_size: 
             agent_id=anchor.agent_id,
             user_id=anchor.user_id,
             session_id=anchor.conversation_id,
+            tool_call_id=key,
+            turn_anchor_id=anchor.id,
             on_output=None,
         )
         result_text = str(raw_result)
@@ -225,6 +227,12 @@ async def _source_channel_for_row(db, row: ChatMessage) -> str:
 
 
 async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
+    meta = row.message_meta if isinstance(getattr(row, "message_meta", None), dict) else {}
+    if meta.get("consumed_by_onmessage") or meta.get("kind") == "on_message_event":
+        # TriggerExecution owns these durable event turns and has its own lease
+        # reclaim path.  Startup recovery must not race it and create a second
+        # LLM invocation for the same event.
+        return False
     if row.role == "assistant":
         source_channel = await _source_channel_for_row(db, row)
         if source_channel not in ASSISTANT_TAIL_REDELIVERY_CHANNELS:
@@ -365,6 +373,7 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                 user_id=anchor.user_id,
                 conversation_id=anchor.conversation_id,
                 content=reply,
+                turn_anchor_id=anchor.id,
             )
             await db.commit()
         delivered = await deliver_recovered_reply_to_origin(

@@ -26,6 +26,7 @@ original rows; only the LLM context sees the synthetic summary).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ from typing import Any
 
 from loguru import logger
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
@@ -163,9 +165,18 @@ async def load_messages_for_session(
         # txn-start) can tie within the same microsecond. Without a secondary
         # sort the order would flap between reloads.
         .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        .limit(ctx_size)
+        # Over-fetch so rows consumed by exact on_message subscriptions can be
+        # removed without needlessly shrinking the normal-session context.
+        .limit(max(ctx_size * 2, ctx_size))
     )
-    rows: list[Any] = list(reversed(rows_q.scalars().all()))
+    rows = [
+        row
+        for row in reversed(rows_q.scalars().all())
+        if not (
+            isinstance(getattr(row, "message_meta", None), dict)
+            and row.message_meta.get("consumed_by_onmessage")
+        )
+    ][-ctx_size:]
 
     marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)
     if marker is not None:
@@ -205,7 +216,15 @@ async def load_recoverable_messages_for_turn(
         )
         .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
     )
-    active_rows: list[Any] = list(result.scalars().all())
+    active_rows: list[Any] = [
+        row
+        for row in result.scalars().all()
+        if row.id == turn_anchor_id
+        or not (
+            isinstance(getattr(row, "message_meta", None), dict)
+            and row.message_meta.get("consumed_by_onmessage")
+        )
+    ]
 
     anchor_idx = next((idx for idx, row in enumerate(active_rows) if row.id == turn_anchor_id), None)
     if anchor_idx is None:
@@ -406,6 +425,9 @@ async def persist_incoming_user_message(
     conversation_id: str,
     content: str,
     participant_id: uuid.UUID | None = None,
+    external_event_key: str | None = None,
+    message_meta: dict[str, Any] | None = None,
+    message_id: uuid.UUID | None = None,
 ) -> ChatMessage:
     """Persist an incoming user message.
 
@@ -413,16 +435,177 @@ async def persist_incoming_user_message(
     anchor when it belongs to a recent incomplete message tail.
     """
     row = ChatMessage(
+        id=message_id or uuid.uuid4(),
         agent_id=agent_id,
         user_id=user_id,
         role="user",
         content=content,
         conversation_id=conversation_id,
         participant_id=participant_id,
+        external_event_key=external_event_key,
+        message_meta=message_meta or {},
     )
     db.add(row)
     await db.flush()
     return row
+
+
+def build_external_event_key(
+    *,
+    agent_id: uuid.UUID,
+    source_channel: str,
+    provider_event_id: str | None,
+    channel_config_id: uuid.UUID | str | None = None,
+) -> str | None:
+    """Build the globally namespaced key used for durable inbound deduplication.
+
+    Provider message ids are only unique inside a bot/application account.  The
+    agent and channel-config namespace therefore form part of the key.  Callers
+    without a stable provider/client event id intentionally receive ``None`` and
+    keep the historical append-only behaviour rather than deduplicating by text.
+    """
+    event_id = str(provider_event_id or "").strip()
+    if not event_id:
+        return None
+    account = str(channel_config_id or "platform")
+    raw_key = f"{agent_id}\x1f{source_channel}\x1f{account}\x1f{event_id}"
+    # Hash the complete provider id instead of truncating it. Two unusually
+    # long ids with the same prefix must never collapse into one inbound event.
+    digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    return f"inbound:{source_channel}:{digest}"
+
+
+async def persist_incoming_user_message_once(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    content: str,
+    participant_id: uuid.UUID | None = None,
+    external_event_key: str | None = None,
+    message_meta: dict[str, Any] | None = None,
+    message_id: uuid.UUID | None = None,
+) -> tuple[ChatMessage, bool]:
+    """Persist one inbound event and report whether this caller created it.
+
+    A nested transaction contains the unique-key race so a duplicate delivery
+    does not roll back the caller's surrounding session/identity work.  The
+    database unique index remains the authority across backend replicas.
+    """
+    if external_event_key:
+        existing = (
+            await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == external_event_key))
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing, False
+
+    try:
+        async with db.begin_nested():
+            row = await persist_incoming_user_message(
+                db,
+                agent_id=agent_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                content=content,
+                participant_id=participant_id,
+                external_event_key=external_event_key,
+                message_meta=message_meta,
+                message_id=message_id,
+            )
+        return row, True
+    except IntegrityError:
+        if not external_event_key:
+            raise
+        existing = (
+            await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == external_event_key))
+        ).scalar_one_or_none()
+        if existing is None:
+            raise
+        return existing, False
+
+
+@dataclass(frozen=True)
+class IncomingMessageIngestResult:
+    message: ChatMessage
+    created: bool
+    consumed_by_onmessage: bool
+    execution_ids: tuple[uuid.UUID, ...] = ()
+
+
+async def ingest_incoming_chat_message(
+    db: AsyncSession,
+    *,
+    session,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    content: str,
+    source_channel: str,
+    provider_event_id: str | None = None,
+    channel_config_id: uuid.UUID | str | None = None,
+    actor_ref: str | None = None,
+    reply_to_external_message_id: str | None = None,
+    participant_id: uuid.UUID | None = None,
+    message_meta: dict[str, Any] | None = None,
+) -> IncomingMessageIngestResult:
+    """Durably ingest, deduplicate and route one channel/web inbound event.
+
+    The caller keeps ownership of the outer transaction.  Exact on_message
+    matching therefore commits atomically with the durable inbound row and its
+    TriggerExecution records; adapters can skip their ordinary remote-session
+    LLM turn when the subscription consumes the event.
+    """
+    event_key = build_external_event_key(
+        agent_id=agent_id,
+        source_channel=source_channel,
+        provider_event_id=provider_event_id,
+        channel_config_id=channel_config_id,
+    )
+    meta = {
+        **(message_meta or {}),
+        "direction": "inbound",
+        "source_channel": source_channel,
+        "actor_ref": str(actor_ref or user_id),
+    }
+    if reply_to_external_message_id:
+        meta["reply_to_external_message_id"] = str(reply_to_external_message_id)
+
+    row, created = await persist_incoming_user_message_once(
+        db,
+        agent_id=agent_id,
+        user_id=user_id,
+        conversation_id=str(session.id),
+        content=content,
+        participant_id=participant_id,
+        external_event_key=event_key,
+        message_meta=meta,
+    )
+    if not created:
+        existing_meta = row.message_meta if isinstance(row.message_meta, dict) else {}
+        execution_ids: list[uuid.UUID] = []
+        for raw_id in existing_meta.get("onmessage_execution_ids") or []:
+            try:
+                execution_ids.append(uuid.UUID(str(raw_id)))
+            except (TypeError, ValueError):
+                continue
+        return IncomingMessageIngestResult(
+            message=row,
+            created=False,
+            # A provider retry must never start a second ordinary LLM turn,
+            # whether or not the first delivery matched a subscription.
+            consumed_by_onmessage=True,
+            execution_ids=tuple(execution_ids),
+        )
+
+    from app.services.trigger_runtime.evaluator import match_incoming_chat_message
+
+    matched = await match_incoming_chat_message(db, row, session)
+    return IncomingMessageIngestResult(
+        message=row,
+        created=True,
+        consumed_by_onmessage=matched.consumed,
+        execution_ids=matched.execution_ids,
+    )
 
 
 async def persist_tool_call(
@@ -542,6 +725,14 @@ async def persist_pending_confirmation_row(
         role="tool_call",
         content=content,
         conversation_id=conversation_id,
+        message_meta=(
+            {
+                "turn_anchor_id": str(turn_anchor_id),
+                "turn_status": "suspended",
+            }
+            if turn_anchor_id is not None
+            else {}
+        ),
         created_at=created_at,
     )
     db.add(row)
@@ -606,6 +797,7 @@ async def persist_assistant_reply(
     conversation_id: str,
     content: str,
     thinking: str | None = None,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> None:
     """Persist a channel agent's final assistant reply.
 
@@ -628,6 +820,7 @@ async def persist_assistant_reply(
                 conversation_id=conversation_id,
                 content=content,
                 thinking=thinking,
+                turn_anchor_id=turn_anchor_id,
             )
             await db.commit()
     except Exception as e:
@@ -642,16 +835,29 @@ async def persist_assistant_reply_row(
     conversation_id: str,
     content: str,
     thinking: str | None = None,
+    message_id: uuid.UUID | None = None,
+    message_meta: dict[str, Any] | None = None,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Persist a non-empty assistant reply in the caller's transaction."""
     if not (content or "").strip():
         raise ValueError("assistant reply content must be non-empty")
+    final_meta = dict(message_meta or {})
+    if turn_anchor_id is not None:
+        final_meta.update(
+            {
+                "turn_anchor_id": str(turn_anchor_id),
+                "turn_status": "completed",
+            }
+        )
     msg = ChatMessage(
+        id=message_id or uuid.uuid4(),
         agent_id=agent_id,
         user_id=user_id,
         role="assistant",
         content=content,
         conversation_id=conversation_id,
+        message_meta=final_meta,
     )
     _capped = cap_thinking(thinking)
     if _capped:
@@ -684,6 +890,7 @@ async def persist_assistant_reply_and_complete_turn(
             conversation_id=conversation_id,
             content=content,
             thinking=thinking,
+            turn_anchor_id=turn_anchor_id,
         )
         await db.commit()
         return row_id

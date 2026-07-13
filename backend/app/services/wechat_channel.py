@@ -284,14 +284,21 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                 ctx_size=agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE,
             )
 
-            db.add(
-                ChatMessage(
-                    agent_id=agent_id,
-                    user_id=platform_user_id,
-                    role="user",
-                    content=user_text,
-                    conversation_id=session_conv_id,
-                )
+            from app.services.chat_history import ingest_incoming_chat_message
+
+            ingested = await ingest_incoming_chat_message(
+                db,
+                session=sess,
+                agent_id=agent_id,
+                user_id=platform_user_id,
+                content=user_text,
+                source_channel="wechat",
+                provider_event_id=(
+                    str(msg.get("message_id") or msg.get("msg_id") or msg.get("client_id") or "")
+                    or None
+                ),
+                channel_config_id=config.id,
+                actor_ref=from_user_id,
             )
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
@@ -304,6 +311,13 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                 agent_id, session_conv_id, content=user_text,
                 sender_name=None, user_id=platform_user_id,
             )
+
+            if ingested.consumed_by_onmessage:
+                logger.info(
+                    "[WeChat] Inbound message routed to %d on_message execution(s)",
+                    len(ingested.execution_ids),
+                )
+                return ""
 
             token = str((config.extra_config or {}).get("bot_token") or "").strip()
             base_url = str((config.extra_config or {}).get("baseurl") or WECHAT_ILINK_BASE_URL).strip()
@@ -335,6 +349,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                     user_id=platform_user_id,
                     session_id=session_conv_id,
                     on_thinking=_collect_thinking,
+                    turn_anchor_id=ingested.message.id,
                 )
             finally:
                 await _thinking_sender.flush()
@@ -357,6 +372,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                 _areply_session, agent_id=agent_id, user_id=platform_user_id,
                 conversation_id=session_conv_id, content=reply_text,
                 thinking="".join(_thinking_chunks) or None,
+                turn_anchor_id=ingested.message.id,
             )
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()

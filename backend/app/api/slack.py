@@ -190,14 +190,6 @@ async def slack_event_webhook(
     event = body.get("event", {})
     event_id = body.get("event_id", "")
 
-    # Dedup
-    if event_id in _processed_slack_events:
-        return {"ok": True}
-    if event_id:
-        _processed_slack_events.add(event_id)
-        if len(_processed_slack_events) > 1000:
-            _processed_slack_events.clear()
-
     # Ignore bot messages (avoid self-reply loop)
     if event.get("bot_id") or event.get("subtype"):
         return {"ok": True}
@@ -227,6 +219,12 @@ async def slack_event_webhook(
     # ghost session that is immediately archived.
     from app.services.channel_commands import is_channel_command, handle_channel_command
     if is_channel_command(user_text):
+        if event_id in _processed_slack_events:
+            return {"ok": True}
+        if event_id:
+            _processed_slack_events.add(event_id)
+            if len(_processed_slack_events) > 1000:
+                _processed_slack_events.clear()
         from app.database import async_session as _async_session
         async with _async_session() as _cmd_db:
             cmd_result = await handle_channel_command(
@@ -246,7 +244,6 @@ async def slack_event_webhook(
     logger.info(f"[Slack] Message from={sender_id}, channel={channel_id}: {user_text[:80]}")
 
     # Load history
-    from app.models.audit import ChatMessage
     from app.models.agent import Agent as AgentModel
     from app.services.channel_session import find_or_create_channel_session
     agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
@@ -357,10 +354,38 @@ async def slack_event_webhook(
     if not user_text and not _file_user_messages and slack_files:
         # Files were present but all downloads failed — still send ack so user knows we got the file event
         _file_names = ", ".join(_sf.get("name", "file") for _sf in slack_files)
-        _ack = f"收到了文件 {_file_names}，不过我暂时无法下载其内容，请检查 Slack App 是否已授权 files:read 权限。"
-        db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="assistant",
-                           content=_ack, conversation_id=session_conv_id))
+        _failed_file_content = f"[file-download-failed:{_file_names}]"
+        from app.services.chat_history import (
+            ingest_incoming_chat_message,
+            persist_assistant_reply_row,
+        )
+
+        _failed_file_ingested = await ingest_incoming_chat_message(
+            db,
+            session=sess,
+            agent_id=agent_id,
+            user_id=platform_user_id,
+            content=_failed_file_content,
+            source_channel="slack",
+            provider_event_id=event_id or event.get("client_msg_id") or event.get("ts"),
+            channel_config_id=config.id,
+            actor_ref=sender_id,
+            message_meta={"message_type": "file", "download_status": "failed"},
+        )
         sess.last_message_at = datetime.now(timezone.utc)
+        await db.commit()
+        if _failed_file_ingested.consumed_by_onmessage:
+            logger.info("[Slack] Failed-download file event %s routed to on_message", event_id)
+            return {"ok": True}
+        _ack = f"收到了文件 {_file_names}，不过我暂时无法下载其内容，请检查 Slack App 是否已授权 files:read 权限。"
+        await persist_assistant_reply_row(
+            db,
+            agent_id=agent_id,
+            user_id=platform_user_id,
+            content=_ack,
+            conversation_id=session_conv_id,
+            turn_anchor_id=_failed_file_ingested.message.id,
+        )
         await db.commit()
         if _bot_token and channel_id:
             await _send_slack_messages(_bot_token, channel_id, _ack)
@@ -369,13 +394,37 @@ async def slack_event_webhook(
     if _file_user_messages and not user_text:
         # Files downloaded, no text — store file paths as user message & send ack
         _file_content = " ".join(f"[file:{p.split('/')[-1]}]" for p in _file_user_messages)
-        db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user",
-                           content=_file_content, conversation_id=session_conv_id))
+        from app.services.chat_history import ingest_incoming_chat_message
+
+        _file_ingested = await ingest_incoming_chat_message(
+            db,
+            session=sess,
+            agent_id=agent_id,
+            user_id=platform_user_id,
+            content=_file_content,
+            source_channel="slack",
+            provider_event_id=event_id or event.get("client_msg_id") or event.get("ts"),
+            channel_config_id=config.id,
+            actor_ref=sender_id,
+            message_meta={"message_type": "file"},
+        )
+        sess.last_message_at = datetime.now(timezone.utc)
+        await db.commit()
+        if _file_ingested.consumed_by_onmessage:
+            logger.info("[Slack] File event %s routed to on_message", event_id)
+            return {"ok": True}
         await _asyncio.sleep(_random.uniform(1.0, 2.0))
         _ack = _random.choice(_FILE_ACK_MESSAGES)
-        db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="assistant",
-                           content=_ack, conversation_id=session_conv_id))
-        sess.last_message_at = datetime.now(timezone.utc)
+        from app.services.chat_history import persist_assistant_reply_row
+
+        await persist_assistant_reply_row(
+            db,
+            agent_id=agent_id,
+            user_id=platform_user_id,
+            content=_ack,
+            conversation_id=session_conv_id,
+            turn_anchor_id=_file_ingested.message.id,
+        )
         await db.commit()
         # Mirror this inbound file message to anyone viewing the session on web in
         # real time (matches what a reload renders: the [file:...] row).
@@ -399,8 +448,20 @@ async def slack_event_webhook(
 
     async def _work() -> str:
         # 正常消息轮次：写入用户行 → LLM → 持久化回复 → 发送
-        # Save user message
-        db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
+        from app.services.chat_history import ingest_incoming_chat_message
+
+        ingested = await ingest_incoming_chat_message(
+            db,
+            session=sess,
+            agent_id=agent_id,
+            user_id=platform_user_id,
+            content=user_text,
+            source_channel="slack",
+            provider_event_id=event_id or event.get("client_msg_id") or event.get("ts"),
+            channel_config_id=config.id,
+            actor_ref=sender_id,
+            reply_to_external_message_id=event.get("thread_ts"),
+        )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
 
@@ -412,6 +473,14 @@ async def slack_event_webhook(
             agent_id, session_conv_id, content=user_text,
             sender_name=_slack_real_name or None, user_id=platform_user_id,
         )
+
+        if ingested.consumed_by_onmessage:
+            logger.info(
+                "[Slack] Inbound event %s routed to %d on_message execution(s)",
+                event_id,
+                len(ingested.execution_ids),
+            )
+            return ""
 
         # Set channel_file_sender contextvar for agent → user file delivery
         from app.services.agent_tools import channel_file_sender as _cfs_s
@@ -476,6 +545,7 @@ async def slack_event_webhook(
                 db, agent_id, user_text,
                 history=history, user_id=platform_user_id, session_id=session_conv_id,
                 on_thinking=_collect_thinking,
+                turn_anchor_id=ingested.message.id,
             )
         finally:
             await _thinking_sender.flush()
@@ -492,6 +562,7 @@ async def slack_event_webhook(
             _areply_session, agent_id=agent_id, user_id=platform_user_id,
             conversation_id=session_conv_id, content=reply_text,
             thinking="".join(_thinking_chunks) or None,
+            turn_anchor_id=ingested.message.id,
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()

@@ -6,6 +6,7 @@ import uuid as _uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chat_session import ChatSession
@@ -21,9 +22,13 @@ async def find_or_create_channel_session(
     is_group: bool = False,
     group_name: str | None = None,
 ) -> ChatSession:
-    """Find an existing ChatSession by (agent_id, external_conv_id), or create one.
+    """Find an existing ChatSession by channel-scoped conversation id, or create one.
 
-    Relies on the UNIQUE constraint on (agent_id, external_conv_id) in the DB.
+    Relies on the UNIQUE constraint on
+    ``(agent_id, source_channel, external_conv_id)`` in the DB.  Provider
+    conversation ids are not globally namespaced (Teams in particular uses the
+    raw id), so omitting ``source_channel`` can attach a message to another
+    transport's session.
 
     Args:
         is_group: True for group chat sessions (Feishu group, Slack channel, etc.).
@@ -34,6 +39,7 @@ async def find_or_create_channel_session(
     result = await db.execute(
         select(ChatSession).where(
             ChatSession.agent_id == agent_id,
+            ChatSession.source_channel == source_channel,
             ChatSession.external_conv_id == external_conv_id,
         )
     )
@@ -41,7 +47,7 @@ async def find_or_create_channel_session(
 
     if session is None:
         now = datetime.now(timezone.utc)
-        session = ChatSession(
+        candidate = ChatSession(
             agent_id=agent_id,
             user_id=user_id,
             title=group_name[:40] if (is_group and group_name) else first_message_title[:40],
@@ -51,8 +57,25 @@ async def find_or_create_channel_session(
             group_name=group_name,
             created_at=now,
         )
-        db.add(session)
-        await db.flush()  # populate session.id
+        try:
+            async with db.begin_nested():
+                db.add(candidate)
+                await db.flush()  # populate candidate.id
+            session = candidate
+        except IntegrityError:
+            # Another replica created the same channel-scoped conversation
+            # between our SELECT and INSERT.  The unique constraint is the
+            # arbitration point; reuse the winner without rolling back the
+            # caller's surrounding inbound-event transaction.
+            session = (
+                await db.execute(
+                    select(ChatSession).where(
+                        ChatSession.agent_id == agent_id,
+                        ChatSession.source_channel == source_channel,
+                        ChatSession.external_conv_id == external_conv_id,
+                    )
+                )
+            ).scalar_one()
     else:
         # For P2P sessions: re-attribute to the correct user
         # (fixes legacy sessions stored under creator_id)

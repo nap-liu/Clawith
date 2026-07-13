@@ -34,6 +34,9 @@ def build_scheduled_execution_key(trigger: AgentTrigger, now: datetime) -> str:
         return f"cron:{trigger.id}:{due_at.astimezone(timezone.utc).isoformat()}"
 
     if trigger_type == "on_message":
+        matched_message_id = str(cfg.get("_matched_message_id") or "").strip()
+        if matched_message_id:
+            return f"on_message:{trigger.id}:{matched_message_id}"
         matched_from = str(cfg.get("_matched_from") or "")
         matched_message = str(cfg.get("_matched_message") or "")
         digest = hashlib.sha256(f"{matched_from}\n{matched_message}".encode("utf-8")).hexdigest()

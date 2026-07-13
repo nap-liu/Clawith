@@ -15,7 +15,8 @@ class ChatSession(Base):
 
     source_channel: 'web' | 'wechat_miniprogram' | 'feishu' | 'discord' | 'slack'
     external_conv_id: original channel conversation ID (e.g. 'feishu_p2p_ou_xxx').
-                      Unique per agent — used for reliable find-or-create without in-process caching.
+                      Unique per agent and source channel — used for reliable
+                      find-or-create without in-process caching.
     is_group: True for group chat sessions (Feishu group, WeCom group, Slack channel, etc.).
               Group sessions have user_id=NULL and only appear in the 'all sessions' view.
     group_name: Display name for group chat sessions (e.g. the group/channel name from IM platform).
@@ -23,7 +24,12 @@ class ChatSession(Base):
 
     __tablename__ = "chat_sessions"
     __table_args__ = (
-        UniqueConstraint("agent_id", "external_conv_id", name="uq_chat_sessions_agent_ext_conv"),
+        UniqueConstraint(
+            "agent_id",
+            "source_channel",
+            "external_conv_id",
+            name="uq_chat_sessions_agent_channel_ext_conv",
+        ),
         Index(
             "uq_chat_sessions_primary_platform",
             "agent_id",

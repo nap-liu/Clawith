@@ -372,10 +372,6 @@ async def delete_channel_config(
 
 # ─── Feishu Event Webhook ───────────────────────────────
 
-# Simple in-memory dedup to avoid processing retried events
-_processed_events: set[str] = set()
-
-
 @router.post("/channel/feishu/{agent_id}/webhook")
 async def feishu_event_webhook(
     agent_id: uuid.UUID,
@@ -397,11 +393,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
     import json as _json
     logger.info(f"[Feishu] Event processing for {agent_id}: event_type={body.get('header', {}).get('event_type', 'N/A')}")
 
-    # Deduplicate — Feishu retries on slow responses
-    # Only mark as processed AFTER successful handling so retries work on crash
     event_id = body.get("header", {}).get("event_id", "")
-    if event_id in _processed_events:
-        return {"code": 0, "msg": "already processed"}
 
     # Get channel config — filter by feishu since an agent can have multiple channels
     result = await db.execute(
@@ -413,13 +405,6 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
     config = result.scalar_one_or_none()
     if not config:
         return {"code": 1, "msg": "Channel not found"}
-
-    # Mark event as processed after config is loaded successfully
-    if event_id:
-        _processed_events.add(event_id)
-        # Keep set bounded
-        if len(_processed_events) > 1000:
-            _processed_events.clear()
 
     # Handle events
     event = body.get("event", {})
@@ -502,18 +487,18 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             logger.info(f"[Feishu] Normalized post → text='{_extracted_text[:100]}', images={len(_image_markers)}")
 
         if msg_type in ("file", "image"):
-            import asyncio as _asyncio
-            _asyncio.create_task(
-                _handle_feishu_file(
-                    db,
-                    agent_id,
-                    config,
-                    message,
-                    sender_open_id,
-                    sender_user_id_from_event,
-                    chat_type,
-                    chat_id,
-                )
+            # Do not acknowledge the provider before the durable ingest/match
+            # transaction has completed. Provider retries are deduplicated by
+            # ChatMessage.external_event_key, not by process-local memory.
+            await _handle_feishu_file(
+                db,
+                agent_id,
+                config,
+                message,
+                sender_open_id,
+                sender_user_id_from_event,
+                chat_type,
+                chat_id,
             )
             return {"code": 0, "msg": "ok"}
 
@@ -568,7 +553,6 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 return {"code": 0, "msg": "ok"}
 
             # Load recent conversation history via session (session UUID may already exist)
-            from app.models.audit import ChatMessage
             from app.models.agent import Agent as AgentModel
             from app.services.channel_session import find_or_create_channel_session
             agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
@@ -744,11 +728,22 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
 
             async def _work() -> str:
                 # ── User-row write (full turn starts here, inside the session lock) ──
-                db.add(ChatMessage(
-                    agent_id=agent_id, user_id=platform_user_id,
-                    role="user", content=user_text,
-                    conversation_id=session_conv_id,
-                ))
+                from app.services.chat_history import ingest_incoming_chat_message
+
+                ingested = await ingest_incoming_chat_message(
+                    db,
+                    session=_sess,
+                    agent_id=agent_id,
+                    user_id=platform_user_id,
+                    content=user_text,
+                    source_channel="feishu",
+                    provider_event_id=event_id or message.get("message_id") or None,
+                    channel_config_id=config.id,
+                    actor_ref=sender_user_id_feishu or sender_open_id,
+                    message_meta={
+                        "actor_ref_type": "user_id" if sender_user_id_feishu else "open_id"
+                    },
+                )
                 _sess.last_message_at = _dt.now(_tz.utc)
                 await db.commit()
 
@@ -760,6 +755,14 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     agent_id, session_conv_id, content=user_text,
                     sender_name=sender_name or None, user_id=platform_user_id,
                 )
+
+                if ingested.consumed_by_onmessage:
+                    logger.info(
+                        "[Feishu] Inbound event %s routed to %d on_message execution(s)",
+                        event_id,
+                        len(ingested.execution_ids),
+                    )
+                    return ""
 
                 # Load history inside the lock so concurrent turns cannot observe
                 # each other's not-yet-committed rows (race condition fix).
@@ -1052,6 +1055,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                         on_thinking=reactions.on_thinking,
                         on_tool_call=reactions.on_tool_call,
                         is_group=(chat_type == "group"),
+                        turn_anchor_id=ingested.message.id,
                     )
                 finally:
                     _llm_done = True
@@ -1173,6 +1177,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     _areply_session, agent_id=agent_id, user_id=platform_user_id,
                     conversation_id=session_conv_id, content=final_reply_text,
                     thinking="".join(_thinking_buffer) or None,
+                    turn_anchor_id=ingested.message.id,
                 )
                 _sess.last_message_at = _dt.now(_tz.utc)
                 await db.commit()
@@ -1204,9 +1209,8 @@ async def _handle_feishu_file(
     chat_type,
     chat_id,
 ):
-    """Handle incoming file or image messages from Feishu (runs as a background task)."""
+    """Handle an incoming Feishu file/image before acknowledging the event."""
     import asyncio, random, json
-    from app.models.audit import ChatMessage
     from app.models.agent import Agent as AgentModel
     from app.models.user import User as UserModel
     from app.services.channel_session import find_or_create_channel_session
@@ -1258,7 +1262,7 @@ async def _handle_feishu_file(
                 await feishu_service.send_message(config.app_id, config.app_secret, sender_open_id, "text", _j.dumps({"text": err_tip}))
         except Exception as e2:
             logger.error(f"[Feishu] Also failed to send error tip: {e2}")
-        return
+        raise RuntimeError(f"Feishu {msg_type} event was not durably ingested") from e
 
     # Resolve platform user and session using a fresh db session
     async with _async_session() as db:
@@ -1398,11 +1402,24 @@ async def _handle_feishu_file(
                 _b64_data = _b64_img.b64encode(file_bytes).decode("ascii")
                 _image_marker = f"[image_data:data:image/jpeg;base64,{_b64_data}]"
                 user_msg_content_img = f"[用户发送了图片]\n{_image_marker}"
-                _db_setup.add(ChatMessage(
-                    agent_id=agent_id, user_id=platform_user_id, role="user",
-                    content=f"[file:{filename}]",  # display-friendly (no base64) in DB
-                    conversation_id=session_conv_id_img,
-                ))
+                from app.services.chat_history import ingest_incoming_chat_message
+
+                _image_ingested = await ingest_incoming_chat_message(
+                    _db_setup,
+                    session=_sess_img,
+                    agent_id=agent_id,
+                    user_id=platform_user_id,
+                    content=f"[file:{filename}]",
+                    source_channel="feishu",
+                    provider_event_id=message_id or None,
+                    channel_config_id=config.id,
+                    actor_ref=sender_user_id_feishu or sender_open_id,
+                    message_meta={
+                        "message_type": "image",
+                        "workspace_path": workspace_path,
+                        "actor_ref_type": "user_id" if sender_user_id_feishu else "open_id",
+                    },
+                )
                 _sess_img.last_message_at = _dt.now(_tz.utc)
 
                 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
@@ -1424,6 +1441,10 @@ async def _handle_feishu_file(
                 agent_id, session_conv_id_img, content=f"[file:{filename}]",
                 sender_name=sender_name_file or None, user_id=platform_user_id,
             )
+
+            if _image_ingested.consumed_by_onmessage:
+                logger.info("[Feishu] Image event %s routed to on_message", message_id)
+                return ""
 
             # ── Streaming card setup ──
             _reply_to = chat_id if chat_type == "group" else sender_open_id
@@ -1531,6 +1552,7 @@ async def _handle_feishu_file(
                         on_chunk=_img_on_chunk,
                         on_thinking=_img_on_thinking,
                         is_group=_is_group_file,
+                        turn_anchor_id=_image_ingested.message.id,
                     )
                 finally:
                     _img_llm_done = True
@@ -1570,6 +1592,7 @@ async def _handle_feishu_file(
                 _async_session, agent_id=agent_id, user_id=platform_user_id,
                 conversation_id=session_conv_id_img, content=reply_text,
                 thinking="".join(_img_thinking_chunks) or None,
+                turn_anchor_id=_image_ingested.message.id,
             )
             from app.services.activity_logger import log_activity
             await log_activity(agent_id, "chat_reply", f"回复了飞书图片消息: {reply_text[:80]}",
@@ -1607,11 +1630,24 @@ async def _handle_feishu_file(
             group_name=_ack_group_name,
         )
         session_conv_id_ack = str(_sess_ack.id)
-        _db_ack.add(ChatMessage(
-            agent_id=agent_id, user_id=platform_user_id, role="user",
+        from app.services.chat_history import ingest_incoming_chat_message
+
+        _file_ingested = await ingest_incoming_chat_message(
+            _db_ack,
+            session=_sess_ack,
+            agent_id=agent_id,
+            user_id=platform_user_id,
             content=f"[file:{filename}]",
-            conversation_id=session_conv_id_ack,
-        ))
+            source_channel="feishu",
+            provider_event_id=message_id or None,
+            channel_config_id=config.id,
+            actor_ref=sender_user_id_feishu or sender_open_id,
+            message_meta={
+                "message_type": "file",
+                "workspace_path": workspace_path,
+                "actor_ref_type": "user_id" if sender_user_id_feishu else "open_id",
+            },
+        )
         _sess_ack.last_message_at = _dt.now(_tz.utc)
         await _db_ack.commit()
 
@@ -1622,6 +1658,10 @@ async def _handle_feishu_file(
         agent_id, session_conv_id_ack, content=f"[file:{filename}]",
         sender_name=sender_name_file or None, user_id=platform_user_id,
     )
+
+    if _file_ingested.consumed_by_onmessage:
+        logger.info("[Feishu] File event %s routed to on_message", message_id)
+        return
 
     await asyncio.sleep(random.uniform(1.0, 2.0))
 
@@ -1645,6 +1685,7 @@ async def _handle_feishu_file(
     await persist_assistant_reply(
         _async_session, agent_id=agent_id, user_id=platform_user_id,
         conversation_id=session_conv_id_ack, content=ack,
+        turn_anchor_id=_file_ingested.message.id,
     )
 
 

@@ -31,6 +31,12 @@ def test_fire_count_none_treated_as_zero():
     assert t.fire_count == 1
 
 
+def test_fire_count_tracks_each_subscription_event_claim():
+    t = _trig(fire_count=2)
+    apply_base_trigger_fired_state(t, NOW, fire_count_increment=3)
+    assert t.fire_count == 5
+
+
 def test_once_trigger_auto_disabled():
     t = _trig(type="once")
     apply_base_trigger_fired_state(t, NOW)

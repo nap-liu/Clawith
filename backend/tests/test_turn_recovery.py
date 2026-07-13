@@ -838,7 +838,14 @@ async def test_resume_turn_executes_unfinished_running_tool_call_before_continui
         (
             "read_file",
             {"path": "a.txt"},
-            {"agent_id": agent_id, "user_id": user_id, "session_id": conv, "on_output": None},
+                {
+                    "agent_id": agent_id,
+                    "user_id": user_id,
+                    "session_id": conv,
+                    "tool_call_id": call_id,
+                    "turn_anchor_id": anchor_id,
+                    "on_output": None,
+                },
         )
     ]
     assert [msg["role"] for msg in captured["history"]] == ["user", "assistant", "tool"]
@@ -941,7 +948,14 @@ async def test_resume_turn_reexecutes_running_tool_without_synthetic_recovery_me
         (
             "send_feishu_message",
             {"open_id": "ou_x", "text": "hello"},
-            {"agent_id": agent_id, "user_id": user_id, "session_id": conv, "on_output": None},
+                {
+                    "agent_id": agent_id,
+                    "user_id": user_id,
+                    "session_id": conv,
+                    "tool_call_id": call_id,
+                    "turn_anchor_id": anchor_id,
+                    "on_output": None,
+                },
         )
     ]
     assert [msg["role"] for msg in captured["history"]] == ["user", "assistant", "tool"]

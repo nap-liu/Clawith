@@ -65,6 +65,9 @@ class RecordingDB:
     async def flush(self):
         self.flushed = True
 
+    async def refresh(self, _value):
+        return None
+
 
 def _make_agent(agent_id=None, name="TestAgent", tenant_id=None, agent_type="native",
                 expired=False, primary_model_id=None):
@@ -147,7 +150,7 @@ async def test_notify_returns_immediately():
 
 @pytest.mark.asyncio
 async def test_task_delegate_creates_focus_and_trigger():
-    """task_delegate should create a focus item and an on_message trigger."""
+    """task_delegate should arm its durable callback before waking the target."""
     from app.services.agent_tools import _send_message_to_agent
 
     from_agent_id = uuid.uuid4()
@@ -169,14 +172,14 @@ async def test_task_delegate_creates_focus_and_trigger():
         DummyResult(scalar_value=rel_id),
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
         DummyResult(scalar_value=_make_tenant()),
     ])
 
     with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
-         patch("app.services.agent_tools._append_focus_item", new_callable=AsyncMock) as mock_focus, \
-         patch("app.services.agent_tools._create_on_message_trigger", new_callable=AsyncMock) as mock_trigger, \
-         patch("app.services.agent_tools._wake_agent_async", new_callable=AsyncMock) as mock_wake:
+         patch("app.services.agent_tools._arm_a2a_delegate_callback", new_callable=AsyncMock) as mock_arm, \
+         patch("app.services.agent_tools._wake_agent_async", new_callable=AsyncMock) as mock_wake, \
+         patch("app.services.activity_logger.log_activity", new_callable=AsyncMock):
 
         mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -189,17 +192,13 @@ async def test_task_delegate_creates_focus_and_trigger():
 
     assert "Task delegated to Bob" in result
     assert "notified when they complete" in result
-    mock_focus.assert_awaited_once()
-    mock_trigger.assert_awaited_once()
+    mock_arm.assert_awaited_once()
     mock_wake.assert_awaited_once()
 
-    focus_call = mock_focus.call_args
-    assert "wait_bob_task" in focus_call[0][1]
-    assert "Bob" in focus_call[0][2]
-
-    trigger_call = mock_trigger.call_args
-    assert trigger_call[1]["from_agent_name"] == "Bob"
-    assert trigger_call[1]["focus_ref"] == focus_call[0][1]
+    arm_kwargs = mock_arm.call_args.kwargs
+    assert arm_kwargs["target"] is target_agent
+    assert arm_kwargs["watch_session_id"] == str(session_id)
+    assert arm_kwargs["outbound_message_id"] is not None
 
 
 @pytest.mark.asyncio
@@ -529,7 +528,7 @@ async def test_openclaw_target_still_queues():
         DummyResult(scalar_value=rel_id),
         DummyResult(scalar_value=src_participant),
         DummyResult(scalar_value=tgt_participant),
-        DummyResult(scalar_value=session),
+        DummyResult(scalars_list=[session]),
     ])
 
     with patch("app.services.agent_tools.async_session") as mock_session_ctx, \
@@ -753,8 +752,6 @@ async def test_execute_tool_failure_writes_system_message():
     assert error_msg.role == "assistant"
     assert "系统提示" in error_msg.content
     assert "send_channel_message" in error_msg.content
-
-
 
 
 

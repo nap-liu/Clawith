@@ -478,15 +478,15 @@ async def chat_with_agent(  # noqa: D401
         )
 
         # Persist the user message and update session timestamp.
-        db.add(
-            ChatMessage(
-                agent_id=target_agent_id,
-                user_id=user.id,
-                role="user",
-                content=message,
-                conversation_id=conv_id,
-            )
+        turn_anchor = ChatMessage(
+            agent_id=target_agent_id,
+            user_id=user.id,
+            role="user",
+            content=message,
+            conversation_id=conv_id,
         )
+        db.add(turn_anchor)
+        await db.flush()
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
 
@@ -524,6 +524,7 @@ async def chat_with_agent(  # noqa: D401
             on_tool_call=on_tool_call,
             is_group=False,
             recovery_hint=None,
+            turn_anchor_id=turn_anchor.id,
         )
 
     # Persist the assistant reply in its own session so created_at is stamped
@@ -534,6 +535,7 @@ async def chat_with_agent(  # noqa: D401
         user_id=user.id,
         conversation_id=conv_id,
         content=reply,
+        turn_anchor_id=turn_anchor.id,
     )
 
     return reply

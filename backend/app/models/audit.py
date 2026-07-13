@@ -3,8 +3,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, func, text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -57,6 +57,19 @@ class ChatMessage(Base):
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
     conversation_id: Mapped[str] = mapped_column(String(200), default="web", nullable=False, index=True)
+    # Stable, namespaced provider event key used to make inbound channel writes
+    # idempotent across retries and backend replicas.  Web/H5 callers supply a
+    # client message id; IM adapters use their provider event/message id.
+    external_event_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Channel transport/correlation metadata.  Keeping this on ChatMessage lets
+    # on_message reuse the existing append-only history instead of introducing a
+    # parallel inbox/outbox model.
+    message_meta: Mapped[dict] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'"),
+    )
     # Participant identity (unified User/Agent identity)
     participant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("participants.id"), nullable=True)
     # Model thinking process
@@ -71,6 +84,15 @@ class ChatMessage(Base):
         nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    __table_args__ = (
+        Index(
+            "uq_chat_messages_external_event_key",
+            "external_event_key",
+            unique=True,
+            postgresql_where=text("external_event_key IS NOT NULL"),
+        ),
+    )
 
 
 class EnterpriseInfo(Base):

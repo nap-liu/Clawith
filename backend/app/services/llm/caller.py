@@ -791,6 +791,8 @@ async def _process_tool_call(
         agent_id=agent_id,
         user_id=user_id or agent_id,
         session_id=session_id,
+        tool_call_id=str(tc.get("id") or ""),
+        turn_anchor_id=turn_anchor_id,
         on_output=_on_output,
     )
     logger.info(f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}")
@@ -1880,6 +1882,7 @@ async def call_agent_llm_with_tools(
                             agent_id=agent_id,
                             user_id=agent.creator_id,
                             session_id=session_id,
+                            tool_call_id=str(tc.get("id") or ""),
                         )
                         logger.info(
                             f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}"

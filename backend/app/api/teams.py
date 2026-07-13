@@ -395,14 +395,7 @@ async def teams_event_webhook(
                 await db.commit()
                 logger.info(f"Teams: Updated service_url for agent {agent_id} to {service_url}")
 
-        # Dedup
         activity_id = activity.get("id")
-        if activity_id in _processed_teams_events:
-            return {"ok": True}
-        if activity_id:
-            _processed_teams_events.add(activity_id)
-            if len(_processed_teams_events) > 1000:
-                _processed_teams_events.clear()
 
         # Only process message activities
         if activity.get("type") != "message":
@@ -469,6 +462,12 @@ async def teams_event_webhook(
         # Early-return for channel commands (/new, /reset):
         # archive the session and send a canned reply — no LLM, no lock needed.
         if is_channel_command(user_text):
+            if activity_id in _processed_teams_events:
+                return {"ok": True}
+            if activity_id:
+                _processed_teams_events.add(activity_id)
+                if len(_processed_teams_events) > 1000:
+                    _processed_teams_events.clear()
             cmd_result = await handle_channel_command(
                 db=db, command=user_text, agent_id=agent_id,
                 user_id=None, external_conv_id=conversation_id,
@@ -521,8 +520,20 @@ async def teams_event_webhook(
                 is_group=False,  # group-chat sender wrap not enabled for Teams yet
             )
 
-            # Save user message
-            db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
+            from app.services.chat_history import ingest_incoming_chat_message
+
+            ingested = await ingest_incoming_chat_message(
+                db,
+                session=sess,
+                agent_id=agent_id,
+                user_id=platform_user_id,
+                content=user_text,
+                source_channel="microsoft_teams",
+                provider_event_id=activity_id,
+                channel_config_id=config.id,
+                actor_ref=sender_id,
+                reply_to_external_message_id=activity.get("replyToId"),
+            )
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 
@@ -534,6 +545,14 @@ async def teams_event_webhook(
                 agent_id, session_conv_id, content=user_text,
                 sender_name=sender_name or None, user_id=platform_user_id,
             )
+
+            if ingested.consumed_by_onmessage:
+                logger.info(
+                    "Teams: inbound event %s routed to %d on_message execution(s)",
+                    activity_id,
+                    len(ingested.execution_ids),
+                )
+                return ""
 
             # Set channel_file_sender contextvar for agent → user file delivery
             async def _teams_file_sender(file_path, msg: str = ""):
@@ -597,6 +616,7 @@ async def teams_event_webhook(
                     db, agent_id, user_text,
                     history=history, user_id=platform_user_id, session_id=session_conv_id,
                     on_thinking=_collect_thinking,
+                    turn_anchor_id=ingested.message.id,
                 )
                 logger.info(f"Teams: LLM reply generated: {reply_text[:80]}")
             except Exception as e:
@@ -618,6 +638,7 @@ async def teams_event_webhook(
                     _areply_session, agent_id=agent_id, user_id=platform_user_id,
                     conversation_id=session_conv_id, content=reply_text,
                     thinking="".join(_thinking_chunks) or None,
+                    turn_anchor_id=ingested.message.id,
                 )
                 sess.last_message_at = datetime.now(timezone.utc)
                 await db.commit()

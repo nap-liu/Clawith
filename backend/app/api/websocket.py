@@ -583,12 +583,23 @@ class WebSocketChatHandler:
             self.conversation.append({"role": "user", "content": content})
 
             # Save user message to DB
-            turn_anchor_id = await self._save_user_message(
+            turn_anchor_id, consumed_by_onmessage = await self._save_user_message(
                 content,
                 display_content,
                 file_name,
                 is_onboarding_trigger,
+                client_message_id=(data.get("message_id") or data.get("client_message_id")),
             )
+
+            if consumed_by_onmessage:
+                # The durable inbound event belongs to one or more exact
+                # on_message subscriptions.  Their origin sessions will run
+                # the corresponding event turns; do not also answer it in this
+                # remote session.
+                if self.conversation and self.conversation[-1].get("role") == "user":
+                    self.conversation.pop()
+                await self._safe_send({"type": "done", "role": "assistant", "content": ""})
+                continue
 
             # OpenClaw routing check
             if self.agent_type == "openclaw":
@@ -733,7 +744,8 @@ class WebSocketChatHandler:
         display_content: str,
         file_name: str,
         is_onboarding_trigger: bool,
-    ) -> uuid.UUID | None:
+        client_message_id: str | None = None,
+    ) -> tuple[uuid.UUID | None, bool]:
         """Saves user message to the database and updates session title/time."""
         has_image_marker = "[image_data:" in content
         if has_image_marker:
@@ -751,22 +763,28 @@ class WebSocketChatHandler:
                 if _s and _s.title.startswith("Session "):
                     _s.title = "Onboarding"
                     await _sdb.commit()
-            return None
+            return None, False
         else:
-            from app.services.chat_history import persist_incoming_user_message
+            from app.services.chat_history import ingest_incoming_chat_message
 
             async with async_session() as db:
-                user_msg = await persist_incoming_user_message(
+                _sess_r = await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(self.conv_id)))
+                _sess = _sess_r.scalar_one_or_none()
+                if _sess is None:
+                    raise RuntimeError("chat session no longer exists")
+                ingested = await ingest_incoming_chat_message(
                     db,
+                    session=_sess,
                     agent_id=self.agent_id,
                     user_id=self.user.id,
                     content=saved_content,
-                    conversation_id=self.conv_id,
+                    source_channel=_sess.source_channel,
+                    provider_event_id=str(client_message_id or "") or None,
+                    channel_config_id=_sess.id,
+                    actor_ref=str(self.user.id),
                 )
                 # Update session
                 _now = datetime.now(tz.utc)
-                _sess_r = await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(self.conv_id)))
-                _sess = _sess_r.scalar_one_or_none()
                 if _sess:
                     _sess.last_message_at = _now
                     if not self.history_messages and (
@@ -779,7 +797,7 @@ class WebSocketChatHandler:
                         _sess.title = clean_title[:40] if clean_title else content[:40]
                 await db.commit()
             logger.info("[WS] User message saved")
-            return user_msg.id
+            return ingested.message.id, ingested.consumed_by_onmessage
 
     async def _route_openclaw(self, content: str):
         """Enqueues message for OpenClaw edge node poll."""
@@ -1240,6 +1258,14 @@ class WebSocketChatHandler:
                 content=assistant_response,
                 conversation_id=self.conv_id,
                 thinking="".join(thinking_content) if thinking_content else None,
+                message_meta=(
+                    {
+                        "turn_anchor_id": str(turn_anchor_id),
+                        "turn_status": "completed",
+                    }
+                    if turn_anchor_id is not None
+                    else {}
+                ),
             )
             db.add(assistant_msg)
             await maybe_mark_session_read_for_active_viewer(

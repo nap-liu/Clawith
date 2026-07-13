@@ -293,11 +293,6 @@ async def process_dingtalk_message(
         image_base64_list: List of base64-encoded image data URIs for vision LLM.
         saved_file_paths: List of local file paths where media files were saved.
     """
-    # ── Dedup check: skip if this message_id was already processed ──
-    if await _check_message_dedup(message_id):
-        logger.info(f"[DingTalk] Skipping duplicate message_id={message_id}")
-        return
-
     import httpx
     from datetime import datetime, timezone
     from sqlalchemy import select as _select
@@ -589,16 +584,20 @@ async def process_dingtalk_message(
             saved_content = f"{_file_prefixes}\n{_clean_text}".strip() if _clean_text else _file_prefixes
         else:
             saved_content = _clean_text or user_text
-        from app.services.chat_history import persist_incoming_user_message
+        from app.services.chat_history import ingest_incoming_chat_message
 
-        turn_anchor = await persist_incoming_user_message(
+        ingested = await ingest_incoming_chat_message(
             db,
+            session=sess,
             agent_id=agent_id,
             user_id=platform_user_id,
-            conversation_id=session_conv_id,
             content=saved_content,
+            source_channel="dingtalk",
+            provider_event_id=message_id or None,
+            channel_config_id=_early_cfg.id if _early_cfg else None,
+            actor_ref=sender_staff_id,
         )
-        turn_anchor_id = turn_anchor.id
+        turn_anchor_id = ingested.message.id
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
 
@@ -610,6 +609,14 @@ async def process_dingtalk_message(
             agent_id, session_conv_id, content=saved_content,
             sender_name=sender_nick or None, user_id=platform_user_id,
         )
+
+        if ingested.consumed_by_onmessage:
+            logger.info(
+                "[DingTalk] Inbound message %s routed to %d on_message execution(s)",
+                message_id,
+                len(ingested.execution_ids),
+            )
+            return
 
         # ── Set up channel_file_sender so the agent can send files via DingTalk ──
         from app.services.agent_tools import channel_file_sender as _cfs
@@ -791,6 +798,7 @@ async def process_dingtalk_message(
                     conversation_id=session_conv_id,
                     content=reply_text,
                     thinking="".join(_thinking_chunks) or None,
+                    turn_anchor_id=turn_anchor_id,
                 )
                 await reply_db.commit()
             sess.last_message_at = datetime.now(timezone.utc)

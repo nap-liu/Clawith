@@ -15,10 +15,15 @@
 """
 
 import asyncio
+import hashlib
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from loguru import logger
+from sqlalchemy import text
+
+from app.database import async_session
 
 Hook0 = Callable[[], Awaitable[None]]
 
@@ -100,12 +105,33 @@ async def cancel_running_turn(lock_key: str) -> bool:
         return True
 
 
+@asynccontextmanager
+async def _distributed_session_lock(lock_key: str):
+    """Cross-replica PostgreSQL advisory lock for durable trigger turns."""
+    lock_id = int.from_bytes(
+        hashlib.blake2b(lock_key.encode("utf-8"), digest_size=8).digest(),
+        byteorder="big",
+        signed=True,
+    )
+    async with async_session() as db:
+        bind = db.get_bind()
+        if bind.dialect.name != "postgresql":
+            yield
+            return
+        await db.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
+        try:
+            yield
+        finally:
+            await db.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
+
+
 async def run_channel_message(
     lock_key: str,
     *,
     is_command: bool,
     reactions: ChannelReactions,
     work: Callable[[], Awaitable[str]],
+    distributed: bool = False,
 ) -> str:
     """Unified entry every IM channel calls to process one inbound message turn.
 
@@ -128,14 +154,20 @@ async def run_channel_message(
     try:
         lock = await _get_session_lock(lock_key)
         async with lock:
-            await _safe(reactions.on_consume)
-            try:
-                reply = await work()
-            except BaseException as exc:
-                await _safe(reactions.on_error, exc)
-                raise
-            await _safe(reactions.on_complete, reply)
-            return reply
+            async def _run_locked() -> str:
+                await _safe(reactions.on_consume)
+                try:
+                    reply = await work()
+                except BaseException as exc:
+                    await _safe(reactions.on_error, exc)
+                    raise
+                await _safe(reactions.on_complete, reply)
+                return reply
+
+            if distributed:
+                async with _distributed_session_lock(lock_key):
+                    return await _run_locked()
+            return await _run_locked()
     finally:
         if current_task is not None:
             await _clear_running_turn(lock_key, current_task)

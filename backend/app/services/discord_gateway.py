@@ -258,14 +258,31 @@ class DiscordGatewayManager:
                 from app.services.llm.utils import convert_chat_messages_to_llm_format as _conv
                 history = _conv(reversed(history_r.scalars().all()))
 
-                # Save user message
-                db.add(ChatMessage(
+                cfg_r = await db.execute(
+                    select(ChannelConfig).where(
+                        ChannelConfig.agent_id == agent_id,
+                        ChannelConfig.channel_type == "discord",
+                    )
+                )
+                channel_config = cfg_r.scalar_one_or_none()
+                from app.services.chat_history import ingest_incoming_chat_message
+
+                ingested = await ingest_incoming_chat_message(
+                    db,
+                    session=sess,
                     agent_id=agent_id,
                     user_id=platform_user_id,
-                    role="user",
                     content=user_text,
-                    conversation_id=session_conv_id,
-                ))
+                    source_channel="discord",
+                    provider_event_id=str(message.id),
+                    channel_config_id=channel_config.id if channel_config else None,
+                    actor_ref=sender_id,
+                    reply_to_external_message_id=(
+                        str(message.reference.message_id)
+                        if message.reference and message.reference.message_id
+                        else None
+                    ),
+                )
                 sess.last_message_at = datetime.now(timezone.utc)
                 await db.commit()
 
@@ -277,6 +294,14 @@ class DiscordGatewayManager:
                     agent_id, session_conv_id, content=user_text,
                     sender_name=_discord_display_name or None, user_id=platform_user_id,
                 )
+
+                if ingested.consumed_by_onmessage:
+                    logger.info(
+                        "[Discord GW] Inbound message %s routed to %d on_message execution(s)",
+                        message.id,
+                        len(ingested.execution_ids),
+                    )
+                    return None
 
                 # Call LLM
                 _thinking_chunks: list[str] = []
@@ -294,6 +319,7 @@ class DiscordGatewayManager:
                         db, agent_id, user_text,
                         history=history, user_id=platform_user_id, session_id=session_conv_id,
                         on_thinking=_collect_thinking,
+                        turn_anchor_id=ingested.message.id,
                     )
                 finally:
                     await _thinking_sender.flush()
@@ -309,6 +335,7 @@ class DiscordGatewayManager:
                     _areply_session, agent_id=agent_id, user_id=platform_user_id,
                     conversation_id=session_conv_id, content=reply_text,
                     thinking="".join(_thinking_chunks) or None,
+                    turn_anchor_id=ingested.message.id,
                 )
                 sess.last_message_at = datetime.now(timezone.utc)
                 await db.commit()

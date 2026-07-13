@@ -253,13 +253,6 @@ async def whatsapp_event_webhook(
 
             for message in messages:
                 message_id = str(message.get("id") or "").strip()
-                if message_id and message_id in _processed_whatsapp_messages:
-                    continue
-                if message_id:
-                    _processed_whatsapp_messages.add(message_id)
-                    if len(_processed_whatsapp_messages) > 2000:
-                        _processed_whatsapp_messages.clear()
-
                 user_text = _extract_message_text(message)
                 sender_phone = str(message.get("from") or "").strip()
                 if not user_text or not sender_phone:
@@ -295,6 +288,12 @@ async def whatsapp_event_webhook(
                 # Early-return for channel commands (/new, /reset):
                 # archive the session and send a canned reply — no LLM, no lock needed.
                 if is_channel_command(user_text):
+                    if message_id and message_id in _processed_whatsapp_messages:
+                        continue
+                    if message_id:
+                        _processed_whatsapp_messages.add(message_id)
+                        if len(_processed_whatsapp_messages) > 2000:
+                            _processed_whatsapp_messages.clear()
                     cmd_result = await handle_channel_command(
                         db=db, command=user_text, agent_id=agent_id,
                         user_id=None, external_conv_id=conv_id,
@@ -330,7 +329,20 @@ async def whatsapp_event_webhook(
                     )
                     history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
 
-                    db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
+                    from app.services.chat_history import ingest_incoming_chat_message
+
+                    ingested = await ingest_incoming_chat_message(
+                        db,
+                        session=sess,
+                        agent_id=agent_id,
+                        user_id=platform_user_id,
+                        content=user_text,
+                        source_channel="whatsapp",
+                        provider_event_id=message_id or None,
+                        channel_config_id=config.id,
+                        actor_ref=_sender_phone,
+                        reply_to_external_message_id=(message.get("context") or {}).get("id"),
+                    )
                     sess.last_message_at = datetime.now(timezone.utc)
                     await db.commit()
 
@@ -342,6 +354,14 @@ async def whatsapp_event_webhook(
                         agent_id, session_conv_id, content=user_text,
                         sender_name=contact_name or None, user_id=platform_user_id,
                     )
+
+                    if ingested.consumed_by_onmessage:
+                        logger.info(
+                            "[WhatsApp] Inbound event %s routed to %d on_message execution(s)",
+                            message_id,
+                            len(ingested.execution_ids),
+                        )
+                        return ""
 
                     _thinking_chunks: list[str] = []
                     _thinking_sender = BufferedIMThinkingSender(
@@ -358,6 +378,7 @@ async def whatsapp_event_webhook(
                             db, agent_id, user_text,
                             history=history, user_id=platform_user_id, session_id=session_conv_id,
                             on_thinking=_collect_thinking,
+                            turn_anchor_id=ingested.message.id,
                         )
                     except Exception as exc:
                         logger.exception(f"[WhatsApp] LLM failed for agent {agent_id}: {exc}")
@@ -378,6 +399,7 @@ async def whatsapp_event_webhook(
                             _areply_session, agent_id=agent_id, user_id=platform_user_id,
                             conversation_id=session_conv_id, content=reply_text,
                             thinking="".join(_thinking_chunks) or None,
+                            turn_anchor_id=ingested.message.id,
                         )
                         sess.last_message_at = datetime.now(timezone.utc)
                         await db.commit()

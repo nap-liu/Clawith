@@ -199,7 +199,13 @@ async def test_confirmation_pending_tool_call_is_the_suspended_state():
 
     payload = await _row_payload(row_id)
     assert payload["status"] == "pending"
+    # The anchor remains platform-private metadata, not model-visible tool
+    # content, and is restored when the confirmation resumes the turn.
     assert "turn_anchor_id" not in payload
+    async with async_session() as db:
+        pending_row = await db.get(ChatMessage, row_id)
+        assert pending_row.message_meta["turn_anchor_id"] == str(anchor_id)
+        assert pending_row.message_meta["turn_status"] == "suspended"
 
     with (
         patch.object(cs, "_reenter_loop", new=AsyncMock()) as reenter,
@@ -216,7 +222,7 @@ async def test_confirmation_pending_tool_call_is_the_suspended_state():
 
     assert result is not None
     reenter.assert_awaited_once()
-    assert "turn_anchor_id" not in reenter.await_args.kwargs
+    assert reenter.await_args.kwargs["turn_anchor_id"] == anchor_id
 
 
 async def test_suspend_confirmation_persists_intro_before_pending_card():

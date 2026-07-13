@@ -371,8 +371,19 @@ async def discord_interaction_webhook(
                         is_group=False,  # group-chat sender wrap not enabled for Discord yet
                     )
 
-                    # Save user message
-                    bg_db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
+                    from app.services.chat_history import ingest_incoming_chat_message
+
+                    ingested = await ingest_incoming_chat_message(
+                        bg_db,
+                        session=sess,
+                        agent_id=agent_id,
+                        user_id=platform_user_id,
+                        content=user_text,
+                        source_channel="discord",
+                        provider_event_id=str(body.get("id") or "") or None,
+                        channel_config_id=config.id,
+                        actor_ref=sender_id,
+                    )
                     sess.last_message_at = datetime.now(timezone.utc)
                     await bg_db.commit()
 
@@ -384,6 +395,14 @@ async def discord_interaction_webhook(
                         agent_id, session_conv_id, content=user_text,
                         sender_name=_discord_username or None, user_id=platform_user_id,
                     )
+
+                    if ingested.consumed_by_onmessage:
+                        logger.info(
+                            "[Discord] Inbound interaction %s routed to %d on_message execution(s)",
+                            body.get("id"),
+                            len(ingested.execution_ids),
+                        )
+                        return ""
 
                     # Call LLM
                     _thinking_chunks: list[str] = []
@@ -413,6 +432,7 @@ async def discord_interaction_webhook(
                             bg_db, agent_id, user_text,
                             history=history, user_id=platform_user_id, session_id=session_conv_id,
                             on_thinking=_collect_thinking,
+                            turn_anchor_id=ingested.message.id,
                         )
                     finally:
                         await _thinking_sender.flush()
@@ -428,6 +448,7 @@ async def discord_interaction_webhook(
                         _areply_session, agent_id=agent_id, user_id=platform_user_id,
                         conversation_id=session_conv_id, content=reply_text,
                         thinking="".join(_thinking_chunks) or None,
+                        turn_anchor_id=ingested.message.id,
                     )
                     sess.last_message_at = datetime.now(timezone.utc)
                     await bg_db.commit()

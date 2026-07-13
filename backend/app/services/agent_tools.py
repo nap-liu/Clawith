@@ -3143,6 +3143,8 @@ async def execute_tool(
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
     session_id: str = "",
+    tool_call_id: str = "",
+    turn_anchor_id: uuid.UUID | None = None,
     on_output=None,
     skip_autonomy: bool = False,
 ) -> str:
@@ -3203,6 +3205,40 @@ async def execute_tool(
         except Exception as e:
             logger.exception(f"[Autonomy] Check failed: {e}")
             return f"⚠️ Autonomy check failed ({e}). Operation blocked for safety. Please retry or contact admin."
+
+    # Tool-loop recovery can replay a completed tool call after a process crash.
+    # Messaging providers do not all expose an idempotency header, so the durable
+    # outbound receipt is the platform-owned replay boundary.  This stays entirely
+    # internal: the tool schema and model-visible arguments remain unchanged.
+    if tool_name in {
+        "send_channel_message",
+        "send_feishu_message",
+        "send_platform_message",
+        "send_message_to_agent",
+    }:
+        cached_outbound = await _find_outbound_tool_receipt(
+            agent_id=agent_id,
+            origin_session_id=session_id,
+            tool_call_id=tool_call_id,
+            origin_turn_anchor_id=turn_anchor_id,
+        )
+        if cached_outbound is not None:
+            cached_meta = (
+                cached_outbound.message_meta
+                if isinstance(cached_outbound.message_meta, dict)
+                else {}
+            )
+            # OpenClaw task delivery has two durable phases: the outbound row is
+            # first recorded and its exact callback is armed, then the gateway
+            # row and `queued` status commit together. A crash between those
+            # phases must resume instead of pretending the target saw it.
+            if not (
+                tool_name == "send_message_to_agent"
+                and cached_meta.get("delivery_status") == "recorded"
+            ):
+                target = str(cached_meta.get("target_name") or "the recipient")
+                channel = str(cached_meta.get("source_channel") or "the selected channel")
+                return f"✅ Message already sent to {target} via {channel} (idempotent replay)."
 
     # Pre-inject session_id into arguments for AgentBay tools so each
     # _agentbay_* handler can pass it to get_agentbay_client_for_agent()
@@ -3365,6 +3401,7 @@ async def execute_tool(
                 arguments,
                 session_id=session_id,
                 user_id=user_id,
+                turn_anchor_id=turn_anchor_id,
             )
         elif tool_name == "update_trigger":
             result = await _handle_update_trigger(agent_id, arguments)
@@ -3379,11 +3416,32 @@ async def execute_tool(
         elif tool_name == "remove_contact":
             result = await _remove_contact_tool(agent_id, arguments, user_id)
         elif tool_name == "send_feishu_message":
-            result = await _send_feishu_message(agent_id, arguments)
+            result = await _send_feishu_message(
+                agent_id,
+                arguments,
+                origin_session_id=session_id,
+                origin_user_id=user_id,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=turn_anchor_id,
+            )
         elif tool_name == "send_platform_message":
-            result = await _send_platform_message(agent_id, arguments)
+            result = await _send_platform_message(
+                agent_id,
+                arguments,
+                origin_session_id=session_id,
+                origin_user_id=user_id,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=turn_anchor_id,
+            )
         elif tool_name == "send_channel_message":
-            result = await _send_channel_message(agent_id, arguments)
+            result = await _send_channel_message(
+                agent_id,
+                arguments,
+                origin_session_id=session_id,
+                origin_user_id=user_id,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=turn_anchor_id,
+            )
         elif tool_name == "start_dingtalk_channel_provisioning":
             result = await _start_dingtalk_channel_provisioning_tool(agent_id, user_id, arguments)
         elif tool_name == "get_dingtalk_channel_provisioning_status":
@@ -3394,6 +3452,8 @@ async def execute_tool(
                 arguments,
                 user_id=user_id,
                 origin_session_id=session_id,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=turn_anchor_id,
             )
         elif tool_name == "send_file_to_agent":
             result = await _send_file_to_agent(agent_id, arguments)
@@ -6521,7 +6581,15 @@ async def _remove_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UU
     return f"❌ Unable to remove contact: {result.get('reason', 'unknown_error')}"
 
 
-async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
+async def _send_feishu_message(
+    agent_id: uuid.UUID,
+    args: dict,
+    *,
+    origin_session_id: str | None = None,
+    origin_user_id: uuid.UUID | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
+) -> str:
     """Send a Feishu message to a person in the agent's relationship list."""
     member_name = (args.get("member_name") or "").strip()
     direct_user_id = (args.get("user_id") or "").strip()
@@ -6569,10 +6637,41 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                         receive_id_type="user_id",
                     )
                     if resp.get("code") == 0:
-                        # NOTE: history-session save is intentionally skipped on the
-                        # direct user_id path — _save_outgoing_to_feishu_session
-                        # depends on `target_member` (resolved below in the
-                        # member_name branch) and cannot be invoked here.
+                        target_member = direct_rel.member
+                        agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+                        agent_obj = agent_r.scalar_one_or_none()
+                        platform_user = await get_platform_user_by_org_member(
+                            db=db,
+                            org_member=target_member,
+                            agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+                        )
+                        sess = await find_or_create_channel_session(
+                            db=db,
+                            agent_id=agent_id,
+                            user_id=platform_user.id,
+                            external_conv_id=f"feishu_p2p_{direct_user_id}",
+                            source_channel="feishu",
+                            first_message_title=f"[Agent → {direct_user_id}]",
+                        )
+                        external_message_id = str(
+                            ((resp.get("data") or {}).get("message_id")) or resp.get("message_id") or ""
+                        ) or None
+                        await _persist_outbound_channel_message(
+                            db,
+                            agent_id=agent_id,
+                            user_id=platform_user.id,
+                            session=sess,
+                            content=message_text,
+                            source_channel="feishu",
+                            actor_ref=direct_user_id,
+                            target_name=target_member.name or direct_user_id,
+                            origin_session_id=origin_session_id,
+                            origin_source_channel=None,
+                            tool_call_id=tool_call_id,
+                            origin_turn_anchor_id=origin_turn_anchor_id,
+                            external_message_id=external_message_id,
+                        )
+                        await db.commit()
                         return f"✅ 消息已发送（user_id: {direct_user_id}）"
                     return f"❌ 发送失败：{resp.get('msg')} (code {resp.get('code')})"
                 except FeishuAPIError as user_id_err:
@@ -6612,15 +6711,14 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                     content=content, receive_id_type=id_type,
                 )
 
-            async def _save_outgoing_to_feishu_session(feishu_user_id: str):
+            async def _save_outgoing_to_feishu_session(
+                feishu_user_id: str,
+                external_message_id: str | None,
+            ) -> tuple[ChatSession, ChatMessage] | None:
                 """Save the outgoing message to the Feishu P2P chat session."""
                 try:
-                    from datetime import datetime as _dt, timezone as _tz
-
-
                     agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
                     agent_obj = agent_r.scalar_one_or_none()
-                    creator_id = agent_obj.creator_id if agent_obj else agent_id
 
                     # Get or create platform user from OrgMember (unified logic)
                     platform_user = await get_platform_user_by_org_member(
@@ -6639,24 +6737,41 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                         source_channel="feishu",
                         first_message_title=f"[Agent → {member_name or feishu_user_id}]",
                     )
-                    db.add(ChatMessage(
+                    outbound = await _persist_outbound_channel_message(
+                        db,
                         agent_id=agent_id,
                         user_id=user_id,
-                        role="assistant",
+                        session=sess,
                         content=message_text,
-                        conversation_id=str(sess.id),
-                    ))
-                    sess.last_message_at = _dt.now(_tz.utc)
+                        source_channel="feishu",
+                        actor_ref=feishu_user_id,
+                        target_name=member_name or feishu_user_id,
+                        origin_session_id=origin_session_id,
+                        origin_source_channel=None,
+                        tool_call_id=tool_call_id,
+                        origin_turn_anchor_id=origin_turn_anchor_id,
+                        external_message_id=external_message_id,
+                    )
                     await db.commit()
                     logger.info(f"[Feishu] Saved outgoing message to session {sess.id} (user_id: {feishu_user_id})")
+                    return sess, outbound
                 except Exception as e:
                     logger.error(f"[Feishu] Failed to save outgoing message to history: {e}")
+                    return None
 
             try:
                 resp = await _try_send(config.app_id, config.app_secret, target_member.external_id, "user_id")
                 if resp.get("code") == 0:
-                    await _save_outgoing_to_feishu_session(target_member.external_id)
-                    return f"✅ Successfully sent message to {member_name}"
+                    external_message_id = str(
+                        ((resp.get("data") or {}).get("message_id")) or resp.get("message_id") or ""
+                    ) or None
+                    saved = await _save_outgoing_to_feishu_session(target_member.external_id, external_message_id)
+                    if saved is not None:
+                        return f"✅ Successfully sent message to {member_name}"
+                    return (
+                        f"❌ The message reached {member_name}, but its platform routing "
+                        "receipt was not persisted. No exact on_message subscription was armed."
+                    )
                 logger.info(f"❌ Failed to send message to {target_member.external_id} via Feishu (user_id): {resp}")
                 return f"发送失败: {resp.get('msg')} (code {resp.get('code')})"
             except FeishuAPIError as user_id_err:
@@ -6765,7 +6880,135 @@ async def _get_dingtalk_channel_provisioning_status_tool(
     return "\n".join(lines)
 
 
-async def _send_channel_message(agent_id: uuid.UUID, args: dict) -> str:
+def _build_outbound_operation_key(
+    *,
+    agent_id: uuid.UUID,
+    origin_session_id: str | None,
+    tool_call_id: str | None,
+    origin_turn_anchor_id: uuid.UUID | str | None = None,
+) -> str | None:
+    """Return the durable replay key for one messaging tool invocation."""
+    if not origin_session_id or not tool_call_id:
+        return None
+    turn_scope = str(origin_turn_anchor_id or "unanchored")
+    return f"outbound:{agent_id}:{origin_session_id}:{turn_scope}:{tool_call_id}"[:500]
+
+
+async def _lock_outbound_operation(db, operation_key: str | None) -> None:
+    """Serialize one internal send operation even before its receipt exists."""
+    if not operation_key or db.get_bind().dialect.name != "postgresql":
+        return
+    import hashlib
+    from sqlalchemy import text as sa_text
+
+    lock_id = int.from_bytes(
+        hashlib.blake2b(operation_key.encode("utf-8"), digest_size=8).digest(),
+        byteorder="big",
+        signed=True,
+    )
+    await db.execute(
+        sa_text("SELECT pg_advisory_xact_lock(:lock_id)"),
+        {"lock_id": lock_id},
+    )
+
+
+async def _find_outbound_tool_receipt(
+    *,
+    agent_id: uuid.UUID,
+    origin_session_id: str | None,
+    tool_call_id: str | None,
+    origin_turn_anchor_id: uuid.UUID | str | None = None,
+) -> ChatMessage | None:
+    """Look up a previously persisted send result before replaying a provider call."""
+    operation_key = _build_outbound_operation_key(
+        agent_id=agent_id,
+        origin_session_id=origin_session_id,
+        tool_call_id=tool_call_id,
+        origin_turn_anchor_id=origin_turn_anchor_id,
+    )
+    if not operation_key:
+        return None
+    async with async_session() as db:
+        return (
+            await db.execute(
+                select(ChatMessage).where(ChatMessage.external_event_key == operation_key)
+            )
+        ).scalar_one_or_none()
+
+
+async def _persist_outbound_channel_message(
+    db,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session: ChatSession,
+    content: str,
+    source_channel: str,
+    actor_ref: str,
+    target_name: str,
+    origin_session_id: str | None,
+    origin_source_channel: str | None,
+    tool_call_id: str | None,
+    origin_turn_anchor_id: uuid.UUID | None,
+    external_message_id: str | None = None,
+) -> ChatMessage:
+    """Append/reuse the outbound receipt used by strict on_message binding."""
+    operation_key = _build_outbound_operation_key(
+        agent_id=agent_id,
+        origin_session_id=origin_session_id,
+        tool_call_id=tool_call_id,
+        origin_turn_anchor_id=origin_turn_anchor_id,
+    )
+    if operation_key:
+        existing = (
+            await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == operation_key))
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing
+
+    if origin_session_id and not origin_source_channel:
+        try:
+            origin = await db.get(ChatSession, uuid.UUID(str(origin_session_id)))
+        except (TypeError, ValueError):
+            origin = None
+        if origin is not None:
+            origin_source_channel = origin.source_channel
+
+    row = ChatMessage(
+        agent_id=agent_id,
+        user_id=user_id,
+        role="assistant",
+        content=content,
+        conversation_id=str(session.id),
+        external_event_key=operation_key,
+        message_meta={
+            "direction": "outbound",
+            "source_channel": source_channel,
+            "actor_ref": str(actor_ref),
+            "target_name": str(target_name),
+            "origin_session_id": str(origin_session_id or ""),
+            "origin_source_channel": str(origin_source_channel or ""),
+            "tool_call_id": str(tool_call_id or ""),
+            "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
+            "external_message_id": str(external_message_id or ""),
+            "delivery_status": "sent",
+        },
+    )
+    db.add(row)
+    session.last_message_at = datetime.now(timezone.utc)
+    await db.flush()
+    return row
+
+
+async def _send_channel_message(
+    agent_id: uuid.UUID,
+    args: dict,
+    *,
+    origin_session_id: str | None = None,
+    origin_user_id: uuid.UUID | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
+) -> str:
     """Send message via the recipient's configured external channel.
 
     1. Find target user from relationships (AgentRelationship -> OrgMember)
@@ -6863,6 +7106,10 @@ async def _send_channel_message(agent_id: uuid.UUID, args: dict) -> str:
                                 "username": platform_identifier,
                                 "message": message_text,
                             },
+                            origin_session_id=origin_session_id,
+                            origin_user_id=origin_user_id,
+                            tool_call_id=tool_call_id,
+                            origin_turn_anchor_id=origin_turn_anchor_id,
                         )
 
                 # Fallback: check which channel configs exist and has user info
@@ -6879,17 +7126,52 @@ async def _send_channel_message(agent_id: uuid.UUID, args: dict) -> str:
 
             # 3. Route to appropriate channel
             if provider_type == "feishu":
-                return await _send_feishu_message(agent_id, {"member_name": member_name, "message": message_text})
+                return await _send_feishu_message(
+                    agent_id,
+                    {
+                        "member_name": member_name,
+                        "message": message_text,
+                    },
+                    origin_session_id=origin_session_id,
+                    origin_user_id=origin_user_id,
+                    tool_call_id=tool_call_id,
+                    origin_turn_anchor_id=origin_turn_anchor_id,
+                )
             elif provider_type == "dingtalk":
-                return await _send_dingtalk_message(agent_id, member_name, message_text, target_member)
+                return await _send_dingtalk_message(
+                    agent_id, member_name, message_text, target_member,
+                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    tool_call_id=tool_call_id,
+                    origin_turn_anchor_id=origin_turn_anchor_id,
+                )
             elif provider_type == "wecom":
-                return await _send_wecom_message(agent_id, member_name, message_text, target_member)
+                return await _send_wecom_message(
+                    agent_id, member_name, message_text, target_member,
+                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    tool_call_id=tool_call_id,
+                    origin_turn_anchor_id=origin_turn_anchor_id,
+                )
             elif provider_type == "slack":
-                return await _send_slack_message(agent_id, member_name, message_text, target_member)
+                return await _send_slack_message(
+                    agent_id, member_name, message_text, target_member,
+                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    tool_call_id=tool_call_id,
+                    origin_turn_anchor_id=origin_turn_anchor_id,
+                )
             elif provider_type == "teams":
-                return await _send_teams_channel_message(agent_id, member_name, message_text, target_member)
+                return await _send_teams_channel_message(
+                    agent_id, member_name, message_text, target_member,
+                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    tool_call_id=tool_call_id,
+                    origin_turn_anchor_id=origin_turn_anchor_id,
+                )
             elif provider_type == "wechat":
-                return await _send_wechat_channel_message(agent_id, member_name, message_text, target_member)
+                return await _send_wechat_channel_message(
+                    agent_id, member_name, message_text, target_member,
+                    origin_session_id=origin_session_id, origin_user_id=origin_user_id,
+                    tool_call_id=tool_call_id,
+                    origin_turn_anchor_id=origin_turn_anchor_id,
+                )
             else:
                 return f"❌ Unsupported channel type: {provider_type}"
 
@@ -6903,6 +7185,11 @@ async def _send_dingtalk_message(
     member_name: str,
     message_text: str,
     target_member: "OrgMember",
+    *,
+    origin_session_id: str | None = None,
+    origin_user_id: uuid.UUID | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Send message via DingTalk channel using Open API."""
     from app.services.dingtalk_service import send_dingtalk_message
@@ -6969,19 +7256,31 @@ async def _send_dingtalk_message(
                         source_channel="dingtalk",
                         first_message_title=message_text[:30],
                     )
-                    # 3. Save assistant message
-                    db.add(ChatMessage(
+                    await _persist_outbound_channel_message(
+                        db,
                         agent_id=agent_id,
                         user_id=platform_user.id,
-                        role="assistant",
+                        session=sess,
                         content=message_text,
-                        conversation_id=str(sess.id),
-                    ))
-                    sess.last_message_at = datetime.now(timezone.utc)
+                        source_channel="dingtalk",
+                        actor_ref=str(user_id),
+                        target_name=member_name,
+                        origin_session_id=origin_session_id,
+                        origin_source_channel=None,
+                        tool_call_id=tool_call_id,
+                        origin_turn_anchor_id=origin_turn_anchor_id,
+                        external_message_id=str(
+                            result.get("task_id") or result.get("processQueryKey") or ""
+                        ) or None,
+                    )
                     await db.commit()
                     logger.info(f"[DingTalk] Proactive message saved to session {sess.id}")
                 except Exception as ex:
                     logger.error(f"[DingTalk] Failed to save proactive message to session: {ex}")
+                    return (
+                        f"❌ The message reached {member_name}, but its platform routing "
+                        "receipt was not persisted. No exact on_message subscription was armed."
+                    )
 
                 return f"✅ Message sent to {member_name} via DingTalk"
             else:
@@ -6999,6 +7298,11 @@ async def _send_wecom_message(
     member_name: str,
     message_text: str,
     target_member: "OrgMember",
+    *,
+    origin_session_id: str | None = None,
+    origin_user_id: uuid.UUID | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Send message via WeCom channel using Open API."""
     from app.services.wecom_service import send_wecom_message
@@ -7033,6 +7337,7 @@ async def _send_wecom_message(
                 config.app_secret,
                 user_id,
                 message_text,
+                agent_id=str((config.extra_config or {}).get("wecom_agent_id") or "") or None,
             )
 
             if result.get("errcode") == 0:
@@ -7060,18 +7365,29 @@ async def _send_wecom_message(
                         source_channel="wecom",
                         first_message_title=message_text[:30],
                     )
-                    db.add(ChatMessage(
+                    await _persist_outbound_channel_message(
+                        db,
                         agent_id=agent_id,
                         user_id=platform_user.id,
-                        role="assistant",
+                        session=sess,
                         content=message_text,
-                        conversation_id=str(sess.id),
-                    ))
-                    sess.last_message_at = datetime.now(timezone.utc)
+                        source_channel="wecom",
+                        actor_ref=str(user_id),
+                        target_name=member_name,
+                        origin_session_id=origin_session_id,
+                        origin_source_channel=None,
+                        tool_call_id=tool_call_id,
+                        origin_turn_anchor_id=origin_turn_anchor_id,
+                        external_message_id=str(result.get("msgid") or "") or None,
+                    )
                     await db.commit()
                     logger.info(f"[WeCom] Proactive message saved to session {sess.id}")
                 except Exception as ex:
                     logger.error(f"[WeCom] Failed to save proactive message to session: {ex}")
+                    return (
+                        f"❌ The message reached {member_name}, but its platform routing "
+                        "receipt was not persisted. No exact on_message subscription was armed."
+                    )
 
                 return f"✅ Message sent to {member_name} via WeCom"
             else:
@@ -7088,6 +7404,11 @@ async def _send_slack_message(
     member_name: str,
     message_text: str,
     target_member: "OrgMember",
+    *,
+    origin_session_id: str | None = None,
+    origin_user_id: uuid.UUID | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Send proactive Slack DM via conversations.open + chat.postMessage."""
     import httpx
@@ -7149,18 +7470,28 @@ async def _send_slack_message(
                     source_channel="slack",
                     first_message_title=message_text[:30],
                 )
-                db.add(ChatMessage(
+                await _persist_outbound_channel_message(
+                    db,
                     agent_id=agent_id,
                     user_id=platform_user.id,
-                    role="assistant",
+                    session=sess,
                     content=message_text,
-                    conversation_id=str(sess.id),
-                ))
-                sess.last_message_at = datetime.now(timezone.utc)
+                    source_channel="slack",
+                    actor_ref=str(user_id),
+                    target_name=member_name,
+                    origin_session_id=origin_session_id,
+                    origin_source_channel=None,
+                    tool_call_id=tool_call_id,
+                    origin_turn_anchor_id=origin_turn_anchor_id,
+                )
                 await db.commit()
                 logger.info(f"[Slack] Proactive message saved to session {sess.id}")
             except Exception as ex:
                 logger.error(f"[Slack] Failed to save proactive message to session: {ex}")
+                return (
+                    f"❌ The message reached {member_name}, but its platform routing "
+                    "receipt was not persisted. No exact on_message subscription was armed."
+                )
 
             return f"✅ Message sent to {member_name} via Slack"
     except Exception as e:
@@ -7173,6 +7504,11 @@ async def _send_teams_channel_message(
     member_name: str,
     message_text: str,
     target_member: "OrgMember",
+    *,
+    origin_session_id: str | None = None,
+    origin_user_id: uuid.UUID | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Send proactive Teams message using the latest known conversation context."""
     from app.api.teams import _send_teams_message
@@ -7228,14 +7564,21 @@ async def _send_teams_channel_message(
                 },
             )
 
-            db.add(ChatMessage(
+            actor_ref = str(target_member.external_id or target_member.open_id or platform_user.id)
+            await _persist_outbound_channel_message(
+                db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
-                role="assistant",
+                session=session,
                 content=message_text,
-                conversation_id=str(session.id),
-            ))
-            session.last_message_at = datetime.now(timezone.utc)
+                source_channel="microsoft_teams",
+                actor_ref=actor_ref,
+                target_name=member_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+            )
             await db.commit()
             logger.info(f"[Teams] Proactive message saved to session {session.id}")
             return f"✅ Message sent to {member_name} via Teams"
@@ -7249,6 +7592,11 @@ async def _send_wechat_channel_message(
     member_name: str,
     message_text: str,
     target_member: "OrgMember",
+    *,
+    origin_session_id: str | None = None,
+    origin_user_id: uuid.UUID | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Send proactive WeChat message using the latest cached context_token."""
     from app.services.wechat_channel import (
@@ -7310,21 +7658,35 @@ async def _send_wechat_channel_message(
                 source_channel="wechat",
                 first_message_title=message_text[:30],
             )
-            db.add(ChatMessage(
+            await _persist_outbound_channel_message(
+                db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
-                role="assistant",
+                session=sess,
                 content=message_text,
-                conversation_id=str(sess.id),
-            ))
-            sess.last_message_at = datetime.now(timezone.utc)
+                source_channel="wechat",
+                actor_ref=str(user_id),
+                target_name=member_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+            )
             await db.commit()
             logger.info(f"[WeChat] Proactive message saved to session {sess.id}")
             return f"✅ Message sent to {member_name} via WeChat"
     except Exception as e:
         logger.exception("[WeChat] Error")
         return f"❌ WeChat message error: {str(e)[:200]}"
-async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
+async def _send_platform_message(
+    agent_id: uuid.UUID,
+    args: dict,
+    *,
+    origin_session_id: str | None = None,
+    origin_user_id: uuid.UUID | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
+) -> str:
     """Send a proactive message to a first-party platform user."""
     username = args.get("username", "").strip()
     message_text = args.get("message", "").strip()
@@ -7333,9 +7695,6 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
         return "❌ Please provide recipient username and message content"
 
     try:
-        from datetime import datetime as _dt, timezone as _tz
-
-
         async with async_session() as db:
             # 0. Get agent's tenant_id for scoping
             agent_res = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
@@ -7393,15 +7752,20 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
 
             session = await ensure_primary_platform_session(db, agent_id, target_user.id)
 
-            # Save the message
-            db.add(ChatMessage(
+            await _persist_outbound_channel_message(
+                db,
                 agent_id=agent_id,
                 user_id=target_user.id,
-                role="assistant",
+                session=session,
                 content=message_text,
-                conversation_id=str(session.id),
-            ))
-            session.last_message_at = _dt.now(_tz.utc)
+                source_channel=session.source_channel,
+                actor_ref=str(target_user.id),
+                target_name=target_user.display_name or target_user.username or username,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+            )
             try:
                 from app.api.websocket import maybe_mark_session_read_for_active_viewer
 
@@ -7719,13 +8083,23 @@ async def _resolve_a2a_target(
 async def _create_on_message_trigger(
     agent_id: uuid.UUID,
     trigger_name: str,
-    from_agent_name: str,
-    reason: str,
+    from_agent_name: str | None,
+    from_user_name: str | None = None,
+    reason: str = "",
     focus_ref: str | None = None,
     notification_summary: str | None = None,
     origin_session_id: str | None = None,
     origin_user_id: str | None = None,
     origin_source_channel: str | None = None,
+    origin_external_conv_id: str | None = None,
+    origin_turn_anchor_id: str | None = None,
+    watch_session_id: str | None = None,
+    watch_source_channel: str | None = None,
+    watch_actor_ref: str | None = None,
+    outbound_message_id: str | None = None,
+    outbound_external_message_id: str | None = None,
+    consume_remote: bool = False,
+    expires_in_minutes: int = 1440,
 ) -> None:
     """Programmatically create an on_message trigger for an agent."""
     from app.models.trigger import AgentTrigger
@@ -7736,7 +8110,11 @@ async def _create_on_message_trigger(
         description=reason or trigger_name,
     )
 
-    config: dict = {"from_agent_name": from_agent_name}
+    config: dict = {}
+    if from_agent_name:
+        config["from_agent_name"] = from_agent_name
+    if from_user_name:
+        config["from_user_name"] = from_user_name
     if notification_summary:
         config["_notification_summary"] = notification_summary
     if origin_session_id:
@@ -7745,22 +8123,96 @@ async def _create_on_message_trigger(
         config["_origin_user_id"] = origin_user_id
     if origin_source_channel:
         config["_origin_source_channel"] = origin_source_channel
+    if origin_external_conv_id is not None:
+        config["_origin_external_conv_id"] = origin_external_conv_id
+    if origin_turn_anchor_id:
+        config["_origin_turn_anchor_id"] = origin_turn_anchor_id
+        # New exact subscriptions wait until the ordinary turn that armed them
+        # has durably persisted its final assistant row.  Keep this explicit so
+        # legacy triggers created before the completion marker was introduced
+        # remain recoverable after an upgrade.
+        config["_origin_completion_barrier"] = True
+    if watch_session_id:
+        config["_watch_session_id"] = watch_session_id
+    if watch_source_channel:
+        config["_watch_source_channel"] = watch_source_channel
+    if watch_actor_ref:
+        config["_watch_actor_ref"] = watch_actor_ref
+    if outbound_message_id:
+        config["_outbound_message_id"] = outbound_message_id
+    if outbound_external_message_id:
+        config["_outbound_external_message_id"] = outbound_external_message_id
+        config["_correlation_mode"] = "reply_to"
+    elif watch_session_id:
+        config["_correlation_mode"] = "next_message"
+    if watch_session_id:
+        config["_consume_remote"] = bool(consume_remote)
+    config["_set_trigger_context"] = {
+        "name": trigger_name,
+        "type": "on_message",
+        "reason": reason,
+        "focus_ref": focus_ref or "",
+        "config": {
+            key: value for key, value in config.items() if not str(key).startswith("_")
+        },
+    }
 
     try:
         from app.models.audit import ChatMessage as _CM
         from app.models.chat_session import ChatSession as _CS
         from sqlalchemy import cast as sa_cast, String as SaString
         async with async_session() as _snap_db:
-            _snap_q = select(_CM.created_at).join(
-                _CS, _CM.conversation_id == sa_cast(_CS.id, SaString)
-            ).where(
-                _CS.agent_id == agent_id,
-                _CM.created_at.isnot(None),
-            ).order_by(_CM.created_at.desc()).limit(1)
-            _snap_r = await _snap_db.execute(_snap_q)
-            _latest_ts = _snap_r.scalar_one_or_none()
-            if _latest_ts:
-                config["_since_ts"] = _latest_ts.isoformat()
+            if origin_turn_anchor_id and origin_session_id:
+                try:
+                    _origin_anchor = await _snap_db.get(
+                        _CM,
+                        uuid.UUID(str(origin_turn_anchor_id)),
+                    )
+                except (TypeError, ValueError):
+                    _origin_anchor = None
+                if (
+                    _origin_anchor is not None
+                    and _origin_anchor.conversation_id == str(origin_session_id)
+                ):
+                    _origin_meta = (
+                        _origin_anchor.message_meta
+                        if isinstance(_origin_anchor.message_meta, dict)
+                        else {}
+                    )
+                    if _origin_meta.get("actor_ref"):
+                        config["_origin_actor_ref"] = str(_origin_meta["actor_ref"])
+                    if _origin_meta.get("actor_ref_type"):
+                        config["_origin_actor_ref_type"] = str(
+                            _origin_meta["actor_ref_type"]
+                        )
+            _outbound_anchor = None
+            if outbound_message_id:
+                try:
+                    _outbound_anchor = await _snap_db.get(
+                        _CM,
+                        uuid.UUID(str(outbound_message_id)),
+                    )
+                except (TypeError, ValueError):
+                    _outbound_anchor = None
+            if (
+                _outbound_anchor is not None
+                and _outbound_anchor.conversation_id == str(watch_session_id or "")
+                and _outbound_anchor.created_at is not None
+            ):
+                # The remote outbound row, not the latest message in any other
+                # active session, is the event cursor for this subscription.
+                config["_since_ts"] = _outbound_anchor.created_at.isoformat()
+            else:
+                _snap_q = select(_CM.created_at).join(
+                    _CS, _CM.conversation_id == sa_cast(_CS.id, SaString)
+                ).where(
+                    _CS.agent_id == agent_id,
+                    _CM.created_at.isnot(None),
+                ).order_by(_CM.created_at.desc()).limit(1)
+                _snap_r = await _snap_db.execute(_snap_q)
+                _latest_ts = _snap_r.scalar_one_or_none()
+                if _latest_ts:
+                    config["_since_ts"] = _latest_ts.isoformat()
     except Exception:
         pass
 
@@ -7774,13 +8226,17 @@ async def _create_on_message_trigger(
         existing = result.scalar_one_or_none()
         if existing:
             if existing.is_enabled:
-                existing.config = {**(existing.config or {}), **config}
-                existing.reason = reason
-                existing.fire_count = 0
-                if focus_ref:
-                    existing.focus_ref = focus_ref
-                await db.commit()
-                return
+                existing_cfg = existing.config or {}
+                if (
+                    existing_cfg.get("_origin_session_id") == config.get("_origin_session_id")
+                    and existing_cfg.get("_outbound_message_id") == config.get("_outbound_message_id")
+                ):
+                    trigger = existing
+                else:
+                    raise RuntimeError(
+                        f"Trigger '{trigger_name}' already exists and is active; "
+                        "use a distinct trigger name or cancel the existing trigger first."
+                    )
             else:
                 existing.type = "on_message"
                 existing.config = config
@@ -7788,21 +8244,131 @@ async def _create_on_message_trigger(
                 existing.focus_ref = focus_ref or None
                 existing.is_enabled = True
                 existing.fire_count = 0
-                await db.commit()
-                return
-
-        trigger = AgentTrigger(
-            agent_id=agent_id,
-            name=trigger_name,
-            type="on_message",
-            config=config,
-            reason=reason,
-            focus_ref=focus_ref or None,
-            max_fires=1,
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
-        )
-        db.add(trigger)
+                trigger = existing
+        else:
+            trigger = AgentTrigger(
+                agent_id=agent_id,
+                name=trigger_name,
+                type="on_message",
+                config=config,
+                reason=reason,
+                focus_ref=focus_ref or None,
+                max_fires=1,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=max(1, expires_in_minutes)),
+            )
+            db.add(trigger)
         await db.commit()
+
+    if watch_session_id:
+        from app.services.trigger_runtime.evaluator import recover_exact_on_message_events
+
+        try:
+            await recover_exact_on_message_events(trigger)
+        except Exception as replay_error:
+            # The durable trigger is already armed; daemon recovery will retry
+            # this best-effort immediate close of the send→arm race.
+            logger.warning(
+                "[A2A] reply-before-arm recovery failed for %s: %s",
+                trigger_name,
+                replay_error,
+            )
+
+
+async def _arm_a2a_delegate_callback(
+    *,
+    from_agent_id: uuid.UUID,
+    target: AgentModel,
+    message_text: str,
+    owner_id: uuid.UUID,
+    origin_session_id: str | None,
+    origin_source_channel: str,
+    origin_external_conv_id: str | None,
+    origin_turn_anchor_id: uuid.UUID | None,
+    watch_session_id: str,
+    watch_actor_ref: str,
+    outbound_message_id: uuid.UUID,
+) -> None:
+    """Arm the existing exact callback path for one A2A delegation event."""
+    from app.models.trigger import AgentTrigger
+    from sqlalchemy.exc import IntegrityError
+
+    correlation_suffix = outbound_message_id.hex[:12]
+    focus_id = f"wait_{target.id.hex[:8]}_{correlation_suffix}_task"
+    await _append_focus_item(
+        from_agent_id,
+        focus_id,
+        f"Waiting for {target.name} to complete delegated task: {message_text[:100]}",
+    )
+    trigger_name = f"a2a_wait_{target.id.hex[:8]}_{correlation_suffix}"
+    trigger_reason = (
+        f"{target.name} has replied with the result of a delegated task. "
+        f"Original task: {message_text[:200]}. "
+        f"Steps: 1) Process {target.name}'s reply. "
+        f"2) Mark focus item '{focus_id}' as completed. "
+        f"3) Cancel this trigger. "
+        f"USER-FACING OUTPUT RULES: Your reply goes directly to the user's chat. "
+        f"Write in natural, conversational language as if talking to a colleague. "
+        f"NEVER use technical terms like: trigger name, focus item, a2a_wait, "
+        f"task_delegate, focus_ref, or any internal identifier. "
+        f"NEVER mention your internal operations (canceling triggers, updating focus, "
+        f"marking items complete, trigger status, etc.). "
+        f"Just summarize the task result in plain language."
+    )
+    def _same_callback(existing: AgentTrigger) -> bool:
+        existing_cfg = existing.config if isinstance(existing.config, dict) else {}
+        return (
+            existing.is_enabled
+            and str(existing_cfg.get("_watch_session_id") or "") == watch_session_id
+            and str(existing_cfg.get("_outbound_message_id") or "")
+            == str(outbound_message_id)
+            and str(existing_cfg.get("_origin_session_id") or "")
+            == str(origin_session_id or "")
+        )
+
+    async def _load_existing() -> AgentTrigger | None:
+        async with async_session() as db:
+            return (
+                await db.execute(
+                    select(AgentTrigger).where(
+                        AgentTrigger.agent_id == from_agent_id,
+                        AgentTrigger.name == trigger_name,
+                    )
+                )
+            ).scalar_one_or_none()
+
+    existing = await _load_existing()
+    if existing is not None:
+        if _same_callback(existing):
+            return
+        raise RuntimeError("A2A delegate callback key is already bound to another route")
+
+    try:
+        await _create_on_message_trigger(
+            agent_id=from_agent_id,
+            trigger_name=trigger_name,
+            from_agent_name=target.name,
+            reason=trigger_reason,
+            focus_ref=focus_id,
+            notification_summary=f"等待{target.name}完成任务并回复",
+            origin_session_id=origin_session_id,
+            origin_user_id=str(owner_id),
+            origin_source_channel=origin_source_channel,
+            origin_external_conv_id=origin_external_conv_id,
+            origin_turn_anchor_id=str(origin_turn_anchor_id or "") or None,
+            watch_session_id=watch_session_id,
+            watch_source_channel="agent",
+            watch_actor_ref=watch_actor_ref,
+            outbound_message_id=str(outbound_message_id),
+            consume_remote=True,
+        )
+    except IntegrityError:
+        # Concurrent replay of the same tool call may lose the unique trigger
+        # insert race. The database winner is success only if it is the exact
+        # same callback envelope.
+        existing = await _load_existing()
+        if existing is not None and _same_callback(existing):
+            return
+        raise
 
 
 async def _append_focus_item(agent_id: uuid.UUID, identifier: str, description: str) -> None:
@@ -7830,6 +8396,8 @@ async def _send_message_to_agent(
     args: dict,
     user_id: uuid.UUID | None = None,
     origin_session_id: str | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Send a message to another digital employee.
 
@@ -7862,6 +8430,7 @@ async def _send_message_to_agent(
         # Resolve the originating conversation's channel so a delegate callback
         # can route its result back to the right place (web vs IM vs trigger).
         origin_source_channel = "web"
+        origin_external_conv_id = None
 
         async with async_session() as db:
             if origin_session_id:
@@ -7872,6 +8441,7 @@ async def _send_message_to_agent(
                     _osess = _osr.scalar_one_or_none()
                     if _osess:
                         origin_source_channel = _osess.source_channel
+                        origin_external_conv_id = _osess.external_conv_id
                 except Exception:
                     pass
 
@@ -7936,6 +8506,57 @@ async def _send_message_to_agent(
             tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target.id))
             tgt_participant = tgt_part_r.scalar_one_or_none()
 
+            outbound_operation_key = _build_outbound_operation_key(
+                agent_id=from_agent_id,
+                origin_session_id=origin_session_id,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+            )
+            recorded_openclaw_outbound = None
+            if getattr(target, "agent_type", "native") == "openclaw" and outbound_operation_key:
+                # A row lock cannot protect the first insert because the row does
+                # not exist yet. The transaction-scoped operation lock closes
+                # that gap across replicas and is released by the receipt commit.
+                await _lock_outbound_operation(db, outbound_operation_key)
+                candidate = (
+                    await db.execute(
+                        select(ChatMessage).where(
+                            ChatMessage.external_event_key == outbound_operation_key
+                        ).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if candidate is not None:
+                    candidate_meta = (
+                        candidate.message_meta
+                        if isinstance(candidate.message_meta, dict)
+                        else {}
+                    )
+                    if str(candidate_meta.get("target_agent_id") or "") != str(target.id):
+                        return "❌ The replayed message receipt does not match the requested target"
+                    if candidate_meta.get("delivery_status") == "queued":
+                        return (
+                            f"✅ Message already sent to {target.name} via agent "
+                            "(idempotent replay)."
+                        )
+                    if candidate_meta.get("delivery_status") != "recorded":
+                        return "❌ The replayed message receipt has an invalid delivery state"
+                    try:
+                        replay_session = await db.get(
+                            ChatSession,
+                            uuid.UUID(str(candidate.conversation_id)),
+                        )
+                    except (TypeError, ValueError):
+                        replay_session = None
+                    if replay_session is None:
+                        return "❌ The recorded message's conversation no longer exists"
+                    expected_pair = {from_agent_id, target.id}
+                    if {
+                        replay_session.agent_id,
+                        replay_session.peer_agent_id,
+                    } != expected_pair or replay_session.source_channel != "agent":
+                        return "❌ The recorded message's conversation route changed"
+                    recorded_openclaw_outbound = candidate
+
             # Find or create ChatSession for this agent pair (ordered consistently)
             session_agent_id = min(from_agent_id, target.id, key=str)
             session_peer_id = max(from_agent_id, target.id, key=str)
@@ -7944,8 +8565,8 @@ async def _send_message_to_agent(
             owner_id = user_id or (source_agent.creator_id if source_agent else from_agent_id)
 
             # Only reuse an existing thread when not explicitly starting a fresh one
-            chat_session = None
-            if not new_conversation:
+            chat_session = replay_session if recorded_openclaw_outbound is not None else None
+            if chat_session is None and not new_conversation:
                 sess_r = await db.execute(
                     select(ChatSession).where(
                         ChatSession.agent_id == session_agent_id,
@@ -7990,17 +8611,84 @@ async def _send_message_to_agent(
             # ── OpenClaw target: queue message for gateway poll ──
             if getattr(target, "agent_type", "native") == "openclaw":
                 # 1. Save the source message to the chat session
-                db.add(ChatMessage(
-                    agent_id=session_agent_id,
-                    user_id=owner_id,
-                    role="user",
-                    content=message_text,
-                    conversation_id=session_id,
-                    participant_id=src_participant.id if src_participant else None,
-                ))
-                chat_session.last_message_at = datetime.now(timezone.utc)
-                
-                # 2. Queue for Gateway
+                outbound_a2a_message = recorded_openclaw_outbound
+                if outbound_a2a_message is None:
+                    outbound_a2a_message = ChatMessage(
+                        id=uuid.uuid4(),
+                        agent_id=session_agent_id,
+                        user_id=owner_id,
+                        role="user",
+                        content=message_text,
+                        conversation_id=session_id,
+                        participant_id=src_participant.id if src_participant else None,
+                        external_event_key=outbound_operation_key,
+                        message_meta={
+                            "direction": "outbound",
+                            "source_channel": "agent",
+                            "origin_session_id": str(origin_session_id or ""),
+                            "origin_source_channel": origin_source_channel,
+                            "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
+                            "tool_call_id": str(tool_call_id or ""),
+                            "actor_ref": str(tgt_participant.id if tgt_participant else target.id),
+                            "target_agent_id": str(target.id),
+                            "target_name": target.name,
+                            "delivery_status": "recorded",
+                        },
+                    )
+                    db.add(outbound_a2a_message)
+                    chat_session.last_message_at = datetime.now(timezone.utc)
+                    await db.commit()
+
+                # A delegated OpenClaw task uses the same exact callback
+                # subscription as a native target, armed before it can poll.
+                if msg_type == "task_delegate":
+                    try:
+                        await _arm_a2a_delegate_callback(
+                            from_agent_id=from_agent_id,
+                            target=target,
+                            message_text=message_text,
+                            owner_id=owner_id,
+                            origin_session_id=origin_session_id,
+                            origin_source_channel=origin_source_channel,
+                            origin_external_conv_id=origin_external_conv_id,
+                            origin_turn_anchor_id=origin_turn_anchor_id,
+                            watch_session_id=session_id,
+                            watch_actor_ref=str(
+                                tgt_participant.id if tgt_participant else target.id
+                            ),
+                            outbound_message_id=outbound_a2a_message.id,
+                        )
+                    except Exception as e:
+                        logger.exception(f"[A2A] Failed to create OpenClaw delegate callback: {e}")
+                        # Keep the durable `recorded` receipt. A concurrent
+                        # replay may already have completed the callback and
+                        # queued transition; deleting here could erase its
+                        # receipt while leaving a live GatewayMessage. A later
+                        # replay safely resumes this same operation key.
+                        return (
+                            "❌ The delegated message was recorded, but its delivery state "
+                            "could not be confirmed. Please retry; the operation is idempotent."
+                        )
+
+                # 2. Queue for Gateway only after the callback is durable.
+                # Reacquire the same operation lock after the recorded receipt
+                # commit. Concurrent replays may both finish the idempotent
+                # callback step, but only one may transition recorded -> queued.
+                await _lock_outbound_operation(db, outbound_operation_key)
+                await db.refresh(outbound_a2a_message)
+                refreshed_meta = (
+                    outbound_a2a_message.message_meta
+                    if isinstance(outbound_a2a_message.message_meta, dict)
+                    else {}
+                )
+                if refreshed_meta.get("delivery_status") == "queued":
+                    return (
+                        f"✅ Message already sent to {target.name} via agent "
+                        "(idempotent replay)."
+                    )
+                if refreshed_meta.get("delivery_status") != "recorded":
+                    return "❌ The replayed message receipt has an invalid delivery state"
+
                 from app.models.gateway_message import GatewayMessage as GMsg
                 gw_msg = GMsg(
                     agent_id=target.id,
@@ -8011,6 +8699,10 @@ async def _send_message_to_agent(
                     conversation_id=session_id,
                 )
                 db.add(gw_msg)
+                outbound_a2a_message.message_meta = {
+                    **refreshed_meta,
+                    "delivery_status": "queued",
+                }
                 await db.commit()
                 
                 # 3. Log activity
@@ -8023,19 +8715,38 @@ async def _send_message_to_agent(
 
                 online = target.openclaw_last_seen and (datetime.now(timezone.utc) - target.openclaw_last_seen).total_seconds() < 300
                 status_hint = "online" if online else "offline (message will be delivered on next heartbeat)"
+                if msg_type == "task_delegate":
+                    return (
+                        f"✅ Task delegated to {target.name} (OpenClaw agent, currently {status_hint}). "
+                        "You will be notified when they complete it."
+                    )
                 return f"✅ Message sent to {target.name} (OpenClaw agent, currently {status_hint}). The message has been queued and will be delivered when the agent polls for updates."
 
             # ── Native target: branch by msg_type ──
 
             # Save source message (common to all paths)
-            db.add(ChatMessage(
+            outbound_a2a_message = ChatMessage(
+                id=uuid.uuid4(),
                 agent_id=session_agent_id,
                 user_id=owner_id,
                 role="user",
                 content=message_text,
                 conversation_id=session_id,
                 participant_id=src_participant.id if src_participant else None,
-            ))
+                external_event_key=outbound_operation_key,
+                message_meta={
+                    "direction": "outbound",
+                    "source_channel": "agent",
+                    "origin_session_id": str(origin_session_id or ""),
+                    "origin_source_channel": origin_source_channel,
+                    "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
+                    "tool_call_id": str(tool_call_id or ""),
+                    "actor_ref": str(tgt_participant.id if tgt_participant else target.id),
+                    "target_agent_id": str(target.id),
+                    "target_name": target.name,
+                },
+            )
+            db.add(outbound_a2a_message)
             chat_session.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 
@@ -8081,43 +8792,28 @@ async def _send_message_to_agent(
 
             # ── task_delegate: async with callback ──
             if msg_type == "task_delegate":
-                focus_id = f"wait_{target.name.lower().replace(' ', '_')}_task"
-                focus_desc = f"Waiting for {target.name} to complete delegated task: {message_text[:100]}"
-
                 try:
-                    await _append_focus_item(from_agent_id, focus_id, focus_desc)
-                except Exception as e:
-                    logger.warning(f"[A2A] Failed to write focus for delegate: {e}")
-
-                trigger_name = f"a2a_wait_{target.name.lower().replace(' ', '_')}"
-                trigger_reason = (
-                    f"{target.name} has replied with the result of a delegated task. "
-                    f"Original task: {message_text[:200]}. "
-                    f"Steps: 1) Process {target.name}'s reply. "
-                    f"2) Mark focus item '{focus_id}' as completed. "
-                    f"3) Cancel this trigger. "
-                    f"USER-FACING OUTPUT RULES: Your reply goes directly to the user's chat. "
-                    f"Write in natural, conversational language as if talking to a colleague. "
-                    f"NEVER use technical terms like: trigger name, focus item, a2a_wait, "
-                    f"task_delegate, focus_ref, or any internal identifier. "
-                    f"NEVER mention your internal operations (canceling triggers, updating focus, "
-                    f"marking items complete, trigger status, etc.). "
-                    f"Just summarize the task result in plain language."
-                )
-                try:
-                    await _create_on_message_trigger(
-                        agent_id=from_agent_id,
-                        trigger_name=trigger_name,
-                        from_agent_name=target.name,
-                        reason=trigger_reason,
-                        focus_ref=focus_id,
-                        notification_summary=f"等待{target.name}完成任务并回复",
+                    await _arm_a2a_delegate_callback(
+                        from_agent_id=from_agent_id,
+                        target=target,
+                        message_text=message_text,
+                        owner_id=owner_id,
                         origin_session_id=origin_session_id,
-                        origin_user_id=str(owner_id) if owner_id else None,
                         origin_source_channel=origin_source_channel,
+                        origin_external_conv_id=origin_external_conv_id,
+                        origin_turn_anchor_id=origin_turn_anchor_id,
+                        watch_session_id=session_id,
+                        watch_actor_ref=str(tgt_participant.id if tgt_participant else target.id),
+                        outbound_message_id=outbound_a2a_message.id,
                     )
                 except Exception as e:
-                    logger.warning(f"[A2A] Failed to create trigger for delegate: {e}")
+                    logger.exception(f"[A2A] Failed to create trigger for delegate: {e}")
+                    await db.delete(outbound_a2a_message)
+                    await db.commit()
+                    return (
+                        "❌ The delegated message was recorded, but its reply subscription "
+                        "could not be created. The target was not awakened; please retry."
+                    )
 
                 try:
                     from app.services.activity_logger import log_activity
@@ -9385,6 +10081,7 @@ async def _handle_set_trigger(
     *,
     session_id: str = "",
     user_id: uuid.UUID | None = None,
+    turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Create a new trigger for the agent."""
     from app.models.trigger import AgentTrigger
@@ -9392,7 +10089,15 @@ async def _handle_set_trigger(
 
     name = arguments.get("name", "").strip()
     ttype = arguments.get("type", "").strip()
-    config = dict(arguments.get("config", {}) or {})
+    # Runtime correlation keys are platform-owned.  Keep the public tool
+    # contract unchanged and never let a model/client forge hidden routing
+    # state through the free-form config object.
+    config = {
+        key: value
+        for key, value in dict(arguments.get("config", {}) or {}).items()
+        if not str(key).startswith("_")
+    }
+    public_config = dict(config)
     reason = arguments.get("reason", "").strip()
     focus_ref = arguments.get("focus_ref", "") or arguments.get("agenda_ref", "")  # backward compat
 
@@ -9477,9 +10182,33 @@ async def _handle_set_trigger(
                 if origin_session:
                     config["_origin_session_id"] = str(origin_session.id)
                     config["_origin_source_channel"] = origin_session.source_channel
+                    config["_origin_external_conv_id"] = origin_session.external_conv_id
+                    if turn_anchor_id:
+                        config["_origin_turn_anchor_id"] = str(turn_anchor_id)
+                        config["_origin_completion_barrier"] = True
+                        origin_anchor = await _ctx_db.get(ChatMessage, turn_anchor_id)
+                        if (
+                            origin_anchor is not None
+                            and origin_anchor.conversation_id == str(origin_session.id)
+                        ):
+                            origin_meta = (
+                                origin_anchor.message_meta
+                                if isinstance(origin_anchor.message_meta, dict)
+                                else {}
+                            )
+                            if origin_meta.get("actor_ref"):
+                                config["_origin_actor_ref"] = str(origin_meta["actor_ref"])
+                            if origin_meta.get("actor_ref_type"):
+                                config["_origin_actor_ref_type"] = str(
+                                    origin_meta["actor_ref_type"]
+                                )
+                    # The active tool caller is authoritative.  Group IM
+                    # sessions keep a creator placeholder in ChatSession.user_id.
+                    if user_id:
+                        config["_origin_user_id"] = str(user_id)
                     if origin_session.source_channel == "agent" and origin_session.peer_agent_id:
                         config["_origin_peer_agent_id"] = str(origin_session.peer_agent_id)
-                    elif origin_session.source_channel != "trigger":
+                    elif origin_session.source_channel != "trigger" and not user_id:
                         config["_origin_user_id"] = str(origin_session.user_id)
                 elif user_id:
                     config["_origin_user_id"] = str(user_id)
@@ -9487,6 +10216,82 @@ async def _handle_set_trigger(
             if user_id:
                 config["_origin_user_id"] = str(user_id)
 
+    # Bind a send-derived on_message subscription to the exact remote session.
+    # Only receipts created by THIS origin turn are eligible: a plain
+    # set_trigger with no same-turn send remains the historical name-based
+    # watcher and is never silently narrowed by an older outbound message.
+    if ttype == "on_message":
+        try:
+            async with async_session() as _bind_db:
+                outbound = None
+                if session_id and turn_anchor_id:
+                    target_name = str(
+                        config.get("from_user_name") or config.get("from_agent_name") or ""
+                    ).strip().casefold()
+                    receipt_rows = await _bind_db.execute(
+                        select(ChatMessage)
+                        .where(
+                            ChatMessage.role.in_(["assistant", "user"]),
+                            ChatMessage.message_meta["direction"].as_string() == "outbound",
+                            ChatMessage.message_meta["origin_session_id"].as_string() == str(session_id),
+                            ChatMessage.message_meta["origin_turn_anchor_id"].as_string()
+                            == str(turn_anchor_id),
+                        )
+                        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                    )
+                    candidates: list[ChatMessage] = []
+                    for candidate in receipt_rows.scalars().all():
+                        meta = candidate.message_meta if isinstance(candidate.message_meta, dict) else {}
+                        candidate_target = str(meta.get("target_name") or "").strip().casefold()
+                        if target_name and candidate_target and candidate_target != target_name:
+                            continue
+                        candidates.append(candidate)
+
+                    watch_ids = {candidate.conversation_id for candidate in candidates}
+                    if len(watch_ids) > 1:
+                        return (
+                            "❌ Multiple matching recipients/channels were used in this turn. "
+                            "Create each on_message trigger immediately after its corresponding send."
+                        )
+                    if candidates:
+                        outbound = candidates[-1]
+
+                if outbound is not None:
+                    meta = outbound.message_meta if isinstance(outbound.message_meta, dict) else {}
+                    config["_outbound_message_id"] = str(outbound.id)
+                    if meta.get("external_message_id"):
+                        config["_outbound_external_message_id"] = str(meta["external_message_id"])
+                    if meta.get("actor_ref"):
+                        config["_watch_actor_ref"] = str(meta["actor_ref"])
+                    watch_session = await _bind_db.get(
+                        ChatSession, uuid.UUID(str(outbound.conversation_id))
+                    )
+                    if watch_session is None:
+                        return "❌ The sent message's conversation no longer exists"
+                    owns_session = watch_session.agent_id == agent_id or (
+                        watch_session.source_channel == "agent"
+                        and agent_id in {watch_session.agent_id, watch_session.peer_agent_id}
+                    )
+                    if not owns_session:
+                        return "❌ The sent message's conversation does not belong to this agent"
+                    config["_watch_session_id"] = str(watch_session.id)
+                    config["_watch_source_channel"] = watch_session.source_channel
+                    config["_correlation_mode"] = "session_event"
+                    config["_consume_remote"] = True
+                    if outbound.created_at:
+                        config["_since_ts"] = outbound.created_at.isoformat()
+        except (TypeError, ValueError):
+            return "❌ Unable to resolve the sent message's conversation"
+
+        config["_set_trigger_context"] = {
+            "name": name,
+            "type": "on_message",
+            "reason": reason,
+            "focus_ref": focus_ref or "",
+            "config": public_config,
+        }
+
+    reenabled_fire_count: int | None = None
     try:
         async with async_session() as db:
             # Load agent to get per-agent trigger limit
@@ -9518,41 +10323,59 @@ async def _handle_set_trigger(
             if existing:
                 if existing.is_enabled:
                     return f"❌ Trigger '{name}' already exists and is active. Use update_trigger to modify it, or cancel_trigger first."
-                else:
-                    # Re-enable disabled trigger with new config (preserve fire history)
-                    # For webhook triggers: reuse the old token so the URL stays stable
-                    if ttype == "webhook":
-                        old_token = (existing.config or {}).get("token")
-                        if old_token:
-                            config["token"] = old_token
-                    existing.type = ttype
-                    existing.config = config
-                    existing.reason = reason
-                    existing.focus_ref = focus_ref
-                    existing.is_enabled = True
-                    # Keep fire_count and last_fired_at — they are cumulative stats,
-                    # but reset fire_count if it reached max_fires to allow it to run again.
-                    if existing.max_fires and existing.fire_count >= existing.max_fires:
-                        existing.fire_count = 0
-                    await db.commit()
-                    return f"✅ Trigger '{name}' re-enabled with new configuration ({ttype}, fired {existing.fire_count} times so far)"
-
-            trigger = AgentTrigger(
-                agent_id=agent_id,
-                name=name,
-                type=ttype,
-                config=config,
-                reason=reason,
-                focus_ref=focus_ref,
-            )
+                # Re-enable disabled trigger with new config (preserve fire history).
+                # For webhook triggers, reuse the old token so the URL stays stable.
+                if ttype == "webhook":
+                    old_token = (existing.config or {}).get("token")
+                    if old_token:
+                        config["token"] = old_token
+                existing.type = ttype
+                existing.config = config
+                existing.reason = reason
+                existing.focus_ref = focus_ref
+                existing.is_enabled = True
+                # Keep fire_count and last_fired_at — they are cumulative stats,
+                # but reset fire_count if it reached max_fires to allow it to run again.
+                if existing.max_fires and existing.fire_count >= existing.max_fires:
+                    existing.fire_count = 0
+                trigger = existing
+                reenabled_fire_count = existing.fire_count
+            else:
+                trigger = AgentTrigger(
+                    agent_id=agent_id,
+                    name=name,
+                    type=ttype,
+                    config=config,
+                    reason=reason,
+                    focus_ref=focus_ref,
+                )
             # Fix 4: Safety cap for on_message triggers —
             # prevent infinite loops if agent creates broad watchers.
             if ttype == "on_message":
                 trigger.max_fires = trigger.max_fires or 100
                 if not trigger.expires_at:
                     trigger.expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-            db.add(trigger)
+            if existing is None:
+                db.add(trigger)
             await db.commit()
+
+        # Close the send→arm race: a fast remote reply may already be durable
+        # before set_trigger commits.  Replay only the exact watch session after
+        # the outbound receipt; the execution key keeps this idempotent with the
+        # daemon poll and the live ingress matcher.
+        if ttype == "on_message" and config.get("_watch_session_id"):
+            try:
+                from app.services.trigger_runtime.evaluator import (
+                    recover_exact_on_message_events,
+                )
+
+                await recover_exact_on_message_events(trigger)
+            except Exception as replay_error:
+                logger.warning(
+                    "[Trigger] reply-before-arm replay failed for %s: %s",
+                    name,
+                    replay_error,
+                )
 
         # Activity log
         try:
@@ -9600,6 +10423,11 @@ async def _handle_set_trigger(
                 "(use webhook_mode=queue to process them one-by-one)."
             )
 
+        if reenabled_fire_count is not None:
+            return (
+                f"✅ Trigger '{name}' re-enabled with new configuration "
+                f"({ttype}, fired {reenabled_fire_count} times so far)"
+            )
         return f"✅ Trigger '{name}' created ({ttype}). It will fire according to your config and wake you up with the reason as context."
 
     except Exception as e:
@@ -9635,8 +10463,33 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
 
             changes = []
             if new_config is not None:
-                old_config = trigger.config
-                trigger.config = new_config
+                if not isinstance(new_config, dict):
+                    return "❌ Trigger config must be an object"
+                old_config = dict(trigger.config or {})
+                public_new = {
+                    key: value for key, value in new_config.items() if not str(key).startswith("_")
+                }
+                private_old = {
+                    key: value for key, value in old_config.items() if str(key).startswith("_")
+                }
+                old_target = (
+                    old_config.get("from_agent_name"),
+                    old_config.get("from_user_name"),
+                )
+                new_target = (
+                    public_new.get("from_agent_name"),
+                    public_new.get("from_user_name"),
+                )
+                if trigger.type == "on_message" and old_target != new_target:
+                    # A changed public sender criterion is a legacy watcher until
+                    # a future same-turn send arms a new exact route.  Preserve
+                    # only the origin destination; never keep a stale remote R.
+                    private_old = {
+                        key: value
+                        for key, value in private_old.items()
+                        if key.startswith("_origin_") or key == "_set_trigger_context"
+                    }
+                trigger.config = {**public_new, **private_old}
                 changes.append(f"config: {old_config} → {new_config}")
             if new_webhook_mode is not None:
                 if trigger.type != "webhook":
@@ -9655,6 +10508,19 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
             if new_reason is not None:
                 trigger.reason = new_reason
                 changes.append(f"reason updated")
+
+            if trigger.type == "on_message":
+                cfg = dict(trigger.config or {})
+                cfg["_set_trigger_context"] = {
+                    "name": trigger.name,
+                    "type": "on_message",
+                    "reason": trigger.reason,
+                    "focus_ref": trigger.focus_ref or "",
+                    "config": {
+                        key: value for key, value in cfg.items() if not str(key).startswith("_")
+                    },
+                }
+                trigger.config = cfg
 
             await db.commit()
 
@@ -9734,7 +10600,16 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
         if not triggers:
             return "No triggers found. Use set_trigger to create one."
 
-        lines = ["| Name | Type | Config | Webhook URL | Reason | Status | Fires |", "|------|------|--------|-------------|--------|--------|-------|"]
+        active_onmessage = sum(
+            1 for trigger in triggers if trigger.type == "on_message" and trigger.is_enabled
+        )
+        total_onmessage = sum(1 for trigger in triggers if trigger.type == "on_message")
+        lines = [
+            f"on_message: {active_onmessage} active / {total_onmessage} total",
+            "",
+            "| Name | Type | Config | Webhook URL | Reason | Status | Fires |",
+            "|------|------|--------|-------------|--------|--------|-------|",
+        ]
         for t in triggers:
             status = "✅ active" if t.is_enabled else "⏸ disabled"
             config = t.config or {}
@@ -9742,7 +10617,10 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
                 config_str = f"token: {config['token']}"
                 webhook_url = f"{_base_url}/api/webhooks/t/{config['token']}"
             else:
-                config_str = str(config)[:50]
+                public_config = {
+                    key: value for key, value in config.items() if not str(key).startswith("_")
+                }
+                config_str = str(public_config)[:50]
                 webhook_url = "-"
             reason_str = t.reason[:40] if t.reason else ""
             lines.append(f"| {t.name} | {t.type} | {config_str} | {webhook_url} | {reason_str} | {status} | {t.fire_count} |")

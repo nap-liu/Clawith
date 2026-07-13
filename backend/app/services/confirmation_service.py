@@ -247,6 +247,12 @@ async def resolve_confirmation(
         if payload.get("name") != REQUEST_CONFIRMATION_TOOL_NAME or payload.get("status") != "pending":
             return None  # idempotent — already resolved (or not a confirmation)
 
+        pending_meta = row.message_meta if isinstance(row.message_meta, dict) else {}
+        try:
+            turn_anchor_id = uuid.UUID(str(pending_meta.get("turn_anchor_id")))
+        except (TypeError, ValueError):
+            turn_anchor_id = None
+
         label = button_label or button_value or "按钮"
         ago = _ago(row.created_at, now)
         expired = bool(row.created_at and (now - row.created_at) > timedelta(hours=CONFIRMATION_EXPIRY_HOURS))
@@ -288,7 +294,12 @@ async def resolve_confirmation(
     # Resume the agent's loop from the now-complete tool result. Best-effort — its failure
     # must not mask the resolution (the REST caller still gets the committed outcome).
     try:
-        await _reenter_loop(agent_id, str(conversation_id), resolving_user_id)
+        await _reenter_loop(
+            agent_id,
+            str(conversation_id),
+            resolving_user_id,
+            turn_anchor_id=turn_anchor_id,
+        )
     except Exception:
         logger.exception("Reenter after resolving confirmation %s failed; resolution stands.", call_id)
 

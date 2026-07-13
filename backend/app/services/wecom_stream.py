@@ -194,6 +194,13 @@ class WeComStreamManager:
                             chat_id=chat_id,
                             chat_type=chat_type,
                             send_thinking_text=_send_thinking_text,
+                            provider_event_id=str(
+                                body.get("msgid")
+                                or body.get("msg_id")
+                                or body.get("message_id")
+                                or ""
+                            )
+                            or None,
                         )
                         await client.reply_stream(frame, _stream_id, reply_text, finish=True)
                         logger.info(f"[WeCom Stream] Replied to {sender_id}: {reply_text[:80]}")
@@ -370,6 +377,7 @@ async def _process_wecom_stream_message(
     chat_id: str = "",
     chat_type: str = "single",
     send_thinking_text: Callable[[str], Awaitable[None]] | None = None,
+    provider_event_id: str | None = None,
 ) -> str:
     """Process a WeCom message through the LLM pipeline and return the reply text."""
     from datetime import datetime, timezone
@@ -428,12 +436,26 @@ async def _process_wecom_stream_message(
         from app.services.llm.utils import convert_chat_messages_to_llm_format as _conv
         history = _conv(reversed(history_r.scalars().all()))
 
-        # Save user message
-        db.add(ChatMessage(
-            agent_id=agent_id, user_id=platform_user_id,
-            role="user", content=user_text,
-            conversation_id=session_conv_id,
-        ))
+        config_r = await db.execute(
+            _select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent_id,
+                ChannelConfig.channel_type == "wecom",
+            )
+        )
+        channel_config = config_r.scalar_one_or_none()
+        from app.services.chat_history import ingest_incoming_chat_message
+
+        ingested = await ingest_incoming_chat_message(
+            db,
+            session=sess,
+            agent_id=agent_id,
+            user_id=platform_user_id,
+            content=user_text,
+            source_channel="wecom",
+            provider_event_id=provider_event_id,
+            channel_config_id=channel_config.id if channel_config else None,
+            actor_ref=sender_id,
+        )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
 
@@ -445,6 +467,14 @@ async def _process_wecom_stream_message(
             agent_id, session_conv_id, content=user_text,
             sender_name=None, user_id=platform_user_id,
         )
+
+        if ingested.consumed_by_onmessage:
+            logger.info(
+                "[WeCom Stream] Inbound event %s routed to %d on_message execution(s)",
+                provider_event_id,
+                len(ingested.execution_ids),
+            )
+            return ""
 
         # Call LLM
         _thinking_chunks: list[str] = []
@@ -467,6 +497,7 @@ async def _process_wecom_stream_message(
                 history=history, user_id=platform_user_id,
                 session_id=session_conv_id,
                 on_thinking=_collect_thinking,
+                turn_anchor_id=ingested.message.id,
             )
         finally:
             await _thinking_sender.flush()
@@ -482,6 +513,7 @@ async def _process_wecom_stream_message(
             _areply_session, agent_id=agent_id, user_id=platform_user_id,
             conversation_id=session_conv_id, content=reply_text,
             thinking="".join(_thinking_chunks) or None,
+            turn_anchor_id=ingested.message.id,
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()

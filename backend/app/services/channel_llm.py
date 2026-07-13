@@ -108,6 +108,7 @@ async def _call_agent_llm(
     continue_turn: bool = False,
     recovery_mode: bool = False,
     turn_anchor_id: uuid.UUID | None = None,
+    storage_agent_id: uuid.UUID | None = None,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -123,6 +124,11 @@ async def _call_agent_llm(
     from app.models.agent import Agent
     from app.models.llm import LLMModel
     from app.services.llm import call_llm_with_failover
+
+    # A2A sessions store their shared history under the session owner (the
+    # stable min-id side), while the model and tools execute as the agent being
+    # awakened.  Ordinary channels use the same id for both roles.
+    history_agent_id = storage_agent_id or agent_id
 
     # Load agent and model
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -195,12 +201,15 @@ async def _call_agent_llm(
 
         try:
             if await maybe_precompact_prompt(
-                agent_id=agent_id, conversation_id=session_id, model=model, prompt_messages=messages
+                agent_id=history_agent_id,
+                conversation_id=session_id,
+                model=model,
+                prompt_messages=messages,
             ):
                 if recovery_mode and turn_anchor_id is not None:
                     fresh = await load_recoverable_history_for_turn(
                         db,
-                        agent_id=agent_id,
+                        agent_id=history_agent_id,
                         conversation_id=session_id,
                         turn_anchor_id=turn_anchor_id,
                         ctx_size=ctx_size,
@@ -211,7 +220,7 @@ async def _call_agent_llm(
                 else:
                     fresh = await load_history_for_llm(
                         db,
-                        agent_id=agent_id,
+                        agent_id=history_agent_id,
                         conversation_id=session_id,
                         ctx_size=ctx_size,
                         is_group=is_group,
@@ -269,7 +278,7 @@ async def _call_agent_llm(
         if session_id and user_id is not None and not evt.get("_durable_persisted"):
             await _persist_tool_call(
                 _persist_session_factory,
-                agent_id=agent_id,
+                agent_id=history_agent_id,
                 user_id=user_id,
                 conversation_id=session_id,
                 evt=public_evt,

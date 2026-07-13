@@ -207,12 +207,13 @@ async def report_result(
         select(GatewayMessage).where(
             GatewayMessage.id == body.message_id,
             GatewayMessage.agent_id == agent.id,
-        )
+        ).with_for_update()
     )
     msg = result.scalar_one_or_none()
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
 
+    first_completion = msg.status != "completed"
     msg.status = "completed"
     msg.result = body.result
     msg.completed_at = datetime.now(timezone.utc)
@@ -224,20 +225,64 @@ async def report_result(
     # (works for both user-originated and agent-to-agent messages)
     if body.result and msg.conversation_id:
         from app.models.audit import ChatMessage
+        from app.models.chat_session import ChatSession
         from app.models.participant import Participant
         # Look up OpenClaw agent's participant_id
         part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == agent.id))
         participant = part_r.scalar_one_or_none()
-        
-        assistant_msg = ChatMessage(
-            agent_id=agent.id,
-            user_id=msg.sender_user_id or getattr(agent, "creator_id", agent.id),
-            role="assistant",
-            content=body.result,
-            conversation_id=msg.conversation_id,
-            participant_id=participant.id if participant else None,
+
+        # A gateway client may retry /report. Persist one stable reply row so
+        # the same remote event cannot enqueue a second on_message execution.
+        report_event_key = f"gateway-report:{msg.id}"
+        assistant_msg = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.external_event_key == report_event_key
+                )
+            )
+        ).scalar_one_or_none()
+        if assistant_msg is None:
+            assistant_msg = ChatMessage(
+                agent_id=agent.id,
+                user_id=msg.sender_user_id or getattr(agent, "creator_id", agent.id),
+                role="assistant",
+                content=body.result,
+                conversation_id=msg.conversation_id,
+                participant_id=participant.id if participant else None,
+                external_event_key=report_event_key,
+                message_meta={
+                    "direction": "inbound",
+                    "source_channel": "agent",
+                    "actor_ref": str(participant.id if participant else agent.id),
+                },
+            )
+            db.add(assistant_msg)
+            await db.flush()
+            try:
+                report_session = await db.get(ChatSession, uuid.UUID(str(msg.conversation_id)))
+            except (TypeError, ValueError):
+                report_session = None
+            if report_session is not None:
+                from app.services.trigger_runtime.evaluator import (
+                    match_incoming_chat_message,
+                )
+
+                await match_incoming_chat_message(db, assistant_msg, report_session)
+
+    # Route an A2A reply in the same transaction as completion and exact
+    # on_message matching. Concurrent/retried reports therefore create neither
+    # a duplicate wake nor a duplicate gateway reply.
+    if body.result and msg.sender_agent_id and first_completion:
+        db.add(
+            GatewayMessage(
+                agent_id=msg.sender_agent_id,
+                sender_agent_id=agent.id,
+                content=body.result,
+                status="pending",
+                conversation_id=msg.conversation_id
+                or f"gw_agent_{msg.sender_agent_id}_{agent.id}",
+            )
         )
-        db.add(assistant_msg)
 
     await db.commit()
 
@@ -253,21 +298,8 @@ async def report_result(
         except Exception:
             pass  # User may have disconnected
 
-    # If the original message was from another agent (OpenClaw-to-OpenClaw),
-    # write the reply back as a gateway_message for the sender agent to poll
-    if body.result and msg.sender_agent_id:
-        async with async_session() as reply_db:
-            conv_id = msg.conversation_id or f"gw_agent_{msg.sender_agent_id}_{agent.id}"
-            gw_reply = GatewayMessage(
-                agent_id=msg.sender_agent_id,
-                sender_agent_id=agent.id,
-                content=body.result,
-                status="pending",
-                conversation_id=conv_id,
-            )
-            reply_db.add(gw_reply)
-            await reply_db.commit()
-            logger.info(f"[Gateway] Reply routed back to sender agent {msg.sender_agent_id}")
+    if body.result and msg.sender_agent_id and first_completion:
+        logger.info(f"[Gateway] Reply routed back to sender agent {msg.sender_agent_id}")
 
     return {"status": "ok"}
 
@@ -301,6 +333,7 @@ async def _send_to_agent_background(
     target_role_description: str,
     target_creator_id: str,
     content: str,
+    source_event_id: str,
 ):
     """Background task: invoke target agent LLM and write reply to gateway_messages.
     
@@ -407,16 +440,25 @@ async def _send_to_agent_background(
             src_participant = src_part_r.scalar_one_or_none()
             tgt_participant = tgt_part_r.scalar_one_or_none()
             
-            # Save user message to conversation
-            db.add(ChatMessage(
-                agent_id=target_agent_id,
-                conversation_id=conv_id,
-                role="user",
+            from app.services.chat_history import ingest_incoming_chat_message
+
+            ingested = await ingest_incoming_chat_message(
+                db,
+                session=session,
+                agent_id=uuid.UUID(str(target_agent_id)),
+                user_id=uuid.UUID(str(target_creator_id)),
                 content=user_msg,
-                user_id=target_creator_id,
+                source_channel="agent",
+                provider_event_id=source_event_id,
+                channel_config_id="gateway-direct",
+                actor_ref=str(src_participant.id if src_participant else source_agent_id),
                 participant_id=src_participant.id if src_participant else None,
-            ))
+            )
             await db.commit()
+
+            if ingested.consumed_by_onmessage:
+                logger.info("[Gateway] Direct A2A event %s routed to on_message", source_event_id)
+                return
 
         # Call LLM
         collected = []
@@ -441,14 +483,27 @@ async def _send_to_agent_background(
             tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id))
             tgt_participant = tgt_part_r.scalar_one_or_none()
             
-            db.add(ChatMessage(
+            reply_row = ChatMessage(
                 agent_id=target_agent_id,
                 conversation_id=conv_id,
                 role="assistant",
                 content=final_reply,
                 user_id=target_creator_id,
                 participant_id=tgt_participant.id if tgt_participant else None,
-            ))
+                external_event_key=f"gateway-direct-reply:{source_event_id}",
+                message_meta={
+                    "direction": "inbound",
+                    "source_channel": "agent",
+                    "actor_ref": str(tgt_participant.id if tgt_participant else target_agent_id),
+                    "turn_anchor_id": str(ingested.message.id),
+                    "turn_status": "completed",
+                },
+            )
+            db.add(reply_row)
+            await db.flush()
+            from app.services.trigger_runtime.evaluator import match_incoming_chat_message
+
+            await match_incoming_chat_message(db, reply_row, session)
 
             # Write reply to gateway_messages for source (OpenClaw) to poll
             gw_reply = GatewayMessage(
@@ -473,6 +528,7 @@ async def _send_to_agent_background(
 async def send_message(
     body: GatewaySendMessageRequest,
     x_api_key: str = Header(..., alias="X-Api-Key"),
+    x_idempotency_key: str | None = Header(None, alias="X-Idempotency-Key"),
     db: AsyncSession = Depends(get_db),
 ):
     """OpenClaw agent sends a message to a person or another agent.
@@ -542,9 +598,14 @@ async def send_message(
             _tgt_role = target_agent.role_description or ""
             _tgt_creator = str(target_agent.creator_id) if target_agent.creator_id else ""
             await db.commit()
+            source_event_id = (
+                f"{agent.id}:{x_idempotency_key}"[:500]
+                if x_idempotency_key
+                else str(uuid.uuid4())
+            )
             task = asyncio.create_task(_send_to_agent_background(
                 _src_id, _src_name, _tgt_id, _tgt_name,
-                _tgt_model, _tgt_role, _tgt_creator, content,
+                _tgt_model, _tgt_role, _tgt_creator, content, source_event_id,
             ))
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)

@@ -25,6 +25,8 @@ from app.services.trigger_runtime.evaluator import (
     handle_okr_report_trigger as handle_okr_report_trigger_runtime,
     mark_trigger_fired as mark_trigger_fired_runtime,
     mark_trigger_skipped as mark_trigger_skipped_runtime,
+    recover_exact_on_message_events,
+    recover_legacy_on_message_events,
     should_skip_non_workday as should_skip_non_workday_runtime,
 )
 from app.services.trigger_runtime import (
@@ -32,7 +34,9 @@ from app.services.trigger_runtime import (
     enqueue_due_trigger,
     mark_trigger_executions_completed,
     mark_trigger_executions_failed,
+    requeue_trigger_executions,
 )
+from app.services.trigger_runtime.executions import renew_trigger_execution_leases
 
 TICK_INTERVAL = 15  # seconds
 DEDUP_WINDOW = 30   # seconds — same agent won't be invoked twice within this window
@@ -43,7 +47,7 @@ _ON_MSG_RATE_WINDOW = 3600  # 1 hour window
 _ON_MSG_RATE_LIMIT = 30     # max on_message fires per agent per hour
 _on_msg_fire_log: dict[uuid.UUID, list[datetime]] = {}  # agent_id -> list of fire timestamps
 
-_last_invoke: dict[uuid.UUID, datetime] = {}
+_last_invoke: dict[object, datetime] = {}
 
 _A2A_WAKE_CHAIN: dict[str, int] = {}
 _A2A_WAKE_CHAIN_TTL = 300
@@ -289,6 +293,18 @@ def _extract_json_path(data, path: str):
 
 
 async def _check_new_agent_messages(trigger: AgentTrigger) -> bool:
+    """Production on_message matcher; runtime module is the single implementation."""
+    if (trigger.config or {}).get("_watch_session_id"):
+        # Exact subscriptions enqueue every missed durable event directly.  The
+        # ordinary evaluator must return False or the tick would enqueue a
+        # second synthetic execution for only one mutated message snapshot.
+        await recover_exact_on_message_events(trigger)
+        return False
+    await recover_legacy_on_message_events(trigger)
+    return False
+
+
+async def _legacy_check_new_agent_messages(trigger: AgentTrigger) -> bool:
     """Check if there are new messages matching this trigger.
     
     Supports two modes:
@@ -365,7 +381,6 @@ async def _check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 # --- Human user message check (Feishu/Slack/Discord) ---
                 # Find sessions for this agent from external channels
                 from sqlalchemy import cast as sa_cast, String as SaString
-                from app.models.user import User
                 from app.models.agent import Agent as AgentModel
 
                 # 0. Get agent for tenant scoping
@@ -441,12 +456,14 @@ async def _resolve_trigger_delivery_target(agent: Agent, triggers: list[AgentTri
 
     Priority:
     1. Explicit A2A callback session
-    2. Originating agent-to-agent session
-    3. Originating platform user → that user's primary platform session
-    4. Pure trigger/reflection context → no user-facing delivery
+    2. Exact originating ChatSession for interactive triggers
+    3. Pure trigger/reflection context → no user-facing delivery
+
+    Never substitute a primary platform session.  ``source_channel`` describes
+    where the continuation belongs; it is not a hint from which another session
+    may be selected.
     """
     from app.models.chat_session import ChatSession
-    from app.services.chat_session_service import ensure_primary_platform_session
 
     # Synthetic A2A wake triggers already carry the callback session explicitly.
     for trigger in triggers:
@@ -477,39 +494,30 @@ async def _resolve_trigger_delivery_target(agent: Agent, triggers: list[AgentTri
     if not origin_cfg:
         return None
 
-    origin_source_channel = origin_cfg.get("_origin_source_channel")
+    origin_source_channel = str(origin_cfg.get("_origin_source_channel") or "").strip()
     origin_session_id = origin_cfg.get("_origin_session_id")
     origin_user_id = origin_cfg.get("_origin_user_id")
+    origin_external_conv_id = origin_cfg.get("_origin_external_conv_id")
 
-    if origin_source_channel == "agent" and origin_session_id:
+    if origin_session_id:
         try:
             async with async_session() as db:
                 session = await db.get(ChatSession, uuid.UUID(origin_session_id))
-                if not session:
+                if not session or session.agent_id != agent.id:
+                    return None
+                if origin_source_channel and session.source_channel != origin_source_channel:
+                    return None
+                if origin_external_conv_id is not None and session.external_conv_id != origin_external_conv_id:
+                    # /new archives the old row by changing external_conv_id.  A
+                    # pending continuation must not silently jump generations.
                     return None
                 return {
                     "kind": "session",
                     "session_id": str(session.id),
-                    "owner_user_id": str(session.user_id),
-                    "source_channel": "agent",
-                }
-        except Exception:
-            return None
-
-    if origin_source_channel != "trigger" and origin_user_id:
-        try:
-            async with async_session() as db:
-                primary = await ensure_primary_platform_session(
-                    db,
-                    agent.id,
-                    uuid.UUID(origin_user_id),
-                )
-                await db.commit()
-                return {
-                    "kind": "primary_user_session",
-                    "session_id": str(primary.id),
-                    "owner_user_id": str(primary.user_id),
-                    "source_channel": primary.source_channel,
+                    "owner_user_id": str(origin_user_id or session.user_id),
+                    "source_channel": session.source_channel,
+                    "external_conv_id": session.external_conv_id,
+                    "is_group": bool(session.is_group),
                 }
         except Exception:
             return None
@@ -582,13 +590,302 @@ def _advance_webhook_trigger(db, trig: AgentTrigger, reply) -> None:
     trig.config = new_cfg
 
 
+_ONMESSAGE_TURN_NAMESPACE = uuid.UUID("1cb1fc5c-c7c4-4f02-aa83-fab956557622")
+
+
+class RetryableOnMessageError(RuntimeError):
+    """A durable on_message turn completed locally but delivery should retry."""
+
+
+async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: AgentTrigger) -> None:
+    """Start one real event turn inside the exact originating ChatSession.
+
+    An on_message trigger is a subscription.  The inbound row can therefore
+    match several triggers, but every (trigger, inbound event) execution gets
+    its own idempotent event turn carrying the trigger's arm-time context.
+    The original send turn is never resumed or reused as the new anchor.
+    """
+    from app.models.audit import ChatMessage
+    from app.models.chat_session import ChatSession
+    from app.services.channel_dispatch import ChannelReactions, run_channel_message
+    from app.services.channel_llm import _call_agent_llm
+    from app.services.chat_history import (
+        load_recoverable_history_for_turn,
+        persist_assistant_reply_row,
+    )
+    from app.services.turn_runtime import deliver_recovered_reply_to_origin
+
+    cfg = trigger.config if isinstance(trigger.config, dict) else {}
+    execution_id = uuid.UUID(str(cfg["_execution_id"]))
+    origin_id = uuid.UUID(str(cfg["_origin_session_id"]))
+    matched_id = uuid.UUID(str(cfg["_matched_message_id"]))
+    anchor_id = uuid.uuid5(_ONMESSAGE_TURN_NAMESPACE, f"anchor:{execution_id}")
+    final_id = uuid.uuid5(_ONMESSAGE_TURN_NAMESPACE, f"final:{execution_id}")
+
+    async def _work() -> str:
+        async with async_session() as db:
+            origin = await db.get(ChatSession, origin_id)
+            matched = await db.get(ChatMessage, matched_id)
+            if origin is None or matched is None:
+                raise RuntimeError("on_message origin or matched message no longer exists")
+            owns_origin = origin.agent_id == agent_id or (
+                origin.source_channel == "agent"
+                and agent_id in {origin.agent_id, origin.peer_agent_id}
+            )
+            if not owns_origin:
+                raise RuntimeError("on_message origin session belongs to another agent")
+            expected_channel = str(cfg.get("_origin_source_channel") or "").strip()
+            if expected_channel and origin.source_channel != expected_channel:
+                raise RuntimeError("on_message origin source channel changed")
+            if (
+                "_origin_external_conv_id" in cfg
+                and origin.external_conv_id != cfg.get("_origin_external_conv_id")
+            ):
+                raise RuntimeError("on_message origin session generation changed")
+            expected_watch = str(
+                cfg.get("_watch_session_id") or cfg.get("_matched_session_id") or ""
+            )
+            if expected_watch and matched.conversation_id != expected_watch:
+                raise RuntimeError("on_message matched message belongs to another remote session")
+
+            # The subscription is armed from inside an ordinary LLM/tool turn.
+            # A fast remote reply may arrive before that origin turn persists
+            # its final assistant row.  Use the durable turn completion marker
+            # as a cross-process barrier so the new event turn cannot interleave
+            # with the turn that created it.
+            origin_turn_anchor_raw = cfg.get("_origin_turn_anchor_id")
+            if origin_turn_anchor_raw:
+                try:
+                    origin_turn_anchor_id = uuid.UUID(str(origin_turn_anchor_raw))
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("on_message origin turn anchor is invalid") from exc
+                origin_turn_anchor = await db.get(ChatMessage, origin_turn_anchor_id)
+                if (
+                    origin_turn_anchor is None
+                    or origin_turn_anchor.conversation_id != str(origin.id)
+                ):
+                    raise RuntimeError("on_message origin turn anchor changed")
+                completion_query = select(ChatMessage.id).where(
+                    ChatMessage.conversation_id == str(origin.id),
+                    ChatMessage.role == "assistant",
+                    ChatMessage.message_meta["turn_anchor_id"].as_string()
+                    == str(origin_turn_anchor_id),
+                    ChatMessage.message_meta["turn_status"].as_string()
+                    == "completed",
+                )
+                completion_id = (
+                    await db.execute(completion_query.order_by(ChatMessage.created_at.asc()).limit(1))
+                ).scalar_one_or_none()
+                if completion_id is None:
+                    raise RetryableOnMessageError(
+                        "on_message origin turn has not completed yet"
+                    )
+
+            # Validate the immutable origin envelope before every retry.  A
+            # persisted final from an older session generation must never be
+            # delivered after /new rotates the external conversation id.
+            existing_final = await db.get(ChatMessage, final_id)
+            if existing_final is not None:
+                return existing_final.content
+
+            owner_user_id = origin.user_id
+            configured_user = cfg.get("_origin_user_id")
+            if configured_user:
+                try:
+                    owner_user_id = uuid.UUID(str(configured_user))
+                except (TypeError, ValueError):
+                    pass
+
+            agent = await db.get(Agent, agent_id)
+            if agent is None:
+                raise RuntimeError("on_message agent no longer exists")
+            from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
+
+            history_agent_id = origin.agent_id if origin.source_channel == "agent" else agent_id
+            trigger_context = cfg.get("_trigger_context") or cfg.get("_set_trigger_context") or {
+                "name": trigger.name,
+                "type": trigger.type,
+                "reason": trigger.reason,
+                "focus_ref": trigger.focus_ref or "",
+                "config": {
+                    key: value for key, value in cfg.items() if not str(key).startswith("_")
+                },
+            }
+            wake_content = (
+                "<on-message-event>\n"
+                "This event wakes the exact session that created the subscription.\n"
+                f"Original set_trigger context: {_json.dumps(trigger_context, ensure_ascii=False)}\n"
+                f"Remote channel: {cfg.get('_watch_source_channel') or 'unknown'}\n"
+                f"Remote session: {matched.conversation_id}\n"
+                f"Sender: {cfg.get('_matched_from') or 'message sender'}\n"
+                f"Reply:\n{matched.content}\n"
+                "Handle the reply according to the original trigger context.\n"
+                "</on-message-event>"
+            )
+
+            anchor = await db.get(ChatMessage, anchor_id)
+            if anchor is None:
+                anchor = ChatMessage(
+                    id=anchor_id,
+                    agent_id=history_agent_id,
+                    user_id=owner_user_id,
+                    role="user",
+                    content=wake_content,
+                    conversation_id=str(origin.id),
+                    external_event_key=(
+                        f"onmessage-wake:{trigger.id}:{matched.id}"[:500]
+                    ),
+                    message_meta={
+                        "kind": "on_message_event",
+                        "trigger_id": str(trigger.id),
+                        "trigger_execution_id": str(execution_id),
+                        "matched_message_id": str(matched.id),
+                        "remote_session_id": matched.conversation_id,
+                        "trigger_context": trigger_context,
+                    },
+                )
+                db.add(anchor)
+                origin.last_message_at = datetime.now(timezone.utc)
+                await db.commit()
+
+            history = await load_recoverable_history_for_turn(
+                db,
+                agent_id=history_agent_id,
+                conversation_id=str(origin.id),
+                turn_anchor_id=anchor_id,
+                ctx_size=agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE,
+                is_group=bool(origin.is_group),
+            )
+            reply = await _call_agent_llm(
+                db,
+                agent_id,
+                "",
+                session_id=str(origin.id),
+                user_id=owner_user_id,
+                history=history,
+                is_group=bool(origin.is_group),
+                recovery_hint=None,
+                continue_turn=True,
+                recovery_mode=True,
+                turn_anchor_id=anchor_id,
+                storage_agent_id=history_agent_id,
+            )
+            if reply and reply.strip():
+                final_meta = {
+                    "kind": "on_message_final",
+                    "trigger_execution_id": str(execution_id),
+                    "matched_message_id": str(matched_id),
+                }
+                origin_agent_participant = None
+                if origin.source_channel == "agent":
+                    from app.models.participant import Participant
+
+                    origin_agent_participant = (
+                        await db.execute(
+                            select(Participant).where(
+                                Participant.type == "agent",
+                                Participant.ref_id == agent_id,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    final_meta.update(
+                        {
+                            "direction": "inbound",
+                            "source_channel": "agent",
+                            "actor_ref": str(
+                                origin_agent_participant.id
+                                if origin_agent_participant is not None
+                                else agent_id
+                            ),
+                        }
+                    )
+                await persist_assistant_reply_row(
+                    db,
+                    agent_id=history_agent_id,
+                    user_id=owner_user_id,
+                    conversation_id=str(origin.id),
+                    content=reply,
+                    message_id=final_id,
+                    message_meta=final_meta,
+                    turn_anchor_id=anchor_id,
+                )
+                if origin.source_channel == "agent":
+                    final_row = await db.get(ChatMessage, final_id)
+                    if final_row is not None:
+                        if origin_agent_participant is not None:
+                            final_row.participant_id = origin_agent_participant.id
+                        from app.services.trigger_runtime.evaluator import (
+                            match_incoming_chat_message,
+                        )
+
+                        await match_incoming_chat_message(db, final_row, origin)
+                origin_row = await db.get(ChatSession, origin.id)
+                if origin_row is not None:
+                    origin_row.last_message_at = datetime.now(timezone.utc)
+            await db.commit()
+            return reply
+
+    async def _work_and_deliver() -> str:
+        """Keep turn creation and origin transport ordering in one session lock."""
+        reply = await _work()
+        if not reply or not reply.strip():
+            return reply
+
+        async with async_session() as db:
+            final_row = await db.get(ChatMessage, final_id)
+            final_meta = (
+                final_row.message_meta
+                if final_row is not None and isinstance(final_row.message_meta, dict)
+                else {}
+            )
+            if final_meta.get("origin_delivery_status") == "delivered":
+                return reply
+
+        delivered = await deliver_recovered_reply_to_origin(
+            agent_id=agent_id,
+            conversation_id=str(origin_id),
+            reply=reply,
+            origin_actor_ref=str(cfg.get("_origin_actor_ref") or "") or None,
+            origin_actor_ref_type=str(cfg.get("_origin_actor_ref_type") or "") or None,
+            require_transport=True,
+            expected_source_channel=str(cfg.get("_origin_source_channel") or "") or None,
+            expected_external_conv_id=cfg.get("_origin_external_conv_id"),
+            validate_external_conv_id="_origin_external_conv_id" in cfg,
+        )
+        if not delivered:
+            raise RetryableOnMessageError("on_message origin delivery failed")
+        try:
+            async with async_session() as db:
+                final_row = await db.get(ChatMessage, final_id)
+                if final_row is not None:
+                    final_meta = final_row.message_meta if isinstance(final_row.message_meta, dict) else {}
+                    final_row.message_meta = {
+                        **final_meta,
+                        "origin_delivery_status": "delivered",
+                        "origin_delivered_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    await db.commit()
+        except Exception as exc:
+            raise RetryableOnMessageError(
+                "on_message delivery succeeded but its durable receipt was not recorded"
+            ) from exc
+        return reply
+
+    await run_channel_message(
+        str(origin_id),
+        is_command=False,
+        reactions=ChannelReactions(),
+        work=_work_and_deliver,
+        distributed=True,
+    )
+
+
 async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTrigger]):
     """Invoke an agent with context from one or more fired triggers.
 
     Creates a Reflection Session and calls the LLM.
     """
     from app.services.llm import call_llm
-    from app.services.agent_context import build_agent_context
     from app.models.llm import LLMModel
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
@@ -610,8 +907,31 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             except (ValueError, TypeError):
                 pass
     invocation_error: str | None = None
+    invocation_retryable = False
+    lease_heartbeat_task: asyncio.Task | None = None
+
+    if execution_ids:
+        async def _lease_heartbeat() -> None:
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    await renew_trigger_execution_leases(execution_ids)
+                except Exception as exc:
+                    logger.warning("Failed to renew trigger execution leases %s: %s", execution_ids, exc)
+
+        lease_heartbeat_task = asyncio.create_task(_lease_heartbeat())
 
     try:
+        if (
+            len(triggers) == 1
+            and triggers[0].type == "on_message"
+            and (triggers[0].config or {}).get("_origin_session_id")
+            and (triggers[0].config or {}).get("_matched_message_id")
+            and (triggers[0].config or {}).get("_execution_id")
+        ):
+            await _resume_origin_session_for_on_message(agent_id, triggers[0])
+            return
+
         async with async_session() as db:
             # Load agent
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -894,21 +1214,55 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                         from app.models.participant import Participant as _P
                         _p_r = await db.execute(select(_P).where(_P.type == "agent", _P.ref_id == agent_id))
                         _p = _p_r.scalar_one_or_none()
-                        db.add(ChatMessage(
-                            agent_id=agent_id,
+                        from app.models.chat_session import ChatSession as _CS
+                        _cs_r = await db.execute(select(_CS).where(_CS.id == uuid.UUID(a2a_sid)))
+                        _cs = _cs_r.scalar_one_or_none()
+                        _source_execution_id = str((t.config or {}).get("_execution_id") or "").strip()
+                        _reply_id = (
+                            uuid.uuid5(
+                                _ONMESSAGE_TURN_NAMESPACE,
+                                f"a2a-reply:{_source_execution_id}",
+                            )
+                            if _source_execution_id
+                            else uuid.uuid4()
+                        )
+                        _existing_reply = await db.get(ChatMessage, _reply_id)
+                        if _existing_reply is not None:
+                            logger.info(
+                                "[A2A] Reply already persisted for execution %s",
+                                _source_execution_id,
+                            )
+                            break
+                        reply_row = ChatMessage(
+                            id=_reply_id,
+                            agent_id=_cs.agent_id if _cs else agent_id,
                             conversation_id=a2a_sid,
                             role="assistant",
                             content=final_reply,
                             user_id=agent.creator_id,
                             participant_id=_p.id if _p else None,
                             thinking=_capped_thinking,
-                        ))
+                            external_event_key=(
+                                f"a2a-inbound:{_source_execution_id}"[:500]
+                                if _source_execution_id
+                                else None
+                            ),
+                            message_meta={
+                                "direction": "inbound",
+                                "source_channel": "agent",
+                                "actor_ref": str(_p.id if _p else agent_id),
+                            },
+                        )
+                        db.add(reply_row)
                         # Update session timestamp
-                        from app.models.chat_session import ChatSession as _CS
-                        _cs_r = await db.execute(select(_CS).where(_CS.id == uuid.UUID(a2a_sid)))
-                        _cs = _cs_r.scalar_one_or_none()
                         if _cs:
                             _cs.last_message_at = datetime.now(timezone.utc)
+                            await db.flush()
+                            from app.services.trigger_runtime.evaluator import (
+                                match_incoming_chat_message,
+                            )
+
+                            await match_incoming_chat_message(db, reply_row, _cs)
                         await db.commit()
                         logger.info(f"[A2A] Saved reply to A2A session {a2a_sid}")
                 except Exception as e:
@@ -1024,10 +1378,14 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
 
     except Exception as e:
         invocation_error = str(e)
+        invocation_retryable = isinstance(e, RetryableOnMessageError)
         logger.error(f"Failed to invoke agent {agent_id} for triggers: {e}")
         import traceback
         traceback.print_exc()
     finally:
+        if lease_heartbeat_task is not None:
+            lease_heartbeat_task.cancel()
+            await asyncio.gather(lease_heartbeat_task, return_exceptions=True)
         # Release the lease on every claimed execution so it is not re-fired.
         # Runs on success, on early return (agent expired / model disabled), and
         # on exception. Early returns leave invocation_error=None → completed,
@@ -1037,6 +1395,8 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             try:
                 if invocation_error is None:
                     await mark_trigger_executions_completed(execution_ids)
+                elif invocation_retryable:
+                    await requeue_trigger_executions(execution_ids, invocation_error)
                 else:
                     await mark_trigger_executions_failed(execution_ids, invocation_error)
             except Exception as _mark_err:
@@ -1054,7 +1414,7 @@ async def _tick():
 
     async with async_session() as db:
         result = await db.execute(
-            select(AgentTrigger).where(AgentTrigger.is_enabled == True)
+            select(AgentTrigger).where(AgentTrigger.is_enabled.is_(True))
         )
         all_triggers = result.scalars().all()
         # Expunge each object before session.close() is called.
@@ -1115,22 +1475,24 @@ async def _tick():
 
     # Claim queued executions with a DB lease so only one worker handles each event.
     try:
-        fired_by_agent, force_invoke_agents = await claim_ready_trigger_invocations(now)
+        fired_by_invocation, force_invoke = await claim_ready_trigger_invocations(now)
     except Exception as e:
         logger.warning(f"Failed to claim trigger executions: {e}")
-        fired_by_agent = {}
-        force_invoke_agents = set()
+        fired_by_invocation = {}
+        force_invoke = set()
 
-    # Invoke each agent (with dedup window)
-    for agent_id, agent_triggers in fired_by_agent.items():
-        last = _last_invoke.get(agent_id)
-        if agent_id not in force_invoke_agents and last and (now - last).total_seconds() < DEDUP_WINDOW:
+    # Invoke each independent execution.  on_message buckets are force-invoked
+    # and are serialized by their exact origin session in the invocation path.
+    for invocation_key, agent_triggers in fired_by_invocation.items():
+        agent_id, _bucket = invocation_key
+        last = _last_invoke.get(invocation_key)
+        if invocation_key not in force_invoke and last and (now - last).total_seconds() < DEDUP_WINDOW:
             continue  # Skip — invoked too recently
-        _last_invoke[agent_id] = now
+        _last_invoke[invocation_key] = now
 
         # Trigger state (last_fired_at / fire_count / single-shot auto-disable /
         # legacy-webhook `_webhook_pending` clear) is updated atomically at claim
-        # time by mark_base_triggers_fired → apply_base_trigger_fired_state,
+        # time by claim_pending_trigger_executions → apply_base_trigger_fired_state,
         # BEFORE this loop runs — which is what stops a long-running trigger from
         # re-firing on the next tick. Every runtime trigger reaching this point
         # carries an `_execution_id`, so the old inline pre-update block here was
@@ -1157,8 +1519,6 @@ async def wake_agent_with_context(agent_id: uuid.UUID, message_context: str, *, 
         skip_dedup: If True, bypass the dedup window check.
         a2a_session_id: Optional A2A chat session ID to mirror the reply into.
     """
-    import time as _time
-
     now = datetime.now(timezone.utc)
 
     if from_agent_id:

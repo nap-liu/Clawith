@@ -437,15 +437,7 @@ async def wecom_event_webhook(
     # Group chat ID — present when message comes from a WeCom group
     chat_id = msg_root.findtext("ChatId", "")
 
-    # Dedup
     dedup_key = msg_id if msg_id else token
-    if dedup_key and dedup_key in _processed_wecom_events:
-        return Response(content="success", media_type="text/plain")
-    if dedup_key:
-        _processed_wecom_events.add(dedup_key)
-        if len(_processed_wecom_events) > 1000:
-            _processed_wecom_events.clear()
-
     logger.info(f"[WeCom] Message type={msg_type}, from={from_user}, msg_id={msg_id}, chat_id={chat_id or 'N/A'}")
 
     if msg_type == "text":
@@ -455,10 +447,23 @@ async def wecom_event_webhook(
 
         # Process in background task
         asyncio.create_task(
-            _process_wecom_text(agent_id, config, from_user, user_text, chat_id=chat_id)
+            _process_wecom_text(
+                agent_id,
+                config,
+                from_user,
+                user_text,
+                chat_id=chat_id,
+                provider_event_id=dedup_key or None,
+            )
         )
 
     elif msg_type == "event":
+        if dedup_key and dedup_key in _processed_wecom_events:
+            return Response(content="success", media_type="text/plain")
+        if dedup_key:
+            _processed_wecom_events.add(dedup_key)
+            if len(_processed_wecom_events) > 1000:
+                _processed_wecom_events.clear()
         event = msg_root.findtext("Event", "")
         if event == "kf_msg_or_event":
             asyncio.create_task(
@@ -546,6 +551,7 @@ async def _process_wecom_text(
     open_kfid: str = None,
     kf_msg_id: str = None,
     chat_id: str = "",
+    provider_event_id: str | None = None,
 ):
     """Process an incoming WeCom text message and reply."""
     from app.services.channel_commands import is_channel_command, handle_channel_command
@@ -632,12 +638,20 @@ async def _process_wecom_text(
                 is_group=False,  # 企微群聊暂不启用 sender wrap
             )
 
-            # 写入用户消息行(锁内,保证顺序)
-            db.add(ChatMessage(
-                agent_id=agent_id, user_id=platform_user_id,
-                role="user", content=user_text,
-                conversation_id=session_conv_id,
-            ))
+            # 写入用户消息行并在同一事务中匹配精确 on_message 订阅。
+            from app.services.chat_history import ingest_incoming_chat_message
+
+            ingested = await ingest_incoming_chat_message(
+                db,
+                session=sess,
+                agent_id=agent_id,
+                user_id=platform_user_id,
+                content=user_text,
+                source_channel="wecom",
+                provider_event_id=provider_event_id or kf_msg_id,
+                channel_config_id=config.id,
+                actor_ref=from_user,
+            )
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
 
@@ -648,6 +662,14 @@ async def _process_wecom_text(
                 agent_id, session_conv_id, content=user_text,
                 sender_name=None, user_id=platform_user_id,
             )
+
+            if ingested.consumed_by_onmessage:
+                logger.info(
+                    "[WeCom] Inbound event %s routed to %d on_message execution(s)",
+                    provider_event_id or kf_msg_id,
+                    len(ingested.execution_ids),
+                )
+                return ""
 
             wecom_agent_id = (config.extra_config or {}).get("wecom_agent_id", "")
 
@@ -697,6 +719,7 @@ async def _process_wecom_text(
                     history=history, user_id=platform_user_id,
                     session_id=session_conv_id,
                     on_thinking=_collect_thinking,
+                    turn_anchor_id=ingested.message.id,
                 )
             finally:
                 await _thinking_sender.flush()
@@ -715,6 +738,7 @@ async def _process_wecom_text(
                 _areply_session, agent_id=agent_id, user_id=platform_user_id,
                 conversation_id=session_conv_id, content=reply_text,
                 thinking="".join(_thinking_chunks) or None,
+                turn_anchor_id=ingested.message.id,
             )
             sess.last_message_at = datetime.now(timezone.utc)
             await db.commit()
