@@ -32,6 +32,10 @@ from app.models.dingtalk_provisioning import (
     DINGTALK_PROVISIONING_STATUS_FAILED,
     DINGTALK_PROVISIONING_STATUS_POLLING,
     DINGTALK_PROVISIONING_STATUS_WAITING,
+    DINGTALK_WELCOME_STATUS_FAILED,
+    DINGTALK_WELCOME_STATUS_PENDING,
+    DINGTALK_WELCOME_STATUS_SENT,
+    DINGTALK_WELCOME_STATUS_SKIPPED,
     DingTalkChannelProvisioningSession,
 )
 from app.models.identity import IdentityProvider
@@ -43,6 +47,13 @@ StreamStarter = Callable[[uuid.UUID, str, str], Awaitable[None]]
 StreamStopper = Callable[[uuid.UUID], Awaitable[None]]
 WelcomeSender = Callable[[str, str, str, str], Awaitable[dict[str, Any]]]
 DINGTALK_BINDING_WELCOME_FALLBACK_NAME = "你的数字员工"
+
+# The first send happens immediately after registration succeeds.  DingTalk's
+# automatically granted robot permission is eventually consistent, so retry
+# the completion message for a bounded period without delaying channel setup.
+# Including the initial attempt, this allows nine sends over about seven
+# minutes.  State is persisted on the provisioning row and survives restarts.
+DINGTALK_WELCOME_RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 30, 60, 120, 180)
 
 
 @dataclass(frozen=True)
@@ -304,7 +315,94 @@ def _compact_welcome_result(result: dict[str, Any]) -> dict[str, Any]:
     error = _as_string(result.get("error"))
     if error:
         compacted["error"] = error
+    error_code = _as_string(result.get("error_code"))
+    if error_code:
+        compacted["error_code"] = error_code
     return compacted
+
+
+def _is_retryable_welcome_failure(error_code: Any, error: str) -> bool:
+    """Return whether a failed welcome send is safe and useful to retry."""
+    normalized_code = _as_string(error_code).lower()
+    normalized_error = (error or "").lower()
+    if normalized_code in {"", "-1", "408", "409", "425", "429"}:
+        return True
+    try:
+        if int(normalized_code) >= 500:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return any(
+        marker in normalized_error
+        for marker in (
+            "qyapi_robot_sendmsg",
+            "accesstokenpermissiondenied",
+            "permissiondenied",
+            "permission denied",
+            "权限",
+        )
+    )
+
+
+def _next_welcome_retry_at(*, attempt_count: int, now: datetime) -> datetime | None:
+    """Return the next persisted retry deadline after ``attempt_count`` sends."""
+    delay_index = max(0, attempt_count - 1)
+    if delay_index >= len(DINGTALK_WELCOME_RETRY_DELAYS_SECONDS):
+        return None
+    return _as_utc(now) + timedelta(seconds=DINGTALK_WELCOME_RETRY_DELAYS_SECONDS[delay_index])
+
+
+def _set_registration_welcome_result(
+    session: DingTalkChannelProvisioningSession,
+    result: dict[str, Any],
+) -> None:
+    # Assign a new dict rather than mutating the JSON value in place so
+    # SQLAlchemy always persists the latest retry outcome.
+    registration_result = dict(session.registration_result or {})
+    registration_result["welcome_message"] = _compact_welcome_result(result)
+    session.registration_result = registration_result
+
+
+def _record_welcome_attempt(
+    session: DingTalkChannelProvisioningSession,
+    result: dict[str, Any] | None,
+    *,
+    now: datetime,
+) -> None:
+    """Persist one welcome attempt without changing channel configuration."""
+    base = _as_utc(now)
+    if result is None:
+        session.welcome_status = DINGTALK_WELCOME_STATUS_SKIPPED
+        session.welcome_next_retry_at = None
+        session.welcome_last_error = None
+        return
+
+    session.welcome_attempt_count += 1
+    _set_registration_welcome_result(session, result)
+    if result.get("status") == "sent":
+        session.welcome_status = DINGTALK_WELCOME_STATUS_SENT
+        session.welcome_next_retry_at = None
+        session.welcome_last_error = None
+        session.welcome_sent_at = base
+        if session.last_error and session.last_error.startswith("钉钉欢迎消息"):
+            session.last_error = None
+        return
+
+    error = _as_string(result.get("error")) or "unknown"
+    session.welcome_last_error = error
+    retryable = bool(result.get("retryable"))
+    next_retry_at = (
+        _next_welcome_retry_at(attempt_count=session.welcome_attempt_count, now=base)
+        if retryable
+        else None
+    )
+    session.welcome_next_retry_at = next_retry_at
+    if next_retry_at is None:
+        session.welcome_status = DINGTALK_WELCOME_STATUS_FAILED
+        session.last_error = f"钉钉欢迎消息发送失败，自动重试已停止: {error}"
+    else:
+        session.welcome_status = DINGTALK_WELCOME_STATUS_PENDING
+        session.last_error = f"钉钉欢迎消息发送失败，正在自动重试: {error}"
 
 
 async def _build_dingtalk_binding_welcome_message(
@@ -403,12 +501,25 @@ async def _send_dingtalk_binding_welcome_message(
         )
     except Exception as exc:
         logger.warning(f"[DingTalk Provisioning] Welcome message send failed: {exc}")
-        return {"status": "failed", "user_id": dingtalk_user_id, "error": type(exc).__name__}
+        return {
+            "status": "failed",
+            "user_id": dingtalk_user_id,
+            "error": type(exc).__name__,
+            "error_code": type(exc).__name__,
+            "retryable": True,
+        }
 
     if send_result.get("errcode") not in (0, "0"):
         error = _as_string(send_result.get("errmsg")) or str(send_result)[:200]
+        error_code = send_result.get("errcode")
         logger.warning(f"[DingTalk Provisioning] Welcome message send failed: {error}")
-        return {"status": "failed", "user_id": dingtalk_user_id, "error": error}
+        return {
+            "status": "failed",
+            "user_id": dingtalk_user_id,
+            "error": error,
+            "error_code": str(error_code) if error_code is not None else "",
+            "retryable": _is_retryable_welcome_failure(error_code, error),
+        }
 
     await _persist_welcome_message_history(
         db,
@@ -576,10 +687,7 @@ async def poll_dingtalk_provisioning_session(
             welcome_sender=welcome_sender,
             now=base,
         )
-        if welcome_result:
-            session.registration_result["welcome_message"] = _compact_welcome_result(welcome_result)
-            if welcome_result.get("status") == "failed":
-                session.last_error = f"钉钉欢迎消息发送失败: {welcome_result.get('error') or 'unknown'}"
+        _record_welcome_attempt(session, welcome_result, now=base)
         _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_CONFIGURED)
         stopper = stream_stopper or _default_stream_stopper
         for replaced_agent_id in replaced_agent_ids:
@@ -594,6 +702,88 @@ async def poll_dingtalk_provisioning_session(
         error=poll_result.get("message") or f"钉钉授权失败: {status or 'UNKNOWN'}",
     )
     return session.status
+
+
+async def retry_due_dingtalk_welcome_messages(
+    db: AsyncSession,
+    *,
+    welcome_sender: WelcomeSender | None = None,
+    now: datetime | None = None,
+    limit: int | None = None,
+) -> int:
+    """Retry due completion messages for already-configured DingTalk channels."""
+    base = _as_utc(now or _now())
+    stmt = (
+        select(DingTalkChannelProvisioningSession)
+        .where(
+            DingTalkChannelProvisioningSession.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED,
+            DingTalkChannelProvisioningSession.welcome_status == DINGTALK_WELCOME_STATUS_PENDING,
+            DingTalkChannelProvisioningSession.welcome_next_retry_at.is_not(None),
+            DingTalkChannelProvisioningSession.welcome_next_retry_at <= base,
+        )
+        .order_by(DingTalkChannelProvisioningSession.welcome_next_retry_at.asc())
+        .with_for_update(skip_locked=True)
+    )
+    if limit:
+        stmt = stmt.limit(limit)
+
+    result = await db.execute(stmt)
+    sessions = result.scalars().all()
+    for session in sessions:
+        config_result = await db.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == session.agent_id,
+                ChannelConfig.channel_type == "dingtalk",
+                ChannelConfig.is_configured.is_(True),
+            )
+        )
+        config = config_result.scalar_one_or_none()
+        expected_client_id = _as_string((session.registration_result or {}).get("client_id"))
+        if (
+            not config
+            or not config.app_id
+            or not config.app_secret
+            or (expected_client_id and config.app_id != expected_client_id)
+        ):
+            error = "钉钉通道已被删除或替换，停止补发配置完成通知"
+            session.welcome_status = DINGTALK_WELCOME_STATUS_FAILED
+            session.welcome_next_retry_at = None
+            session.welcome_last_error = error
+            session.last_error = error
+            continue
+
+        welcome_result = await _send_dingtalk_binding_welcome_message(
+            db,
+            session,
+            client_id=config.app_id,
+            client_secret=config.app_secret,
+            welcome_sender=welcome_sender,
+            now=base,
+        )
+        _record_welcome_attempt(session, welcome_result, now=base)
+        if session.welcome_status == DINGTALK_WELCOME_STATUS_SENT:
+            logger.info(
+                f"[DingTalk Provisioning] Welcome message delivered for session {session.id} "
+                f"after {session.welcome_attempt_count} attempt(s)"
+            )
+        elif session.welcome_status == DINGTALK_WELCOME_STATUS_PENDING:
+            logger.info(
+                f"[DingTalk Provisioning] Welcome retry scheduled for session {session.id} "
+                f"at {session.welcome_next_retry_at.isoformat()}"
+            )
+        elif session.welcome_status == DINGTALK_WELCOME_STATUS_SKIPPED:
+            logger.info(
+                f"[DingTalk Provisioning] Welcome retry skipped for session {session.id}: "
+                "requesting user has no active DingTalk member mapping"
+            )
+        else:
+            logger.warning(
+                f"[DingTalk Provisioning] Welcome retries exhausted for session {session.id}: "
+                f"{session.welcome_last_error}"
+            )
+
+    await db.flush()
+    return len(sessions)
 
 
 async def poll_due_dingtalk_provisioning_sessions(
@@ -665,9 +855,15 @@ class DingTalkProvisioningPoller:
                         db,
                         limit=settings.DINGTALK_PROVISIONING_POLL_BATCH_SIZE,
                     )
+                    welcome_count = await retry_due_dingtalk_welcome_messages(
+                        db,
+                        limit=settings.DINGTALK_PROVISIONING_POLL_BATCH_SIZE,
+                    )
                     await db.commit()
                     if count:
                         logger.info(f"[DingTalk Provisioning] Polled {count} session(s)")
+                    if welcome_count:
+                        logger.info(f"[DingTalk Provisioning] Retried {welcome_count} welcome message(s)")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

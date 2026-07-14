@@ -18,6 +18,9 @@ from app.models.dingtalk_provisioning import (
     DINGTALK_PROVISIONING_STATUS_FAILED,
     DINGTALK_PROVISIONING_STATUS_POLLING,
     DINGTALK_PROVISIONING_STATUS_WAITING,
+    DINGTALK_WELCOME_STATUS_FAILED,
+    DINGTALK_WELCOME_STATUS_PENDING,
+    DINGTALK_WELCOME_STATUS_SENT,
     DingTalkChannelProvisioningSession,
 )
 from app.models.identity import IdentityProvider
@@ -27,9 +30,11 @@ from app.models.participant import Participant
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services.dingtalk_provisioning import (
+    DINGTALK_WELCOME_RETRY_DELAYS_SECONDS,
     _bounded_polling_window,
     poll_dingtalk_provisioning_session,
     poll_due_dingtalk_provisioning_sessions,
+    retry_due_dingtalk_welcome_messages,
     start_dingtalk_channel_provisioning,
 )
 
@@ -414,6 +419,11 @@ async def test_poll_success_sends_welcome_message_to_bound_dingtalk_user(db_sess
     )
 
     assert session.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    assert session.welcome_status == DINGTALK_WELCOME_STATUS_SENT
+    assert session.welcome_attempt_count == 1
+    assert session.welcome_next_retry_at is None
+    assert session.welcome_last_error is None
+    assert session.welcome_sent_at == now
     assert sent_messages == [
         (
             "ding-client-id",
@@ -452,6 +462,187 @@ async def test_poll_success_sends_welcome_message_to_bound_dingtalk_user(db_sess
     ).scalar_one()
     assert chat_message.role == "assistant"
     assert chat_message.content == "你好，我是销售数字员工。钉钉通道已配置完成，之后可以直接在这里和我对话。"
+
+
+@pytest.mark.asyncio
+async def test_poll_success_retries_welcome_after_permission_propagates(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    provider = IdentityProvider(
+        id=uuid.uuid4(),
+        tenant_id=agent.tenant_id,
+        provider_type="dingtalk",
+        name="DingTalk",
+        is_active=True,
+    )
+    member = OrgMember(
+        id=uuid.uuid4(),
+        tenant_id=agent.tenant_id,
+        provider_id=provider.id,
+        user_id=user.id,
+        external_id="632277911",
+        name="刘喜",
+        status="active",
+    )
+    provisioning = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="device-permission-race",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(minutes=5),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=10,
+    )
+    db_session.add_all([provider, member, provisioning])
+    await db_session.flush()
+    fake_client = FakeRegistrationClient(
+        poll_responses=[
+            {
+                "status": "SUCCESS",
+                "client_id": "ding-client-id",
+                "client_secret": "ding-client-secret",
+            }
+        ]
+    )
+    send_attempts = []
+
+    async def permission_race_sender(app_id, app_secret, user_id, message):
+        send_attempts.append((app_id, user_id, message))
+        if len(send_attempts) == 1:
+            return {
+                "errcode": 403,
+                "errmsg": (
+                    "Forbidden.AccessDenied.AccessTokenPermissionDenied: "
+                    "应用尚未开通所需的权限：[qyapi_robot_sendmsg]"
+                ),
+            }
+        return {"errcode": 0, "processQueryKey": "retry-process-key"}
+
+    async def fake_stream_starter(agent_id, app_key, app_secret):
+        return None
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        provisioning,
+        registration_client=fake_client,
+        stream_starter=fake_stream_starter,
+        welcome_sender=permission_race_sender,
+        now=now,
+    )
+
+    assert provisioning.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    assert provisioning.welcome_status == DINGTALK_WELCOME_STATUS_PENDING
+    assert provisioning.welcome_attempt_count == 1
+    assert provisioning.welcome_next_retry_at == now + timedelta(seconds=2)
+    assert "正在自动重试" in provisioning.last_error
+
+    # A connector tick before the persisted deadline must not send early.
+    count = await retry_due_dingtalk_welcome_messages(
+        db_session,
+        welcome_sender=permission_race_sender,
+        now=now + timedelta(seconds=1),
+    )
+    assert count == 0
+    assert len(send_attempts) == 1
+
+    count = await retry_due_dingtalk_welcome_messages(
+        db_session,
+        welcome_sender=permission_race_sender,
+        now=now + timedelta(seconds=2),
+    )
+    assert count == 1
+    assert len(send_attempts) == 2
+    assert provisioning.welcome_status == DINGTALK_WELCOME_STATUS_SENT
+    assert provisioning.welcome_attempt_count == 2
+    assert provisioning.welcome_next_retry_at is None
+    assert provisioning.welcome_last_error is None
+    assert provisioning.welcome_sent_at == now + timedelta(seconds=2)
+    assert provisioning.last_error is None
+    assert provisioning.registration_result["welcome_message"] == {
+        "status": "sent",
+        "user_id": "632277911",
+        "process_query_key": "retry-process-key",
+    }
+
+    messages = (
+        await db_session.execute(
+            select(ChatMessage).where(ChatMessage.agent_id == agent.id, ChatMessage.role == "assistant")
+        )
+    ).scalars().all()
+    assert [message.content for message in messages] == [
+        "你好，我是销售数字员工。钉钉通道已配置完成，之后可以直接在这里和我对话。"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_welcome_retry_is_bounded_and_does_not_reconfigure_channel(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    provider = IdentityProvider(
+        id=uuid.uuid4(),
+        tenant_id=agent.tenant_id,
+        provider_type="dingtalk",
+        name="DingTalk",
+        is_active=True,
+    )
+    member = OrgMember(
+        id=uuid.uuid4(),
+        tenant_id=agent.tenant_id,
+        provider_id=provider.id,
+        user_id=user.id,
+        external_id="632277911",
+        name="刘喜",
+        status="active",
+    )
+    provisioning = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_CONFIGURED,
+        device_code="device-bounded-retry",
+        authorization_url="https://auth.example",
+        registration_result={"client_id": "ding-client-id"},
+        expires_at=now + timedelta(minutes=5),
+        poll_interval_seconds=2,
+        max_poll_attempts=10,
+        welcome_status=DINGTALK_WELCOME_STATUS_PENDING,
+        welcome_attempt_count=len(DINGTALK_WELCOME_RETRY_DELAYS_SECONDS),
+        welcome_next_retry_at=now,
+    )
+    channel = ChannelConfig(
+        agent_id=agent.id,
+        channel_type="dingtalk",
+        app_id="ding-client-id",
+        app_secret="ding-client-secret",
+        is_configured=True,
+        extra_config={"connection_mode": "websocket"},
+    )
+    db_session.add_all([provider, member, provisioning, channel])
+    await db_session.flush()
+
+    async def always_permission_denied(app_id, app_secret, user_id, message):
+        return {
+            "errcode": 403,
+            "errmsg": "AccessTokenPermissionDenied: qyapi_robot_sendmsg",
+        }
+
+    count = await retry_due_dingtalk_welcome_messages(
+        db_session,
+        welcome_sender=always_permission_denied,
+        now=now,
+    )
+
+    assert count == 1
+    assert provisioning.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    assert provisioning.welcome_status == DINGTALK_WELCOME_STATUS_FAILED
+    assert provisioning.welcome_attempt_count == len(DINGTALK_WELCOME_RETRY_DELAYS_SECONDS) + 1
+    assert provisioning.welcome_next_retry_at is None
+    assert "自动重试已停止" in provisioning.last_error
+    assert channel.is_configured is True
+    assert channel.app_id == "ding-client-id"
 
 
 @pytest.mark.asyncio
