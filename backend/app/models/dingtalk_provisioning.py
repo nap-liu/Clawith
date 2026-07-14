@@ -17,6 +17,11 @@ DINGTALK_PROVISIONING_STATUS_FAILED = "failed"
 DINGTALK_PROVISIONING_STATUS_EXPIRED = "expired"
 DINGTALK_PROVISIONING_STATUS_CANCELLED = "cancelled"
 
+DINGTALK_WELCOME_STATUS_PENDING = "pending"
+DINGTALK_WELCOME_STATUS_SENT = "sent"
+DINGTALK_WELCOME_STATUS_FAILED = "failed"
+DINGTALK_WELCOME_STATUS_SKIPPED = "skipped"
+
 DINGTALK_PROVISIONING_ACTIVE_STATUSES = (
     DINGTALK_PROVISIONING_STATUS_WAITING,
     DINGTALK_PROVISIONING_STATUS_POLLING,
@@ -39,6 +44,11 @@ class DingTalkChannelProvisioningSession(Base):
             "status",
             "next_poll_at",
             "expires_at",
+        ),
+        Index(
+            "ix_dingtalk_welcome_retry_due",
+            "welcome_status",
+            "welcome_next_retry_at",
         ),
     )
 
@@ -75,6 +85,16 @@ class DingTalkChannelProvisioningSession(Base):
     poll_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     max_poll_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=180)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # The robot credentials can be ready a few moments before DingTalk's
+    # automatically granted send-message permission has propagated.  Keep the
+    # completion-message retry state separate from the provisioning state so a
+    # transient notification failure never rolls back a configured channel.
+    welcome_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    welcome_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    welcome_next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    welcome_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    welcome_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
