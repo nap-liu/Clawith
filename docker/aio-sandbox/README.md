@@ -56,6 +56,31 @@ kept retrying with guessed arguments. Patched to append `: {e}` to the 500
 the LLM, which can then self-correct). The only change vs upstream is that one
 f-string.
 
+### 5. `/v1/shell` timeout enforcement and session cleanup (`shell.py`, `bash.py`)
+
+The bundled OpenHands `BashSession` reported `hard_timeout` without signalling
+the command. The foreground process kept running, the next command hit the same
+busy tmux pane, and deleting the session only killed tmux while signal-resistant
+children survived as PID 1 orphans.
+
+The patched `/v1/shell` keeps the existing single `timeout` request field and
+treats it as the actual command deadline instead of merely an HTTP polling
+window. The overlay uses Linux terminal job-control metadata (`tpgid`) to terminate
+only the current foreground process group with `SIGINT` → `SIGTERM` → `SIGKILL`,
+waits until bash regains the pane, and then returns `hard_timeout`. Existing
+shell state and previously launched background jobs are preserved. Explicit
+session close remains destructive by design and additionally reaps every
+process still attached to the pane shell's Linux process session.
+
+The Dockerfile verifies the upstream `bash.py` SHA256 before copying the patch,
+so an upstream image change cannot silently apply this overlay to incompatible
+code.
+
+`MAX_SHELL_SESSIONS` remains an explicit deployment setting (Compose default:
+10). For a higher-capacity production host, validate a synthetic ceiling on
+that same host and configure no more than 80% of the last fully stable level;
+for a business target of 100, the 125-session gate must pass first.
+
 ## Build
 
 ### Local (Mac / development):

@@ -40,6 +40,10 @@ services:
     container_name: clawith-aio-sandbox
     restart: unless-stopped
     shm_size: 2gb
+    environment:
+      # Keep the conservative image default unless production explicitly
+      # raises it after same-host capacity validation.
+      MAX_SHELL_SESSIONS: ${MAX_SHELL_SESSIONS:-10}
     security_opt:
       - seccomp:unconfined
     volumes:

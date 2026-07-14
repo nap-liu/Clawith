@@ -127,6 +127,63 @@ async def test_shell_env_vars_persist_across_calls(backend, agent_id):
     )
 
 
+async def test_shell_timeout_kills_tree_without_poisoning_stateful_session(
+    backend, agent_id
+):
+    """The existing timeout is a process deadline, not just an HTTP deadline."""
+    token = uuid.uuid4().hex[:8]
+    bg_pidfile = f"/tmp/clawith-timeout-bg-{token}.pid"
+    fg_pidfile = f"/tmp/clawith-timeout-fg-{token}.pid"
+    session_id = f"clawith-{agent_id}"
+    try:
+        setup = await backend.execute(
+            code=(
+                "export AIOSB_TIMEOUT_MARKER=preserved; "
+                f"nohup sleep 120 >/tmp/clawith-timeout-bg-{token}.log 2>&1 & "
+                f"echo $! > {bg_pidfile}"
+            ),
+            language="bash",
+            timeout=10,
+            work_dir="/data/agents",
+            agent_id=agent_id,
+        )
+        assert setup.success is True
+
+        timed_out = await backend.execute(
+            code=(
+                "bash -c 'trap \"\" HUP INT TERM; "
+                f"echo $$ > {fg_pidfile}; while :; do sleep 1; done'"
+            ),
+            language="bash",
+            timeout=1,
+            work_dir="/data/agents",
+            agent_id=agent_id,
+        )
+        assert timed_out.success is False
+        assert timed_out.exit_code == 124
+        assert "timed out after 1s" in (timed_out.error or "")
+
+        follow = await backend.execute(
+            code=(
+                f"if kill -0 $(cat {fg_pidfile}) 2>/dev/null; then exit 97; fi; "
+                f"kill -0 $(cat {bg_pidfile}); "
+                'printf "marker=%s followup-ok" "$AIOSB_TIMEOUT_MARKER"'
+            ),
+            language="bash",
+            timeout=10,
+            work_dir="/data/agents",
+            agent_id=agent_id,
+        )
+        assert follow.success is True
+        assert "marker=preserved followup-ok" in follow.stdout
+    finally:
+        async with httpx.AsyncClient() as client:
+            await client.delete(
+                f"{os.environ['SANDBOX_API_URL']}/v1/shell/sessions/{session_id}",
+                timeout=10.0,
+            )
+
+
 async def test_two_agents_have_isolated_shell_sessions(backend):
     a1 = f"agentA-{uuid.uuid4().hex[:8]}"
     a2 = f"agentB-{uuid.uuid4().hex[:8]}"
