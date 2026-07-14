@@ -365,6 +365,7 @@ export default function H5AgentChat() {
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const uploadAbortRef = useRef<Map<string, () => void>>(new Map());
+    const skipNextConnectedHistoryRef = useRef<string | null>(null);
 
     useEffect(() => {
         document.body.classList.add('h5-chat-active');
@@ -536,16 +537,37 @@ export default function H5AgentChat() {
     }, [agentId, token]);
 
     const loadHistory = useCallback(async (nextSessionId: string) => {
-        if (!agentId) return;
+        if (!agentId || !token) return false;
+        const pages: any[][] = [];
+        let fullyLoaded = true;
         try {
-            const rows = await chatSessionApi.messages(agentId, nextSessionId, 200);
-            if (sessionIdRef.current !== nextSessionId) return;
-            const history = rows.map(normalizeHistoryMessage).filter(Boolean) as H5ChatMessage[];
-            setMessages((prev) => mergeHistoryMessages(prev, history));
+            let before = '';
+            while (sessionIdRef.current === nextSessionId) {
+                const params = new URLSearchParams({ limit: '500' });
+                if (before) params.set('before', before);
+                const response = await fetch(`/api/agents/${agentId}/sessions/${nextSessionId}/messages?${params}`, {
+                    headers: { Authorization: `Bearer ${token}` },
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const rows = await response.json();
+                if (!Array.isArray(rows) || rows.length === 0) break;
+                pages.push(rows);
+                const nextBefore = rows[0]?.created_at || '';
+                if (!nextBefore || nextBefore === before) break;
+                before = nextBefore;
+            }
         } catch {
-            // History is nice-to-have for H5 reconnects; live chat can continue.
+            fullyLoaded = false;
         }
-    }, [agentId, normalizeHistoryMessage]);
+        if (sessionIdRef.current !== nextSessionId) return false;
+        const normalized = pages.reverse().flat().map(normalizeHistoryMessage).filter(Boolean) as H5ChatMessage[];
+        const seenToolCalls = new Set<string>();
+        const history = normalized.reverse().filter((msg) => (
+            !msg.toolCallId || (!seenToolCalls.has(msg.toolCallId) && !!seenToolCalls.add(msg.toolCallId))
+        )).reverse();
+        setMessages((prev) => mergeHistoryMessages(prev, history));
+        return fullyLoaded;
+    }, [agentId, normalizeHistoryMessage, token]);
 
     const loadSessions = useCallback(async () => {
         if (!agentId) return;
@@ -584,7 +606,11 @@ export default function H5AgentChat() {
             sessionIdRef.current = nextSessionId;
             setSessionId(nextSessionId);
             window.history.replaceState({}, '', writeChatSessionIdToHref(window.location.href, nextSessionId));
-            loadHistory(nextSessionId);
+            if (skipNextConnectedHistoryRef.current === nextSessionId) {
+                skipNextConnectedHistoryRef.current = null;
+            } else {
+                loadHistory(nextSessionId);
+            }
             return;
         }
 
@@ -750,7 +776,7 @@ export default function H5AgentChat() {
 
         manualCloseRef.current = true;
         wsRef.current?.close();
-        await loadHistory(nextSessionId);
+        if (await loadHistory(nextSessionId)) skipNextConnectedHistoryRef.current = nextSessionId;
         window.setTimeout(() => {
             manualCloseRef.current = false;
             openSocket(nextSessionId);

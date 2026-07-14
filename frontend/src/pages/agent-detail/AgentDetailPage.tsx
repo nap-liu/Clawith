@@ -2197,7 +2197,7 @@ export default function AgentDetailPage() {
     const [historyOldestTs, setHistoryOldestTs] = useState<string | null>(null);
     const [historyHasMore, setHistoryHasMore] = useState(true);
     const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
-    const HISTORY_PAGE_SIZE = 20;
+    const HISTORY_PAGE_SIZE = 500;
     const [sessionsLoading, setSessionsLoading] = useState(false);
     const [allSessionsLoading, setAllSessionsLoading] = useState(false);
     const [agentExpired, setAgentExpired] = useState(false);
@@ -2446,6 +2446,7 @@ export default function AgentDetailPage() {
         setHistoryOldestTs(null);
         setHistoryHasMore(true);
         setHistoryLoadingMore(false);
+        historyAutoLoadCursorRef.current = null;
         setIsStreaming(runtimeState.isStreaming);
         setIsWaiting(runtimeState.isWaiting);
         setIsStopping(runtimeState.isStopping);
@@ -2486,7 +2487,7 @@ export default function AgentDetailPage() {
                 ...(m.sender_user_id && { sender_user_id: m.sender_user_id }),
                 ...(m.participant_id && { participant_id: m.participant_id }),
             }));
-            setHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
+            setHistoryHasMore(msgs.length > 0);
             // Backend returns the page oldest-first, so msgs[0] is the oldest
             // loaded row — seed the cursor for the next (older) page.
             setHistoryOldestTs(msgs.length ? msgs[0].created_at : null);
@@ -3641,6 +3642,7 @@ export default function AgentDetailPage() {
     const [chatScrollBtnBottom, setChatScrollBtnBottom] = useState(96);
     // Read-only history scroll-to-bottom
     const historyContainerRef = useRef<HTMLDivElement>(null);
+    const historyAutoLoadCursorRef = useRef<string | null>(null);
     const [showHistoryScrollBtn, setShowHistoryScrollBtn] = useState(false);
     const scheduleComposerFocus = useCallback(() => {
         let attempts = 0;
@@ -3713,6 +3715,8 @@ export default function AgentDetailPage() {
         if (!historyOldestTs) { setHistoryHasMore(false); return; }
         const sess = activeSession;
         const targetAgentId = id;
+        const loadSeq = sessionLoadSeqRef.current;
+        const writable = isWritableSession(sess);
         setHistoryLoadingMore(true);
         try {
             const tkn = localStorage.getItem('token');
@@ -3721,6 +3725,8 @@ export default function AgentDetailPage() {
             });
             if (!res.ok) return;
             const msgs = await res.json();
+            if (loadSeq !== sessionLoadSeqRef.current || currentAgentIdRef.current !== targetAgentId
+                || String(activeSessionIdRef.current) !== String(sess.id)) return;
             if (msgs.length === 0) {
                 setHistoryHasMore(false);
                 return;
@@ -3734,25 +3740,42 @@ export default function AgentDetailPage() {
                 ...(m.id && { id: m.id }),
             }));
             // Save current scroll position
-            const el = historyContainerRef.current;
+            const el = writable ? chatContainerRef.current : historyContainerRef.current;
             const oldScrollHeight = el?.scrollHeight ?? 0;
-            setHistoryMsgs(prev => [...preParsed, ...prev]);
+            const oldScrollTop = el?.scrollTop ?? 0;
+            const prependPage = (prev: any[]) => {
+                const newerToolCalls = new Set(prev.map(m => m.toolCallId).filter(Boolean));
+                return [...preParsed.filter((m: any) => !m.toolCallId || !newerToolCalls.has(m.toolCallId)), ...prev];
+            };
+            if (writable) setChatMessages(prependPage);
+            else setHistoryMsgs(prependPage);
             // Advance the cursor to the oldest row of this (older) page.
-            setHistoryOldestTs(msgs[0]?.created_at ?? historyOldestTs);
-            setHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
+            const nextOldestTs = msgs[0]?.created_at ?? null;
+            setHistoryOldestTs(nextOldestTs);
+            setHistoryHasMore(Boolean(nextOldestTs && nextOldestTs !== historyOldestTs));
             // Restore scroll position after new messages are prepended
             requestAnimationFrame(() => {
                 if (el) {
                     const newScrollHeight = el.scrollHeight;
-                    el.scrollTop = newScrollHeight - oldScrollHeight;
+                    el.scrollTop = oldScrollTop + newScrollHeight - oldScrollHeight;
                 }
             });
         } catch (err: any) {
             console.error('Failed to load more history messages:', err);
         } finally {
-            setHistoryLoadingMore(false);
+            if (loadSeq === sessionLoadSeqRef.current) setHistoryLoadingMore(false);
         }
     }, [historyLoadingMore, historyHasMore, activeSession, id, historyOldestTs]);
+
+    useEffect(() => {
+        if (!activeSession || historyLoadingMore || !historyHasMore || !historyOldestTs) return;
+        const el = isWritableSession(activeSession) ? chatContainerRef.current : historyContainerRef.current;
+        if (el && el.clientHeight > 0 && el.scrollHeight <= el.clientHeight + 1
+            && historyAutoLoadCursorRef.current !== historyOldestTs) {
+            historyAutoLoadCursorRef.current = historyOldestTs;
+            loadMoreHistoryMessages();
+        }
+    }, [activeSession?.id, chatMessages.length, historyMsgs.length, historyLoadingMore, historyHasMore, historyOldestTs, loadMoreHistoryMessages]);
 
     const handleHistoryScroll = () => {
         const el = historyContainerRef.current;
@@ -4160,6 +4183,9 @@ export default function AgentDetailPage() {
             cancelLiveAutoFollow();
         }
         setShowScrollBtn(distFromBottom > 200);
+        if (el.scrollTop < 100 && historyHasMore && !historyLoadingMore) {
+            loadMoreHistoryMessages();
+        }
     };
     const handleChatWheelCapture = (event: React.WheelEvent<HTMLDivElement>) => {
         const el = chatContainerRef.current;
