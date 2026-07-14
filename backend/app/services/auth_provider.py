@@ -805,7 +805,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
                 data=data,
             )
             if resp.status_code != 200:
-                logger.error(f"OAuth2 token exchange failed (HTTP {resp.status_code}): {resp.text}")
+                logger.error("OAuth2 token exchange failed (HTTP {})", resp.status_code)
                 return {}
             return resp.json()
 

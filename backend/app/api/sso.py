@@ -11,6 +11,7 @@ from app.database import get_db
 from loguru import logger
 from app.models.identity import SSOScanSession, IdentityProvider
 from app.schemas.schemas import TokenResponse, UserOut
+from app.services.oauth_login import OAuthCodeLoginError, exchange_oauth_code_for_user
 
 router = APIRouter(tags=["sso"])
 
@@ -200,45 +201,23 @@ async def oauth2_callback(
 
     # 3. 换 token → 获取用户信息 → 查找/创建用户
     try:
-        token_data = await auth_provider.exchange_code_for_token(code)
-        if not token_data:
-            raise Exception("Empty response from token exchange")
-        access_token = token_data.get("access_token")
-        if not access_token:
-            logger.error(f"OAuth2 token exchange failed: {token_data}")
-            return HTMLResponse("Auth failed: Token exchange error")
-
-        # Try userinfo endpoint first; fallback to token_data if it fails (returns 401 for new users)
-        try:
-            user_info = await auth_provider.get_user_info(access_token)
-        except Exception as e:
-            logger.warning(f"OAuth2 userinfo failed, trying token_data fallback: {e}")
-            logger.info(f"token_data keys: {list(token_data.keys()) if token_data else 'empty'}")
-            # token response 包含 openid，可以用 openid 作为 provider_user_id 创建用户
-            if any(k in str(token_data) for k in ["userId", "userName", "userCode", "mobile", "userInfo", "openid"]):
-                try:
-                    user_info = await auth_provider.get_user_info_from_token_data(token_data)
-                    logger.info(f"token_data fallback succeeded: user_id={user_info.provider_user_id}")
-                except Exception as fallback_e:
-                    logger.error(f"token_data fallback also failed: {fallback_e}, token_data={token_data}")
-                    raise
-            else:
-                logger.error(f"token_data has no user fields: {token_data}")
-                raise
-
-        if not user_info.provider_user_id:
-            logger.error(f"OAuth2 user info missing userId: {user_info.raw_data}")
-            return HTMLResponse("Auth failed: No user ID returned")
-
-        user, is_new = await auth_provider.find_or_create_user(
-            db, user_info, tenant_id=str(tenant_id) if tenant_id else None
+        login_result = await exchange_oauth_code_for_user(
+            db,
+            auth_provider,
+            code,
+            tenant_id=str(tenant_id) if tenant_id else None,
         )
-        if not user:
-            return HTMLResponse("Auth failed: User resolution failed")
-
+        user = login_result.user
+    except OAuthCodeLoginError as e:
+        logger.warning(
+            "OAuth2 login rejected: reason={} status_code={}",
+            e.reason,
+            e.status_code,
+        )
+        return HTMLResponse(f"Auth failed: {e.public_message}")
     except Exception as e:
-        logger.error(f"OAuth2 login error: {e}")
-        return HTMLResponse(f"Auth failed: {str(e)}")
+        logger.error("OAuth2 login error: error_type={}", type(e).__name__)
+        return HTMLResponse("Auth failed: OAuth authentication failed")
 
     # 4. 生成 JWT，更新 SSO session
     token = create_access_token(str(user.id), user.role)
@@ -264,4 +243,3 @@ async def oauth2_callback(
             logger.exception("Failed to update SSO session (oauth2) %s", e)
 
     return HTMLResponse(f"Logged in successfully.")
-

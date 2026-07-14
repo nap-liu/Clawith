@@ -12,6 +12,7 @@ from app.models.identity import IdentityProvider
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.auth_provider import OAuth2AuthProvider
+from app.services.auth_registry import auth_provider_registry
 
 pytestmark = pytest.mark.asyncio
 
@@ -19,10 +20,12 @@ pytestmark = pytest.mark.asyncio
 @pytest.fixture(autouse=True)
 async def _isolate():
     await engine.dispose()
+    auth_provider_registry.clear_all_cache()
     async with async_session() as db:
         await db.execute(delete(IdentityProvider))
         await db.commit()
     yield
+    auth_provider_registry.clear_all_cache()
     async with async_session() as db:
         await db.execute(delete(IdentityProvider))
         await db.commit()
@@ -101,7 +104,7 @@ async def test_oauth2_token_exchange_can_omit_redirect_uri(monkeypatch):
     ]
 
 
-async def test_auth_code_exchange_uses_provider_key_and_returns_platform_token(monkeypatch):
+async def test_h5_and_regular_sso_share_code_only_token_exchange(monkeypatch):
     async with async_session() as db:
         db.add(
             IdentityProvider(
@@ -129,15 +132,13 @@ async def test_auth_code_exchange_uses_provider_key_and_returns_platform_token(m
         )
         await db.commit()
 
+    captured_token_forms: list[dict[str, str]] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if url == "https://oauth.example.com/token":
             form = dict(httpx.QueryParams(request.content.decode()))
-            assert form["code"] == "CODE-H5"
-            assert form["redirect_uri"] == (
-                "https://app.example.com/h5/agents/a1/chat"
-                "?channel=wechat_miniprogram&provider=oauth-h5"
-            )
+            captured_token_forms.append(form)
             return httpx.Response(200, json={"access_token": "AT-H5", "token_type": "Bearer"})
         if url == "https://oauth.example.com/userinfo":
             return httpx.Response(
@@ -175,6 +176,10 @@ async def test_auth_code_exchange_uses_provider_key_and_returns_platform_token(m
                 "context": {"agent_id": "a1"},
             },
         )
+        sso_resp = await client.get(
+            "/api/auth/oauth2/callback",
+            params={"code": "CODE-SSO"},
+        )
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -182,6 +187,12 @@ async def test_auth_code_exchange_uses_provider_key_and_returns_platform_token(m
     assert body["token_type"] == "bearer"
     assert body["user"]["display_name"] == "H5 User"
     assert body["needs_company_setup"] is True
+    assert sso_resp.status_code == 200
+    assert "Logged in successfully" in sso_resp.text
+    assert captured_token_forms == [
+        {"grant_type": "authorization_code", "code": "CODE-H5"},
+        {"grant_type": "authorization_code", "code": "CODE-SSO"},
+    ]
 
     async with async_session() as db:
         user = (
@@ -190,6 +201,102 @@ async def test_auth_code_exchange_uses_provider_key_and_returns_platform_token(m
             )
         ).scalar_one()
         assert user.registration_source == "oauth2"
+
+
+async def test_auth_code_exchange_returns_safe_provider_rejection(monkeypatch):
+    async with async_session() as db:
+        db.add(
+            IdentityProvider(
+                provider_type="oauth2",
+                name="H5 OAuth",
+                is_active=True,
+                sso_login_enabled=True,
+                config={
+                    "provider_key": "oauth-h5",
+                    "app_id": "h5-client",
+                    "app_secret": "h5-secret",
+                    "token_url": "https://oauth.example.com/token",
+                    "user_info_url": "https://oauth.example.com/userinfo",
+                    "allowed_purposes": ["h5_agent_chat"],
+                    "allowed_redirect_hosts": ["app.example.com"],
+                    "allowed_redirect_paths": ["/h5/agents/*/chat"],
+                },
+            )
+        )
+        await db.commit()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://oauth.example.com/token"
+        form = dict(httpx.QueryParams(request.content.decode()))
+        assert form == {"grant_type": "authorization_code", "code": "SECRET-CODE"}
+        return httpx.Response(200, json={"status": -1024, "msg": "invalid code: SECRET-CODE"})
+
+    class _PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    _RealAsyncClient = httpx.AsyncClient
+    monkeypatch.setattr("app.services.auth_provider.httpx.AsyncClient", _PatchedAsyncClient)
+
+    transport = httpx.ASGITransport(app=app)
+    async with _RealAsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/auth/code/exchange",
+            json={
+                "provider": "oauth-h5",
+                "code": "SECRET-CODE",
+                "purpose": "h5_agent_chat",
+                "channel": "wechat_miniprogram",
+                "redirect_uri": "https://app.example.com/h5/agents/a1/chat",
+            },
+        )
+
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "OAuth provider rejected the authorization code"}
+    assert "SECRET-CODE" not in resp.text
+
+
+async def test_auth_code_exchange_validates_redirect_locally_before_token_exchange(monkeypatch):
+    async with async_session() as db:
+        db.add(
+            IdentityProvider(
+                provider_type="oauth2",
+                name="H5 OAuth",
+                is_active=True,
+                sso_login_enabled=True,
+                config={
+                    "provider_key": "oauth-h5",
+                    "app_id": "h5-client",
+                    "app_secret": "h5-secret",
+                    "token_url": "https://oauth.example.com/token",
+                    "allowed_purposes": ["h5_agent_chat"],
+                    "allowed_redirect_hosts": ["app.example.com"],
+                    "allowed_redirect_paths": ["/h5/agents/*/chat"],
+                },
+            )
+        )
+        await db.commit()
+
+    async def fail_if_exchanged(*args, **kwargs):
+        pytest.fail("redirect_uri must be rejected before the provider token request")
+
+    monkeypatch.setattr(OAuth2AuthProvider, "exchange_code_for_token", fail_if_exchanged)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            "/api/auth/code/exchange",
+            json={
+                "provider": "oauth-h5",
+                "code": "CODE-H5",
+                "purpose": "h5_agent_chat",
+                "channel": "wechat_miniprogram",
+                "redirect_uri": "https://evil.example.com/h5/agents/a1/chat",
+            },
+        )
+
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "redirect_uri host not allowed"}
 
 
 async def test_auth_code_exchange_filters_provider_type_by_purpose(monkeypatch):
@@ -270,6 +377,10 @@ async def test_auth_code_exchange_filters_provider_type_by_purpose(monkeypatch):
 
 async def test_auth_code_exchange_binds_user_to_provider_tenant(monkeypatch):
     tenant_id = uuid.uuid4()
+    user_suffix = uuid.uuid4().hex[:8]
+    provider_user_id = f"tenant-user-{user_suffix}"
+    display_name = f"Tenant User {user_suffix}"
+    email = f"tenant-user-{user_suffix}@example.com"
     async with async_session() as db:
         db.add(Tenant(id=tenant_id, name="H5 Company", slug=f"h5-{uuid.uuid4().hex[:8]}"))
         db.add(
@@ -300,7 +411,7 @@ async def test_auth_code_exchange_binds_user_to_provider_tenant(monkeypatch):
         if str(request.url) == "https://oauth.example.com/userinfo":
             return httpx.Response(
                 200,
-                json={"userId": "tenant-user-1", "userName": "Tenant User", "email": "tenant-user@example.com"},
+                json={"userId": provider_user_id, "userName": display_name, "email": email},
             )
         return httpx.Response(404, json={})
 
@@ -333,7 +444,7 @@ async def test_auth_code_exchange_binds_user_to_provider_tenant(monkeypatch):
     async with async_session() as db:
         user = (
             await db.execute(
-                select(User).join(User.identity).where(User.display_name == "Tenant User")
+                select(User).join(User.identity).where(User.display_name == display_name)
             )
         ).scalar_one()
         assert user.tenant_id == tenant_id

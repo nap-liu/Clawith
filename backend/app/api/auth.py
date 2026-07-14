@@ -995,6 +995,7 @@ async def exchange_auth_code(
         resolve_platform_login_provider,
         validate_platform_login_channel,
     )
+    from app.services.oauth_login import OAuthCodeLoginError, exchange_oauth_code_for_user
 
     validate_platform_login_channel(data.channel)
     auth_provider = await resolve_platform_login_provider(
@@ -1005,29 +1006,24 @@ async def exchange_auth_code(
     )
 
     try:
-        token_data = await auth_provider.exchange_code_for_token(data.code, data.redirect_uri)
-        access_token = token_data.get("access_token")
-        if not access_token:
-            raise HTTPException(status_code=400, detail="Failed to get access token from provider")
-
-        user_info = await auth_provider.get_user_info(access_token)
-        if not user_info.provider_user_id:
-            raise HTTPException(status_code=502, detail="userinfo response missing user ID field")
-
         provider_tenant_id = getattr(getattr(auth_provider, "provider", None), "tenant_id", None)
-        user, _ = await auth_provider.find_or_create_user(
+        login_result = await exchange_oauth_code_for_user(
             db,
-            user_info,
+            auth_provider,
+            data.code,
             tenant_id=str(provider_tenant_id) if provider_tenant_id else None,
         )
-        if not user:
-            raise HTTPException(status_code=500, detail="Failed to create user")
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="Account is disabled")
+        user = login_result.user
+    except OAuthCodeLoginError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.public_message) from e
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Auth code exchange failed for provider={data.provider}: {e}")
+        logger.error(
+            "Auth code exchange failed: provider={} error_type={}",
+            data.provider,
+            type(e).__name__,
+        )
         raise HTTPException(status_code=500, detail="OAuth authentication failed")
 
     jwt_token = create_access_token(str(user.id), user.role)
