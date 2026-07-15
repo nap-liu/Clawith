@@ -6,7 +6,6 @@ import pytest
 from sqlalchemy import func, select
 
 from app.services.channel_user_service import ChannelUserService
-from app.services.channel_user_service import ChannelUserResolutionError
 from app.services.channel_user_service import get_platform_user_by_org_member
 from app.database import async_session, engine
 from app.models.identity import IdentityProvider
@@ -149,9 +148,9 @@ async def test_channel_user_service_uses_feishu_open_id_for_existing_member_look
     service = ChannelUserService()
     db = AsyncMock()
     expected_member = SimpleNamespace(id="member-1")
-    db.execute = AsyncMock(
-        return_value=Mock(scalar_one_or_none=Mock(return_value=expected_member))
-    )
+    result = Mock()
+    result.scalars.return_value.all.return_value = [expected_member]
+    db.execute = AsyncMock(return_value=result)
 
     member = await service._find_org_member(
         db,
@@ -166,23 +165,33 @@ async def test_channel_user_service_uses_feishu_open_id_for_existing_member_look
 
 
 @pytest.mark.asyncio
-async def test_channel_user_service_rejects_feishu_open_id_only_lazy_registration():
+async def test_channel_user_service_accepts_scoped_feishu_open_id_binding():
     service = ChannelUserService()
     db = AsyncMock()
     db.get.return_value = None
-    agent = SimpleNamespace(tenant_id="tenant-1")
+    agent = SimpleNamespace(id="agent-1", tenant_id="tenant-1")
 
-    service._ensure_provider = AsyncMock(return_value=SimpleNamespace(id="provider-1"))
+    provider = SimpleNamespace(
+        id="provider-1", tenant_id="tenant-1", config={}, provider_type="feishu"
+    )
+    created_user = SimpleNamespace(id="user-1")
+    service._ensure_provider = AsyncMock(return_value=provider)
+    service._find_bound_user = AsyncMock(return_value=None)
     service._find_org_member = AsyncMock(return_value=None)
+    service._create_channel_user = AsyncMock(return_value=created_user)
+    service._ensure_bindings = AsyncMock(return_value=(created_user, True))
+    service._create_org_member_shell = AsyncMock()
 
-    with pytest.raises(ChannelUserResolutionError):
-        await service.resolve_channel_user(
-            db=db,
-            agent=agent,
-            channel_type="feishu",
-            external_user_id=None,
-            extra_info={"open_id": "ou_open_123"},
-        )
+    user = await service.resolve_channel_user(
+        db=db,
+        agent=agent,
+        channel_type="feishu",
+        external_user_id=None,
+        extra_info={"open_id": "ou_open_123", "_installation_scope": "test:feishu"},
+    )
+
+    assert user is created_user
+    service._ensure_bindings.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -206,10 +215,16 @@ async def test_channel_user_service_skips_dingtalk_lookup_when_ids_missing():
 async def test_channel_user_service_uses_wechat_external_id_for_existing_member_lookup():
     service = ChannelUserService()
     db = AsyncMock()
-    expected_member = SimpleNamespace(id="member-wechat-1")
-    db.execute = AsyncMock(
-        return_value=Mock(scalar_one_or_none=Mock(return_value=expected_member))
+    expected_member = SimpleNamespace(
+        id="member-wechat-1",
+        tenant_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
     )
+    member_result = Mock()
+    member_result.scalars.return_value.all.return_value = [expected_member]
+    installation_result = Mock()
+    installation_result.scalar_one.return_value = 1
+    db.execute = AsyncMock(side_effect=[member_result, installation_result])
 
     member = await service._find_org_member(
         db,
@@ -220,7 +235,7 @@ async def test_channel_user_service_uses_wechat_external_id_for_existing_member_
     )
 
     assert member is expected_member
-    db.execute.assert_awaited_once()
+    assert db.execute.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -228,13 +243,17 @@ async def test_channel_user_service_creates_wechat_org_member_shell_for_lazy_reg
     service = ChannelUserService()
     db = AsyncMock()
     db.get.return_value = None
-    agent = SimpleNamespace(tenant_id="tenant-1")
-    provider = SimpleNamespace(id="provider-1")
+    agent = SimpleNamespace(id="agent-1", tenant_id="tenant-1")
+    provider = SimpleNamespace(
+        id="provider-1", tenant_id="tenant-1", config={}, provider_type="wechat"
+    )
     created_user = SimpleNamespace(id="user-1")
 
     service._ensure_provider = AsyncMock(return_value=provider)
+    service._find_bound_user = AsyncMock(return_value=None)
     service._find_org_member = AsyncMock(return_value=None)
     service._create_channel_user = AsyncMock(return_value=created_user)
+    service._ensure_bindings = AsyncMock(return_value=(created_user, True))
     service._create_org_member_shell = AsyncMock()
 
     user = await service.resolve_channel_user(
@@ -242,7 +261,7 @@ async def test_channel_user_service_creates_wechat_org_member_shell_for_lazy_reg
         agent=agent,
         channel_type="wechat",
         external_user_id="wx_user_123",
-        extra_info={"external_id": "wx_user_123"},
+        extra_info={"external_id": "wx_user_123", "_installation_scope": "test:wechat"},
     )
 
     assert user is created_user
@@ -251,7 +270,7 @@ async def test_channel_user_service_creates_wechat_org_member_shell_for_lazy_reg
         provider,
         "wechat",
         "wx_user_123",
-        {"external_id": "wx_user_123"},
+        {"external_id": "wx_user_123", "_installation_scope": "test:wechat"},
         linked_user_id="user-1",
     )
 
@@ -318,7 +337,7 @@ async def test_channel_user_service_uses_org_member_provisioning_before_lazy_reg
         member_id = member.id
 
     service = ChannelUserService()
-    agent = SimpleNamespace(tenant_id=tenant.id)
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant.id)
 
     async with async_session() as db:
         user = await service.resolve_channel_user(
@@ -326,18 +345,22 @@ async def test_channel_user_service_uses_org_member_provisioning_before_lazy_reg
             agent=agent,
             channel_type="dingtalk",
             external_user_id=external_id,
-            extra_info={"unionid": unionid, "name": "钉钉未关联成员"},
+            extra_info={
+                "unionid": unionid,
+                "name": "钉钉未关联成员",
+                "_installation_scope": "test:dingtalk",
+            },
         )
         await db.commit()
 
         member = await db.get(OrgMember, member_id)
         assert member.user_id == user.id
         assert user.registration_source == "dingtalk_org_sync"
-        assert user.primary_mobile == phone
+        assert user.identity_id is None
 
 
 @pytest.mark.asyncio
-async def test_channel_user_service_mobile_payload_uses_provisioning_before_email_match():
+async def test_channel_user_service_unverified_contact_payload_does_not_merge_email():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     phone = _phone()
@@ -363,7 +386,7 @@ async def test_channel_user_service_mobile_payload_uses_provisioning_before_emai
         wrong_user_id = email_identity_user.id
 
     service = ChannelUserService()
-    agent = SimpleNamespace(tenant_id=tenant.id)
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant.id)
     external_id = f"dt_{uuid.uuid4().hex[:8]}"
     unionid = f"union_{uuid.uuid4().hex[:8]}"
 
@@ -378,13 +401,14 @@ async def test_channel_user_service_mobile_payload_uses_provisioning_before_emai
                 "name": "手机号优先消息人",
                 "mobile": phone,
                 "email": shared_email,
+                "_installation_scope": "test:dingtalk",
             },
         )
         await db.commit()
 
         assert user.id != wrong_user_id
-        assert user.primary_mobile == phone
-        assert user.registration_source == "dingtalk_org_sync"
+        assert user.identity_id is None
+        assert user.registration_source == "dingtalk_channel"
         member = (
             await db.execute(
                 select(OrgMember).where(
@@ -435,26 +459,29 @@ async def test_channel_user_service_dingtalk_without_mobile_does_not_bind_by_ema
         member_id = member.id
 
     service = ChannelUserService()
-    agent = SimpleNamespace(tenant_id=tenant.id)
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant.id)
 
     async with async_session() as db:
-        with pytest.raises(ChannelUserResolutionError):
-            await service.resolve_channel_user(
-                db=db,
-                agent=agent,
-                channel_type="dingtalk",
-                external_user_id=external_id,
-                extra_info={"unionid": unionid, "email": shared_email},
-            )
-        await db.rollback()
-
-    async with async_session() as db:
+        user = await service.resolve_channel_user(
+            db=db,
+            agent=agent,
+            channel_type="dingtalk",
+            external_user_id=external_id,
+            extra_info={
+                "unionid": unionid,
+                "email": shared_email,
+                "_installation_scope": "test:dingtalk",
+            },
+        )
+        await db.commit()
         member = await db.get(OrgMember, member_id)
-        assert member.user_id is None
+        assert member.user_id == user.id
+        assert user.id != email_user.id
+        assert user.identity_id is None
 
 
 @pytest.mark.asyncio
-async def test_get_platform_user_by_org_member_non_dingtalk_keeps_email_match_compatibility():
+async def test_get_platform_user_by_org_member_does_not_merge_unverified_email():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id, provider_type="wechat")
     email = f"wechat-{uuid.uuid4().hex[:8]}@example.com"
@@ -494,12 +521,13 @@ async def test_get_platform_user_by_org_member_non_dingtalk_keeps_email_match_co
         user = await get_platform_user_by_org_member(db, member, agent_tenant_id=tenant.id)
         await db.commit()
 
-        assert user.id == user_id
-        assert member.user_id == user_id
+        assert user.id != user_id
+        assert member.user_id == user.id
+        assert user.identity_id is None
 
 
 @pytest.mark.asyncio
-async def test_get_platform_user_by_org_member_non_dingtalk_keeps_email_create_compatibility():
+async def test_get_platform_user_by_org_member_creates_external_only_user():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id, provider_type="wechat")
     email = f"wechat-create-{uuid.uuid4().hex[:8]}@example.com"
@@ -524,13 +552,13 @@ async def test_get_platform_user_by_org_member_non_dingtalk_keeps_email_create_c
         await db.commit()
 
         assert user.tenant_id == tenant.id
-        assert user.registration_source == "wechat"
-        assert user.email == email
+        assert user.registration_source == "wechat_org_sync"
+        assert user.identity_id is None
         assert member.user_id == user.id
 
 
 @pytest.mark.asyncio
-async def test_get_platform_user_by_org_member_non_dingtalk_keeps_email_before_phone_order():
+async def test_get_platform_user_by_org_member_does_not_guess_email_or_phone_identity():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id, provider_type="wechat")
     email = f"wechat-priority-{uuid.uuid4().hex[:8]}@example.com"
@@ -585,6 +613,7 @@ async def test_get_platform_user_by_org_member_non_dingtalk_keeps_email_before_p
         user = await get_platform_user_by_org_member(db, member, agent_tenant_id=tenant.id)
         await db.commit()
 
-        assert user.id == email_user_id
+        assert user.id != email_user_id
         assert user.id != phone_user_id
-        assert member.user_id == email_user_id
+        assert member.user_id == user.id
+        assert user.identity_id is None

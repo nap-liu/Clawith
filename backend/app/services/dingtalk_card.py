@@ -119,8 +119,8 @@ async def send_confirmation_card(
             "outTrackId": out_track_id,
             "cardData": {"cardParamMap": card_data},
             "callbackType": "STREAM",
-            "imRobotOpenSpaceModel": {"supportForward": True},
-            "imGroupOpenSpaceModel": {"supportForward": True},
+            "imRobotOpenSpaceModel": {"supportForward": False},
+            "imGroupOpenSpaceModel": {"supportForward": False},
         }
 
         space_type, space_id = _parse_target(external_conv_id, is_group)

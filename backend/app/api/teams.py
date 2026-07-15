@@ -22,7 +22,7 @@ from app.models.agent import Agent as AgentModel
 from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
-from app.schemas.schemas import ChannelConfigOut
+from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_llm import _call_agent_llm
 from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
@@ -339,9 +339,6 @@ async def delete_teams_channel(
 
 # ─── Event Webhook ──────────────────────────────────────
 
-_processed_teams_events: set[str] = set()
-
-
 @router.post("/channel/teams/{agent_id}/webhook")
 async def teams_event_webhook(
     agent_id: uuid.UUID,
@@ -367,12 +364,6 @@ async def teams_event_webhook(
             logger.warning(f"Teams: Unexpected body structure for agent {agent_id}: {list(body.keys()) if isinstance(body, dict) else type(body)}")
             activity = body if isinstance(body, dict) else {}
         
-        logger.info(f"Teams: Webhook received for agent {agent_id}, activity type={activity.get('type')}, from={activity.get('from', {}).get('id', 'unknown')}, text={activity.get('text', '')[:50] if activity.get('text') else 'no text'}")
-
-        # Teams Bot Framework uses a simple token for authentication, not HMAC for incoming webhooks
-        # For now, we rely on the unguessable URL token.
-        # In a full production setup, you'd validate the JWT token in the Authorization header.
-
         # Get channel config
         result = await db.execute(
             select(ChannelConfig).where(
@@ -385,11 +376,26 @@ async def teams_event_webhook(
             logger.warning(f"Teams: Webhook received for unconfigured agent {agent_id}")
             return Response(status_code=404)
 
+        from app.services.webhook_security import (
+            WebhookVerificationError,
+            verify_teams_service_url,
+            verify_teams_webhook,
+        )
+        try:
+            claims = await verify_teams_webhook(
+                request.headers.get("authorization"), config.app_id, activity.get("channelId")
+            )
+            service_url = verify_teams_service_url(activity.get("serviceUrl"), claims)
+        except WebhookVerificationError as exc:
+            logger.warning(f"Teams: rejected unauthenticated webhook for agent {agent_id}: {exc}")
+            return Response(status_code=401, content="Unauthorized")
+
+        logger.info(f"Teams: Authenticated webhook received for agent {agent_id}, activity type={activity.get('type')}")
+
         # Extract serviceUrl from the activity for sending replies
-        service_url = activity.get("serviceUrl")
         if service_url:
             if config.extra_config.get("service_url") != service_url:
-                config.extra_config["service_url"] = service_url
+                config.extra_config = {**(config.extra_config or {}), "service_url": service_url}
                 config.is_connected = True
                 await db.flush()
                 await db.commit()
@@ -400,6 +406,9 @@ async def teams_event_webhook(
         # Only process message activities
         if activity.get("type") != "message":
             return {"ok": True}
+        if not activity_id:
+            logger.warning(f"Teams: rejected message without activity id for agent {agent_id}")
+            return Response(status_code=400, content="Activity id is required")
 
         # Ignore bot's own messages
         # Check if the message is from the bot itself (either by app_id or by comparing with recipient)
@@ -462,12 +471,9 @@ async def teams_event_webhook(
         # Early-return for channel commands (/new, /reset):
         # archive the session and send a canned reply — no LLM, no lock needed.
         if is_channel_command(user_text):
-            if activity_id in _processed_teams_events:
+            from app.services.webhook_security import claim_command_event
+            if not await claim_command_event("teams", config.id, activity_id):
                 return {"ok": True}
-            if activity_id:
-                _processed_teams_events.add(activity_id)
-                if len(_processed_teams_events) > 1000:
-                    _processed_teams_events.clear()
             cmd_result = await handle_channel_command(
                 db=db, command=user_text, agent_id=agent_id,
                 user_id=None, external_conv_id=conversation_id,

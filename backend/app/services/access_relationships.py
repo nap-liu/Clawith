@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import get_agent_accessible_user_ids
 from app.models.agent import Agent
-from app.models.org import AgentRelationship, OrgMember
+from app.models.org import AgentRelationship, RelationshipSuppression
 from app.models.user import User
 from app.services.registration_service import registration_service
 
@@ -37,17 +37,24 @@ async def ensure_access_granted_platform_relationships(
         return False
 
     existing_result = await db.execute(
-        select(OrgMember.user_id)
-        .join(AgentRelationship, AgentRelationship.member_id == OrgMember.id)
+        select(AgentRelationship.user_id)
         .where(
             AgentRelationship.agent_id == agent.id,
-            OrgMember.tenant_id == agent.tenant_id,
-            OrgMember.status == "active",
-            OrgMember.user_id.in_(user_ids),
+            AgentRelationship.user_id.in_(user_ids),
         )
     )
     existing_user_ids = {row[0] for row in existing_result.fetchall() if row[0]}
     missing_user_ids = user_ids - existing_user_ids
+    suppressed_result = await db.execute(
+        select(RelationshipSuppression.target_id).where(
+            RelationshipSuppression.agent_id == agent.id,
+            RelationshipSuppression.target_type == "user",
+            RelationshipSuppression.target_id.in_(missing_user_ids),
+        )
+    )
+    missing_user_ids -= {
+        row[0] for row in suppressed_result.fetchall() if row[0]
+    }
     if not missing_user_ids:
         return False
 
@@ -67,6 +74,7 @@ async def ensure_access_granted_platform_relationships(
         db.add(
             AgentRelationship(
                 agent_id=agent.id,
+                user_id=user.id,
                 member_id=member.id,
                 relation="collaborator",
                 description="Auto-added from agent access permissions.",

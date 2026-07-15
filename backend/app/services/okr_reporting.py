@@ -25,7 +25,7 @@ from app.database import async_session
 from app.models.agent import Agent
 from app.models.llm import LLMModel
 from app.models.okr import CompanyReport, MemberDailyReport, OKRSettings
-from app.models.org import AgentAgentRelationship, AgentRelationship, OrgMember
+from app.models.org import AgentAgentRelationship, AgentRelationship
 from app.models.user import User
 from app.services.llm.client import chat_complete
 from app.services.llm.utils import get_model_api_key, get_max_tokens
@@ -46,8 +46,8 @@ RISK_KEYWORDS = (
 class CompanyMember:
     """Resolved member metadata used by reporting and the Reports UI."""
 
-    member_type: str
-    member_id: uuid.UUID
+    user_id: uuid.UUID | None
+    agent_id: uuid.UUID | None
     display_name: str
     avatar_url: str | None
     group_label: str
@@ -173,8 +173,8 @@ async def list_company_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
         for user in users_result.scalars().all():
             members.append(
                 CompanyMember(
-                    member_type="user",
-                    member_id=user.id,
+                    user_id=user.id,
+                    agent_id=None,
                     display_name=user.display_name,
                     avatar_url=user.avatar_url,
                     group_label=user.title or "Members",
@@ -183,8 +183,8 @@ async def list_company_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
         for agent in agents_result.scalars().all():
             members.append(
                 CompanyMember(
-                    member_type="agent",
-                    member_id=agent.id,
+                    user_id=None,
+                    agent_id=agent.id,
                     display_name=agent.name,
                     avatar_url=agent.avatar_url,
                     group_label="Digital Employees",
@@ -205,11 +205,12 @@ async def list_tracked_okr_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
             return []
 
         human_result = await db.execute(
-            select(AgentRelationship, OrgMember)
-            .join(OrgMember, AgentRelationship.member_id == OrgMember.id)
+            select(User)
+            .join(AgentRelationship, AgentRelationship.user_id == User.id)
             .where(
                 AgentRelationship.agent_id == settings.okr_agent_id,
-                OrgMember.status == "active",
+                User.tenant_id == tenant_id,
+                User.is_active == True,  # noqa: E712
             )
         )
         agent_result = await db.execute(
@@ -226,21 +227,21 @@ async def list_tracked_okr_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
         )
 
         members: list[CompanyMember] = []
-        for _, org_member in human_result.all():
+        for platform_user in human_result.scalars().all():
             members.append(
                 CompanyMember(
-                    member_type="user",
-                    member_id=org_member.user_id or org_member.id,
-                    display_name=org_member.name,
-                    avatar_url=org_member.avatar_url,
-                    group_label=org_member.title or "Members",
+                    user_id=platform_user.id,
+                    agent_id=None,
+                    display_name=platform_user.display_name,
+                    avatar_url=platform_user.avatar_url,
+                    group_label=platform_user.title or "Members",
                 )
             )
         for agent in agent_result.scalars().all():
             members.append(
                 CompanyMember(
-                    member_type="agent",
-                    member_id=agent.id,
+                    user_id=None,
+                    agent_id=agent.id,
                     display_name=agent.name,
                     avatar_url=agent.avatar_url,
                     group_label="Digital Employees",
@@ -252,8 +253,8 @@ async def list_tracked_okr_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
 
 async def upsert_member_daily_report(
     tenant_id: uuid.UUID,
-    member_type: str,
-    member_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    agent_id: uuid.UUID | None,
     report_date: date,
     content: str,
     *,
@@ -261,16 +262,40 @@ async def upsert_member_daily_report(
     mark_late_if_past: bool = True,
 ) -> MemberDailyReport:
     """Create or update a member daily report and mark related company reports dirty."""
+    if (user_id is None) == (agent_id is None):
+        raise ValueError("Exactly one of user_id or agent_id is required")
     normalized = _truncate_report_content(content)
     today = date.today()
     status = "late" if mark_late_if_past and report_date < today else "submitted"
 
     async with async_session() as db:
+        if user_id is not None:
+            actor_exists = await db.scalar(
+                select(User.id).where(
+                    User.id == user_id,
+                    User.tenant_id == tenant_id,
+                    User.is_active.is_(True),
+                )
+            )
+            if actor_exists is None:
+                raise ValueError("user_id is not an active user in this tenant")
+        else:
+            actor_exists = await db.scalar(
+                select(Agent.id).where(
+                    Agent.id == agent_id,
+                    Agent.tenant_id == tenant_id,
+                    Agent.is_deleted.is_(False),
+                    Agent.is_expired.is_(False),
+                    Agent.status.notin_(["stopped", "error"]),
+                )
+            )
+            if actor_exists is None:
+                raise ValueError("agent_id is not an active agent in this tenant")
+
         result = await db.execute(
             select(MemberDailyReport).where(
                 MemberDailyReport.tenant_id == tenant_id,
-                MemberDailyReport.member_type == member_type,
-                MemberDailyReport.member_id == member_id,
+                MemberDailyReport.user_id == user_id if user_id else MemberDailyReport.agent_id == agent_id,
                 MemberDailyReport.report_date == report_date,
             )
         )
@@ -285,8 +310,8 @@ async def upsert_member_daily_report(
         else:
             report = MemberDailyReport(
                 tenant_id=tenant_id,
-                member_type=member_type,
-                member_id=member_id,
+                user_id=user_id,
+                agent_id=agent_id,
                 report_date=report_date,
                 content=normalized,
                 status=status,
@@ -314,16 +339,17 @@ async def list_member_daily_reports_for_date(
             )
         )
         reports = {
-            (row.member_type, row.member_id): row
+            (("user", row.user_id) if row.user_id else ("agent", row.agent_id)): row
             for row in result.scalars().all()
         }
 
     items: list[dict] = []
     for member in members:
-        report = reports.get((member.member_type, member.member_id))
+        member_key = ("user", member.user_id) if member.user_id else ("agent", member.agent_id)
+        report = reports.get(member_key)
         items.append({
-            "member_type": member.member_type,
-            "member_id": str(member.member_id),
+            "user_id": str(member.user_id) if member.user_id else None,
+            "agent_id": str(member.agent_id) if member.agent_id else None,
             "display_name": member.display_name,
             "avatar_url": member.avatar_url,
             "group_label": member.group_label,
@@ -373,7 +399,7 @@ def _build_company_daily_content(
 ) -> str:
     """Build a concise company daily report from member daily reports."""
     lines = [
-        f"# Company Daily Report",
+        "# Company Daily Report",
         f"Date: {period_day.isoformat()}",
         "",
         "## Submission Summary",
@@ -712,11 +738,15 @@ async def generate_company_daily_report(tenant_id: uuid.UUID, period_day: date) 
         )
         rows = result.scalars().all()
 
-    submitted_lookup = {(row.member_type, row.member_id): row for row in rows}
+    submitted_lookup = {
+        (("user", row.user_id) if row.user_id else ("agent", row.agent_id)): row
+        for row in rows
+    }
     submitted_items: list[dict] = []
     missing_items: list[dict] = []
     for member in members:
-        row = submitted_lookup.get((member.member_type, member.member_id))
+        member_key = ("user", member.user_id) if member.user_id else ("agent", member.agent_id)
+        row = submitted_lookup.get(member_key)
         member_payload = {
             "display_name": member.display_name,
             "content": row.content if row else "",

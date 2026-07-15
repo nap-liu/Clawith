@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
@@ -93,6 +93,9 @@ class AutonomyService:
         self, db: AsyncSession, approval_id: uuid.UUID, user: User, action: str
     ) -> ApprovalRequest:
         """Approve or reject a pending approval request."""
+        if action not in {"approve", "reject"}:
+            raise ValueError("Action must be 'approve' or 'reject'")
+
         result = await db.execute(
             select(ApprovalRequest).where(ApprovalRequest.id == approval_id)
         )
@@ -106,24 +109,43 @@ class AutonomyService:
         # Permission check: only agent creator or platform admin can resolve
         agent_result = await db.execute(select(Agent).where(Agent.id == approval.agent_id))
         agent = agent_result.scalar_one_or_none()
-        if agent and agent.creator_id != user.id and user.role != "platform_admin":
+        if not agent:
+            raise ValueError("Approval agent not found")
+        if agent.creator_id != user.id and user.role != "platform_admin":
             raise ValueError("Only the agent creator or platform admin can resolve approvals")
 
-        approval.status = "approved" if action == "approve" else "rejected"
-        approval.resolved_at = datetime.now(timezone.utc)
-        approval.resolved_by = user.id
+        resolved_status = "approved" if action == "approve" else "rejected"
+        resolved_at = datetime.now(timezone.utc)
+
+        # Compare-and-swap is the single execution gate across workers.  Commit the
+        # terminal decision before any external side effect so a racing request (or a
+        # retry after execution starts) cannot execute the action a second time.
+        claim = await db.execute(
+            update(ApprovalRequest)
+            .where(
+                ApprovalRequest.id == approval_id,
+                ApprovalRequest.status == "pending",
+            )
+            .values(status=resolved_status, resolved_at=resolved_at, resolved_by=user.id)
+            .returning(ApprovalRequest.id)
+        )
+        if claim.scalar_one_or_none() is None:
+            await db.rollback()
+            raise ValueError("Approval already resolved")
 
         # Log
         db.add(AuditLog(
             user_id=user.id,
             agent_id=approval.agent_id,
-            action=f"approval_{approval.status}",
+            action=f"approval_{resolved_status}",
             details={"approval_id": str(approval.id), "action_type": approval.action_type},
         ))
+        await db.commit()
+        approval = await db.get(ApprovalRequest, approval_id)
 
         # Post-processing: execute the approved action
         execution_result = None
-        if approval.status == "approved" and approval.details:
+        if resolved_status == "approved" and approval.details:
             execution_result = await self._execute_approved_action(
                 approval.agent_id,
                 approval.action_type,
@@ -135,7 +157,7 @@ class AutonomyService:
         # Web notification to agent creator about the result
         if agent:
             from app.services.notification_service import send_notification
-            status_label = "approved" if approval.status == "approved" else "rejected"
+            status_label = resolved_status
             body_text = json.dumps(approval.details, ensure_ascii=False)[:200]
             if execution_result:
                 body_text = f"Result: {execution_result}"

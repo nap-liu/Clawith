@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy import select
 
 from app.models.user import Identity, User  # noqa: F401
 from app.models.agent import Agent  # noqa: F401
@@ -27,6 +28,14 @@ async def _isolate_async_engine_between_tests():
 
 async def _seed_user(suffix: str, display_name: str) -> User:
     async with async_session() as db:
+        tenant_slug = f"chat-msg-{suffix[-8:]}"
+        tenant = (
+            await db.execute(select(Tenant).where(Tenant.slug == tenant_slug))
+        ).scalar_one_or_none()
+        if not tenant:
+            tenant = Tenant(name=f"Chat messages {suffix[-8:]}", slug=tenant_slug)
+            db.add(tenant)
+            await db.flush()
         ident = Identity(
             username=f"u_{suffix}",
             email=f"u_{suffix}@test.local",
@@ -34,7 +43,13 @@ async def _seed_user(suffix: str, display_name: str) -> User:
         )
         db.add(ident)
         await db.flush()
-        user = User(identity_id=ident.id, display_name=display_name, role="member", is_active=True)
+        user = User(
+            identity_id=ident.id,
+            tenant_id=tenant.id,
+            display_name=display_name,
+            role="member",
+            is_active=True,
+        )
         db.add(user)
         await db.commit()
         await db.refresh(user)
@@ -43,7 +58,12 @@ async def _seed_user(suffix: str, display_name: str) -> User:
 
 async def _seed_agent(creator_user_id) -> uuid.UUID:
     async with async_session() as db:
-        agent = Agent(name="GroupTestAgent", creator_id=creator_user_id)
+        tenant_id = await db.scalar(select(User.tenant_id).where(User.id == creator_user_id))
+        agent = Agent(
+            name="GroupTestAgent",
+            creator_id=creator_user_id,
+            tenant_id=tenant_id,
+        )
         db.add(agent)
         await db.commit()
         await db.refresh(agent)
@@ -154,11 +174,11 @@ async def test_group_messages_api_returns_sender_user_id_and_sender_name():
     assert user_msgs[1]["sender_user_id"] == str(bob.id)
     assert user_msgs[1]["sender_name"] == "Bob"
 
-    # Assistant rows are NOT decorated with sender_user_id (group spec carves
-    # out only user-role messages — agent rows render with the agent's own
-    # avatar/name in the UI).
+    # Assistant rows expose the canonical digital-employee actor, never a
+    # creator-user or Participant placeholder.
     assistant_msgs = [m for m in out if m["role"] == "assistant"]
     assert all("sender_user_id" not in m for m in assistant_msgs)
+    assert all(m["sender_agent_id"] == str(agent_id) for m in assistant_msgs)
 
 
 async def test_group_member_non_owner_can_read_group_messages(monkeypatch):
@@ -297,9 +317,8 @@ async def test_p2p_non_owner_non_admin_still_forbidden(monkeypatch):
     assert exc.value.status_code == 403
 
 
-async def test_p2p_messages_api_does_not_add_sender_user_id_field():
-    """For non-group sessions get_session_messages must NOT add sender_user_id /
-    sender_name on user messages — preserve byte-identical legacy behavior."""
+async def test_p2p_messages_api_returns_canonical_sender_user_id():
+    """P2P user messages expose the same canonical user_id as every IM path."""
     from datetime import datetime, timedelta, timezone
     from app.api.chat_sessions import get_session_messages
 
@@ -342,6 +361,6 @@ async def test_p2p_messages_api_does_not_add_sender_user_id_field():
 
     user_msgs = [m for m in out if m["role"] == "user"]
     assert len(user_msgs) == 1
-    assert "sender_user_id" not in user_msgs[0]
-    # sender_name is also absent for non-group, non-A2A
-    assert "sender_name" not in user_msgs[0]
+    assert user_msgs[0]["sender_user_id"] == str(owner.id)
+    assert "participant_id" not in user_msgs[0]
+    assert "participant_id" not in user_msgs[0]

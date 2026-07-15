@@ -5,7 +5,12 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.agent import Agent
-from app.models.org import AgentRelationship, AgentAgentRelationship, OrgMember
+from app.models.org import (
+    AgentRelationship,
+    AgentAgentRelationship,
+    OrgMember,
+    RelationshipSuppression,
+)
 
 async def hook_new_org_member(db: AsyncSession, member_id: uuid.UUID, tenant_id: uuid.UUID) -> None:
     """When a new OrgMember is created or bound, bind them to the system OKR Agent if it exists."""
@@ -13,16 +18,32 @@ async def hook_new_org_member(db: AsyncSession, member_id: uuid.UUID, tenant_id:
     if not okr_agent:
         return
 
+    member = await db.get(OrgMember, member_id)
+    if not member or member.tenant_id != tenant_id or not member.user_id:
+        logger.warning(
+            f"[OKR Hook] Skipping legacy OrgMember {member_id} without canonical user_id"
+        )
+        return
+    if await db.scalar(
+        select(RelationshipSuppression.id).where(
+            RelationshipSuppression.agent_id == okr_agent.id,
+            RelationshipSuppression.target_type == "user",
+            RelationshipSuppression.target_id == member.user_id,
+        )
+    ):
+        return
+
     # Check if relationship already exists
     existing = await db.execute(
         select(AgentRelationship).where(
             AgentRelationship.agent_id == okr_agent.id,
-            AgentRelationship.member_id == member_id
+            AgentRelationship.user_id == member.user_id,
         )
     )
     if not existing.scalar_one_or_none():
         db.add(AgentRelationship(
             agent_id=okr_agent.id,
+            user_id=member.user_id,
             member_id=member_id,
             relation="okr_coordinator"
         ))
@@ -41,11 +62,18 @@ async def sync_okr_agent_platform_members(db: AsyncSession, tenant_id: uuid.UUID
         return 0
 
     existing_result = await db.execute(
-        select(AgentRelationship.member_id).where(
+        select(AgentRelationship.user_id).where(
             AgentRelationship.agent_id == okr_agent.id,
         )
     )
-    existing_member_ids = {row[0] for row in existing_result.fetchall() if row[0]}
+    existing_user_ids = {row[0] for row in existing_result.fetchall() if row[0]}
+    suppressed_result = await db.execute(
+        select(RelationshipSuppression.target_id).where(
+            RelationshipSuppression.agent_id == okr_agent.id,
+            RelationshipSuppression.target_type == "user",
+        )
+    )
+    suppressed_user_ids = {row[0] for row in suppressed_result.fetchall() if row[0]}
 
     member_result = await db.execute(
         select(OrgMember).where(
@@ -56,14 +84,15 @@ async def sync_okr_agent_platform_members(db: AsyncSession, tenant_id: uuid.UUID
     )
     added = 0
     for member in member_result.scalars().all():
-        if member.id in existing_member_ids:
+        if member.user_id in existing_user_ids or member.user_id in suppressed_user_ids:
             continue
         db.add(AgentRelationship(
             agent_id=okr_agent.id,
+            user_id=member.user_id,
             member_id=member.id,
             relation="okr_coordinator",
         ))
-        existing_member_ids.add(member.id)
+        existing_user_ids.add(member.user_id)
         added += 1
 
     if added:
@@ -95,7 +124,14 @@ async def hook_new_agent(db: AsyncSession, new_agent_id: uuid.UUID, tenant_id: u
             AgentAgentRelationship.target_agent_id == new_agent_id
         )
     )
-    if not existing1.scalar_one_or_none():
+    first_suppressed = await db.scalar(
+        select(RelationshipSuppression.id).where(
+            RelationshipSuppression.agent_id == okr_agent.id,
+            RelationshipSuppression.target_type == "agent",
+            RelationshipSuppression.target_id == new_agent_id,
+        )
+    )
+    if not existing1.scalar_one_or_none() and not first_suppressed:
         db.add(AgentAgentRelationship(
             agent_id=okr_agent.id,
             target_agent_id=new_agent_id,
@@ -109,7 +145,14 @@ async def hook_new_agent(db: AsyncSession, new_agent_id: uuid.UUID, tenant_id: u
             AgentAgentRelationship.target_agent_id == okr_agent.id
         )
     )
-    if not existing2.scalar_one_or_none():
+    second_suppressed = await db.scalar(
+        select(RelationshipSuppression.id).where(
+            RelationshipSuppression.agent_id == new_agent_id,
+            RelationshipSuppression.target_type == "agent",
+            RelationshipSuppression.target_id == okr_agent.id,
+        )
+    )
+    if not existing2.scalar_one_or_none() and not second_suppressed:
         db.add(AgentAgentRelationship(
             agent_id=new_agent_id,
             target_agent_id=okr_agent.id,
@@ -123,7 +166,7 @@ async def _get_okr_agent(db: AsyncSession, tenant_id: uuid.UUID) -> Agent | None
     res = await db.execute(
         select(Agent).where(
             Agent.tenant_id == tenant_id,
-            Agent.is_system == True,
+            Agent.is_system,
             Agent.name == "OKR Agent"
         ).limit(1)
     )

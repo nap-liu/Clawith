@@ -104,6 +104,29 @@ async def _seed_session(
         return s
 
 
+async def _seed_legacy_malformed_session(
+    agent_id, user_id, *, channel: str, peer
+) -> ChatSession:
+    """Insert a pre-normalization row so read predicates can prove fail-closed behavior."""
+    async with async_session() as db:
+        await db.execute(text("SET session_replication_role = replica"))
+        s = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            source_channel=channel,
+            peer_agent_id=peer,
+            is_group=False,
+            title="legacy malformed",
+            last_message_at=datetime.now(timezone.utc),
+        )
+        db.add(s)
+        await db.commit()
+        await db.execute(text("SET session_replication_role = DEFAULT"))
+        await db.commit()
+        await db.refresh(s)
+        return s
+
+
 async def _seed_message(agent_id, user_id, conv_id, role, content, *, created_at=None) -> uuid.UUID:
     async with async_session() as db:
         m = ChatMessage(
@@ -160,7 +183,12 @@ async def test_owned_predicate_covers_three_kinds_and_excludes_others():
     s_a2a_peer = await _seed_session(peer.id, owner.id, channel="agent", peer=agent.id)
     s_foreign = await _seed_session(other_agent.id, owner.id, channel="web")
     # peer_agent_id == agent but channel != 'agent' -> must NOT be owned
-    s_trap = await _seed_session(other_agent.id, owner.id, channel="web", peer=agent.id)
+    s_trap = await _seed_legacy_malformed_session(
+        other_agent.id,
+        owner.id,
+        channel="web",
+        peer=agent.id,
+    )
 
     async with async_session() as db:
         ids = set(

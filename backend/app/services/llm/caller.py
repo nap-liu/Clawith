@@ -925,6 +925,7 @@ async def call_llm(
         agent_name,
         role_description,
         current_user_name=_user_name,
+        current_user_id=None if current_user_name_override else user_id,
         is_group=is_group,
         channel_context=channel_context,
     )
@@ -1798,7 +1799,9 @@ async def call_agent_llm_with_tools(
                             conversation_id=session_id,
                             chat_session_id=None,
                             source_channel="web",
-                            user_id=None,
+                            # Background tool loops have no live requester; bind the
+                            # confirmation to the agent creator who owns the approval.
+                            user_id=agent.creator_id,
                             intro_text=response.content,
                             title=conf_call.title,
                             summary=conf_call.summary,

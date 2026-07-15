@@ -38,7 +38,7 @@ from app.services.channel_user_service import channel_user_service
 from app.services.platform_service import platform_service
 from app.services.channel_llm import _call_agent_llm
 from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
-from app.schemas.schemas import ChannelConfigOut
+from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.wecom_stream import wecom_stream_manager
 
 router = APIRouter(tags=["wecom"])

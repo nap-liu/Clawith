@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 # ─── Auth ───────────────────────────────────────────────
@@ -356,9 +356,30 @@ class TaskCreate(BaseModel):
     priority: str = "medium"
     due_date: datetime | None = None
     # Supervision fields
-    supervision_target_name: str | None = None
+    supervision_target_user_id: uuid.UUID | None = None
+    supervision_target_agent_id: uuid.UUID | None = None
     supervision_channel: str | None = None
     remind_schedule: str | None = None
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_supervision_target(self):
+        target_count = sum(
+            value is not None
+            for value in (
+                self.supervision_target_user_id,
+                self.supervision_target_agent_id,
+            )
+        )
+        if self.type == "supervision" and target_count != 1:
+            raise ValueError(
+                "supervision tasks require exactly one canonical "
+                "supervision_target_user_id or supervision_target_agent_id"
+            )
+        if self.type != "supervision" and target_count:
+            raise ValueError("only supervision tasks may define a supervision target")
+        return self
 
 
 class TaskOut(BaseModel):
@@ -373,6 +394,9 @@ class TaskOut(BaseModel):
     created_by: uuid.UUID
     creator_username: str | None = None
     due_date: datetime | None = None
+    supervision_target_user_id: uuid.UUID | None = None
+    supervision_target_agent_id: uuid.UUID | None = None
+    # Human-readable snapshot only; never accepted as an execution locator.
     supervision_target_name: str | None = None
     supervision_channel: str | None = None
     remind_schedule: str | None = None
@@ -389,8 +413,12 @@ class TaskUpdate(BaseModel):
     status: str | None = None
     priority: str | None = None
     due_date: datetime | None = None
-    supervision_target_name: str | None = None
+    supervision_target_user_id: uuid.UUID | None = None
+    supervision_target_agent_id: uuid.UUID | None = None
+    supervision_channel: str | None = None
     remind_schedule: str | None = None
+
+    model_config = {"extra": "forbid"}
 
 
 class TaskLogCreate(BaseModel):
@@ -574,26 +602,42 @@ class GatewayHistoryItem(BaseModel):
     role: str  # "user" or "assistant"
     content: str
     sender_name: str | None = None
+    sender_user_id: uuid.UUID | None = None
+    sender_agent_id: uuid.UUID | None = None
     created_at: datetime
 
 
 class GatewayRelationshipItem(BaseModel):
-    name: str
-    type: str  # "human" or "agent"
+    display_name: str
+    user_id: uuid.UUID | None = None
+    agent_id: uuid.UUID | None = None
     role: str | None = None  # e.g. "collaborator", "supervisor"
     description: str | None = None
     channels: list[str] = []  # e.g. ["feishu"], ["agent"]
+
+    @model_validator(mode="after")
+    def exactly_one_recipient_id(self):
+        if (self.user_id is None) == (self.agent_id is None):
+            raise ValueError("relationship item requires exactly one of user_id or agent_id")
+        return self
 
 
 class GatewayMessageOut(BaseModel):
     id: uuid.UUID
     conversation_id: str | None = None
     sender_agent_name: str | None = None
+    sender_agent_id: uuid.UUID | None = None
     sender_user_name: str | None = None
-    sender_user_id: str | None = None
+    sender_user_id: uuid.UUID | None = None
     content: str
     created_at: datetime
     history: list[GatewayHistoryItem] = []
+
+    @model_validator(mode="after")
+    def exactly_one_sender_id(self):
+        if (self.sender_user_id is None) == (self.sender_agent_id is None):
+            raise ValueError("gateway message requires exactly one canonical sender ID")
+        return self
 
 
 
@@ -608,6 +652,15 @@ class GatewayReportRequest(BaseModel):
 
 
 class GatewaySendMessageRequest(BaseModel):
-    target: str  # Name of target person or agent
+    user_id: uuid.UUID | None = None
+    agent_id: uuid.UUID | None = None
     content: str = Field(min_length=1)
-    channel: str | None = None  # Optional: "feishu", "agent", etc. Auto-detected if omitted.
+    channel: str | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_recipient_id(self):
+        if (self.user_id is None) == (self.agent_id is None):
+            raise ValueError("provide exactly one of user_id or agent_id")
+        if self.agent_id is not None and self.channel not in {None, "", "agent"}:
+            raise ValueError("channel is not applicable to agent_id recipients")
+        return self

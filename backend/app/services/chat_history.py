@@ -57,6 +57,8 @@ class _SyntheticSummaryMessage:
     id: uuid.UUID = field(default_factory=uuid.uuid4)
     agent_id: uuid.UUID | None = None
     user_id: uuid.UUID | None = None
+    sender_user_id: uuid.UUID | None = None
+    sender_agent_id: uuid.UUID | None = None
     conversation_id: str = ""
     participant_id: None = None
     thinking: None = None
@@ -406,8 +408,13 @@ def build_llm_messages_from_rows(
         if m.role == "tool_call":
             out.extend(expand_tool_call_row(m))
             continue
-        if wrap_user_names and m.role == "user" and m.user_id is not None:
-            content = wrap_with_sender(m.content, m.user_id, (name_map or {}).get(m.user_id))
+        sender_user_id = getattr(m, "sender_user_id", None) or getattr(m, "user_id", None)
+        if wrap_user_names and m.role == "user" and sender_user_id is not None:
+            content = wrap_with_sender(
+                m.content,
+                sender_user_id,
+                (name_map or {}).get(sender_user_id),
+            )
         else:
             content = m.content
         entry: dict[str, Any] = {"role": m.role, "content": content}
@@ -438,6 +445,7 @@ async def persist_incoming_user_message(
         id=message_id or uuid.uuid4(),
         agent_id=agent_id,
         user_id=user_id,
+        sender_user_id=user_id,
         role="user",
         content=content,
         conversation_id=conversation_id,
@@ -725,14 +733,17 @@ async def persist_pending_confirmation_row(
         role="tool_call",
         content=content,
         conversation_id=conversation_id,
-        message_meta=(
-            {
-                "turn_anchor_id": str(turn_anchor_id),
-                "turn_status": "suspended",
-            }
-            if turn_anchor_id is not None
-            else {}
-        ),
+        message_meta={
+            **(
+                {
+                    "turn_anchor_id": str(turn_anchor_id),
+                    "turn_status": "suspended",
+                }
+                if turn_anchor_id is not None
+                else {}
+            ),
+            **({"intended_user_id": str(user_id)} if user_id is not None else {}),
+        },
         created_at=created_at,
     )
     db.add(row)
@@ -980,7 +991,12 @@ async def load_history_for_llm(
     wrap_users = False
     name_map: dict[uuid.UUID, str] = {}
     if is_group:
-        user_ids = {m.user_id for m in rows if m.role == "user" and m.user_id is not None}
+        user_ids = {
+            getattr(m, "sender_user_id", None) or getattr(m, "user_id", None)
+            for m in rows
+            if m.role == "user"
+            and (getattr(m, "sender_user_id", None) or getattr(m, "user_id", None)) is not None
+        }
         try:
             name_map = await _batch_load_display_names(db, user_ids)
             wrap_users = True
@@ -1026,7 +1042,12 @@ async def load_recoverable_history_for_turn(
     wrap_users = False
     name_map: dict[uuid.UUID, str] = {}
     if is_group:
-        user_ids = {m.user_id for m in rows if m.role == "user" and m.user_id is not None}
+        user_ids = {
+            getattr(m, "sender_user_id", None) or getattr(m, "user_id", None)
+            for m in rows
+            if m.role == "user"
+            and (getattr(m, "sender_user_id", None) or getattr(m, "user_id", None)) is not None
+        }
         try:
             name_map = await _batch_load_display_names(db, user_ids)
             wrap_users = True

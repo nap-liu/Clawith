@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.database import Base
 from app.models.agent import Agent, AgentPermission
 from app.models.identity import IdentityProvider
-from app.models.org import AgentAgentRelationship, AgentRelationship, OrgDepartment, OrgMember
+from app.models.org import (
+    AgentAgentRelationship,
+    AgentRelationship,
+    OrgDepartment,
+    OrgMember,
+    RelationshipSuppression,
+)
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services import agent_tools
@@ -89,6 +95,7 @@ async def contact_session():
         OrgMember.__table__,
         AgentRelationship.__table__,
         AgentAgentRelationship.__table__,
+        RelationshipSuppression.__table__,
     ]
     async with engine.begin() as conn:
         await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=tables))
@@ -195,6 +202,7 @@ async def _seed_contact_graph(session):
     return {
         "tenant_id": tenant_id,
         "creator_id": creator_id,
+        "member_user_id": member_user_id,
         "source": source,
         "target": target,
         "other_tenant_agent": other_tenant_agent,
@@ -215,7 +223,7 @@ async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_
         contact_type="human",
         current_user_id=ctx["creator_id"],
     )
-    assert [row["id"] for row in formatted_phone_results] == [str(ctx["dingtalk_member"].id)]
+    assert [row["user_id"] for row in formatted_phone_results] == [str(ctx["member_user_id"])]
     assert formatted_phone_results[0]["phone"] == "138****0000"
 
     human_results = await search_contacts_for_agent(
@@ -227,7 +235,7 @@ async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_
     )
     assert human_results == [
         {
-            "id": str(ctx["dingtalk_member"].id),
+            "user_id": str(ctx["member_user_id"]),
             "type": "human",
             "name": "刘喜",
             "title": "前端开发",
@@ -247,7 +255,7 @@ async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_
         contact_type="agent",
         current_user_id=ctx["creator_id"],
     )
-    assert [row["id"] for row in agent_results] == [str(ctx["target"].id)]
+    assert [row["agent_id"] for row in agent_results] == [str(ctx["target"].id)]
     assert agent_results[0]["type"] == "agent"
     assert "send_hint" not in agent_results[0]
 
@@ -274,7 +282,7 @@ async def test_search_contacts_includes_human_not_rostered_on_custom_agent(conta
         current_user_id=ctx["creator_id"],
     )
 
-    assert [row["id"] for row in human_results] == [str(ctx["dingtalk_member"].id)]
+    assert [row["user_id"] for row in human_results] == [str(ctx["member_user_id"])]
     assert human_results[0]["relationship_status"] == "not_added"
 
 
@@ -286,7 +294,7 @@ async def test_add_contact_creates_human_relationship_idempotently(contact_sessi
         contact_session,
         ctx["source"].id,
         target_type="human",
-        target_id=str(ctx["dingtalk_member"].id),
+        target_id=str(ctx["member_user_id"]),
         relation="collaborator",
         description="前端事项协作",
         current_user_id=ctx["creator_id"],
@@ -295,7 +303,7 @@ async def test_add_contact_creates_human_relationship_idempotently(contact_sessi
         contact_session,
         ctx["source"].id,
         target_type="human",
-        target_id=str(ctx["dingtalk_member"].id),
+        target_id=str(ctx["member_user_id"]),
         relation="stakeholder",
         description="更新描述",
         current_user_id=ctx["creator_id"],
@@ -311,7 +319,7 @@ async def test_add_contact_creates_human_relationship_idempotently(contact_sessi
         )
     ).scalars().all()
     assert len(rows) == 1
-    assert rows[0].member_id == ctx["dingtalk_member"].id
+    assert rows[0].user_id == ctx["member_user_id"]
     assert rows[0].relation == "stakeholder"
     assert rows[0].description == "更新描述"
 
@@ -334,7 +342,7 @@ async def test_add_contact_allows_human_not_rostered_on_custom_agent(contact_ses
         contact_session,
         ctx["source"].id,
         target_type="human",
-        target_id=str(ctx["dingtalk_member"].id),
+        target_id=str(ctx["member_user_id"]),
         relation="collaborator",
         current_user_id=ctx["creator_id"],
     )
@@ -437,12 +445,12 @@ async def test_execute_tool_direct_uses_approval_resolver_for_contact_relationsh
 
     without_user = await agent_tools._execute_tool_direct(
         "add_contact",
-        {"target_type": "agent", "target_id": str(target_id)},
+        {"agent_id": str(target_id)},
         source_id,
     )
     with_resolver = await agent_tools._execute_tool_direct(
         "add_contact",
-        {"target_type": "agent", "target_id": str(target_id)},
+        {"agent_id": str(target_id)},
         source_id,
         user_id=creator_id,
     )
@@ -491,7 +499,7 @@ async def test_remove_contact_deletes_human_relationship_idempotently(contact_se
         contact_session,
         ctx["source"].id,
         target_type="human",
-        target_id=str(ctx["dingtalk_member"].id),
+        target_id=str(ctx["member_user_id"]),
         current_user_id=ctx["creator_id"],
     )
 
@@ -499,26 +507,26 @@ async def test_remove_contact_deletes_human_relationship_idempotently(contact_se
         contact_session,
         ctx["source"].id,
         target_type="human",
-        target_id=str(ctx["dingtalk_member"].id),
+        target_id=str(ctx["member_user_id"]),
         current_user_id=ctx["creator_id"],
     )
     second = await remove_contact_for_agent(
         contact_session,
         ctx["source"].id,
         target_type="human",
-        target_id=str(ctx["dingtalk_member"].id),
+        target_id=str(ctx["member_user_id"]),
         current_user_id=ctx["creator_id"],
     )
 
     assert first == {
         "status": "removed",
-        "id": str(ctx["dingtalk_member"].id),
+        "user_id": str(ctx["member_user_id"]),
         "type": "human",
         "name": "刘喜",
     }
     assert second == {
         "status": "not_found",
-        "id": str(ctx["dingtalk_member"].id),
+        "user_id": str(ctx["member_user_id"]),
         "type": "human",
         "name": "刘喜",
     }
@@ -528,6 +536,31 @@ async def test_remove_contact_deletes_human_relationship_idempotently(contact_se
         )
     ).scalars().all()
     assert rows == []
+
+    suppression = await contact_session.scalar(
+        select(RelationshipSuppression).where(
+            RelationshipSuppression.agent_id == ctx["source"].id,
+            RelationshipSuppression.target_type == "user",
+            RelationshipSuppression.target_id == ctx["member_user_id"],
+        )
+    )
+    assert suppression is not None
+
+    restored = await add_contact_for_agent(
+        contact_session,
+        ctx["source"].id,
+        target_type="human",
+        target_id=str(ctx["member_user_id"]),
+        current_user_id=ctx["creator_id"],
+    )
+    assert restored["status"] == "added"
+    assert await contact_session.scalar(
+        select(RelationshipSuppression.id).where(
+            RelationshipSuppression.agent_id == ctx["source"].id,
+            RelationshipSuppression.target_type == "user",
+            RelationshipSuppression.target_id == ctx["member_user_id"],
+        )
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -558,13 +591,13 @@ async def test_remove_contact_deletes_agent_relationship_idempotently(contact_se
 
     assert first == {
         "status": "removed",
-        "id": str(ctx["target"].id),
+        "agent_id": str(ctx["target"].id),
         "type": "agent",
         "name": "Research Agent",
     }
     assert second == {
         "status": "not_found",
-        "id": str(ctx["target"].id),
+        "agent_id": str(ctx["target"].id),
         "type": "agent",
         "name": "Research Agent",
     }
@@ -625,8 +658,8 @@ async def test_execute_tool_search_contacts_returns_human_contacts(contact_sessi
         ctx["creator_id"],
     )
 
-    assert f"id={ctx['dingtalk_member'].id}" in result
-    assert "type=human" in result
+    assert f"user_id={ctx['member_user_id']}" in result
+    assert "display_name=刘喜" in result
     assert "human:" not in result
     assert "刘喜" in result
     assert "dingtalk" in result
@@ -646,8 +679,7 @@ async def test_execute_tool_add_contact_creates_human_and_agent_relationships(co
     human_result = await agent_tools.execute_tool(
         "add_contact",
         {
-            "target_type": "human",
-            "target_id": str(ctx["dingtalk_member"].id),
+            "user_id": str(ctx["member_user_id"]),
             "relation": "collaborator",
             "description": "前端协作",
         },
@@ -658,8 +690,7 @@ async def test_execute_tool_add_contact_creates_human_and_agent_relationships(co
     agent_result = await agent_tools.execute_tool(
         "add_contact",
         {
-            "target_type": "agent",
-            "target_id": str(ctx["target"].id),
+            "agent_id": str(ctx["target"].id),
             "relation": "peer",
             "description": "调研协作",
         },
@@ -689,7 +720,7 @@ async def test_execute_tool_add_contact_creates_human_and_agent_relationships(co
             select(AgentAgentRelationship).where(AgentAgentRelationship.agent_id == ctx["source"].id)
         )
     ).scalars().all()
-    assert [row.member_id for row in human_rows] == [ctx["dingtalk_member"].id]
+    assert [row.user_id for row in human_rows] == [ctx["member_user_id"]]
     assert [row.target_agent_id for row in agent_rows] == [ctx["target"].id]
 
 
@@ -701,7 +732,7 @@ async def test_execute_tool_remove_contact_removes_human_and_agent_relationships
         contact_session,
         ctx["source"].id,
         target_type="human",
-        target_id=str(ctx["dingtalk_member"].id),
+        target_id=str(ctx["member_user_id"]),
         current_user_id=ctx["creator_id"],
     )
     await add_contact_for_agent(
@@ -714,24 +745,24 @@ async def test_execute_tool_remove_contact_removes_human_and_agent_relationships
 
     human_result = await agent_tools.execute_tool(
         "remove_contact",
-        {"target_type": "human", "target_id": str(ctx["dingtalk_member"].id)},
+        {"user_id": str(ctx["member_user_id"])},
         ctx["source"].id,
         ctx["creator_id"],
         skip_autonomy=True,
     )
     agent_result = await agent_tools.execute_tool(
         "remove_contact",
-        {"target_type": "agent", "target_id": str(ctx["target"].id)},
+        {"agent_id": str(ctx["target"].id)},
         ctx["source"].id,
         ctx["creator_id"],
         skip_autonomy=True,
     )
 
     assert "✅ Removed 刘喜" in human_result
-    assert "human id=" in human_result
+    assert "user_id=" in human_result
     assert "human:" not in human_result
     assert "✅ Removed Research Agent" in agent_result
-    assert "agent id=" in agent_result
+    assert "agent_id=" in agent_result
     assert "agent:" not in agent_result
 
     human_rows = (

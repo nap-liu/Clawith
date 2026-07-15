@@ -54,13 +54,16 @@ async def resolve_confirmation_endpoint(
     # Raises 404 if agent not found, 403 if no access.
     await check_agent_access(db, current_user, agent_id)
 
-    result = await confirmation_service.resolve_confirmation(
-        agent_id=agent_id,
-        call_id=cid,
-        button_value=value,
-        button_label=label,
-        resolving_user_id=current_user.id,
-    )
+    try:
+        result = await confirmation_service.resolve_confirmation(
+            agent_id=agent_id,
+            call_id=cid,
+            button_value=value,
+            button_label=label,
+            resolving_user_id=current_user.id,
+        )
+    except confirmation_service.ConfirmationActorMismatch as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     if result is None:
         # Unknown card, not owned by this agent, or already resolved (idempotent).
         return {"status": "done", "result": None}

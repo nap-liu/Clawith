@@ -64,15 +64,18 @@ async def _seed_basic_agent() -> uuid.UUID:
 async def test_p2p_includes_current_conversation():
     """P2P 场景 (is_group=False): 必须含 ## Current Conversation 段."""
     agent_id = await _seed_basic_agent()
+    current_user_id = uuid.uuid4()
     static_p, dynamic_p = await build_agent_context(
         agent_id,
         "Test Agent",
         "role",
         current_user_name="Alice",
+        current_user_id=current_user_id,
         is_group=False,
     )
     assert "## Current Conversation" in dynamic_p
     assert "Alice" in dynamic_p
+    assert str(current_user_id) in dynamic_p
     # The Message Sender Tag rules block is unconditional — it must be in
     # static_parts even for P2P (regression guard against someone making
     # the rules-block injection conditional on is_group).

@@ -79,7 +79,7 @@ async def _seed_org_member(
         return member
 
 
-async def test_provision_org_member_creates_user_identity_participant_by_mobile():
+async def test_provision_org_member_creates_external_only_user_and_participant():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     phone = _phone()
@@ -99,6 +99,7 @@ async def test_provision_org_member_creates_user_identity_participant_by_mobile(
         await db.commit()
 
         assert result.user_created is True
+        assert result.external_only_user_created is True
         assert result.skipped_reason is None
         assert member.user_id == result.user.id
 
@@ -114,8 +115,8 @@ async def test_provision_org_member_creates_user_identity_participant_by_mobile(
         assert user.role == "member"
         assert user.registration_source == "dingtalk_org_sync"
         assert user.source == "dingtalk"
-        assert user.identity.phone == phone
-        assert user.identity.email == f"dingtalk_{provider.id.hex}_dt_create_user@dingtalk.local"
+        assert user.identity is None
+        assert member.phone == raw_phone
 
         participant_count = (
             await db.execute(
@@ -434,7 +435,7 @@ async def test_provision_org_member_does_not_link_inactive_tenant_user():
         assert member.user_id is None
 
 
-async def test_provision_org_member_skips_create_without_mobile():
+async def test_provision_org_member_without_mobile_still_gets_exact_external_user():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     member = await _seed_org_member(tenant.id, provider.id, phone=None, email="nomobile@example.com")
@@ -444,10 +445,12 @@ async def test_provision_org_member_skips_create_without_mobile():
         result = await contact_provisioning.ensure_user_for_org_member(db, member)
         await db.commit()
 
-        assert result.user is None
-        assert result.user_created is False
-        assert result.skipped_reason == "missing_mobile"
-        assert member.user_id is None
+        assert result.user is not None
+        assert result.user_created is True
+        assert result.external_only_user_created is True
+        assert result.skipped_reason is None
+        assert result.user.identity is None
+        assert member.user_id == result.user.id
 
 
 async def test_provision_org_member_upserts_participant_idempotently():
@@ -498,7 +501,7 @@ async def test_provision_org_member_upserts_participant_idempotently():
         assert participant_count == 1
 
 
-async def test_provision_org_member_upgrades_placeholder_email_without_overwriting_real_email():
+async def test_provision_org_member_never_mints_login_identity_from_directory_email():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     member = await _seed_org_member(
@@ -512,14 +515,16 @@ async def test_provision_org_member_upgrades_placeholder_email_without_overwriti
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
         first = await contact_provisioning.ensure_user_for_org_member(db, member)
-        assert first.user.identity.email == f"dingtalk_{provider.id.hex}_dt_email_upgrade@dingtalk.local"
+        assert first.user.identity is None
 
         real_email = f"real-{uuid.uuid4().hex[:10]}@example.com"
         member.email = real_email
         second = await contact_provisioning.ensure_user_for_org_member(db, member)
-        assert second.user.identity.email == real_email
+        assert second.user.id == first.user.id
+        assert second.user.identity is None
 
         member.email = None
         third = await contact_provisioning.ensure_user_for_org_member(db, member)
         await db.commit()
-        assert third.user.identity.email == real_email
+        assert third.user.id == first.user.id
+        assert third.user.identity is None

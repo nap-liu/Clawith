@@ -6,18 +6,20 @@ to poll for messages, report results, send messages, and send heartbeat pings.
 
 import asyncio
 import hashlib
+import json
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Header, HTTPException, Depends, Request
 from loguru import logger
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db, async_session
-from app.core.permissions import evaluate_agent_relationship_status, evaluate_human_relationship_status
+from app.core.permissions import evaluate_agent_relationship_status
 from app.models.agent import Agent
-from app.models.gateway_message import GatewayMessage
+from app.models.gateway_message import GatewayMessage, GatewaySendReceipt
 from app.models.user import User
 from app.schemas.schemas import (
     GatewayPollResponse, GatewayMessageOut, GatewayReportRequest,
@@ -59,6 +61,104 @@ async def _get_agent_by_key(api_key: str, db: AsyncSession) -> Agent:
     return agent
 
 
+def _gateway_send_request_hash(body: GatewaySendMessageRequest) -> str:
+    payload = {
+        "user_id": str(body.user_id) if body.user_id else None,
+        "agent_id": str(body.agent_id) if body.agent_id else None,
+        "content": body.content.strip(),
+        "channel": (body.channel or "").strip().lower() or None,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+async def _claim_gateway_send(
+    db: AsyncSession,
+    source_agent_id: uuid.UUID,
+    body: GatewaySendMessageRequest,
+    idempotency_key: str | None,
+) -> tuple[uuid.UUID | None, dict | None]:
+    key = (idempotency_key or "").strip()
+    if not key:
+        return None, None
+    if len(key) > 200:
+        raise HTTPException(status_code=422, detail="X-Idempotency-Key exceeds 200 characters")
+
+    request_hash = _gateway_send_request_hash(body)
+    receipt_id = uuid.uuid4()
+    await db.execute(
+        pg_insert(GatewaySendReceipt)
+        .values(
+            id=receipt_id,
+            source_agent_id=source_agent_id,
+            idempotency_key=key,
+            request_hash=request_hash,
+            status="pending",
+        )
+        .on_conflict_do_nothing(
+            index_elements=["source_agent_id", "idempotency_key"]
+        )
+    )
+    # Persist the claim before any external side effect. A crash can therefore
+    # leave an explicit in-progress/unknown receipt, but can never silently
+    # resend the same key and duplicate the operation.
+    await db.commit()
+    receipt = (
+        await db.execute(
+            select(GatewaySendReceipt).where(
+                GatewaySendReceipt.source_agent_id == source_agent_id,
+                GatewaySendReceipt.idempotency_key == key,
+            )
+        )
+    ).scalar_one()
+    if receipt.request_hash != request_hash:
+        raise HTTPException(
+            status_code=409,
+            detail="X-Idempotency-Key was already used with a different target or payload",
+        )
+    if receipt.id != receipt_id:
+        if receipt.status == "completed" and receipt.response_payload is not None:
+            replay = dict(receipt.response_payload)
+            error_status = replay.pop("__http_status", None)
+            if error_status:
+                raise HTTPException(status_code=int(error_status), detail=replay.get("detail"))
+            return None, replay
+        raise HTTPException(
+            status_code=409,
+            detail="The idempotent send is still in progress or its outcome is unknown",
+        )
+    return receipt.id, None
+
+
+async def _complete_gateway_send(
+    db: AsyncSession,
+    receipt_id: uuid.UUID | None,
+    response: dict,
+) -> dict:
+    if receipt_id is not None:
+        receipt = await db.get(GatewaySendReceipt, receipt_id)
+        if receipt is None:
+            raise HTTPException(status_code=500, detail="Gateway idempotency receipt was lost")
+        receipt.status = "completed"
+        receipt.response_payload = response
+        receipt.completed_at = datetime.now(timezone.utc)
+    await db.commit()
+    return response
+
+
+async def _complete_gateway_send_error(
+    db: AsyncSession,
+    receipt_id: uuid.UUID | None,
+    status_code: int,
+    detail,
+) -> None:
+    await _complete_gateway_send(
+        db,
+        receipt_id,
+        {"__http_status": status_code, "detail": detail},
+    )
+
+
 # ─── Poll for messages ──────────────────────────────────
 
 @router.get("/poll", response_model=GatewayPollResponse)
@@ -83,6 +183,7 @@ async def poll_messages(
         select(GatewayMessage)
         .where(GatewayMessage.agent_id == agent.id, GatewayMessage.status == "pending")
         .order_by(GatewayMessage.created_at.asc())
+        .with_for_update(skip_locked=True)
     )
     messages = result.scalars().all()
 
@@ -117,15 +218,22 @@ async def poll_messages(
             for h in hist_msgs:
                 # Resolve sender name for each history message
                 h_sender = None
-                if h.role == "user" and h.user_id:
-                    r = await db.execute(select(User.display_name).where(User.id == h.user_id))
+                if getattr(h, "sender_user_id", None):
+                    r = await db.execute(
+                        select(User.display_name).where(User.id == h.sender_user_id)
+                    )
                     h_sender = r.scalar_one_or_none()
-                elif h.role == "assistant":
-                    h_sender = agent.name
+                elif getattr(h, "sender_agent_id", None):
+                    r = await db.execute(
+                        select(Agent.name).where(Agent.id == h.sender_agent_id)
+                    )
+                    h_sender = r.scalar_one_or_none()
                 history.append(GatewayHistoryItem(
                     role=h.role,
                     content=h.content or "",
                     sender_name=h_sender,
+                    sender_user_id=getattr(h, "sender_user_id", None),
+                    sender_agent_id=getattr(h, "sender_agent_id", None),
                     created_at=h.created_at,
                 ))
 
@@ -133,6 +241,7 @@ async def poll_messages(
             id=msg.id,
             conversation_id=msg.conversation_id,
             sender_agent_name=sender_agent_name,
+            sender_agent_id=msg.sender_agent_id,
             sender_user_name=sender_user_name,
             sender_user_id=str(msg.sender_user_id) if msg.sender_user_id else None,
             content=msg.content,
@@ -142,31 +251,36 @@ async def poll_messages(
 
     # Fetch agent relationships for context
     from app.models.org import AgentRelationship, AgentAgentRelationship
+    from app.services.recipient_resolver import load_human_recipient_profiles
     from sqlalchemy.orm import selectinload
 
     rel_items = []
+    human_items: dict[uuid.UUID, GatewayRelationshipItem] = {}
 
     # Human relationships (with available channels)
     h_result = await db.execute(
         select(AgentRelationship)
         .where(AgentRelationship.agent_id == agent.id)
-        .options(selectinload(AgentRelationship.member))
     )
-    for r in h_result.scalars().all():
-        status_info = await evaluate_human_relationship_status(db, r, source_agent=agent)
-        if r.member and status_info["access_status"] == "active":
-            channels = []
-            if getattr(r.member, 'external_id', None) or getattr(r.member, 'open_id', None):
-                channels.append("feishu")
-            if getattr(r.member, 'email', None):
-                channels.append("email")
-            rel_items.append(GatewayRelationshipItem(
-                name=r.member.name,
-                type="human",
-                role=r.relation,
-                description=r.description or None,
-                channels=channels,
-            ))
+    human_relationships = list(h_result.scalars().all())
+    profiles = await load_human_recipient_profiles(db, agent, human_relationships)
+    for r in human_relationships:
+        profile = profiles.get(r.user_id)
+        if profile and profile.access_status == "active":
+            existing = human_items.get(r.user_id)
+            channels = list(profile.channels)
+            if existing:
+                existing.channels = sorted(set(existing.channels + channels))
+            else:
+                human_items[r.user_id] = GatewayRelationshipItem(
+                    display_name=profile.user.display_name,
+                    user_id=r.user_id,
+                    role=r.relation,
+                    description=r.description or None,
+                    channels=channels,
+                )
+
+    rel_items.extend(human_items.values())
 
     # Agent-to-agent relationships
     a_result = await db.execute(
@@ -178,8 +292,8 @@ async def poll_messages(
         status_info = await evaluate_agent_relationship_status(db, r)
         if r.target_agent and status_info["access_status"] == "active":
             rel_items.append(GatewayRelationshipItem(
-                name=r.target_agent.name,
-                type="agent",
+                display_name=r.target_agent.name,
+                agent_id=r.target_agent.id,
                 role=r.relation,
                 description=r.description or None,
                 channels=["agent"],
@@ -245,6 +359,7 @@ async def report_result(
             assistant_msg = ChatMessage(
                 agent_id=agent.id,
                 user_id=msg.sender_user_id or getattr(agent, "creator_id", agent.id),
+                sender_agent_id=agent.id,
                 role="assistant",
                 content=body.result,
                 conversation_id=msg.conversation_id,
@@ -454,6 +569,8 @@ async def _send_to_agent_background(
                 actor_ref=str(src_participant.id if src_participant else source_agent_id),
                 participant_id=src_participant.id if src_participant else None,
             )
+            ingested.message.sender_user_id = None
+            ingested.message.sender_agent_id = uuid.UUID(str(source_agent_id))
             await db.commit()
 
             if ingested.consumed_by_onmessage:
@@ -489,6 +606,7 @@ async def _send_to_agent_background(
                 role="assistant",
                 content=final_reply,
                 user_id=target_creator_id,
+                sender_agent_id=uuid.UUID(str(target_agent_id)),
                 participant_id=tgt_participant.id if tgt_participant else None,
                 external_event_key=f"gateway-direct-reply:{source_event_id}",
                 message_meta={
@@ -531,16 +649,10 @@ async def send_message(
     x_idempotency_key: str | None = Header(None, alias="X-Idempotency-Key"),
     db: AsyncSession = Depends(get_db),
 ):
-    """OpenClaw agent sends a message to a person or another agent.
-
-    Routes automatically based on target type:
-    - Agent target: triggers LLM processing, reply returned via next poll
-    - Human target: sends via available channel (feishu, etc.)
-    """
+    """Send by exactly one canonical user_id or agent_id."""
     agent = await _get_agent_by_key(x_api_key, db)
     agent.openclaw_last_seen = datetime.now(timezone.utc)
 
-    target_name = body.target.strip()
     content = body.content.strip()
     channel_hint = (body.channel or "").strip().lower()
 
@@ -548,26 +660,41 @@ async def send_message(
     from app.models.org import AgentAgentRelationship
     from sqlalchemy.orm import selectinload
 
-    rel_result = await db.execute(
-        select(AgentAgentRelationship)
-        .where(AgentAgentRelationship.agent_id == agent.id)
-        .options(selectinload(AgentAgentRelationship.target_agent))
-    )
     target_agent = None
-    for rel in rel_result.scalars().all():
-        candidate = rel.target_agent
-        if not candidate:
-            continue
-        status_info = await evaluate_agent_relationship_status(db, rel)
-        if status_info["access_status"] != "active":
-            continue
-        if candidate.name.lower() == target_name.lower() or target_name.lower() in candidate.name.lower():
-            target_agent = candidate
-            break
+    if body.agent_id:
+        rel_result = await db.execute(
+            select(AgentAgentRelationship)
+            .where(
+                AgentAgentRelationship.agent_id == agent.id,
+                AgentAgentRelationship.target_agent_id == body.agent_id,
+            )
+            .options(selectinload(AgentAgentRelationship.target_agent))
+        )
+        rel = rel_result.scalar_one_or_none()
+        if rel:
+            status_info = await evaluate_agent_relationship_status(db, rel)
+            if status_info["access_status"] == "active":
+                target_agent = rel.target_agent
+        if not target_agent:
+            raise HTTPException(
+                status_code=404,
+                detail="agent_id is not an active related digital employee",
+            )
 
-    logger.info(f"[Gateway] send_message: target='{target_name}', found_agent={target_agent.name if target_agent else None}, agent_type={getattr(target_agent, 'agent_type', None) if target_agent else None}, channel_hint='{channel_hint}'")
+    logger.info(
+        "[Gateway] send_message: user_id=%s agent_id=%s channel=%s",
+        body.user_id,
+        body.agent_id,
+        channel_hint,
+    )
 
-    if target_agent and (not channel_hint or channel_hint == "agent"):
+    receipt_id = None
+    if target_agent:
+        receipt_id, replay = await _claim_gateway_send(
+            db, agent.id, body, x_idempotency_key
+        )
+        if replay is not None:
+            return replay
         conv_id = f"gw_agent_{agent.id}_{target_agent.id}"
 
         if getattr(target_agent, 'agent_type', None) == 'openclaw':
@@ -580,13 +707,14 @@ async def send_message(
                 conversation_id=conv_id,
             )
             db.add(gw_msg)
-            await db.commit()
-            return {
+            response = {
                 "status": "accepted",
-                "target": target_agent.name,
+                "agent_id": str(target_agent.id),
+                "display_name": target_agent.name,
                 "type": "openclaw_agent",
                 "message": f"Message sent to {target_agent.name}. Reply will appear in your next poll.",
             }
+            return await _complete_gateway_send(db, receipt_id, response)
         else:
             # Native agent: async LLM processing
             # Extract plain values before session closes to avoid stale ORM references
@@ -609,109 +737,64 @@ async def send_message(
             ))
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
-            return {
+            response = {
                 "status": "accepted",
-                "target": target_agent.name,
+                "agent_id": str(target_agent.id),
+                "display_name": target_agent.name,
                 "type": "agent",
                 "message": f"Message sent to {target_agent.name}. Reply will appear in your next poll.",
             }
+            return await _complete_gateway_send(db, receipt_id, response)
 
-    # 2. Try to find target as a human (via relationships)
-    from app.models.org import AgentRelationship
-    from sqlalchemy.orm import selectinload
+    if not body.user_id:
+        raise HTTPException(status_code=422, detail="user_id or agent_id is required")
 
-    rel_result = await db.execute(
-        select(AgentRelationship)
-        .where(AgentRelationship.agent_id == agent.id)
-        .options(selectinload(AgentRelationship.member))
+    user_result = await db.execute(
+        select(User).where(User.id == body.user_id, User.tenant_id == agent.tenant_id)
     )
-    rels = rel_result.scalars().all()
+    target_user = user_result.scalar_one_or_none()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="user_id not found in agent tenant")
+    receipt_id, replay = await _claim_gateway_send(
+        db, agent.id, body, x_idempotency_key
+    )
+    if replay is not None:
+        return replay
 
-    target_member = None
-    for r in rels:
-        status_info = await evaluate_human_relationship_status(db, r, source_agent=agent)
-        if r.member and status_info["access_status"] == "active" and r.member.name == target_name:
-            target_member = r.member
-            break
-    # Fuzzy match if exact match fails
-    if not target_member:
-        for r in rels:
-            status_info = await evaluate_human_relationship_status(db, r, source_agent=agent)
-            if r.member and status_info["access_status"] == "active" and target_name.lower() in r.member.name.lower():
-                target_member = r.member
-                break
+    from app.services.agent_tools import _send_channel_message, _send_platform_message
 
-    if not target_member:
-        await db.commit()
-        raise HTTPException(
-            status_code=404,
-            detail=f"Target '{target_name}' not found. Check your relationships list."
+    if channel_hint in {"platform", "web"}:
+        send_result = await _send_platform_message(
+            agent.id, {"user_id": str(body.user_id), "message": content}
         )
+        selected_channel = "platform"
+    else:
+        send_args = {"user_id": str(body.user_id), "message": content}
+        if channel_hint:
+            send_args["channel"] = channel_hint
+        send_result = await _send_channel_message(agent.id, send_args)
+        selected_channel = channel_hint or None
 
-    # Send via feishu if available
-    if (target_member.external_id or target_member.open_id) and (not channel_hint or channel_hint == "feishu"):
-        from app.models.channel_config import ChannelConfig
-        from app.services.feishu_service import feishu_service
+    if send_result.startswith("❌"):
+        await _complete_gateway_send_error(db, receipt_id, 400, send_result)
+        raise HTTPException(status_code=400, detail=send_result)
+    if send_result.startswith("{"):
         import json as _json
-
-        config_result = await db.execute(
-            select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
-        )
-        config = config_result.scalar_one_or_none()
-        if not config:
-            # Try to find any feishu config in the org
-            config_result = await db.execute(
-                select(ChannelConfig).where(ChannelConfig.channel == "feishu").limit(1)
-            )
-            config = config_result.scalar_one_or_none()
-
-        if not config:
-            await db.commit()
-            raise HTTPException(status_code=400, detail="No Feishu channel configured")
-
-        # Extract config values and release connection before Feishu HTTP calls
-        _cfg_app_id = config.app_id
-        _cfg_app_secret = config.app_secret
-        await db.commit()
-        await db.close()
-
-        # Prefer user_id (tenant-stable, works across apps), fallback to open_id
-        resp = None
-        if target_member.external_id:
-            resp = await feishu_service.send_message(
-                _cfg_app_id, _cfg_app_secret,
-                receive_id=target_member.external_id,
-                msg_type="text",
-                content=_json.dumps({"text": content}, ensure_ascii=False),
-                receive_id_type="user_id",
-            )
-        if (resp is None or resp.get("code") != 0) and target_member.open_id:
-            resp = await feishu_service.send_message(
-                _cfg_app_id, _cfg_app_secret,
-                receive_id=target_member.open_id,
-                msg_type="text",
-                content=_json.dumps({"text": content}, ensure_ascii=False),
-                receive_id_type="open_id",
-            )
-
-        if resp and resp.get("code") == 0:
-            return {
-                "status": "sent",
-                "target": target_member.name,
-                "type": "human",
-                "channel": "feishu",
-            }
-        else:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Feishu send failed: {resp.get('msg') if resp else 'no ID available'} (code {resp.get('code') if resp else 'N/A'})"
-            )
-
-    await db.commit()
-    raise HTTPException(
-        status_code=400,
-        detail=f"No available channel to reach {target_member.name}. feishu_user_id={'yes' if target_member.external_id else 'no'}, feishu_open_id={'yes' if target_member.open_id else 'no'}"
-    )
+        try:
+            structured = _json.loads(send_result)
+        except ValueError:
+            structured = None
+        if isinstance(structured, dict) and structured.get("status") == "error":
+            await _complete_gateway_send_error(db, receipt_id, 400, structured)
+            raise HTTPException(status_code=400, detail=structured)
+    response = {
+        "status": "sent",
+        "user_id": str(body.user_id),
+        "display_name": target_user.display_name,
+        "channel": selected_channel,
+        "message": send_result,
+    }
+    return await _complete_gateway_send(db, receipt_id, response)
 
 
 # ─── Setup guide ────────────────────────────────────────
@@ -758,12 +841,13 @@ The response contains a `messages` array. Each message includes:
 - `content` — the message text
 - `sender_user_name` — name of the {platform_name} user who sent it
 - `sender_user_id` — unique ID of the sender
+- `sender_agent_id` — canonical digital-employee sender ID for A2A messages
 - `conversation_id` — the conversation this message belongs to
 - `history` — array of previous messages in this conversation for context
 
 The response also contains a `relationships` array describing your colleagues:
-- `name` — the person or agent name
-- `type` — "human" or "agent"
+- `display_name` — display-only person or agent name
+- `user_id` or `agent_id` — exactly one canonical execution identifier
 - `role` — relationship type (e.g. collaborator, supervisor)
 - `channels` — available communication channels (e.g. ["feishu"], ["agent"])
 
@@ -781,11 +865,12 @@ For each completed message, make an HTTP POST request:
 To proactively contact a person or agent, make an HTTP POST request:
 - URL: {base_url}/api/gateway/send-message
 - Header: X-Api-Key: {x_api_key}
+- Header: X-Idempotency-Key: <stable unique ID for this logical send; reuse the same key only when retrying it>
 - Header: Content-Type: application/json
-- Body: {{"target": "<name of person or agent>", "content": "<your message>"}}
+- Human body: {{"user_id": "<user_id>", "content": "<your message>", "channel": "<chosen route>"}}
+- Digital employee body: {{"agent_id": "<agent_id>", "content": "<your message>"}}
 
-The system auto-detects the best channel. For agents, the reply appears in your next poll.
-For humans, the message is delivered via their available channel (e.g. Feishu).
+Names are never execution locators. If a human has multiple valid channels, choose one from `relationships.channels`; the platform will not pick the first route. Always include X-Idempotency-Key and reuse it for retries of the same logical message. Agent replies appear in your next poll.
 """
 
     heartbeat_line = f"- Check {platform_name} inbox using the clawith_sync skill and process any pending messages"

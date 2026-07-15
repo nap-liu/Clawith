@@ -72,6 +72,12 @@ from app.config import get_settings
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
+from app.services.recipient_resolver import (
+    RecipientResolutionError,
+    resolve_agent_recipient,
+    resolve_human_channel_recipient,
+    resolve_platform_user_recipient,
+)
 
 
 _settings = get_settings()
@@ -90,7 +96,7 @@ _STDOUT_RPA_LIMIT = 20000
 A2A_DELIVERY_GUIDANCE = (
     "你正在回复另一位数字员工同事,请简洁、切题地作答。\n"
     "如果你写了任何文件(报告/文档/分析)需要交付给对方,必须调用 "
-    "send_file_to_agent(agent_name=\"<对方名字>\", file_path=\"<路径>\") 投递 —— "
+    "send_file_to_agent(agent_id=\"<Relationships 中对方的 agent_id>\", file_path=\"<路径>\") 投递 —— "
     "对方无法访问你的工作区,绝不能只告诉路径。"
 )
 
@@ -498,7 +504,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "set_trigger",
-            "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Every trigger is attached to a focus item; if focus_ref is omitted, the system will automatically create a focus item from the reason and attach the trigger to it. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or a human user replies — use from_agent_name for agents, or from_user_name for human users on Feishu/Slack/Discord), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.). For type=webhook you can also set webhook_mode to control how bursts of rapid triggers are handled — see the webhook_mode parameter.",
+            "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Every trigger is attached to a focus item; if focus_ref is omitted, the system will automatically create a focus item from the reason and attach the trigger to it. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or human replies — identify exactly one actor with from_agent_id or from_user_id), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.). For type=webhook you can also set webhook_mode to control how bursts of rapid triggers are handled — see the webhook_mode parameter.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -513,7 +519,7 @@ AGENT_TOOLS = [
                     },
                     "config": {
                         "type": "object",
-                        "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message: {\"from_agent_name\": \"<agent_name>\"} or {\"from_user_name\": \"<user_name>\"} (for human users on Feishu/Slack/Discord). webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)",
+                        "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message must contain exactly one canonical actor: {\"from_agent_id\": \"<agent_id>\"} or {\"from_user_id\": \"<user_id>\"}. webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)",
                     },
                     "reason": {
                         "type": "string",
@@ -595,7 +601,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_channel_file",
-            "description": "Send a workspace file to a person or back to the current conversation. To send to the person you are CURRENTLY talking to (you are replying inside an IM or web conversation), OMIT member_name — the file is delivered straight back to the current conversation and no relationship or contact lookup is required. Only pass member_name when sending to someone who is NOT the current conversation partner; the system then resolves that person across all connected channels (Feishu, DingTalk, WeCom, Slack, etc.) and delivers via the appropriate one.",
+            "description": "Send a workspace file to a person or back to the current conversation. Omit user_id only when replying to the current IM/web conversation; that preserves the exact current-session route. Explicit delivery to another person currently supports Feishu and Slack only; provide canonical user_id and choose one of those routes.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -603,9 +609,14 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "Workspace-relative path to the file, e.g. workspace/report.md",
                     },
-                    "member_name": {
+                    "user_id": {
                         "type": "string",
-                        "description": "OPTIONAL. Only set this to send to someone who is NOT the current conversation partner; the system then looks up this person across all configured channels and delivers via the appropriate one. Leave it unset to deliver to the current conversation.",
+                        "description": "Canonical platform user_id. Omit only to reply to the current conversation.",
+                    },
+                    "channel": {
+                        "type": "string",
+                        "enum": ["feishu", "slack"],
+                        "description": "Executable explicit file route chosen by the Agent.",
                     },
                     "message": {
                         "type": "string",
@@ -622,27 +633,22 @@ AGENT_TOOLS = [
             "name": "send_feishu_message",
             "description": (
                 "Send a Feishu IM message to a colleague. "
-                "You can provide either the colleague's name "
-                "or their Feishu user_id directly. "
+                "Provide the colleague's canonical platform user_id. "
                 "To contact digital employees use send_message_to_agent instead."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "member_name": {
-                        "type": "string",
-                        "description": "Recipient's name, e.g. '覃睿'. Will be looked up automatically.",
-                    },
                     "user_id": {
                         "type": "string",
-                        "description": "Recipient's Feishu user_id (preferred, tenant-stable). Get from feishu_user_search.",
+                        "description": "Recipient's canonical Clawith user_id. Provider IDs are resolved internally.",
                     },
                     "message": {
                         "type": "string",
                         "description": "Message content to send",
                     },
                 },
-                "required": ["message"],
+                "required": ["user_id", "message"],
             },
         },
     },
@@ -654,7 +660,7 @@ AGENT_TOOLS = [
                 "Search people and digital employees as candidates for relationship network editing. "
                 "Only use this tool when the user explicitly asks you to search, review, or edit the relationship network. "
                 "Do not use it proactively just because you want to contact someone. "
-                "Results include separate id and type fields. Pass them to add_contact as target_id and target_type."
+                "Human results contain user_id; digital employee results contain agent_id. Names are display-only."
             ),
             "parameters": {
                 "type": "object",
@@ -682,23 +688,15 @@ AGENT_TOOLS = [
         "function": {
             "name": "add_contact",
             "description": (
-                "Add a person or digital employee to your relationship network using the id and type returned by search_contacts. "
-                "Use target_type=human for people from synced org directories, and target_type=agent for digital employees. "
+                "Add a person or digital employee to your relationship network using exactly one canonical ID returned by search_contacts. "
                 "Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. "
                 "Do not add contacts proactively or based only on your own intent to contact someone."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target_type": {
-                        "type": "string",
-                        "description": "Contact type returned by search_contacts.",
-                        "enum": ["human", "agent"],
-                    },
-                    "target_id": {
-                        "type": "string",
-                        "description": "UUID id returned by search_contacts.",
-                    },
+                    "user_id": {"type": "string", "description": "Canonical natural-person user_id."},
+                    "agent_id": {"type": "string", "description": "Canonical digital-employee agent_id."},
                     "relation": {
                         "type": "string",
                         "description": "Relationship label, such as collaborator, stakeholder, peer, team_member, or other.",
@@ -708,7 +706,10 @@ AGENT_TOOLS = [
                         "description": "Optional short note explaining why this contact is needed.",
                     },
                 },
-                "required": ["target_type", "target_id"],
+                "oneOf": [
+                    {"required": ["user_id"], "not": {"required": ["agent_id"]}},
+                    {"required": ["agent_id"], "not": {"required": ["user_id"]}},
+                ],
             },
         },
     },
@@ -717,25 +718,20 @@ AGENT_TOOLS = [
         "function": {
             "name": "remove_contact",
             "description": (
-                "Remove a person or digital employee from your relationship network using the id and type returned by search_contacts. "
-                "Use target_type=human for people from synced org directories, and target_type=agent for digital employees. "
+                "Remove a person or digital employee from your relationship network using exactly one canonical ID returned by search_contacts. "
                 "Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. "
                 "Do not remove contacts proactively or based only on your own intent to stop messaging someone."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target_type": {
-                        "type": "string",
-                        "description": "Contact type returned by search_contacts.",
-                        "enum": ["human", "agent"],
-                    },
-                    "target_id": {
-                        "type": "string",
-                        "description": "UUID id returned by search_contacts.",
-                    },
+                    "user_id": {"type": "string", "description": "Canonical natural-person user_id."},
+                    "agent_id": {"type": "string", "description": "Canonical digital-employee agent_id."},
                 },
-                "required": ["target_type", "target_id"],
+                "oneOf": [
+                    {"required": ["user_id"], "not": {"required": ["agent_id"]}},
+                    {"required": ["agent_id"], "not": {"required": ["user_id"]}},
+                ],
             },
         },
     },
@@ -744,17 +740,16 @@ AGENT_TOOLS = [
         "function": {
             "name": "send_channel_message",
             "description": (
-                "Send a message to a colleague via their configured external channel "
-                "(Feishu, DingTalk, WeCom). Automatically detects the recipient's channel "
-                "based on their org relationship. Use this only for channel users. "
-                "For relationships labeled Platform User / 平台用户, use send_platform_message instead."
+                "Send a message to a related person through an external IM route. "
+                "Address the person only by canonical user_id. If several routes are valid, "
+                "choose channel explicitly; the platform never selects a first match."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "member_name": {
+                    "user_id": {
                         "type": "string",
-                        "description": "Recipient's name as shown in relationships, e.g. '张三'. Must be a person in your relationship network.",
+                        "description": "Recipient's canonical platform user_id from Relationships/search results.",
                     },
                     "message": {
                         "type": "string",
@@ -762,11 +757,11 @@ AGENT_TOOLS = [
                     },
                     "channel": {
                         "type": "string",
-                        "description": "Optional: Specific channel to use (feishu, dingtalk, wecom). Use this if multiple people have the same name in different channels.",
-                        "enum": ["feishu", "dingtalk", "wecom"]
+                        "description": "External route chosen by the Agent when multiple valid routes exist.",
+                        "enum": ["feishu", "dingtalk", "wecom", "slack", "teams", "wechat"]
                     },
                 },
-                "required": ["member_name", "message"],
+                "required": ["user_id", "message"],
             },
         },
     },
@@ -778,16 +773,16 @@ AGENT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "username": {
+                    "user_id": {
                         "type": "string",
-                        "description": "Username or display name of the recipient (must be a registered platform user)",
+                        "description": "Canonical platform user_id of the recipient.",
                     },
                     "message": {
                         "type": "string",
                         "description": "Message content to send",
                     },
                 },
-                "required": ["username", "message"],
+                "required": ["user_id", "message"],
             },
         },
     },
@@ -839,9 +834,9 @@ AGENT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "agent_name": {
+                    "agent_id": {
                         "type": "string",
-                        "description": "Target digital employee's name",
+                        "description": "Target digital employee's canonical agent_id from Relationships/search results.",
                     },
                     "message": {
                         "type": "string",
@@ -862,7 +857,7 @@ AGENT_TOOLS = [
                         ),
                     },
                 },
-                "required": ["agent_name", "message", "msg_type"],
+                "required": ["agent_id", "message", "msg_type"],
             },
         },
     },
@@ -874,9 +869,9 @@ AGENT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "agent_name": {
+                    "agent_id": {
                         "type": "string",
-                        "description": "Target digital employee's name",
+                        "description": "Target digital employee's canonical agent_id from Relationships/search results.",
                     },
                     "file_path": {
                         "type": "string",
@@ -887,7 +882,7 @@ AGENT_TOOLS = [
                         "description": "Optional delivery note for the target digital employee",
                     },
                 },
-                "required": ["agent_name", "file_path"],
+                "required": ["agent_id", "file_path"],
             },
         },
     },
@@ -1465,9 +1460,9 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "查询截止时间，ISO 8601 格式。默认：7天后。",
                     },
-                    "user_open_id": {
+                    "user_id": {
                         "type": "string",
-                        "description": "要查询 freebusy 的用户 open_id。不填则自动使用当前对话发送者。",
+                        "description": "要查询 freebusy 的 canonical platform user_id。不填则自动使用当前飞书对话发送者。",
                     },
                     "max_results": {
                         "type": "integer",
@@ -1502,20 +1497,10 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "Event description or agenda",
                     },
-                    "attendee_names": {
+                    "attendee_user_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Names of colleagues to invite, e.g. ['覃睿', '张三']. Will be looked up automatically via feishu_user_search.",
-                    },
-                    "attendee_open_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Feishu open_ids to invite directly (if you already have them from feishu_user_search).",
-                    },
-                    "attendee_emails": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Additional attendee emails to invite (use attendee_names if you only have the name).",
+                        "description": "Canonical platform user_ids to invite. Use feishu_user_search to discover exact IDs.",
                     },
                     "location": {
                         "type": "string",
@@ -1538,7 +1523,6 @@ AGENT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "user_email": {"type": "string", "description": "Calendar owner's email"},
                     "event_id": {"type": "string", "description": "Event ID from feishu_calendar_list"},
                     "summary": {"type": "string", "description": "New title"},
                     "description": {"type": "string", "description": "New description"},
@@ -1546,7 +1530,7 @@ AGENT_TOOLS = [
                     "end_time": {"type": "string", "description": "New end time (ISO 8601)"},
                     "location": {"type": "string", "description": "New location"},
                 },
-                "required": ["user_email", "event_id"],
+                "required": ["event_id"],
             },
         },
     },
@@ -1558,10 +1542,9 @@ AGENT_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "user_email": {"type": "string", "description": "Calendar owner's email"},
                     "event_id": {"type": "string", "description": "Event ID to delete"},
                 },
-                "required": ["user_email", "event_id"],
+                "required": ["event_id"],
             },
         },
     },
@@ -1575,7 +1558,7 @@ AGENT_TOOLS = [
                 "Supports ALL file types: docx, bitable, sheet, doc, folder, mindnote, slides. "
                 "Can add or remove collaborators with viewer/editor/full_access roles, "
                 "or get the current collaborator list. "
-                "Accepts colleague names (auto-searched) or open_ids directly."
+                "Accepts canonical platform user_ids; Feishu IDs remain internal."
             ),
             "parameters": {
                 "type": "object",
@@ -1594,15 +1577,10 @@ AGENT_TOOLS = [
                         "enum": ["add", "remove", "list"],
                         "description": "'add' to grant access, 'remove' to revoke, 'list' to view current collaborators",
                     },
-                    "member_names": {
+                    "user_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Colleague names to add/remove, e.g. ['覃睿', '张三']. Auto-searched.",
-                    },
-                    "member_open_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Feishu open_ids to add/remove directly (if already known).",
+                        "description": "Canonical platform user_ids to add/remove.",
                     },
                     "permission": {
                         "type": "string",
@@ -1648,9 +1626,9 @@ AGENT_TOOLS = [
             "name": "feishu_user_search",
             "description": (
                 "Search for a colleague in the Feishu (Lark) directory by name. "
-                "Returns their open_id, email, and department so you can send messages, "
-                "invite them to calendar events, or share documents. "
-                "Use this whenever you need to find a colleague's Feishu identity."
+                "Returns each related person's canonical platform user_id, display name, "
+                "and department. Names are discovery-only; use the exact returned user_id "
+                "for messages, calendar invitations, approvals, and document sharing."
             ),
             "parameters": {
                 "type": "object",
@@ -1679,7 +1657,7 @@ AGENT_TOOLS = [
                     },
                     "user_id": {
                         "type": "string",
-                        "description": "发起人的 open_id。可以通过 feishu_user_search 获取。",
+                        "description": "发起人的 canonical platform user_id，可通过 feishu_user_search 获取。",
                     },
                     "form_data": {
                         "type": "string",
@@ -4434,15 +4412,15 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     """Send a file to a person or back to the current channel.
     
     Priority:
-    1. If member_name is provided, resolve the recipient across all configured channels
-       and deliver via the appropriate one (Feishu, Slack, etc.).
+    1. If canonical user_id is provided, resolve one exact internal route.
     2. If channel_file_sender ContextVar is set (channel-initiated), use it directly.
     3. Fall back to a structured web/H5 file delivery result when no explicit recipient is requested.
     """
     raw_rel_path = arguments.get("file_path", "")
     rel_path = raw_rel_path.strip() if isinstance(raw_rel_path, str) else ""
     accompany_msg = arguments.get("message", "")
-    member_name = (arguments.get("member_name") or "").strip()
+    canonical_user_id = str(arguments.get("user_id") or "").strip()
+    channel = str(arguments.get("channel") or "").strip().lower() or None
     if not rel_path:
         return "Error: file_path is required"
     rel_path = _normalize_tool_workspace_rel_path(rel_path)
@@ -4461,14 +4439,14 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     if not file_path.exists():
         return f"Error: File not found: {rel_path}"
 
-    # Priority 1: explicit recipient - resolve member across channels
-    if member_name:
-        result = await _send_file_to_recipient(agent_id, file_path, member_name, accompany_msg)
-        if result:
-            return result
-        return (
-            f"Failed to send file to '{member_name}': recipient not reachable via configured channels. "
-            "Use send_message_to_agent for digital employees, or omit member_name to return a download link."
+    # Priority 1: explicit canonical recipient.
+    if canonical_user_id:
+        return await _send_file_to_recipient(
+            agent_id,
+            file_path,
+            canonical_user_id,
+            accompany_msg,
+            channel=channel,
         )
 
     # Priority 2: channel-initiated (ContextVar set by channel webhook handler)
@@ -4515,79 +4493,60 @@ def _platform_file_delivery_result(file_path: Path, rel_path: str, message: str 
 
 
 async def _send_file_to_recipient(
-    agent_id: uuid.UUID, file_path: Path, member_name: str, message: str = ""
-) -> str | None:
-    """Resolve a recipient by name and send file via their reachable channel.
-    
-    Checks Feishu and Slack channels configured for this agent.
-    Returns a result string, or None if no channel found.
-    """
-    from app.models.channel_config import ChannelConfig
-
+    agent_id: uuid.UUID,
+    file_path: Path,
+    user_id: str,
+    message: str = "",
+    *,
+    channel: str | None = None,
+) -> str:
+    """Resolve one canonical recipient route and send without name lookup."""
     async with async_session() as db:
-        # Load all channel configs for this agent
-        result = await db.execute(
-            select(ChannelConfig).where(ChannelConfig.agent_id == agent_id)
+        try:
+            route = await resolve_human_channel_recipient(
+                db, agent_id, user_id, channel=channel
+            )
+        except RecipientResolutionError as exc:
+            return exc.as_json()
+        config_result = await db.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent_id,
+                ChannelConfig.channel_type
+                == ("microsoft_teams" if route.channel == "teams" else route.channel),
+                ChannelConfig.is_configured.is_(True),
+            )
         )
-        configs = {c.channel_type: c for c in result.scalars().all()}
-
-    # --- Try Feishu ---
-    feishu_config = configs.get("feishu")
-    if feishu_config:
-        feishu_result = await _send_file_via_feishu(agent_id, feishu_config, file_path, member_name, message)
-        if feishu_result:
-            return feishu_result
-
-    # --- Try Slack ---
-    slack_config = configs.get("slack")
-    if slack_config:
-        slack_result = await _send_file_via_slack(agent_id, slack_config, file_path, member_name, message)
-        if slack_result:
-            return slack_result
-
-    return None  # No channel could reach this recipient
-
-
-async def _resolve_feishu_recipient(agent_id: uuid.UUID, config, member_name: str) -> tuple[str, str] | None:
-    """Resolve a Feishu recipient by name. Returns (receive_id, id_type) or None."""
-    # 1. Try feishu_user_search (checks cache, OrgMember, User table)
-    import re as _re
-    search_result = await _feishu_user_search(agent_id, {"name": member_name})
-    
-    uid_match = _re.search(r'user_id: `([A-Za-z0-9]+)`', search_result)
-    oid_match = _re.search(r'open_id: `(ou_[A-Za-z0-9]+)`', search_result)
-    
-    if uid_match:
-        return (uid_match.group(1), "user_id")
-    if oid_match:
-        return (oid_match.group(1), "open_id")
-    
-    # 2. Try AgentRelationship
-    from app.models.org import AgentRelationship
-    from sqlalchemy.orm import selectinload
-    async with async_session() as db:
-        result = await db.execute(
-            select(AgentRelationship)
-            .where(AgentRelationship.agent_id == agent_id)
-            .options(selectinload(AgentRelationship.member))
+        config = config_result.scalar_one_or_none()
+    if not config:
+        return RecipientResolutionError(
+            "channel_unconfigured",
+            f"Source agent has no configured {route.channel} channel",
+        ).as_json()
+    if route.channel == "feishu":
+        return await _send_file_via_feishu(
+            agent_id, config, file_path, route.member, route.user.display_name, message
         )
-        for r in result.scalars().all():
-            if r.member and r.member.name == member_name:
-                if r.member.external_id:
-                    return (r.member.external_id, "user_id")
-                if r.member.open_id:
-                    return (r.member.open_id, "open_id")
-                break
-    return None
+    if route.channel == "slack":
+        return await _send_file_via_slack(
+            config, file_path, route.member, route.user.display_name, message
+        )
+    return RecipientResolutionError(
+        "file_route_unsupported",
+        f"File delivery is not implemented for {route.channel}",
+        available_channels=[route.channel],
+    ).as_json()
 
 
-async def _send_file_via_feishu(agent_id, config, file_path: Path, member_name: str, message: str) -> str | None:
-    """Send file to a person via Feishu. Returns result string or None."""
-    recipient = await _resolve_feishu_recipient(agent_id, config, member_name)
-    if not recipient:
-        return None
-    
-    receive_id, id_type = recipient
+async def _send_file_via_feishu(
+    agent_id, config, file_path: Path, member: OrgMember, display_name: str, message: str
+) -> str:
+    """Send a file to an already-authorized internal Feishu endpoint."""
+    receive_id = (member.external_id or member.open_id or "").strip()
+    id_type = "user_id" if member.external_id else "open_id"
+    if not receive_id:
+        return RecipientResolutionError(
+            "recipient_unreachable", "Canonical user has no usable Feishu endpoint"
+        ).as_json()
     from app.services.feishu_service import feishu_service
     try:
         await feishu_service.upload_and_send_file(
@@ -4596,7 +4555,7 @@ async def _send_file_via_feishu(agent_id, config, file_path: Path, member_name: 
             receive_id_type=id_type,
             accompany_msg=message,
         )
-        return f"File '{file_path.name}' sent to {member_name} via Feishu."
+        return f"File '{file_path.name}' sent to {display_name} via Feishu."
     except Exception as e:
         # If upload fails, try sending a download link as fallback
         import json as _j
@@ -4622,39 +4581,28 @@ async def _send_file_via_feishu(agent_id, config, file_path: Path, member_name: 
                 _j.dumps({"text": "\n\n".join(parts)}, ensure_ascii=False),
                 receive_id_type=id_type,
             )
-            return f"File upload to Feishu failed, sent download link to {member_name} instead."
+            return f"File upload to Feishu failed, sent download link to {display_name} instead."
         except Exception:
-            return f"Failed to send file to {member_name} via Feishu: {e}"
+            return f"Failed to send file to {display_name} via Feishu: {e}"
 
 
-async def _send_file_via_slack(agent_id, config, file_path: Path, member_name: str, message: str) -> str | None:
-    """Send file to a person via Slack DM. Returns result string or None."""
+async def _send_file_via_slack(
+    config, file_path: Path, member: OrgMember, display_name: str, message: str
+) -> str:
+    """Send file to an already-authorized internal Slack endpoint."""
     import httpx
     bot_token = config.app_secret or ""
     if not bot_token:
-        return None
-    
-    # Resolve Slack user by name
+        return RecipientResolutionError(
+            "channel_unconfigured", "Slack bot token is missing"
+        ).as_json()
+    slack_user_id = (member.external_id or "").strip()
+    if not slack_user_id:
+        return RecipientResolutionError(
+            "recipient_unreachable", "Canonical user has no usable Slack endpoint"
+        ).as_json()
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                "https://slack.com/api/users.list",
-                headers={"Authorization": f"Bearer {bot_token}"},
-                params={"limit": 200},
-            )
-            data = resp.json()
-            if not data.get("ok"):
-                return None
-            slack_user_id = None
-            for u in data.get("members", []):
-                profile = u.get("profile", {})
-                display = profile.get("display_name", "") or profile.get("real_name", "") or u.get("real_name", "")
-                if display == member_name or u.get("name") == member_name:
-                    slack_user_id = u.get("id")
-                    break
-            if not slack_user_id:
-                return None
-            
             # Open a DM channel
             dm_resp = await client.post(
                 "https://slack.com/api/conversations.open",
@@ -4663,7 +4611,7 @@ async def _send_file_via_slack(agent_id, config, file_path: Path, member_name: s
             )
             dm_data = dm_resp.json()
             if not dm_data.get("ok"):
-                return None
+                return f"Slack conversations.open failed: {dm_data.get('error')}"
             channel_id = dm_data["channel"]["id"]
             
             # Upload file
@@ -4685,7 +4633,7 @@ async def _send_file_via_slack(agent_id, config, file_path: Path, member_name: s
             )
             if not complete.json().get("ok"):
                 return f"Slack file upload complete failed: {complete.json().get('error')}"
-            return f"File '{file_path.name}' sent to {member_name} via Slack."
+            return f"File '{file_path.name}' sent to {display_name} via Slack."
     except Exception as e:
         return f"Failed to send file via Slack: {e}"
 
@@ -6403,6 +6351,44 @@ async def _manage_tasks(
     async with async_session() as db:
         if action == "create":
             task_type = args.get("task_type", "todo")
+            resolved_target = None
+            target_user_id = None
+            target_agent_id = None
+            if task_type == "supervision":
+                if args.get("supervision_target_name"):
+                    return (
+                        "❌ supervision_target_name is display-only; provide exactly "
+                        "one canonical supervision_target_user_id or "
+                        "supervision_target_agent_id"
+                    )
+                try:
+                    target_user_id = (
+                        uuid.UUID(str(args["supervision_target_user_id"]))
+                        if args.get("supervision_target_user_id")
+                        else None
+                    )
+                    target_agent_id = (
+                        uuid.UUID(str(args["supervision_target_agent_id"]))
+                        if args.get("supervision_target_agent_id")
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    return "❌ supervision target IDs must be complete platform UUIDs"
+                from app.services.supervision_targets import resolve_supervision_target
+                try:
+                    resolved_target = await resolve_supervision_target(
+                        db,
+                        agent_id,
+                        target_user_id=target_user_id,
+                        target_agent_id=target_agent_id,
+                        channel=args.get("supervision_channel"),
+                    )
+                except (RecipientResolutionError, ValueError) as exc:
+                    return (
+                        exc.as_json()
+                        if isinstance(exc, RecipientResolutionError)
+                        else f"❌ {exc}"
+                    )
             task = Task(
                 agent_id=agent_id,
                 title=title,
@@ -6411,8 +6397,12 @@ async def _manage_tasks(
                 priority=args.get("priority", "medium"),
                 created_by=user_id,
                 status="pending",
-                supervision_target_name=args.get("supervision_target_name"),
-                supervision_channel=args.get("supervision_channel", "feishu"),
+                supervision_target_user_id=target_user_id,
+                supervision_target_agent_id=target_agent_id,
+                supervision_target_name=(
+                    resolved_target.display_name if resolved_target else None
+                ),
+                supervision_channel=(resolved_target.channel if resolved_target else None),
                 remind_schedule=args.get("remind_schedule"),
             )
             db.add(task)
@@ -6428,7 +6418,7 @@ async def _manage_tasks(
                 return f"✅ Task created: {title} — auto-execution started"
             else:
                 # Supervision task — reminder engine will pick it up
-                target = args.get('supervision_target_name', 'someone')
+                target = resolved_target.display_name if resolved_target else "unknown"
                 schedule = args.get('remind_schedule', 'not set')
                 await _sync_tasks_to_file(agent_id, ws)
                 return f"✅ Supervision task created: '{title}' — will remind {target} on schedule ({schedule})"
@@ -6472,10 +6462,10 @@ def _format_contact_search_results(rows: list[dict]) -> str:
 
     lines = [f"Found {len(rows)} contact(s):"]
     for item in rows:
-        if item.get("type") == "agent":
+        if item.get("agent_id"):
             role = f" — {item.get('role_description')}" if item.get("role_description") else ""
             lines.append(
-                f"- id={item['id']} | type=agent | {item.get('name')}{role} | "
+                f"- agent_id={item['agent_id']} | display_name={item.get('name')}{role} | "
                 f"relationship={item.get('relationship_status')}"
             )
         else:
@@ -6483,7 +6473,7 @@ def _format_contact_search_results(rows: list[dict]) -> str:
             dept = f" | dept={item.get('department_path')}" if item.get("department_path") else ""
             phone = f" | phone={item.get('phone')}" if item.get("phone") else ""
             lines.append(
-                f"- id={item['id']} | type=human | {item.get('name')}{title} | "
+                f"- user_id={item['user_id']} | display_name={item.get('name')}{title} | "
                 f"channel={item.get('channel')}{dept}{phone} | relationship={item.get('relationship_status')}"
             )
     return "\n".join(lines)
@@ -6508,74 +6498,127 @@ async def _search_contacts_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.U
             current_user_id=user_id,
             limit=limit,
         )
-    return _format_contact_search_results(rows)
+        normalized: list[dict] = []
+        seen_users: set[str] = set()
+        for item in rows:
+            public = dict(item)
+            raw_id = public.pop("id", None)
+            item_type = public.pop("type", None)
+            if item_type == "agent":
+                public["agent_id"] = str(public.get("agent_id") or raw_id)
+                normalized.append(public)
+                continue
+            canonical_user_id = public.get("user_id") or raw_id
+            if not canonical_user_id:
+                # Workstream 3 must provision an external-only User before this
+                # person can enter the public Agent identity contract.
+                continue
+            canonical = str(canonical_user_id)
+            if canonical in seen_users:
+                continue
+            seen_users.add(canonical)
+            public["user_id"] = canonical
+            normalized.append(public)
+    return _format_contact_search_results(normalized)
 
 
 async def _add_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID | None) -> str:
-    target_type = (args.get("target_type") or args.get("type") or "").strip().lower()
-    target_id = (args.get("target_id") or args.get("id") or "").strip()
-    if not target_type or not target_id:
-        return "❌ Please provide target_type and target_id from search_contacts"
+    human_id = str(args.get("user_id") or "").strip()
+    digital_id = str(args.get("agent_id") or "").strip()
+    if bool(human_id) == bool(digital_id):
+        return "❌ Provide exactly one of user_id or agent_id from search_contacts"
 
-    from app.services.contact_relationships import add_contact_for_agent
+    from app.services.contact_relationships import (
+        add_agent_contact_for_agent,
+        add_user_contact_for_agent,
+    )
 
     async with async_session() as db:
-        result = await add_contact_for_agent(
-            db,
-            agent_id,
-            target_type=target_type,
-            target_id=target_id,
-            relation=args.get("relation") or "collaborator",
-            description=args.get("description") or "",
-            current_user_id=user_id,
-        )
+        try:
+            target_uuid = uuid.UUID(digital_id or human_id)
+        except ValueError:
+            return "❌ user_id/agent_id must be a complete platform UUID"
+        common = {
+            "relation": args.get("relation") or "collaborator",
+            "description": args.get("description") or "",
+            "current_user_id": user_id,
+        }
+        if digital_id:
+            result = await add_agent_contact_for_agent(
+                db, agent_id, target_agent_id=target_uuid, **common
+            )
+        else:
+            result = await add_user_contact_for_agent(
+                db, agent_id, user_id=target_uuid, **common
+            )
         if result.get("status") in {"added", "already_added"}:
             await db.commit()
         else:
             await db.rollback()
 
     if result.get("status") == "added":
+        public_id = digital_id if digital_id else human_id
+        public_field = "agent_id" if digital_id else "user_id"
         return (
-            f"✅ Added {result.get('name')} ({result.get('type')} id={result.get('id')}) "
-            f"as {result.get('type')} contact."
+            f"✅ Added {result.get('name')} ({public_field}={public_id}) as a contact."
         )
     if result.get("status") == "already_added":
+        public_id = digital_id if digital_id else human_id
+        public_field = "agent_id" if digital_id else "user_id"
         return (
-            f"ℹ️ {result.get('name')} ({result.get('type')} id={result.get('id')}) is already in your relationship network. "
+            f"ℹ️ {result.get('name')} ({public_field}={public_id}) is already in your relationship network. "
             "Updated relation details."
         )
     return f"❌ Unable to add contact: {result.get('reason', 'unknown_error')}"
 
 
 async def _remove_contact_tool(agent_id: uuid.UUID, args: dict, user_id: uuid.UUID | None) -> str:
-    target_type = (args.get("target_type") or args.get("type") or "").strip().lower()
-    target_id = (args.get("target_id") or args.get("id") or "").strip()
-    if not target_type or not target_id:
-        return "❌ Please provide target_type and target_id from search_contacts"
+    human_id = str(args.get("user_id") or "").strip()
+    digital_id = str(args.get("agent_id") or "").strip()
+    if bool(human_id) == bool(digital_id):
+        return "❌ Provide exactly one of user_id or agent_id from search_contacts"
 
-    from app.services.contact_relationships import remove_contact_for_agent
+    from app.services.contact_relationships import (
+        remove_agent_contact_for_agent,
+        remove_user_contact_for_agent,
+    )
 
     async with async_session() as db:
-        result = await remove_contact_for_agent(
-            db,
-            agent_id,
-            target_type=target_type,
-            target_id=target_id,
-            current_user_id=user_id,
-        )
+        try:
+            target_uuid = uuid.UUID(digital_id or human_id)
+        except ValueError:
+            return "❌ user_id/agent_id must be a complete platform UUID"
+        if digital_id:
+            result = await remove_agent_contact_for_agent(
+                db,
+                agent_id,
+                target_agent_id=target_uuid,
+                current_user_id=user_id,
+            )
+        else:
+            result = await remove_user_contact_for_agent(
+                db,
+                agent_id,
+                user_id=target_uuid,
+                current_user_id=user_id,
+            )
         if result.get("status") == "removed":
             await db.commit()
         else:
             await db.rollback()
 
     if result.get("status") == "removed":
+        public_id = digital_id if digital_id else human_id
+        public_field = "agent_id" if digital_id else "user_id"
         return (
-            f"✅ Removed {result.get('name')} ({result.get('type')} id={result.get('id')}) "
+            f"✅ Removed {result.get('name')} ({public_field}={public_id}) "
             "from your relationship network."
         )
     if result.get("status") == "not_found":
+        public_id = digital_id if digital_id else human_id
+        public_field = "agent_id" if digital_id else "user_id"
         return (
-            f"ℹ️ {result.get('name')} ({result.get('type')} id={result.get('id')}) "
+            f"ℹ️ {result.get('name')} ({public_field}={public_id}) "
             "is not in your relationship network."
         )
     return f"❌ Unable to remove contact: {result.get('reason', 'unknown_error')}"
@@ -6590,194 +6633,82 @@ async def _send_feishu_message(
     tool_call_id: str | None = None,
     origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
-    """Send a Feishu message to a person in the agent's relationship list."""
-    member_name = (args.get("member_name") or "").strip()
-    direct_user_id = (args.get("user_id") or "").strip()
+    """Send Feishu IM by canonical platform user_id."""
+    canonical_user_id = (args.get("user_id") or "").strip()
     message_text = (args.get("message") or "").strip()
-
-    if not message_text:
-        return "❌ Please provide message content"
-    if not member_name and not direct_user_id:
-        return "❌ Please provide member_name or user_id"
-
+    if not canonical_user_id or not message_text:
+        return "❌ Please provide canonical user_id and message content"
     try:
         from app.services.feishu_service import FeishuAPIError, feishu_service
-        from sqlalchemy.orm import selectinload
-
         async with async_session() as db:
-            # ── Shortcut: if caller provided user_id directly ──
+            try:
+                route = await resolve_human_channel_recipient(
+                    db, agent_id, canonical_user_id, channel="feishu"
+                )
+            except RecipientResolutionError as exc:
+                return exc.as_json()
             config_result = await db.execute(
-                select(ChannelConfig).where(ChannelConfig.agent_id == agent_id, ChannelConfig.channel_type == "feishu")
+                select(ChannelConfig).where(
+                    ChannelConfig.agent_id == agent_id,
+                    ChannelConfig.channel_type == "feishu",
+                    ChannelConfig.is_configured.is_(True),
+                )
             )
             config = config_result.scalar_one_or_none()
             if not config:
                 return "❌ This agent has no Feishu channel configured"
-            if direct_user_id and not member_name:
-                rel_result = await db.execute(
-                    select(AgentRelationship)
-                    .join(OrgMember, AgentRelationship.member_id == OrgMember.id)
-                    .where(
-                        AgentRelationship.agent_id == agent_id,
-                        (OrgMember.external_id == direct_user_id) | (OrgMember.open_id == direct_user_id),
-                        OrgMember.status == "active",
-                    )
-                    .options(selectinload(AgentRelationship.member))
-                )
-                direct_rel = rel_result.scalars().first()
-                if not direct_rel:
-                    return "❌ Recipient is not in your active relationship network"
-                status_info = await evaluate_human_relationship_status(db, direct_rel)
-                if status_info["access_status"] != "active":
-                    return f"❌ Relationship to recipient is not active ({status_info['access_status_reason'] or 'restricted'})"
-                try:
-                    resp = await feishu_service.send_message(
-                        config.app_id, config.app_secret,
-                        receive_id=direct_user_id, msg_type="text",
-                        content=json.dumps({"text": message_text}, ensure_ascii=False),
-                        receive_id_type="user_id",
-                    )
-                    if resp.get("code") == 0:
-                        target_member = direct_rel.member
-                        agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                        agent_obj = agent_r.scalar_one_or_none()
-                        platform_user = await get_platform_user_by_org_member(
-                            db=db,
-                            org_member=target_member,
-                            agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
-                        )
-                        sess = await find_or_create_channel_session(
-                            db=db,
-                            agent_id=agent_id,
-                            user_id=platform_user.id,
-                            external_conv_id=f"feishu_p2p_{direct_user_id}",
-                            source_channel="feishu",
-                            first_message_title=f"[Agent → {direct_user_id}]",
-                        )
-                        external_message_id = str(
-                            ((resp.get("data") or {}).get("message_id")) or resp.get("message_id") or ""
-                        ) or None
-                        await _persist_outbound_channel_message(
-                            db,
-                            agent_id=agent_id,
-                            user_id=platform_user.id,
-                            session=sess,
-                            content=message_text,
-                            source_channel="feishu",
-                            actor_ref=direct_user_id,
-                            target_name=target_member.name or direct_user_id,
-                            origin_session_id=origin_session_id,
-                            origin_source_channel=None,
-                            tool_call_id=tool_call_id,
-                            origin_turn_anchor_id=origin_turn_anchor_id,
-                            external_message_id=external_message_id,
-                        )
-                        await db.commit()
-                        return f"✅ 消息已发送（user_id: {direct_user_id}）"
-                    return f"❌ 发送失败：{resp.get('msg')} (code {resp.get('code')})"
-                except FeishuAPIError as user_id_err:
-                    logger.info(f"❌ 发送失败(user_id): {user_id_err.msg}")
-                    return f"❌ 飞书发送失败：{user_id_err.user_message}"
-
-            # Find the relationship member by name
-            result = await db.execute(
-                select(AgentRelationship)
-                .where(AgentRelationship.agent_id == agent_id)
-                .options(selectinload(AgentRelationship.member))
-            )
-            rels = result.scalars().all()
-
-            target_member = None
-            for r in rels:
-                status_info = await evaluate_human_relationship_status(db, r)
-                if r.member and status_info["access_status"] == "active" and r.member.name == member_name:
-                    target_member = r.member
-                    break
-
-            if not target_member:
-                logger.info(f"❌ {member_name} has no Feishu user_id in relationship")   
-                return f"❌ {member_name} 不是我的关系"
-                
-            logger.info(f"target_member={target_member.external_id}, {target_member.open_id}, {target_member.email}, {target_member.phone}")
-            if not target_member.external_id:
-                logger.error(f"❌ {member_name} has no linked Feishu user_id")
-                return f"❌ {member_name} 没有关联可用的飞书 user_id"
-
-            content = json.dumps({"text": message_text}, ensure_ascii=False)
-
-            async def _try_send(app_id: str, app_secret: str, receive_id: str, id_type: str = "user_id") -> dict:
-                return await feishu_service.send_message(
-                    app_id, app_secret,
-                    receive_id=receive_id, msg_type="text",
-                    content=content, receive_id_type=id_type,
-                )
-
-            async def _save_outgoing_to_feishu_session(
-                feishu_user_id: str,
-                external_message_id: str | None,
-            ) -> tuple[ChatSession, ChatMessage] | None:
-                """Save the outgoing message to the Feishu P2P chat session."""
-                try:
-                    agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                    agent_obj = agent_r.scalar_one_or_none()
-
-                    # Get or create platform user from OrgMember (unified logic)
-                    platform_user = await get_platform_user_by_org_member(
-                        db=db,
-                        org_member=target_member,
-                        agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
-                    )
-                    user_id = platform_user.id
-
-                    ext_conv_id = f"feishu_p2p_{feishu_user_id}"
-                    sess = await find_or_create_channel_session(
-                        db=db,
-                        agent_id=agent_id,
-                        user_id=user_id,
-                        external_conv_id=ext_conv_id,
-                        source_channel="feishu",
-                        first_message_title=f"[Agent → {member_name or feishu_user_id}]",
-                    )
-                    outbound = await _persist_outbound_channel_message(
-                        db,
-                        agent_id=agent_id,
-                        user_id=user_id,
-                        session=sess,
-                        content=message_text,
-                        source_channel="feishu",
-                        actor_ref=feishu_user_id,
-                        target_name=member_name or feishu_user_id,
-                        origin_session_id=origin_session_id,
-                        origin_source_channel=None,
-                        tool_call_id=tool_call_id,
-                        origin_turn_anchor_id=origin_turn_anchor_id,
-                        external_message_id=external_message_id,
-                    )
-                    await db.commit()
-                    logger.info(f"[Feishu] Saved outgoing message to session {sess.id} (user_id: {feishu_user_id})")
-                    return sess, outbound
-                except Exception as e:
-                    logger.error(f"[Feishu] Failed to save outgoing message to history: {e}")
-                    return None
-
+            receive_id = (route.member.external_id or route.member.open_id or "").strip()
+            receive_id_type = "user_id" if route.member.external_id else "open_id"
+            if not receive_id:
+                return RecipientResolutionError(
+                    "recipient_unreachable", "Canonical user has no usable Feishu endpoint"
+                ).as_json()
             try:
-                resp = await _try_send(config.app_id, config.app_secret, target_member.external_id, "user_id")
-                if resp.get("code") == 0:
-                    external_message_id = str(
-                        ((resp.get("data") or {}).get("message_id")) or resp.get("message_id") or ""
-                    ) or None
-                    saved = await _save_outgoing_to_feishu_session(target_member.external_id, external_message_id)
-                    if saved is not None:
-                        return f"✅ Successfully sent message to {member_name}"
-                    return (
-                        f"❌ The message reached {member_name}, but its platform routing "
-                        "receipt was not persisted. No exact on_message subscription was armed."
-                    )
-                logger.info(f"❌ Failed to send message to {target_member.external_id} via Feishu (user_id): {resp}")
-                return f"发送失败: {resp.get('msg')} (code {resp.get('code')})"
-            except FeishuAPIError as user_id_err:
-                logger.info(f"❌ Failed to send message to {target_member.external_id} via Feishu (user_id): {user_id_err}")
-                return f"❌ 飞书发送失败：{user_id_err.user_message}"
+                resp = await feishu_service.send_message(
+                    config.app_id,
+                    config.app_secret,
+                    receive_id=receive_id,
+                    msg_type="text",
+                    content=json.dumps({"text": message_text}, ensure_ascii=False),
+                    receive_id_type=receive_id_type,
+                )
+            except FeishuAPIError as exc:
+                return f"❌ Feishu send failed: {exc.user_message}"
+            if resp.get("code") != 0:
+                return f"❌ Feishu send failed: {resp.get('msg')} (code {resp.get('code')})"
+
+            session = await find_or_create_channel_session(
+                db=db,
+                agent_id=agent_id,
+                user_id=route.user.id,
+                external_conv_id=f"feishu_p2p_{receive_id}",
+                source_channel="feishu",
+                first_message_title=f"[Agent → {route.user.display_name}]",
+            )
+            external_message_id = str(
+                ((resp.get("data") or {}).get("message_id"))
+                or resp.get("message_id")
+                or ""
+            ) or None
+            await _persist_outbound_channel_message(
+                db,
+                agent_id=agent_id,
+                user_id=route.user.id,
+                session=session,
+                content=message_text,
+                source_channel="feishu",
+                actor_ref=receive_id,
+                target_name=route.user.display_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                external_message_id=external_message_id,
+            )
+            await db.commit()
+            return f"✅ Message sent to {route.user.display_name} via Feishu"
     except Exception as e:
+        logger.exception("[Feishu] canonical send failed")
         return f"❌ Message send error: {str(e)[:200]}"
 
 
@@ -6985,6 +6916,7 @@ async def _persist_outbound_channel_message(
             "direction": "outbound",
             "source_channel": source_channel,
             "actor_ref": str(actor_ref),
+            "target_user_id": str(user_id),
             "target_name": str(target_name),
             "origin_session_id": str(origin_session_id or ""),
             "origin_source_channel": str(origin_source_channel or ""),
@@ -7009,127 +6941,42 @@ async def _send_channel_message(
     tool_call_id: str | None = None,
     origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
-    """Send message via the recipient's configured external channel.
-
-    1. Find target user from relationships (AgentRelationship -> OrgMember)
-    2. Determine user's provider type (via OrgMember.provider_id -> IdentityProvider)
-    3. Find corresponding channel config (ChannelConfig)
-    4. Send via the appropriate channel
-    """
-    from sqlalchemy import select
-    from sqlalchemy.orm import selectinload
-    from app.models.org import AgentRelationship, OrgMember
-    from app.models.identity import IdentityProvider
-
-    member_name = (args.get("member_name") or "").strip()
+    """Send an external-channel message by canonical platform user_id."""
+    canonical_user_id = str(args.get("user_id") or "").strip()
     message_text = (args.get("message") or "").strip()
     raw_target_channel = (args.get("channel") or "").strip().lower()
     target_channel = "teams" if raw_target_channel == "microsoft_teams" else raw_target_channel
 
-    if not member_name:
-        return "❌ Please provide member_name"
+    if not canonical_user_id:
+        return "❌ Please provide canonical user_id"
     if not message_text:
         return "❌ Please provide message content"
 
     try:
         async with async_session() as db:
-            # 1. Find target member from relationships with provider info (only active members)
-            result = await db.execute(
-                select(AgentRelationship, OrgMember, IdentityProvider)
-                .join(OrgMember, AgentRelationship.member_id == OrgMember.id)
-                .outerjoin(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
-                .where(AgentRelationship.agent_id == agent_id, OrgMember.name == member_name, OrgMember.status == "active")
-                .options(selectinload(AgentRelationship.member))
+            try:
+                route = await resolve_human_channel_recipient(
+                    db,
+                    agent_id,
+                    canonical_user_id,
+                    channel=target_channel or None,
+                )
+            except RecipientResolutionError as exc:
+                return exc.as_json()
+            target_member = route.member
+            provider_type = route.channel
+            member_name = route.user.display_name
+            logger.info(
+                "[ChannelMessage] canonical user %s via %s",
+                canonical_user_id,
+                provider_type,
             )
-            rows = result.all()
-            active_rows = []
-            for rel, member, provider in rows:
-                status_info = await evaluate_human_relationship_status(db, rel)
-                if status_info["access_status"] == "active":
-                    active_rows.append((rel, member, provider))
-            rows = active_rows
 
-            if not rows:
-                return f"❌ {member_name} is not in your relationship network"
-
-            target_member = None
-            provider_type = None
-
-            def _normalize_provider_type(value: str | None) -> str | None:
-                if not value:
-                    return None
-                return "teams" if value == "microsoft_teams" else value
-
-            # Handle multiple matches across different providers
-            if target_channel:
-                for rel, member, provider in rows:
-                    if provider and _normalize_provider_type(provider.provider_type) == target_channel:
-                        target_member = member
-                        provider_type = _normalize_provider_type(provider.provider_type)
-                        break
-                if not target_member:
-                    available = sorted({_normalize_provider_type(p.provider_type) for _, _, p in rows if p})
-                    return f"❌ {member_name} not found in {target_channel} channel. Available channels: {', '.join(available)}"
-            else:
-                if len(rows) > 1:
-                    available = [_normalize_provider_type(p.provider_type) for _, _, p in rows if p]
-                    logger.warning(f"[ChannelMessage] Ambiguous member '{member_name}' found in multiple channels: {available}")
-                    # Pick the first one as before, but mention others if possible
-                
-                rel, member, provider = rows[0]
-                target_member = member
-                provider_type = _normalize_provider_type(provider.provider_type) if provider else None
-
-            # 2. Determine channel based on provider type
-            if not provider_type:
-                # Platform-only relationships are stored as provider-less OrgMembers that
-                # still point at a platform User. In that case, transparently route to the
-                # platform message tool so model tool-choice mistakes do not break delivery.
-                if target_member.user_id:
-                    user_result = await db.execute(
-                        select(UserModel).where(UserModel.id == target_member.user_id)
-                    )
-                    platform_user = user_result.scalar_one_or_none()
-                    if platform_user:
-                        platform_identifier = (
-                            platform_user.display_name
-                            or platform_user.username
-                            or member_name
-                        )
-                        logger.info(
-                            "[ChannelMessage] %s is a platform user; rerouting send_channel_message -> send_platform_message",
-                            member_name,
-                        )
-                        return await _send_platform_message(
-                            agent_id,
-                            {
-                                "username": platform_identifier,
-                                "message": message_text,
-                            },
-                            origin_session_id=origin_session_id,
-                            origin_user_id=origin_user_id,
-                            tool_call_id=tool_call_id,
-                            origin_turn_anchor_id=origin_turn_anchor_id,
-                        )
-
-                # Fallback: check which channel configs exist and has user info
-                if target_member.external_id or target_member.open_id:
-                    # Try Feishu as default
-                    provider_type = "feishu"
-                else:
-                    return (
-                        f"❌ {member_name} has no linked channel. "
-                        "If they are a platform user, use send_platform_message instead."
-                    )
-
-            logger.info(f"[ChannelMessage] Sending to {member_name} via {provider_type}")
-
-            # 3. Route to appropriate channel
             if provider_type == "feishu":
                 return await _send_feishu_message(
                     agent_id,
                     {
-                        "member_name": member_name,
+                        "user_id": canonical_user_id,
                         "message": message_text,
                     },
                     origin_session_id=origin_session_id,
@@ -7688,62 +7535,21 @@ async def _send_platform_message(
     origin_turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Send a proactive message to a first-party platform user."""
-    username = args.get("username", "").strip()
+    canonical_user_id = str(args.get("user_id") or "").strip()
     message_text = args.get("message", "").strip()
 
-    if not username or not message_text:
-        return "❌ Please provide recipient username and message content"
+    if not canonical_user_id or not message_text:
+        return "❌ Please provide canonical user_id and message content"
 
     try:
         async with async_session() as db:
-            # 0. Get agent's tenant_id for scoping
-            agent_res = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-            agent = agent_res.scalar_one_or_none()
-            if not agent:
-                return "❌ Agent not found"
-            if await ensure_access_granted_platform_relationships(db, agent, created_by_user_id=agent.creator_id):
-                await db.flush()
-
-            # 1. Look up target user by username or display_name within tenant
-
-            from app.models.user import Identity as _IdentityModel
-            query = select(UserModel).outerjoin(UserModel.identity).where(
-                or_(
-                    _IdentityModel.username == username,
-                    UserModel.display_name == username,
+            try:
+                recipient = await resolve_platform_user_recipient(
+                    db, agent_id, canonical_user_id
                 )
-            )
-            if agent.tenant_id:
-                query = query.where(UserModel.tenant_id == agent.tenant_id)
-
-            u_result = await db.execute(query)
-            target_user = u_result.scalar_one_or_none()
-            if not target_user:
-                # List available users for the agent to pick from (within the same tenant)
-                list_query = select(UserModel).limit(20)
-                if agent.tenant_id:
-                    list_query = list_query.where(UserModel.tenant_id == agent.tenant_id)
-                
-                all_r = await db.execute(list_query)
-                names = [f"{u.display_name or u.username}" for u in all_r.scalars().all()]
-                return f"❌ No user named '{username}' found in your organization. Available users: {', '.join(names) if names else 'none'}"
-
-            rel_result = await db.execute(
-                select(AgentRelationship)
-                .join(OrgMember, AgentRelationship.member_id == OrgMember.id)
-                .where(
-                    AgentRelationship.agent_id == agent_id,
-                    OrgMember.user_id == target_user.id,
-                    OrgMember.status == "active",
-                )
-                .options(selectinload(AgentRelationship.member))
-            )
-            rel = rel_result.scalars().first()
-            if not rel:
-                return f"❌ {target_user.display_name or target_user.username} is not in your active relationship network"
-            status_info = await evaluate_human_relationship_status(db, rel, source_agent=agent)
-            if status_info["access_status"] != "active":
-                return f"❌ Relationship to {target_user.display_name or target_user.username} is not active ({status_info['access_status_reason'] or 'restricted'})"
+            except RecipientResolutionError as exc:
+                return exc.as_json()
+            target_user = recipient.user
 
             # Agent-initiated platform messages should always go to the long-lived primary session
             # for this agent+user pair, so trigger-driven outreach does not fragment into dozens of
@@ -7760,7 +7566,7 @@ async def _send_platform_message(
                 content=message_text,
                 source_channel=session.source_channel,
                 actor_ref=str(target_user.id),
-                target_name=target_user.display_name or target_user.username or username,
+                target_name=target_user.display_name,
                 origin_session_id=origin_session_id,
                 origin_source_channel=None,
                 tool_call_id=tool_call_id,
@@ -7795,7 +7601,7 @@ async def _send_platform_message(
             except Exception:
                 pass
 
-            display = target_user.display_name or target_user.username
+            display = target_user.display_name
             return f"✅ Message sent to {display} on web platform. It has been saved to their chat history."
 
     except Exception as e:
@@ -7805,12 +7611,12 @@ async def _send_platform_message(
 
 async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
     """Send a workspace file to another digital employee (agent)."""
-    agent_name = (args.get("agent_name") or "").strip()
+    canonical_agent_id = str(args.get("agent_id") or "").strip()
     rel_path = (args.get("file_path") or "").strip()
     delivery_note = (args.get("message") or "").strip()
 
-    if not agent_name or not rel_path:
-        return "❌ Please provide both agent_name and file_path"
+    if not canonical_agent_id or not rel_path:
+        return "❌ Please provide both canonical agent_id and file_path"
 
     storage = get_storage_backend()
     source_key = normalize_storage_key(f"{from_agent_id}/{rel_path}")
@@ -7831,61 +7637,16 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
         from app.services.activity_logger import log_activity
 
         async with async_session() as db:
-            src_result = await db.execute(select(AgentModel).where(AgentModel.id == from_agent_id))
-            source_agent = src_result.scalar_one_or_none()
-            source_agent_name = source_agent.name if source_agent else "Unknown agent"
-            source_tenant_id = source_agent.tenant_id if source_agent else None
-            source_creator_id = source_agent.creator_id if source_agent else from_agent_id
-
-            # Build base filter: same tenant + not self
-            base_filter = [AgentModel.id != from_agent_id]
-            if source_tenant_id:
-                base_filter.append(AgentModel.tenant_id == source_tenant_id)
-
-            # Try exact name match first, then fuzzy
-            target_agent = None
-            exact_result = await db.execute(
-                select(AgentModel).where(AgentModel.name == agent_name, *base_filter)
-            )
-            target_agent = exact_result.scalars().first()
-            if not target_agent:
-                # Sanitize SQL wildcards in user input
-                safe_name = agent_name.replace("%", "").replace("_", r"\_")
-                fuzzy_result = await db.execute(
-                    select(AgentModel).where(AgentModel.name.ilike(f"%{safe_name}%"), *base_filter)
+            try:
+                recipient = await resolve_agent_recipient(
+                    db, from_agent_id, canonical_agent_id
                 )
-                target_agent = fuzzy_result.scalars().first()
-
-            if not target_agent:
-                # Only show agents from relationships, not all agents
-                # (AgentAgentRelationship is imported at module level — no local import needed)
-                rel_r = await db.execute(
-                    select(AgentModel.name).join(
-                        AgentAgentRelationship,
-                        (AgentAgentRelationship.target_agent_id == AgentModel.id) & (AgentAgentRelationship.agent_id == from_agent_id)
-                    )
-                )
-                rel_names = [n for (n,) in rel_r.all()]
-                return f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}"
-
-            if target_agent.is_expired or (target_agent.expires_at and datetime.now(timezone.utc) >= target_agent.expires_at):
-                return f"⚠️ {target_agent.name} is currently unavailable — their service period has ended. Please contact the platform administrator."
-
-            # Enforce relationship: only allow file transfer with agents in relationships
-            rel_check = await db.execute(
-                select(AgentAgentRelationship).where(
-                    AgentAgentRelationship.agent_id == from_agent_id,
-                    AgentAgentRelationship.target_agent_id == target_agent.id,
-                ).limit(1)
-            )
-            rel = rel_check.scalar_one_or_none()
-            if not rel:
-                return f"❌ You do not have a relationship with {target_agent.name}. Only agents in your relationship list can receive files. Ask your administrator to add a relationship if needed."
-            if hasattr(rel, "agent_id"):
-                status_info = await evaluate_agent_relationship_status(db, rel)
-                if status_info["access_status"] != "active":
-                    return f"❌ Relationship to {target_agent.name} is not active ({status_info['access_status_reason'] or 'restricted'}). Ask a manager of both agents to review Relationships."
-
+            except RecipientResolutionError as exc:
+                return exc.as_json()
+            source_agent = recipient.source_agent
+            target_agent = recipient.target_agent
+            source_agent_name = source_agent.name
+            source_creator_id = source_agent.creator_id
             target_name = target_agent.name
             target_id = target_agent.id
 
@@ -8017,6 +7778,7 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 db2.add(ChatMessage(
                     agent_id=session_agent_id,
                     user_id=source_creator_id,
+                    sender_agent_id=from_agent_id,
                     role="user",
                     content=file_msg_content,
                     conversation_id=str(chat_session.id),
@@ -8042,49 +7804,21 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
 
 
 async def _resolve_a2a_target(
-    db, from_agent_id: uuid.UUID, agent_name: str
+    db, from_agent_id: uuid.UUID, agent_id: str
 ) -> tuple[AgentModel | None, str | None]:
-    """Resolve the target agent for A2A communication.
-
-    Returns (target_agent, error_message). If target is None, error_message
-    explains why.  Caller is responsible for relationship / expiry checks.
-    """
-    src_result = await db.execute(select(AgentModel).where(AgentModel.id == from_agent_id))
-    source_agent = src_result.scalar_one_or_none()
-    source_tenant_id = source_agent.tenant_id if source_agent else None
-
-    base_filter = [AgentModel.id != from_agent_id]
-    if source_tenant_id:
-        base_filter.append(AgentModel.tenant_id == source_tenant_id)
-
-    exact_result = await db.execute(
-        select(AgentModel).where(AgentModel.name == agent_name, *base_filter)
-    )
-    target = exact_result.scalars().first()
-    if not target:
-        safe_name = agent_name.replace("%", "").replace("_", r"\_")
-        fuzzy_result = await db.execute(
-            select(AgentModel).where(AgentModel.name.ilike(f"%{safe_name}%"), *base_filter)
-        )
-        target = fuzzy_result.scalars().first()
-    if not target:
-        rel_r = await db.execute(
-            select(AgentModel.name).join(
-                AgentAgentRelationship,
-                (AgentAgentRelationship.target_agent_id == AgentModel.id) & (AgentAgentRelationship.agent_id == from_agent_id)
-            )
-        )
-        rel_names = [n for (n,) in rel_r.all()]
-        return None, f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}"
-
-    return target, None
+    """Compatibility helper backed by the canonical exact-ID resolver."""
+    try:
+        recipient = await resolve_agent_recipient(db, from_agent_id, agent_id)
+    except RecipientResolutionError as exc:
+        return None, exc.as_json()
+    return recipient.target_agent, None
 
 
 async def _create_on_message_trigger(
     agent_id: uuid.UUID,
     trigger_name: str,
-    from_agent_name: str | None,
-    from_user_name: str | None = None,
+    from_agent_id_value: str | None,
+    from_user_id_value: str | None = None,
     reason: str = "",
     focus_ref: str | None = None,
     notification_summary: str | None = None,
@@ -8111,10 +7845,12 @@ async def _create_on_message_trigger(
     )
 
     config: dict = {}
-    if from_agent_name:
-        config["from_agent_name"] = from_agent_name
-    if from_user_name:
-        config["from_user_name"] = from_user_name
+    if bool(from_agent_id_value) == bool(from_user_id_value):
+        raise ValueError("on_message requires exactly one canonical sender ID")
+    if from_agent_id_value:
+        config["from_agent_id"] = str(uuid.UUID(from_agent_id_value))
+    if from_user_id_value:
+        config["from_user_id"] = str(uuid.UUID(from_user_id_value))
     if notification_summary:
         config["_notification_summary"] = notification_summary
     if origin_session_id:
@@ -8346,7 +8082,7 @@ async def _arm_a2a_delegate_callback(
         await _create_on_message_trigger(
             agent_id=from_agent_id,
             trigger_name=trigger_name,
-            from_agent_name=target.name,
+            from_agent_id_value=str(target.id),
             reason=trigger_reason,
             focus_ref=focus_id,
             notification_summary=f"等待{target.name}完成任务并回复",
@@ -8414,14 +8150,14 @@ async def _send_message_to_agent(
     trigger remember WHERE the originating conversation lived so the eventual
     reply is routed back to it.
     """
-    agent_name = args.get("agent_name", "").strip()
+    canonical_agent_id = str(args.get("agent_id") or "").strip()
     message_text = args.get("message", "").strip()
     msg_type = args.get("msg_type", "notify").strip().lower()
     force_async = bool(args.get("force_async"))
     new_conversation = bool(args.get("new_conversation"))
 
-    if not agent_name or not message_text:
-        return "❌ Please provide target agent name and message content"
+    if not canonical_agent_id or not message_text:
+        return "❌ Please provide canonical agent_id and message content"
 
     try:
         from app.models.participant import Participant
@@ -8445,61 +8181,15 @@ async def _send_message_to_agent(
                 except Exception:
                     pass
 
-            # Look up source agent
-            src_result = await db.execute(select(AgentModel).where(AgentModel.id == from_agent_id))
-
-            source_agent = src_result.scalar_one_or_none()
-            source_name = source_agent.name if source_agent else "Unknown agent"
-            source_tenant_id = source_agent.tenant_id if source_agent else None
-
-            # Build base filter: same tenant + not self
-            base_filter = [AgentModel.id != from_agent_id]
-            if source_tenant_id:
-                base_filter.append(AgentModel.tenant_id == source_tenant_id)
-
-            # Find target agent by name — exact match first, then fuzzy
-            target = None
-            exact_result = await db.execute(
-                select(AgentModel).where(AgentModel.name == agent_name, *base_filter)
-            )
-            target = exact_result.scalars().first()
-            if not target:
-                safe_name = agent_name.replace("%", "").replace("_", r"\_")
-                fuzzy_result = await db.execute(
-                    select(AgentModel).where(AgentModel.name.ilike(f"%{safe_name}%"), *base_filter)
+            try:
+                recipient = await resolve_agent_recipient(
+                    db, from_agent_id, canonical_agent_id
                 )
-                target = fuzzy_result.scalars().first()
-            if not target:
-                # Only show agents from relationships, not all agents
-                rel_r = await db.execute(
-                    select(AgentModel.name).join(
-                        AgentAgentRelationship,
-                        (AgentAgentRelationship.target_agent_id == AgentModel.id) & (AgentAgentRelationship.agent_id == from_agent_id)
-                    )
-                )
-                rel_names = [n for (n,) in rel_r.all()]
-                return f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}"
-
-
-            # Check if target agent has expired
-            if target.is_expired or (target.expires_at and datetime.now(timezone.utc) >= target.expires_at):
-                return f"⚠️ {target.name} is currently unavailable — their service period has ended. Please contact the platform administrator."
-
-            # Enforce relationship: only allow communication with agents in relationships
-            # (AgentAgentRelationship is imported at module level — no local import needed)
-            rel_check = await db.execute(
-                select(AgentAgentRelationship).where(
-                    AgentAgentRelationship.agent_id == from_agent_id,
-                    AgentAgentRelationship.target_agent_id == target.id,
-                ).limit(1)
-            )
-            rel = rel_check.scalar_one_or_none()
-            if not rel:
-                return f"❌ You do not have a relationship with {target.name}. Only agents in your relationship list can be contacted. Ask your administrator to add a relationship if needed."
-            if hasattr(rel, "agent_id"):
-                status_info = await evaluate_agent_relationship_status(db, rel)
-                if status_info["access_status"] != "active":
-                    return f"❌ Relationship to {target.name} is not active ({status_info['access_status_reason'] or 'restricted'}). Ask a manager of both agents to review Relationships."
+            except RecipientResolutionError as exc:
+                return exc.as_json()
+            source_agent = recipient.source_agent
+            target = recipient.target_agent
+            source_name = source_agent.name
 
             src_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id))
             src_participant = src_part_r.scalar_one_or_none()
@@ -8617,6 +8307,7 @@ async def _send_message_to_agent(
                         id=uuid.uuid4(),
                         agent_id=session_agent_id,
                         user_id=owner_id,
+                        sender_agent_id=from_agent_id,
                         role="user",
                         content=message_text,
                         conversation_id=session_id,
@@ -8693,7 +8384,6 @@ async def _send_message_to_agent(
                 gw_msg = GMsg(
                     agent_id=target.id,
                     sender_agent_id=from_agent_id,
-                    sender_user_id=owner_id,
                     content=f"[From {source_name}] {message_text}",
                     status="pending",
                     conversation_id=session_id,
@@ -8729,6 +8419,7 @@ async def _send_message_to_agent(
                 id=uuid.uuid4(),
                 agent_id=session_agent_id,
                 user_id=owner_id,
+                sender_agent_id=from_agent_id,
                 role="user",
                 content=message_text,
                 conversation_id=session_id,
@@ -8928,6 +8619,7 @@ async def _send_message_to_agent(
                 db2.add(ChatMessage(
                     agent_id=session_agent_id,
                     user_id=owner_id,
+                    sender_agent_id=target.id,
                     role="assistant",
                     content=target_reply,
                     conversation_id=session_id,
@@ -8953,7 +8645,7 @@ async def _send_message_to_agent(
 
     except Exception as e:
         logger.exception(
-            f"[A2A] send_message_to_agent failed: from={from_agent_id}, to={args.get('agent_name', '')}"
+            f"[A2A] send_message_to_agent failed: from={from_agent_id}, to={args.get('agent_id', '')}"
         )
         error_type = type(e).__name__
         error_detail = (str(e) or "").strip()
@@ -10156,7 +9848,6 @@ async def _handle_set_trigger(
         for key, value in dict(arguments.get("config", {}) or {}).items()
         if not str(key).startswith("_")
     }
-    public_config = dict(config)
     reason = arguments.get("reason", "").strip()
     focus_ref = arguments.get("focus_ref", "") or arguments.get("agenda_ref", "")  # backward compat
 
@@ -10198,8 +9889,24 @@ async def _handle_set_trigger(
         if not config.get("url"):
             return "❌ poll trigger requires config.url"
     elif ttype == "on_message":
-        if not config.get("from_agent_name") and not config.get("from_user_name"):
-            return "❌ on_message trigger requires config.from_agent_name (for agents) or config.from_user_name (for human users on Feishu/Slack/Discord)"
+        raw_agent_id = str(config.get("from_agent_id") or "").strip()
+        raw_user_id = str(config.get("from_user_id") or "").strip()
+        if bool(raw_agent_id) == bool(raw_user_id):
+            return "❌ on_message config requires exactly one of from_agent_id or from_user_id"
+        try:
+            async with async_session() as _identity_db:
+                if raw_agent_id:
+                    resolved = await resolve_agent_recipient(
+                        _identity_db, agent_id, raw_agent_id
+                    )
+                    config["from_agent_id"] = str(resolved.target_agent.id)
+                else:
+                    resolved = await resolve_platform_user_recipient(
+                        _identity_db, agent_id, raw_user_id
+                    )
+                    config["from_user_id"] = str(resolved.user.id)
+        except RecipientResolutionError as exc:
+            return exc.as_json()
         # Snapshot the latest message timestamp so we only detect NEW messages after this point
         # This prevents false positives from already-processed messages
         try:
@@ -10228,6 +9935,10 @@ async def _handle_set_trigger(
         if wmode in ("queue", "merge"):
             config["webhook_mode"] = wmode
             config["_webhook_queue"] = []
+
+    public_config = {
+        key: value for key, value in config.items() if not str(key).startswith("_")
+    }
 
     # Record the session that created this trigger so trigger results can later be routed to
     # the correct destination instead of being broadcast to every live web session.
@@ -10284,9 +9995,8 @@ async def _handle_set_trigger(
             async with async_session() as _bind_db:
                 outbound = None
                 if session_id and turn_anchor_id:
-                    target_name = str(
-                        config.get("from_user_name") or config.get("from_agent_name") or ""
-                    ).strip().casefold()
+                    target_user_id = str(config.get("from_user_id") or "").strip()
+                    target_agent_id = str(config.get("from_agent_id") or "").strip()
                     receipt_rows = await _bind_db.execute(
                         select(ChatMessage)
                         .where(
@@ -10301,8 +10011,11 @@ async def _handle_set_trigger(
                     candidates: list[ChatMessage] = []
                     for candidate in receipt_rows.scalars().all():
                         meta = candidate.message_meta if isinstance(candidate.message_meta, dict) else {}
-                        candidate_target = str(meta.get("target_name") or "").strip().casefold()
-                        if target_name and candidate_target and candidate_target != target_name:
+                        candidate_user_id = str(meta.get("target_user_id") or "").strip()
+                        candidate_agent_id = str(meta.get("target_agent_id") or "").strip()
+                        if target_user_id and candidate_user_id != target_user_id:
+                            continue
+                        if target_agent_id and candidate_agent_id != target_agent_id:
                             continue
                         candidates.append(candidate)
 
@@ -10528,16 +10241,36 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
                 public_new = {
                     key: value for key, value in new_config.items() if not str(key).startswith("_")
                 }
+                if trigger.type == "on_message":
+                    raw_agent_id = str(public_new.get("from_agent_id") or "").strip()
+                    raw_user_id = str(public_new.get("from_user_id") or "").strip()
+                    if bool(raw_agent_id) == bool(raw_user_id):
+                        return "❌ on_message config requires exactly one of from_agent_id or from_user_id"
+                    try:
+                        if raw_agent_id:
+                            recipient = await resolve_agent_recipient(
+                                db, agent_id, raw_agent_id
+                            )
+                            public_new["from_agent_id"] = str(recipient.target_agent.id)
+                        else:
+                            recipient = await resolve_platform_user_recipient(
+                                db, agent_id, raw_user_id
+                            )
+                            public_new["from_user_id"] = str(recipient.user.id)
+                    except RecipientResolutionError as exc:
+                        return exc.as_json()
+                    public_new.pop("from_agent_name", None)
+                    public_new.pop("from_user_name", None)
                 private_old = {
                     key: value for key, value in old_config.items() if str(key).startswith("_")
                 }
                 old_target = (
-                    old_config.get("from_agent_name"),
-                    old_config.get("from_user_name"),
+                    old_config.get("from_agent_id"),
+                    old_config.get("from_user_id"),
                 )
                 new_target = (
-                    public_new.get("from_agent_name"),
-                    public_new.get("from_user_name"),
+                    public_new.get("from_agent_id"),
+                    public_new.get("from_user_id"),
                 )
                 if trigger.type == "on_message" and old_target != new_target:
                     # A changed public sender criterion is a legacy watcher until
@@ -12650,41 +12383,69 @@ async def _feishu_drive_share(agent_id: uuid.UUID, arguments: dict) -> str:
         if not members:
             return f"📄 文档 `{document_token}` 当前没有其他协作者。"
 
+        provider_ids = [
+            str(m.get("member_id") or "")
+            for m in members
+            if m.get("member_type") == "openid" and m.get("member_id")
+        ]
+        identity_map: dict[str, tuple[str, str]] = {}
+        if provider_ids:
+            async with async_session() as identity_db:
+                agent_result = await identity_db.execute(
+                    select(AgentModel).where(AgentModel.id == agent_id)
+                )
+                source_agent = agent_result.scalar_one_or_none()
+                if source_agent:
+                    rows = await identity_db.execute(
+                        select(OrgMember, UserModel).join(
+                            UserModel, OrgMember.user_id == UserModel.id
+                        ).where(
+                            OrgMember.tenant_id == source_agent.tenant_id,
+                            OrgMember.open_id.in_(provider_ids),
+                        )
+                    )
+                    for member, user in rows.all():
+                        identity_map[str(member.open_id)] = (
+                            str(user.id), user.display_name
+                        )
         lines = [f"📄 文档 `{document_token}` 的协作者列表（共 {len(members)} 人）：\n"]
         for m in members:
             perm = m.get("perm", "")
             member_type = m.get("member_type", "")
             member_id = m.get("member_id", "")
-            _type_label = {"openid": "用户", "openchat": "群组", "opendepartmentid": "部门"}.get(member_type, member_type)
-            lines.append(f"• {_type_label} `{member_id}` | 权限: **{perm}**")
+            canonical = identity_map.get(str(member_id))
+            if member_type == "openid" and canonical:
+                user_id, display_name = canonical
+                lines.append(
+                    f"• {display_name} | user_id: `{user_id}` | 权限: **{perm}**"
+                )
+            else:
+                lines.append(f"• 非用户协作者或未映射用户 | 权限: **{perm}**")
         return "\n".join(lines)
 
     # ── ADD / REMOVE collaborators ─────────────────────────────────────────────
-    member_names: list[str] = list(arguments.get("member_names") or [])
-    member_open_ids: list[str] = list(arguments.get("member_open_ids") or [])
+    user_ids: list[str] = list(arguments.get("user_ids") or [])
+    if not user_ids:
+        return "❌ 请提供 canonical user_ids"
 
-    if not member_names and not member_open_ids:
-        return "❌ 请提供 member_names（姓名列表）或 member_open_ids（open_id 列表）"
-
-    # Resolve names → open_ids
     resolved: list[tuple[str, str]] = []  # (display_name, open_id)
-    for name in member_names:
-        sr = await _feishu_user_search(agent_id, {"name": name})
-        m = _re.search(r'open_id: `(ou_[A-Za-z0-9]+)`', sr)
-        if m:
-            resolved.append((name, m.group(1)))
-        else:
-            resolved.append((name, ""))
-
-    for oid in member_open_ids:
-        if oid:
-            resolved.append((oid, oid))
+    async with async_session() as identity_db:
+        for canonical_user_id in user_ids:
+            try:
+                route = await resolve_human_channel_recipient(
+                    identity_db, agent_id, canonical_user_id, channel="feishu"
+                )
+            except RecipientResolutionError:
+                resolved.append((str(canonical_user_id), ""))
+                continue
+            open_id = str(route.member.open_id or "")
+            resolved.append((route.user.display_name, open_id))
 
     results = []
     async with httpx.AsyncClient(timeout=15) as client:
         for display, oid in resolved:
             if not oid:
-                results.append(f"❌ 无法找到「{display}」的 open_id，跳过")
+                results.append(f"❌ 无法将 canonical user_id「{display}」解析到唯一 Feishu open_id，跳过")
                 continue
 
             if action == "add":
@@ -12853,12 +12614,28 @@ async def _feishu_drive_delete(agent_id: uuid.UUID, arguments: dict) -> str:
 
 # ─── Feishu Calendar Tools ────────────────────────────────────────────────────
 
+async def _resolve_feishu_open_id(
+    agent_id: uuid.UUID,
+    canonical_user_id: object,
+) -> tuple[str, str]:
+    """Resolve a public canonical user_id to one internal Feishu open_id."""
+    async with async_session() as db:
+        route = await resolve_human_channel_recipient(
+            db, agent_id, canonical_user_id, channel="feishu"
+        )
+        open_id = str(route.member.open_id or "").strip()
+        if not open_id:
+            raise RecipientResolutionError(
+                "recipient_unreachable",
+                "user_id has no usable Feishu open_id",
+            )
+        return route.user.display_name, open_id
+
+
 async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
     import httpx
     import re as _re
     from datetime import timedelta as _td
-
-    user_email = arguments.get("user_email", "").strip()
 
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     if not app_id or not app_secret:
@@ -12907,13 +12684,14 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
 
     # ── 1. Query sender's real freebusy from Feishu Calendar ─────────────────
     sender_open_id = channel_feishu_sender_open_id.get(None)
-    # Allow explicit override via argument
-    if arguments.get("user_open_id"):
-        sender_open_id = arguments["user_open_id"]
-    elif user_email:
-        resolved = await _feishu_resolve_open_id(token, user_email)
-        if resolved:
-            sender_open_id = resolved
+    canonical_user_id = str(arguments.get("user_id") or "").strip()
+    if canonical_user_id:
+        try:
+            _, sender_open_id = await _resolve_feishu_open_id(
+                agent_id, canonical_user_id
+            )
+        except RecipientResolutionError as exc:
+            return exc.as_json()
 
     freebusy_section = ""
     if sender_open_id:
@@ -13009,7 +12787,6 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
 async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
     import httpx
 
-    user_email = arguments.get("user_email", "").strip()
     summary = arguments.get("summary", "").strip()
     start_time = arguments.get("start_time", "").strip()
     end_time = arguments.get("end_time", "").strip()
@@ -13024,12 +12801,25 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
     from app.services.feishu_service import feishu_service
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
 
-    # Resolve organizer open_id from email — soft failure
-    organizer_open_id: str | None = None
-    if user_email:
-        organizer_open_id = await _feishu_resolve_open_id(token, user_email)
-        if not organizer_open_id:
-            logger.warning(f"[Feishu Calendar] Could not resolve open_id for '{user_email}', continuing without organizer invite")
+    # Resolve every explicit attendee before creating the event, so invalid or
+    # ambiguous IDs cannot leave a partially-created calendar operation.
+    attendee_open_ids: list[str] = []
+    attendee_display: list[str] = []
+    for canonical_user_id in list(arguments.get("attendee_user_ids") or [])[:20]:
+        try:
+            display_name, open_id = await _resolve_feishu_open_id(
+                agent_id, canonical_user_id
+            )
+        except RecipientResolutionError as exc:
+            return exc.as_json()
+        if open_id not in attendee_open_ids:
+            attendee_open_ids.append(open_id)
+            attendee_display.append(display_name)
+
+    # Current Feishu sender remains an implicit internal route.
+    sender_oid = channel_feishu_sender_open_id.get(None)
+    if sender_oid and sender_oid not in attendee_open_ids:
+        attendee_open_ids.append(sender_oid)
 
     agent_cal_id, cal_err = await _get_agent_calendar_id(token)
     if not agent_cal_id:
@@ -13059,47 +12849,6 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
 
     event_id = data.get("data", {}).get("event", {}).get("event_id", "")
 
-    # Collect all attendee open_ids to invite
-    attendee_open_ids: list[str] = []
-    attendee_display: list[str] = []  # for summary message
-
-    # 1. Direct open_ids provided by caller
-    for oid in (arguments.get("attendee_open_ids") or []):
-        if oid and oid not in attendee_open_ids:
-            attendee_open_ids.append(oid)
-            attendee_display.append(oid)
-
-    # 2. Names → look up via feishu_user_search
-    import re as _re_oid
-    for aname in (arguments.get("attendee_names") or []):
-        aname = aname.strip()
-        if not aname:
-            continue
-        _sr = await _feishu_user_search(agent_id, {"name": aname})
-        _m = _re_oid.search(r'open_id: `(ou_[A-Za-z0-9]+)`', _sr)
-        if _m:
-            _oid = _m.group(1)
-            if _oid not in attendee_open_ids:
-                attendee_open_ids.append(_oid)
-                attendee_display.append(aname)
-        else:
-                logger.warning(f"[Calendar] Could not resolve attendee '{aname}': {_sr[:100]}")
-
-    # 3. From explicit attendee_emails
-    attendee_emails: list[str] = list(arguments.get("attendee_emails") or [])
-    if user_email and user_email not in attendee_emails:
-        attendee_emails.append(user_email)
-    for email in attendee_emails[:20]:
-        oid = await _feishu_resolve_open_id(token, email)
-        if oid and oid not in attendee_open_ids:
-            attendee_open_ids.append(oid)
-            attendee_display.append(email)
-
-    # 4. Auto-invite the Feishu message sender (from context var)
-    sender_oid = channel_feishu_sender_open_id.get(None)
-    if sender_oid and sender_oid not in attendee_open_ids:
-        attendee_open_ids.append(sender_oid)
-
     if attendee_open_ids and event_id:
         async with httpx.AsyncClient(timeout=20) as client:
             for oid in attendee_open_ids:
@@ -13123,20 +12872,15 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
 async def _feishu_calendar_update(agent_id: uuid.UUID, arguments: dict) -> str:
     import httpx
 
-    user_email = arguments.get("user_email", "").strip()
     event_id = arguments.get("event_id", "").strip()
-    if not user_email or not event_id:
-        return "❌ Both 'user_email' and 'event_id' are required."
+    if not event_id:
+        return "❌ 'event_id' is required."
 
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
-
-    open_id = await _feishu_resolve_open_id(token, user_email)
-    if not open_id:
-        return f"❌ User '{user_email}' not found."
 
     agent_cal_id, cal_err = await _get_agent_calendar_id(token)
     if not agent_cal_id:
@@ -13175,20 +12919,15 @@ async def _feishu_calendar_update(agent_id: uuid.UUID, arguments: dict) -> str:
 async def _feishu_calendar_delete(agent_id: uuid.UUID, arguments: dict) -> str:
     import httpx
 
-    user_email = arguments.get("user_email", "").strip()
     event_id = arguments.get("event_id", "").strip()
-    if not user_email or not event_id:
-        return "❌ Both 'user_email' and 'event_id' are required."
+    if not event_id:
+        return "❌ 'event_id' is required."
 
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
     token = await feishu_service.get_tenant_access_token(app_id, app_secret)
-
-    open_id = await _feishu_resolve_open_id(token, user_email)
-    if not open_id:
-        return f"❌ User '{user_email}' not found."
 
     agent_cal_id, cal_err = await _get_agent_calendar_id(token)
     if not agent_cal_id:
@@ -13214,15 +12953,20 @@ async def _feishu_approval_create(agent_id: uuid.UUID, arguments: dict) -> str:
         return "❌ Agent has no Feishu channel configured."
 
     approval_code = arguments.get("approval_code", "").strip()
-    user_id = arguments.get("user_id", "").strip()
+    canonical_user_id = arguments.get("user_id", "").strip()
     form_data = arguments.get("form_data", "").strip()
 
-    if not approval_code or not user_id or not form_data:
+    if not approval_code or not canonical_user_id or not form_data:
         return "❌ form_data, user_id and approval_code are required."
+
+    try:
+        _, open_id = await _resolve_feishu_open_id(agent_id, canonical_user_id)
+    except RecipientResolutionError as exc:
+        return exc.as_json()
 
     from app.services.feishu_service import feishu_service
     try:
-        resp = await feishu_service.create_approval_instance(app_id, app_secret, approval_code, user_id, form_data)
+        resp = await feishu_service.create_approval_instance(app_id, app_secret, approval_code, open_id, form_data)
         err = _check_feishu_err(resp)
         if err: return err
 
@@ -13282,150 +13026,57 @@ async def _feishu_approval_get(agent_id: uuid.UUID, arguments: dict) -> str:
 # ─── Feishu User Search ───────────────────────────────────────────────────────
 
 async def _feishu_user_search(agent_id: uuid.UUID, arguments: dict) -> str:
-    """Search for colleagues in the Feishu directory by name.
-
-    Strategy:
-    1. Search local contacts cache (populated when anyone messages the bot).
-    2. Fall back to Contact v3 GET /users/{open_id} if we find a match by email.
-    The cache is populated by feishu.py each time a message sender is resolved.
-    """
-    import httpx
-    import json as _json
-    import pathlib as _pl
+    """Search related people by display name and return canonical IDs only."""
 
     name = (arguments.get("name") or "").strip()
     if not name:
         return "❌ Missing required argument 'name'"
 
-    app_id, app_secret = await _get_feishu_credentials(agent_id)
-    if not app_id or not app_secret:
-        return "❌ Agent has no Feishu channel configured."
-    from app.services.feishu_service import feishu_service
-    token = await feishu_service.get_tenant_access_token(app_id, app_secret)
-
-    # ── Load local contacts cache ─────────────────────────────────────────────
-    _cache_file = _pl.Path(f"/data/workspaces/{agent_id}/feishu_contacts_cache.json")
-    _cached_users: list[dict] = []
-    try:
-        if _cache_file.exists():
-            _raw = _json.loads(_cache_file.read_text())
-            _cached_users = _raw.get("users", [])
-    except Exception:
-        pass
-
-    name_lower = name.lower()
-
-    def _matches(u: dict) -> bool:
-        return (
-            name_lower in (u.get("name") or "").lower()
-            or name_lower in (u.get("en_name") or "").lower()
-        )
-
-    matched = [u for u in _cached_users if _matches(u)]
-
-    if matched:
-        lines = [f"🔍 找到 {len(matched)} 位匹配「{name}」的用户：\n"]
-        for u in matched:
-            open_id = u.get("open_id", "")
-            user_id = u.get("user_id", "")
-            display_name = u.get("name", "")
-            en_name = u.get("en_name", "")
-            email = u.get("email", "")
-            lines.append(f"• **{display_name}**{'（' + en_name + '）' if en_name else ''}")
-            if user_id:
-                lines.append(f"  user_id: `{user_id}`")
-            if open_id:
-                lines.append(f"  open_id: `{open_id}`")
-            if email:
-                lines.append(f"  邮箱: {email}")
-        return "\n".join(lines)
-
-    # ── Cache miss: try OrgMember table first (has user_id from org sync) ──────
-    try:
-        from app.database import async_session as _async_session
-        from sqlalchemy import select as _sa_select
-        from app.models.org import OrgMember as _OrgMember
-        from app.models.agent import Agent as _AgentModel
-        async with _async_session() as _db:
-            _agent_tenant_id = await _db.execute(
-                _sa_select(_AgentModel.tenant_id).where(_AgentModel.id == agent_id)
+    async with async_session() as db:
+        query = (
+            select(AgentRelationship)
+            .join(UserModel, AgentRelationship.user_id == UserModel.id)
+            .where(
+                AgentRelationship.agent_id == agent_id,
+                UserModel.is_active.is_(True),
+                UserModel.display_name.ilike(f"%{name}%"),
             )
-            _tid = _agent_tenant_id.scalar_one_or_none()
-            _query = _sa_select(_OrgMember).where(_OrgMember.name.ilike(f"%{name}%"))
-            if _tid:
-                _query = _query.where(_OrgMember.tenant_id == _tid)
-            _r = await _db.execute(_query)
-            _org_members = _r.scalars().all()
-        if _org_members:
-            lines = [f"🔍 从通讯录找到 {len(_org_members)} 位匹配「{name}」的用户：\n"]
-            for _om in _org_members:
-                lines.append(f"• **{_om.name}**")
-                if _om.external_id:
-                    lines.append(f"  user_id: `{_om.external_id}`")
-                if _om.open_id:
-                    lines.append(f"  open_id: `{_om.open_id}`")
-                if _om.email:
-                    lines.append(f"  邮箱: {_om.email}")
-                if _om.department_path:
-                    lines.append(f"  部门: {_om.department_path}")
-            return "\n".join(lines)
-    except Exception:
-        pass
-
-    # ── Fallback: try User table ──────────────────────────────────────
-    try:
-        from app.database import async_session as _async_session
-        from sqlalchemy import select as _sa_select
-        from app.models.user import User as _User
-        from app.models.agent import Agent as _AgentModel2
-        async with _async_session() as _db:
-            _agent_tenant_id2 = await _db.execute(
-                _sa_select(_AgentModel2.tenant_id).where(_AgentModel2.id == agent_id)
+            .options(
+                selectinload(AgentRelationship.user),
+                selectinload(AgentRelationship.member),
             )
-            _tid2 = _agent_tenant_id2.scalar_one_or_none()
-            _query2 = _sa_select(_User).where(_User.display_name.ilike(f"%{name}%"))
-            if _tid2:
-                _query2 = _query2.where(_User.tenant_id == _tid2)
-            _r = await _db.execute(_query2)
-            _platform_users = _r.scalars().all()
-        for _pu in _platform_users:
-            _uid = getattr(_pu, "feishu_user_id", None)
-            if _uid:
-                result_lines = [f"🔍 找到匹配「{name}」的用户：\n", f"• **{_pu.display_name}**"]
-                result_lines.append(f"  user_id: `{_uid}`")
-                _email = getattr(_pu, "email", None)
-                if _email:
-                    result_lines.append(f"  邮箱: {_email}")
-                return "\n".join(result_lines)
-    except Exception:
-        pass
-
-    total = len(_cached_users)
-    if total == 0:
-        return (
-            f"❌ 本地通讯录缓存为空，暂时无法搜索「{name}」。\n\n"
-            "通讯录缓存会在同事向机器人发消息时自动建立。\n"
-            "如果「覃睿」从未给机器人发过消息，可以请他先给机器人发一条消息，"
-            "之后就能直接搜索到他了。\n\n"
-            "或者，请直接告诉我「覃睿」的飞书 open_id 或邮箱，我可以立刻操作。"
+            .order_by(UserModel.display_name, UserModel.id)
         )
-    return (
-        f"❌ 未在本地通讯录（已缓存 {total} 人）中找到「{name}」。\n\n"
-        "通讯录缓存来自给机器人发过消息的同事。\n"
-        "如果「{name}」从未给机器人发消息，请他先发一条，之后即可自动识别。\n"
-        "或者请直接提供其飞书 open_id / 工作邮箱。"
-    )
+        relationships = (await db.execute(query)).scalars().all()
+        matches: list[tuple[UserModel, OrgMember]] = []
+        seen: set[uuid.UUID] = set()
+        for relationship in relationships:
+            if relationship.user_id in seen:
+                continue
+            try:
+                route = await resolve_human_channel_recipient(
+                    db,
+                    agent_id,
+                    relationship.user_id,
+                    channel="feishu",
+                )
+            except RecipientResolutionError:
+                continue
+            seen.add(route.user.id)
+            matches.append((route.user, route.member))
 
+    if not matches:
+        return f"🔍 未找到与「{name}」匹配且可通过飞书联系的关系用户。"
 
-async def _feishu_contacts_refresh(agent_id: uuid.UUID) -> None:
-    """Force-clear the local contacts cache so next search re-fetches from API."""
-    import pathlib as _pl
-    _cache_file = _pl.Path("/data/workspaces") / str(agent_id) / "feishu_contacts_cache.json"
-    try:
-        if _cache_file.exists():
-            _cache_file.unlink()
-    except Exception:
-        pass
+    lines = [f"🔍 找到 {len(matches)} 位匹配「{name}」的关系用户：\n"]
+    for user, member in matches:
+        lines.append(f"• **{user.display_name}**")
+        lines.append(f"  user_id: `{user.id}`")
+        if member.department_path:
+            lines.append(f"  部门: {member.department_path}")
+    if len(matches) > 1:
+        lines.append("\n存在重名，请根据 user_id 和部门选择准确对象。")
+    return "\n".join(lines)
 
 
 # ─── Email Tool Helpers ─────────────────────────────────────
@@ -15687,24 +15338,6 @@ async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, argum
 # ─── OKR Tools ───────────────────────────────────────────────────────────────
 
 
-async def _get_agent_owner_info(agent_id: uuid.UUID) -> tuple[str, str]:
-    """Return (owner_type, owner_id_str) for the calling agent.
-
-    Used by get_my_okr and update_kr_progress to scope queries to the
-    correct owner without requiring the caller to pass their own ID.
-    """
-    from app.database import async_session
-    from app.models.agent import Agent
-    from sqlalchemy import select as _select
-
-    async with async_session() as db:
-        result = await db.execute(_select(Agent).where(Agent.id == agent_id))
-        agent = result.scalar_one_or_none()
-    if not agent:
-        return "agent", str(agent_id)
-    return "agent", str(agent_id)
-
-
 def _compute_okr_period_bounds(frequency: str, length_days: int | None):
     """Return the current OKR period using the tenant's configured cadence."""
     from datetime import date, timedelta
@@ -15749,7 +15382,6 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
         from app.database import async_session
         from app.models.agent import Agent
         from app.models.okr import OKRObjective, OKRKeyResult, OKRSettings
-        from app.models.org import OrgMember
         from app.models.user import User
         from sqlalchemy import select as _select
         from datetime import date, timedelta
@@ -15791,7 +15423,7 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
                     OKRObjective.period_start >= ps,
                     OKRObjective.period_end <= pe,
                     OKRObjective.status != "archived",
-                ).order_by(OKRObjective.owner_type, OKRObjective.created_at)
+                ).order_by(OKRObjective.created_at)
             )
             objectives = obj_result.scalars().all()
 
@@ -15814,12 +15446,10 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
             # Resolve readable owner names so the OKR Agent can reason about
             # members by display name instead of raw UUIDs.
             user_owner_ids = [
-                o.owner_id for o in objectives
-                if o.owner_type == "user" and o.owner_id
+                o.owner_user_id for o in objectives if o.owner_user_id
             ]
             agent_owner_ids = [
-                o.owner_id for o in objectives
-                if o.owner_type == "agent" and o.owner_id
+                o.owner_agent_id for o in objectives if o.owner_agent_id
             ]
 
             user_names: dict[uuid.UUID, str] = {}
@@ -15832,16 +15462,6 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
                     for row in u_result.fetchall()
                 }
 
-                unresolved_ids = [oid for oid in user_owner_ids if oid not in user_names]
-                if unresolved_ids:
-                    m_result = await db.execute(
-                        _select(OrgMember.id, OrgMember.name).where(
-                            OrgMember.id.in_(unresolved_ids)
-                        )
-                    )
-                    for row in m_result.fetchall():
-                        user_names[row.id] = row.name or ""
-
             agent_names: dict[uuid.UUID, str] = {}
             if agent_owner_ids:
                 a_result = await db.execute(
@@ -15853,21 +15473,19 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
                 }
 
             def _resolve_owner_label(obj: OKRObjective) -> str:
-                if obj.owner_type == "company":
+                if not obj.owner_user_id and not obj.owner_agent_id:
                     return "Company"
-                if not obj.owner_id:
-                    return f"{obj.owner_type}:unassigned"
-                if obj.owner_type == "user":
-                    return user_names.get(obj.owner_id) or f"user:{obj.owner_id}"
-                if obj.owner_type == "agent":
-                    return agent_names.get(obj.owner_id) or f"agent:{obj.owner_id}"
-                return f"{obj.owner_type}:{obj.owner_id}"
+                if obj.owner_user_id:
+                    name = user_names.get(obj.owner_user_id) or "Unknown user"
+                    return f"{name} | user_id:{obj.owner_user_id}"
+                name = agent_names.get(obj.owner_agent_id) or "Unknown agent"
+                return f"{name} | agent_id:{obj.owner_agent_id}"
 
         # Format output
         lines = [f"# OKR Board — {ps} to {pe}\n"]
 
-        company_objs = [o for o in objectives if o.owner_type == "company"]
-        member_objs = [o for o in objectives if o.owner_type != "company"]
+        company_objs = [o for o in objectives if not o.owner_user_id and not o.owner_agent_id]
+        member_objs = [o for o in objectives if o.owner_user_id or o.owner_agent_id]
 
         if company_objs:
             lines.append("## Company Objectives")
@@ -15941,8 +15559,7 @@ async def _get_my_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
             obj_result = await db.execute(
                 _select(OKRObjective).where(
                     OKRObjective.tenant_id == agent.tenant_id,
-                    OKRObjective.owner_type == "agent",
-                    OKRObjective.owner_id == agent_id,
+                    OKRObjective.owner_agent_id == agent_id,
                     OKRObjective.period_start >= ps,
                     OKRObjective.period_end <= pe,
                     OKRObjective.status != "archived",
@@ -16023,36 +15640,44 @@ def _okr_permission_denied(message: str) -> str:
     return f"Permission denied: {message}"
 
 
-def _can_access_existing_okr_target(ctx: dict, owner_type: str, owner_id: uuid.UUID | None) -> str | None:
+def _can_access_existing_okr_target(
+    ctx: dict,
+    owner_user_id: uuid.UUID | None,
+    owner_agent_id: uuid.UUID | None,
+) -> str | None:
     if ctx["agent_is_system"]:
         if ctx["requester_is_admin"]:
             return None
-        if owner_type != "user" or owner_id != ctx["requester_user_id"]:
+        if owner_user_id != ctx["requester_user_id"] or owner_agent_id is not None:
             return _okr_permission_denied(
                 "non-admin requests may only create or modify the requester's own personal OKRs. "
                 "Do not create or edit company OKRs or other members' OKRs."
             )
         return None
 
-    if owner_type != "agent" or owner_id != ctx["agent"].id:
+    if owner_agent_id != ctx["agent"].id or owner_user_id is not None:
         return _okr_permission_denied(
             "you can only create or modify your own agent OKRs."
         )
     return None
 
 
-def _can_create_okr_target(ctx: dict, owner_type: str, owner_id: uuid.UUID | None) -> str | None:
+def _can_create_okr_target(
+    ctx: dict,
+    owner_user_id: uuid.UUID | None,
+    owner_agent_id: uuid.UUID | None,
+) -> str | None:
     if ctx["agent_is_system"]:
         if ctx["requester_is_admin"]:
             return None
-        if owner_type != "user" or owner_id != ctx["requester_user_id"]:
+        if owner_user_id != ctx["requester_user_id"] or owner_agent_id is not None:
             return _okr_permission_denied(
                 "non-admin requests may only create the requester's own personal OKRs. "
                 "Creating company OKRs or other members' OKRs requires an org admin."
             )
         return None
 
-    if owner_type != "agent" or owner_id != ctx["agent"].id:
+    if owner_agent_id != ctx["agent"].id or owner_user_id is not None:
         return _okr_permission_denied(
             "you can only create OKRs for yourself."
         )
@@ -16104,7 +15729,9 @@ async def _update_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID | N
                 return f"Key Result {kr_id_str} not found in your organization."
 
             kr, obj = row
-            permission_error = _can_access_existing_okr_target(ctx, obj.owner_type, obj.owner_id)
+            permission_error = _can_access_existing_okr_target(
+                ctx, obj.owner_user_id, obj.owner_agent_id
+            )
             if permission_error:
                 return permission_error
 
@@ -16190,7 +15817,9 @@ async def _update_kr_content(agent_id: uuid.UUID | None, user_id: uuid.UUID | No
                 return f"Key Result {kr_id_str} not found in your organization."
 
             kr, obj = row
-            permission_error = _can_access_existing_okr_target(ctx, obj.owner_type, obj.owner_id)
+            permission_error = _can_access_existing_okr_target(
+                ctx, obj.owner_user_id, obj.owner_agent_id
+            )
             if permission_error:
                 return permission_error
 
@@ -16363,7 +15992,6 @@ async def _create_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
         from app.models.agent import Agent as AgentModel
         from app.models.okr import OKRObjective
         from app.models.user import User as UserModel
-        from app.models.org import OrgMember
         async with async_session() as db:
             ctx = await _load_okr_request_context(db, agent_id, user_id)
             ag = ctx["agent"]
@@ -16371,84 +15999,55 @@ async def _create_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
                 return "Agent not found."
 
             title = arguments.get("title")
-            owner_type = arguments.get("owner_type")
             period_start = arguments.get("period_start")
             period_end = arguments.get("period_end")
-            if not all([title, owner_type, period_start, period_end]):
-                return "Missing required fields: title, owner_type, period_start, period_end"
+            if not all([title, period_start, period_end]):
+                return "Missing required fields: title, period_start, period_end"
 
             from datetime import date
             p_start = date.fromisoformat(period_start)
             p_end = date.fromisoformat(period_end)
 
-            owner_id_str = arguments.get("owner_id")
-            owner_name_hint = arguments.get("owner_name")  # optional name-based fallback
-            owner_id: uuid.UUID | None = None
+            owner_user_raw = arguments.get("user_id")
+            owner_agent_raw = arguments.get("agent_id")
+            if bool(owner_user_raw) and bool(owner_agent_raw):
+                return "Exactly one of user_id or agent_id may be provided. Omit both for a company Objective."
 
-            if owner_id_str:
+            owner_user_id: uuid.UUID | None = None
+            owner_agent_id: uuid.UUID | None = None
+            if owner_user_raw:
                 try:
-                    owner_id = uuid.UUID(owner_id_str)
-                except ValueError:
-                    owner_id = None
+                    owner_user_id = uuid.UUID(str(owner_user_raw))
+                except (TypeError, ValueError):
+                    return "Invalid user_id format. Use a canonical Clawith User UUID."
+                result = await db.execute(
+                    select(UserModel.id).where(
+                        UserModel.id == owner_user_id,
+                        UserModel.tenant_id == ag.tenant_id,
+                        UserModel.is_active.is_(True),
+                    )
+                )
+                if result.scalar_one_or_none() is None:
+                    return "user_id was not found as an active User in this tenant."
+            elif owner_agent_raw:
+                try:
+                    owner_agent_id = uuid.UUID(str(owner_agent_raw))
+                except (TypeError, ValueError):
+                    return "Invalid agent_id format. Use a canonical Clawith Agent UUID."
+                result = await db.execute(
+                    select(AgentModel.id).where(
+                        AgentModel.id == owner_agent_id,
+                        AgentModel.tenant_id == ag.tenant_id,
+                        AgentModel.is_deleted.is_(False),
+                        AgentModel.is_expired.is_(False),
+                    )
+                )
+                if result.scalar_one_or_none() is None:
+                    return "agent_id was not found as an active Agent in this tenant."
 
-                if owner_id:
-                    owner_exists = False
-                    if owner_type == "agent":
-                        res = await db.execute(select(AgentModel.id).where(AgentModel.id == owner_id))
-                        owner_exists = res.scalar_one_or_none() is not None
-                    elif owner_type == "user":
-                        from app.models.user import User as UserModel
-                        from app.models.org import OrgMember
-                        res = await db.execute(select(UserModel.id).where(UserModel.id == owner_id))
-                        owner_exists = res.scalar_one_or_none() is not None
-                        if not owner_exists:
-                            # Maybe agent passed OrgMember.id — resolve to linked User.id when available
-                            res = await db.execute(
-                                select(OrgMember.id, OrgMember.user_id).where(OrgMember.id == owner_id)
-                            )
-                            member_row = res.first()
-                            if member_row:
-                                owner_exists = True
-                                if member_row.user_id:
-                                    # Resolve OrgMember.id → User.id so name lookup in list_objectives works
-                                    owner_id = member_row.user_id
-                                    logger.info(
-                                        f"[OKR] _create_objective: resolved OrgMember.id {owner_id_str} "
-                                        f"→ user_id {owner_id}"
-                                    )
-                                # else: channel-only member, keep OrgMember.id as owner_id
+            owner_id = owner_user_id or owner_agent_id
 
-                    if not owner_exists:
-                        owner_id = None
-                        if not owner_name_hint:
-                            return f"owner_id '{owner_id_str}' was not found. Provide a valid UUID, or pass owner_name instead."
-
-            if owner_type != "company" and not owner_id and owner_name_hint:
-                # If we don't have a valid UUID but we have a name, look it up
-                if owner_type == "agent":
-                    res = await db.execute(select(AgentModel.id).where(AgentModel.tenant_id == ag.tenant_id, AgentModel.name == owner_name_hint))
-                    owner_id = res.scalar_one_or_none()
-                elif owner_type == "user":
-                    from app.models.org import OrgMember
-                    from app.models.user import User as UserModel
-                    # Try platform User.display_name first
-                    res = await db.execute(select(UserModel.id).where(UserModel.display_name == owner_name_hint, UserModel.tenant_id == ag.tenant_id))
-                    owner_id = res.scalar_one_or_none()
-                    if not owner_id:
-                        # Fall back to OrgMember.name (Feishu/channel-only users)
-                        res = await db.execute(select(OrgMember.id).where(OrgMember.name == owner_name_hint, OrgMember.tenant_id == ag.tenant_id))
-                        owner_id = res.scalar_one_or_none()
-
-                if not owner_id:
-                    return f"Failed: Could not resolve a valid system UUID for the {owner_type} named '{owner_name_hint}'."
-
-            if owner_type != "company" and not owner_id:
-               return f"Failed: owner_id or owner_name is required for {owner_type} OKRs."
-
-            if not ctx["agent_is_system"] and owner_type == "agent" and owner_id is None:
-                owner_id = agent_id
-
-            permission_error = _can_create_okr_target(ctx, owner_type, owner_id)
+            permission_error = _can_create_okr_target(ctx, owner_user_id, owner_agent_id)
             if permission_error:
                 return permission_error
 
@@ -16456,15 +16055,15 @@ async def _create_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
                 tenant_id=ag.tenant_id,
                 title=title,
                 description=arguments.get("description"),
-                owner_type=owner_type,
-                owner_id=owner_id,
+                owner_user_id=owner_user_id,
+                owner_agent_id=owner_agent_id,
                 period_start=p_start,
                 period_end=p_end,
                 status="active"
             )
             db.add(obj)
             await db.commit()
-            owner_info = f"owner={owner_name_hint or owner_id_str or 'unattributed'}"
+            owner_info = f"owner={owner_id or 'company'}"
             return f"Successfully created Objective '{obj.title}' (ID: {obj.id}, {owner_info})"
     except Exception as e:
         logger.exception(f"[OKR] create_objective failed")
@@ -16500,7 +16099,9 @@ async def _create_key_result(agent_id: uuid.UUID | None, user_id: uuid.UUID | No
             if not obj:
                 return f"Objective {obj_id} not found."
 
-            permission_error = _can_access_existing_okr_target(ctx, obj.owner_type, obj.owner_id)
+            permission_error = _can_access_existing_okr_target(
+                ctx, obj.owner_user_id, obj.owner_agent_id
+            )
             if permission_error:
                 return permission_error
 
@@ -16524,7 +16125,7 @@ async def _update_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
     """Update Objective metadata.
 
     Permission rules:
-    - Regular agents: can only modify Objectives they own (owner_type='agent', owner_id=agent_id).
+    - Regular agents: can only modify Objectives whose canonical agent_id is their own.
     - System agents are constrained by the requesting user's role: admins can modify any OKR,
       non-admins may only modify their own personal OKRs.
     """
@@ -16555,7 +16156,9 @@ async def _update_objective(agent_id: uuid.UUID | None, user_id: uuid.UUID | Non
             if not obj:
                 return f"Objective {obj_id} not found."
 
-            permission_error = _can_access_existing_okr_target(ctx, obj.owner_type, obj.owner_id)
+            permission_error = _can_access_existing_okr_target(
+                ctx, obj.owner_user_id, obj.owner_agent_id
+            )
             if permission_error:
                 return permission_error
 
@@ -16621,7 +16224,9 @@ async def _update_any_kr_progress(agent_id: uuid.UUID | None, user_id: uuid.UUID
                 return f"Key Result {kr_id} not found in your organization."
 
             kr, obj = row
-            permission_error = _can_access_existing_okr_target(ctx, obj.owner_type, obj.owner_id)
+            permission_error = _can_access_existing_okr_target(
+                ctx, obj.owner_user_id, obj.owner_agent_id
+            )
             if permission_error:
                 return permission_error
 
@@ -16672,20 +16277,19 @@ async def _upsert_member_daily_report(agent_id: uuid.UUID | None, arguments: dic
         from datetime import date as date_cls
         from app.models.agent import Agent as AgentModel
         from app.models.okr import MemberDailyReport
-        from app.services.okr_reporting import (
-            list_tracked_okr_members,
-            upsert_member_daily_report as _upsert,
-        )
+        from app.models.user import User as UserModel
+        from app.services.okr_reporting import upsert_member_daily_report as _upsert
 
         report_date_raw = arguments.get("report_date")
         content = (arguments.get("content") or "").strip()
-        member_type = arguments.get("member_type") or "user"
-        member_id_raw = arguments.get("member_id")
-        member_name = (arguments.get("member_name") or "").strip()
+        target_user_raw = arguments.get("user_id")
+        target_agent_raw = arguments.get("agent_id")
         source = (arguments.get("source") or "okr_agent_assisted").strip() or "okr_agent_assisted"
 
         if not report_date_raw or not content:
             return "Missing report_date or content"
+        if bool(target_user_raw) == bool(target_agent_raw):
+            return "Exactly one of user_id or agent_id is required."
 
         try:
             report_date = date_cls.fromisoformat(report_date_raw)
@@ -16700,46 +16304,44 @@ async def _upsert_member_daily_report(agent_id: uuid.UUID | None, arguments: dic
             if not ag.is_system:
                 return "Permission denied: only the OKR Agent can upsert member daily reports."
 
-            target_member_id: uuid.UUID | None = None
-            if member_id_raw:
+            target_user_id: uuid.UUID | None = None
+            target_agent_id: uuid.UUID | None = None
+            if target_user_raw:
                 try:
-                    target_member_id = uuid.UUID(member_id_raw)
-                except ValueError:
-                    return "Invalid member_id format. Use a UUID."
-
-            if not target_member_id:
-                if not member_name:
-                    return "Provide either member_id or member_name."
-                members = await list_tracked_okr_members(ag.tenant_id)
-                lowered = member_name.casefold()
-                exact_matches = [
-                    member for member in members
-                    if member.member_type == member_type and member.display_name.casefold() == lowered
-                ]
-                if len(exact_matches) == 1:
-                    target_member_id = exact_matches[0].member_id
-                    member_name = exact_matches[0].display_name
-                elif len(exact_matches) > 1:
-                    return f"Multiple {member_type} members matched '{member_name}'. Please provide member_id."
-                else:
-                    fuzzy_matches = [
-                        member for member in members
-                        if member.member_type == member_type and lowered in member.display_name.casefold()
-                    ]
-                    if len(fuzzy_matches) == 1:
-                        target_member_id = fuzzy_matches[0].member_id
-                        member_name = fuzzy_matches[0].display_name
-                    elif len(fuzzy_matches) > 1:
-                        options = ", ".join(member.display_name for member in fuzzy_matches[:5])
-                        return f"Multiple {member_type} members matched '{member_name}': {options}. Please provide member_id."
-                    else:
-                        return f"No {member_type} member matched '{member_name}'."
+                    target_user_id = uuid.UUID(str(target_user_raw))
+                except (TypeError, ValueError):
+                    return "Invalid user_id format. Use a canonical Clawith User UUID."
+                target_result = await db.execute(
+                    select(UserModel.id).where(
+                        UserModel.id == target_user_id,
+                        UserModel.tenant_id == ag.tenant_id,
+                        UserModel.is_active.is_(True),
+                    )
+                )
+                if target_result.scalar_one_or_none() is None:
+                    return "user_id was not found as an active User in this tenant."
+            else:
+                try:
+                    target_agent_id = uuid.UUID(str(target_agent_raw))
+                except (TypeError, ValueError):
+                    return "Invalid agent_id format. Use a canonical Clawith Agent UUID."
+                target_result = await db.execute(
+                    select(AgentModel.id).where(
+                        AgentModel.id == target_agent_id,
+                        AgentModel.tenant_id == ag.tenant_id,
+                        AgentModel.is_deleted.is_(False),
+                        AgentModel.is_expired.is_(False),
+                    )
+                )
+                if target_result.scalar_one_or_none() is None:
+                    return "agent_id was not found as an active Agent in this tenant."
 
             existing_res = await db.execute(
                 select(MemberDailyReport).where(
                     MemberDailyReport.tenant_id == ag.tenant_id,
-                    MemberDailyReport.member_type == member_type,
-                    MemberDailyReport.member_id == target_member_id,
+                    MemberDailyReport.user_id == target_user_id
+                    if target_user_id
+                    else MemberDailyReport.agent_id == target_agent_id,
                     MemberDailyReport.report_date == report_date,
                 )
             )
@@ -16748,17 +16350,17 @@ async def _upsert_member_daily_report(agent_id: uuid.UUID | None, arguments: dic
 
         report = await _upsert(
             tenant_id=ag.tenant_id,
-            member_type=member_type,
-            member_id=target_member_id,
+            user_id=target_user_id,
+            agent_id=target_agent_id,
             report_date=report_date,
             content=content,
             source=source,
         )
 
-        resolved_name = member_name or str(target_member_id)
+        resolved_id = target_user_id or target_agent_id
         action = "Updated" if previous_content else "Created"
         details = [
-            f"{action} daily report for {resolved_name} on {report.report_date.isoformat()}.",
+            f"{action} daily report for {resolved_id} on {report.report_date.isoformat()}.",
             f"Stored length: {len(report.content)} characters.",
             f"Status: {report.status}.",
         ]

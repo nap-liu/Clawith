@@ -23,7 +23,6 @@ interface UserInfo {
     quota_agent_ttl_hours: number;
     agents_count: number;
     primary_mobile?: string;
-    feishu_open_id?: string;
     created_at?: string;
     source?: string;
 }

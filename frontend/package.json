@@ -7,6 +7,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "check:identity-contract": "node scripts/check-identity-contract.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

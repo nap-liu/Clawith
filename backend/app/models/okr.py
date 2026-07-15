@@ -14,6 +14,7 @@ Core tables powering the OKR feature:
 import uuid
 from datetime import date, datetime
 
+import sqlalchemy as sa
 from sqlalchemy import (
     Boolean,
     Date,
@@ -24,6 +25,9 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    CheckConstraint,
+    Index,
+    event,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -62,6 +66,14 @@ class OKRObjective(Base):
     owner_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True)
     )  # NULL for company-level O
+    # Canonical owner identity. Both NULL means a company-level objective;
+    # exactly one identifies a natural person or digital employee.
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    owner_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=True, index=True
+    )
 
     # Period
     period_start: Mapped[date] = mapped_column(Date, nullable=False)
@@ -77,6 +89,13 @@ class OKRObjective(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "NOT (owner_user_id IS NOT NULL AND owner_agent_id IS NOT NULL)",
+            name="ck_okr_objective_single_owner",
+        ),
     )
 
 
@@ -215,6 +234,12 @@ class WorkReport(Base):
         String(20), nullable=False
     )  # "user" | "agent"
     author_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=True, index=True
+    )
 
     report_type: Mapped[str] = mapped_column(
         String(10), nullable=False
@@ -233,6 +258,13 @@ class WorkReport(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "(user_id IS NOT NULL) <> (agent_id IS NOT NULL)",
+            name="ck_work_report_single_author",
+        ),
     )
 
 
@@ -260,6 +292,12 @@ class MemberDailyReport(Base):
     member_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False, index=True
     )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     report_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     content: Mapped[str] = mapped_column(
         Text, nullable=False, default=""
@@ -282,7 +320,81 @@ class MemberDailyReport(Base):
             "tenant_id", "member_type", "member_id", "report_date",
             name="uq_member_daily_report",
         ),
+        Index(
+            "uq_member_daily_report_user",
+            "tenant_id",
+            "user_id",
+            "report_date",
+            unique=True,
+            postgresql_where=sa.text("user_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_member_daily_report_agent",
+            "tenant_id",
+            "agent_id",
+            "report_date",
+            unique=True,
+            postgresql_where=sa.text("agent_id IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "(user_id IS NOT NULL) <> (agent_id IS NOT NULL)",
+            name="ck_member_daily_report_single_member",
+        ),
     )
+
+
+@event.listens_for(OKRObjective, "before_insert")
+@event.listens_for(OKRObjective, "before_update")
+def _sync_objective_owner(_mapper, _connection, target: OKRObjective) -> None:
+    if target.owner_user_id is not None:
+        target.owner_agent_id = None
+        target.owner_type = "user"
+        target.owner_id = target.owner_user_id
+    elif target.owner_agent_id is not None:
+        target.owner_user_id = None
+        target.owner_type = "agent"
+        target.owner_id = target.owner_agent_id
+    elif target.owner_type == "user" and target.owner_id is not None:
+        target.owner_user_id = target.owner_id
+    elif target.owner_type == "agent" and target.owner_id is not None:
+        target.owner_agent_id = target.owner_id
+    else:
+        target.owner_type = "company"
+        target.owner_id = None
+
+
+@event.listens_for(MemberDailyReport, "before_insert")
+@event.listens_for(MemberDailyReport, "before_update")
+def _sync_daily_report_member(_mapper, _connection, target: MemberDailyReport) -> None:
+    if target.user_id is not None:
+        target.agent_id = None
+        target.member_type = "user"
+        target.member_id = target.user_id
+    elif target.agent_id is not None:
+        target.user_id = None
+        target.member_type = "agent"
+        target.member_id = target.agent_id
+    elif target.member_type == "user" and target.member_id is not None:
+        target.user_id = target.member_id
+    elif target.member_type == "agent" and target.member_id is not None:
+        target.agent_id = target.member_id
+
+
+@event.listens_for(WorkReport, "before_insert")
+@event.listens_for(WorkReport, "before_update")
+def _sync_work_report_author(_mapper, _connection, target: WorkReport) -> None:
+    if target.user_id is not None:
+        target.agent_id = None
+        target.author_type = "user"
+        target.author_id = target.user_id
+    elif target.agent_id is not None:
+        target.user_id = None
+        target.author_type = "agent"
+        target.author_id = target.agent_id
+    elif target.author_type == "user" and target.author_id is not None:
+        target.user_id = target.author_id
+    elif target.author_type == "agent" and target.author_id is not None:
+        target.agent_id = target.author_id
 
 
 class CompanyReport(Base):

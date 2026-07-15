@@ -36,7 +36,21 @@ async def _isolate_async_engine_between_tests():
     await engine.dispose()
 
 
-async def _seed_user(suffix: str, display_name: str, role: str = "member") -> User:
+async def _seed_tenant() -> Tenant:
+    async with async_session() as db:
+        tenant = Tenant(name="Perm Edge", slug=f"perm-edge-{uuid.uuid4().hex[:10]}")
+        db.add(tenant)
+        await db.commit()
+        await db.refresh(tenant)
+        return tenant
+
+
+async def _seed_user(
+    suffix: str,
+    display_name: str,
+    tenant_id: uuid.UUID,
+    role: str = "member",
+) -> User:
     async with async_session() as db:
         ident = Identity(
             username=f"u_{suffix}",
@@ -45,16 +59,26 @@ async def _seed_user(suffix: str, display_name: str, role: str = "member") -> Us
         )
         db.add(ident)
         await db.flush()
-        user = User(identity_id=ident.id, display_name=display_name, role=role, is_active=True)
+        user = User(
+            identity_id=ident.id,
+            tenant_id=tenant_id,
+            display_name=display_name,
+            role=role,
+            is_active=True,
+        )
         db.add(user)
         await db.commit()
         await db.refresh(user)
         return user
 
 
-async def _seed_agent(creator_user_id) -> uuid.UUID:
+async def _seed_agent(creator_user_id, tenant_id: uuid.UUID) -> uuid.UUID:
     async with async_session() as db:
-        agent = Agent(name="PermEdgeAgent", creator_id=creator_user_id)
+        agent = Agent(
+            name="PermEdgeAgent",
+            creator_id=creator_user_id,
+            tenant_id=tenant_id,
+        )
         db.add(agent)
         await db.commit()
         await db.refresh(agent)
@@ -67,7 +91,7 @@ async def _seed_group_session(agent_id, owner_user_id, conv_id_str: str) -> uuid
         session = ChatSession(
             id=sess_id,
             agent_id=agent_id,
-            user_id=owner_user_id,
+            user_id=None,
             title="Perm Edge Group",
             source_channel="dingtalk",
             external_conv_id=conv_id_str,
@@ -123,10 +147,11 @@ async def test_group_member_cannot_rename_session(monkeypatch):
     from app.api.chat_sessions import rename_session, PatchSessionIn
 
     run = uuid.uuid4().hex[:8]
-    owner = await _seed_user(f"po_{run}", "Owner")
-    member = await _seed_user(f"pm_{run}", "Member")  # role=member, not creator
+    tenant = await _seed_tenant()
+    owner = await _seed_user(f"po_{run}", "Owner", tenant.id)
+    member = await _seed_user(f"pm_{run}", "Member", tenant.id)  # role=member, not creator
 
-    agent_id = await _seed_agent(owner.id)
+    agent_id = await _seed_agent(owner.id, tenant.id)
     sess_id = await _seed_group_session(agent_id, owner.id, f"dingtalk_group_{run}")
     await _insert_user_msg(agent_id, sess_id, member.id)  # qualifies as member
 
@@ -149,10 +174,11 @@ async def test_group_member_cannot_delete_session(monkeypatch):
     from app.api.chat_sessions import delete_session
 
     run = uuid.uuid4().hex[:8]
-    owner = await _seed_user(f"do_{run}", "Owner")
-    member = await _seed_user(f"dm_{run}", "Member")
+    tenant = await _seed_tenant()
+    owner = await _seed_user(f"do_{run}", "Owner", tenant.id)
+    member = await _seed_user(f"dm_{run}", "Member", tenant.id)
 
-    agent_id = await _seed_agent(owner.id)
+    agent_id = await _seed_agent(owner.id, tenant.id)
     sess_id = await _seed_group_session(agent_id, owner.id, f"dingtalk_group_{run}")
     await _insert_user_msg(agent_id, sess_id, member.id)
 
@@ -181,10 +207,11 @@ async def test_admin_can_rename_group_session(monkeypatch):
     from app.api.chat_sessions import rename_session, PatchSessionIn
 
     run = uuid.uuid4().hex[:8]
-    owner = await _seed_user(f"ao_{run}", "Owner")
-    admin = await _seed_user(f"aa_{run}", "Admin", role="org_admin")
+    tenant = await _seed_tenant()
+    owner = await _seed_user(f"ao_{run}", "Owner", tenant.id)
+    admin = await _seed_user(f"aa_{run}", "Admin", tenant.id, role="org_admin")
 
-    agent_id = await _seed_agent(owner.id)
+    agent_id = await _seed_agent(owner.id, tenant.id)
     sess_id = await _seed_group_session(agent_id, owner.id, f"dingtalk_group_{run}")
 
     _patch_check_agent_access(monkeypatch, creator_id=owner.id)
@@ -211,10 +238,11 @@ async def test_scope_all_rejected_for_non_admin_group_member(monkeypatch):
     from app.api.chat_sessions import list_sessions
 
     run = uuid.uuid4().hex[:8]
-    owner = await _seed_user(f"so_{run}", "Owner")
-    member = await _seed_user(f"sm_{run}", "Member")  # role=member, not creator, not admin
+    tenant = await _seed_tenant()
+    owner = await _seed_user(f"so_{run}", "Owner", tenant.id)
+    member = await _seed_user(f"sm_{run}", "Member", tenant.id)  # role=member, not creator, not admin
 
-    agent_id = await _seed_agent(owner.id)
+    agent_id = await _seed_agent(owner.id, tenant.id)
     sess_id = await _seed_group_session(agent_id, owner.id, f"dingtalk_group_{run}")
     await _insert_user_msg(agent_id, sess_id, member.id)  # establishes membership
 

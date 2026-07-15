@@ -46,7 +46,7 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
-from app.schemas.schemas import ChannelConfigOut
+from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 
 router = APIRouter(tags=["dingtalk"])
 
@@ -455,6 +455,37 @@ async def process_dingtalk_message(
                 "[DingTalk] No enterprise or agent robot credentials are available for directory enrichment"
             )
 
+        # Canonical attribution is resolved once through the shared scoped
+        # channel binding. Corporate directory credentials are authoritative;
+        # the robot credentials are only the documented fallback source.
+        if _directory_credentials:
+            dt_user_detail = await _get_dingtalk_user_detail_with_fallback(
+                _directory_credentials,
+                sender_staff_id,
+                getattr(_dingtalk_provider, "id", None),
+            )
+            if dt_user_detail:
+                dt_unionid = dt_user_detail.get("unionid", "")
+                dt_mobile = dt_user_detail.get("mobile", "")
+                dt_email = dt_user_detail.get("email", "") or dt_user_detail.get("org_email", "")
+
+        from app.services.channel_user_service import channel_user_service
+
+        platform_user = await channel_user_service.resolve_channel_user(
+            db,
+            agent_obj,
+            "dingtalk",
+            sender_staff_id,
+            {
+                "external_id": sender_staff_id,
+                "unionid": dt_unionid,
+                "mobile": dt_mobile,
+                "email": dt_email,
+                "name": sender_nick,
+                "identity_verified": bool(dt_mobile or dt_email),
+            },
+        )
+
         _sender_org_member = None
 
         # Step 1: Match via sender_staff_id in org_members.external_id (企业 userId，最稳定)
@@ -531,11 +562,7 @@ async def process_dingtalk_message(
                     logger.info("[DingTalk] Step3a: Matched user via enterprise unionid")
 
         # 3b: mobile 匹配
-        if dt_mobile and (
-            not platform_user
-            or not platform_user.identity
-            or not platform_user.identity.phone
-        ):
+        if dt_mobile and not platform_user:
             _u_r = await db.execute(
                 _select(UserModel).join(UserModel.identity).where(
                     _IdentityModel.phone == dt_mobile,
@@ -562,19 +589,10 @@ async def process_dingtalk_message(
 
         # Step 4: No match found — create new user
         if not platform_user:
-            import uuid as _uuid
-            from app.services.registration_service import registration_service as _reg_svc
-            # Create or find Identity first
-            _identity = await _reg_svc.find_or_create_identity(
-                db,
-                email=dt_email or f"{dt_username}@dingtalk.local",
-                phone=dt_mobile or None,
-                username=dt_username,
-                password=_uuid.uuid4().hex,
-            )
-            # Create tenant-scoped User
+            # Defensive fallback only: inbound channel identities are not login
+            # principals and must never mint synthetic credentials.
             platform_user = UserModel(
-                identity_id=_identity.id,
+                identity_id=None,
                 display_name=sender_nick or f"DingTalk {sender_staff_id[:8]}",
                 role="member",
                 tenant_id=agent_obj.tenant_id if agent_obj else None,
@@ -583,7 +601,6 @@ async def process_dingtalk_message(
             )
             db.add(platform_user)
             await db.flush()
-            platform_user.identity = _identity
             logger.info(f"[DingTalk] Step4: Created new user: {dt_username}")
         else:
             # Update display_name, source, mobile, email for existing users

@@ -401,9 +401,10 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
 
     assert messages == [
         {
-            "role": "user",
-            "content": "hello",
-            "created_at": now.isoformat(),
+                "role": "user",
+                "content": "hello",
+                "created_at": now.isoformat(),
+                "sender_user_id": str(owner_id),
         }
     ]
 
@@ -455,9 +456,10 @@ async def test_creator_can_view_other_users_session_messages(monkeypatch):
 
     assert messages == [
         {
-            "role": "user",
-            "content": "hello",
-            "created_at": now.isoformat(),
+                "role": "user",
+                "content": "hello",
+                "created_at": now.isoformat(),
+                "sender_user_id": str(other_user_id),
         }
     ]
 

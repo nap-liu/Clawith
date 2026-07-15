@@ -52,8 +52,8 @@ interface Objective {
     id: string;
     title: string;
     description?: string;
-    owner_type: string; // company | user | agent
-    owner_id?: string;
+    user_id?: string;
+    agent_id?: string;
     owner_name?: string; // resolved display name (agent name or user display_name)
     period_start: string;
     period_end: string;
@@ -95,8 +95,8 @@ interface CompanyReport {
 
 interface MemberDailyReportItem {
     id: string;
-    member_type: 'user' | 'agent';
-    member_id: string;
+    user_id?: string;
+    agent_id?: string;
     display_name: string;
     avatar_url?: string | null;
     group_label: string;
@@ -108,12 +108,11 @@ interface MemberDailyReportItem {
 }
 
 interface MemberWithoutOKR {
-    id: string;
-    type: 'user' | 'agent';
+    user_id?: string | null;
+    agent_id?: string | null;
     display_name: string;
     avatar_url: string;
-    channel: string | null;
-    channel_user_id: string | null;
+    channel?: string | null;
     source_label?: string | null;
 }
 
@@ -731,8 +730,7 @@ function CreateObjectiveForm({
                 body: JSON.stringify({
                     title: title.trim(),
                     description: description.trim() || undefined,
-                    owner_type: ownerType,
-                    owner_id: ownerType === 'user' ? userId : undefined,
+                    user_id: ownerType === 'user' ? userId : undefined,
                     period_start: selectedPeriod.start,
                     period_end: selectedPeriod.end,
                 }),
@@ -950,13 +948,13 @@ export default function OKR() {
     }
 
     // ── Enabled OKR dashboard ────────────────────────────────────────────────
-    const companyObjs = objectives.filter(o => o.owner_type === 'company');
-    const memberObjs = objectives.filter(o => o.owner_type !== 'company');
+    const companyObjs = objectives.filter(o => !o.user_id && !o.agent_id);
+    const memberObjs = objectives.filter(o => o.user_id || o.agent_id);
 
     // Group member objectives by owner — use owner_name as the display label
     const memberGroups: Record<string, { label: string; objs: Objective[] }> = {};
     for (const obj of memberObjs) {
-        const key = `${obj.owner_type}:${obj.owner_id ?? ''}`;
+        const key = obj.user_id ? `user:${obj.user_id}` : `agent:${obj.agent_id ?? ''}`;
         if (!memberGroups[key]) {
             // Prefer resolved name; fall back to a readable placeholder
             const label = obj.owner_name || '?';
@@ -1527,7 +1525,7 @@ function MembersWithoutOKRPanel({
                 {/* Member list */}
                 <div style={{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                     {members.map((member) => (
-                        <div key={member.id} style={{
+                        <div key={member.user_id || member.agent_id} style={{
                             display: 'flex', alignItems: 'center', gap: '10px',
                             padding: '8px 10px',
                             background: 'var(--bg-secondary)',
@@ -1536,10 +1534,10 @@ function MembersWithoutOKRPanel({
                         }}>
                             <div style={{
                                 width: 28, height: 28, borderRadius: '50%', flexShrink: 0,
-                                background: member.type === 'agent' ? 'rgba(99,102,241,0.15)' : 'rgba(16,185,129,0.15)',
+                                background: member.agent_id ? 'rgba(99,102,241,0.15)' : 'rgba(16,185,129,0.15)',
                                 display: 'flex', alignItems: 'center', justifyContent: 'center',
                                 fontSize: '11px', fontWeight: 600,
-                                color: member.type === 'agent' ? '#6366f1' : '#10b981',
+                                color: member.agent_id ? '#6366f1' : '#10b981',
                             }}>
                                 {(member.display_name || '?').charAt(0).toUpperCase()}
                             </div>
@@ -1548,7 +1546,7 @@ function MembersWithoutOKRPanel({
                                     {member.display_name}
                                 </div>
                                 <div style={{ fontSize: '11px', color: 'var(--text-quaternary)' }}>
-                                    {member.type === 'agent'
+                                    {member.agent_id
                                         ? 'AI Agent'
                                         : (member.source_label
                                             ? (member.source_label === 'Platform User'

@@ -9,7 +9,11 @@ from sqlalchemy import and_, false, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent, AgentPermission
-from app.models.org import AgentAgentRelationship, AgentRelationship, OrgMember
+from app.models.org import (
+    AgentAgentRelationship,
+    AgentRelationship,
+    RelationshipSuppression,
+)
 from app.models.user import User
 
 
@@ -79,6 +83,28 @@ def _is_admin(user: User) -> bool:
     return user.role in ("platform_admin", "org_admin")
 
 
+def current_agent_tenant_matches(user: User, agent: Agent) -> bool:
+    """Return whether the authenticated user/token is scoped to the agent tenant."""
+    # A few isolated unit tests use deliberately minimal protocol doubles. Real
+    # ``User`` and ``Agent`` ORM instances always expose both tenant attributes.
+    if not hasattr(user, "tenant_id") or not hasattr(agent, "tenant_id"):
+        return True
+    return bool(user.tenant_id) and user.tenant_id == agent.tenant_id
+
+
+def require_current_agent_tenant(user: User, agent: Agent) -> None:
+    """Require an agent operation to use the active login enterprise.
+
+    Platform administrators retain global capability through tenant switching,
+    but a tenant-scoped request must use the user record/token for that tenant.
+    """
+    if not current_agent_tenant_matches(user, agent):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Switch to the agent's organization before continuing",
+        )
+
+
 def can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
     """Whether ``user`` may view/monitor OTHER users' chat sessions for ``agent``.
 
@@ -87,9 +113,94 @@ def can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
     monitor path. Admins (platform/org/agent) and the agent's creator qualify.
     """
     return (
+        current_agent_tenant_matches(user, agent)
+        and (
         user.role in ("platform_admin", "org_admin", "agent_admin")
         or str(agent.creator_id) == str(user.id)
+        )
     )
+
+
+async def filter_tenant_safe_chat_sessions(
+    db: AsyncSession,
+    sessions: list,
+    tenant_id: uuid.UUID | None,
+) -> list:
+    """Hide every malformed session edge that crosses its owning tenant."""
+    if not sessions:
+        return []
+    if not tenant_id:
+        return []
+
+    required_agent_ids = {
+        agent_id
+        for session in sessions
+        for agent_id in (
+            getattr(session, "agent_id", None),
+            getattr(session, "peer_agent_id", None),
+        )
+        if agent_id
+    }
+    valid_ids = set(
+        (
+            await db.execute(
+                select(Agent.id).where(
+                    Agent.id.in_(required_agent_ids),
+                    Agent.tenant_id == tenant_id,
+                )
+            )
+        ).scalars().all()
+    )
+    required_user_ids = {
+        getattr(session, "user_id", None)
+        for session in sessions
+        if getattr(session, "user_id", None)
+    }
+    valid_user_ids = set()
+    if required_user_ids:
+        valid_user_ids = set(
+            (
+                await db.execute(
+                    select(User.id).where(
+                        User.id.in_(required_user_ids),
+                        User.tenant_id == tenant_id,
+                    )
+                )
+            ).scalars().all()
+        )
+
+    def _safe(session) -> bool:
+        source_id = getattr(session, "agent_id", None)
+        peer_id = getattr(session, "peer_agent_id", None)
+        user_id = getattr(session, "user_id", None)
+        source_channel = getattr(session, "source_channel", None)
+        is_group = bool(getattr(session, "is_group", False))
+        if source_id not in valid_ids:
+            return False
+        if source_channel == "agent":
+            return not is_group and user_id is None and peer_id in valid_ids
+        if is_group or source_channel == "trigger":
+            return user_id is None and peer_id is None
+        return peer_id is None and user_id in valid_user_ids
+
+    return [
+        session
+        for session in sessions
+        if _safe(session)
+    ]
+
+
+async def require_tenant_safe_chat_session(
+    db: AsyncSession,
+    session,
+    tenant_id: uuid.UUID | None,
+) -> None:
+    """Fail closed when any selected session edge violates tenant identity."""
+    if len(await filter_tenant_safe_chat_sessions(db, [session], tenant_id)) != 1:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found",
+        )
 
 
 async def get_agent_access_level_for_user_id(
@@ -109,6 +220,8 @@ async def get_agent_access_level_for_user_id(
     user = user_result.scalar_one_or_none()
     if not user or not user.is_active:
         return None
+    if user.role == "org_admin" and user.tenant_id is None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant scope assigned")
     if agent.tenant_id != user.tenant_id:
         return None
     if agent.creator_id == user.id:
@@ -236,6 +349,19 @@ async def evaluate_agent_relationship_status(
             "access_status": "restricted",
             "access_status_reason": "different_tenant",
         }
+    suppression = await db.scalar(
+        select(RelationshipSuppression.id).where(
+            RelationshipSuppression.agent_id == source.id,
+            RelationshipSuppression.target_type == "agent",
+            RelationshipSuppression.target_id == target.id,
+        )
+    )
+    if suppression:
+        return {
+            "access_allowed": False,
+            "access_status": "suppressed",
+            "access_status_reason": "relationship_explicitly_suppressed",
+        }
 
     available, reason = _agent_available(target)
     if not available:
@@ -249,7 +375,9 @@ async def evaluate_agent_relationship_status(
     if created_by_user_id:
         # Source must still be MANAGED by the creator; target need only be VISIBLE
         # (relationship is directional source->target, target is not mutated).
-        if await user_can_manage_agent_id(db, created_by_user_id, source) and await user_can_view_agent_id(db, created_by_user_id, target):
+        if await user_can_manage_agent_id(
+            db, created_by_user_id, source
+        ) and await user_can_view_agent_id(db, created_by_user_id, target):
             return {
                 "access_allowed": True,
                 "access_status": "active",
@@ -302,24 +430,36 @@ async def evaluate_human_relationship_status(
     if source_agent is None:
         source_result = await db.execute(select(Agent).where(Agent.id == rel.agent_id))
         source_agent = source_result.scalar_one_or_none()
-    member = rel.__dict__.get("member")
-    if member is None:
-        member_result = await db.execute(select(OrgMember).where(OrgMember.id == rel.member_id))
-        member = member_result.scalar_one_or_none()
-
-    if not source_agent or not member:
+    user = rel.__dict__.get("user")
+    if user is None:
+        user_result = await db.execute(select(User).where(User.id == rel.user_id))
+        user = user_result.scalar_one_or_none()
+    if not source_agent or not user:
         return {
             "access_allowed": False,
             "access_status": "missing_target",
-            "access_status_reason": "agent_or_member_not_found",
+            "access_status_reason": "agent_or_user_not_found",
         }
-    if member.status != "active":
+    suppression = await db.scalar(
+        select(RelationshipSuppression.id).where(
+            RelationshipSuppression.agent_id == source_agent.id,
+            RelationshipSuppression.target_type == "user",
+            RelationshipSuppression.target_id == user.id,
+        )
+    )
+    if suppression:
+        return {
+            "access_allowed": False,
+            "access_status": "suppressed",
+            "access_status_reason": "relationship_explicitly_suppressed",
+        }
+    if not user.is_active:
         return {
             "access_allowed": False,
             "access_status": "restricted",
-            "access_status_reason": "member_inactive",
+            "access_status_reason": "user_inactive",
         }
-    if member.tenant_id and source_agent.tenant_id and member.tenant_id != source_agent.tenant_id:
+    if not source_agent.tenant_id or user.tenant_id != source_agent.tenant_id:
         return {
             "access_allowed": False,
             "access_status": "restricted",
@@ -347,11 +487,11 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
-    # Admins can access everything with manage
-    if user.role in ("platform_admin", "org_admin"):
+    # Platform admins are the only role with intentional cross-tenant access.
+    if user.role == "platform_admin":
         return agent, "manage"
 
-    # Tenant isolation: non-admin users can only access agents in their own tenant
+    # Tenant isolation applies to every tenant-scoped role, including org admins.
     if agent.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to this agent")
 
@@ -361,12 +501,12 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
 
     access_mode = getattr(agent, "access_mode", None) or "company"
 
+    # Org admins manage tenant-visible agents, but private agents remain private.
+    if user.role == "org_admin" and access_mode != "private":
+        return agent, "manage"
+
     perms = await db.execute(select(AgentPermission).where(AgentPermission.agent_id == agent_id))
     permissions = perms.scalars().all()
-
-    is_admin = user.role in ("platform_admin", "org_admin")
-    if is_admin and access_mode != "private":
-        return agent, "manage"
 
     if access_mode == "company":
         company_level = getattr(agent, "company_access_level", None)

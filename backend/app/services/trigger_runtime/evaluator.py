@@ -27,6 +27,28 @@ class OnMessageMatchResult:
     trigger_ids: tuple[uuid.UUID, ...] = ()
 
 
+def _canonical_trigger_actor(config: dict) -> tuple[str, uuid.UUID] | None:
+    """Return the exactly-one canonical actor frozen in an on_message trigger."""
+    raw_user_id = str(config.get("from_user_id") or "").strip()
+    raw_agent_id = str(config.get("from_agent_id") or "").strip()
+    if bool(raw_user_id) == bool(raw_agent_id):
+        return None
+    try:
+        if raw_user_id:
+            return "user", uuid.UUID(raw_user_id)
+        return "agent", uuid.UUID(raw_agent_id)
+    except ValueError:
+        return None
+
+
+def _canonical_message_actor(message) -> tuple[str, uuid.UUID] | None:
+    if getattr(message, "sender_user_id", None):
+        return "user", message.sender_user_id
+    if getattr(message, "sender_agent_id", None):
+        return "agent", message.sender_agent_id
+    return None
+
+
 async def match_incoming_chat_message(db, message, session) -> OnMessageMatchResult:
     """Atomically enqueue the exact on_message binding for one durable row.
 
@@ -72,7 +94,8 @@ async def match_incoming_chat_message(db, message, session) -> OnMessageMatchRes
         }
     matches: list[AgentTrigger] = []
     meta = message.message_meta if isinstance(message.message_meta, dict) else {}
-    actual_actor = str(meta.get("actor_ref") or message.participant_id or message.user_id or "").strip()
+    actual_actor_pair = _canonical_message_actor(message)
+    actual_actor = str(actual_actor_pair[1]) if actual_actor_pair else ""
 
     for trigger in candidates:
         cfg = trigger.config or {}
@@ -87,8 +110,8 @@ async def match_incoming_chat_message(db, message, session) -> OnMessageMatchRes
         expected_channel = str(cfg.get("_watch_source_channel") or "").strip()
         if expected_channel and expected_channel != session.source_channel:
             continue
-        expected_actor = str(cfg.get("_watch_actor_ref") or "").strip()
-        if expected_actor and expected_actor != actual_actor:
+        expected_actor_pair = _canonical_trigger_actor(cfg)
+        if expected_actor_pair is None or actual_actor_pair != expected_actor_pair:
             continue
         if session.source_channel != "agent" and message.role != "user":
             continue
@@ -292,7 +315,7 @@ async def recover_legacy_on_message_events(
     *,
     page_size: int = 200,
 ) -> int:
-    """Enqueue every legacy name-matched message without changing its tool contract."""
+    """Recover exact canonical-ID on_message events outside a watched session."""
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
     from app.models.trigger_execution import TriggerExecution
@@ -319,18 +342,10 @@ async def recover_legacy_on_message_events(
         cfg = trigger.config if isinstance(trigger.config, dict) else {}
         if cfg.get("_watch_session_id"):
             return 0
-        from_agent_name = cfg.get("from_agent_name")
-        from_user_name = cfg.get("from_user_name")
-        if isinstance(from_agent_name, list):
-            from_agent_name = from_agent_name[0] if from_agent_name else ""
-        if isinstance(from_user_name, list):
-            from_user_name = from_user_name[0] if from_user_name else ""
-        if not isinstance(from_agent_name, str):
-            from_agent_name = ""
-        if not isinstance(from_user_name, str):
-            from_user_name = ""
-        if not from_agent_name and not from_user_name:
+        actor = _canonical_trigger_actor(cfg)
+        if actor is None:
             return 0
+        actor_type, actor_id = actor
 
         # Event time and processing time are independent. A message can commit
         # after a scan but before an earlier execution is claimed; using
@@ -376,29 +391,8 @@ async def recover_legacy_on_message_events(
         from sqlalchemy import String as SaString, cast as sa_cast
 
         base_query = None
-        matched_from = ""
-        if from_agent_name:
-            from app.models.agent import Agent as AgentModel
-            from app.models.participant import Participant
-
-            safe_agent_name = from_agent_name.replace("%", "").replace("_", r"\_")
-            source_agent = (
-                await db.execute(
-                    select(AgentModel).where(AgentModel.name.ilike(f"%{safe_agent_name}%"))
-                )
-            ).scalars().first()
-            if source_agent is None:
-                return 0
-            from_participant = (
-                await db.execute(
-                    select(Participant.id).where(
-                        Participant.type == "agent",
-                        Participant.ref_id == source_agent.id,
-                    )
-                )
-            ).scalar_one_or_none()
-            if from_participant is None:
-                return 0
+        matched_from = str(actor_id)
+        if actor_type == "agent":
             base_query = (
                 select(ChatMessage)
                 .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
@@ -410,49 +404,25 @@ async def recover_legacy_on_message_events(
                             ChatSession.peer_agent_id == trigger.agent_id,
                         ),
                     ),
-                    ChatMessage.participant_id == from_participant,
+                    ChatMessage.sender_agent_id == actor_id,
                     ChatMessage.created_at >= since,
                     ChatMessage.role.in_(["assistant", "user"]),
                     ChatSession.source_channel != "trigger",
                 )
             )
-            matched_from = from_agent_name
         else:
-            from app.models.agent import Agent as AgentModel
-            from app.models.user import Identity, User
-
-            safe_user_name = from_user_name.replace("%", "").replace("_", r"\_")
-            agent = await db.get(AgentModel, trigger.agent_id)
-            user_query = select(User).join(User.identity).where(
-                or_(
-                    User.display_name.ilike(f"%{safe_user_name}%"),
-                    Identity.username.ilike(f"%{safe_user_name}%"),
-                )
-            )
-            if agent is not None and agent.tenant_id:
-                user_query = user_query.where(User.tenant_id == agent.tenant_id)
-            target_user = (await db.execute(user_query)).scalars().first()
             user_filters = [
                 ChatSession.agent_id == trigger.agent_id,
                 ChatSession.source_channel != "trigger",
                 ChatMessage.role == "user",
                 ChatMessage.created_at >= since,
+                ChatMessage.sender_user_id == actor_id,
             ]
-            if target_user is not None:
-                user_filters.append(ChatSession.user_id == target_user.id)
-            else:
-                user_filters.append(
-                    or_(
-                        ChatSession.title.ilike(f"%{safe_user_name}%"),
-                        ChatMessage.content.ilike(f"%{safe_user_name}%"),
-                    )
-                )
             base_query = (
                 select(ChatMessage)
                 .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
                 .where(*user_filters)
             )
-            matched_from = from_user_name
 
         last_created_at = None
         last_id = None
@@ -851,10 +821,10 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
             cfg = json.loads(cfg)
         except (json.JSONDecodeError, TypeError):
             cfg = {}
-    from_agent_name = cfg.get("from_agent_name")
-    from_user_name = cfg.get("from_user_name")
-    if not from_agent_name and not from_user_name:
+    actor = _canonical_trigger_actor(cfg)
+    if actor is None:
         return False
+    actor_type, actor_id = actor
 
     since = trigger.last_fired_at or trigger.created_at
     if trigger.fire_count == 0 and not trigger.last_fired_at:
@@ -918,7 +888,6 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                     .limit(50)
                 )
                 candidates = result.scalars().all()
-                expected_actor = str(cfg.get("_watch_actor_ref") or "").strip()
                 correlation_mode = str(cfg.get("_correlation_mode") or "next_message")
                 outbound_external_id = str(cfg.get("_outbound_external_message_id") or "").strip()
                 msg = None
@@ -933,10 +902,7 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                         ):
                             continue
                     meta = candidate.message_meta if isinstance(candidate.message_meta, dict) else {}
-                    actual_actor = str(
-                        meta.get("actor_ref") or candidate.participant_id or candidate.user_id or ""
-                    ).strip()
-                    if expected_actor and actual_actor != expected_actor:
+                    if _canonical_message_actor(candidate) != actor:
                         continue
                     if correlation_mode == "reply_to":
                         reply_to = str(meta.get("reply_to_external_message_id") or "").strip()
@@ -948,31 +914,14 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 if msg is None:
                     return False
                 cfg["_matched_message"] = (msg.content or "")[:2000]
-                cfg["_matched_from"] = from_agent_name or from_user_name or expected_actor or "message"
+                cfg["_matched_from"] = str(actor_id)
                 cfg["_matched_message_id"] = str(msg.id)
                 cfg["_matched_session_id"] = watch_session_id
                 if msg.external_event_key:
                     cfg["_matched_external_event_key"] = msg.external_event_key
                 return True
 
-            if from_agent_name:
-                from app.models.participant import Participant
-                from app.models.agent import Agent as AgentModel
-                if isinstance(from_agent_name, list):
-                    from_agent_name = from_agent_name[0] if from_agent_name else ""
-                if not isinstance(from_agent_name, str):
-                    return False
-                safe_agent_name = from_agent_name.replace("%", "").replace("_", r"\_")
-                agent_r = await db.execute(select(AgentModel).where(AgentModel.name.ilike(f"%{safe_agent_name}%")))
-                source_agent = agent_r.scalars().first()
-                if not source_agent:
-                    return False
-                result = await db.execute(
-                    select(Participant.id).where(Participant.type == "agent", Participant.ref_id == source_agent.id)
-                )
-                from_participant = result.scalar_one_or_none()
-                if not from_participant:
-                    return False
+            if actor_type == "agent":
                 from sqlalchemy import String as SaString, cast as sa_cast
                 result = await db.execute(
                     select(ChatMessage)
@@ -985,7 +934,7 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                                 ChatSession.peer_agent_id == trigger.agent_id,
                             ),
                         ),
-                        ChatMessage.participant_id == from_participant,
+                        ChatMessage.sender_agent_id == actor_id,
                         ChatMessage.created_at > since,
                         # Fix 1: Only match real conversational messages,
                         # not internal tool_call / system records.
@@ -1001,77 +950,34 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 if not msg:
                     return False
                 cfg["_matched_message"] = (msg.content or "")[:2000]
-                cfg["_matched_from"] = from_agent_name
+                cfg["_matched_from"] = str(actor_id)
                 cfg["_matched_message_id"] = str(msg.id)
                 cfg["_matched_session_id"] = str(msg.conversation_id)
                 if msg.external_event_key:
                     cfg["_matched_external_event_key"] = msg.external_event_key
                 return True
 
-            if from_user_name:
+            if actor_type == "user":
                 from sqlalchemy import String as SaString, cast as sa_cast
-                from app.models.agent import Agent as AgentModel
-                from app.models.user import Identity, User
-
-                agent_r = await db.execute(select(AgentModel).where(AgentModel.id == trigger.agent_id))
-                agent = agent_r.scalar_one_or_none()
-                if isinstance(from_user_name, list):
-                    from_user_name = from_user_name[0] if from_user_name else ""
-                if not isinstance(from_user_name, str):
-                    return False
-                safe_user_name = from_user_name.replace("%", "").replace("_", r"\_")
-                query = (
-                    select(User)
-                    .join(User.identity)
+                result = await db.execute(
+                    select(ChatMessage)
+                    .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
                     .where(
-                        or_(
-                            User.display_name.ilike(f"%{safe_user_name}%"),
-                            Identity.username.ilike(f"%{safe_user_name}%"),
-                        )
+                        ChatSession.agent_id == trigger.agent_id,
+                        ChatSession.source_channel != "trigger",
+                        ChatMessage.sender_user_id == actor_id,
+                        ChatMessage.role == "user",
+                        ChatMessage.created_at > since,
                     )
+                    .order_by(ChatMessage.created_at.desc())
+                    .limit(1)
                 )
-                if agent and agent.tenant_id:
-                    query = query.where(User.tenant_id == agent.tenant_id)
-                user_r = await db.execute(query)
-                target_user = user_r.scalars().first()
-
-                if target_user:
-                    result = await db.execute(
-                        select(ChatMessage)
-                        .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
-                        .where(
-                            ChatSession.agent_id == trigger.agent_id,
-                            ChatSession.user_id == target_user.id,
-                            ChatSession.source_channel != "trigger",
-                            ChatMessage.role == "user",
-                            ChatMessage.created_at > since,
-                        )
-                        .order_by(ChatMessage.created_at.desc())
-                        .limit(1)
-                    )
-                else:
-                    result = await db.execute(
-                        select(ChatMessage)
-                        .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
-                        .where(
-                            ChatSession.agent_id == trigger.agent_id,
-                            ChatSession.source_channel != "trigger",
-                            ChatMessage.role == "user",
-                            ChatMessage.created_at > since,
-                            or_(
-                                ChatSession.title.ilike(f"%{safe_user_name}%"),
-                                ChatMessage.content.ilike(f"%{safe_user_name}%"),
-                            ),
-                        )
-                        .order_by(ChatMessage.created_at.desc())
-                        .limit(1)
-                    )
 
                 msg = result.scalar_one_or_none()
                 if not msg:
                     return False
                 cfg["_matched_message"] = (msg.content or "")[:2000]
-                cfg["_matched_from"] = from_user_name
+                cfg["_matched_from"] = str(actor_id)
                 cfg["_matched_message_id"] = str(msg.id)
                 cfg["_matched_session_id"] = str(msg.conversation_id)
                 if msg.external_event_key:

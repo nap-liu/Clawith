@@ -8,13 +8,19 @@ from datetime import datetime, timezone as tz
 from time import perf_counter
 
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging_config import set_trace_id
-from app.core.permissions import can_view_all_agent_chat_sessions, check_agent_access, is_agent_expired
+from app.core.permissions import (
+    can_view_all_agent_chat_sessions,
+    check_agent_access,
+    is_agent_expired,
+    require_current_agent_tenant,
+    require_tenant_safe_chat_session,
+)
 from app.core.security import decode_access_token
 from app.database import async_session
 from app.models.agent import Agent
@@ -325,6 +331,7 @@ class WebSocketChatHandler:
 
                 logger.info(f"[WS] Checking agent access for {self.agent_id}")
                 self.agent, _ = await check_agent_access(db, self.user, self.agent_id)
+                require_current_agent_tenant(self.user, self.agent)
                 if is_agent_expired(self.agent):
                     await self.websocket.send_json(
                         {
@@ -449,6 +456,17 @@ class WebSocketChatHandler:
                 if not _existing:
                     conv_id = None
                 else:
+                    if hasattr(self.agent, "tenant_id"):
+                        try:
+                            await require_tenant_safe_chat_session(
+                                db, _existing, self.agent.tenant_id
+                            )
+                        except HTTPException:
+                            await self.websocket.send_json(
+                                {"type": "error", "content": "Session not found"}
+                            )
+                            await self.websocket.close(code=4003)
+                            return None
                     self.source_channel = _existing.source_channel or self.source_channel
                 if _existing and _existing.source_channel != "agent" and str(_existing.user_id) != str(user_id):
                     # Not the owner. Allow a READ-ONLY monitor connection if the

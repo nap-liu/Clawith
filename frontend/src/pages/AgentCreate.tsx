@@ -320,19 +320,20 @@ Make an HTTP GET request:
 The response contains a \`messages\` array. Each message includes:
 - \`id\` — unique message ID (use this for reporting)
 - \`content\` — the message text
-- \`sender_user_name\` — name of the Clawith user who sent it
-- \`sender_user_id\` — unique ID of the sender
+- \`sender_user_name\` — display name of a human sender, when applicable
+- \`sender_user_id\` — canonical User UUID of a human sender, when applicable
+- \`sender_agent_id\` — canonical Agent UUID of an agent sender, when applicable
 - \`conversation_id\` — the conversation this message belongs to
 - \`history\` — array of previous messages in this conversation for context
 
 The response also contains a \`relationships\` array describing your colleagues:
-- \`name\` — the person or agent name
-- \`type\` — "human" or "agent"
+- \`display_name\` — display-only person or agent name; never use it for execution
+- exactly one of \`user_id\` or \`agent_id\` — the canonical execution target
 - \`role\` — relationship type (e.g. collaborator, supervisor)
 - \`channels\` — available communication channels (e.g. ["feishu"], ["agent"])
 
 **IMPORTANT**: Use the \`history\` array to understand conversation context before replying.
-Different \`sender_user_name\` values mean different people — address them accordingly.
+Use canonical IDs, not display names, to identify recipients.
 
 ### 2. Report results
 For each completed message, make an HTTP POST request:
@@ -345,15 +346,17 @@ For each completed message, make an HTTP POST request:
 To proactively contact a person or agent, make an HTTP POST request:
 - URL: ${window.location.origin}/api/gateway/send-message
 - Header: X-Api-Key: ${createdApiKey}
+- Header: X-Idempotency-Key: <stable unique ID for this logical send; reuse the same key only when retrying it>
 - Header: Content-Type: application/json
-- Body: {"target": "<name of person or agent>", "content": "<your message>"}
+- Human body: {"user_id": "<canonical User UUID>", "channel": "<one available channel>", "content": "<your message>"}
+- Agent body: {"agent_id": "<canonical Agent UUID>", "content": "<your message>"}
 
-The system auto-detects the best channel. For agents, the reply appears in your next poll.
-For humans, the message is delivered via their available channel (e.g. Feishu).`}</pre>
+Provide exactly one of \`user_id\` or \`agent_id\`. For humans with multiple channels, choose one from \`relationships[].channels\`. Always send X-Idempotency-Key and reuse it for retries of the same logical message.
+For agents, the reply appears in your next poll.`}</pre>
                                     <LinearCopyButton
                                         className="btn btn-ghost"
                                         style={{ position: 'absolute', top: '4px', right: '4px', fontSize: '11px', minWidth: '60px' }}
-                                        textToCopy={`Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Clawith inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:\n\n---\nname: clawith_sync\ndescription: Sync with Clawith platform — check inbox, submit results, and send messages.\n---\n\n# Clawith Sync\n\n## When to use\nCheck for new messages from the Clawith platform during every heartbeat cycle.\nYou can also proactively send messages to people and agents in your relationships.\n\n## Instructions\n\n### 1. Check inbox\nMake an HTTP GET request:\n- URL: ${window.location.origin}/api/gateway/poll\n- Header: X-Api-Key: ${createdApiKey}\n\nThe response contains a \`messages\` array. Each message includes:\n- \`id\` — unique message ID (use this for reporting)\n- \`content\` — the message text\n- \`sender_user_name\` — name of the Clawith user who sent it\n- \`sender_user_id\` — unique ID of the sender\n- \`conversation_id\` — the conversation this message belongs to\n- \`history\` — array of previous messages in this conversation for context\n\nThe response also contains a \`relationships\` array describing your colleagues:\n- \`name\` — the person or agent name\n- \`type\` — "human" or "agent"\n- \`role\` — relationship type (e.g. collaborator, supervisor)\n- \`channels\` — available communication channels (e.g. ["feishu"], ["agent"])\n\n**IMPORTANT**: Use the \`history\` array to understand conversation context before replying.\nDifferent \`sender_user_name\` values mean different people — address them accordingly.\n\n### 2. Report results\nFor each completed message, make an HTTP POST request:\n- URL: ${window.location.origin}/api/gateway/report\n- Header: X-Api-Key: ${createdApiKey}\n- Header: Content-Type: application/json\n- Body: {"message_id": "<id from the message>", "result": "<your response>"}\n\n### 3. Send a message to someone\nTo proactively contact a person or agent, make an HTTP POST request:\n- URL: ${window.location.origin}/api/gateway/send-message\n- Header: X-Api-Key: ${createdApiKey}\n- Header: Content-Type: application/json\n- Body: {"target": "<name of person or agent>", "content": "<your message>"}\n\nThe system auto-detects the best channel. For agents, the reply appears in your next poll.\nFor humans, the message is delivered via their available channel (e.g. Feishu).`}
+                                        textToCopy={`Please create a skill file at skills/clawith_sync.md, then add "Check Clawith inbox using the clawith_sync skill and process any pending messages" to HEARTBEAT.md.\n\n---\nname: clawith_sync\ndescription: Sync with Clawith platform — check inbox, submit results, and send messages.\n---\n\n# Clawith Sync\n\nPoll ${window.location.origin}/api/gateway/poll with X-Api-Key: ${createdApiKey}. Use message history for context. A human sender has sender_user_id; an agent sender has sender_agent_id. Relationships expose display_name for display and exactly one canonical user_id or agent_id for execution. Never execute by display name.\n\nReport each result to ${window.location.origin}/api/gateway/report with {"message_id":"<message id>","result":"<response>"}.\n\nSend proactively to ${window.location.origin}/api/gateway/send-message. For a human use {"user_id":"<User UUID>","channel":"<relationship channel>","content":"<message>"}; for an agent use {"agent_id":"<Agent UUID>","content":"<message>"}. Provide exactly one recipient ID. If a human has multiple channels, choose one from relationships[].channels. Always include X-Idempotency-Key with one stable unique value per logical send and reuse that same key only for retries.`}
                                         label={t('common.copy', 'Copy')}
                                         copiedLabel="Copied"
                                     />

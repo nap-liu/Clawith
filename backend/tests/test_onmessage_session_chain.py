@@ -16,6 +16,7 @@ from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction  # noqa: F401 - register ChatMessage FK target
 from app.models.chat_session import ChatSession
 from app.models.participant import Participant  # noqa: F401 - register FK table metadata
+from app.models.org import AgentRelationship
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
@@ -27,6 +28,7 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 async def _dispose_engine_between_tests():
+    await engine.dispose()
     yield
     await engine.dispose()
 
@@ -58,6 +60,14 @@ async def _make_agent() -> tuple[Agent, User]:
             status="idle",
         )
         db.add(agent)
+        await db.flush()
+        db.add(
+            AgentRelationship(
+                agent_id=agent.id,
+                user_id=user.id,
+                relation="collaborator",
+            )
+        )
         await db.commit()
         return agent, user
 
@@ -112,7 +122,7 @@ async def test_one_inbound_event_fans_out_once_per_matching_subscription():
                 "type": "on_message",
                 "reason": f"original reason {index}",
                 "focus_ref": f"focus-{index}",
-                "config": {"from_user_name": "Remote User"},
+                "config": {"from_user_id": str(user.id)},
             }
             triggers.append(
                 AgentTrigger(
@@ -125,7 +135,7 @@ async def test_one_inbound_event_fans_out_once_per_matching_subscription():
                     fire_count=0,
                     max_fires=100,
                     config={
-                        "from_user_name": "Remote User",
+                        "from_user_id": str(user.id),
                         "_origin_session_id": str(origin.id),
                         "_origin_source_channel": origin.source_channel,
                         "_origin_external_conv_id": origin.external_conv_id,
@@ -232,6 +242,7 @@ async def test_origin_wake_creates_a_new_idempotent_turn_with_arm_context(monkey
         old_turn = ChatMessage(
             agent_id=agent.id,
             user_id=user.id,
+            sender_user_id=user.id,
             role="user",
             content="the original user turn",
             conversation_id=str(origin.id),
@@ -252,6 +263,7 @@ async def test_origin_wake_creates_a_new_idempotent_turn_with_arm_context(monkey
         matched = ChatMessage(
             agent_id=agent.id,
             user_id=user.id,
+            sender_user_id=user.id,
             role="user",
             content="remote reply payload",
             conversation_id=str(remote.id),
@@ -270,7 +282,7 @@ async def test_origin_wake_creates_a_new_idempotent_turn_with_arm_context(monkey
         "type": "on_message",
         "reason": "continue the exact original workflow",
         "focus_ref": "workflow-7",
-        "config": {"from_user_name": "Remote User"},
+        "config": {"from_user_id": str(user.id)},
     }
     trigger = AgentTrigger(
         id=uuid.uuid4(),
@@ -435,7 +447,7 @@ async def test_openclaw_report_is_one_agent_channel_event_across_retries():
             type="on_message",
             reason="continue source workflow",
             config={
-                "from_agent_name": target_agent.name,
+                "from_agent_id": str(target_agent.id),
                 "_watch_session_id": str(session.id),
                 "_watch_source_channel": "agent",
                 "_watch_actor_ref": str(target_participant.id),
@@ -448,7 +460,6 @@ async def test_openclaw_report_is_one_agent_channel_event_across_retries():
         gateway_message = GatewayMessage(
             agent_id=target_agent.id,
             sender_agent_id=source_agent.id,
-            sender_user_id=user.id,
             conversation_id=str(session.id),
             content="remote task",
             status="delivered",
@@ -529,6 +540,7 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
         old_turn = ChatMessage(
             agent_id=agent.id,
             user_id=user.id,
+            sender_user_id=user.id,
             role="user",
             content="old turn",
             conversation_id=str(origin.id),
@@ -537,6 +549,7 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
         current_turn = ChatMessage(
             agent_id=agent.id,
             user_id=user.id,
+            sender_user_id=user.id,
             role="user",
             content="current turn",
             conversation_id=str(origin.id),
@@ -561,8 +574,9 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
                     message_meta={
                         "direction": "outbound",
                         "source_channel": "slack",
-                        "actor_ref": "remote-actor",
-                        "target_name": "Remote User",
+                            "actor_ref": "remote-actor",
+                            "target_user_id": str(user.id),
+                            "target_name": "Remote User",
                         "origin_session_id": str(origin.id),
                         "origin_turn_anchor_id": str(old_turn.id),
                     },
@@ -577,8 +591,9 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
                     message_meta={
                         "direction": "outbound",
                         "source_channel": "dingtalk",
-                        "actor_ref": "remote-actor",
-                        "target_name": "Remote User",
+                            "actor_ref": "remote-actor",
+                            "target_user_id": str(user.id),
+                            "target_name": "Remote User",
                         "origin_session_id": str(origin.id),
                         "origin_turn_anchor_id": str(current_turn.id),
                         "external_message_id": "provider-outbound-7",
@@ -598,7 +613,7 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
             "name": f"wait-current-{uuid.uuid4().hex[:6]}",
             "type": "on_message",
             "config": {
-                "from_user_name": "Remote User",
+                "from_user_id": str(user.id),
                 "_watch_session_id": str(old_remote.id),
             },
             "reason": "use the current outbound request context",
@@ -628,7 +643,7 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
         "type": "on_message",
         "reason": "use the current outbound request context",
         "focus_ref": "focus-current-turn",
-        "config": {"from_user_name": "Remote User"},
+        "config": {"from_user_id": str(user.id)},
     }
     assert "_watch_session_id" not in stored.config["_set_trigger_context"]["config"]
 
@@ -641,6 +656,7 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
             ChatMessage(
                 agent_id=agent.id,
                 user_id=user.id,
+                sender_user_id=user.id,
                 role="user",
                 content="reply while trigger was disabled",
                 conversation_id=str(current_remote.id),
@@ -656,6 +672,7 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
             ChatMessage(
                 agent_id=agent.id,
                 user_id=user.id,
+                sender_user_id=user.id,
                 role="user",
                 content="second reply before re-arm",
                 conversation_id=str(current_remote.id),
@@ -674,7 +691,7 @@ async def test_set_trigger_binds_only_the_current_turn_outbound_receipt(monkeypa
         {
             "name": stored.name,
             "type": "on_message",
-            "config": {"from_user_name": "Remote User"},
+            "config": {"from_user_id": str(user.id)},
             "reason": "use the current outbound request context",
         },
         session_id=str(origin.id),
@@ -723,7 +740,7 @@ async def test_legacy_recovery_keeps_stable_event_cursor_after_processing_time()
             type="on_message",
             reason="preserve every event",
             config={
-                "from_user_name": user.display_name,
+                "from_user_id": str(user.id),
                 "_since_ts": (now - timedelta(minutes=10)).isoformat(),
             },
             is_enabled=True,
@@ -733,6 +750,7 @@ async def test_legacy_recovery_keeps_stable_event_cursor_after_processing_time()
         first = ChatMessage(
             agent_id=agent.id,
             user_id=user.id,
+            sender_user_id=user.id,
             role="user",
             content="first legacy event",
             conversation_id=str(session.id),
@@ -750,6 +768,7 @@ async def test_legacy_recovery_keeps_stable_event_cursor_after_processing_time()
             ChatMessage(
                 agent_id=agent.id,
                 user_id=user.id,
+                sender_user_id=user.id,
                 role="user",
                 content="committed after scan with older event time",
                 conversation_id=str(session.id),
@@ -796,7 +815,7 @@ async def test_legacy_upgrade_floor_skips_pre_cutover_history():
             type="on_message",
             reason="do not replay pre-cutover history",
             config={
-                "from_user_name": user.display_name,
+                "from_user_id": str(user.id),
                 "_since_ts": (now - timedelta(minutes=10)).isoformat(),
                 "_legacy_scan_floor": now.isoformat(),
             },
@@ -810,6 +829,7 @@ async def test_legacy_upgrade_floor_skips_pre_cutover_history():
                 ChatMessage(
                     agent_id=agent.id,
                     user_id=user.id,
+                    sender_user_id=user.id,
                     role="user",
                     content="historical legacy event",
                     conversation_id=str(session.id),
@@ -818,6 +838,7 @@ async def test_legacy_upgrade_floor_skips_pre_cutover_history():
                 ChatMessage(
                     agent_id=agent.id,
                     user_id=user.id,
+                    sender_user_id=user.id,
                     role="user",
                     content="at-cutover legacy event",
                     conversation_id=str(session.id),
@@ -864,7 +885,7 @@ async def test_legacy_recovery_ignores_exact_watch_session_trigger():
             type="on_message",
             reason="exact session path is not a legacy scan",
             config={
-                "from_user_name": user.display_name,
+                "from_user_id": str(user.id),
                 "_watch_session_id": str(session.id),
                 "_since_ts": (now - timedelta(minutes=1)).isoformat(),
                 "_legacy_scan_floor": now.isoformat(),
@@ -879,6 +900,7 @@ async def test_legacy_recovery_ignores_exact_watch_session_trigger():
                 ChatMessage(
                     agent_id=agent.id,
                     user_id=user.id,
+                    sender_user_id=user.id,
                     role="user",
                     content="exact session event",
                     conversation_id=str(session.id),
@@ -921,7 +943,7 @@ async def test_legacy_recovery_serializes_max_fire_capacity():
             type="on_message",
             reason="one remaining slot",
             config={
-                "from_user_name": user.display_name,
+                "from_user_id": str(user.id),
                 "_since_ts": (now - timedelta(minutes=10)).isoformat(),
             },
             is_enabled=True,
@@ -934,6 +956,7 @@ async def test_legacy_recovery_serializes_max_fire_capacity():
                 ChatMessage(
                     agent_id=agent.id,
                     user_id=user.id,
+                    sender_user_id=user.id,
                     role="user",
                     content=f"capacity event {index}",
                     conversation_id=str(session.id),
@@ -985,6 +1008,7 @@ async def test_origin_completion_barrier_rejects_unrelated_assistant_turn():
         anchor = ChatMessage(
             agent_id=agent.id,
             user_id=user.id,
+            sender_user_id=user.id,
             role="user",
             content="turn that armed the trigger",
             conversation_id=str(origin.id),
@@ -999,6 +1023,7 @@ async def test_origin_completion_barrier_rejects_unrelated_assistant_turn():
         matched = ChatMessage(
             agent_id=agent.id,
             user_id=user.id,
+            sender_user_id=user.id,
             role="user",
             content="fast remote reply",
             conversation_id=str(remote.id),
@@ -1097,6 +1122,7 @@ async def test_openclaw_recorded_replay_queues_gateway_once(monkeypatch):
         anchor = ChatMessage(
             agent_id=source.id,
             user_id=user.id,
+            sender_user_id=user.id,
             role="user",
             content="delegate this task",
             conversation_id=str(origin.id),
@@ -1113,6 +1139,7 @@ async def test_openclaw_recorded_replay_queues_gateway_once(monkeypatch):
             id=uuid.uuid4(),
             agent_id=pair_session.agent_id,
             user_id=user.id,
+            sender_agent_id=source.id,
             role="user",
             content="prepare the strict replay report",
             conversation_id=str(pair_session.id),
@@ -1150,7 +1177,7 @@ async def test_openclaw_recorded_replay_queues_gateway_once(monkeypatch):
         agent_tools._send_message_to_agent(
             source.id,
             {
-                "agent_name": target.name,
+                "agent_id": str(target.id),
                 "message": "prepare the strict replay report",
                 "msg_type": "task_delegate",
             },
@@ -1159,7 +1186,7 @@ async def test_openclaw_recorded_replay_queues_gateway_once(monkeypatch):
         agent_tools._send_message_to_agent(
             source.id,
             {
-                "agent_name": target.name,
+                "agent_id": str(target.id),
                 "message": "prepare the strict replay report",
                 "msg_type": "task_delegate",
             },

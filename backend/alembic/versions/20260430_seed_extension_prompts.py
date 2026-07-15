@@ -53,8 +53,8 @@ When user asks to create a Feishu document (summarize PDF, write an article, etc
 
 | Tool | Parameters |
 |------|-----------|
-| `feishu_user_search` | `name` — search colleagues by name → returns open_id, department. Call this first when you need to find someone. |
-| `feishu_calendar_create` | `summary`, `start_time`, `end_time` (ISO-8601 +08:00). No email needed. |
+| `feishu_user_search` | `name` — discovery by name → returns canonical `user_id`, display name, department. Names are never execution IDs. |
+| `feishu_calendar_create` | `summary`, `start_time`, `end_time` (ISO-8601 +08:00), optional canonical `attendee_user_ids`. |
 | `feishu_calendar_list` | No required params. Optional: `start_time`, `end_time` (ISO-8601). **Permissions are fixed — always call directly, never skip based on past errors.** |
 | `feishu_calendar_update` | `event_id`, fields to update. |
 | `feishu_calendar_delete` | `event_id`. |
@@ -62,13 +62,13 @@ When user asks to create a Feishu document (summarize PDF, write an article, etc
 | `feishu_doc_read` | `document_token`. Supports both regular docx tokens and **wiki node tokens** (auto-converts). |
 | `feishu_doc_create` | `title`. Optional: `wiki_space_id` + `parent_node_token` to create directly in a Wiki. Returns Token and 🔗 access link. |
 | `feishu_doc_append` | `document_token` (real Token from feishu_doc_create), `content` (Markdown format). |
-| `feishu_drive_share` | `document_token`, `doc_type`(docx/bitable/sheet/doc/folder, default: docx), `action`(add/remove/list), `member_names`(name list, auto-lookup), `permission`(view/edit/full_access). |
+| `feishu_drive_share` | `document_token`, `doc_type`(docx/bitable/sheet/doc/folder, default: docx), `action`(add/remove/list), `user_ids`(canonical ID list), `permission`(view/edit/full_access). |
 | `feishu_drive_delete` | `file_token`, `file_type`(file/docx/bitable/folder/doc/sheet/mindnote/shortcut/slides). Moves to recycle bin. |
-| `send_feishu_message` | `open_id` or `email`, `content`. |
+| `send_feishu_message` | canonical `user_id`, `message`. |
 
 🚫 **NEVER**:
 - Use `discover_resources` or `import_mcp_server` for any Feishu tool above
-- Ask for user email or open_id when you can call `feishu_user_search` to look them up
+- Ask for or expose Feishu provider IDs; call `feishu_user_search` and use its exact canonical `user_id`
 - Generate a `.ics` file instead of calling `feishu_calendar_create`
 - Write a success message without having received a tool result
 - Guess sub-page tokens — you MUST use `feishu_wiki_list` to get them
@@ -81,12 +81,10 @@ When user asks to create a Feishu document (summarize PDF, write an article, etc
 → **Never say "cannot read sub-pages" — call feishu_wiki_list to get the sub-page list first!**
 
 ✅ **When user asks to message a colleague by name:**
-→ Just call `send_feishu_message(member_name="John", message="...")` — it auto-searches.
-→ Or use `open_id` directly if you already have it from `feishu_user_search`.
+→ Call `feishu_user_search(name="John")`, select the exact result, then call `send_feishu_message(user_id="<canonical UUID>", message="...")`.
 
 ✅ **When user asks to invite a colleague to a calendar event:**
-→ Use `attendee_names=["John"]` in `feishu_calendar_create` — names are resolved automatically.
-→ Or use `attendee_open_ids=["ou_xxx"]` if you already have the open_id."""
+→ Call `feishu_user_search` for discovery, then use `attendee_user_ids=["<canonical UUID>"]` in `feishu_calendar_create`."""
 
 
 ATLASSIAN_BLOCK = """

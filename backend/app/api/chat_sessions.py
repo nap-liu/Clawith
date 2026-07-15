@@ -9,7 +9,13 @@ from pydantic import BaseModel
 from sqlalchemy import and_, cast, func, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import can_view_all_agent_chat_sessions, check_agent_access
+from app.core.permissions import (
+    can_view_all_agent_chat_sessions,
+    check_agent_access,
+    filter_tenant_safe_chat_sessions,
+    require_current_agent_tenant,
+    require_tenant_safe_chat_session,
+)
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.audit import ChatMessage
@@ -29,7 +35,7 @@ _can_view_all_agent_chat_sessions = can_view_all_agent_chat_sessions
 class SessionOut(BaseModel):
     id: str
     agent_id: str
-    user_id: str
+    user_id: Optional[str] = None
     username: Optional[str] = None      # display_name ?? username
     source_channel: str = "web"         # web / feishu / discord / slack / agent
     title: str
@@ -71,6 +77,7 @@ async def _load_accessible_session(
 ) -> tuple[Agent, ChatSession, Literal["mine", "all"]]:
     """Resolve one session and the web picker scope that can display it."""
     agent, _ = await check_agent_access(db, current_user, agent_id)
+    require_current_agent_tenant(current_user, agent)
     result = await db.execute(
         select(ChatSession).where(
             ChatSession.id == session_id,
@@ -80,6 +87,10 @@ async def _load_accessible_session(
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    # Real ORM agents always expose tenant_id. A few isolated protocol-double
+    # tests intentionally omit it and exercise unrelated response shaping.
+    if hasattr(agent, "tenant_id"):
+        await require_tenant_safe_chat_session(db, session, agent.tenant_id)
 
     is_owner = str(session.user_id) == str(current_user.id)
     is_privileged = _can_view_all_agent_chat_sessions(current_user, agent)
@@ -90,7 +101,13 @@ async def _load_accessible_session(
             .where(
                 ChatMessage.conversation_id == str(session_id),
                 ChatMessage.role == "user",
-                ChatMessage.user_id == current_user.id,
+                or_(
+                    ChatMessage.sender_user_id == current_user.id,
+                    and_(
+                        ChatMessage.sender_user_id.is_(None),
+                        ChatMessage.user_id == current_user.id,
+                    ),
+                ),
             )
             .limit(1)
         )
@@ -148,7 +165,7 @@ async def _build_session_detail_out(
     return SessionDetailOut(
         id=str(session.id),
         agent_id=str(session.agent_id),
-        user_id=str(session.user_id),
+        user_id=str(session.user_id) if session.user_id else None,
         username=username,
         source_channel=session.source_channel,
         title=session.title,
@@ -183,6 +200,7 @@ async def list_sessions(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     await check_agent_access(db, current_user, agent_id)
+    require_current_agent_tenant(current_user, agent)
     source_channel = (source_channel or "").strip() or None
     limit = max(1, min(int(limit or 50), 200))
     offset = max(0, int(offset or 0))
@@ -206,6 +224,10 @@ async def list_sessions(
             .limit(limit)
         )
         sessions = result.scalars().all()
+        if hasattr(agent, "tenant_id"):
+            sessions = await filter_tenant_safe_chat_sessions(
+                db, list(sessions), agent.tenant_id
+            )
         out = []
 
         # --- BULK FETCH: message counts, user names, agent names in 3 queries total ---
@@ -249,7 +271,7 @@ async def list_sessions(
         if user_ids:
             user_r = await db.execute(
                 select(User.id, func.coalesce(User.display_name, Identity.username))
-                .join(Identity, User.identity_id == Identity.id)
+                .outerjoin(Identity, User.identity_id == Identity.id)
                 .where(User.id.in_(user_ids))
             )
             for row in user_r.all():
@@ -293,7 +315,7 @@ async def list_sessions(
             out.append(SessionOut(
                 id=str(session.id),
                 agent_id=str(session.agent_id),
-                user_id=str(session.user_id),
+                user_id=str(session.user_id) if session.user_id else None,
                 username=display,
                 source_channel=session.source_channel,
                 title=session.title,
@@ -320,7 +342,13 @@ async def list_sessions(
             .where(
                 ChatMessage.conversation_id == cast(ChatSession.id, String),
                 ChatMessage.role == "user",
-                ChatMessage.user_id == current_user.id,
+                or_(
+                    ChatMessage.sender_user_id == current_user.id,
+                    and_(
+                        ChatMessage.sender_user_id.is_(None),
+                        ChatMessage.user_id == current_user.id,
+                    ),
+                ),
             )
             .correlate(ChatSession)
             .exists()
@@ -351,6 +379,10 @@ async def list_sessions(
             .limit(limit)
         )
         sessions = result.scalars().all()
+        if hasattr(agent, "tenant_id"):
+            sessions = await filter_tenant_safe_chat_sessions(
+                db, list(sessions), agent.tenant_id
+            )
         out = []
 
         # --- BULK FETCH: count total messages and unread messages in two compact queries ---
@@ -399,7 +431,7 @@ async def list_sessions(
             out.append(SessionOut(
                 id=str(session.id),
                 agent_id=str(session.agent_id),
-                user_id=str(session.user_id),
+                user_id=str(session.user_id) if session.user_id else None,
                 username=(session.group_name or session.title) if session.is_group else None,
                 source_channel=session.source_channel,
                 title=session.title,
@@ -435,7 +467,8 @@ async def create_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new chat session for the current user."""
-    await check_agent_access(db, current_user, agent_id)
+    agent, _ = await check_agent_access(db, current_user, agent_id)
+    require_current_agent_tenant(current_user, agent)
     source_channel = validate_platform_login_channel(body.source_channel)
 
     now = datetime.now(tz.utc)
@@ -455,7 +488,7 @@ async def create_session(
     return SessionOut(
         id=str(session.id),
         agent_id=str(session.agent_id),
-        user_id=str(session.user_id),
+        user_id=str(session.user_id) if session.user_id else None,
         source_channel=session.source_channel,
         title=session.title,
         created_at=session.created_at.isoformat(),
@@ -478,6 +511,7 @@ async def rename_session(
 ):
     """Rename a session. Owner, agent creator, or admin may rename others' sessions."""
     agent, _ = await check_agent_access(db, current_user, agent_id)
+    require_current_agent_tenant(current_user, agent)
     result = await db.execute(
         select(ChatSession).where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
     )
@@ -502,6 +536,7 @@ async def delete_session(
 ):
     """Delete a chat session and its messages. Owner, agent creator, or admin may delete others' sessions."""
     agent, _ = await check_agent_access(db, current_user, agent_id)
+    require_current_agent_tenant(current_user, agent)
     result = await db.execute(
         select(ChatSession).where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
     )
@@ -560,50 +595,80 @@ async def get_session_messages(
         session.last_read_at_by_user = datetime.now(tz.utc)
         await db.commit()
 
-    # Resolve sender names (batched, no N+1). Two flows:
-    # - Agent (A2A) sessions: sender = Participant.display_name keyed by m.participant_id
-    # - Group chat sessions: sender = User.display_name keyed by m.user_id (so group
-    #   chat web UI can label each user message with the actual speaker — multiple
-    #   real humans share the same session and need to be visually distinguished).
-    sender_cache: dict = {}
-    if session.source_channel == "agent":
-        from app.models.participant import Participant
-        participant_ids = list({m.participant_id for m in messages if m.participant_id})
-        if participant_ids:
-            p_result = await db.execute(
-                select(Participant.id, Participant.display_name)
-                .where(Participant.id.in_(participant_ids))
-            )
-            for row in p_result.all():
-                sender_cache[str(row[0])] = row[1] or "Unknown"
+    # Resolve canonical sender IDs and display names in batches. Participant is
+    # consulted only as a one-release read bridge for legacy A2A rows; its ID is
+    # never returned to callers.
+    from app.models.agent import Agent
+    from app.models.participant import Participant
 
-    # For group sessions, batch-resolve User.display_name for every distinct
-    # m.user_id seen on user-role messages — agent (assistant) messages don't
-    # need a sender label here (the UI shows the agent's own avatar/name).
-    # Use getattr defensively: existing tests mock `session` as a SimpleNamespace
-    # that may not carry every ChatSession column.
-    _is_group = bool(getattr(session, "is_group", False))
-    user_name_cache: dict = {}
-    if _is_group:
-        user_ids_seen = {m.user_id for m in messages if m.role == "user" and m.user_id is not None}
-        if user_ids_seen:
-            u_rows = await db.execute(
-                select(User.id, User.display_name).where(User.id.in_(user_ids_seen))
-            )
-            user_name_cache = {str(uid): (name or "Unknown") for uid, name in u_rows.all()}
+    participant_ids = {m.participant_id for m in messages if m.participant_id}
+    legacy_participants: dict[str, tuple[str, uuid.UUID, str]] = {}
+    if participant_ids:
+        p_result = await db.execute(
+            select(Participant.id, Participant.type, Participant.ref_id, Participant.display_name)
+            .where(Participant.id.in_(participant_ids))
+        )
+        legacy_participants = {
+            str(pid): (ptype, ref_id, display_name or "Unknown")
+            for pid, ptype, ref_id, display_name in p_result.all()
+        }
+
+    user_ids_seen: set[uuid.UUID] = set()
+    agent_ids_seen: set[uuid.UUID] = set()
+    for message in messages:
+        sender_user_id = getattr(message, "sender_user_id", None)
+        sender_agent_id = getattr(message, "sender_agent_id", None)
+        if sender_user_id:
+            user_ids_seen.add(sender_user_id)
+        elif sender_agent_id:
+            agent_ids_seen.add(sender_agent_id)
+        elif message.participant_id and str(message.participant_id) in legacy_participants:
+            participant_type, ref_id, _display = legacy_participants[str(message.participant_id)]
+            if participant_type == "user":
+                user_ids_seen.add(ref_id)
+            elif participant_type == "agent":
+                agent_ids_seen.add(ref_id)
+        elif message.role == "user" and session.source_channel != "agent":
+            legacy_user_id = getattr(message, "user_id", None) or session.user_id
+            if legacy_user_id:
+                user_ids_seen.add(legacy_user_id)
+        elif message.role in {"assistant", "tool_call"}:
+            agent_ids_seen.add(getattr(message, "agent_id", None) or agent_id)
+
+    user_name_cache: dict[str, str] = {}
+    needs_sender_names = bool(getattr(session, "is_group", False)) or session.source_channel == "agent"
+    if needs_sender_names and user_ids_seen:
+        u_rows = await db.execute(select(User.id, User.display_name).where(User.id.in_(user_ids_seen)))
+        user_name_cache = {str(uid): (name or "Unknown") for uid, name in u_rows.all()}
+    agent_name_cache: dict[str, str] = {}
+    if needs_sender_names and agent_ids_seen:
+        a_rows = await db.execute(select(Agent.id, Agent.name).where(Agent.id.in_(agent_ids_seen)))
+        agent_name_cache = {str(aid): (name or "Unknown") for aid, name in a_rows.all()}
 
     out = []
     tool_call_positions: dict[str, int] = {}
     for m in messages:
-        sender_name = sender_cache.get(str(m.participant_id)) if m.participant_id else None
-        # Group-chat user messages: surface the speaker so the web UI can
-        # render a per-message avatar / name label (otherwise every user
-        # message looks like it came from the logged-in viewer).
-        sender_user_id = None
-        if _is_group and m.role == "user" and m.user_id is not None:
-            sender_user_id = str(m.user_id)
-            if not sender_name:
-                sender_name = user_name_cache.get(sender_user_id)
+        sender_user_id = getattr(m, "sender_user_id", None)
+        sender_agent_id = getattr(m, "sender_agent_id", None)
+        legacy_sender_name = None
+        if not sender_user_id and not sender_agent_id and m.participant_id:
+            legacy = legacy_participants.get(str(m.participant_id))
+            if legacy:
+                participant_type, ref_id, legacy_sender_name = legacy
+                if participant_type == "user":
+                    sender_user_id = ref_id
+                elif participant_type == "agent":
+                    sender_agent_id = ref_id
+        if not sender_user_id and not sender_agent_id:
+            if m.role == "user" and session.source_channel != "agent":
+                sender_user_id = getattr(m, "user_id", None) or session.user_id
+            elif m.role in {"assistant", "tool_call"}:
+                sender_agent_id = getattr(m, "agent_id", None) or agent_id
+        sender_name = legacy_sender_name
+        if sender_user_id:
+            sender_name = user_name_cache.get(str(sender_user_id), sender_name)
+        elif sender_agent_id:
+            sender_name = agent_name_cache.get(str(sender_agent_id), sender_name)
 
         if m.role == "tool_call":
             from app.services.chat_history import parse_tool_call_for_display
@@ -621,7 +686,9 @@ async def get_session_messages(
             if sender_name:
                 entry["sender_name"] = sender_name
             if sender_user_id:
-                entry["sender_user_id"] = sender_user_id
+                entry["sender_user_id"] = str(sender_user_id)
+            if sender_agent_id:
+                entry["sender_agent_id"] = str(sender_agent_id)
             tool_call_id = entry["toolCallId"]
             previous_position = tool_call_positions.get(tool_call_id)
             if previous_position is None:
@@ -643,8 +710,10 @@ async def get_session_messages(
             for part in parts:
                 if sender_name:
                     part["sender_name"] = sender_name
-                if m.participant_id:
-                    part["participant_id"] = str(m.participant_id)
+                if sender_user_id:
+                    part["sender_user_id"] = str(sender_user_id)
+                if sender_agent_id:
+                    part["sender_agent_id"] = str(sender_agent_id)
                 out.append(part)
         else:
             entry = {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
@@ -652,10 +721,10 @@ async def get_session_messages(
                 entry["thinking"] = m.thinking
             if sender_name:
                 entry["sender_name"] = sender_name
-            if m.participant_id:
-                entry["participant_id"] = str(m.participant_id)
             if sender_user_id:
-                entry["sender_user_id"] = sender_user_id
+                entry["sender_user_id"] = str(sender_user_id)
+            if sender_agent_id:
+                entry["sender_agent_id"] = str(sender_agent_id)
             out.append(entry)
 
     # NB: confirmation cards are NOT merged here any more — a card is just a

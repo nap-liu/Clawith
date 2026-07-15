@@ -506,7 +506,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "name": {"type": "string", "description": "Unique name for this trigger"},
                 "type": {"type": "string", "enum": ["cron", "once", "interval", "poll", "on_message"], "description": "Trigger type"},
-                "config": {"type": "object", "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\"}. on_message: {\"from_agent_name\": \"<agent_name>\"} or {\"from_user_name\": \"<user_name>\"}"},
+                "config": {"type": "object", "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\"}. on_message requires exactly one canonical actor: {\"from_agent_id\": \"<agent_id>\"} or {\"from_user_id\": \"<user_id>\"}"},
                 "reason": {"type": "string", "description": "What to do when this trigger fires"},
                 "focus_ref": {"type": "string", "description": "Optional: which focus item this relates to. If omitted, one is created automatically."},
             },
@@ -568,7 +568,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_channel_file",
         "display_name": "Send File",
-        "description": "Send a workspace file to a person or back to the current conversation. To send to the person you are CURRENTLY talking to (you are replying inside an IM or web conversation), OMIT member_name — the file is delivered straight back to the current conversation and no relationship or contact lookup is required. Only pass member_name when sending to someone who is NOT the current conversation partner; the system then resolves that person across all connected channels (Feishu, DingTalk, WeCom, Slack, etc.) and delivers via the appropriate one.",
+        "description": "Send a workspace file to a person or back to the current conversation. Omit user_id only when replying to the current IM/web conversation; that preserves the exact current-session route. Explicit delivery to another person currently supports Feishu and Slack only; provide canonical user_id and choose one of those routes.",
         "category": "communication",
         "icon": "📎",
         "is_default": True,
@@ -576,7 +576,8 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Workspace-relative path to the file"},
-                "member_name": {"type": "string", "description": "OPTIONAL. Only set this to send to someone who is NOT the current conversation partner; the system then looks up this person across all configured channels and delivers via the appropriate one. Leave it unset to deliver to the current conversation."},
+                "user_id": {"type": "string", "description": "Canonical platform user_id. Omit only to reply to the current conversation."},
+                "channel": {"type": "string", "enum": ["feishu", "slack"], "description": "Executable explicit file route selected by the Agent."},
                 "message": {"type": "string", "description": "Optional message to accompany the file"},
             },
             "required": ["file_path"],
@@ -597,10 +598,29 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "username": {"type": "string", "description": "Recipient username or display name"},
+                "user_id": {"type": "string", "description": "Canonical platform user_id"},
                 "message": {"type": "string", "description": "Message content"},
             },
-            "required": ["username", "message"],
+            "required": ["user_id", "message"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "send_channel_message",
+        "display_name": "Channel Message",
+        "description": "Send a message to a related person through an external IM route. Address the person only by canonical user_id. If several routes are valid, the Agent must choose channel; the platform never selects a first match.",
+        "category": "communication",
+        "icon": "💬",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string", "description": "Canonical platform user_id"},
+                "message": {"type": "string", "description": "Message content"},
+                "channel": {"type": "string", "enum": ["feishu", "dingtalk", "wecom", "slack", "teams", "wechat"], "description": "External route selected by the Agent when several are valid."},
+            },
+            "required": ["user_id", "message"],
         },
         "config": {},
         "config_schema": {},
@@ -608,7 +628,7 @@ BUILTIN_TOOLS = [
     {
         "name": "search_contacts",
         "display_name": "Search Contacts",
-        "description": "Search people and digital employees as candidates for relationship network editing. Only use this tool when the user explicitly asks you to search, review, or edit the relationship network. Do not use it proactively just because you want to contact someone. Results include separate id and type fields; pass them to add_contact as target_id and target_type.",
+        "description": "Search people and digital employees as candidates for relationship network editing. Only use this tool when the user explicitly asks you to search, review, or edit the relationship network. Do not use it proactively just because you want to contact someone. Human results contain user_id; digital employee results contain agent_id. Names are display-only.",
         "category": "communication",
         "icon": "🔎",
         "is_default": True,
@@ -627,19 +647,22 @@ BUILTIN_TOOLS = [
     {
         "name": "add_contact",
         "display_name": "Add Contact",
-        "description": "Add a person or digital employee to your relationship network using the id and type returned by search_contacts. Use target_type=human for people from synced org directories, and target_type=agent for digital employees. Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. Do not add contacts proactively or based only on your own intent to send a message.",
+        "description": "Add a person or digital employee using exactly one canonical user_id or agent_id returned by search_contacts. Only call this tool after the user explicitly asked to edit the relationship network and the agent creator confirmed the selected target. Do not add contacts proactively.",
         "category": "communication",
         "icon": "➕",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "target_type": {"type": "string", "enum": ["human", "agent"], "description": "Contact type returned by search_contacts."},
-                "target_id": {"type": "string", "description": "UUID id returned by search_contacts."},
+                "user_id": {"type": "string", "description": "Canonical natural-person user_id."},
+                "agent_id": {"type": "string", "description": "Canonical digital-employee agent_id."},
                 "relation": {"type": "string", "description": "Relationship label, such as collaborator, stakeholder, peer, team_member, or other."},
                 "description": {"type": "string", "description": "Optional short note explaining why this contact is needed."},
             },
-            "required": ["target_type", "target_id"],
+            "oneOf": [
+                {"required": ["user_id"], "not": {"required": ["agent_id"]}},
+                {"required": ["agent_id"], "not": {"required": ["user_id"]}},
+            ],
         },
         "config": {},
         "config_schema": {},
@@ -647,17 +670,20 @@ BUILTIN_TOOLS = [
     {
         "name": "remove_contact",
         "display_name": "Remove Contact",
-        "description": "Remove a person or digital employee from your relationship network using the id and type returned by search_contacts. Use target_type=human for people from synced org directories, and target_type=agent for digital employees. Only call this tool after the user explicitly asked to edit the relationship network and the agent creator has clearly confirmed the selected target in the conversation or a confirmation card. Do not remove contacts proactively or based only on your own intent to stop messaging someone.",
+        "description": "Remove a person or digital employee using exactly one canonical user_id or agent_id returned by search_contacts. Only call this tool after the user explicitly asked to edit the relationship network and the agent creator confirmed the selected target. Do not remove contacts proactively.",
         "category": "communication",
         "icon": "minus",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "target_type": {"type": "string", "enum": ["human", "agent"], "description": "Contact type returned by search_contacts."},
-                "target_id": {"type": "string", "description": "UUID id returned by search_contacts."},
+                "user_id": {"type": "string", "description": "Canonical natural-person user_id."},
+                "agent_id": {"type": "string", "description": "Canonical digital-employee agent_id."},
             },
-            "required": ["target_type", "target_id"],
+            "oneOf": [
+                {"required": ["user_id"], "not": {"required": ["agent_id"]}},
+                {"required": ["agent_id"], "not": {"required": ["user_id"]}},
+            ],
         },
         "config": {},
         "config_schema": {},
@@ -672,12 +698,12 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "agent_name": {"type": "string", "description": "Target agent name"},
+                "agent_id": {"type": "string", "description": "Canonical target agent_id"},
                 "message": {"type": "string", "description": "Message content"},
                 "msg_type": {"type": "string", "enum": ["notify", "consult", "task_delegate"], "description": "(1) Target needs to DO WORK and return results? → task_delegate. (2) Just FYI? → notify. (3) Quick factual question? → consult. When unsure, prefer task_delegate."},
                 "new_conversation": {"type": "boolean", "description": "默认 false。仅当当前与该同事的对话明显异常时设为 true 来主动重置 —— 例如对话反复报同一个错、陷入循环、或历史上下文看起来已损坏/混乱。设为 true 会开启一条全新对话线程，丢弃旧的(可能已损坏的)历史，从干净状态重新开始。正常往来请保持 false 或省略。"},
             },
-            "required": ["agent_name", "message", "msg_type"],
+            "required": ["agent_id", "message", "msg_type"],
         },
         "config": {},
         "config_schema": {},
@@ -725,11 +751,11 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "agent_name": {"type": "string", "description": "Target agent name"},
+                "agent_id": {"type": "string", "description": "Canonical target agent_id"},
                 "file_path": {"type": "string", "description": "Workspace-relative source file path"},
                 "message": {"type": "string", "description": "Optional delivery note"},
             },
-            "required": ["agent_name", "file_path"],
+            "required": ["agent_id", "file_path"],
         },
         "config": {},
         "config_schema": {},
@@ -2192,8 +2218,8 @@ BUILTIN_TOOLS = [
             "Call this after confirming the objective with the relevant person through conversation. "
             "Use this only when a new Objective needs to be created for the period. "
             "If the person already has a matching Objective and just wants to revise it, use update_objective instead. "
-            "owner_type must be 'company', 'user', or 'agent'. "
-            "owner_id is not required for company-level objectives. "
+            "For a company-level objective, omit both user_id and agent_id. "
+            "For an individual objective, pass exactly one canonical user_id or agent_id from context. "
             "period_start and period_end must be ISO date strings (YYYY-MM-DD)."
         ),
         "category": "okr",
@@ -2210,18 +2236,15 @@ BUILTIN_TOOLS = [
                     "type": "string",
                     "description": "Optional detailed description of the objective.",
                 },
-                "owner_type": {
+                "user_id": {
                     "type": "string",
-                    "enum": ["company", "user", "agent"],
-                    "description": "Who this objective belongs to.",
+                    "format": "uuid",
+                    "description": "Canonical Clawith User UUID. Omit for company or agent objectives.",
                 },
-                "owner_id": {
+                "agent_id": {
                     "type": "string",
-                    "description": "UUID of the owner. Try to use this if available in context.",
-                },
-                "owner_name": {
-                    "type": "string",
-                    "description": "Optional fallback: the exact display name of the human/agent. Use this ONLY if you don't have their UUID.",
+                    "format": "uuid",
+                    "description": "Canonical Clawith Agent UUID. Omit for company or user objectives.",
                 },
                 "period_start": {
                     "type": "string",
@@ -2232,7 +2255,8 @@ BUILTIN_TOOLS = [
                     "description": "ISO date string for the end of the OKR period (e.g. '2026-06-30').",
                 },
             },
-            "required": ["title", "owner_type", "period_start", "period_end"],
+            "required": ["title", "period_start", "period_end"],
+            "not": {"required": ["user_id", "agent_id"]},
         },
         "config": {"okr_agent_only": True},
         "config_schema": {},
@@ -2401,7 +2425,8 @@ BUILTIN_TOOLS = [
         "description": (
             "Create or update the final normalized daily report for any member in the company. "
             "Use this after discussing progress with the member and distilling their update into "
-            "one concise final report. The stored content should stay within 2000 characters."
+            "one concise final report. Pass exactly one canonical user_id or agent_id. "
+            "The stored content should stay within 2000 characters."
         ),
         "category": "okr",
         "icon": "📝",
@@ -2417,18 +2442,15 @@ BUILTIN_TOOLS = [
                     "type": "string",
                     "description": "Final concise daily report content. Keep it within 2000 characters.",
                 },
-                "member_type": {
+                "user_id": {
                     "type": "string",
-                    "enum": ["user", "agent"],
-                    "description": "Member type. Defaults to user if omitted.",
+                    "format": "uuid",
+                    "description": "Canonical Clawith User UUID for a natural person.",
                 },
-                "member_id": {
+                "agent_id": {
                     "type": "string",
-                    "description": "UUID of the member. Preferred when available.",
-                },
-                "member_name": {
-                    "type": "string",
-                    "description": "Member display name. Use when you do not have the UUID.",
+                    "format": "uuid",
+                    "description": "Canonical Clawith Agent UUID for a digital employee.",
                 },
                 "source": {
                     "type": "string",
@@ -2436,6 +2458,10 @@ BUILTIN_TOOLS = [
                 },
             },
             "required": ["report_date", "content"],
+            "oneOf": [
+                {"required": ["user_id"], "not": {"required": ["agent_id"]}},
+                {"required": ["agent_id"], "not": {"required": ["user_id"]}},
+            ],
         },
         "config": {"okr_agent_only": True},
         "config_schema": {},
@@ -2453,10 +2479,10 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "member_name": {"type": "string", "description": "Recipient name"},
+                "user_id": {"type": "string", "description": "Canonical Clawith user_id; Feishu endpoint is internal."},
                 "message": {"type": "string", "description": "Message content"},
             },
-            "required": ["member_name", "message"],
+            "required": ["user_id", "message"],
         },
         "config": {},
         "config_schema": {},
@@ -2464,7 +2490,7 @@ BUILTIN_TOOLS = [
     {
         "name": "feishu_user_search",
         "display_name": "Feishu User Search",
-        "description": "Search for a colleague in the Feishu (Lark) directory by name. Returns their open_id, email, and department.",
+        "description": "Search related Feishu colleagues by name. Returns canonical platform user_id, display name, and department; names are discovery-only.",
         "category": "feishu",
         "icon": "🔍",
         "is_default": False,
@@ -2700,8 +2726,7 @@ BUILTIN_TOOLS = [
                 "document_token": {"type": "string", "description": "File token (from URL or previous tool output)"},
                 "doc_type": {"type": "string", "enum": ["docx", "bitable", "sheet", "doc", "folder", "mindnote", "slides"], "description": "File type. Default: 'docx'"},
                 "action": {"type": "string", "enum": ["add", "remove", "list"], "description": "'add' to grant, 'remove' to revoke, 'list' to view"},
-                "member_names": {"type": "array", "items": {"type": "string"}, "description": "Colleague names to add/remove (auto-searched)"},
-                "member_open_ids": {"type": "array", "items": {"type": "string"}, "description": "Feishu open_ids directly"},
+                "user_ids": {"type": "array", "items": {"type": "string"}, "description": "Canonical platform user_ids to add/remove; Feishu IDs are internal."},
                 "permission": {"type": "string", "enum": ["view", "edit", "full_access"], "description": "Permission level. Default: 'edit'"},
             },
             "required": ["document_token", "action"],
@@ -2730,7 +2755,7 @@ BUILTIN_TOOLS = [
     {
         "name": "feishu_calendar_list",
         "display_name": "Feishu Calendar List",
-        "description": "List Feishu calendar events. No email or authorization needed.",
+        "description": "List Feishu calendar events and optionally query one related user by canonical platform user_id.",
         "category": "feishu",
         "icon": "📅",
         "is_default": False,
@@ -2739,6 +2764,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "start_time": {"type": "string", "description": "Range start, ISO 8601. Default: now."},
                 "end_time": {"type": "string", "description": "Range end, ISO 8601. Default: 7 days from now."},
+                "user_id": {"type": "string", "description": "Canonical platform user_id for freebusy. Omit to use the current Feishu sender."},
                 "max_results": {"type": "integer", "description": "Max events to return (default 20)"},
             },
         },
@@ -2748,7 +2774,7 @@ BUILTIN_TOOLS = [
     {
         "name": "feishu_calendar_create",
         "display_name": "Feishu Calendar Create",
-        "description": "Create a Feishu calendar event. Supports inviting colleagues by name. No email needed.",
+        "description": "Create a Feishu calendar event. Invite colleagues only by canonical platform user_id.",
         "category": "feishu",
         "icon": "📅",
         "is_default": False,
@@ -2759,7 +2785,7 @@ BUILTIN_TOOLS = [
                 "start_time": {"type": "string", "description": "Event start in ISO 8601 with timezone"},
                 "end_time": {"type": "string", "description": "Event end in ISO 8601 with timezone"},
                 "description": {"type": "string", "description": "Event description or agenda"},
-                "attendee_names": {"type": "array", "items": {"type": "string"}, "description": "Names of colleagues to invite"},
+                "attendee_user_ids": {"type": "array", "items": {"type": "string"}, "description": "Canonical platform user_ids to invite; use feishu_user_search for discovery."},
                 "location": {"type": "string", "description": "Event location"},
             },
             "required": ["summary", "start_time", "end_time"],
@@ -2777,13 +2803,12 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "user_email": {"type": "string", "description": "Calendar owner's email"},
                 "event_id": {"type": "string", "description": "Event ID from feishu_calendar_list"},
                 "summary": {"type": "string", "description": "New title"},
                 "start_time": {"type": "string", "description": "New start time (ISO 8601)"},
                 "end_time": {"type": "string", "description": "New end time (ISO 8601)"},
             },
-            "required": ["user_email", "event_id"],
+            "required": ["event_id"],
         },
         "config": {},
         "config_schema": {},
@@ -2798,10 +2823,9 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "user_email": {"type": "string", "description": "Calendar owner's email"},
                 "event_id": {"type": "string", "description": "Event ID to delete"},
             },
-            "required": ["user_email", "event_id"],
+            "required": ["event_id"],
         },
         "config": {},
         "config_schema": {},
@@ -2817,7 +2841,7 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "approval_code": {"type": "string", "description": "审批定义的唯一代码 (approval_code)"},
-                "user_id": {"type": "string", "description": "发起人的 open_id。可以通过 feishu_user_search 获取。"},
+                "user_id": {"type": "string", "description": "发起人的 canonical platform user_id，可通过 feishu_user_search 获取。"},
                 "form_data": {"type": "string", "description": "表单内容的 JSON 字符串，例如 '[{\"id\":\"widget1\",\"type\":\"input\",\"value\":\"这是内容\"}]'"},
             },
             "required": ["approval_code", "user_id", "form_data"],

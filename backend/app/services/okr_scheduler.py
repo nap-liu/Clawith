@@ -208,7 +208,7 @@ async def collect_all_focus_updates(
                         f"  - {agent.name} / {kr.title}: {prev_value} → {value} ({kr.status})"
                     )
 
-            except Exception as exc:
+            except Exception:
                 logger.exception(f"[OKRScheduler] Failed to process focus.md for agent {agent.id}")
                 error_count += 1
 
@@ -274,7 +274,7 @@ async def _build_okr_snapshot(
             OKRObjective.period_start >= ps,
             OKRObjective.period_end <= pe,
             OKRObjective.status != "archived",
-        ).order_by(OKRObjective.owner_type, OKRObjective.created_at)
+        ).order_by(OKRObjective.created_at)
     )
     objectives = obj_result.scalars().all()
 
@@ -328,7 +328,7 @@ def _format_report_body(
 
     # Health summary
     lines.append("## Health Summary\n")
-    lines.append(f"| Status | Count | % |\n|---|---|---|")
+    lines.append("| Status | Count | % |\n|---|---|---|")
     if total_krs:
         lines.append(f"| On Track / Completed | {on_track} | {on_track*100//total_krs}% |")
         lines.append(f"| At Risk | {at_risk} | {at_risk*100//total_krs}% |")
@@ -345,7 +345,7 @@ def _format_report_body(
         lines.append("")
 
     # Company objectives section
-    company_objs = [o for o in objectives if o.owner_type == "company"]
+    company_objs = [o for o in objectives if not o.owner_user_id and not o.owner_agent_id]
     if company_objs:
         lines.append("## Company Objectives\n")
         for o in company_objs:
@@ -362,12 +362,13 @@ def _format_report_body(
             lines.append("")
 
     # Member objectives section
-    member_objs = [o for o in objectives if o.owner_type != "company"]
+    member_objs = [o for o in objectives if o.owner_user_id or o.owner_agent_id]
     if member_objs:
         lines.append("## Member Objectives\n")
         for o in member_objs:
             krs = krs_by_obj.get(str(o.id), [])
-            lines.append(f"### {o.owner_type}:{o.owner_id} — {o.title}\n")
+            owner_ref = f"user_id:{o.owner_user_id}" if o.owner_user_id else f"agent_id:{o.owner_agent_id}"
+            lines.append(f"### {owner_ref} — {o.title}\n")
             for kr in krs:
                 kr_pct = int(kr.current_value / kr.target_value * 100) if kr.target_value else 0
                 lines.append(f"- {kr.title}: {kr.current_value}/{kr.target_value} {kr.unit or ''} ({kr_pct}%) — _{kr.status}_")
@@ -387,8 +388,7 @@ async def _store_report(
     """Write a report to the WorkReport table."""
     report = WorkReport(
         tenant_id=tenant_id,
-        author_type="agent",
-        author_id=okr_agent_id,
+        agent_id=okr_agent_id,
         report_type=report_type,
         period_date=period_date,
         content=content,
@@ -612,8 +612,8 @@ def _format_monthly_report_body(
     # ── Health summary ────────────────────────────────────────────────
     lines.append("## Monthly Health Summary\n")
     if total_krs:
-        lines.append(f"| Status | Count | Ratio |")
-        lines.append(f"|---|---|---|")
+        lines.append("| Status | Count | Ratio |")
+        lines.append("|---|---|---|")
         lines.append(f"| Completed   | {completed} | {completed*100//total_krs}% |")
         lines.append(f"| On Track    | {on_track}  | {on_track*100//total_krs}% |")
         lines.append(f"| At Risk     | {at_risk}   | {at_risk*100//total_krs}% |")
@@ -623,7 +623,7 @@ def _format_monthly_report_body(
     lines.append("")
 
     # ── Company objectives ────────────────────────────────────────────
-    company_objs = [o for o in objectives if o.owner_type == "company"]
+    company_objs = [o for o in objectives if not o.owner_user_id and not o.owner_agent_id]
     if company_objs:
         lines.append("## Company Objectives\n")
         for o in company_objs:
@@ -651,12 +651,13 @@ def _format_monthly_report_body(
             lines.append("")
 
     # ── Member objectives ─────────────────────────────────────────────
-    member_objs = [o for o in objectives if o.owner_type != "company"]
+    member_objs = [o for o in objectives if o.owner_user_id or o.owner_agent_id]
     if member_objs:
         lines.append("## Member Objectives\n")
         for o in member_objs:
             krs = krs_by_obj.get(str(o.id), [])
-            lines.append(f"### {o.owner_type}: {o.title}\n")
+            owner_ref = f"user_id:{o.owner_user_id}" if o.owner_user_id else f"agent_id:{o.owner_agent_id}"
+            lines.append(f"### {owner_ref}: {o.title}\n")
             for kr in krs:
                 kr_pct = int(kr.current_value / kr.target_value * 100) if kr.target_value else 0
                 lines.append(

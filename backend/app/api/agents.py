@@ -79,6 +79,11 @@ async def _archive_agent_task_history(db: AsyncSession, agent_id: uuid.UUID, arc
                 "supervision_target_user_id": (
                     str(task.supervision_target_user_id) if task.supervision_target_user_id else None
                 ),
+                "supervision_target_agent_id": (
+                    str(task.supervision_target_agent_id)
+                    if getattr(task, "supervision_target_agent_id", None)
+                    else None
+                ),
                 "supervision_target_name": task.supervision_target_name,
                 "supervision_channel": task.supervision_channel,
                 "remind_schedule": task.remind_schedule,

@@ -3,7 +3,8 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import (
@@ -15,7 +16,12 @@ from app.core.permissions import (
 )
 from app.models.agent import Agent
 from app.models.identity import IdentityProvider
-from app.models.org import AgentAgentRelationship, AgentRelationship, OrgMember
+from app.models.org import (
+    AgentAgentRelationship,
+    AgentRelationship,
+    OrgMember,
+    RelationshipSuppression,
+)
 from app.models.user import User
 
 
@@ -123,12 +129,13 @@ async def _load_relationship_actor(
 async def _human_relationship_status(
     db: AsyncSession,
     source_agent: Agent,
+    user: User,
     member: OrgMember,
 ) -> str:
     result = await db.execute(
         select(AgentRelationship).where(
             AgentRelationship.agent_id == source_agent.id,
-            AgentRelationship.member_id == member.id,
+            AgentRelationship.user_id == user.id,
         )
     )
     rel = result.scalar_one_or_none()
@@ -202,8 +209,15 @@ async def search_contacts_for_agent(
                 OrgMember,
                 IdentityProvider.name.label("provider_name"),
                 IdentityProvider.provider_type.label("provider_type"),
+                User,
             )
             .outerjoin(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
+            .join(
+                User,
+                (OrgMember.user_id == User.id)
+                & (User.tenant_id == source_agent.tenant_id)
+                & (User.is_active == True),  # noqa: E712
+            )
             .where(
                 OrgMember.tenant_id == source_agent.tenant_id,
                 OrgMember.status == "active",
@@ -214,23 +228,27 @@ async def search_contacts_for_agent(
         )
         human_rows = (await db.execute(human_query)).all()
         external_rows = []
-        platform_rows_by_user: dict[uuid.UUID, tuple[OrgMember, str | None, str | None]] = {}
-        unlinked_rows = []
-        for member, _provider_name, raw_provider_type in human_rows:
+        platform_rows_by_user: dict[
+            uuid.UUID, tuple[OrgMember, str | None, str | None, User]
+        ] = {}
+        for member, _provider_name, raw_provider_type, user in human_rows:
             if not await _member_available_to_agent(db, source_agent, member):
                 continue
             channel = _provider_type(raw_provider_type)
             if member.user_id and _is_external_channel(channel):
-                external_rows.append((member, _provider_name, channel))
+                external_rows.append((member, _provider_name, channel, user))
             elif member.user_id:
-                platform_rows_by_user.setdefault(member.user_id, (member, _provider_name, channel))
+                platform_rows_by_user.setdefault(member.user_id, (member, _provider_name, channel, user))
             else:
-                unlinked_rows.append((member, _provider_name, channel))
+                # The canonical relationship identity is User.id. Unlinked
+                # legacy OrgMember rows are intentionally fail-closed.
+                continue
 
-        external_user_ids = {member.user_id for member, _provider_name, _channel in external_rows if member.user_id}
+        external_user_ids = {
+            member.user_id for member, _provider_name, _channel, _user in external_rows if member.user_id
+        }
         selected_human_rows = [
             *external_rows,
-            *unlinked_rows,
             *[
                 row
                 for user_id, row in platform_rows_by_user.items()
@@ -238,17 +256,19 @@ async def search_contacts_for_agent(
             ],
         ]
 
-        for member, _provider_name, channel in selected_human_rows:
+        for member, _provider_name, channel, user in selected_human_rows:
             results.append(
                 {
-                    "id": str(member.id),
+                    "user_id": str(user.id),
                     "type": "human",
                     "name": member.name,
                     "title": member.title or "",
                     "channel": channel or "platform",
                     "department_path": member.department_path or "",
                     "phone": _mask_phone_for_display(member.phone),
-                    "relationship_status": await _human_relationship_status(db, source_agent, member),
+                    "relationship_status": await _human_relationship_status(
+                        db, source_agent, user, member
+                    ),
                 }
             )
 
@@ -283,7 +303,7 @@ async def search_contacts_for_agent(
                 continue
             results.append(
                 {
-                    "id": str(target.id),
+                    "agent_id": str(target.id),
                     "type": "agent",
                     "name": target.name,
                     "role_description": target.role_description or "",
@@ -302,7 +322,7 @@ async def search_contacts_for_agent(
 async def _add_human_contact(
     db: AsyncSession,
     source_agent: Agent,
-    member_id: uuid.UUID,
+    user_id: uuid.UUID,
     *,
     relation: str,
     description: str,
@@ -312,21 +332,54 @@ async def _add_human_contact(
     if not actor:
         return {"status": "error", "reason": reason}
 
-    member_result = await db.execute(select(OrgMember).where(OrgMember.id == member_id))
+    user_result = await db.execute(
+        select(User).where(
+            User.id == user_id,
+            User.tenant_id == source_agent.tenant_id,
+            User.is_active == True,  # noqa: E712
+        )
+    )
+    target_user = user_result.scalar_one_or_none()
+    if not target_user:
+        return {"status": "error", "reason": "contact_not_available"}
+
+    member_result = await db.execute(
+        select(OrgMember)
+        .where(
+            OrgMember.user_id == target_user.id,
+            OrgMember.tenant_id == source_agent.tenant_id,
+            OrgMember.status == "active",
+        )
+        .order_by(OrgMember.provider_id.is_(None), OrgMember.synced_at.asc())
+        .limit(1)
+    )
     member = member_result.scalar_one_or_none()
+    if not member:
+        from app.services.registration_service import registration_service
+
+        member = await registration_service.ensure_web_org_member(db, target_user)
     if not member or not await _member_available_to_agent(db, source_agent, member):
         return {"status": "error", "reason": "contact_not_available"}
+
+    await db.execute(
+        delete(RelationshipSuppression).where(
+            RelationshipSuppression.agent_id == source_agent.id,
+            RelationshipSuppression.target_type == "user",
+            RelationshipSuppression.target_id == target_user.id,
+        )
+    )
 
     existing_result = await db.execute(
         select(AgentRelationship).where(
             AgentRelationship.agent_id == source_agent.id,
-            AgentRelationship.member_id == member.id,
+            AgentRelationship.user_id == target_user.id,
         )
     )
     existing = existing_result.scalar_one_or_none()
     status = "already_added" if existing else "added"
     rel = existing or AgentRelationship(
         agent_id=source_agent.id,
+        user_id=target_user.id,
         member_id=member.id,
         created_by_user_id=actor.id,
     )
@@ -343,7 +396,7 @@ async def _add_human_contact(
     status_info = await evaluate_human_relationship_status(db, rel, source_agent=source_agent)
     return {
         "status": status,
-        "id": str(member.id),
+        "user_id": str(target_user.id),
         "type": "human",
         "name": member.name,
         "relationship_status": status_info["access_status"],
@@ -385,6 +438,14 @@ async def _add_agent_contact(
     if visible_result.scalar_one_or_none() is None:
         return {"status": "error", "reason": "contact_not_available"}
 
+    await db.execute(
+        delete(RelationshipSuppression).where(
+            RelationshipSuppression.agent_id == source_agent.id,
+            RelationshipSuppression.target_type == "agent",
+            RelationshipSuppression.target_id == target.id,
+        )
+    )
+
     existing_result = await db.execute(
         select(AgentAgentRelationship).where(
             AgentAgentRelationship.agent_id == source_agent.id,
@@ -416,7 +477,7 @@ async def _add_agent_contact(
         return {"status": "error", "reason": "relationship_not_active"}
     return {
         "status": status,
-        "id": str(target.id),
+        "agent_id": str(target.id),
         "type": "agent",
         "name": target.name,
         "relationship_status": status_info["access_status"],
@@ -447,20 +508,64 @@ async def add_contact_for_agent(
     clean_description = (description or "").strip()[:500]
 
     if clean_target_type == "human":
-        return await _add_human_contact(
+        return await add_user_contact_for_agent(
             db,
-            source_agent,
-            parsed_target_id,
+            agent_id,
+            user_id=parsed_target_id,
             relation=clean_relation,
             description=clean_description,
             current_user_id=current_user_id,
         )
+    return await add_agent_contact_for_agent(
+        db,
+        agent_id,
+        target_agent_id=parsed_target_id,
+        relation=clean_relation,
+        description=clean_description,
+        current_user_id=current_user_id,
+    )
+
+
+async def add_user_contact_for_agent(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    *,
+    user_id: uuid.UUID,
+    relation: str = "collaborator",
+    description: str = "",
+    current_user_id: uuid.UUID | None = None,
+) -> dict:
+    source_agent = await _load_source_agent(db, agent_id)
+    if not source_agent or not source_agent.tenant_id:
+        return {"status": "error", "reason": "source_agent_not_available"}
+    return await _add_human_contact(
+        db,
+        source_agent,
+        user_id,
+        relation=_normalize_relation(relation),
+        description=(description or "").strip()[:500],
+        current_user_id=current_user_id,
+    )
+
+
+async def add_agent_contact_for_agent(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    *,
+    target_agent_id: uuid.UUID,
+    relation: str = "collaborator",
+    description: str = "",
+    current_user_id: uuid.UUID | None = None,
+) -> dict:
+    source_agent = await _load_source_agent(db, agent_id)
+    if not source_agent or not source_agent.tenant_id:
+        return {"status": "error", "reason": "source_agent_not_available"}
     return await _add_agent_contact(
         db,
         source_agent,
-        parsed_target_id,
-        relation=clean_relation,
-        description=clean_description,
+        target_agent_id,
+        relation=_normalize_relation(relation),
+        description=(description or "").strip()[:500],
         current_user_id=current_user_id,
     )
 
@@ -468,7 +573,7 @@ async def add_contact_for_agent(
 async def _remove_human_contact(
     db: AsyncSession,
     source_agent: Agent,
-    member_id: uuid.UUID,
+    user_id: uuid.UUID,
     *,
     current_user_id: uuid.UUID | None,
 ) -> dict:
@@ -476,38 +581,51 @@ async def _remove_human_contact(
     if not actor:
         return {"status": "error", "reason": reason}
 
-    member_result = await db.execute(
-        select(OrgMember).where(
-            OrgMember.id == member_id,
-            OrgMember.tenant_id == source_agent.tenant_id,
+    user_result = await db.execute(
+        select(User).where(
+            User.id == user_id,
+            User.tenant_id == source_agent.tenant_id,
         )
     )
-    member = member_result.scalar_one_or_none()
-    if not member:
+    target_user = user_result.scalar_one_or_none()
+    if not target_user:
         return {"status": "error", "reason": "contact_not_available"}
 
     rel_result = await db.execute(
         select(AgentRelationship).where(
             AgentRelationship.agent_id == source_agent.id,
-            AgentRelationship.member_id == member.id,
+            AgentRelationship.user_id == target_user.id,
         )
     )
     rel = rel_result.scalar_one_or_none()
     if not rel:
         return {
             "status": "not_found",
-            "id": str(member.id),
+            "user_id": str(target_user.id),
             "type": "human",
-            "name": member.name,
+            "name": target_user.display_name,
         }
 
+    await db.execute(
+        pg_insert(RelationshipSuppression)
+        .values(
+            id=uuid.uuid4(),
+            agent_id=source_agent.id,
+            target_type="user",
+            target_id=target_user.id,
+            created_by_user_id=actor.id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["agent_id", "target_type", "target_id"]
+        )
+    )
     await db.delete(rel)
     await db.flush()
     return {
         "status": "removed",
-        "id": str(member.id),
+        "user_id": str(target_user.id),
         "type": "human",
-        "name": member.name,
+        "name": target_user.display_name,
     }
 
 
@@ -543,16 +661,29 @@ async def _remove_agent_contact(
     if not rel:
         return {
             "status": "not_found",
-            "id": str(target.id),
+            "agent_id": str(target.id),
             "type": "agent",
             "name": target.name,
         }
 
+    await db.execute(
+        pg_insert(RelationshipSuppression)
+        .values(
+            id=uuid.uuid4(),
+            agent_id=source_agent.id,
+            target_type="agent",
+            target_id=target.id,
+            created_by_user_id=actor.id,
+        )
+        .on_conflict_do_nothing(
+            index_elements=["agent_id", "target_type", "target_id"]
+        )
+    )
     await db.delete(rel)
     await db.flush()
     return {
         "status": "removed",
-        "id": str(target.id),
+        "agent_id": str(target.id),
         "type": "agent",
         "name": target.name,
     }
@@ -577,15 +708,45 @@ async def remove_contact_for_agent(
         return {"status": "error", "reason": "invalid_contact_target"}
 
     if clean_target_type == "human":
-        return await _remove_human_contact(
+        return await remove_user_contact_for_agent(
             db,
-            source_agent,
-            parsed_target_id,
+            agent_id,
+            user_id=parsed_target_id,
             current_user_id=current_user_id,
         )
-    return await _remove_agent_contact(
+    return await remove_agent_contact_for_agent(
         db,
-        source_agent,
-        parsed_target_id,
+        agent_id,
+        target_agent_id=parsed_target_id,
         current_user_id=current_user_id,
+    )
+
+
+async def remove_user_contact_for_agent(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    *,
+    user_id: uuid.UUID,
+    current_user_id: uuid.UUID | None = None,
+) -> dict:
+    source_agent = await _load_source_agent(db, agent_id)
+    if not source_agent or not source_agent.tenant_id:
+        return {"status": "error", "reason": "source_agent_not_available"}
+    return await _remove_human_contact(
+        db, source_agent, user_id, current_user_id=current_user_id
+    )
+
+
+async def remove_agent_contact_for_agent(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    *,
+    target_agent_id: uuid.UUID,
+    current_user_id: uuid.UUID | None = None,
+) -> dict:
+    source_agent = await _load_source_agent(db, agent_id)
+    if not source_agent or not source_agent.tenant_id:
+        return {"status": "error", "reason": "source_agent_not_available"}
+    return await _remove_agent_contact(
+        db, source_agent, target_agent_id, current_user_id=current_user_id
     )

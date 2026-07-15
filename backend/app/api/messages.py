@@ -13,6 +13,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user
+from app.core.permissions import filter_tenant_safe_chat_sessions
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
@@ -34,8 +35,15 @@ async def get_inbox(
     Returns recent messages from ChatSessions with source_channel='agent'
     where the user's agents are participants.
     """
+    if not current_user.tenant_id:
+        return []
     # Find agents the current user created
-    agent_ids_q = await db.execute(select(Agent.id).where(Agent.creator_id == current_user.id))
+    agent_ids_q = await db.execute(
+        select(Agent.id).where(
+            Agent.creator_id == current_user.id,
+            Agent.tenant_id == current_user.tenant_id,
+        )
+    )
     my_agent_ids = [r[0] for r in agent_ids_q.fetchall()]
 
     if not my_agent_ids:
@@ -51,7 +59,9 @@ async def get_inbox(
         .order_by(ChatSession.last_message_at.desc().nullslast())
         .limit(limit)
     )
-    sessions = sessions_q.scalars().all()
+    sessions = await filter_tenant_safe_chat_sessions(
+        db, list(sessions_q.scalars().all()), current_user.tenant_id
+    )
 
     result_list = []
     for sess in sessions:
@@ -88,7 +98,14 @@ async def get_unread_count(
     db: AsyncSession = Depends(get_db),
 ):
     """Get count of unread agent-to-agent messages for the current user's agents."""
-    agent_ids_q = await db.execute(select(Agent.id).where(Agent.creator_id == current_user.id))
+    if not current_user.tenant_id:
+        return {"unread_count": 0}
+    agent_ids_q = await db.execute(
+        select(Agent.id).where(
+            Agent.creator_id == current_user.id,
+            Agent.tenant_id == current_user.tenant_id,
+        )
+    )
     my_agent_ids = [r[0] for r in agent_ids_q.fetchall()]
 
     if not my_agent_ids:

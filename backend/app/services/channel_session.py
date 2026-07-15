@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chat_session import ChatSession
+from app.services.session_identity import require_same_tenant_session_user
 
 
 async def find_or_create_channel_session(
@@ -36,6 +37,8 @@ async def find_or_create_channel_session(
                   are excluded from the user's "mine" session list.
         group_name: Display name for group sessions (e.g. IM group/channel name).
     """
+    if not is_group:
+        await require_same_tenant_session_user(db, agent_id, user_id)
     result = await db.execute(
         select(ChatSession).where(
             ChatSession.agent_id == agent_id,

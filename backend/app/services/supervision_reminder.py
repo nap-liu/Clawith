@@ -98,82 +98,35 @@ def _is_reminder_due(remind_schedule: str, last_reminded_at: datetime | None, no
     return elapsed >= min_interval
 
 
-async def _get_agent_reply(target_agent, message: str, db) -> str | None:
-    """Call target agent's LLM to generate a reply to a supervision reminder.
-
-    Returns the reply text, or None if the agent can't respond.
-    """
-    from app.models.llm import LLMModel
-    from app.services.agent_context import build_agent_context
-    from app.services.llm import (
-        get_provider_base_url,
-        create_llm_client,
-        LLMMessage,
-        LLMError,
-        get_model_api_key,
-    )
-
-    model_id = target_agent.primary_model_id or target_agent.fallback_model_id
-    if not model_id:
-        return None
-
-    from sqlalchemy import select as _select
-    model_result = await db.execute(_select(LLMModel).where(LLMModel.id == model_id))
-    model = model_result.scalar_one_or_none()
-    if not model:
-        return None
-
-    base_url = get_provider_base_url(model.provider, model.base_url)
-    if not base_url:
-        return None
-
-    static_prompt, dynamic_prompt = await build_agent_context(
-        target_agent.id, target_agent.name, target_agent.role_description or ""
-    )
-
-    messages = [
-        LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt),
-        LLMMessage(role="user", content=message),
-    ]
-
-    client = create_llm_client(
-        provider=model.provider,
-        api_key=get_model_api_key(model),
-        model=model.model,
-        base_url=base_url,
-        timeout=float(getattr(model, 'request_timeout', None) or 60.0),
-    )
-    try:
-        response = await client.complete(
-            messages=messages,
-            temperature=model.temperature,
-            max_tokens=512,
-        )
-        content = (response.content or "").strip()
-        return content if content else None
-    except LLMError as e:
-        logger.error(f"_get_agent_reply LLM error: {e}")
-    except Exception as e:
-        logger.error(f"_get_agent_reply LLM call failed: {e}")
-    finally:
-        await client.close()
-    return None
-
-
 async def _send_supervision_reminder(task: Task, agent_name: str):
-    """Send a single supervision reminder. Target can be an Agent or a Member."""
-    try:
-        from app.models.agent import Agent
-        from app.models.org import AgentRelationship
-        from app.models.channel_config import ChannelConfig
-        from app.models.activity_log import AgentActivityLog
-        from app.services.feishu_service import feishu_service
-        from sqlalchemy.orm import selectinload
-        import json as _json
+    """Send one reminder through the canonical delivery paths.
 
-        target_name = task.supervision_target_name
-        if not target_name:
-            logger.warning(f"Supervision task {task.id} has no target name")
+    The task must already contain exactly one frozen canonical target ID. A
+    legacy name-only task fails closed and is surfaced for operator repair.
+    """
+    try:
+        from app.models.activity_log import AgentActivityLog
+        from app.services.agent_tools import _send_channel_message, _send_message_to_agent
+        from app.services.recipient_resolver import RecipientResolutionError
+        from app.services.supervision_targets import resolve_supervision_target
+
+        if (task.supervision_target_user_id is None) == (
+            task.supervision_target_agent_id is None
+        ):
+            logger.warning(
+                "Supervision task %s requires canonical target migration", task.id
+            )
+            async with async_session() as db:
+                db.add(
+                    TaskLog(
+                        task_id=task.id,
+                        content=(
+                            "⚠️ 提醒失败：督办对象缺少唯一的 user_id/agent_id，"
+                            "请修复任务后重试（migration_required）"
+                        ),
+                    )
+                )
+                await db.commit()
             return
 
         days_since = (datetime.now(timezone.utc) - task.created_at).days
@@ -186,141 +139,78 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
         reminder_msg += f"创建于：{days_since} 天前\n"
         if task.due_date:
             reminder_msg += f"截止日期：{task.due_date.strftime('%Y-%m-%d')}\n"
-        reminder_msg += f"\n请及时处理，谢谢！"
+        reminder_msg += "\n请及时处理，谢谢！"
 
         async with async_session() as db:
-            sent = False
-            send_method = ""
+            try:
+                target = await resolve_supervision_target(
+                    db,
+                    task.agent_id,
+                    target_user_id=task.supervision_target_user_id,
+                    target_agent_id=task.supervision_target_agent_id,
+                    channel=task.supervision_channel,
+                )
+            except (RecipientResolutionError, ValueError) as exc:
+                target_name = task.supervision_target_name or "unknown"
+                db.add(
+                    TaskLog(
+                        task_id=task.id,
+                        content=f"⚠️ 提醒失败：{exc}",
+                    )
+                )
+                db.add(
+                    AgentActivityLog(
+                        agent_id=task.agent_id,
+                        action_type="schedule_run",
+                        summary=f"📋 督办提醒失败：{task.title} → {target_name}",
+                        detail_json={
+                            "task_id": str(task.id),
+                            "target_user_id": str(task.supervision_target_user_id or ""),
+                            "target_agent_id": str(task.supervision_target_agent_id or ""),
+                            "sent": False,
+                            "error": str(exc),
+                        },
+                        related_id=task.id,
+                    )
+                )
+                await db.commit()
+                return
 
-            # 1. Try to find target as an Agent
-            agent_result = await db.execute(
-                select(Agent).where(Agent.name == target_name)
+            target_name = target.display_name
+
+        if target.target_type == "agent":
+            result = await _send_message_to_agent(
+                task.agent_id,
+                {
+                    "agent_id": str(target.target_id),
+                    "message": reminder_msg,
+                    "msg_type": "consult",
+                },
+                user_id=task.created_by,
+                origin_session_id=str(task.id),
             )
-            target_agent = agent_result.scalar_one_or_none()
+            send_method = "agent"
+        else:
+            result = await _send_channel_message(
+                task.agent_id,
+                {
+                    "user_id": str(target.target_id),
+                    "message": reminder_msg,
+                    "channel": target.channel,
+                },
+                origin_user_id=task.created_by,
+            )
+            send_method = target.channel or "channel"
 
-            if target_agent:
-                # Send agent-to-agent message via ChatSession + ChatMessage
-                from app.models.audit import ChatMessage
-                from app.models.chat_session import ChatSession
-                from app.models.participant import Participant
+        sent = result.startswith("✅")
 
-                # Get participant for sender agent
-                src_part_r = await db.execute(
-                    select(Participant).where(Participant.type == "agent", Participant.ref_id == task.agent_id)
-                )
-                src_part = src_part_r.scalar_one_or_none()
-                tgt_part_r = await db.execute(
-                    select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent.id)
-                )
-                tgt_part = tgt_part_r.scalar_one_or_none()
-
-                # Find or create ChatSession
-                session_agent_id = min(task.agent_id, target_agent.id, key=str)
-                session_peer_id = max(task.agent_id, target_agent.id, key=str)
-                sess_r = await db.execute(
-                    select(ChatSession).where(
-                        ChatSession.agent_id == session_agent_id,
-                        ChatSession.peer_agent_id == session_peer_id,
-                        ChatSession.source_channel == "agent",
-                    )
-                )
-                chat_session = sess_r.scalar_one_or_none()
-                if not chat_session:
-                    # Get creator for user_id
-                    src_agent_r = await db.execute(select(Agent).where(Agent.id == task.agent_id))
-                    src_agent = src_agent_r.scalar_one_or_none()
-                    owner_id = src_agent.creator_id if src_agent else task.agent_id
-                    chat_session = ChatSession(
-                        agent_id=session_agent_id,
-                        user_id=owner_id,
-                        title=f"{agent_name} ↔ {target_agent.name}",
-                        source_channel="agent",
-                        participant_id=src_part.id if src_part else None,
-                        peer_agent_id=session_peer_id,
-                    )
-                    db.add(chat_session)
-                    await db.flush()
-
-                session_id = str(chat_session.id)
-                src_agent_r2 = await db.execute(select(Agent).where(Agent.id == task.agent_id))
-                src_agent2 = src_agent_r2.scalar_one_or_none()
-                owner_id = src_agent2.creator_id if src_agent2 else task.agent_id
-
-                # Save reminder message
-                db.add(ChatMessage(
-                    agent_id=session_agent_id, user_id=owner_id,
-                    role="user", content=reminder_msg,
-                    conversation_id=session_id,
-                    participant_id=src_part.id if src_part else None,
-                ))
-                await db.flush()
-                chat_session.last_message_at = datetime.now(timezone.utc)
-                sent = True
-                send_method = "agent消息"
-
-                # Trigger target agent's LLM to generate a reply
-                try:
-                    reply = await _get_agent_reply(target_agent, reminder_msg, db)
-                    if reply:
-                        db.add(ChatMessage(
-                            agent_id=session_agent_id, user_id=owner_id,
-                            role="assistant", content=reply,
-                            conversation_id=session_id,
-                            participant_id=tgt_part.id if tgt_part else None,
-                        ))
-                        send_method = f"agent消息+回复({reply[:40]})"
-                        logger.info(f"📋 Target agent {target_agent.name} replied: {reply[:80]}")
-                except Exception as e:
-                    logger.warning(f"Target agent reply failed: {e}")
-            else:
-                # 2. Fallback: find target as a Member in relationships
-                rel_result = await db.execute(
-                    select(AgentRelationship)
-                    .where(AgentRelationship.agent_id == task.agent_id)
-                    .options(selectinload(AgentRelationship.member))
-                )
-                rels = rel_result.scalars().all()
-                target_member = None
-                for r in rels:
-                    if r.member and r.member.name == target_name:
-                        target_member = r.member
-                        break
-
-                if target_member:
-                    # Try Feishu
-                    config_r = await db.execute(
-                        select(ChannelConfig).where(
-                            ChannelConfig.agent_id == task.agent_id,
-                            ChannelConfig.channel_type == "feishu",
-                        )
-                    )
-                    config = config_r.scalar_one_or_none()
-                    if config and (target_member.email or target_member.phone):
-                        try:
-                            resolved = await feishu_service.resolve_open_id(
-                                config.app_id, config.app_secret,
-                                email=target_member.email, mobile=target_member.phone,
-                            )
-                            if resolved:
-                                content = _json.dumps({"text": reminder_msg}, ensure_ascii=False)
-                                resp = await feishu_service.send_message(
-                                    config.app_id, config.app_secret,
-                                    receive_id=resolved, msg_type="text",
-                                    content=content, receive_id_type="open_id",
-                                )
-                                if resp.get("code") == 0:
-                                    sent = True
-                                    send_method = "飞书"
-                        except Exception:
-                            pass
+        async with async_session() as db:
 
             # Log result to TaskLog
             if sent:
                 log = TaskLog(task_id=task.id, content=f"✅ 已向 {target_name} 发送督办提醒（{send_method}）")
-            elif target_agent or target_name:
-                log = TaskLog(task_id=task.id, content=f"📋 督办提醒已触发，目标：{target_name}")
             else:
-                log = TaskLog(task_id=task.id, content=f"⚠️ 提醒失败：未找到联系人 '{target_name}'")
+                log = TaskLog(task_id=task.id, content=f"⚠️ 提醒失败：{result[:300]}")
             db.add(log)
 
             # Log to AgentActivityLog for Activity tab visibility
@@ -328,7 +218,12 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                 agent_id=task.agent_id,
                 action_type="schedule_run",
                 summary=f"📋 督办提醒：{task.title} → {target_name}" + (f"（{send_method}已发送）" if sent else ""),
-                detail_json={"task_id": str(task.id), "target": target_name, "sent": sent},
+                detail_json={
+                    "task_id": str(task.id),
+                    "target_user_id": str(task.supervision_target_user_id or ""),
+                    "target_agent_id": str(task.supervision_target_agent_id or ""),
+                    "sent": sent,
+                },
                 related_id=task.id,
             )
             db.add(activity)

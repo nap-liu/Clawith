@@ -10,7 +10,6 @@ export interface User {
     is_platform_admin?: boolean;
     tenant_id?: string;
     title?: string;
-    feishu_open_id?: string;
     is_active: boolean;
     email_verified?: boolean;
     created_at: string;
@@ -69,6 +68,9 @@ export interface Task {
     created_by: string;
     creator_username?: string;
     due_date?: string;
+    supervision_target_user_id?: string;
+    supervision_target_agent_id?: string;
+    /** Display snapshot only; never submit this as the target locator. */
     supervision_target_name?: string;
     supervision_channel?: string;
     remind_schedule?: string;

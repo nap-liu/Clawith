@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import select
 
 from app.models.user import Identity, User  # noqa: F401
 from app.models.agent import Agent
@@ -34,6 +35,14 @@ async def _isolate_async_engine_between_tests():
 
 async def _seed_user(suffix: str, display_name: str, role: str = "member") -> User:
     async with async_session() as db:
+        tenant_slug = f"chat-list-{suffix[-8:]}"
+        tenant = (
+            await db.execute(select(Tenant).where(Tenant.slug == tenant_slug))
+        ).scalar_one_or_none()
+        if not tenant:
+            tenant = Tenant(name=f"Chat list {suffix[-8:]}", slug=tenant_slug)
+            db.add(tenant)
+            await db.flush()
         ident = Identity(
             username=f"u_{suffix}",
             email=f"u_{suffix}@test.local",
@@ -41,7 +50,13 @@ async def _seed_user(suffix: str, display_name: str, role: str = "member") -> Us
         )
         db.add(ident)
         await db.flush()
-        user = User(identity_id=ident.id, display_name=display_name, role=role, is_active=True)
+        user = User(
+            identity_id=ident.id,
+            tenant_id=tenant.id,
+            display_name=display_name,
+            role=role,
+            is_active=True,
+        )
         db.add(user)
         await db.commit()
         await db.refresh(user)
@@ -50,7 +65,12 @@ async def _seed_user(suffix: str, display_name: str, role: str = "member") -> Us
 
 async def _seed_agent(creator_user_id) -> uuid.UUID:
     async with async_session() as db:
-        agent = Agent(name="ListTestAgent", creator_id=creator_user_id)
+        tenant_id = await db.scalar(select(User.tenant_id).where(User.id == creator_user_id))
+        agent = Agent(
+            name="ListTestAgent",
+            creator_id=creator_user_id,
+            tenant_id=tenant_id,
+        )
         db.add(agent)
         await db.commit()
         await db.refresh(agent)

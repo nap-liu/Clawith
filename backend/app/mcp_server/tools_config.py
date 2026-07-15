@@ -4,7 +4,8 @@ from __future__ import annotations
 import uuid as _uuid
 
 from mcp.server.fastmcp import Context
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.database import async_session
 from app.mcp_server import mcp
@@ -119,7 +120,7 @@ async def set_agent_trigger(ctx: Context, agent: str, name: str, type: str, conf
     """Create or update an autonomous trigger on an agent (write scope + manage).
     type: cron | once | interval | poll | on_message | webhook.
     config per type — cron: {"expr": "0 9 * * *"}; once: {"at": "<iso8601>"}; interval: {"minutes": N};
-    poll: {"url": "..."}; on_message: {"from_agent_name": "..."} or {"from_user_name": "..."}; webhook: {} (token auto-issued).
+    poll: {"url": "..."}; on_message: {"from_agent_id": "<Agent UUID>"} or {"from_user_id": "<User UUID>"}; webhook: {} (token auto-issued).
     reason explains what the trigger should do. For webhook triggers the returned text includes the callback URL."""
     return await set_agent_trigger_impl(ctx, agent=agent, name=name, type=type, config=config,
                                         reason=reason, focus_ref=focus_ref, webhook_mode=webhook_mode)
@@ -136,31 +137,39 @@ async def delete_agent_trigger(ctx: Context, agent: str, trigger: str) -> str:  
 async def _apply_a2a_links(db, current_user, source_agent, links, mode, added, errors):
     """Wire agent-to-agent (A2A) relationships. Mutates added/errors in place."""
     from app.models.agent import Agent  # noqa: F401  (kept for clarity)
-    from app.models.org import AgentAgentRelationship
+    from app.models.org import AgentAgentRelationship, RelationshipSuppression
     from app.mcp_server.tools import _resolve_visible_agent
-
-    if mode == "replace":
-        from sqlalchemy import delete
-        await db.execute(delete(AgentAgentRelationship).where(
-            AgentAgentRelationship.agent_id == source_agent.id))
-        await db.flush()
 
     existing_result = await db.execute(select(AgentAgentRelationship).where(
         AgentAgentRelationship.agent_id == source_agent.id))
     existing_by_target = {r.target_agent_id: r for r in existing_result.scalars().all()}
+    requested_target_ids: set[_uuid.UUID] = set()
 
     for link in links:
-        ref = link.get("target_agent")
+        ref = link.get("agent_id")
         if not ref:
-            errors.append("(A2A 缺少 target_agent)")
+            errors.append("(A2A 缺少 agent_id)")
             continue
-        target = await _resolve_visible_agent(db, current_user, str(ref))
+        try:
+            target_id = _uuid.UUID(str(ref))
+        except (ValueError, TypeError):
+            errors.append(f"A2A:{ref}(agent_id 必须是 UUID)")
+            continue
+        target = await _resolve_visible_agent(db, current_user, str(target_id))
         if target is None:
             errors.append(f"A2A:{ref}")
             continue
         if target.id == source_agent.id:
             errors.append(f"A2A:{ref}(不能关联自身)")
             continue
+        requested_target_ids.add(target.id)
+        await db.execute(
+            delete(RelationshipSuppression).where(
+                RelationshipSuppression.agent_id == source_agent.id,
+                RelationshipSuppression.target_type == "agent",
+                RelationshipSuppression.target_id == target.id,
+            )
+        )
         relation = link.get("relation") or "collaborator"
         description = link.get("description") or ""
         existing = existing_by_target.get(target.id)
@@ -181,88 +190,96 @@ async def _apply_a2a_links(db, current_user, source_agent, links, mode, added, e
             existing_by_target[target.id] = row
         added.append(f"🤖{target.name}")
 
+    if mode == "replace":
+        removed_target_ids = set(existing_by_target) - requested_target_ids
+        for target_id in removed_target_ids:
+            await db.execute(
+                pg_insert(RelationshipSuppression)
+                .values(
+                    id=_uuid.uuid4(),
+                    agent_id=source_agent.id,
+                    target_type="agent",
+                    target_id=target_id,
+                    created_by_user_id=current_user.id,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["agent_id", "target_type", "target_id"]
+                )
+            )
+        if removed_target_ids:
+            await db.execute(
+                delete(AgentAgentRelationship).where(
+                    AgentAgentRelationship.agent_id == source_agent.id,
+                    AgentAgentRelationship.target_agent_id.in_(removed_target_ids),
+                )
+            )
+
 
 async def _apply_human_links(db, current_user, source_agent, links, mode, added, errors):
     """Wire agent-to-human relationships. Mutates added/errors in place."""
     from app.core.permissions import get_agent_access_level_for_user_id
-    from app.models.org import AgentRelationship, OrgMember
+    from app.models.org import AgentRelationship, OrgMember, RelationshipSuppression
     from app.models.user import User
-
-    if mode == "replace":
-        from sqlalchemy import delete
-        await db.execute(delete(AgentRelationship).where(
-            AgentRelationship.agent_id == source_agent.id))
-        await db.flush()
 
     existing_result = await db.execute(select(AgentRelationship).where(
         AgentRelationship.agent_id == source_agent.id))
-    existing_by_member = {r.member_id: r for r in existing_result.scalars().all()}
+    existing_by_member = {r.user_id: r for r in existing_result.scalars().all()}
+    requested_user_ids: set[_uuid.UUID] = set()
 
     for link in links:
-        ref = link.get("user")
+        ref = link.get("user_id")
         if not ref:
-            errors.append("(human 缺少 user)")
+            errors.append("(human 缺少 user_id)")
             continue
         ref = str(ref)
-        member = None
-        if ref.startswith("platform-user:"):
-            try:
-                platform_user_id = _uuid.UUID(ref.split(":", 1)[1])
-            except (ValueError, TypeError):
-                errors.append(f"human:{ref}")
-                continue
-            user_result = await db.execute(select(User).where(
-                User.id == platform_user_id,
-                User.tenant_id == source_agent.tenant_id,
-                User.is_active == True,  # noqa: E712
-            ))
-            platform_user = user_result.scalar_one_or_none()
-            if not platform_user:
-                errors.append(f"human:{ref}")
-                continue
-            if not await get_agent_access_level_for_user_id(db, platform_user.id, source_agent):
-                errors.append(f"human:{ref}(无权访问)")
-                continue
-            member_result = await db.execute(select(OrgMember).where(
-                OrgMember.tenant_id == source_agent.tenant_id,
-                OrgMember.user_id == platform_user.id,
-                OrgMember.status == "active",
-            ))
-            member = member_result.scalar_one_or_none()
-            if not member:
-                member = OrgMember(
-                    tenant_id=source_agent.tenant_id,
-                    user_id=platform_user.id,
-                    external_id=f"platform:{platform_user.id}",
-                    name=platform_user.display_name or platform_user.username
-                    or platform_user.email or str(platform_user.id),
-                    email=platform_user.email,
-                    avatar_url=platform_user.avatar_url,
-                    title=platform_user.title or "",
-                    department_path="",
-                    status="active",
-                )
-                db.add(member)
-                await db.flush()
-        else:
-            try:
-                member_id = _uuid.UUID(ref)
-            except (ValueError, TypeError):
-                errors.append(f"human:{ref}")
-                continue
-            member_result = await db.execute(select(OrgMember).where(OrgMember.id == member_id))
-            member = member_result.scalar_one_or_none()
-
-        if not member or member.tenant_id != source_agent.tenant_id or member.status != "active":
+        try:
+            user_id = _uuid.UUID(ref)
+        except (ValueError, TypeError):
             errors.append(f"human:{ref}")
             continue
-        if member.user_id and not await get_agent_access_level_for_user_id(db, member.user_id, source_agent):
+        user_result = await db.execute(
+            select(User).where(
+                User.id == user_id,
+                User.tenant_id == source_agent.tenant_id,
+                User.is_active == True,  # noqa: E712
+            )
+        )
+        target_user = user_result.scalar_one_or_none()
+        if not target_user:
+            errors.append(f"human:{ref}")
+            continue
+        if target_user.identity_id and not await get_agent_access_level_for_user_id(
+            db, target_user.id, source_agent
+        ):
             errors.append(f"human:{ref}(无权访问)")
             continue
+        requested_user_ids.add(target_user.id)
+        await db.execute(
+            delete(RelationshipSuppression).where(
+                RelationshipSuppression.agent_id == source_agent.id,
+                RelationshipSuppression.target_type == "user",
+                RelationshipSuppression.target_id == target_user.id,
+            )
+        )
+        member_result = await db.execute(
+            select(OrgMember)
+            .where(
+                OrgMember.tenant_id == source_agent.tenant_id,
+                OrgMember.user_id == target_user.id,
+                OrgMember.status == "active",
+            )
+            .order_by(OrgMember.provider_id.is_(None), OrgMember.synced_at.asc())
+            .limit(1)
+        )
+        member = member_result.scalar_one_or_none()
+        if not member:
+            from app.services.registration_service import registration_service
+
+            member = await registration_service.ensure_web_org_member(db, target_user)
 
         relation = link.get("relation") or "collaborator"
         description = link.get("description") or ""
-        existing = existing_by_member.get(member.id)
+        existing = existing_by_member.get(target_user.id)
         if existing is not None:
             existing.relation = relation
             existing.description = description
@@ -270,6 +287,7 @@ async def _apply_human_links(db, current_user, source_agent, links, mode, added,
         else:
             row = AgentRelationship(
                 agent_id=source_agent.id,
+                user_id=target_user.id,
                 member_id=member.id,
                 relation=relation,
                 description=description,
@@ -277,8 +295,32 @@ async def _apply_human_links(db, current_user, source_agent, links, mode, added,
                 updated_by_user_id=current_user.id,
             )
             db.add(row)
-            existing_by_member[member.id] = row
+            existing_by_member[target_user.id] = row
         added.append(f"👤{member.name}")
+
+    if mode == "replace":
+        removed_user_ids = set(existing_by_member) - requested_user_ids
+        for user_id in removed_user_ids:
+            await db.execute(
+                pg_insert(RelationshipSuppression)
+                .values(
+                    id=_uuid.uuid4(),
+                    agent_id=source_agent.id,
+                    target_type="user",
+                    target_id=user_id,
+                    created_by_user_id=current_user.id,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["agent_id", "target_type", "target_id"]
+                )
+            )
+        if removed_user_ids:
+            await db.execute(
+                delete(AgentRelationship).where(
+                    AgentRelationship.agent_id == source_agent.id,
+                    AgentRelationship.user_id.in_(removed_user_ids),
+                )
+            )
 
 
 async def set_agent_relationships_impl(ctx, agent, agent_links=None, human_links=None, mode="merge") -> str:
@@ -315,18 +357,22 @@ async def set_agent_relationships_impl(ctx, agent, agent_links=None, human_links
 
 
 @mcp.tool()
-async def set_agent_relationships(ctx: Context, agent: str, agent_links: list[dict] = [],  # noqa: D401,B006
+async def set_agent_relationships(ctx: Context, agent_id: str, agent_links: list[dict] = [],  # noqa: D401,B006
                                   human_links: list[dict] = [], mode: str = "merge") -> str:
     """Wire an agent's collaboration relationships (write scope + manage).
-    agent: id or name of the agent to configure.
-    agent_links: list of {"target_agent": id|name, "relation"?: str, "description"?: str} —
+    agent_id: canonical id of the agent to configure.
+    agent_links: list of {"agent_id": "<uuid>", "relation"?: str, "description"?: str} —
       agent-to-agent (A2A) links; the target must be VISIBLE to the calling user.
-    human_links: list of {"user": "platform-user:<uuid>" | "<member_id>", "relation"?: str, "description"?: str} —
+    human_links: list of {"user_id": "<uuid>", "relation"?: str, "description"?: str} —
       agent-to-human links; the user must have access to this agent.
     mode: "merge" (default, upsert) keeps existing links and adds/updates the given ones;
       "replace" wipes existing links of EACH provided kind first, then sets the given ones.
     Targets that can't be found or aren't permitted are skipped (reported), not fatal."""
-    return await set_agent_relationships_impl(ctx, agent=agent, agent_links=agent_links,
+    try:
+        canonical_agent_id = str(_uuid.UUID(agent_id))
+    except (TypeError, ValueError):
+        return "❌ agent_id 必须是完整的平台 UUID，不能使用名称。"
+    return await set_agent_relationships_impl(ctx, agent=canonical_agent_id, agent_links=agent_links,
                                               human_links=human_links, mode=mode)
 
 

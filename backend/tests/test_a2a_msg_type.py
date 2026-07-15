@@ -6,12 +6,26 @@ Validates the branching logic in _send_message_to_agent:
 - consult:   synchronous request-response (original behaviour)
 """
 
-import json
 import uuid
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _active_a2a_relationship(monkeypatch):
+    async def active(*_args, **_kwargs):
+        return {
+            "access_allowed": True,
+            "access_status": "active",
+            "access_status_reason": None,
+        }
+
+    monkeypatch.setattr(
+        "app.services.recipient_resolver.evaluate_agent_relationship_status",
+        active,
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -138,7 +152,7 @@ async def test_notify_returns_immediately():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Please review the document",
             "msg_type": "notify",
         })
@@ -185,7 +199,7 @@ async def test_task_delegate_creates_focus_and_trigger():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Please prepare the Q3 report",
             "msg_type": "task_delegate",
         })
@@ -263,7 +277,7 @@ async def test_consult_calls_llm_synchronously():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "What is 2+2?",
             "msg_type": "consult",
         })
@@ -311,7 +325,7 @@ async def test_default_msg_type_is_notify():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Heads up about the meeting",
         })
 
@@ -320,12 +334,12 @@ async def test_default_msg_type_is_notify():
 
 
 @pytest.mark.asyncio
-async def test_missing_agent_name_returns_error():
-    """Missing agent_name should return an error."""
+async def test_missing_agent_id_returns_error():
+    """Missing canonical agent_id should return an error."""
     from app.services.agent_tools import _send_message_to_agent
 
     result = await _send_message_to_agent(uuid.uuid4(), {
-        "agent_name": "",
+        "agent_id": "",
         "message": "Hello",
     })
 
@@ -357,12 +371,12 @@ async def test_no_relationship_returns_error():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Hello",
             "msg_type": "notify",
         })
 
-    assert "do not have a relationship" in result
+    assert '"code": "recipient_not_related"' in result
 
 
 @pytest.mark.asyncio
@@ -382,6 +396,7 @@ async def test_create_on_message_trigger():
     from app.services.agent_tools import _create_on_message_trigger
 
     agent_id = uuid.uuid4()
+    from_agent_id = uuid.uuid4()
 
     snap_db = RecordingDB(responses=[
         DummyResult(scalar_value=None),
@@ -413,7 +428,7 @@ async def test_create_on_message_trigger():
         await _create_on_message_trigger(
             agent_id=agent_id,
             trigger_name="test_trigger",
-            from_agent_name="Bob",
+            from_agent_id_value=str(from_agent_id),
             reason="Test reason",
             focus_ref="test_focus",
         )
@@ -424,7 +439,7 @@ async def test_create_on_message_trigger():
     trigger = trigger_db.added[0]
     assert trigger.name == "test_trigger"
     assert trigger.type == "on_message"
-    assert trigger.config["from_agent_name"] == "Bob"
+    assert trigger.config["from_agent_id"] == str(from_agent_id)
     assert trigger.reason == "Test reason"
     assert trigger.focus_ref == "test_focus"
 
@@ -436,12 +451,13 @@ async def test_create_on_message_trigger_resets_fire_count():
     from app.models.trigger import AgentTrigger
 
     agent_id = uuid.uuid4()
+    from_agent_id = uuid.uuid4()
 
     existing_trigger = AgentTrigger(
         agent_id=agent_id,
         name="test_trigger",
         type="on_message",
-        config={"from_agent_name": "Bob"},
+        config={"from_agent_id": str(from_agent_id)},
         reason="Old reason",
         focus_ref="old_focus",
         is_enabled=False,
@@ -474,7 +490,7 @@ async def test_create_on_message_trigger_resets_fire_count():
         await _create_on_message_trigger(
             agent_id=agent_id,
             trigger_name="test_trigger",
-            from_agent_name="Bob",
+            from_agent_id_value=str(from_agent_id),
             reason="New reason",
             focus_ref="new_focus",
         )
@@ -538,7 +554,7 @@ async def test_openclaw_target_still_queues():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "OpenClawBot",
+            "agent_id": str(target_id),
             "message": "Hello",
             "msg_type": "notify",
         })
@@ -601,7 +617,7 @@ async def test_feature_flag_off_falls_back_to_consult():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Hello",
             "msg_type": "notify",
         })
@@ -650,7 +666,7 @@ async def test_feature_flag_on_uses_notify():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Hello",
             "msg_type": "notify",
         })
@@ -752,8 +768,3 @@ async def test_execute_tool_failure_writes_system_message():
     assert error_msg.role == "assistant"
     assert "系统提示" in error_msg.content
     assert "send_channel_message" in error_msg.content
-
-
-
-
-

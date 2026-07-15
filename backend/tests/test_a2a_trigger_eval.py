@@ -56,13 +56,6 @@ async def test_check_new_agent_messages_matches_user_role():
     """Verify check_new_agent_messages matches messages from agent with role='user'."""
     agent_id = uuid.uuid4()
     source_agent_id = uuid.uuid4()
-    participant_id = uuid.uuid4()
-    
-    # Mock source agent
-    source_agent = MagicMock()
-    source_agent.id = source_agent_id
-    source_agent.name = "Ray"
-
     # Mock chat message
     chat_message = MagicMock()
     chat_message.content = "Designed the logo"
@@ -73,16 +66,14 @@ async def test_check_new_agent_messages_matches_user_role():
         agent_id=agent_id,
         name="test_trigger",
         type="on_message",
-        config={"from_agent_name": "Ray"},
+        config={"from_agent_id": str(source_agent_id)},
         is_enabled=True,
         created_at=datetime.now(UTC),
         fire_count=0,
     )
 
     db = RecordingDB(responses=[
-        DummyResult(scalars_list=[source_agent]),  # AgentModel lookup
-        DummyResult(scalar_value=participant_id),  # Participant lookup
-        DummyResult(scalar_value=chat_message),    # ChatMessage lookup
+        DummyResult(scalar_value=chat_message),  # exact sender_agent_id lookup
     ])
 
     with patch("app.services.trigger_runtime.evaluator.async_session") as mock_session_ctx:
@@ -93,4 +84,4 @@ async def test_check_new_agent_messages_matches_user_role():
 
     assert result is True
     assert trigger.config["_matched_message"] == "Designed the logo"
-    assert trigger.config["_matched_from"] == "Ray"
+    assert trigger.config["_matched_from"] == str(source_agent_id)

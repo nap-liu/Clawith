@@ -10,10 +10,24 @@ Validates three behaviours:
 """
 
 import uuid
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _active_a2a_relationship(monkeypatch):
+    async def active(*_args, **_kwargs):
+        return {
+            "access_allowed": True,
+            "access_status": "active",
+            "access_status_reason": None,
+        }
+
+    monkeypatch.setattr(
+        "app.services.recipient_resolver.evaluate_agent_relationship_status",
+        active,
+    )
 
 
 # ── Re-use the same helpers from test_a2a_msg_type ────────────────────
@@ -146,7 +160,7 @@ async def test_new_conversation_creates_session_with_external_conv_id():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Starting fresh",
             "msg_type": "notify",
             "new_conversation": True,
@@ -209,7 +223,7 @@ async def test_new_conversation_force_creates_even_when_prior_session_exists():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Reset please",
             "msg_type": "notify",
             "new_conversation": True,
@@ -264,7 +278,7 @@ async def test_default_reuses_existing_session_no_new_session_added():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Hello again",
             "msg_type": "notify",
             # new_conversation omitted → default False

@@ -980,9 +980,14 @@ async def get_category_config(
         raw_agent = {k: v for k, v in raw_agent.items() if v is not None}
 
     # ── 3. Build effective config ───────────────────────────────────────────
-    # Priority: Agent config > Company config > Default
-    # Agent can override company values by setting their own.
+    # Never return decrypted ChannelConfig credentials.  The update endpoint
+    # already preserves omitted secrets, so the UI can use blank password fields.
     effective_config = {**raw_global, **raw_agent}
+    sensitive_keys = get_sensitive_keys(cat_schema)
+    public_agent = {key: value for key, value in raw_agent.items() if key not in sensitive_keys}
+    public_effective = {
+        key: value for key, value in effective_config.items() if key not in sensitive_keys
+    }
 
     return {
         "id": config_id,
@@ -990,10 +995,10 @@ async def get_category_config(
         "category": category,
         "is_configured": is_configured,
         # Legacy field (backward-compat): full effective config for display
-        "config": effective_config,
+        "config": public_effective,
         # New fields for richer UI: show global and agent configs separately
         "global_config": masked_global,
-        "agent_config": raw_agent,
+        "agent_config": public_agent,
     }
 
 

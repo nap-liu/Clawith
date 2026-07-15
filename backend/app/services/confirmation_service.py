@@ -30,6 +30,16 @@ logger = logging.getLogger(__name__)
 CONFIRMATION_EXPIRY_HOURS = 24
 
 
+class ConfirmationActorMismatch(PermissionError):
+    """The resolving user is not the human for whom this card was created."""
+
+
+def _assert_confirmation_actor(row, pending_meta: dict, resolving_user_id: uuid.UUID) -> None:
+    intended_user_id = pending_meta.get("intended_user_id") or row.user_id
+    if intended_user_id is None or str(intended_user_id) != str(resolving_user_id):
+        raise ConfirmationActorMismatch("This confirmation belongs to another user")
+
+
 def _action_preview(action: dict | None) -> str:
     """One-line, concrete preview of the action the agent intends to run (display only)."""
     if not action:
@@ -248,6 +258,16 @@ async def resolve_confirmation(
             return None  # idempotent — already resolved (or not a confirmation)
 
         pending_meta = row.message_meta if isinstance(row.message_meta, dict) else {}
+        try:
+            _assert_confirmation_actor(row, pending_meta, resolving_user_id)
+        except ConfirmationActorMismatch:
+            logger.warning(
+                "resolve_confirmation: actor %s rejected for row %s intended for %s",
+                resolving_user_id,
+                call_id,
+                pending_meta.get("intended_user_id") or row.user_id,
+            )
+            raise
         try:
             turn_anchor_id = uuid.UUID(str(pending_meta.get("turn_anchor_id")))
         except (TypeError, ValueError):

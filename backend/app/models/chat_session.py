@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, JSON, String, UniqueConstraint, func, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, JSON, String, UniqueConstraint, event, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -50,15 +50,20 @@ class ChatSession(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=False, index=True)
-    # user_id: for P2P sessions this is the user; for group sessions this is the agent creator (placeholder)
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    # Canonical human counterpart for P2P sessions.  Group, trigger, and A2A
+    # sessions do not invent a creator-user placeholder and therefore keep this
+    # NULL.  A2A uses ``agent_id`` + ``peer_agent_id`` instead.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="New Session")
     source_channel: Mapped[str] = mapped_column(String(20), nullable=False, default="web")
     external_conv_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     # Group chat support: group sessions have user_id=NULL and show group_name instead
     is_group: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     group_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    # Participant identity (unified User/Agent identity)
+    # Legacy internal compatibility only.  Participant IDs are not a public
+    # identity contract; callers use user_id or peer_agent_id.
     participant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("participants.id"), nullable=True)
     # For agent-to-agent sessions: the other agent in the conversation
     peer_agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True)
@@ -77,3 +82,10 @@ class ChatSession(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+@event.listens_for(ChatSession, "before_insert")
+@event.listens_for(ChatSession, "before_update")
+def _clear_nonhuman_session_user(_mapper, _connection, target: ChatSession) -> None:
+    if target.is_group or target.source_channel in {"agent", "trigger"}:
+        target.user_id = None

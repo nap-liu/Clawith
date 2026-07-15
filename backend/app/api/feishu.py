@@ -17,7 +17,8 @@ from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.models.identity import IdentityProvider
-from app.schemas.schemas import ChannelConfigCreate, ChannelConfigOut, TokenResponse, UserOut
+from app.schemas.schemas import ChannelConfigCreate, TokenResponse, UserOut
+from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 # Shared, channel-agnostic LLM entry point now lives in services/channel_llm.
 # Re-exported here for backwards compatibility (older code does
 # `from app.api.feishu import _call_agent_llm`); new code imports it directly.
@@ -379,12 +380,30 @@ async def feishu_event_webhook(
     db: AsyncSession = Depends(get_db),
 ):
     """Handle Feishu event callback for a specific agent's bot."""
-    body = await request.json()
-    
-    # Handle verification challenge
+    try:
+        body = await request.json()
+    except ValueError:
+        return Response(status_code=400, content="Invalid JSON")
+
+    result = await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.agent_id == agent_id,
+            ChannelConfig.channel_type == "feishu",
+        )
+    )
+    config = result.scalar_one_or_none()
+    if not config:
+        return Response(status_code=404)
+
+    from app.services.webhook_security import WebhookVerificationError, verify_feishu_webhook
+    try:
+        body = verify_feishu_webhook(body, config)
+    except WebhookVerificationError as exc:
+        logger.warning(f"[Feishu] rejected unauthenticated webhook for agent {agent_id}: {exc}")
+        return Response(status_code=401, content="Unauthorized")
+
     if "challenge" in body:
         return {"challenge": body["challenge"]}
-
     return await process_feishu_event(agent_id, body, db)
 
 
@@ -531,6 +550,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             # Must run BEFORE find_or_create_channel_session to avoid creating a
             # ghost session that is immediately archived.
             if is_channel_command(user_text):
+                from app.services.webhook_security import claim_command_event
+                command_event_id = event_id or message.get("message_id") or None
+                if not await claim_command_event("feishu", config.id, command_event_id):
+                    return {"code": 0, "msg": "duplicate"}
                 from app.database import async_session as _async_session
                 async with _async_session() as _cmd_db:
                     cmd_result = await handle_channel_command(
@@ -615,39 +638,6 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                                 "open_id": sender_open_id,
                             }
                             logger.info(f"[Feishu] Resolved sender: {sender_name} (user_id={sender_user_id_feishu})")
-                            # Cache sender info so feishu_user_search can find them by name
-                            if sender_name and sender_open_id:
-                                try:
-                                    import pathlib as _pl, json as _cj, time as _ct
-                                    _safe_id = str(agent_id).replace("..", "").replace("/", "")
-                                    _cache = _pl.Path(f"/data/workspaces/{_safe_id}/feishu_contacts_cache.json")
-                                    _cache.parent.mkdir(parents=True, exist_ok=True)
-                                    _existing = {}
-                                    if _cache.exists():
-                                        try:
-                                            _existing = _cj.loads(_cache.read_text())
-                                        except Exception:
-                                            pass
-                                    # Key by user_id when available (tenant-stable), fallback to open_id
-                                    _users = {}
-                                    for _u in _existing.get("users", []):
-                                        _key = _u.get("user_id") or _u.get("open_id", "")
-                                        _users[_key] = _u
-                                    _cache_key = sender_user_id_feishu or sender_open_id
-                                    _users[_cache_key] = {
-                                        "open_id": sender_open_id,
-                                        "name": sender_name,
-                                        "email": sender_email,
-                                        "user_id": sender_user_id_feishu,
-                                    }
-                                    _cache.write_text(_cj.dumps(
-                                        {"ts": _ct.time(), "users": list(_users.values())},
-                                        ensure_ascii=False,
-                                    ), encoding="utf-8")
-                                    import os as _os
-                                    _os.chmod(str(_cache), 0o600)
-                                except Exception as _ce:
-                                    logger.error(f"[Feishu] Cache write failed: {_ce}")
             except Exception as e:
                 logger.error(f"[Feishu] Failed to resolve sender: {e}")
 

@@ -18,7 +18,7 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
-from app.schemas.schemas import ChannelConfigOut
+from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 
 
 router = APIRouter(tags=["whatsapp"])

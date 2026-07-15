@@ -16,6 +16,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _active_a2a_relationship(monkeypatch):
+    async def active(*_args, **_kwargs):
+        return {
+            "access_allowed": True,
+            "access_status": "active",
+            "access_status_reason": None,
+        }
+
+    monkeypatch.setattr(
+        "app.services.recipient_resolver.evaluate_agent_relationship_status",
+        active,
+    )
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
@@ -159,7 +174,7 @@ async def test_consult_routes_through_unified_loop_and_returns_reply():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "What is the status?",
             "msg_type": "consult",
         })
@@ -239,7 +254,7 @@ async def test_consult_persists_target_thinking():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Register the report.",
             "msg_type": "consult",
         })
@@ -340,7 +355,7 @@ async def test_consult_persist_tool_call_stores_raw_connection_string():
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(from_agent_id, {
-            "agent_name": "Bob",
+            "agent_id": str(target_id),
             "message": "Query the DB",
             "msg_type": "consult",
         })

@@ -2,7 +2,7 @@ from __future__ import annotations
 import uuid
 import pytest
 from types import SimpleNamespace
-from sqlalchemy import select
+from sqlalchemy import func, select
 from app.database import async_session, engine
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
@@ -125,7 +125,7 @@ async def test_set_agent_relationships_a2a_merge():
     agent_manager._agent_dir(a.id).mkdir(parents=True, exist_ok=True)
     token = await _pat(user, scope="write")
     out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
-              agent_links=[{"target_agent": b.name, "relation": "collaborator"}])
+              agent_links=[{"agent_id": str(b.id), "relation": "collaborator"}])
     assert "✅" in out, out
     async with async_session() as db:
         row = (await db.execute(select(AgentAgentRelationship).where(
@@ -146,12 +146,74 @@ async def test_set_agent_relationships_human_platform_user():
     agent_manager._agent_dir(a.id).mkdir(parents=True, exist_ok=True)
     token = await _pat(owner, scope="write")
     out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
-              human_links=[{"user": f"platform-user:{colleague.id}", "relation": "manager"}])
+              human_links=[{"user_id": str(colleague.id), "relation": "manager"}])
     assert "✅" in out, out
     async with async_session() as db:
         rows = (await db.execute(select(AgentRelationship).where(
             AgentRelationship.agent_id == a.id))).scalars().all()
     assert len(rows) >= 1
+
+
+async def test_mcp_relationship_replace_suppresses_and_merge_explicitly_restores():
+    from app.mcp_server.tools_config import set_agent_relationships_impl
+    from app.models.org import RelationshipSuppression
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    colleague_a = await _seed_user(tenant_id=tenant.id)
+    colleague_b = await _seed_user(tenant_id=tenant.id)
+    source = await _seed_agent(owner, name=f"Source_{uuid.uuid4().hex[:6]}")
+    target_a = await _seed_agent(owner, name=f"TargetA_{uuid.uuid4().hex[:6]}")
+    target_b = await _seed_agent(owner, name=f"TargetB_{uuid.uuid4().hex[:6]}")
+    token = await _pat(owner, scope="write")
+
+    await set_agent_relationships_impl(
+        _ctx(token),
+        agent=str(source.id),
+        human_links=[
+            {"user_id": str(colleague_a.id)},
+            {"user_id": str(colleague_b.id)},
+        ],
+        agent_links=[
+            {"agent_id": str(target_a.id)},
+            {"agent_id": str(target_b.id)},
+        ],
+    )
+    await set_agent_relationships_impl(
+        _ctx(token),
+        agent=str(source.id),
+        human_links=[{"user_id": str(colleague_a.id)}],
+        agent_links=[{"agent_id": str(target_a.id)}],
+        mode="replace",
+    )
+
+    async with async_session() as db:
+        suppressions = (
+            await db.execute(
+                select(RelationshipSuppression).where(
+                    RelationshipSuppression.agent_id == source.id
+                )
+            )
+        ).scalars().all()
+        assert {(row.target_type, row.target_id) for row in suppressions} == {
+            ("user", colleague_b.id),
+            ("agent", target_b.id),
+        }
+
+    await set_agent_relationships_impl(
+        _ctx(token),
+        agent=str(source.id),
+        human_links=[{"user_id": str(colleague_b.id)}],
+        agent_links=[{"agent_id": str(target_b.id)}],
+        mode="merge",
+    )
+    async with async_session() as db:
+        remaining = await db.scalar(
+            select(func.count(RelationshipSuppression.id)).where(
+                RelationshipSuppression.agent_id == source.id
+            )
+        )
+    assert remaining == 0
 
 
 async def test_set_agent_relationships_requires_write():
@@ -161,7 +223,7 @@ async def test_set_agent_relationships_requires_write():
     a = await _seed_agent(user)
     token = await _pat(user, scope="read")
     out = await set_agent_relationships_impl(_ctx(token), agent=str(a.id),
-              agent_links=[{"target_agent": "whatever"}])
+              agent_links=[{"agent_id": str(uuid.uuid4())}])
     assert "需要 write" in out
 
 

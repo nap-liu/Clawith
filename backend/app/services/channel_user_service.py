@@ -5,17 +5,19 @@ external channels (DingTalk, WeCom, Feishu, etc.). It reuses the SSO service
 and OrgMember-based identity management.
 """
 
+import hashlib
 import uuid
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.agent import Agent
 from app.models.identity import IdentityProvider
-from app.models.org import OrgMember
+from app.models.org import ChannelUserBinding, OrgMember
 from app.models.user import Identity, User
 from app.services.sso_service import sso_service
 
@@ -82,6 +84,226 @@ class ChannelUserService:
 
         return unionid, open_id, external_id
 
+    def _installation_scope(
+        self,
+        provider: IdentityProvider,
+        extra_info: dict[str, Any] | None = None,
+    ) -> str:
+        """Return the non-secret installation namespace for channel subjects."""
+        explicit = str((extra_info or {}).get("_installation_scope") or "").strip()
+        if explicit:
+            return explicit
+        configured = str((provider.config or {}).get("installation_scope") or "").strip()
+        return configured or f"provider:{provider.id}"
+
+    async def _resolve_installation_scope(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        channel_type: str,
+        extra_info: dict[str, Any],
+    ) -> str:
+        """Build a stable non-secret namespace for the receiving bot installation."""
+        explicit = str(extra_info.get("_installation_scope") or "").strip()
+        if explicit:
+            return explicit
+
+        from app.models.channel_config import ChannelConfig
+
+        normalized = self._normalize_channel_type(channel_type)
+        config_type = "microsoft_teams" if normalized == "teams" else normalized
+        config = (
+            await db.execute(
+                select(ChannelConfig).where(
+                    ChannelConfig.agent_id == agent.id,
+                    ChannelConfig.channel_type == config_type,
+                )
+            )
+        ).scalar_one_or_none()
+        if config is None:
+            return f"agent:{agent.id}:channel:{normalized}"
+
+        extra_config = config.extra_config if isinstance(config.extra_config, dict) else {}
+        issuer = str(
+            extra_info.get("_issuer")
+            or config.app_id
+            or extra_config.get("app_id")
+            or extra_config.get("workspace_id")
+            or extra_config.get("team_id")
+            or extra_config.get("corp_id")
+            or extra_config.get("robot_code")
+            or extra_config.get("phone_number_id")
+            or ""
+        ).strip()
+        if issuer:
+            issuer_hash = hashlib.sha256(issuer.encode("utf-8")).hexdigest()[:32]
+            return f"agent:{agent.id}:channel:{normalized}:issuer:{issuer_hash}"
+        return f"channel-config:{config.id}"
+
+    async def resolve_installation_scope(
+        self,
+        db: AsyncSession,
+        agent: Agent,
+        channel_type: str,
+    ) -> str:
+        """Return the same installation namespace used by inbound bindings."""
+        return await self._resolve_installation_scope(db, agent, channel_type, {})
+
+    def _binding_subjects(
+        self,
+        provider: IdentityProvider,
+        channel_type: str,
+        external_user_id: str | None,
+        extra_info: dict[str, Any],
+    ) -> list[tuple[str, str]]:
+        unionid, open_id, external_id = self._get_channel_ids(
+            channel_type, external_user_id, extra_info
+        )
+        normalized = self._normalize_channel_type(channel_type)
+        external_type = {
+            "feishu": "user_id",
+            "dingtalk": "staff_id",
+            "wecom": "user_id",
+        }.get(normalized, "external_id")
+        candidates = [
+            ("union_id", unionid),
+            ("open_id", open_id),
+            (external_type, external_id),
+        ]
+        seen: set[tuple[str, str]] = set()
+        subjects: list[tuple[str, str]] = []
+        for id_type, subject in candidates:
+            full_subject = str(subject or "").strip()
+            key = (id_type, full_subject)
+            if full_subject and key not in seen:
+                seen.add(key)
+                subjects.append(key)
+        return subjects
+
+    async def _find_bound_user(
+        self,
+        db: AsyncSession,
+        provider: IdentityProvider,
+        channel_type: str,
+        external_user_id: str | None,
+        extra_info: dict[str, Any],
+    ) -> User | None:
+        if provider.tenant_id is None:
+            raise ChannelUserResolutionError("Channel provider has no tenant scope")
+        subjects = self._binding_subjects(provider, channel_type, external_user_id, extra_info)
+        if not subjects:
+            return None
+        scope = self._installation_scope(provider, extra_info)
+        rows = (
+            await db.execute(
+                select(ChannelUserBinding).where(
+                    ChannelUserBinding.tenant_id == provider.tenant_id,
+                    ChannelUserBinding.installation_scope == scope,
+                    or_(
+                        *(
+                            (ChannelUserBinding.id_type == id_type)
+                            & (ChannelUserBinding.subject == subject)
+                            for id_type, subject in subjects
+                        )
+                    ),
+                )
+            )
+        ).scalars().all()
+        user_ids = {row.user_id for row in rows}
+        if len(user_ids) > 1:
+            raise ChannelUserResolutionError(
+                "Channel subjects resolve to multiple users; refusing ambiguous attribution"
+            )
+        if not user_ids:
+            return None
+        user = await _load_user_with_identity(db, next(iter(user_ids)), provider.tenant_id)
+        if not user or not user.is_active:
+            raise ChannelUserResolutionError("Channel binding points to an unavailable user")
+        return user
+
+    async def _ensure_bindings(
+        self,
+        db: AsyncSession,
+        provider: IdentityProvider,
+        channel_type: str,
+        external_user_id: str | None,
+        extra_info: dict[str, Any],
+        user: User,
+    ) -> tuple[User, bool]:
+        if provider.tenant_id is None or user.tenant_id != provider.tenant_id:
+            raise ChannelUserResolutionError("Channel binding tenant does not match user tenant")
+        subjects = self._binding_subjects(provider, channel_type, external_user_id, extra_info)
+        if not subjects:
+            raise ChannelUserResolutionError("Channel sender has no scoped subject identifier")
+        scope = self._installation_scope(provider, extra_info)
+        pending: list[tuple[str, str]] = []
+        saw_existing = False
+        existing_user_ids: set[uuid.UUID] = set()
+        for id_type, subject in subjects:
+            query = select(ChannelUserBinding).where(
+                ChannelUserBinding.tenant_id == provider.tenant_id,
+                ChannelUserBinding.installation_scope == scope,
+                ChannelUserBinding.id_type == id_type,
+                ChannelUserBinding.subject == subject,
+            )
+            binding = (await db.execute(query)).scalar_one_or_none()
+            if binding:
+                saw_existing = True
+                existing_user_ids.add(binding.user_id)
+                continue
+            pending.append((id_type, subject))
+
+        if len(existing_user_ids) > 1:
+            raise ChannelUserResolutionError(
+                "Channel subjects resolve to multiple users; refusing ambiguous attribution"
+            )
+        if existing_user_ids:
+            canonical = await _load_user_with_identity(
+                db, next(iter(existing_user_ids)), provider.tenant_id
+            )
+            if canonical is None or not canonical.is_active:
+                raise ChannelUserResolutionError(
+                    "Channel binding points to an unavailable user"
+                )
+            # The scoped binding is authoritative. This branch is also the
+            # normal loser path when another replica commits the same ingress
+            # between the initial lookup and this transactional insert.
+            user = canonical
+
+        if not pending:
+            return user, False
+
+        try:
+            # Save the complete identifier set atomically. A conflict must not
+            # leave a partial union/open/external mapping in this transaction.
+            async with db.begin_nested():
+                for id_type, subject in pending:
+                    db.add(
+                        ChannelUserBinding(
+                            tenant_id=provider.tenant_id,
+                            provider_id=provider.id,
+                            installation_scope=scope,
+                            channel_type=self._normalize_channel_type(channel_type),
+                            id_type=id_type,
+                            subject=subject,
+                            user_id=user.id,
+                        )
+                    )
+                await db.flush()
+        except IntegrityError:
+            canonical = await self._find_bound_user(
+                db, provider, channel_type, external_user_id, extra_info
+            )
+            if canonical and (not saw_existing or canonical.id == user.id):
+                return canonical, False
+            raise ChannelUserResolutionError(
+                "Concurrent channel binding could not be resolved to one canonical user"
+            )
+        # Only the transaction that established the first binding owns lazy
+        # OrgMember-shell creation. Transactions that merely complete another
+        # subject for an already-bound person must not create duplicate shells.
+        return user, not saw_existing
+
     async def resolve_channel_user(
         self,
         db: AsyncSession,
@@ -109,10 +331,74 @@ class ChannelUserService:
             Resolved User instance
         """
         tenant_id = agent.tenant_id
-        extra_info = extra_info or {}
+        extra_info = dict(extra_info or {})
+        extra_info["_installation_scope"] = await self._resolve_installation_scope(
+            db, agent, channel_type, extra_info
+        )
 
         # Step 1: Ensure IdentityProvider exists
         provider = await self._ensure_provider(db, channel_type, tenant_id)
+
+        bound_user = await self._find_bound_user(
+            db, provider, channel_type, external_user_id, extra_info
+        )
+        if bound_user:
+            # A provider may reveal additional exact subjects over time (for
+            # example open_id first, then union_id). Complete those scoped
+            # bindings transactionally without changing the canonical user.
+            canonical_user, _ = await self._ensure_bindings(
+                db,
+                provider,
+                channel_type,
+                external_user_id,
+                extra_info,
+                bound_user,
+            )
+            return canonical_user
+
+        # One-release migration bridge for the historical DingTalk login
+        # principal. It is exact, tenant-scoped, unique and active; no display
+        # name/contact guessing is involved. The scoped binding becomes the
+        # only lookup path after this first successful message.
+        normalized_channel = self._normalize_channel_type(channel_type)
+        if normalized_channel == "dingtalk" and external_user_id:
+            legacy_username = f"dingtalk_{external_user_id}"
+            legacy_users = (
+                await db.execute(
+                    select(User)
+                    .join(User.identity)
+                    .where(
+                        User.tenant_id == tenant_id,
+                        User.is_active == True,  # noqa: E712
+                        Identity.username == legacy_username,
+                    )
+                    .options(selectinload(User.identity))
+                )
+            ).scalars().all()
+            if len(legacy_users) > 1:
+                raise ChannelUserResolutionError(
+                    "Legacy DingTalk subject maps to multiple tenant users; migration_required"
+                )
+            if legacy_users:
+                legacy_user = legacy_users[0]
+                canonical_user, binding_created = await self._ensure_bindings(
+                    db, provider, channel_type, external_user_id, extra_info, legacy_user
+                )
+                if binding_created:
+                    legacy_member = await self._create_org_member_shell(
+                        db,
+                        provider,
+                        channel_type,
+                        external_user_id,
+                        extra_info,
+                        linked_user_id=canonical_user.id,
+                    )
+                    from app.services.contact_provisioning import contact_provisioning
+
+                    await contact_provisioning.ensure_user_for_org_member(
+                        db, legacy_member, provider=provider
+                    )
+                return canonical_user
 
         # Step 2: Try to find OrgMember by external identity
         org_member = await self._find_org_member(
@@ -121,8 +407,6 @@ class ChannelUserService:
 
         # Step 3: Resolve User from OrgMember or other means
         user = None
-        normalized_channel = self._normalize_channel_type(channel_type)
-
         if org_member:
             if org_member.tenant_id is None and provider.tenant_id:
                 org_member.tenant_id = provider.tenant_id
@@ -134,6 +418,10 @@ class ChannelUserService:
                     provider,
                 )
                 if provisioned_user:
+                    provisioned_user, _binding_created = await self._ensure_bindings(
+                        db, provider, channel_type, external_user_id, extra_info, provisioned_user
+                    )
+                    org_member.user_id = provisioned_user.id
                     logger.info(
                         f"[{channel_type}] Provisioned user via OrgMember {org_member.id}: {provisioned_user.id}"
                     )
@@ -142,6 +430,10 @@ class ChannelUserService:
             if org_member.user_id:
                 user = await _load_user_with_identity(db, org_member.user_id, tenant_id)
                 if user:
+                    user, _binding_created = await self._ensure_bindings(
+                        db, provider, channel_type, external_user_id, extra_info, user
+                    )
+                    org_member.user_id = user.id
                     logger.debug(
                         f"[{channel_type}] Found user via linked OrgMember: {user.id}"
                     )
@@ -153,38 +445,36 @@ class ChannelUserService:
                 )
 
         # Step 4: Try to find User by email/mobile from extra_info
-        email = extra_info.get("email")
-        mobile = extra_info.get("mobile")
+        verified_contact = extra_info.get("identity_verified") is True
+        email = extra_info.get("email") if verified_contact else None
+        mobile = extra_info.get("mobile") if verified_contact else None
 
         should_persist_member = True
 
-        if not org_member and should_persist_member and mobile and normalized_channel == "dingtalk":
-            org_member = await self._create_org_member_shell(
-                db,
-                provider,
-                channel_type,
-                external_user_id,
-                extra_info,
-                linked_user_id=None,
-            )
-            provisioned_user = await self._provision_user_from_member(
-                db,
-                org_member,
-                provider,
-            )
-            if provisioned_user:
-                logger.info(
-                    f"[{channel_type}] Provisioned user from mobile payload: {provisioned_user.id}"
+        if not org_member and should_persist_member and normalized_channel == "dingtalk":
+            if mobile:
+                user = await sso_service.match_user_by_mobile(db, mobile, tenant_id)
+            proposed_user = None
+            if not user:
+                proposed_user = await self._create_channel_user(
+                    db, channel_type, external_user_id, extra_info, tenant_id
                 )
-                return provisioned_user
-            raise ChannelUserResolutionError(
-                f"DingTalk sender {external_user_id} has a mobile number but could not be provisioned safely"
+                user = proposed_user
+            user, binding_created = await self._ensure_bindings(
+                db, provider, channel_type, external_user_id, extra_info, user
             )
-
-        if normalized_channel == "dingtalk":
-            raise ChannelUserResolutionError(
-                f"DingTalk sender {external_user_id} cannot be resolved without a mobile number"
-            )
+            if proposed_user is not None and user.id != proposed_user.id:
+                await db.delete(proposed_user)
+            if binding_created:
+                await self._create_org_member_shell(
+                    db,
+                    provider,
+                    channel_type,
+                    external_user_id,
+                    extra_info,
+                    linked_user_id=user.id,
+                )
+            return user
 
         if not user and email:
             user = await sso_service.match_user_by_email(db, email, tenant_id)
@@ -202,60 +492,38 @@ class ChannelUserService:
 
         # If found User by email/mobile, link OrgMember if exists
         if user:
-            if should_persist_member:
-                if org_member and not org_member.user_id:
-                    # Existing shell OrgMember not yet linked → link it
-                    org_member.user_id = user.id
-                elif not org_member:
-                    # No OrgMember found by external_id. Before creating a new shell,
-                    # check if this user already has an OrgMember from org sync so
-                    # we reuse it instead of creating a duplicate entry.
-                    existing_member = await self._find_existing_org_member_for_user(
-                        db, user.id, provider.id, tenant_id
-                    )
-                    if existing_member:
-                        unionid, open_id, external_id = self._get_channel_ids(
-                            channel_type, external_user_id, extra_info
-                        )
-                        if unionid and not existing_member.unionid:
-                            existing_member.unionid = unionid
-                        if open_id and not existing_member.open_id:
-                            existing_member.open_id = open_id
-                        if external_id and not existing_member.external_id:
-                            existing_member.external_id = external_id
-                        logger.info(
-                            f"[{channel_type}] Reusing org-synced OrgMember {existing_member.id} "
-                            f"for user {user.id} instead of creating a duplicate shell"
-                        )
-                    else:
-                        # Truly no OrgMember for this user → create shell
-                        await self._create_org_member_shell(
-                            db, provider, channel_type, external_user_id, extra_info,
-                            linked_user_id=user.id
-                        )
+            user, binding_created = await self._ensure_bindings(
+                db, provider, channel_type, external_user_id, extra_info, user
+            )
+            if org_member:
+                org_member.user_id = user.id
+            elif should_persist_member and binding_created:
+                await self._create_org_member_shell(
+                    db, provider, channel_type, external_user_id, extra_info,
+                    linked_user_id=user.id
+                )
             await db.flush()
             return user
 
-        unionid, open_id, external_id = self._get_channel_ids(
-            channel_type, external_user_id, extra_info
-        )
-
-        if channel_type == "feishu" and not org_member and not (unionid or external_id):
-            raise ChannelUserResolutionError(
-                "Feishu sender could not be resolved to a stable user_id/union_id; "
-                "refusing to lazily create a duplicate user from open_id only."
-            )
+        if not self._binding_subjects(provider, channel_type, external_user_id, extra_info):
+            raise ChannelUserResolutionError("Channel sender has no scoped subject identifier")
 
         # Step 5: Create new User (lazy registration)
         user = await self._create_channel_user(
             db, channel_type, external_user_id, extra_info, tenant_id
         )
+        proposed_user = user
+        user, binding_created = await self._ensure_bindings(
+            db, provider, channel_type, external_user_id, extra_info, user
+        )
+        if user.id != proposed_user.id:
+            await db.delete(proposed_user)
 
         # Step 6: Link or create OrgMember
         if should_persist_member:
             if org_member:
                 org_member.user_id = user.id
-            else:
+            elif binding_created:
                 await self._create_org_member_shell(
                     db, provider, channel_type, external_user_id, extra_info,
                     linked_user_id=user.id
@@ -278,9 +546,10 @@ class ChannelUserService:
         incoming_name = (extra_info.get("name") or "").strip()
         if incoming_name and (not org_member.name or org_member.name == generated_name):
             org_member.name = incoming_name
-        if extra_info.get("email") and not org_member.email:
+        contact_verified = extra_info.get("identity_verified") is True
+        if contact_verified and extra_info.get("email") and not org_member.email:
             org_member.email = extra_info["email"]
-        if extra_info.get("mobile") and not org_member.phone:
+        if contact_verified and extra_info.get("mobile") and not org_member.phone:
             org_member.phone = extra_info["mobile"]
         if extra_info.get("avatar_url") and not org_member.avatar_url:
             org_member.avatar_url = extra_info["avatar_url"]
@@ -413,27 +682,78 @@ class ChannelUserService:
                     return None
                 conditions.append(OrgMember.external_id == external_id)
 
-            # Use limit(1) + prioritize records that are already linked to a User.
-            # scalar_one_or_none() would raise MultipleResultsFound when duplicate
-            # OrgMember shells exist for the same external_user_id — which was the
-            # root cause of continuous new-user creation on every Feishu message.
             query = (
                 select(OrgMember)
                 .where(*conditions)
                 .order_by(
-                    # Prefer rows already linked to a platform User
-                    OrgMember.user_id.isnot(None).desc(),
-                    # Among equals, pick the oldest (most likely the "canonical" one)
                     OrgMember.synced_at.asc(),
+                    OrgMember.id.asc(),
                 )
-                .limit(1)
             )
             result = await db.execute(query)
-            return result.scalar_one_or_none()
+            rows = result.scalars().all()
+            if not rows:
+                return None
+            if normalized_channel not in {"feishu", "dingtalk", "wecom"}:
+                # Historical generic-channel OrgMembers were tenant/provider
+                # scoped, not installation scoped. They are an exact bridge
+                # only when that tenant has one installation for the channel;
+                # with multiple workspaces/bots the same external subject may
+                # refer to different people, so fail closed for repair instead
+                # of merging or creating a silent duplicate.
+                from app.models.channel_config import ChannelConfig
+
+                config_types = [normalized_channel]
+                if normalized_channel == "teams":
+                    config_types.append("microsoft_teams")
+                installation_count = (
+                    await db.execute(
+                        select(func.count(ChannelConfig.id))
+                        .select_from(ChannelConfig)
+                        .join(Agent, Agent.id == ChannelConfig.agent_id)
+                        .where(
+                            Agent.tenant_id == rows[0].tenant_id,
+                            ChannelConfig.channel_type.in_(config_types),
+                        )
+                    )
+                ).scalar_one()
+                if installation_count != 1:
+                    row_user_ids = {row.user_id for row in rows if row.user_id is not None}
+                    bound_user_ids = set(
+                        (
+                            await db.execute(
+                                select(ChannelUserBinding.user_id).where(
+                                    ChannelUserBinding.provider_id == provider_id,
+                                    ChannelUserBinding.user_id.in_(row_user_ids),
+                                    ChannelUserBinding.channel_type.in_(config_types),
+                                    ChannelUserBinding.id_type == "external_id",
+                                    ChannelUserBinding.subject == external_id,
+                                )
+                            )
+                        ).scalars().all()
+                    ) if row_user_ids else set()
+                    if row_user_ids and row_user_ids.issubset(bound_user_ids):
+                        # These are modern shells owned by other installation
+                        # scopes, not unresolved legacy data. Ignore them so
+                        # the current installation can create its own isolated
+                        # canonical user and binding for the same subject.
+                        return None
+                    raise ChannelUserResolutionError(
+                        "Legacy channel subject has no unique installation scope; migration_required"
+                    )
+            if len(rows) > 1:
+                user_ids = {row.user_id for row in rows}
+                if None in user_ids or len(user_ids) != 1:
+                    raise ChannelUserResolutionError(
+                        "Directory subject maps to multiple OrgMember records; migration_required"
+                    )
+            return rows[0]
+        except ChannelUserResolutionError:
+            raise
         except Exception as e:
-            # OrgMember table may not exist or org sync not enabled
-            logger.debug(f"[{channel_type}] OrgMember lookup failed: {e}")
-            return None
+            raise ChannelUserResolutionError(
+                f"Directory identity lookup failed closed for {channel_type}"
+            ) from e
 
     async def _create_org_member_shell(
         self,
@@ -455,7 +775,7 @@ class ChannelUserService:
 
         member = OrgMember(
             name=name,
-            email=extra_info.get("email"),
+            email=extra_info.get("email") if extra_info.get("identity_verified") is True else None,
             provider_id=provider.id,
             user_id=linked_user_id,
             tenant_id=provider.tenant_id,
@@ -463,7 +783,7 @@ class ChannelUserService:
             unionid=unionid,
             open_id=open_id,
             avatar_url=extra_info.get("avatar_url"),
-            phone=extra_info.get("mobile"),
+            phone=extra_info.get("mobile") if extra_info.get("identity_verified") is True else None,
             title=extra_info.get("title", ""),
             status="active",
         )
@@ -501,14 +821,7 @@ class ChannelUserService:
         extra_info: dict[str, Any],
         tenant_id: uuid.UUID | None,
     ) -> User:
-        """Create a new Identity + User for channel identity (lazy registration).
-
-        Creates a global Identity first, then a tenant-scoped User linked to it.
-        This ensures compatibility with the Phase 2 user model where username,
-        email, and password_hash live on the Identity table.
-        """
-        # Generate username and email
-        email = extra_info.get("email")
+        """Create a non-login tenant User for a channel-only identity."""
         identity_seed = (
             external_user_id
             or (extra_info.get("open_id") or "").strip()
@@ -516,44 +829,13 @@ class ChannelUserService:
         )
         name = extra_info.get("name") or f"{channel_type.capitalize()} {identity_seed[:8]}"
 
-        if email:
-            username = email.split("@")[0]
-        else:
-            username = f"{channel_type}_{identity_seed[:12]}"
-
-        # Ensure unique username within tenant
-        query = (
-            select(User)
-            .join(User.identity)
-            .where(Identity.username == username)
-        )
-        if tenant_id:
-            query = query.where(User.tenant_id == tenant_id)
-
-        existing = await db.execute(query)
-        if existing.scalar_one_or_none():
-            username = f"{username}_{identity_seed[:6]}"
-
-        email = email or f"{username}@{channel_type}.local"
-
-        # Step 1: Find or create global Identity using unified registration service
-        from app.services.registration_service import registration_service
-        identity = await registration_service.find_or_create_identity(
-            db,
-            email=email,
-            phone=extra_info.get("mobile"),
-            username=username,
-            password=uuid.uuid4().hex,
-        )
-
-
-        # Step 2: Create tenant-scoped User linked to Identity
         user = User(
-            identity_id=identity.id,
+            identity_id=None,
             display_name=name,
             avatar_url=extra_info.get("avatar_url"),
             role="member",
-            registration_source=channel_type,
+            source=self._normalize_channel_type(channel_type),
+            registration_source=f"{self._normalize_channel_type(channel_type)}_channel",
             tenant_id=tenant_id,
             is_active=True,
         )
@@ -598,70 +880,24 @@ async def get_platform_user_by_org_member(
             org_member.tenant_id = agent_tenant_id
 
     provider = await db.get(IdentityProvider, org_member.provider_id)
-    provider_type = channel_user_service._normalize_channel_type(
-        provider.provider_type if provider else "unknown"
-    )
-
-    if provider_type == "dingtalk":
-        from app.services.contact_provisioning import contact_provisioning
-
-        provisioning = await contact_provisioning.ensure_user_for_org_member(
-            db,
-            org_member,
-            provider=provider,
-        )
-        if provisioning.user:
-            user = await _load_user_with_identity(db, provisioning.user.id, agent_tenant_id)
-            if user:
-                return user
-
     if org_member.user_id:
         linked_user = await _load_user_with_identity(db, org_member.user_id, agent_tenant_id)
         if linked_user:
             return linked_user
 
-    if provider_type == "dingtalk":
-        raise ChannelUserResolutionError(
-            f"OrgMember {org_member.id} cannot be provisioned safely by DingTalk mobile"
-        )
+    from app.services.contact_provisioning import contact_provisioning
 
-    user = None
-    if org_member.email:
-        user = await sso_service.match_user_by_email(db, org_member.email, agent_tenant_id)
-    if not user and org_member.phone:
-        user = await sso_service.match_user_by_mobile(db, org_member.phone, agent_tenant_id)
-
-    if user:
-        org_member.user_id = user.id
-        await db.flush()
-        loaded_user = await _load_user_with_identity(db, user.id, agent_tenant_id)
-        if loaded_user:
-            return loaded_user
-
-    extra_info = {
-        "name": org_member.name,
-        "email": org_member.email,
-        "mobile": org_member.phone,
-        "avatar_url": org_member.avatar_url,
-        "title": org_member.title,
-        "external_id": org_member.external_id,
-        "open_id": org_member.open_id,
-        "unionid": org_member.unionid,
-    }
-    user = await channel_user_service._create_channel_user(
+    provisioning = await contact_provisioning.ensure_user_for_org_member(
         db,
-        provider_type,
-        org_member.external_id or org_member.open_id,
-        extra_info,
-        agent_tenant_id,
+        org_member,
+        provider=provider,
     )
-    org_member.user_id = user.id
-    await db.flush()
-    loaded_user = await _load_user_with_identity(db, user.id, agent_tenant_id)
-    if loaded_user:
-        return loaded_user
+    if provisioning.user:
+        user = await _load_user_with_identity(db, provisioning.user.id, agent_tenant_id)
+        if user:
+            return user
 
     raise ChannelUserResolutionError(
         f"OrgMember {org_member.id} cannot be provisioned without a tenant-scoped active user "
-        "or a mobile number"
+        "or a safe external-only user"
     )

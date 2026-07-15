@@ -1399,14 +1399,14 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
         queryFn: () => fetchAuth<any[]>(`/agents/${agentId}/relationships/agents`),
     });
 
-    const relatedMemberIds = useMemo(() => new Set(relationships.map((r: any) => r.member_id)), [relationships]);
-    const relatedAgentIds = useMemo(() => new Set(agentRelationships.map((r: any) => r.target_agent_id)), [agentRelationships]);
-    const selectedMemberIds = useMemo(() => new Set(selectedMembers.map((m: any) => m.id)), [selectedMembers]);
-    const selectedAgentIds = useMemo(() => new Set(selectedAgents.map((a: any) => a.id)), [selectedAgents]);
+    const relatedMemberIds = useMemo(() => new Set(relationships.map((r: any) => r.user_id)), [relationships]);
+    const relatedAgentIds = useMemo(() => new Set(agentRelationships.map((r: any) => r.agent_id)), [agentRelationships]);
+    const selectedMemberIds = useMemo(() => new Set(selectedMembers.map((m: any) => m.user_id)), [selectedMembers]);
+    const selectedAgentIds = useMemo(() => new Set(selectedAgents.map((a: any) => a.agent_id)), [selectedAgents]);
     const relatedMemberById = useMemo(() => {
         const map = new Map<string, any>();
         relationships.forEach((r: any) => {
-            if (r.member_id) map.set(r.member_id, r);
+            if (r.user_id) map.set(r.user_id, r);
         });
         return map;
     }, [relationships]);
@@ -1416,7 +1416,7 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
         [searchResults],
     );
     const visibleAgentResults = useMemo(
-        () => agentSearchResults.filter((a: any) => !relatedAgentIds.has(a.id)),
+        () => agentSearchResults.filter((a: any) => !relatedAgentIds.has(a.agent_id)),
         [agentSearchResults, relatedAgentIds],
     );
 
@@ -1486,16 +1486,16 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
 
     const toggleMemberSelection = (member: any) => {
         setSelectedMembers(prev =>
-            prev.some((item: any) => item.id === member.id)
-                ? prev.filter((item: any) => item.id !== member.id)
+            prev.some((item: any) => item.user_id === member.user_id)
+                ? prev.filter((item: any) => item.user_id !== member.user_id)
                 : [...prev, member]
         );
     };
 
     const toggleAgentSelection = (agent: any) => {
         setSelectedAgents(prev =>
-            prev.some((item: any) => item.id === agent.id)
-                ? prev.filter((item: any) => item.id !== agent.id)
+            prev.some((item: any) => item.agent_id === agent.agent_id)
+                ? prev.filter((item: any) => item.agent_id !== agent.agent_id)
                 : [...prev, agent]
         );
     };
@@ -1503,10 +1503,10 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
     const addRelationship = async () => {
         if (!selectedMembers.length) return;
         const existing = new Map(
-            relationships.map((r: any) => [r.member_id, { member_id: r.member_id, relation: r.relation, description: r.description }])
+            relationships.map((r: any) => [r.user_id, { user_id: r.user_id, relation: r.relation, description: r.description }])
         );
         selectedMembers.forEach((member: any) => {
-            existing.set(member.id, { member_id: member.id, relation, description });
+            existing.set(member.user_id, { user_id: member.user_id, relation, description });
         });
         await fetchAuth(`/agents/${agentId}/relationships/`, { method: 'PUT', body: JSON.stringify({ relationships: Array.from(existing.values()) }) });
         resetHumanDraft();
@@ -1534,7 +1534,7 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
 
     const saveEditRelationship = async (targetId: string) => {
         const updated = relationships.map((r: any) => ({
-            member_id: r.member_id,
+            user_id: r.user_id,
             relation: r.id === targetId ? editRelation : r.relation,
             description: r.id === targetId ? editDescription : r.description,
         }));
@@ -1546,10 +1546,10 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
     const addAgentRelationship = async () => {
         if (!selectedAgents.length) return;
         const existing = new Map(
-            agentRelationships.map((r: any) => [r.target_agent_id, { target_agent_id: r.target_agent_id, relation: r.relation, description: r.description }])
+            agentRelationships.map((r: any) => [r.agent_id, { agent_id: r.agent_id, relation: r.relation, description: r.description }])
         );
         selectedAgents.forEach((agent: any) => {
-            existing.set(agent.id, { target_agent_id: agent.id, relation: agentRelation, description: agentDescription });
+            existing.set(agent.agent_id, { agent_id: agent.agent_id, relation: agentRelation, description: agentDescription });
         });
         await fetchAuth(`/agents/${agentId}/relationships/agents`, { method: 'PUT', body: JSON.stringify({ relationships: Array.from(existing.values()) }) });
         resetAgentDraft();
@@ -1577,7 +1577,7 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
 
     const saveEditAgentRelationship = async (targetId: string) => {
         const updated = agentRelationships.map((r: any) => ({
-            target_agent_id: r.target_agent_id,
+            agent_id: r.agent_id,
             relation: r.id === targetId ? editAgentRelation : r.relation,
             description: r.id === targetId ? editAgentDescription : r.description,
         }));
@@ -1720,12 +1720,12 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                             {showMemberDropdown && visibleMemberResults.length > 0 && (
                                 <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', marginTop: '4px', maxHeight: '200px', overflowY: 'auto', zIndex: 10, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
                                     {visibleMemberResults.map((m: any) => {
-                                        const existingRelationship = relatedMemberById.get(m.id);
+                                        const existingRelationship = relatedMemberById.get(m.user_id);
                                         const alreadyAdded = Boolean(existingRelationship);
-                                        const checked = alreadyAdded || selectedMemberIds.has(m.id);
+                                        const checked = alreadyAdded || selectedMemberIds.has(m.user_id);
                                         return (
                                             <div
-                                                key={m.id}
+                                                key={m.user_id}
                                                 style={{
                                                     padding: '8px 12px',
                                                     cursor: alreadyAdded ? 'default' : 'pointer',
@@ -1776,7 +1776,7 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', marginBottom: '10px' }}>
                                 {selectedMembers.map((member: any) => (
                                     <div
-                                        key={member.id}
+                                        key={member.user_id}
                                         style={{
                                             display: 'inline-flex',
                                             alignItems: 'center',
@@ -1924,9 +1924,9 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                             {showAgentDropdown && visibleAgentResults.length > 0 && (
                                 <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', marginTop: '4px', maxHeight: '200px', overflowY: 'auto', zIndex: 10, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
                                     {visibleAgentResults.map((agent: any) => {
-                                        const checked = selectedAgentIds.has(agent.id);
+                                        const checked = selectedAgentIds.has(agent.agent_id);
                                         return (
-                                            <div key={agent.id} style={{ padding: '8px 12px', cursor: 'pointer', fontSize: '13px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'flex-start', gap: '8px' }}
+                                            <div key={agent.agent_id} style={{ padding: '8px 12px', cursor: 'pointer', fontSize: '13px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'flex-start', gap: '8px' }}
                                                 onClick={() => toggleAgentSelection(agent)}
                                                 onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-elevated)')}
                                                 onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
@@ -1950,7 +1950,7 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', marginBottom: '10px' }}>
                                 {selectedAgents.map((agent: any) => (
                                     <div
-                                        key={agent.id}
+                                        key={agent.agent_id}
                                         style={{
                                             display: 'inline-flex',
                                             alignItems: 'center',
@@ -2485,7 +2485,7 @@ export default function AgentDetailPage() {
                 // happens to drop unknown keys, so we need to pre-pack them.
                 ...(m.sender_name && { sender_name: m.sender_name }),
                 ...(m.sender_user_id && { sender_user_id: m.sender_user_id }),
-                ...(m.participant_id && { participant_id: m.participant_id }),
+                ...(m.sender_agent_id && { sender_agent_id: m.sender_agent_id }),
             }));
             setHistoryHasMore(msgs.length > 0);
             // Backend returns the page oldest-first, so msgs[0] is the oldest
@@ -2594,7 +2594,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error('保存失败', { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -3421,11 +3421,14 @@ export default function AgentDetailPage() {
                 setChatMessages(prev => {
                     const last = prev[prev.length - 1];
                     if (last && last.role === 'user' && last.content === d.content
-                        && ((last as any).sender_name || '') === (d.sender_name || '')) return prev;
+                        && ((last as any).sender_name || '') === (d.sender_name || '')
+                        && ((last as any).sender_user_id || '') === (d.sender_user_id || d.user_id || '')) return prev;
                     return [...prev, parseChatMsg({
                         role: 'user',
                         content: d.content,
                         ...(d.sender_name ? { sender_name: d.sender_name } : {}),
+                        ...((d.sender_user_id || d.user_id) ? { sender_user_id: d.sender_user_id || d.user_id } : {}),
+                        ...(d.sender_agent_id ? { sender_agent_id: d.sender_agent_id } : {}),
                         timestamp: new Date().toISOString(),
                     })];
                 });
@@ -3738,6 +3741,9 @@ export default function AgentDetailPage() {
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
+                ...(m.sender_name && { sender_name: m.sender_name }),
+                ...(m.sender_user_id && { sender_user_id: m.sender_user_id }),
+                ...(m.sender_agent_id && { sender_agent_id: m.sender_agent_id }),
             }));
             // Save current scroll position
             const el = writable ? chatContainerRef.current : historyContainerRef.current;
@@ -4693,7 +4699,7 @@ export default function AgentDetailPage() {
     // ─── Task creation & detail ───────────────────────────────────
     const [showTaskForm, setShowTaskForm] = useState(false);
     const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-    const [taskForm, setTaskForm] = useState({ title: '', description: '', priority: 'medium', type: 'todo' as 'todo' | 'supervision', supervision_target_name: '', remind_schedule: '', due_date: '' });
+    const [taskForm, setTaskForm] = useState({ title: '', description: '', priority: 'medium', type: 'todo' as 'todo' | 'supervision', supervision_target_user_id: '', supervision_target_agent_id: '', supervision_channel: '', remind_schedule: '', due_date: '' });
     const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
     const { data: taskLogs = [] } = useQuery({
         queryKey: ['task-logs', id, selectedTaskId],
@@ -4718,7 +4724,7 @@ export default function AgentDetailPage() {
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['tasks', id] });
             setShowTaskForm(false);
-            setTaskForm({ title: '', description: '', priority: 'medium', type: 'todo', supervision_target_name: '', remind_schedule: '', due_date: '' });
+            setTaskForm({ title: '', description: '', priority: 'medium', type: 'todo', supervision_target_user_id: '', supervision_target_agent_id: '', supervision_channel: '', remind_schedule: '', due_date: '' });
         },
     });
 
@@ -5702,7 +5708,7 @@ export default function AgentDetailPage() {
                         }
                         if (trig.type === 'poll') return `${isZh ? '轮询' : 'Poll'}: ${trig.config?.url?.substring(0, 40) || 'URL'}`;
                         if (trig.type === 'on_message') {
-                            const sender = trig.config?.from_agent_name || trig.config?.from_user_name || (isZh ? '未知对象' : 'unknown');
+                            const sender = trig.config?.from_agent_id || trig.config?.from_user_id || (isZh ? '未知对象' : 'unknown');
                             return isZh ? `收到 ${sender} 的消息时` : `On message from ${sender}`;
                         }
                         if (trig.type === 'webhook') {
@@ -6623,16 +6629,11 @@ export default function AgentDetailPage() {
                                                 </div>
                                             )}
                                             {(() => {
-                                                // For A2A sessions, determine which participant is "this agent" (left side)
-                                                // Use agent.name matching against sender_name from messages
+                                                // A2A perspective is based only on the canonical sender Agent ID.
                                                 const isA2A = activeSession.source_channel === 'agent' || activeSession.participant_type === 'agent';
                                                 const isGroupChat = !isA2A && !!activeSession.is_group;
                                                 const isHumanReadonly = !isA2A && !activeSession.is_group;
-                                                const thisAgentName = (agent as any)?.name;
-                                                // Find this agent's participant_id from loaded messages
-                                                const thisAgentPid = isA2A && thisAgentName
-                                                    ? historyMsgs.find((m: any) => m.sender_name === thisAgentName)?.participant_id
-                                                    : null;
+                                                const thisAgentId = (agent as any)?.id != null ? String((agent as any).id) : null;
                                                 const viewerId = currentUser?.id != null ? String(currentUser.id) : null;
                                                 // Route history through the same grouped renderer as the live
                                                 // chat so A2A / group / read-only views also collapse thinking
@@ -6644,8 +6645,8 @@ export default function AgentDetailPage() {
                                                     // by the logged-in viewer themself, otherwise LEFT (so each distinct
                                                     // human speaker gets their own avatar/name label).
                                                     let isLeft: boolean;
-                                                    if (isA2A && thisAgentPid) {
-                                                        isLeft = m.participant_id !== thisAgentPid;
+                                                    if (isA2A && thisAgentId && m.sender_agent_id) {
+                                                        isLeft = String(m.sender_agent_id) !== thisAgentId;
                                                     } else if (isGroupChat) {
                                                         if (m.role === 'assistant') {
                                                             isLeft = true;

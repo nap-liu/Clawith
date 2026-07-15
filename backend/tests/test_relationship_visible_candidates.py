@@ -112,6 +112,9 @@ class _SourceOnlyDb:
     async def execute(self, _stmt):
         return _ScalarResult(self.source)
 
+    async def scalar(self, _stmt):
+        return None
+
 
 def _ready_agent(tenant_id, *, creator_id=None, access_mode="company"):
     return SimpleNamespace(
@@ -199,7 +202,7 @@ async def session():
     _register_all_models()
     from app.database import Base
     from app.models.agent import Agent, AgentPermission
-    from app.models.org import AgentAgentRelationship
+    from app.models.org import AgentAgentRelationship, RelationshipSuppression
     from app.models.user import User
 
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -208,6 +211,7 @@ async def session():
         Agent.__table__,
         AgentPermission.__table__,
         AgentAgentRelationship.__table__,
+        RelationshipSuppression.__table__,
     ]
     async with eng.begin() as conn:
         await conn.run_sync(lambda c: Base.metadata.create_all(c, tables=tables))
@@ -253,13 +257,13 @@ async def test_candidate_list_includes_visible_company_agent_user_cannot_manage(
     await session.flush()
 
     result = await search_visible_agents(agent_id=source.id, search=None, current_user=user, db=session)
-    ids = {r["id"] for r in result}
+    ids = {r["agent_id"] for r in result}
 
     assert str(public.id) in ids  # visible company agent IS a candidate now
     assert str(others_private.id) not in ids  # not visible → not a candidate
     assert str(source.id) not in ids  # cannot relate an agent to itself
 
-    pub = next(r for r in result if r["id"] == str(public.id))
+    pub = next(r for r in result if r["agent_id"] == str(public.id))
     assert pub["can_manage"] is False  # regular user may relate without managing it
 
 
@@ -279,7 +283,7 @@ async def test_save_rejects_target_not_visible_to_user(session):
     await session.flush()
 
     data = AgentRelationshipBatchIn(
-        relationships=[AgentRelationshipIn(target_agent_id=str(secret.id), relation="collaborator")]
+        relationships=[AgentRelationshipIn(agent_id=str(secret.id), relation="collaborator")]
     )
     with pytest.raises(HTTPException) as exc:
         await save_agent_relationships(agent_id=source.id, data=data, current_user=user, db=session)
@@ -308,7 +312,7 @@ async def test_save_accepts_visible_but_unmanaged_target(session, monkeypatch):
     monkeypatch.setattr(rel_api, "_regenerate_relationships_file", _noop)
 
     data = AgentRelationshipBatchIn(
-        relationships=[AgentRelationshipIn(target_agent_id=str(public.id), relation="collaborator")]
+        relationships=[AgentRelationshipIn(agent_id=str(public.id), relation="collaborator")]
     )
     out = await save_agent_relationships(agent_id=source.id, data=data, current_user=user, db=session)
     assert out["status"] == "ok"
@@ -321,6 +325,71 @@ async def test_save_accepts_visible_but_unmanaged_target(session, monkeypatch):
         )
     ).scalars().all()
     assert [str(r.target_agent_id) for r in rows] == [str(public.id)]
+
+
+@pytest.mark.asyncio
+async def test_platform_admin_must_switch_to_source_agent_tenant(session, monkeypatch):
+    source_tenant = uuid.uuid4()
+    other_tenant = uuid.uuid4()
+    source_creator = _new_user(source_tenant)
+    cross_tenant_admin = _new_user(other_tenant, role="platform_admin")
+    session.add_all([source_creator, cross_tenant_admin])
+    await session.flush()
+
+    source = _new_agent(source_tenant, source_creator.id, name="source", access_mode="private")
+    target = _new_agent(source_tenant, source_creator.id, name="target", access_mode="company")
+    session.add_all([source, target])
+    await session.flush()
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(rel_api, "_regenerate_relationships_file", _noop)
+    data = AgentRelationshipBatchIn(
+        relationships=[AgentRelationshipIn(agent_id=target.id)]
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await save_agent_relationships(
+            agent_id=source.id,
+            data=data,
+            current_user=cross_tenant_admin,
+            db=session,
+        )
+
+    assert exc.value.status_code == 403
+    assert "switch" in exc.value.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_platform_admin_can_manage_relationship_after_switching_tenant(session, monkeypatch):
+    tenant = uuid.uuid4()
+    source_creator = _new_user(tenant)
+    switched_admin = _new_user(tenant, role="platform_admin")
+    session.add_all([source_creator, switched_admin])
+    await session.flush()
+
+    source = _new_agent(tenant, source_creator.id, name="source", access_mode="private")
+    target = _new_agent(tenant, source_creator.id, name="target", access_mode="company")
+    session.add_all([source, target])
+    await session.flush()
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(rel_api, "_regenerate_relationships_file", _noop)
+    data = AgentRelationshipBatchIn(
+        relationships=[AgentRelationshipIn(agent_id=target.id)]
+    )
+
+    result = await save_agent_relationships(
+        agent_id=source.id,
+        data=data,
+        current_user=switched_admin,
+        db=session,
+    )
+
+    assert result == {"status": "ok"}
 
 
 @pytest.mark.asyncio
@@ -362,7 +431,7 @@ async def test_save_preserves_existing_relationship_to_now_invisible_target(sess
 
     # Member replays the full list (including the inherited, invisible-target row).
     data = AgentRelationshipBatchIn(
-        relationships=[AgentRelationshipIn(target_agent_id=str(invisible.id), relation="collaborator")]
+        relationships=[AgentRelationshipIn(agent_id=str(invisible.id), relation="collaborator")]
     )
     out = await save_agent_relationships(agent_id=source.id, data=data, current_user=user, db=session)
     assert out["status"] == "ok"

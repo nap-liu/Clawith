@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, func, text
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, JSON, String, Text, event, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -50,7 +50,16 @@ class ChatMessage(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=False, index=True)
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    # Legacy conversation-owner compatibility.  New actor attribution uses the
+    # explicit sender columns below; trigger/A2A rows no longer require a fake
+    # creator user.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    sender_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
+    sender_agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True, index=True
+    )
     role: Mapped[str] = mapped_column(
         Enum("user", "assistant", "system", "tool_call", name="chat_role_enum"),
         nullable=False,
@@ -70,7 +79,8 @@ class ChatMessage(Base):
         default=dict,
         server_default=text("'{}'"),
     )
-    # Participant identity (unified User/Agent identity)
+    # Legacy internal compatibility only.  Never expose this as the identity of
+    # a human or digital employee.
     participant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("participants.id"), nullable=True)
     # Model thinking process
     thinking: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -92,7 +102,28 @@ class ChatMessage(Base):
             unique=True,
             postgresql_where=text("external_event_key IS NOT NULL"),
         ),
+        CheckConstraint(
+            "NOT (sender_user_id IS NOT NULL AND sender_agent_id IS NOT NULL)",
+            name="ck_chat_messages_single_canonical_sender",
+        ),
     )
+
+
+@event.listens_for(ChatMessage, "before_insert")
+def _populate_canonical_chat_sender(_mapper, _connection, target: ChatMessage) -> None:
+    """Populate canonical actor fields for ordinary writes.
+
+    A2A writers set ``sender_agent_id`` explicitly even though the logical LLM
+    role is ``user`` at the receiving side.  For all other rows, a user-role
+    message belongs to the real human ``user_id`` while assistant/tool rows are
+    authored by the owning Agent.  System rows intentionally remain actorless.
+    """
+    if target.sender_user_id is not None or target.sender_agent_id is not None:
+        return
+    if target.role == "user" and target.user_id is not None:
+        target.sender_user_id = target.user_id
+    elif target.role in {"assistant", "tool_call"}:
+        target.sender_agent_id = target.agent_id
 
 
 class EnterpriseInfo(Base):

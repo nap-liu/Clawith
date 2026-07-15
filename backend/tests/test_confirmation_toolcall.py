@@ -559,3 +559,23 @@ async def test_suspend_persists_intro_before_toolcall_and_broadcasts_web():
     assert payload["call_id"] == str(row_id)
     assert payload["status"] == "running"
     assert payload["args"]["buttons"][0]["value"] == "confirm"
+
+
+async def test_confirmation_rejects_a_different_resolving_user():
+    """A shareable/forwarded card cannot be resolved by another agent user."""
+    from app.services import confirmation_service as cs
+
+    agent_id, intended_user_id = await _make_agent()
+    _conv, row_id = await _make_pending(agent_id, intended_user_id)
+
+    with pytest.raises(cs.ConfirmationActorMismatch):
+        await cs.resolve_confirmation(
+            agent_id=agent_id,
+            call_id=row_id,
+            button_value="confirm",
+            button_label="确认",
+            resolving_user_id=uuid.uuid4(),
+        )
+
+    payload = await _row_payload(row_id)
+    assert payload["status"] == "pending"

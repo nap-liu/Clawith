@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.services.session_identity import require_same_tenant_session_user
 
 
 async def get_primary_platform_session(
@@ -48,6 +49,7 @@ async def ensure_primary_platform_session(
     - Only create a brand new primary session when the pair has never talked on-platform.
     """
 
+    await require_same_tenant_session_user(db, agent_id, user_id)
     primary = await get_primary_platform_session(db, agent_id, user_id, source_channel=source_channel)
     if primary:
         return primary

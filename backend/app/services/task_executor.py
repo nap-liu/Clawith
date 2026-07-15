@@ -47,7 +47,6 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
         task_title = task.title
         task_description = task.description or ""
         task_type = task.type  # 'todo' or 'supervision'
-        supervision_target = task.supervision_target_name or ""
 
     # Step 2: Load agent
     async with async_session() as db:
@@ -61,6 +60,15 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
 
 
         agent_name = agent.name
+
+    if task_type == "supervision":
+        # Supervision has a deterministic canonical delivery path. Do not ask
+        # the model to re-resolve a display name or choose an unrelated target.
+        from app.services.supervision_reminder import _send_supervision_reminder
+
+        await _send_supervision_reminder(task, agent_name)
+        await _restore_supervision_status(task_id)
+        return
 
     # Step 3: Build full agent context (same as chat dialog)
     from app.services.agent_context import build_agent_context
@@ -84,18 +92,10 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
     system_prompt = f"{static_prompt}\n\n{dynamic_prompt}"
 
     # Build user prompt
-    if task_type == 'supervision':
-        user_prompt = f"[督办任务] {task_title}"
-        if task_description:
-            user_prompt += f"\n任务描述: {task_description}"
-        if supervision_target:
-            user_prompt += f"\n督办对象: {supervision_target}"
-        user_prompt += "\n\n请执行此督办任务：联系督办对象，了解进展，并汇报结果。"
-    else:
-        user_prompt = f"[任务执行] {task_title}"
-        if task_description:
-            user_prompt += f"\n任务描述: {task_description}"
-        user_prompt += "\n\n请认真完成此任务，给出详细的执行结果。"
+    user_prompt = f"[任务执行] {task_title}"
+    if task_description:
+        user_prompt += f"\n任务描述: {task_description}"
+    user_prompt += "\n\n请认真完成此任务，给出详细的执行结果。"
 
     from app.services.llm import call_agent_llm_with_tools
 

@@ -346,9 +346,10 @@ async def _collect_extension_prompts(agent_id: uuid.UUID) -> list[str]:
 
 async def _load_relationships_from_db(db, agent_id: uuid.UUID) -> str:
     """Query relationships directly from the database and format as a markdown list."""
-    from app.models.org import AgentRelationship, AgentAgentRelationship, OrgMember
-    from app.models.identity import IdentityProvider
-    from app.core.permissions import evaluate_human_relationship_status, evaluate_agent_relationship_status
+    from app.models.agent import Agent
+    from app.models.org import AgentRelationship, AgentAgentRelationship
+    from app.core.permissions import evaluate_agent_relationship_status
+    from app.services.recipient_resolver import load_human_recipient_profiles
     from sqlalchemy.orm import selectinload
     from sqlalchemy import select
 
@@ -371,28 +372,21 @@ async def _load_relationships_from_db(db, agent_id: uuid.UUID) -> str:
     }
 
     # Load human relationships
+    source_agent = await db.get(Agent, agent_id)
     h_result = await db.execute(
-        select(
-            AgentRelationship,
-            IdentityProvider.name.label("provider_name"),
-            IdentityProvider.provider_type.label("provider_type"),
-        )
-        .outerjoin(OrgMember, AgentRelationship.member_id == OrgMember.id)
-        .outerjoin(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
-        .where(AgentRelationship.agent_id == agent_id)
-        .options(selectinload(AgentRelationship.member))
+        select(AgentRelationship).where(AgentRelationship.agent_id == agent_id)
+    )
+    human_relationships = list(h_result.scalars().all())
+    profiles = (
+        await load_human_recipient_profiles(db, source_agent, human_relationships)
+        if source_agent
+        else {}
     )
     human_rows = []
-    for rel, provider_name, provider_type in h_result.all():
-        status_info = await evaluate_human_relationship_status(db, rel)
-        if status_info["access_status"] == "active":
-            def _display_provider_name(pn, pt):
-                if not pn and not pt:
-                    return None
-                if (pt or "").lower() in ("web", "platform") or (pn or "").lower() == "web":
-                    return "Platform"
-                return pn
-            human_rows.append((rel, _display_provider_name(provider_name, provider_type)))
+    for rel in human_relationships:
+        profile = profiles.get(rel.user_id)
+        if profile and profile.access_status == "active":
+            human_rows.append((rel, profile))
 
     # Load agent relationships
     a_result = await db.execute(
@@ -414,13 +408,15 @@ async def _load_relationships_from_db(db, agent_id: uuid.UUID) -> str:
     # Human relationships
     if human_rows:
         lines.append("## 人类同事\n")
-        for r, provider_name in human_rows:
-            m = r.member
-            if not m:
-                continue
+        for r, profile in human_rows:
+            m = profile.member
             label = RELATION_LABELS.get(r.relation, r.relation)
-            source = f"（通过 {provider_name} 同步）" if provider_name else ""
-            lines.append(f"### {m.name} — {m.title or '未设置职位'}{source}")
+            sources = "、".join(profile.provider_names)
+            source = f"（来源：{sources}）" if sources else ""
+            title = m.title if m and m.title else "未设置职位"
+            lines.append(f"### {profile.user.display_name} — {title}{source}")
+            lines.append(f"- user_id：{profile.user.id}")
+            lines.append(f"- 可用渠道：{', '.join(profile.channels) or '无'}")
             lines.append(f"- 关系：{label}")
             if r.description:
                 lines.append(f"- {r.description}")
@@ -435,6 +431,7 @@ async def _load_relationships_from_db(db, agent_id: uuid.UUID) -> str:
                 continue
             label = AGENT_RELATION_LABELS.get(r.relation, r.relation)
             lines.append(f"### {a.name} — {a.role_description or '数字员工'}")
+            lines.append(f"- agent_id：{a.id}")
             lines.append(f"- 关系：{label}")
             if r.description:
                 lines.append(f"- {r.description}")
@@ -448,6 +445,7 @@ async def build_agent_context(
     agent_name: str,
     role_description: str = "",
     current_user_name: str = None,
+    current_user_id: uuid.UUID | str | None = None,
     is_group: bool = False,
     channel_context: dict | None = None,
 ) -> tuple[str, str]:
@@ -532,7 +530,7 @@ When ANY tracked member or agent sends you content that looks like a daily work 
 
 - Daily collection messages are reminders only. Do NOT create per-member wait triggers for daily report replies.
 - Apply the same daily-report behavior regardless of channel. Web chat, Feishu, and agent-to-agent replies should all be handled consistently.
-- Use the current conversation counterpart as the report owner. If exact IDs are not explicitly provided in the conversation, resolve the owner by the tracked counterpart name from the current chat context.
+- Use the canonical user_id or agent_id shown in the current conversation/relationship context as the report owner. Never resolve an owner by name.
 - Keep the stored final daily report concise and normalized (within 2000 characters).
 - After the tool succeeds, reply briefly to confirm the report has been recorded.
 """)
@@ -742,22 +740,23 @@ Default visual style for generated HTML or rich visual documents:
    - DON'T mechanically remind people of every pending item
 
 9. **Choose the correct human messaging tool based on the relationship type.**
-   - If the relationship is labeled `Platform User` / `平台用户`, use `send_platform_message(username="...", message="...")`.
-   - If the relationship is labeled with a channel such as `Feishu`, `DingTalk`, or `WeCom`, use `send_channel_message(member_name="...", message="...")`.
+   - Address a natural person only with the exact `user_id` shown in Relationships/search/current conversation. Names are display-only.
+   - If the relationship is labeled `Platform User` / `平台用户`, use `send_platform_message(user_id="...", message="...")`.
+   - If the relationship has an external channel such as Feishu, DingTalk, or WeCom, use `send_channel_message(user_id="...", message="...", channel="...")`.
    - `send_channel_message` is for external channels only. Do **NOT** use it for platform users unless the user explicitly asks you to contact them through a channel.
    - `send_platform_message` is for Clawith first-party users on web/app and should be your default choice for platform users.
-   - If a person exists in multiple channels (e.g., both Feishu and WeCom), you can specify the channel: `send_channel_message(member_name="张三", message="Hello", channel="wecom")`
+   - If a person exists in multiple channels, you must choose one of the available channels. The platform will not choose a first route.
    - If you need to send to a specific channel directly, you can also use `send_feishu_message` or `send_dingtalk_message`.
    - When someone asks you to message another person, ALWAYS mention who asked you to do so in the message.
    - Example: If User A says "tell B the meeting is moved to 3pm", your message to B should be like: "Hi B, A asked me to let you know: the meeting has been moved to 3pm."
    - Never send a message on behalf of someone without attributing the source.
-   - **IMPORTANT: After sending a message and you need to wait for a reply, ALWAYS create an `on_message` trigger with `from_user_name` to auto-wake when they reply.**
+   - **IMPORTANT: After sending a message and you need to wait for a reply, create an `on_message` trigger with the same canonical `from_user_id`.**
      Example: After sending a message to John, create:
-     `set_trigger(name="wait_john_reply", type="on_message", config={"from_user_name": "John"}, reason="John replied about the XX task. Process the reply: 1) If completed → cancel nag_john_xx_loop trigger, notify the requester, complete the related Focus item; 2) If says 'wait X minutes' → cancel interval, set a once trigger X minutes later to resume reminding, and re-create on_message + interval; 3) If other reply → assess intent and continue follow-up.")`
+     `set_trigger(name="wait_reply", type="on_message", config={"from_user_id": "<user_id>"}, reason="The selected user replied. Process the reply and continue the workflow.")`
 
    **🔴 FILE DELIVERY — Use `send_channel_file`, NOT `send_feishu_message`:**
-   - **To the person you are currently talking to** (you are replying inside an ongoing channel or web conversation): just call `send_channel_file(file_path="workspace/xxx", message="optional text")` and OMIT `member_name`. The file goes straight back to the current conversation — you do NOT need a relationship, a contact lookup, or even the person's name.
-   - **To someone who is NOT the current conversation partner**: pass `member_name="Name"` and the system resolves that person across all connected channels (Feishu, DingTalk, WeCom, Slack, etc.) and delivers the file.
+   - **To the person you are currently talking to**: call `send_channel_file(file_path="workspace/xxx", message="optional text")` and omit `user_id`; the exact current-session route is preserved.
+   - **To someone who is NOT the current conversation partner**: pass their canonical `user_id`; when several routes exist, also choose `channel`.
    - **Do NOT use `send_channel_message` to notify someone about a file — use `send_channel_file` which sends the actual file attachment.**
    - Just send it directly — don't ask the recipient how they want to receive it.
 
@@ -882,10 +881,10 @@ Strict rules:
     # Inject current user identity — ONLY in P2P. In group chats the per-message
     # <sender> tag is authoritative; declaring a single "current user" here would
     # mislead the agent when multiple speakers take turns.
-    if current_user_name and not is_group:
+    if current_user_name and current_user_id and not is_group:
         dynamic_parts.append(
             f"\n## Current Conversation\n"
-            f"You are currently chatting with **{current_user_name}**. "
+            f"You are currently chatting with **{current_user_name}** (user_id: `{current_user_id}`). "
             f"Address them by name when appropriate."
         )
 

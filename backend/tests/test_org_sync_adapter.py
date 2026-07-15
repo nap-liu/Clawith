@@ -722,7 +722,7 @@ async def test_org_sync_links_existing_user_by_mobile_before_email():
 
 
 @pytest.mark.asyncio
-async def test_org_sync_reports_missing_mobile_without_creating_user():
+async def test_org_sync_missing_mobile_creates_external_only_canonical_user():
     tenant = await _seed_tenant()
     provider = await _seed_dingtalk_provider(tenant.id)
     adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
@@ -748,9 +748,11 @@ async def test_org_sync_reports_missing_mobile_without_creating_user():
                 )
             )
         ).scalar_one()
-        assert stats["user_created"] is False
-        assert stats["user_skipped_no_phone"] is True
-        assert member.user_id is None
+        assert stats["user_created"] is True
+        assert stats["user_skipped_no_phone"] is False
+        assert member.user_id is not None
+        canonical_user = await db.get(User, member.user_id)
+        assert canonical_user.identity_id is None
 
 
 @pytest.mark.asyncio
@@ -788,7 +790,7 @@ async def test_org_sync_non_dingtalk_still_links_existing_user_by_email():
 
 
 @pytest.mark.asyncio
-async def test_org_sync_dingtalk_existing_member_missing_mobile_clears_old_phone_and_skips_user():
+async def test_org_sync_dingtalk_missing_mobile_clears_phone_and_keeps_canonical_user():
     tenant = await _seed_tenant()
     provider = await _seed_dingtalk_provider(tenant.id)
     adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
@@ -824,10 +826,12 @@ async def test_org_sync_dingtalk_existing_member_missing_mobile_clears_old_phone
         await db.commit()
 
         member = await db.get(OrgMember, member_id)
-        assert stats["user_created"] is False
-        assert stats["user_skipped_no_phone"] is True
+        assert stats["user_created"] is True
+        assert stats["user_skipped_no_phone"] is False
         assert member.phone is None
-        assert member.user_id is None
+        assert member.user_id is not None
+        canonical_user = await db.get(User, member.user_id)
+        assert canonical_user.identity_id is None
 
 
 @pytest.mark.asyncio
