@@ -20,6 +20,7 @@ from app.core.logging_config import new_trace_id
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
+from app.models.trigger_execution import TriggerExecution
 from app.services.trigger_runtime.evaluator import (
     handle_okr_collection_trigger as handle_okr_collection_trigger_runtime,
     handle_okr_report_trigger as handle_okr_report_trigger_runtime,
@@ -32,9 +33,6 @@ from app.services.trigger_runtime.evaluator import (
 from app.services.trigger_runtime import (
     claim_ready_trigger_invocations,
     enqueue_due_trigger,
-    mark_trigger_executions_completed,
-    mark_trigger_executions_failed,
-    requeue_trigger_executions,
 )
 from app.services.trigger_runtime.executions import renew_trigger_execution_leases
 
@@ -590,6 +588,64 @@ def _advance_webhook_trigger(db, trig: AgentTrigger, reply) -> None:
     trig.config = new_cfg
 
 
+async def _finalize_invocation_executions(
+    execution_ids: list[uuid.UUID],
+    triggers: list[AgentTrigger],
+    reply: str | None,
+    invocation_error: str | None,
+    invocation_retryable: bool,
+) -> None:
+    """Finalize durable executions and webhook queue state atomically.
+
+    Webhook append, claim, and advance all read-modify-write the same JSONB
+    config.  Advance therefore holds the trigger row lock, and its execution
+    terminal state is committed in the same transaction.  A rollback leaves
+    both the active batch and its processing execution recoverable together.
+    """
+    if not execution_ids:
+        return
+
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        executions = (
+            await db.execute(
+                select(TriggerExecution)
+                .where(TriggerExecution.id.in_(execution_ids))
+                .with_for_update()
+            )
+        ).scalars().all()
+        for execution in executions:
+            if invocation_error is None:
+                execution.status = "completed"
+                execution.finished_at = now
+                execution.last_error = None
+            elif invocation_retryable:
+                execution.status = "pending"
+                execution.finished_at = None
+                execution.last_error = invocation_error
+            else:
+                execution.status = "failed"
+                execution.finished_at = now
+                execution.last_error = invocation_error
+            execution.lease_owner = None
+            execution.lease_expires_at = None
+
+        for runtime_trigger in triggers:
+            if runtime_trigger.type != "webhook":
+                continue
+            stored_trigger = (
+                await db.execute(
+                    select(AgentTrigger)
+                    .where(AgentTrigger.id == runtime_trigger.id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if stored_trigger is not None:
+                _advance_webhook_trigger(db, stored_trigger, reply)
+
+        await db.commit()
+
+
 _ONMESSAGE_TURN_NAMESPACE = uuid.UUID("1cb1fc5c-c7c4-4f02-aa83-fab956557622")
 
 
@@ -908,6 +964,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 pass
     invocation_error: str | None = None
     invocation_retryable = False
+    reply: str | None = None
     lease_heartbeat_task: asyncio.Task | None = None
 
     if execution_ids:
@@ -1135,43 +1192,19 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             except Exception as e:
                 logger.warning(f"Failed to persist tool call for trigger session: {e}")
 
-        # reply is initialized so the finally (and post-LLM code) can reference
-        # it even if call_llm raises. The finally ALWAYS advances any queue/merge
-        # webhook trigger + releases the serial lock — success, empty reply, or
-        # exception (D6: failure still counts as done). This is what keeps the
-        # 10-min deadlock fallback in _evaluate_trigger safe.
-        reply = None
-        try:
-            reply = await call_llm(
-                model=model,
-                messages=messages,
-                agent_name=agent.name,
-                role_description=agent.role_description or "",
-                agent_id=agent_id,
-                user_id=agent.creator_id,
-                session_id=str(session_id),
-                on_chunk=on_chunk,
-                on_tool_call=on_tool_call,
-                on_thinking=on_thinking,
-                # A2A wake uses the agent's own max_tool_rounds setting (no override)
-            )
-        finally:
-            if any(t.type == "webhook" for t in triggers):
-                try:
-                    async with async_session() as _db:
-                        for _t in triggers:
-                            if _t.type != "webhook":
-                                continue
-                            _res = await _db.execute(
-                                select(AgentTrigger).where(AgentTrigger.id == _t.id)
-                            )
-                            _trig = _res.scalar_one_or_none()
-                            if not _trig:
-                                continue
-                            _advance_webhook_trigger(_db, _trig, reply)
-                        await _db.commit()
-                except Exception as _e:
-                    logger.warning(f"Failed to advance webhook queue after session: {_e}")
+        reply = await call_llm(
+            model=model,
+            messages=messages,
+            agent_name=agent.name,
+            role_description=agent.role_description or "",
+            agent_id=agent_id,
+            user_id=agent.creator_id,
+            session_id=str(session_id),
+            on_chunk=on_chunk,
+            on_tool_call=on_tool_call,
+            on_thinking=on_thinking,
+            # A2A wake uses the agent's own max_tool_rounds setting (no override)
+        )
 
         # Cap the turn's accumulated thinking once; reused by all assistant rows
         # persisted below (Reflection / A2A mirror / delivery). UI-only field.
@@ -1393,12 +1426,13 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
         # would not help.
         if execution_ids:
             try:
-                if invocation_error is None:
-                    await mark_trigger_executions_completed(execution_ids)
-                elif invocation_retryable:
-                    await requeue_trigger_executions(execution_ids, invocation_error)
-                else:
-                    await mark_trigger_executions_failed(execution_ids, invocation_error)
+                await _finalize_invocation_executions(
+                    execution_ids,
+                    triggers,
+                    reply,
+                    invocation_error,
+                    invocation_retryable,
+                )
             except Exception as _mark_err:
                 logger.warning(
                     f"Failed to finalize trigger executions {execution_ids} for agent {agent_id}: {_mark_err}"

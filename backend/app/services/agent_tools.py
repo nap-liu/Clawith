@@ -10227,7 +10227,7 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
                 select(AgentTrigger).where(
                     AgentTrigger.agent_id == agent_id,
                     AgentTrigger.name == name,
-                )
+                ).with_for_update()
             )
             trigger = result.scalar_one_or_none()
             if not trigger:

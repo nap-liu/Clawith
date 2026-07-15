@@ -70,7 +70,7 @@ async def receive_webhook(token: str, request: Request):
         result = await db.execute(
             select(AgentTrigger).where(
                 AgentTrigger.type == "webhook",
-                AgentTrigger.is_enabled == True,
+                AgentTrigger.is_enabled.is_(True),
             )
         )
         triggers = result.scalars().all()
@@ -85,6 +85,20 @@ async def receive_webhook(token: str, request: Request):
 
         if not target:
             # Return 200 OK to avoid leaking whether the token exists
+            return JSONResponse({"ok": True})
+
+        # Join webhook append to the same row-lock domain used by daemon claim
+        # and completion advance.  All three mutate one JSONB config column;
+        # without a fresh locked row, an ingress request can overwrite the
+        # active lock or resurrect a batch that the daemon just consumed.
+        locked_result = await db.execute(
+            select(AgentTrigger)
+            .where(AgentTrigger.id == target.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        target = locked_result.scalar_one_or_none()
+        if not target or not target.is_enabled or (target.config or {}).get("token") != token:
             return JSONResponse({"ok": True})
 
         # Per-agent rate limit check
@@ -158,12 +172,7 @@ async def receive_webhook(token: str, request: Request):
                 return JSONResponse({"ok": False, "error": "queue full"}, status_code=503)
             queue.append(payload_str[:8000])
             new_config = {**cfg, "_webhook_queue": queue}
-        from sqlalchemy import update
-        await db.execute(
-            update(AgentTrigger)
-            .where(AgentTrigger.id == target.id)
-            .values(config=new_config)
-        )
+        target.config = new_config
         await db.commit()
 
         logger.info(f"Webhook queued for trigger {target.name} (agent {target.agent_id})")

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+
+from sqlalchemy import select
 
 from app.database import async_session
 from app.models.trigger import AgentTrigger
+from app.models.trigger_execution import TriggerExecution
 from app.services.trigger_runtime.executions import (
     build_execution_runtime_trigger,
     claim_pending_trigger_executions,
@@ -55,6 +58,86 @@ def runtime_execution_payload(trigger: AgentTrigger) -> dict:
 
 async def enqueue_due_trigger(trigger: AgentTrigger, now: datetime) -> None:
     async with async_session() as db:
+        cfg = trigger.config or {}
+        webhook_mode = (
+            cfg.get("webhook_mode", "legacy")
+            if trigger.type == "webhook"
+            else "legacy"
+        )
+        if trigger.type == "webhook" and webhook_mode in {"queue", "merge"}:
+            # Claim the queue/merge batch and enqueue its durable execution in
+            # one transaction.  The trigger daemon ticks faster than an LLM
+            # turn can finish, so merely checking the detached trigger snapshot
+            # allows every tick to enqueue the same still-pending payload again.
+            fresh = (
+                await db.execute(
+                    select(AgentTrigger)
+                    .where(AgentTrigger.id == trigger.id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if fresh is None or not fresh.is_enabled:
+                return
+
+            fresh_cfg = dict(fresh.config or {})
+            queue = list(fresh_cfg.get("_webhook_queue") or [])
+            if not queue:
+                return
+
+            if fresh_cfg.get("_webhook_active"):
+                active_since = fresh_cfg.get("_webhook_active_since")
+                lock_is_stale = False
+                if active_since:
+                    try:
+                        lock_is_stale = (
+                            now - datetime.fromisoformat(active_since)
+                            > timedelta(minutes=10)
+                        )
+                    except (TypeError, ValueError):
+                        lock_is_stale = True
+                if not lock_is_stale:
+                    return
+
+                # A stale JSON lock is not enough to create another execution:
+                # the durable lease path may still have pending/reclaimable work.
+                # Only recover the batch when no unfinished execution exists.
+                unfinished = (
+                    await db.execute(
+                        select(TriggerExecution.id)
+                        .where(
+                            TriggerExecution.trigger_id == fresh.id,
+                            TriggerExecution.status.in_(("pending", "processing")),
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if unfinished is not None:
+                    return
+
+            active_since = now.isoformat()
+            locked_cfg = {
+                **fresh_cfg,
+                "_webhook_active": True,
+                "_webhook_active_since": active_since,
+            }
+            if webhook_mode == "merge":
+                locked_cfg["_webhook_batch_size"] = len(queue)
+            fresh.config = locked_cfg
+
+            _execution, created = await enqueue_trigger_execution(
+                db,
+                trigger=fresh,
+                source="webhook",
+                idempotency_key=f"webhook:{fresh.id}:{active_since}",
+                payload_obj=runtime_execution_payload(fresh),
+                commit=False,
+            )
+            if created:
+                await db.commit()
+            else:
+                await db.rollback()
+            return
+
         await enqueue_trigger_execution(
             db,
             trigger=trigger,

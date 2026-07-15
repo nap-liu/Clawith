@@ -12,6 +12,8 @@ class FakeScalarResult:
         self._value = value
 
     def scalar_one_or_none(self):
+        if isinstance(self._value, list):
+            return self._value[0] if len(self._value) == 1 else None
         return self._value
 
     def scalars(self):

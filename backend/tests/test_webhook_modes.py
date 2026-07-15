@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -10,12 +11,15 @@ from app.main import app
 from app.models.agent import Agent
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
+from app.models.trigger_execution import TriggerExecution
 from app.models.user import User, Identity
 from app.services.trigger_daemon import (
+    _finalize_invocation_executions,
     _evaluate_trigger,
     _merge_webhook_payloads,
     _advance_webhook_trigger,
 )
+from app.services.trigger_runtime.dispatch import enqueue_due_trigger
 from app.models.audit import AuditLog
 
 pytestmark = pytest.mark.asyncio
@@ -238,6 +242,285 @@ async def test_queue_lock_timeout_forces_refire():
 async def test_merge_fires_when_queue_nonempty():
     now = datetime.now(timezone.utc)
     assert await _evaluate_trigger(_mk_trigger("merge", queue=["a", "b", "c"], active=False), now) is True
+
+
+async def test_merge_due_claim_is_atomic_and_enqueues_one_execution():
+    """Repeated daemon ticks must not enqueue one queued payload twice."""
+    _agent_id, trigger_id = await _make_persisted_webhook_trigger("merge", ["a"])
+    async with async_session() as db:
+        trigger = (
+            await db.execute(select(AgentTrigger).where(AgentTrigger.id == trigger_id))
+        ).scalar_one()
+        trigger.config = {
+            **trigger.config,
+            "_webhook_active": False,
+            "_webhook_active_since": None,
+        }
+        await db.commit()
+        await db.refresh(trigger)
+        db.expunge(trigger)
+
+    now = datetime.now(timezone.utc)
+    await enqueue_due_trigger(trigger, now)
+    # Simulate the next daemon tick reusing an old detached snapshot while the
+    # first LLM turn is still active.  The DB row lock/fresh state is decisive.
+    await enqueue_due_trigger(trigger, now + timedelta(seconds=15))
+
+    async with async_session() as db:
+        stored = await db.get(AgentTrigger, trigger_id)
+        executions = (
+            await db.execute(
+                select(TriggerExecution).where(TriggerExecution.trigger_id == trigger_id)
+            )
+        ).scalars().all()
+        assert stored.config["_webhook_active"] is True
+        assert stored.config["_webhook_batch_size"] == 1
+        assert len(executions) == 1
+
+
+async def test_stale_webhook_lock_with_unfinished_execution_does_not_duplicate():
+    """The 10-minute recovery path defers to the durable execution lease."""
+    _agent_id, trigger_id = await _make_persisted_webhook_trigger("queue", ["a"])
+    async with async_session() as db:
+        trigger = await db.get(AgentTrigger, trigger_id)
+        stale = datetime.now(timezone.utc) - timedelta(minutes=11)
+        trigger.config = {
+            **trigger.config,
+            "_webhook_active": True,
+            "_webhook_active_since": stale.isoformat(),
+        }
+        execution = TriggerExecution(
+            trigger_id=trigger.id,
+            agent_id=trigger.agent_id,
+            source="webhook",
+            status="processing",
+            idempotency_key=f"existing:{uuid.uuid4()}",
+            payload={},
+            payload_text="",
+            scheduled_at=stale,
+            started_at=stale,
+        )
+        db.add(execution)
+        await db.commit()
+        await db.refresh(trigger)
+        db.expunge(trigger)
+
+    await enqueue_due_trigger(trigger, datetime.now(timezone.utc))
+
+    async with async_session() as db:
+        count = len(
+            (
+                await db.execute(
+                    select(TriggerExecution).where(TriggerExecution.trigger_id == trigger_id)
+                )
+            ).scalars().all()
+        )
+        assert count == 1
+
+
+async def test_ingress_and_claim_share_one_row_lock_without_losing_active_state():
+    """A concurrent append cannot clear the daemon's active batch lock."""
+    agent_id, token = await _make_agent_with_hook("merge")
+    assert (await _post(token, {"n": 1})).status_code == 200
+    async with async_session() as db:
+        trigger = (
+            await db.execute(
+                select(AgentTrigger).where(AgentTrigger.agent_id == agent_id)
+            )
+        ).scalar_one()
+        trigger_id = trigger.id
+        db.expunge(trigger)
+
+    response, _ = await asyncio.gather(
+        _post(token, {"n": 2}),
+        enqueue_due_trigger(trigger, datetime.now(timezone.utc)),
+    )
+    assert response.status_code == 200
+
+    async with async_session() as db:
+        stored = await db.get(AgentTrigger, trigger_id)
+        executions = (
+            await db.execute(
+                select(TriggerExecution).where(TriggerExecution.trigger_id == trigger_id)
+            )
+        ).scalars().all()
+        assert stored.config["_webhook_active"] is True
+        assert stored.config["_webhook_batch_size"] in {1, 2}
+        assert len(stored.config["_webhook_queue"]) == 2
+        assert len(executions) == 1
+
+
+async def test_ingress_and_advance_preserve_late_payload_and_finalize_atomically():
+    """A payload arriving during advance survives as the next merge batch."""
+    agent_id, token = await _make_agent_with_hook("merge")
+    assert (await _post(token, {"n": 1})).status_code == 200
+    async with async_session() as db:
+        trigger = (
+            await db.execute(
+                select(AgentTrigger).where(AgentTrigger.agent_id == agent_id)
+            )
+        ).scalar_one()
+        trigger_id = trigger.id
+        db.expunge(trigger)
+
+    await enqueue_due_trigger(trigger, datetime.now(timezone.utc))
+    async with async_session() as db:
+        execution = (
+            await db.execute(
+                select(TriggerExecution).where(TriggerExecution.trigger_id == trigger_id)
+            )
+        ).scalar_one()
+        execution_id = execution.id
+        runtime_trigger = await db.get(AgentTrigger, trigger_id)
+        db.expunge(runtime_trigger)
+
+    response, _ = await asyncio.gather(
+        _post(token, {"n": 2}),
+        _finalize_invocation_executions(
+            [execution_id],
+            [runtime_trigger],
+            "ok",
+            None,
+            False,
+        ),
+    )
+    assert response.status_code == 200
+
+    async with async_session() as db:
+        stored = await db.get(AgentTrigger, trigger_id)
+        execution = await db.get(TriggerExecution, execution_id)
+        assert len(stored.config["_webhook_queue"]) == 1
+        assert '"n": 2' in stored.config["_webhook_queue"][0]
+        assert stored.config["_webhook_active"] is False
+        assert execution.status == "completed"
+
+
+async def test_merge_burst_and_parallel_ticks_create_one_complete_batch():
+    """A burst plus many stale daemon snapshots still produces one execution."""
+    agent_id, token = await _make_agent_with_hook("merge")
+    responses = await asyncio.gather(*[_post(token, {"n": i}) for i in range(30)])
+    assert all(response.status_code == 200 for response in responses)
+
+    async with async_session() as db:
+        trigger = (
+            await db.execute(
+                select(AgentTrigger).where(AgentTrigger.agent_id == agent_id)
+            )
+        ).scalar_one()
+        trigger_id = trigger.id
+        db.expunge(trigger)
+
+    now = datetime.now(timezone.utc)
+    await asyncio.gather(
+        *[enqueue_due_trigger(trigger, now + timedelta(milliseconds=i)) for i in range(20)]
+    )
+
+    async with async_session() as db:
+        stored = await db.get(AgentTrigger, trigger_id)
+        executions = (
+            await db.execute(
+                select(TriggerExecution).where(TriggerExecution.trigger_id == trigger_id)
+            )
+        ).scalars().all()
+        assert stored.config["_webhook_batch_size"] == 30
+        assert len(executions) == 1
+        execution_id = executions[0].id
+        db.expunge(stored)
+
+    await _finalize_invocation_executions(
+        [execution_id],
+        [stored],
+        "ok",
+        None,
+        False,
+    )
+
+    async with async_session() as db:
+        stored = await db.get(AgentTrigger, trigger_id)
+        execution = await db.get(TriggerExecution, execution_id)
+        assert stored.config["_webhook_queue"] == []
+        assert stored.config["_webhook_active"] is False
+        assert execution.status == "completed"
+
+
+async def test_early_skip_advances_webhook_and_completes_execution():
+    """Agent/model early-return semantics consume the batch exactly once."""
+    _agent_id, trigger_id = await _make_persisted_webhook_trigger("queue", ["a"])
+    async with async_session() as db:
+        trigger = await db.get(AgentTrigger, trigger_id)
+        execution = TriggerExecution(
+            trigger_id=trigger.id,
+            agent_id=trigger.agent_id,
+            source="webhook",
+            status="processing",
+            idempotency_key=f"early:{uuid.uuid4()}",
+            payload={},
+            payload_text="",
+        )
+        db.add(execution)
+        await db.commit()
+        execution_id = execution.id
+        db.expunge(trigger)
+
+    await _finalize_invocation_executions(
+        [execution_id],
+        [trigger],
+        None,
+        None,
+        False,
+    )
+
+    async with async_session() as db:
+        stored = await db.get(AgentTrigger, trigger_id)
+        execution = await db.get(TriggerExecution, execution_id)
+        assert stored.config["_webhook_queue"] == []
+        assert stored.config["_webhook_active"] is False
+        assert execution.status == "completed"
+
+
+async def test_advance_failure_rolls_back_execution_terminal_state(monkeypatch):
+    """Advance and execution completion succeed or roll back together."""
+    from app.services import trigger_daemon as daemon
+
+    _agent_id, trigger_id = await _make_persisted_webhook_trigger("queue", ["a"])
+    async with async_session() as db:
+        trigger = await db.get(AgentTrigger, trigger_id)
+        execution = TriggerExecution(
+            trigger_id=trigger.id,
+            agent_id=trigger.agent_id,
+            source="webhook",
+            status="processing",
+            idempotency_key=f"rollback:{uuid.uuid4()}",
+            payload={},
+            payload_text="",
+        )
+        db.add(execution)
+        await db.commit()
+        execution_id = execution.id
+        db.expunge(trigger)
+
+    original_advance = daemon._advance_webhook_trigger
+
+    def fail_after_advance(db, stored_trigger, reply):
+        original_advance(db, stored_trigger, reply)
+        raise RuntimeError("forced advance failure")
+
+    monkeypatch.setattr(daemon, "_advance_webhook_trigger", fail_after_advance)
+    with pytest.raises(RuntimeError, match="forced advance failure"):
+        await _finalize_invocation_executions(
+            [execution_id],
+            [trigger],
+            "ok",
+            None,
+            False,
+        )
+
+    async with async_session() as db:
+        stored = await db.get(AgentTrigger, trigger_id)
+        execution = await db.get(TriggerExecution, execution_id)
+        assert stored.config["_webhook_queue"] == ["a"]
+        assert stored.config["_webhook_active"] is True
+        assert execution.status == "processing"
 
 
 async def test_legacy_still_respects_cooldown():
