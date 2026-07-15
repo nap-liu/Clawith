@@ -152,6 +152,7 @@ body.h5-chat-active #root {
 .h5-chat__icon-button,
 .h5-chat__send,
 .h5-chat__attach,
+.h5-chat__speech-button,
 .h5-chat__bubble-image-button,
 .h5-chat__file-thumb-button,
 .h5-chat__file-remove {
@@ -180,7 +181,8 @@ body.h5-chat-active #root {
 
 .h5-chat__icon-button:disabled,
 .h5-chat__send:disabled,
-.h5-chat__attach:disabled {
+.h5-chat__attach:disabled,
+.h5-chat__speech-button:disabled {
     cursor: default;
     opacity: 0.45;
 }
@@ -1021,15 +1023,49 @@ body.h5-chat-active #root {
     gap: 8px;
 }
 
-.h5-chat__composer textarea {
+.h5-chat__speech-status {
+    min-height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-radius: 8px;
+    padding: 6px 9px;
+    background: var(--accent-subtle);
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.h5-chat__speech-status span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.h5-chat__speech-status--error {
+    background: var(--error-subtle);
+    color: var(--error);
+}
+
+.h5-chat__composer-input {
+    position: relative;
     flex: 1 1 auto;
+    min-width: 0;
+}
+
+.h5-chat__composer textarea {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
     min-width: 0;
     min-height: 40px;
     max-height: 132px;
     resize: none;
     border: 1px solid var(--border-default);
     border-radius: 8px;
-    padding: 9px 11px;
+    padding: 9px 48px 9px 11px;
     background: var(--bg-secondary);
     color: var(--text-primary);
     font-family: inherit;
@@ -1080,6 +1116,33 @@ body.h5-chat-active #root {
 .h5-chat--dark .h5-chat__attach {
     background: transparent;
     color: var(--text-secondary);
+}
+
+.h5-chat__speech-button {
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    z-index: 1;
+    width: 32px;
+    height: 32px;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+.h5-chat__speech-button:active {
+    background: var(--bg-hover);
+}
+
+.h5-chat--dark .h5-chat__speech-button {
+    background: transparent;
+    color: var(--text-secondary);
+}
+
+.h5-chat__speech-button--recording,
+.h5-chat--dark .h5-chat__speech-button--recording {
+    background: var(--error-subtle);
+    color: var(--error);
 }
 
 .h5-chat__send {

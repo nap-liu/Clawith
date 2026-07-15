@@ -15,6 +15,7 @@ import OrgTab from './enterprise-settings/tabs/OrgTab';
 import SkillsTab from './enterprise-settings/tabs/SkillsTab';
 import OkrTab from './enterprise-settings/tabs/OkrTab';
 import LlmTab from './enterprise-settings/tabs/LlmTab';
+import SpeechRecognitionTab from './enterprise-settings/tabs/SpeechRecognitionTab';
 import EnterpriseKBBrowser from './enterprise-settings/components/EnterpriseKBBrowser';
 import { A2AAsyncToggle, CompanyLogoEditor, CompanyNameEditor, CompanyTimezoneEditor } from './enterprise-settings/components/CompanyInfoEditors';
 import { mcpServersApi } from '../services/mcpServers';
@@ -133,8 +134,8 @@ export default function EnterpriseSettings() {
     const qc = useQueryClient();
     const currentUser = useAuthStore((s) => s.user);
     const isPlatformAdmin = currentUser?.role === 'platform_admin' || currentUser?.is_platform_admin === true;
-    type TabKey = 'llm' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites' | 'okr';
-    const VALID_TABS: TabKey[] = ['info', 'llm', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
+    type TabKey = 'llm' | 'speech' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites' | 'okr';
+    const VALID_TABS: TabKey[] = ['info', 'llm', 'speech', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
     const getTabFromHash = (): TabKey => {
         const hash = window.location.hash.replace('#', '') as TabKey;
         return VALID_TABS.includes(hash) ? hash : 'info';
@@ -490,7 +491,7 @@ export default function EnterpriseSettings() {
                 </div>
 
                 <div className="tabs">
-                    {(['info', 'llm', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'] as const).map(tab => (
+                    {(['info', 'llm', 'speech', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'] as const).map(tab => (
                         <div
                             key={tab}
                             className={`tab ${activeTab === tab ? 'active' : ''}`}
@@ -509,6 +510,9 @@ export default function EnterpriseSettings() {
 
                 {/* ── LLM Model Pool ── */}
                 {activeTab === 'llm' && <LlmTab selectedTenantId={selectedTenantId} />}
+
+                {/* ── Speech Recognition Service ── */}
+                {activeTab === 'speech' && <SpeechRecognitionTab selectedTenantId={selectedTenantId} />}
 
                 {/* ── Org Structure ── */}
                 {activeTab === 'org' && <OrgTab tenant={currentTenant} />}

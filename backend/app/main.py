@@ -475,6 +475,8 @@ from app.api.sdk_auth import router as sdk_auth_router
 from app.api.onboarding import router as onboarding_router
 from app.api.personal_access_tokens import router as personal_access_tokens_router
 from app.api.confirmations import router as confirmations_router
+from app.api.speech import router as speech_router
+from app.api.speech_config import router as speech_config_router
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
@@ -541,6 +543,8 @@ app.include_router(sdk_auth_router, prefix=settings.API_PREFIX)
 app.include_router(onboarding_router, prefix=settings.API_PREFIX)
 app.include_router(personal_access_tokens_router, prefix=settings.API_PREFIX)
 app.include_router(confirmations_router, prefix=settings.API_PREFIX)
+app.include_router(speech_router)
+app.include_router(speech_config_router)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])

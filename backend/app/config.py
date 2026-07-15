@@ -149,6 +149,10 @@ class Settings(BaseSettings):
     # Jina AI (Reader + Search APIs)
     JINA_API_KEY: str = ""
 
+    # Speech input (Alibaba Cloud Model Studio / Fun-ASR)
+    ASR_WEBSOCKET_URL: str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+    ASR_MAX_DURATION_SECONDS: int = 60
+
     # Exa AI (Search API)
     EXA_API_KEY: str = ""
 

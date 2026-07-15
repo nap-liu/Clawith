@@ -7,6 +7,7 @@ import {
     IconChevronDown,
     IconHistory,
     IconLoader2,
+    IconMicrophone,
     IconPaperclip,
     IconPlayerStopFilled,
     IconPlus,
@@ -52,6 +53,7 @@ import { parseH5Theme } from './h5Params';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import { copyToClipboard } from '../../utils/clipboard';
 import { isWechatMiniProgramWebView, resolveExternalHttpLink } from '../../utils/h5LinkPolicy';
+import { insertSpeechTranscript, useSpeechInput } from '../../hooks/useSpeechInput';
 import './H5AgentChat.css';
 
 type AuthStatus = 'checking' | 'exchanging' | 'ready' | 'error';
@@ -371,6 +373,67 @@ export default function H5AgentChat() {
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const uploadAbortRef = useRef<Map<string, () => void>>(new Map());
     const skipNextConnectedHistoryRef = useRef<string | null>(null);
+    const speechInputSnapshotRef = useRef({ value: '', selectionStart: 0, selectionEnd: 0 });
+    const speechSelectionCapturedRef = useRef(false);
+    const inputSelectionRef = useRef({ start: 0, end: 0, hasPosition: false });
+
+    const speechTextAtCursor = useCallback((text: string) => {
+        const snapshot = speechInputSnapshotRef.current;
+        return insertSpeechTranscript(snapshot.value, text, snapshot.selectionStart, snapshot.selectionEnd);
+    }, []);
+
+    const restoreInputCaret = useCallback((position: number) => {
+        inputSelectionRef.current = { start: position, end: position, hasPosition: true };
+        window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => {
+                textareaRef.current?.setSelectionRange(position, position);
+            });
+        });
+    }, []);
+
+    const handleSpeechInterim = useCallback((text: string) => {
+        setInput(speechTextAtCursor(text).value);
+    }, [speechTextAtCursor]);
+    const handleSpeechFinal = useCallback((text: string) => {
+        const next = speechTextAtCursor(text);
+        setInput(next.value);
+        restoreInputCaret(next.caret);
+    }, [restoreInputCaret, speechTextAtCursor]);
+    const handleSpeechCancel = useCallback(() => {
+        const snapshot = speechInputSnapshotRef.current;
+        setInput(snapshot.value);
+        restoreInputCaret(snapshot.selectionStart);
+    }, [restoreInputCaret]);
+    const speech = useSpeechInput({
+        onInterim: handleSpeechInterim,
+        onFinal: handleSpeechFinal,
+        onCancel: handleSpeechCancel,
+    });
+    const startSpeech = speech.start;
+
+    const captureSpeechInsertionPoint = useCallback(() => {
+        const selection = inputSelectionRef.current;
+        const field = textareaRef.current;
+        const selectionStart = selection.hasPosition && field ? field.selectionStart : input.length;
+        const selectionEnd = selection.hasPosition && field ? field.selectionEnd : input.length;
+        speechInputSnapshotRef.current = { value: input, selectionStart, selectionEnd };
+        speechSelectionCapturedRef.current = true;
+    }, [input]);
+
+    const startSpeechInput = useCallback(() => {
+        if (!speechSelectionCapturedRef.current) captureSpeechInsertionPoint();
+        speechSelectionCapturedRef.current = false;
+        void startSpeech();
+    }, [captureSpeechInsertionPoint, startSpeech]);
+
+    const handleInputSelect = (event: React.SyntheticEvent<HTMLTextAreaElement>) => {
+        const field = event.currentTarget;
+        inputSelectionRef.current = {
+            start: field.selectionStart,
+            end: field.selectionEnd,
+            hasPosition: true,
+        };
+    };
 
     useEffect(() => {
         document.body.classList.add('h5-chat-active');
@@ -946,7 +1009,7 @@ export default function H5AgentChat() {
 
     const sendMessage = useCallback(async () => {
         const content = input.trim();
-        if ((!content && attachedFiles.length === 0) || isWaiting || isStreaming || isStopping || isStartingNew || isSwitchingSession || uploadDrafts.length > 0) return;
+        if ((!content && attachedFiles.length === 0) || isWaiting || isStreaming || isStopping || isStartingNew || isSwitchingSession || uploadDrafts.length > 0 || speech.isActive) return;
 
         if (attachedFiles.length === 0 && (content === '/new' || content === '/reset')) {
             setInput('');
@@ -990,12 +1053,12 @@ export default function H5AgentChat() {
             file_name: payload.fileName,
             model_id: effectiveModelId,
         }));
-    }, [attachedFiles, effectiveModelId, effectiveModelSupportsVision, input, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, startNewSession, uploadDrafts.length]);
+    }, [attachedFiles, effectiveModelId, effectiveModelSupportsVision, input, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
 
     const handleInputKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
         if (event.key === 'Enter' && !event.shiftKey) {
             event.preventDefault();
-            if (!isWaiting && !isStreaming && !isStopping && uploadDrafts.length === 0) {
+            if (!isWaiting && !isStreaming && !isStopping && uploadDrafts.length === 0 && !speech.isActive) {
                 sendMessage();
             }
         }
@@ -1174,12 +1237,14 @@ export default function H5AgentChat() {
         || showBlockingError
         || isBusy
         || generationActive
+        || speech.isActive
         || isStartingNew
         || isSwitchingSession
         || uploadDrafts.length > 0;
     const uploadDisabled = showBlockingError
         || isBusy
         || generationActive
+        || speech.isActive
         || isStartingNew
         || isSwitchingSession
         || uploadDrafts.length > 0
@@ -1208,7 +1273,7 @@ export default function H5AgentChat() {
                         type="button"
                         className="h5-chat__icon-button"
                         onClick={openSessionPanel}
-                        disabled={authStatus !== 'ready' || isSwitchingSession}
+                        disabled={authStatus !== 'ready' || isSwitchingSession || speech.isActive}
                         aria-label="历史会话"
                         title="历史会话"
                     >
@@ -1218,7 +1283,7 @@ export default function H5AgentChat() {
                         type="button"
                         className="h5-chat__icon-button"
                         onClick={startNewSession}
-                        disabled={isStartingNew || authStatus !== 'ready'}
+                        disabled={isStartingNew || authStatus !== 'ready' || speech.isActive}
                         aria-label="新会话"
                         title="新会话"
                     >
@@ -1228,7 +1293,7 @@ export default function H5AgentChat() {
                         type="button"
                         className="h5-chat__icon-button"
                         onClick={() => openSocket(sessionIdRef.current)}
-                        disabled={authStatus !== 'ready'}
+                        disabled={authStatus !== 'ready' || speech.isActive}
                         aria-label="重连"
                         title="重连"
                     >
@@ -1439,6 +1504,18 @@ export default function H5AgentChat() {
                         })}
                     </div>
                 ) : null}
+                {speech.isActive || speech.error ? (
+                    <div className={`h5-chat__speech-status${speech.error ? ' h5-chat__speech-status--error' : ''}`}>
+                        <span>
+                            {speech.error
+                                || (speech.status === 'connecting'
+                                    ? '正在连接语音识别…'
+                                    : speech.status === 'stopping'
+                                        ? '正在整理文字…'
+                                        : `正在听${speech.transcript ? `：${speech.transcript}` : '…'}`)}
+                        </span>
+                    </div>
+                ) : null}
                 <div className="h5-chat__composer-row">
                     <button
                         type="button"
@@ -1450,16 +1527,43 @@ export default function H5AgentChat() {
                     >
                         <IconPaperclip size={19} stroke={1.75} />
                     </button>
-                    <textarea
-                        ref={textareaRef}
-                        value={input}
-                        onChange={(event) => setInput(event.target.value)}
-                        onKeyDown={handleInputKeyDown}
-                        onPaste={handlePaste}
-                        placeholder="输入消息"
-                        rows={1}
-                        disabled={showBlockingError || isBusy || isStartingNew}
-                    />
+                    <div className="h5-chat__composer-input">
+                        <textarea
+                            ref={textareaRef}
+                            value={input}
+                            onChange={(event) => setInput(event.target.value)}
+                            onSelect={handleInputSelect}
+                            onKeyDown={handleInputKeyDown}
+                            onPaste={handlePaste}
+                            placeholder="输入消息"
+                            rows={1}
+                            onFocus={handleInputSelect}
+                            disabled={showBlockingError || isBusy || isStartingNew || speech.isActive}
+                        />
+                        <button
+                            type="button"
+                            className={`h5-chat__speech-button${speech.status === 'recording' ? ' h5-chat__speech-button--recording' : ''}`}
+                            onPointerDown={speech.status === 'recording' ? undefined : captureSpeechInsertionPoint}
+                            onClick={speech.status === 'recording' ? speech.stop : startSpeechInput}
+                            disabled={!speech.supported
+                                || showBlockingError
+                                || isBusy
+                                || generationActive
+                                || isStartingNew
+                                || isSwitchingSession
+                                || speech.status === 'connecting'
+                                || speech.status === 'stopping'}
+                            aria-label={speech.status === 'recording' ? '停止语音输入' : '开始语音输入'}
+                            title={!speech.supported ? '当前浏览器不支持实时语音输入' : speech.status === 'recording' ? '停止语音输入' : '语音输入'}
+                            aria-pressed={speech.status === 'recording'}
+                        >
+                            {speech.status === 'connecting' || speech.status === 'stopping'
+                                ? <IconLoader2 size={19} className="h5-chat__spin" />
+                                : speech.status === 'recording'
+                                    ? <IconPlayerStopFilled size={17} />
+                                    : <IconMicrophone size={19} stroke={1.8} />}
+                        </button>
+                    </div>
                     {generationActive ? (
                         <button
                             type="button"

@@ -79,6 +79,10 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
 /** Legacy/Internal generic fetcher */
 export const fetchJson = request;
 
+export const speechApi = {
+    createTicket: () => request<{ ticket: string; expires_in: number }>("/speech/ticket", { method: "POST" }),
+};
+
 async function uploadFile(url: string, file: File, extraFields?: Record<string, string>): Promise<any> {
     const token = localStorage.getItem('token');
     const formData = new FormData();
