@@ -14,6 +14,9 @@ from app.services.tool_config import meaningful_config, tenant_tool_config_key
 _settings = get_settings()
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
+    "execute_code",
+    "execute_code_aio",
+    "read_image",
     "read_webpage",
     "duckduckgo_search",
     "jina_search",
@@ -298,11 +301,11 @@ BUILTIN_TOOLS = [
         "display_name": "Read Image",
         "description": (
             "Read an image via a vision LLM: transcribe text or describe content. "
-            "Admin-configurable; disabled by default."
+            "Admin-configurable; enabled by default."
         ),
         "category": "document",
         "icon": "👁️",
-        "is_default": False,
+        "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {
@@ -1124,7 +1127,7 @@ BUILTIN_TOOLS = [
         ),
         "category": "code",
         "icon": "💻",
-        "is_default": True,
+        "is_default": False,
         "parameters_schema": {
             "type": "object",
             "properties": {
@@ -1311,7 +1314,7 @@ BUILTIN_TOOLS = [
         ),
         "category": "code",
         "icon": "📦",
-        "is_default": False,
+        "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {

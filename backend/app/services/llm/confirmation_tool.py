@@ -85,9 +85,9 @@ REQUEST_CONFIRMATION_TOOL_SEED: dict[str, Any] = {
     # NB: tools.icon is varchar(10) — keep the name short (lucide "shield"; the
     # 12-char "shield-check" overflows the column and the seed INSERT fails).
     "icon": "shield",
-    # OPT-IN: NOT default-enabled — a new agent does not get it until the user explicitly
-    # turns it on (request_confirmation is in SYNC_IS_DEFAULT_TOOL_NAMES so this syncs to the DB).
-    "is_default": False,
+    # Company agents receive the confirmation capability by default so they can
+    # ask a human before carrying out irreversible or externally visible work.
+    "is_default": True,
     "parameters_schema": REQUEST_CONFIRMATION_TOOL_DEFINITION["function"]["parameters"],
     "config": {},
     # Standard builtin-tool config — the ONLY deployment-specific knob is which DingTalk
