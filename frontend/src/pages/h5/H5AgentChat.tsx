@@ -18,6 +18,7 @@ import ChatImageLightbox from '../../components/ChatImageLightbox';
 import ChatFileDeliveryCard from '../../components/ChatFileDeliveryCard';
 import ConfirmationCard from '../../components/ConfirmationCard';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
+import { useToast } from '../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../stores';
 import { agentApi, authApi, chatSessionApi, enterpriseApi, tenantApi, uploadFileWithProgress } from '../../services/api';
 import type { Agent, TokenResponse } from '../../types';
@@ -49,6 +50,8 @@ import {
 } from './chatTimeline';
 import { parseH5Theme } from './h5Params';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
+import { copyToClipboard } from '../../utils/clipboard';
+import { isWechatMiniProgramWebView, resolveExternalHttpLink } from '../../utils/h5LinkPolicy';
 import './H5AgentChat.css';
 
 type AuthStatus = 'checking' | 'exchanging' | 'ready' | 'error';
@@ -315,6 +318,7 @@ function estimateConversationEntrySize(entry: ReturnType<typeof buildH5Conversat
 export default function H5AgentChat() {
     const { agentId } = useParams<{ agentId: string }>();
     const [searchParams] = useSearchParams();
+    const toast = useToast();
     const searchString = searchParams.toString();
     const channel = useMemo(() => {
         const params = new URLSearchParams(searchString);
@@ -325,6 +329,7 @@ export default function H5AgentChat() {
     const oauthState = useMemo(() => new URLSearchParams(searchString).get('state'), [searchString]);
     const theme = useMemo(() => parseH5Theme(new URLSearchParams(searchString).get('theme')), [searchString]);
     const initialSessionId = useMemo(() => parseChatSessionId(new URLSearchParams(searchString).get('session_id')), [searchString]);
+    const isWechatMiniProgram = useMemo(() => isWechatMiniProgramWebView(), []);
 
     const token = useAuthStore((s) => s.token);
     const setAuth = useAuthStore((s) => s.setAuth);
@@ -1044,6 +1049,22 @@ export default function H5AgentChat() {
         </article>
     ), []);
 
+    const handleMarkdownLinkClick = useCallback((href: string): boolean => {
+        if (!isWechatMiniProgram) return false;
+
+        const externalUrl = resolveExternalHttpLink(href);
+        if (!externalUrl) return false;
+
+        void copyToClipboard(externalUrl).then((copied) => {
+            if (copied) {
+                toast.success('链接已复制，请在外部浏览器中打开');
+            } else {
+                toast.error('链接复制失败，请稍后重试');
+            }
+        });
+        return true;
+    }, [isWechatMiniProgram, toast]);
+
     const renderConversationEntry = useCallback((entry: (typeof conversationEntries)[number]) => {
         if (entry.type === 'analysis_group') {
             return (
@@ -1126,14 +1147,19 @@ export default function H5AgentChat() {
                         <div className="h5-chat__thinking">思考中</div>
                     ) : null}
                     {displayContent ? (
-                        <MarkdownRenderer className="h5-chat__markdown" content={displayContent} imagePreviewMode="mobile" />
+                        <MarkdownRenderer
+                            className="h5-chat__markdown"
+                            content={displayContent}
+                            imagePreviewMode="mobile"
+                            onLinkClick={handleMarkdownLinkClick}
+                        />
                     ) : msg.streaming ? (
                         <div className="h5-chat__typing"><span /><span /><span /></div>
                     ) : null}
                 </div>
             </article>
         );
-    }, [agentId, analysisExpanded, toggleAnalysis]);
+    }, [agentId, analysisExpanded, handleMarkdownLinkClick, toggleAnalysis]);
 
     const connectionLabel = connectionStatus === 'connected'
         ? '已连接'

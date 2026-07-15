@@ -258,9 +258,11 @@ interface MarkdownRendererProps {
     style?: React.CSSProperties;
     className?: string;
     imagePreviewMode?: 'desktop' | 'mobile';
+    /** Return true when the caller handled the link and native navigation should be prevented. */
+    onLinkClick?: (href: string) => boolean;
 }
 
-export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, style, className, imagePreviewMode = 'desktop' }: MarkdownRendererProps) {
+export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, style, className, imagePreviewMode = 'desktop', onLinkClick }: MarkdownRendererProps) {
     const html = useMemo(() => markdownToHtml(content), [content]);
     const [preview, setPreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
 
@@ -293,8 +295,15 @@ export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, 
                 images,
                 index: Math.max(0, imageNodes.indexOf(image)),
             });
+            return;
         }
-    }, []);
+
+        const link = target.closest<HTMLAnchorElement>('a[href]');
+        if (link && onLinkClick?.(link.href)) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    }, [onLinkClick]);
 
     return (
         <>
