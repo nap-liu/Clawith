@@ -31,11 +31,17 @@ def _decode_transport(command: str) -> str:
     return base64.b64decode(match.group(1)).decode()
 
 
-def _wrapper_payloads(script: str) -> list[str]:
+def _launcher_payloads(script: str) -> list[str]:
     return [
         base64.b64decode(value).decode()
         for value in re.findall(r"echo ([A-Za-z0-9+/=]+) \| base64 -d >", script)
     ]
+
+
+def _scoped_user_code(script: str) -> str:
+    match = re.search(r"source <\(echo ([A-Za-z0-9+/=]+) \| base64 -d\)", script)
+    assert match, script
+    return base64.b64decode(match.group(1)).decode()
 
 
 async def test_background_job_reuses_environment_and_permission_composer():
@@ -99,21 +105,24 @@ async def test_background_job_reuses_environment_and_permission_composer():
     assert exec_body["timeout"] == 900.0
     script = _decode_transport(exec_body["command"])
     namespace = compute_session_namespace(compute_session_anchor("A", "C"))
-    expected_bindir = f'$HOME/.jobs/{namespace}/{result["job_id"]}/bin'
-    expected_log = f'$HOME/.jobs/{namespace}/{result["job_id"]}/output.log'
+    expected_log = f'$HOME/.cache/aio/jobs/{namespace}/{result["job_id"]}/output.log'
     assert "cd '/data/agents/A'" in script
     assert "export HOME='/data/agents/A'" in script
     assert "export PIP_USER=1" in script
     assert 'export NPM_CONFIG_PREFIX="$HOME/.npm-global"' in script
     assert "export CI=true" in script
     assert "export GIT_TERMINAL_PROMPT=0" in script
-    assert f'export PATH="{expected_bindir}:$PATH"' in script
-    assert f'tee -a "{expected_log}"' in script
-    wrappers = _wrapper_payloads(script)
-    assert len(wrappers) == 1
-    assert "YYBPC_CLI_USER_PHONE='13800000000'" in wrappers[0]
-    assert "13800000000" not in script
-    assert ".clawith-jobs" not in script
+    assert '$HOME/.local/bin' in script
+    assert f'mkdir -p "$(dirname "{expected_log}")"' in script
+    scoped_code = _scoped_user_code(script)
+    assert f'tee -a "{expected_log}"' in scoped_code
+    launchers = _launcher_payloads(script)
+    assert len(launchers) == 1
+    assert "YYBPC_CLI_USER_PHONE" not in launchers[0]
+    assert "13800000000" not in launchers[0]
+    assert "local -x AIO_CLI_CONTEXT_" in script
+    assert ".jobs" not in script
+    assert ".clawith" not in script
 
 
 async def test_job_list_is_filtered_to_current_chat_session():
@@ -136,7 +145,7 @@ async def test_job_list_is_filtered_to_current_chat_session():
                         "aio-job-other-job_222222222222": {
                             "status": "running"
                         },
-                        "clawith-A:C": {"status": "completed"},
+                        f"aio-fg-{namespace}": {"status": "completed"},
                     }
                 },
             },
@@ -210,7 +219,7 @@ async def test_job_stop_deletes_only_the_requested_job_session():
 async def test_running_job_logs_are_read_from_shared_agent_home(tmp_path):
     anchor = compute_session_anchor("A", "C")
     namespace = compute_session_namespace(anchor)
-    log_dir = tmp_path / ".jobs" / namespace / "job_111111111111"
+    log_dir = tmp_path / ".cache" / "aio" / "jobs" / namespace / "job_111111111111"
     log_dir.mkdir(parents=True)
     (log_dir / "output.log").write_text("line-1\nline-2\nline-3\n")
 
@@ -251,7 +260,6 @@ def test_background_python_is_a_managed_shell_process():
         cwd="/data/agents/A",
         code="print('hello')",
         language="python",
-        bindir="$HOME/.jobs/ns/job_x/bin",
         background_job=True,
     )
     script = _decode_transport(command)

@@ -14,7 +14,10 @@ import httpx
 import pytest
 
 from app.services.sandbox.config import SandboxConfig, SandboxType
-from app.services.sandbox.remote.aio_sandbox_backend import AioSandboxBackend
+from app.services.sandbox.remote.aio_sandbox_backend import (
+    AioSandboxBackend,
+    compute_session_namespace,
+)
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("SANDBOX_API_URL"),
@@ -132,14 +135,14 @@ async def test_shell_timeout_kills_tree_without_poisoning_stateful_session(
 ):
     """The existing timeout is a process deadline, not just an HTTP deadline."""
     token = uuid.uuid4().hex[:8]
-    bg_pidfile = f"/tmp/clawith-timeout-bg-{token}.pid"
-    fg_pidfile = f"/tmp/clawith-timeout-fg-{token}.pid"
-    session_id = f"clawith-{agent_id}"
+    bg_pidfile = f"/tmp/aio-timeout-bg-{token}.pid"
+    fg_pidfile = f"/tmp/aio-timeout-fg-{token}.pid"
+    session_id = f"aio-fg-{compute_session_namespace(agent_id)}"
     try:
         setup = await backend.execute(
             code=(
                 "export AIOSB_TIMEOUT_MARKER=preserved; "
-                f"nohup sleep 120 >/tmp/clawith-timeout-bg-{token}.log 2>&1 & "
+                f"nohup sleep 120 >/tmp/aio-timeout-bg-{token}.log 2>&1 & "
                 f"echo $! > {bg_pidfile}"
             ),
             language="bash",
@@ -209,8 +212,7 @@ async def test_two_agents_have_isolated_shell_sessions(backend):
 async def test_unknown_session_id_auto_recreates(backend, agent_id):
     """If sandbox restarts and our session vanishes, execute() auto-recreates.
 
-    Step 1: first execute() must create a named shell session
-            `clawith-{agent_id}` (server-side identity tied to agent).
+    Step 1: first execute() must create a namespaced ``aio-fg-*`` shell session.
     Step 2: we manually delete that session via HTTP to simulate sandbox
             restart / GC.
     Step 3: next execute() must transparently recreate the session and
@@ -228,7 +230,7 @@ async def test_unknown_session_id_auto_recreates(backend, agent_id):
         agent_id=agent_id,
     )
 
-    session_id = f"clawith-{agent_id}"
+    session_id = f"aio-fg-{compute_session_namespace(agent_id)}"
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             f"{os.environ['SANDBOX_API_URL']}/v1/shell/sessions",
@@ -368,19 +370,17 @@ async def test_lru_eviction_resets_oldest_conversation(backend, agent_id):
     assert "oldest" not in r.stdout
 
 
-# ----------------------------------------------- identity isolation (wrapper-based)
+# ----------------------------------------------- identity isolation (signed context)
 #
-# These exercise the real failure the per-session work + wrapper-identity design
-# fixes: in a shared (group IM) conversation, a later sender must never inherit a
-# prior sender's CLI identity. We simulate a CLI tool with a fake "svc" binary
-# that just echoes its identity env, and drive _compose_shell_command-level
-# injection through backend.execute(inject=...).
+# These exercise the real group-IM failure mode: a later sender must never
+# inherit a prior sender's CLI identity. The launcher is shared and identity-free;
+# each backend.execute(inject=...) supplies a signed function-local context.
 
 
 async def _install_fake_svc(backend, agent_id) -> str:
     """Install a stand-in CLI binary INSIDE the sandbox (the test container's
     tmp is invisible to it). It prints whatever identity env it was given.
-    Returns the in-sandbox path to use as a wrapper binary_path."""
+    Returns the in-sandbox path to use as the launcher's binary_path."""
     path = "/data/agents/_fake_svc.sh"
     install = (
         "printf '#!/bin/sh\\necho \"who=${YYBPC_CLI_USER_PHONE:-NONE}\"\\n' > "
@@ -410,7 +410,7 @@ async def test_group_conversation_second_sender_without_inject_sees_no_prior_ide
     )
     assert "who=AAA111" in ra.stdout
     # Sender B's exec has NO injection (e.g. unmapped user / build blip).
-    # svc must now be command-not-found OR identity-less — never AAA111.
+    # The identity-free launcher remains but must fail closed without context.
     rb = await backend.execute(
         code="svc 2>&1 || echo SVC_GONE", language="bash", timeout=15,
         work_dir="/data/agents", agent_id=agent_id, conversation_id=conv, inject=None,
@@ -421,8 +421,8 @@ async def test_group_conversation_second_sender_without_inject_sees_no_prior_ide
 async def test_group_conversation_second_sender_overrides_identity(
     backend, agent_id, tmp_path
 ):
-    """A then B (both with their own identity) in one conversation: B sees ONLY
-    B's identity (the wrapper is rewritten with the current sender)."""
+    """A then B in one conversation: the shared launcher uses only B's current
+    signed context and never A's prior identity."""
     binpath = await _install_fake_svc(backend, agent_id)
     conv = "groupchat-2"
     inject_a = {"wrappers": [{"name": "svc", "binary_path": binpath,
@@ -440,8 +440,8 @@ async def test_group_conversation_second_sender_overrides_identity(
 
 
 async def test_identity_not_visible_in_session_env(backend, agent_id, tmp_path):
-    """Identity rides in the wrapper, never the session env: `env` / `echo $VAR`
-    in the same conversation must not reveal the phone."""
+    """Identity rides in a scoped context, never the persistent session env:
+    `env` / `echo $VAR` in the same conversation must not reveal the phone."""
     binpath = await _install_fake_svc(backend, agent_id)
     conv = "groupchat-3"
     inject = {"wrappers": [{"name": "svc", "binary_path": binpath,

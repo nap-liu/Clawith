@@ -9325,14 +9325,14 @@ async def build_cli_injection(
     user_id: Optional[uuid.UUID],
     only_tool_names: Optional[set[str]] = None,
 ) -> Optional[dict]:
-    """Build the per-exec CLI injection: identity-carrying wrapper specs.
+    """Build the per-exec CLI injection used to create signed contexts.
 
     Returns ``{"wrappers": [{"name", "binary_path", "env": {...}}, ...]}`` or
     None when the agent has no enabled CLI tool with a binary (the common
-    case — zero overhead for non-CLI deployments). Each wrapper carries its own
-    tool's identity ``env``; the backend writes it inside the wrapper's exec
-    line (scoped to the binary process), never the session env — so identity
-    can't persist across senders in a shared conversation (see sandbox_inject).
+    case — zero overhead for non-CLI deployments). The backend signs each
+    tool's resolved ``env`` into a short-lived, process-scoped context. Static
+    launchers under ``$HOME/.local/bin`` contain no identity, so identity cannot
+    persist across senders in a shared conversation (see sandbox_inject).
 
     Identity binding follows the call origin, via the `user_id` the caller
     threads in:
@@ -9342,12 +9342,11 @@ async def build_cli_injection(
         behalf, using the owner's data permissions (cron reports rely on this);
       - A2A consult (passes the source agent's ``owner_id``) → the source
         agent's creator.
-    The resolved identity (phone / tokens / $state.dir) rides on each wrapper's
-    ``env``. Only when ``user_id`` is None or the User row is missing are the
-    identity entries ($user.*/$state.*) dropped — that wrapper then runs the CLI
-    identity-less (NOT_LOGGED_IN) rather than impersonating; because the wrapper
-    is rewritten every exec, a prior sender's identity is overwritten, not
-    inherited.
+    The resolved identity (phone / tokens / $state.dir) rides in each execution
+    context. Only when ``user_id`` is None or the User row is missing are the
+    identity entries ($user.*/$state.*) dropped. A launcher invoked outside the
+    current signed execution scope fails closed rather than inheriting a prior
+    sender's identity.
 
     ``only_tool_names`` restricts to those CLI tool names (standalone CLI-tool
     LLM functions inject just their own tool); None → all visible CLI tools
@@ -9445,10 +9444,9 @@ async def build_cli_injection(
                 tenant={"id": tenant_key if tenant_key != "_global" else ""},
                 state=state_ctx,
             )
-            # Each wrapper carries ONLY its own tool's identity env (no merged
-            # top-level env): the env rides inside the wrapper's exec line, so a
-            # tool's token can't leak into another tool's call or persist in the
-            # session — per-session isolation, see sandbox_inject docstring.
+            # Keep each tool's resolved env separate. The AIO backend signs it
+            # into that tool's process-local context; it is never merged into a
+            # persistent shell/Jupyter environment.
             wrappers.append({
                 "name": tool.name,
                 "binary_path": str(binary_path),

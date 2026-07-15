@@ -1,97 +1,45 @@
-"""Build the CLI-tool sandbox injection (identity-carrying PATH wrappers).
+"""Render identity-safe CLI launchers for aio-sandbox executions.
 
-Each type='cli' tool (e.g. `svc`) is exposed to the agent's sandbox as a real
-command on PATH via a wrapper script that carries the caller's identity as an
-``env`` prefix on the exec line:
+CLI commands live in the agent's standard ``$HOME/.local/bin`` directory.  A
+launcher is stable across conversations and contains no caller identity.  The
+current caller's resolved environment is carried by a short-lived, signed
+execution context in a process-local environment variable instead.
 
-    <bindir>/svc  ->  #!/bin/sh
-                      exec env YYBPC_CLI_USER_PHONE='138...' YYBPC_CLI_HOME='...' \\
-                          '/data/cli_binaries/<...>/<sha>.bin' "$@"
-
-Why identity lives in the WRAPPER, not the session env
-------------------------------------------------------
-The shell session is per-conversation and persistent (so the agent's own
-``export``/``cd`` survive across calls — a documented session semantic). If we
-exported identity into that session it would persist too, and in a multi-user
-group IM conversation a later sender (or an exec whose injection couldn't be
-built) would inherit the previous sender's identity — cross-user impersonation
-with zero malice. Putting identity on the wrapper's exec line instead means:
-
-  * the identity is scoped to the binary process (and its pipes / subprocesses),
-    never the session env — `env` / logs never show another user's phone;
-  * every exec REWRITES the wrapper with the *current* sender's identity, so a
-    prior sender's identity cannot persist (correct-by-construction, not
-    "re-export wins");
-  * fail-safe: if the injection can't be built (DB blip, deleted binary), NO
-    wrapper is written → `svc` is simply `command not found`, never run under a
-    stale identity.
-
-Per-conversation bindir
------------------------
-The wrapper is written to a per-conversation directory (``bindir``, keyed by a
-hash of the session anchor) that the caller prepends to PATH. A per-agent shared
-path would race across concurrent conversations (two senders rewriting the same
-``svc`` file). The bindir is computed by the backend (which knows the anchor)
-and passed in.
-
-Trust model (current): the wrapper file holds the identity in cleartext on disk;
-a malicious agent in the sandbox could `cat` it (and historical per-anchor
-wrappers, bounded by the LRU). Accepted for the trusted-agent scenario (the
-agent can sudo anyway, spec v4 §1.3); what this design closes is *automatic*
-cross-user leakage. Hardening = per-conversation signed token, tracked
-separately.
-
-Paths need no translation: backend and sandbox mount the same named volumes at
-the same paths (/data/cli_binaries ro, /data/cli_state rw).
-
-Split: pure rendering functions here (unit-tested); the DB-touching builder
-(`build_cli_injection`) lives in agent_tools.
+This keeps foreground shells, Jupyter kernels and managed background jobs in
+the same filesystem/PATH namespace without allowing one sender's identity to
+persist into the next execution.  A launcher without a valid context fails
+closed with exit code 126.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import re
+import time
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from app.config import get_settings
 from app.services.cli_tools.placeholders import PlaceholderContext, resolve
 
-# Strict shell-identifier — for ENV KEYS, which become `export KEY=` / `env KEY=`
-# on the wrapper exec line and so must be valid shell identifiers (no dashes).
 _FUNC_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-# CLI tool / wrapper / LLM-function names. A hyphen is allowed here (e.g. a tool
-# named `my-cli`): it is a valid PATH command + filename, and a valid
-# OpenAI/Anthropic/qwen function name (`^[a-zA-Z0-9_-]{1,64}$`). The leading char
-# is still restricted so the name can never be parsed as a flag (`-x`).
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
-
-# Per-conversation wrapper directories live under this dir in the sandbox user's
-# home (resolved at runtime — bash: $HOME; python: expanduser). The leaf is a
-# hash of the session anchor (computed by the backend), giving each conversation
-# its own `svc` so concurrent conversations don't race on one shared file.
-_WRAPPER_BIN_ROOT = ".clawith-bin"
-
-# Env entries referencing these roots are identity-scoped: when the caller
-# supplied no user context (placeholder resolves to itself) they are skipped
-# so the CLI sees no identity at all (and reports its own NOT_LOGGED_IN)
-# instead of a fake empty one. The caller (build_cli_injection) decides the
-# user context from the call origin — web/IM = conversation user, trigger/cron
-# = agent creator, A2A consult = source agent owner.
 _IDENTITY_ROOTS = ("$user.", "$state.")
+_LOCAL_BIN = "$HOME/.local/bin"
+_MANAGED_MARKER = "# aio-managed-cli-launcher:v1"
+_TOKEN_VERSION = 1
 
 
 def shell_quote(value: str) -> str:
-    """Single-quote `value` for bash, escaping embedded single quotes."""
+    """Single-quote ``value`` for bash, escaping embedded single quotes."""
     return "'" + str(value).replace("'", "'\\''") + "'"
 
 
 def render_env(env: dict[str, str], ctx: PlaceholderContext) -> dict[str, str]:
-    """Resolve placeholder values; drop identity entries with no context.
-
-    An identity-prefixed entry ($user./$state.) is dropped when its value does
-    not resolve (token comes back unchanged) — e.g. no user in context, or a
-    typo'd field.
-    """
+    """Resolve placeholder values; drop identity entries with no context."""
     out: dict[str, str] = {}
     for key, raw in env.items():
         resolved = resolve(raw, ctx)
@@ -112,68 +60,204 @@ def _validate_env_keys(env: dict[str, str]) -> None:
             raise ValueError(f"unsafe env key: {key!r}")
 
 
-def _wrapper_content(binary_path: str, env: dict[str, str]) -> str:
-    """The wrapper script body: `exec [env K='v'...] '<binary>' "$@"`.
-
-    Identity rides as an ``env`` prefix so it is scoped to the binary process
-    (and its pipes / subprocesses), never the shell session. Empty env → a plain
-    ``exec`` (identity-less; the binary reports its own NOT_LOGGED_IN).
-    """
-    _validate_env_keys(env)
-    if env:
-        assigns = " ".join(f"{k}={shell_quote(v)}" for k, v in env.items())
-        exec_line = f"exec env {assigns} {shell_quote(binary_path)} \"$@\""
-    else:
-        exec_line = f"exec {shell_quote(binary_path)} \"$@\""
-    return f"#!/bin/sh\n{exec_line}\n"
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def build_wrapper_write_sh(
-    *, name: str, binary_path: str, env: dict[str, str], bindir: str
-) -> str:
-    """Bash that (re)writes one tool's identity-carrying wrapper into ``bindir``.
+def _signing_key() -> Ed25519PrivateKey:
+    # Deterministic deployment key: backend replicas using the same application
+    # secret emit contexts accepted by the same identity-free launcher.
+    seed = hashlib.sha256(
+        (get_settings().SECRET_KEY + ":aio-cli-context:v1").encode()
+    ).digest()
+    return Ed25519PrivateKey.from_private_bytes(seed)
 
-    ``bindir`` is the per-conversation wrapper dir (already quoted for bash, e.g.
-    ``"$HOME/.clawith-bin/<hash>"``) that the caller prepends to PATH. Rewritten
-    every exec with the *current* sender's ``env`` so a prior sender's identity
-    cannot persist. Content is base64'd to avoid quoting pitfalls; ``name`` and
-    every env key are validated so they're safe as a filename / env assignment.
-    """
+
+def context_env_name(name: str) -> str:
+    """Return the neutral, shell-safe execution-context variable for a tool."""
     _validate_name(name)
-    b64 = base64.b64encode(_wrapper_content(binary_path, env).encode()).decode()
+    suffix = hashlib.sha256(name.encode()).hexdigest()[:16].upper()
+    return f"AIO_CLI_CONTEXT_{suffix}"
+
+
+def _launcher_content(
+    *, name: str, binary_path: str, context_env: str, public_key_b64: str
+) -> str:
+    """Build a static launcher containing no identity or per-exec secret."""
+    _validate_name(name)
+    # repr() values are backend-controlled after strict tool-name validation;
+    # the result is Python source, not shell source.
+    return f'''#!/usr/bin/env python3
+{_MANAGED_MARKER}
+import base64
+import json
+import os
+import sys
+import time
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+TOOL = {name!r}
+BINARY = {binary_path!r}
+CONTEXT_ENV = {context_env!r}
+PUBLIC_KEY = {public_key_b64!r}
+
+def _decode(value):
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+def _fail(message):
+    sys.stderr.write("aio cli: " + message + "\\n")
+    raise SystemExit(126)
+
+token = os.environ.get(CONTEXT_ENV)
+if not token:
+    _fail("valid execution context required for " + TOOL)
+try:
+    payload_part, signature_part = token.split(".", 1)
+    payload = _decode(payload_part)
+    Ed25519PublicKey.from_public_bytes(_decode(PUBLIC_KEY)).verify(
+        _decode(signature_part), payload
+    )
+    context = json.loads(payload)
+except Exception:
+    _fail("invalid execution context for " + TOOL)
+
+now = int(time.time())
+if (
+    context.get("v") != {_TOKEN_VERSION}
+    or context.get("tool") != TOOL
+    or context.get("binary") != BINARY
+    or not isinstance(context.get("env"), dict)
+    or int(context.get("iat", 0)) > now + 60
+    or int(context.get("exp", 0)) < now
+):
+    _fail("expired or mismatched execution context for " + TOOL)
+
+child_env = os.environ.copy()
+child_env.pop(CONTEXT_ENV, None)
+for key, value in context["env"].items():
+    if not isinstance(key, str) or not isinstance(value, str):
+        _fail("invalid environment in execution context for " + TOOL)
+    child_env[key] = value
+os.execve(BINARY, [BINARY, *sys.argv[1:]], child_env)
+'''
+
+
+def prepare_launchers(
+    wrappers: list[dict], *, ttl_seconds: int
+) -> list[dict[str, str]]:
+    """Sign per-exec contexts and return identity-free launcher specs."""
+    ttl = max(1, int(ttl_seconds))
+    now = int(time.time())
+    private_key = _signing_key()
+    public_key_b64 = _b64url(
+        private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    )
+    prepared: list[dict[str, str]] = []
+    for wrapper in wrappers:
+        name = wrapper["name"]
+        binary_path = str(wrapper["binary_path"])
+        env = {str(k): str(v) for k, v in (wrapper.get("env") or {}).items()}
+        _validate_name(name)
+        _validate_env_keys(env)
+        context_env = context_env_name(name)
+        payload = json.dumps(
+            {
+                "v": _TOKEN_VERSION,
+                "tool": name,
+                "binary": binary_path,
+                "env": env,
+                "iat": now,
+                "exp": now + ttl,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        prepared.append(
+            {
+                "name": name,
+                "context_env": context_env,
+                "context_token": (
+                    f"{_b64url(payload)}.{_b64url(private_key.sign(payload))}"
+                ),
+                "launcher": _launcher_content(
+                    name=name,
+                    binary_path=binary_path,
+                    context_env=context_env,
+                    public_key_b64=public_key_b64,
+                ),
+            }
+        )
+    return prepared
+
+
+def build_launcher_write_sh(launcher: dict[str, str]) -> str:
+    """Bash that atomically installs one managed launcher in ``.local/bin``.
+
+    A non-managed file with the same name is never overwritten.  The setup
+    fails before user code runs so command resolution cannot silently fall
+    through to a different executable.
+    """
+    name = launcher["name"]
+    _validate_name(name)
+    content = launcher["launcher"]
+    encoded = base64.b64encode(content.encode()).decode()
+    target = f'"{_LOCAL_BIN}/{name}"'
+    temp = f'"{_LOCAL_BIN}/.{name}.aio-tmp-$$"'
     return (
-        f"mkdir -p {bindir} && "
-        f"echo {b64} | base64 -d > {bindir}/{name} && "
-        f"chmod 755 {bindir}/{name}"
+        f"mkdir -p \"{_LOCAL_BIN}\" && "
+        f"if [ -e {target} ] && ! grep -Fqx {_MANAGED_MARKER!r} {target}; then "
+        f"echo 'aio cli: refusing to overwrite unmanaged {_LOCAL_BIN}/{name}' >&2; false; "
+        f"else echo {encoded} | base64 -d > {temp} && chmod 755 {temp} && mv -f {temp} {target}; fi"
     )
 
 
-def build_python_prelude(wrappers: list[dict], bindir: str) -> str:
-    """Python prepended to a python exec: write the identity-carrying wrappers
-    into ``bindir`` and prepend ``bindir`` to PATH.
-
-    Identity is NOT written to ``os.environ`` — it rides inside each wrapper (env
-    prefix), so a persistent kernel's ``os.environ`` can never leak a prior
-    sender's identity. ``subprocess.run(['svc', ...])`` finds `svc` on PATH and
-    the wrapper supplies the identity. ``bindir`` is an expanduser-style path
-    (e.g. ``~/.clawith-bin/<hash>``); ``_``-prefixed locals avoid clashing with
-    the user's code.
-    """
+def build_python_execution(
+    wrappers: list[dict], code: str, *, ttl_seconds: int
+) -> str:
+    """Wrap one Jupyter cell with launcher setup and scoped identity context."""
+    launchers = prepare_launchers(wrappers, ttl_seconds=ttl_seconds)
+    user_code = base64.b64encode(code.encode()).decode()
     lines = [
-        "import os as _os, base64 as _b64, shutil as _shutil",
-        f"_bindir = _os.path.expanduser({bindir!r})",
-        # Clear any PRIOR sender's wrappers first — the wrapper set must reflect
-        # THIS exec's sender (no wrappers below → empty dir → svc not found).
-        "_shutil.rmtree(_bindir, ignore_errors=True)",
-        "_os.makedirs(_bindir, exist_ok=True)",
-        "_os.environ['PATH'] = _bindir + ':' + _os.environ.get('PATH', '')",
+        "import os as _aio_os, base64 as _aio_b64",
+        "_aio_bindir = _aio_os.path.expanduser('~/.local/bin')",
+        "_aio_os.makedirs(_aio_bindir, exist_ok=True)",
+        "_aio_path = _aio_os.environ.get('PATH', '')",
+        "if _aio_bindir not in _aio_path.split(':'):",
+        "    _aio_os.environ['PATH'] = _aio_bindir + ':' + _aio_path",
     ]
-    for w in wrappers:
-        name = w["name"]
-        _validate_name(name)
-        content = _wrapper_content(w["binary_path"], w.get("env") or {})
-        b64 = base64.b64encode(content.encode()).decode()
-        lines.append(f"_p = _os.path.join(_bindir, {name!r})")
-        lines.append(f"open(_p, 'wb').write(_b64.b64decode({b64!r}))")
-        lines.append("_os.chmod(_p, 0o755)")
+    for launcher in launchers:
+        name = launcher["name"]
+        encoded = base64.b64encode(launcher["launcher"].encode()).decode()
+        lines.extend(
+            [
+                f"_aio_target = _aio_os.path.join(_aio_bindir, {name!r})",
+                "if _aio_os.path.exists(_aio_target):",
+                "    with open(_aio_target, 'r', encoding='utf-8', errors='replace') as _aio_f:",
+                f"        if {_MANAGED_MARKER!r} not in _aio_f.read().splitlines():",
+                "            raise RuntimeError('aio cli: refusing to overwrite unmanaged ' + _aio_target)",
+                "_aio_temp = _aio_target + '.aio-tmp-' + str(_aio_os.getpid())",
+                f"with open(_aio_temp, 'wb') as _aio_f: _aio_f.write(_aio_b64.b64decode({encoded!r}))",
+                "_aio_os.chmod(_aio_temp, 0o755)",
+                "_aio_os.replace(_aio_temp, _aio_target)",
+            ]
+        )
+    lines.append("_aio_previous = {}")
+    lines.append("_aio_missing = object()")
+    lines.append("try:")
+    for launcher in launchers:
+        key = launcher["context_env"]
+        token = launcher["context_token"]
+        lines.append(f"    _aio_previous[{key!r}] = _aio_os.environ.get({key!r}, _aio_missing)")
+        lines.append(f"    _aio_os.environ[{key!r}] = {token!r}")
+    lines.append(
+        f"    exec(compile(_aio_b64.b64decode({user_code!r}), '<aio-cell>', 'exec'), globals(), globals())"
+    )
+    lines.append("finally:")
+    lines.append("    for _aio_key, _aio_value in _aio_previous.items():")
+    lines.append("        if _aio_value is _aio_missing: _aio_os.environ.pop(_aio_key, None)")
+    lines.append("        else: _aio_os.environ[_aio_key] = _aio_value")
     return "\n".join(lines)

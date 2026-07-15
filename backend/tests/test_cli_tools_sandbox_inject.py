@@ -1,21 +1,17 @@
-"""Pure-function tests for the sandbox CLI injection block builder."""
+"""Pure-function tests for identity-safe aio CLI launchers."""
+import os
+import subprocess
+
 import pytest
 
 from app.services.cli_tools.sandbox_inject import (
-    build_wrapper_write_sh,
-    build_python_prelude,
+    build_launcher_write_sh,
+    build_python_execution,
+    prepare_launchers,
     render_env,
     shell_quote,
 )
 from app.services.cli_tools.placeholders import PlaceholderContext
-
-
-def _decode_wrapper(text: str) -> str:
-    import base64
-    import re
-    m = re.search(r"echo ([A-Za-z0-9+/=]+) \| base64 -d", text)
-    assert m, f"no base64 block found in: {text}"
-    return base64.b64decode(m.group(1)).decode()
 
 
 def test_shell_quote_wraps_and_escapes():
@@ -23,75 +19,89 @@ def test_shell_quote_wraps_and_escapes():
     assert shell_quote("a'b") == "'a'\\''b'"
 
 
-def test_build_wrapper_write_sh_embeds_identity_env_and_writes_to_bindir():
-    """Identity rides INSIDE the wrapper as an `env` prefix (scoped to the
-    binary process), and the wrapper is written to the per-conversation bindir
-    — never the session environment. This is the per-session isolation contract:
-    the next exec rewrites the wrapper with the current sender's identity, so a
-    prior sender's identity can never persist in the shell env."""
-    text = build_wrapper_write_sh(
-        name="svc",
-        binary_path="/data/cli_binaries/_global/t1/aa.bin",
-        env={"YYBPC_CLI_USER_PHONE": "13800000000", "YYBPC_CLI_HOME": "/data/cli_state/x"},
-        bindir='"$HOME/.clawith-bin/abc123"',
+def test_launcher_is_identity_free_and_targets_standard_local_bin():
+    prepared = prepare_launchers([{
+        "name": "svc",
+        "binary_path": "/data/cli_binaries/_global/t1/aa.bin",
+        "env": {"YYBPC_CLI_USER_PHONE": "13800000000"},
+    }], ttl_seconds=60)
+    launcher = prepared[0]
+    assert "13800000000" not in launcher["launcher"]
+    assert "YYBPC_CLI_USER_PHONE" not in launcher["launcher"]
+    assert "AIO_CLI_CONTEXT_" in launcher["launcher"]
+    write_sh = build_launcher_write_sh(launcher)
+    assert '"$HOME/.local/bin/svc"' in write_sh
+    assert ".clawith-bin" not in write_sh
+    assert ".jobs" not in write_sh
+
+
+def test_signed_context_executes_binary_and_is_not_forwarded(tmp_path):
+    binary = tmp_path / "binary"
+    binary.write_text(
+        "#!/bin/sh\nprintf '%s|' \"$IDENTITY\"\n"
+        "env | grep '^AIO_CLI_CONTEXT_' || true\n"
     )
-    assert 'mkdir -p "$HOME/.clawith-bin/abc123"' in text
-    assert "chmod 755" in text
-    assert '"$HOME/.clawith-bin/abc123"/svc' in text
-    decoded = _decode_wrapper(text)
-    assert "#!/bin/sh" in decoded
-    # Identity is an `env` prefix on the exec line — confined to the binary.
-    assert (
-        "exec env YYBPC_CLI_USER_PHONE='13800000000' YYBPC_CLI_HOME='/data/cli_state/x' "
-        "'/data/cli_binaries/_global/t1/aa.bin' \"$@\"" in decoded
+    binary.chmod(0o755)
+    launcher = prepare_launchers([{
+        "name": "svc", "binary_path": str(binary), "env": {"IDENTITY": "user-a"},
+    }], ttl_seconds=60)[0]
+    launcher_path = tmp_path / "svc"
+    launcher_path.write_text(launcher["launcher"])
+    launcher_path.chmod(0o755)
+    env = os.environ.copy()
+    env[launcher["context_env"]] = launcher["context_token"]
+    result = subprocess.run([str(launcher_path)], env=env, text=True, capture_output=True)
+    assert result.returncode == 0
+    assert result.stdout == "user-a|"
+
+
+def test_launcher_fails_closed_for_missing_or_tampered_context(tmp_path):
+    prepared = prepare_launchers([{
+        "name": "svc", "binary_path": "/bin/true", "env": {},
+    }], ttl_seconds=60)[0]
+    launcher_path = tmp_path / "svc"
+    launcher_path.write_text(prepared["launcher"])
+    launcher_path.chmod(0o755)
+    missing = subprocess.run([str(launcher_path)], text=True, capture_output=True)
+    assert missing.returncode == 126
+    env = os.environ.copy()
+    env[prepared["context_env"]] = prepared["context_token"] + "x"
+    tampered = subprocess.run([str(launcher_path)], env=env, text=True, capture_output=True)
+    assert tampered.returncode == 126
+
+
+@pytest.mark.parametrize("name", ["bad name; rm", "svc\n"])
+def test_prepare_launchers_rejects_unsafe_name(name):
+    with pytest.raises(ValueError):
+        prepare_launchers([{"name": name, "binary_path": "/x", "env": {}}], ttl_seconds=60)
+
+
+def test_prepare_launchers_rejects_unsafe_env_key():
+    with pytest.raises(ValueError):
+        prepare_launchers([{
+            "name": "svc", "binary_path": "/x", "env": {"A; rm -rf /": "v"},
+        }], ttl_seconds=60)
+
+
+def test_python_execution_uses_local_bin_and_restores_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    binary = tmp_path / "binary"
+    binary.write_text("#!/bin/sh\nprintf '%s' \"$MY_KEY\"\n")
+    binary.chmod(0o755)
+    wrapped = build_python_execution(
+        [{"name": "svc", "binary_path": str(binary), "env": {"MY_KEY": "my_val"}}],
+        "import subprocess\nanswer = subprocess.check_output(['svc'], text=True)",
+        ttl_seconds=60,
     )
-
-
-def test_build_wrapper_write_sh_no_env_is_plain_exec():
-    """No identity (e.g. unmapped sender) → wrapper has no env prefix, so the
-    binary runs identity-less and reports its own NOT_LOGGED_IN. Crucially the
-    wrapper is still rewritten, overwriting any prior sender's identity."""
-    text = build_wrapper_write_sh(
-        name="svc", binary_path="/b.bin", env={}, bindir='"$HOME/.clawith-bin/z"'
-    )
-    decoded = _decode_wrapper(text)
-    assert "exec '/b.bin' \"$@\"" in decoded
-    assert "exec env" not in decoded
-
-
-def test_build_wrapper_write_sh_rejects_unsafe_name():
-    with pytest.raises(ValueError):
-        build_wrapper_write_sh(name="bad name; rm", binary_path="/x", env={}, bindir='"$HOME/b"')
-
-
-def test_build_wrapper_write_sh_rejects_trailing_newline_name():
-    with pytest.raises(ValueError):
-        build_wrapper_write_sh(name="svc\n", binary_path="/x", env={}, bindir='"$HOME/b"')
-
-
-def test_build_wrapper_write_sh_rejects_unsafe_env_key():
-    with pytest.raises(ValueError):
-        build_wrapper_write_sh(
-            name="svc", binary_path="/x", env={"A; rm -rf /": "v"}, bindir='"$HOME/b"'
-        )
-
-
-def test_build_python_prelude_wrapper_carries_env_path_only_no_identity():
-    """Python path: identity rides in the wrapper (env prefix), os.environ gets
-    only PATH (the per-conversation bindir) — NEVER the identity. So a stale
-    kernel os.environ can't leak a prior sender's identity."""
-    wrappers = [{"name": "svc", "binary_path": "/data/cli_binaries/x.bin", "env": {"MY_KEY": "my_val"}}]
-    prelude = build_python_prelude(wrappers, bindir="~/.clawith-bin/abc123")
-    assert "import os as _os" in prelude
-    assert "expanduser" in prelude
-    assert ".clawith-bin/abc123" in prelude
-    assert "svc" in prelude
-    # Identity value appears ONLY inside the wrapper content (base64), not as a
-    # bare os.environ assignment.
-    assert "_os.environ.update" not in prelude
-    assert "_os.environ['MY_KEY']" not in prelude
-    # PATH is prepended with the bindir.
-    assert "_os.environ['PATH']" in prelude
+    assert "~/.local/bin" in wrapped
+    assert ".clawith-bin" not in wrapped
+    assert ".jobs" not in wrapped
+    assert "finally:" in wrapped
+    assert "_aio_os.environ.pop" in wrapped
+    scope = {}
+    exec(wrapped, scope, scope)
+    assert scope["answer"] == "my_val"
+    assert not any(key.startswith("AIO_CLI_CONTEXT_") for key in os.environ)
 
 
 def test_render_env_resolves_placeholders_and_skips_userless_identity():
@@ -632,41 +642,30 @@ async def test_same_tenant_admin_tool_injected(cli_inject_session_agents, monkey
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def test_build_wrapper_write_sh_accepts_hyphenated_name():
-    """A hyphenated tool name (canonical `my-cli`) is a valid wrapper filename
-    and must not be rejected."""
-    text = build_wrapper_write_sh(
-        name="my-cli",
-        binary_path="/data/cli_binaries/_global/t1/aa.bin",
-        env={"YYBPC_CLI_HOME": "/data/cli_state/x"},
-        bindir='"$HOME/.clawith-bin/abc123"',
-    )
-    assert '"$HOME/.clawith-bin/abc123"/my-cli' in text
-    decoded = _decode_wrapper(text)
-    assert "#!/bin/sh" in decoded
-    assert (
-        "exec env YYBPC_CLI_HOME='/data/cli_state/x' "
-        "'/data/cli_binaries/_global/t1/aa.bin' \"$@\"" in decoded
-    )
+def test_launcher_accepts_hyphenated_name():
+    launcher = prepare_launchers([{
+        "name": "my-cli",
+        "binary_path": "/data/cli_binaries/_global/t1/aa.bin",
+        "env": {"YYBPC_CLI_HOME": "/data/cli_state/x"},
+    }], ttl_seconds=60)[0]
+    text = build_launcher_write_sh(launcher)
+    assert '"$HOME/.local/bin/my-cli"' in text
+    assert "YYBPC_CLI_HOME" not in launcher["launcher"]
 
 
-def test_build_python_prelude_accepts_hyphenated_name():
-    """The python-exec prelude must write a wrapper for a hyphenated tool name."""
+def test_python_execution_accepts_hyphenated_name():
     wrappers = [{"name": "my-cli", "binary_path": "/data/cli_binaries/x.bin", "env": {}}]
-    prelude = build_python_prelude(wrappers, bindir="~/.clawith-bin/abc123")
-    assert "my-cli" in prelude
+    wrapped = build_python_execution(wrappers, "pass", ttl_seconds=60)
+    assert "my-cli" in wrapped
 
 
-def test_build_wrapper_write_sh_still_rejects_hyphenated_env_key():
+def test_prepare_launchers_still_rejects_hyphenated_env_key():
     """Relaxing the NAME rule must NOT relax env-key validation: an env key with a
     hyphen is invalid as `export`/`env KEY=` and must still raise."""
     with pytest.raises(ValueError):
-        build_wrapper_write_sh(
-            name="my-cli",
-            binary_path="/x",
-            env={"BAD-KEY": "v"},
-            bindir='"$HOME/b"',
-        )
+        prepare_launchers([{
+            "name": "my-cli", "binary_path": "/x", "env": {"BAD-KEY": "v"},
+        }], ttl_seconds=60)
 
 
 @pytest.mark.asyncio
