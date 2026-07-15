@@ -81,7 +81,7 @@ async def test_hard_timeout_is_exit_124_without_deleting_stateful_session():
     client.delete.assert_not_awaited()
 
 
-async def test_unexpected_running_fallback_deletes_but_does_not_immediately_recreate():
+async def test_running_busy_fallback_preserves_stateful_session():
     backend = _backend()
     backend._shell_exec = AsyncMock(
         return_value=(
@@ -111,5 +111,6 @@ async def test_unexpected_running_fallback_deletes_but_does_not_immediately_recr
 
     assert result.success is False
     assert result.exit_code == 124
-    client.delete.assert_awaited_once()
+    assert "SESSION_BUSY" in (result.error or "")
+    client.delete.assert_not_awaited()
     backend._create_shell_session.assert_not_awaited()

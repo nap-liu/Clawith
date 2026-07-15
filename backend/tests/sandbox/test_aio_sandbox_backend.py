@@ -470,3 +470,142 @@ async def test_user_export_still_persists_across_calls_with_inject(backend, agen
                               work_dir="/data/agents", agent_id=agent_id,
                               conversation_id=conv, inject=inject)
     assert "mine=persisted-42" in r.stdout
+
+
+# ---------------------------------------------------------- managed background Jobs
+
+
+async def _stop_all_jobs(backend, agent_id: str, conversation_id: str) -> None:
+    listed = await backend.manage_background_jobs(
+        action="list_jobs",
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+    )
+    for job in listed.get("jobs", []):
+        await backend.manage_background_jobs(
+            action="job_stop",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            job_id=job["job_id"],
+            work_dir="/data/agents",
+        )
+
+
+async def test_multiple_jobs_are_independently_managed_per_chat_session(
+    backend, agent_id
+):
+    conversation_id = f"jobs-{uuid.uuid4().hex[:8]}"
+    try:
+        first = await backend.start_background_job(
+            code="echo first-ready; sleep 20",
+            language="bash",
+            timeout=30,
+            work_dir="/data/agents",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+        second = await backend.start_background_job(
+            code="echo second-ready; sleep 20",
+            language="bash",
+            timeout=30,
+            work_dir="/data/agents",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+        assert first["success"] is True
+        assert second["success"] is True
+        assert first["job_id"] != second["job_id"]
+
+        listed = await backend.manage_background_jobs(
+            action="list_jobs",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+        assert {item["job_id"] for item in listed["jobs"]} == {
+            first["job_id"],
+            second["job_id"],
+        }
+
+        stopped = await backend.manage_background_jobs(
+            action="job_stop",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            job_id=first["job_id"],
+            work_dir="/data/agents",
+        )
+        assert stopped["success"] is True
+
+        survivor = await backend.manage_background_jobs(
+            action="job_status",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            job_id=second["job_id"],
+        )
+        assert survivor["success"] is True
+        assert survivor["status"] == "running"
+    finally:
+        await _stop_all_jobs(backend, agent_id, conversation_id)
+
+
+async def test_background_and_foreground_share_localhost_and_agent_files(
+    backend, agent_id
+):
+    conversation_id = f"interop-{uuid.uuid4().hex[:8]}"
+    token = uuid.uuid4().hex
+    port = 20000 + int(token[:4], 16) % 20000
+    marker = f"aio-job-{token}.txt"
+    code = f"printf '%s' {marker} > {marker}; python -u -m http.server {port} --bind 127.0.0.1"
+    try:
+        job = await backend.start_background_job(
+            code=code,
+            language="bash",
+            timeout=30,
+            work_dir="/data/agents",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+        assert job["success"] is True
+
+        foreground = await backend.execute(
+            code=(
+                "body=''; "
+                "for i in $(seq 1 30); do "
+                f"body=$(curl -fsS http://127.0.0.1:{port}/{marker}) && "
+                "break; sleep .1; done; test -n \"$body\" && printf '%s' \"$body\""
+            ),
+            language="bash",
+            timeout=10,
+            work_dir="/data/agents",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+        assert foreground.success is True
+        assert marker in foreground.stdout
+    finally:
+        await _stop_all_jobs(backend, agent_id, conversation_id)
+
+
+async def test_running_job_logs_are_available_before_process_exits(backend, agent_id):
+    conversation_id = f"logs-{uuid.uuid4().hex[:8]}"
+    try:
+        job = await backend.start_background_job(
+            code="echo authorization-code-123; sleep 20",
+            language="bash",
+            timeout=30,
+            work_dir="/data/agents",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+        assert job["success"] is True
+
+        logs = await backend.manage_background_jobs(
+            action="job_logs",
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            job_id=job["job_id"],
+            work_dir="/data/agents",
+        )
+        assert logs["status"] == "running"
+        assert "authorization-code-123" in logs["output"]
+    finally:
+        await _stop_all_jobs(backend, agent_id, conversation_id)

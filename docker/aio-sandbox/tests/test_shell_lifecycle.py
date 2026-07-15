@@ -212,6 +212,51 @@ class ShellLifecycleTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertTrue(wait_pid_gone(bg_pid), f"background PID {bg_pid} survived DELETE")
 
+    def test_busy_session_fails_fast_without_interrupting_active_command(self):
+        """A second command must not queue behind a long-running command."""
+        status, started = request(
+            "POST",
+            "/v1/shell/exec",
+            {
+                "id": self.session_id,
+                "command": "echo job-ready; sleep 2; echo job-finished",
+                "async_mode": True,
+                "timeout": 8,
+            },
+        )
+        self.assertEqual(status, 200, started)
+        self.assertTrue(started["success"], started)
+
+        began = time.monotonic()
+        status, busy = request(
+            "POST",
+            "/v1/shell/exec",
+            {
+                "id": self.session_id,
+                "command": "echo must-not-run",
+                "timeout": 5,
+            },
+        )
+        elapsed = time.monotonic() - began
+        self.assertEqual(status, 200, busy)
+        self.assertFalse(busy["success"], busy)
+        self.assertEqual(busy["data"]["status"], "running", busy)
+        self.assertIn("Session busy", busy["message"])
+        self.assertLess(elapsed, 1, busy)
+
+        deadline = time.monotonic() + 5
+        viewed = None
+        while time.monotonic() < deadline:
+            _, viewed = request(
+                "POST", "/v1/shell/view", {"id": self.session_id}
+            )
+            if viewed["data"]["status"] != "running":
+                break
+            time.sleep(0.1)
+        self.assertEqual(viewed["data"]["status"], "completed", viewed)
+        self.assertIn("job-finished", viewed["data"]["output"])
+        self.assertNotIn("must-not-run", viewed["data"]["output"])
+
 
 class ShellLifecycleStressTest(unittest.TestCase):
     def test_many_precreated_sessions_timeout_simultaneously(self):

@@ -211,6 +211,27 @@ async def exec_command(request: ShellExecRequest, http_request: Request):
         if not session:
             raise ResourceNotFoundException('Session not found')
 
+    # One tmux shell can execute only one foreground command at a time. Do not
+    # queue a second request behind the per-session execution lock: its timeout
+    # would be consumed while waiting and callers could misclassify the result
+    # as a failed hard termination. Long-lived work belongs in a dedicated AIO
+    # job session, while an occupied foreground shell fails fast and stays
+    # untouched.
+    if _session_has_active_command(session):
+        busy_result = ShellCommandResult(
+            session_id=session_id,
+            command=request.command,
+            status=BashCommandStatus.RUNNING,
+            output=None,
+            console=None,
+            exit_code=None,
+        )
+        return Response(
+            success=False,
+            message='Session busy: another command is already running',
+            data=busy_result.model_dump(),
+        )
+
     """
     FIXME: sse output bug: output will stuck sse pipeline finished
     """

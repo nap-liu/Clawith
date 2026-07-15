@@ -25,6 +25,12 @@ class _FakeSandboxConfig:
 def _make_mock_backend():
     backend = MagicMock()
     backend.execute = AsyncMock(return_value=MagicMock())
+    backend.start_background_job = AsyncMock(
+        return_value={"success": True, "status": "running", "job_id": "job_123"}
+    )
+    backend.manage_background_jobs = AsyncMock(
+        return_value={"success": True, "status": "ok", "jobs": []}
+    )
     backend._format_result = MagicMock(return_value="ok")
     return backend
 
@@ -85,6 +91,61 @@ async def test_execute_code_without_session_passes_none(tmp_path):
         )
 
     assert mock_backend.execute.call_args.kwargs.get("conversation_id") is None
+
+
+@pytest.mark.asyncio
+async def test_background_execute_uses_same_session_and_injection(tmp_path):
+    from app.services.agent_tools import _execute_code
+
+    agent_id = uuid.uuid4()
+    injection = {"wrappers": [{"name": "svc", "binary_path": "/x"}]}
+    mock_backend = _make_mock_backend()
+    p1, p2, p3, p4 = _patches(mock_backend)
+    with p1, p2, p3, p4:
+        await _execute_code(
+            agent_id,
+            tmp_path,
+            {
+                "language": "bash",
+                "code": "svc auth wait",
+                "execution_mode": "background",
+                "timeout": 120,
+            },
+            tool_name="execute_code_aio",
+            user_id=uuid.uuid4(),
+            cli_injection=injection,
+            session_id="conv-background",
+        )
+
+    kwargs = mock_backend.start_background_job.call_args.kwargs
+    assert kwargs["agent_id"] == str(agent_id)
+    assert kwargs["conversation_id"] == "conv-background"
+    assert kwargs["inject"] == injection
+    assert kwargs["timeout"] == 120
+    mock_backend.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_job_management_is_scoped_to_current_session(tmp_path):
+    from app.services.agent_tools import _execute_code
+
+    agent_id = uuid.uuid4()
+    mock_backend = _make_mock_backend()
+    p1, p2, p3, p4 = _patches(mock_backend)
+    with p1, p2, p3, p4:
+        await _execute_code(
+            agent_id,
+            tmp_path,
+            {"action": "job_logs", "job_id": "job_123", "tail_lines": 25},
+            tool_name="execute_code_aio",
+            session_id="conv-manage",
+        )
+
+    kwargs = mock_backend.manage_background_jobs.call_args.kwargs
+    assert kwargs["agent_id"] == str(agent_id)
+    assert kwargs["conversation_id"] == "conv-manage"
+    assert kwargs["job_id"] == "job_123"
+    assert kwargs["tail_lines"] == 25
 
 
 @pytest.mark.asyncio

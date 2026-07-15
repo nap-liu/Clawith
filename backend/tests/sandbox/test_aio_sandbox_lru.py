@@ -103,7 +103,7 @@ async def test_evict_anchor_cleans_per_conversation_wrapper_dir():
 
     await b._evict_anchor(client, "A:c1")
 
-    assert any("rm -rf" in cmd and ".clawith-bin" in cmd for _, cmd in sent), (
+    assert any("rm -rf" in cmd and ".jobs" in cmd for _, cmd in sent), (
         f"expected a wrapper-dir cleanup rm, got {sent!r}"
     )
 
