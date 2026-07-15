@@ -60,11 +60,16 @@ Failure modes that propagate to ExecutionResult
 - Timeout → ExecutionResult(success=False, exit_code=124)
 - Two recreate attempts both failing → ExecutionResult(success=False, exit_code=1)
 """
+import asyncio
 import hashlib
 import json
+import re
+import shutil
 import time
+import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -128,15 +133,46 @@ def compute_session_anchor(
 
 # Wrapper-dir leaf for an anchor. A hash keeps the leaf shell-safe (the anchor
 # contains ':' which is the PATH separator) and stable across calls of the same
-# conversation. bash form is "$HOME/.clawith-bin/<leaf>"; python expanduser form
-# is "~/.clawith-bin/<leaf>" — both resolve to the same per-conversation dir.
-_WRAPPER_BIN_ROOT = ".clawith-bin"
+# conversation. Foreground and managed Jobs share ``$HOME/.jobs/<leaf>`` as
+# their filesystem namespace while keeping separate immutable wrapper dirs.
+_SESSION_RUNTIME_ROOT = ".jobs"
+_JOB_ID_RE = re.compile(r"^job_[0-9a-f]{12}$")
+_JOB_INITIAL_OUTPUT_WAIT_SECONDS = 2.0
+
+
+def compute_session_namespace(anchor: str) -> str:
+    """Return the stable filesystem/session namespace shared by one chat session."""
+    return hashlib.sha256(anchor.encode()).hexdigest()[:16]
 
 
 def _anchor_bindir(anchor: str, *, python: bool = False) -> str:
-    leaf = hashlib.sha256(anchor.encode()).hexdigest()[:16]
+    leaf = compute_session_namespace(anchor)
     head = "~" if python else "$HOME"
-    return f"{head}/{_WRAPPER_BIN_ROOT}/{leaf}"
+    return f"{head}/{_SESSION_RUNTIME_ROOT}/{leaf}/foreground/bin"
+
+
+def _job_bindir(anchor: str, job_id: str) -> str:
+    return (
+        f"$HOME/{_SESSION_RUNTIME_ROOT}/{compute_session_namespace(anchor)}"
+        f"/{job_id}/bin"
+    )
+
+
+def _job_log_path(anchor: str, job_id: str) -> str:
+    return (
+        f"$HOME/{_SESSION_RUNTIME_ROOT}/{compute_session_namespace(anchor)}"
+        f"/{job_id}/output.log"
+    )
+
+
+def _job_session_prefix(anchor: str) -> str:
+    return f"aio-job-{compute_session_namespace(anchor)}-"
+
+
+def _job_session_id(anchor: str, job_id: str) -> str:
+    if not _JOB_ID_RE.fullmatch(job_id):
+        raise ValueError("Invalid background job ID")
+    return f"{_job_session_prefix(anchor)}{job_id}"
 
 
 class AioSandboxBackend(BaseSandboxBackend):
@@ -261,6 +297,330 @@ class AioSandboxBackend(BaseSandboxBackend):
         result.duration_ms = int((time.time() - start) * 1000)
         return result
 
+    # --------------------------------------------------------- Background jobs
+
+    async def start_background_job(
+        self,
+        *,
+        code: str,
+        language: str,
+        timeout: int,
+        work_dir: str,
+        agent_id: str,
+        conversation_id: str,
+        inject: dict | None = None,
+    ) -> dict[str, Any]:
+        """Start one independently managed job inside the chat session namespace.
+
+        A job gets its own AIO shell/tmux session so it cannot occupy the
+        foreground shell's execution lock.  It still runs in the same AIO
+        container and therefore shares PID/network/mount/IPC namespaces, HOME,
+        files, ports and Unix sockets with foreground commands and sibling jobs.
+        """
+        if not conversation_id:
+            return {
+                "success": False,
+                "status": "rejected",
+                "error": "Background jobs require a chat session.",
+            }
+        if language not in ("python", "bash", "node", "javascript"):
+            return {
+                "success": False,
+                "status": "rejected",
+                "error": f"Unsupported background language: {language}",
+            }
+
+        anchor = compute_session_anchor(agent_id, conversation_id)
+        job_id = f"job_{uuid.uuid4().hex[:12]}"
+        session_id = _job_session_id(anchor, job_id)
+        bindir = _job_bindir(anchor, job_id)
+        command = self._compose_shell_command(
+            cwd=work_dir,
+            code=code,
+            language=language,
+            inject=inject,
+            bindir=bindir,
+            reset_wrappers=True,
+            background_job=True,
+            output_log=_job_log_path(anchor, job_id),
+        )
+
+        async with httpx.AsyncClient() as client:
+            try:
+                await self._create_shell_session(client, session_id, work_dir)
+                body, ok = await self._shell_exec_async(
+                    client, session_id, command, timeout
+                )
+                if not ok:
+                    await self._delete_job_session(client, session_id)
+                    return {
+                        "success": False,
+                        "status": "failed",
+                        "job_id": job_id,
+                        "error": (body.get("message") or "Failed to start job")[:500],
+                    }
+
+                snapshot: dict[str, Any] = {
+                    "success": True,
+                    "status": "running",
+                    "job_id": job_id,
+                    "timeout": timeout,
+                    "output": "",
+                }
+                deadline = time.monotonic() + _JOB_INITIAL_OUTPUT_WAIT_SECONDS
+                while time.monotonic() < deadline:
+                    current = await self._view_job(client, session_id)
+                    if current is not None:
+                        snapshot.update(current)
+                        snapshot["output"] = self._read_job_log(
+                            work_dir, anchor, job_id
+                        ) or str(current.get("output") or "")
+                        snapshot["success"] = True
+                        snapshot["job_id"] = job_id
+                        snapshot["timeout"] = timeout
+                        if current.get("output") or current.get("status") != "running":
+                            break
+                    await asyncio.sleep(0.1)
+                return snapshot
+            except httpx.TimeoutException:
+                # A lost start response is ambiguous. The deterministic session
+                # ID lets us probe before reporting failure instead of submitting
+                # the command a second time and creating a duplicate process.
+                current = await self._view_job(client, session_id)
+                if current is not None:
+                    return {
+                        "success": True,
+                        "job_id": job_id,
+                        "timeout": timeout,
+                        **current,
+                    }
+                return {
+                    "success": False,
+                    "status": "failed",
+                    "job_id": job_id,
+                    "error": "Timed out while starting the background job.",
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[AioSandbox] Background job start failed")
+                return {
+                    "success": False,
+                    "status": "failed",
+                    "job_id": job_id,
+                    "error": f"Background job start failed: {str(exc)[:300]}",
+                }
+
+    async def manage_background_jobs(
+        self,
+        *,
+        action: str,
+        agent_id: str,
+        conversation_id: str,
+        job_id: str | None = None,
+        tail_lines: int = 100,
+        work_dir: str | None = None,
+    ) -> dict[str, Any]:
+        """List, inspect or stop jobs owned by one chat session."""
+        if not conversation_id:
+            return {
+                "success": False,
+                "status": "rejected",
+                "error": "Background jobs require a chat session.",
+            }
+        anchor = compute_session_anchor(agent_id, conversation_id)
+        action = action.strip().lower()
+
+        async with httpx.AsyncClient() as client:
+            if action == "list_jobs":
+                sessions = await self._list_shell_sessions(client)
+                prefix = _job_session_prefix(anchor)
+                jobs: list[dict[str, Any]] = []
+                for session_id, info in sessions.items():
+                    if not session_id.startswith(prefix):
+                        continue
+                    candidate = session_id[len(prefix) :]
+                    if not _JOB_ID_RE.fullmatch(candidate):
+                        continue
+                    jobs.append(
+                        {
+                            "job_id": candidate,
+                            "status": info.get("status", "running"),
+                            "created_at": info.get("created_at"),
+                            "age_seconds": info.get("age_seconds"),
+                        }
+                    )
+                jobs.sort(key=lambda item: str(item.get("created_at") or ""))
+                return {"success": True, "status": "ok", "jobs": jobs}
+
+            if action not in {"job_status", "job_logs", "job_stop"}:
+                return {
+                    "success": False,
+                    "status": "rejected",
+                    "error": f"Unsupported job action: {action}",
+                }
+            if not job_id or not _JOB_ID_RE.fullmatch(job_id):
+                return {
+                    "success": False,
+                    "status": "rejected",
+                    "error": "A valid job_id is required.",
+                }
+
+            session_id = _job_session_id(anchor, job_id)
+            snapshot = await self._view_job(client, session_id)
+            if snapshot is None:
+                return {
+                    "success": False,
+                    "status": "not_found",
+                    "job_id": job_id,
+                    "error": "Background job not found in this chat session.",
+                }
+
+            if action == "job_status":
+                snapshot.pop("output", None)
+                return {"success": True, "job_id": job_id, **snapshot}
+            if action == "job_logs":
+                output = self._read_job_log(
+                    work_dir, anchor, job_id
+                ) or str(snapshot.get("output") or "")
+                lines = output.splitlines()
+                snapshot["output"] = "\n".join(lines[-max(1, min(tail_lines, 500)) :])
+                return {"success": True, "job_id": job_id, **snapshot}
+
+            # A dedicated job session is the lifecycle boundary, so deleting it
+            # kills only that job's process tree and leaves foreground/siblings.
+            stopped = await self._delete_job_session(client, session_id)
+            output = self._read_job_log(
+                work_dir, anchor, job_id
+            ) or str(snapshot.get("output") or "")
+            if stopped and work_dir:
+                self._cleanup_job_runtime_dir(work_dir, anchor, job_id)
+            return {
+                "success": stopped,
+                "status": "stopped" if stopped else "not_found",
+                "job_id": job_id,
+                "output": output[-_STDOUT_LIMIT:],
+            }
+
+    async def _shell_exec_async(
+        self,
+        client: httpx.AsyncClient,
+        session_id: str,
+        command: str,
+        timeout: int,
+    ) -> tuple[dict[str, Any], bool]:
+        resp = await client.post(
+            f"{self.base_url}/v1/shell/exec",
+            json={
+                "id": session_id,
+                "command": command,
+                "async_mode": True,
+                # For a background job the existing timeout is its maximum
+                # lifetime. The HTTP request itself returns immediately.
+                "timeout": float(timeout),
+            },
+            headers=self._headers(),
+            timeout=10.0,
+        )
+        if resp.status_code != 200:
+            return {"message": f"HTTP {resp.status_code}: {resp.text[:200]}"}, False
+        body = resp.json()
+        return body, bool(body.get("success"))
+
+    async def _view_job(
+        self, client: httpx.AsyncClient, session_id: str
+    ) -> dict[str, Any] | None:
+        resp = await client.post(
+            f"{self.base_url}/v1/shell/view",
+            json={"id": session_id},
+            headers=self._headers(),
+            timeout=5.0,
+        )
+        if resp.status_code == 404:
+            return None
+        if resp.status_code != 200:
+            raise RuntimeError(f"Job view HTTP {resp.status_code}: {resp.text[:200]}")
+        body = resp.json()
+        if not body.get("success"):
+            return None
+        data = body.get("data") or {}
+        status = data.get("status") or "running"
+        if status == "hard_timeout":
+            status = "timed_out"
+        elif status == "terminated":
+            status = "failed"
+        return {
+            "status": status,
+            "exit_code": data.get("exit_code"),
+            "output": str(data.get("output") or "")[-_STDOUT_LIMIT:],
+        }
+
+    async def _list_shell_sessions(
+        self, client: httpx.AsyncClient
+    ) -> dict[str, dict[str, Any]]:
+        resp = await client.get(
+            f"{self.base_url}/v1/shell/sessions",
+            headers=self._headers(),
+            timeout=5.0,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Session list HTTP {resp.status_code}: {resp.text[:200]}")
+        return (resp.json().get("data") or {}).get("sessions") or {}
+
+    async def _delete_job_session(
+        self, client: httpx.AsyncClient, session_id: str
+    ) -> bool:
+        resp = await client.delete(
+            f"{self.base_url}/v1/shell/sessions/{session_id}",
+            headers=self._headers(),
+            timeout=10.0,
+        )
+        if resp.status_code == 404:
+            return False
+        if resp.status_code != 200:
+            raise RuntimeError(f"Job stop HTTP {resp.status_code}: {resp.text[:200]}")
+        return bool(resp.json().get("success"))
+
+    @staticmethod
+    def _job_runtime_dir(work_dir: str, anchor: str, job_id: str) -> Path | None:
+        if not work_dir or not _JOB_ID_RE.fullmatch(job_id):
+            return None
+        root = Path(work_dir).resolve()
+        target = (
+            root
+            / _SESSION_RUNTIME_ROOT
+            / compute_session_namespace(anchor)
+            / job_id
+        ).resolve()
+        return target if target.is_relative_to(root) else None
+
+    @classmethod
+    def _read_job_log(cls, work_dir: str | None, anchor: str, job_id: str) -> str:
+        if not work_dir:
+            return ""
+        try:
+            runtime_dir = cls._job_runtime_dir(work_dir, anchor, job_id)
+            log_path = runtime_dir / "output.log" if runtime_dir else None
+            if not log_path or not log_path.is_file():
+                return ""
+            with log_path.open("rb") as handle:
+                handle.seek(0, 2)
+                size = handle.tell()
+                handle.seek(max(0, size - _STDOUT_LIMIT))
+                return handle.read(_STDOUT_LIMIT).decode(errors="replace")
+        except OSError as exc:
+            logger.warning(f"[AioSandbox] Job log read failed: {exc}")
+            return ""
+
+    @classmethod
+    def _cleanup_job_runtime_dir(
+        cls, work_dir: str, anchor: str, job_id: str
+    ) -> None:
+        try:
+            target = cls._job_runtime_dir(work_dir, anchor, job_id)
+            if target and target.exists():
+                shutil.rmtree(target)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[AioSandbox] Job runtime cleanup failed: {exc}")
+
     # ------------------------------------------------------------------ Anchor LRU
 
     def _register_anchor(self, agent_part: str, anchor: str) -> list[str]:
@@ -383,23 +743,13 @@ class AioSandboxBackend(BaseSandboxBackend):
                 error=f"Command timed out after {timeout}s and was killed.",
             )
 
-        # A patched sandbox returns hard_timeout before the longer HTTP wait
-        # window expires. `running` therefore means the server failed to
-        # enforce the hard timeout. Fail closed by deleting the unhealthy
-        # session, but do not immediately recreate the same ID while the old
-        # execution task may still be unwinding. The normal session-not-found
-        # recovery creates it lazily on the next call.
+        # `running` is not proof that hard termination failed: the AIO shell may
+        # be reporting an already-active command / execution-lock conflict. A
+        # session DELETE is destructive and also kills intentionally persistent
+        # background processes, so preserve the session and surface a precise
+        # retry/interrupt instruction. Only an explicit shell-corruption status
+        # may justify deleting a stateful session.
         if data.get("status") == "running":
-            try:
-                await client.delete(
-                    f"{self.base_url}/v1/shell/sessions/{session_id}",
-                    headers=self._headers(),
-                    timeout=5.0,
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    f"[AioSandbox] DELETE after failed hard timeout for {session_id} failed: {e}"
-                )
             return ExecutionResult(
                 success=False,
                 stdout=output,
@@ -407,14 +757,11 @@ class AioSandboxBackend(BaseSandboxBackend):
                 exit_code=124,
                 duration_ms=0,
                 error=(
-                    f"Command timed out after {timeout}s, but the sandbox did "
-                    f"not confirm hard termination. The unhealthy shell session "
-                    f"was removed and will be recreated on the next call. If the "
-                    f"command was waiting for stdin (an "
-                    f"interactive prompt), retry with non-interactive flags "
-                    f"like --yes / -y / --non-interactive. If the command "
-                    f"legitimately needs longer than {timeout}s, pass a larger "
-                    f"timeout in the tool arguments."
+                    "SESSION_BUSY: the foreground shell still has an active "
+                    "command. The session was preserved. If this is a service, "
+                    "listener, authorization wait or other long-lived process, "
+                    "retry with execution_mode='background'. Otherwise wait for "
+                    "or stop the existing foreground command before retrying."
                 ),
             )
 
@@ -504,6 +851,8 @@ class AioSandboxBackend(BaseSandboxBackend):
         inject: dict | None = None,
         bindir: str | None = None,
         reset_wrappers: bool = False,
+        background_job: bool = False,
+        output_log: str | None = None,
     ) -> str:
         """Compose the per-exec command and deliver it **verbatim**.
 
@@ -535,7 +884,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         session persists across calls (so exported env vars / background
         processes survive), but the working directory + HOME are statelessly
         reset to align with execute_code (subprocess) semantics. The wrapper
-        writes come AFTER the HOME reset so ``bindir`` (``$HOME/.clawith-bin/...``)
+        writes come AFTER the HOME reset so ``bindir`` (``$HOME/.jobs/...``)
         lands under the agent root.
 
         HOME is the critical one for SSH / git / npm / pip --user / etc. —
@@ -557,7 +906,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         tool (npm, yarn, pnpm, npx, prompts, apt, debconf, git over https)
         to skip prompts and pick safe defaults. This is the standard CI
         contract — not a hack. Tools that ignore these (rare) will still
-        hit the status:running timeout branch and trigger a session reset.
+        receive an explicit busy/timeout result without deleting the session.
         """
         import base64
 
@@ -566,7 +915,7 @@ class AioSandboxBackend(BaseSandboxBackend):
         quoted_cwd = "'" + cwd.replace("'", "'\\''") + "'"
         script_lines: list[str] = []
         # cwd + HOME reset FIRST so the per-conversation bindir
-        # (``$HOME/.clawith-bin/...``) lands under the agent root.
+        # (``$HOME/.jobs/...``) lands under the agent root.
         script_lines.append(
             f"cd {quoted_cwd} && "
             f"export HOME={quoted_cwd} && "
@@ -602,7 +951,19 @@ class AioSandboxBackend(BaseSandboxBackend):
             # subprocess.run(['svc']) all resolve to the current wrapper. (PATH
             # grows by one entry per exec, like the BASE npm-global prepend.)
             script_lines.append(f'export PATH="{bindir}:$PATH"')
-        user_cmd = cls._build_shell_command(code, language)
+        user_cmd = cls._build_shell_command(
+            code, language, background_job=background_job
+        )
+        if output_log:
+            # AIO 1.9.3 does not expose incremental stdout through /shell/view.
+            # Mirror both streams into the per-Job runtime directory, which is
+            # on the same Agent HOME bind mount visible to backend and sandbox.
+            # Process substitution preserves the user's real exit status.
+            user_cmd = (
+                "{\n"
+                f"{user_cmd}\n"
+                f'}} > >(tee -a "{output_log}") 2>&1'
+            )
         script = "\n".join(script_lines) + "\n" + user_cmd
         # Deliver verbatim: single-line base64 transport (no newlines for the
         # sandbox command-splitter to mangle) → decoded script is sourced into
@@ -613,7 +974,17 @@ class AioSandboxBackend(BaseSandboxBackend):
         return f"source <(echo {b64} | base64 -d)"
 
     @staticmethod
-    def _build_shell_command(code: str, language: str) -> str:
+    def _build_shell_command(
+        code: str, language: str, *, background_job: bool = False
+    ) -> str:
+        if background_job and language == "python":
+            # Foreground Python remains a persistent Jupyter kernel. Background
+            # Python is a normal process in the job's dedicated AIO shell so it
+            # has the same lifecycle/status/log handling as bash and node jobs.
+            import secrets
+
+            delim = "AIOSB_PYTHON_" + secrets.token_hex(16).upper()
+            return f"python -u <<'{delim}'\n{code}\n{delim}"
         if language == "bash":
             return code
         if language in ("node", "javascript"):

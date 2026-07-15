@@ -1243,8 +1243,19 @@ BUILTIN_TOOLS = [
         "name": "execute_code_aio",
         "display_name": "Code Executor (AIO Sandbox)",
         "description": (
-            "Execute code (Python, Bash, Node.js) in a long-lived per-agent "
-            "aio-sandbox container.\n"
+            "Execute foreground code or autonomously start and manage background "
+            "jobs in a long-lived per-session aio-sandbox environment.\n"
+            "\n"
+            "Actions:\n"
+            "- execute (default): run code. Use execution_mode=foreground for finite "
+            "commands and execution_mode=background for servers, listeners, watch "
+            "processes, device/OAuth authorization waits, continuous polling, or any "
+            "work that must survive later chat turns. Never add &, nohup, setsid, "
+            "tmux or screen in background mode; the tool creates a managed AIO job.\n"
+            "- list_jobs: list every background job owned by the current chat session.\n"
+            "- job_status / job_logs / job_stop: inspect status, read live output "
+            "(including while running), or stop the supplied job_id.\n"
+            "If you forget a job_id, call list_jobs. Stop jobs that are no longer needed.\n"
             "\n"
             "Languages and runtimes:\n"
             "- Bash, Python (Jupyter kernel pinned to python3.10), Node.js v22.\n"
@@ -1269,9 +1280,14 @@ BUILTIN_TOOLS = [
             "  list_files / write_file using relative paths from the agent "
             "  root.\n"
             "\n"
-            "Persistence across calls (same agent):\n"
+            "Persistence across calls:\n"
             "- Shell (bash/node): exported environment variables and "
-            "  background processes persist. Working directory does not.\n"
+            "  foreground shell state persist inside one chat session. Working "
+            "  directory does not.\n"
+            "- Managed background jobs are isolated for control at chat-session level, "
+            "  but share the same AIO PID/network/mount/IPC namespaces, Agent HOME, "
+            "  files, localhost ports and Unix sockets with foreground commands and "
+            "  sibling jobs.\n"
             "- Python (Jupyter): variables, imports, and global state persist.\n"
             "- Filesystem under the agent root persists.\n"
             "\n"
@@ -1300,10 +1316,11 @@ BUILTIN_TOOLS = [
             "- Python tracebacks and shell stderr are returned verbatim.\n"
             "\n"
             "Timeout:\n"
-            "- `timeout` argument (seconds) — default 60, platform cap 300.\n"
-            "- On timeout the command is terminated, the shell session is "
-            "  reset (env vars and background processes are cleared), and an "
-            "  error is returned.\n"
+            "- Foreground `timeout` is the command lifetime (default 30, cap 300).\n"
+            "- Background `timeout` is the managed Job lifetime (default 900, "
+            "  configurable cap 3600). A Job timeout terminates only that Job.\n"
+            "- Foreground timeout terminates only the active foreground process group; "
+            "  it does not delete the shell or managed Jobs.\n"
             "\n"
             "Isolation:\n"
             "- Each agent has its own HOME, its own shell session, its own "
@@ -1318,11 +1335,24 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["execute", "list_jobs", "job_status", "job_logs", "job_stop"],
+                    "default": "execute",
+                    "description": "Execute code or manage background jobs in the current chat session",
+                },
                 "language": {"type": "string", "enum": ["python", "bash", "node"], "description": "Programming language"},
-                "code": {"type": "string", "description": "Code to execute"},
-                "timeout": {"type": "integer", "description": "Per-call execution timeout in seconds. Default 60, platform cap 300. On timeout the command is terminated, the shell session is reset, and an error is returned."},
+                "code": {"type": "string", "description": "Code to execute; required when action=execute"},
+                "execution_mode": {
+                    "type": "string",
+                    "enum": ["foreground", "background"],
+                    "default": "foreground",
+                    "description": "Use background for servers, listeners, authorization waits, polling and work that must survive later turns. Do not add shell detachment syntax.",
+                },
+                "timeout": {"type": "integer", "description": "Existing timeout. Foreground: command lifetime. Background: managed Job lifetime."},
+                "job_id": {"type": "string", "description": "Required for job_status, job_logs and job_stop; obtain it from background execute or list_jobs"},
+                "tail_lines": {"type": "integer", "description": "For job_logs, trailing lines to return (default 100, max 500)"},
             },
-            "required": ["language", "code"],
         },
         "config": {
             "sandbox_type": "aio_sandbox",
@@ -1330,6 +1360,8 @@ BUILTIN_TOOLS = [
             "api_key": "",
             "default_timeout": 30,
             "max_timeout": 300,
+            "background_default_timeout": 900,
+            "background_max_timeout": 3600,
         },
         "config_schema": {
             "fields": [
@@ -1364,6 +1396,22 @@ BUILTIN_TOOLS = [
                     "default": 60,
                     "min": 10,
                     "max": 300,
+                },
+                {
+                    "key": "background_default_timeout",
+                    "label": "Background Job Default Lifetime (seconds)",
+                    "type": "number",
+                    "default": 900,
+                    "min": 30,
+                    "max": 3600,
+                },
+                {
+                    "key": "background_max_timeout",
+                    "label": "Background Job Maximum Lifetime (seconds)",
+                    "type": "number",
+                    "default": 3600,
+                    "min": 60,
+                    "max": 86400,
                 },
             ]
         },

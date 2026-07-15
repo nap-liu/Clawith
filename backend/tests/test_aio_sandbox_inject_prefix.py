@@ -11,7 +11,7 @@ import re
 
 from app.services.sandbox.remote.aio_sandbox_backend import AioSandboxBackend
 
-_BINDIR = "$HOME/.clawith-bin/abc123"
+_BINDIR = "$HOME/.jobs/abc123/foreground/bin"
 
 
 def _decode_cmd(cmd: str) -> str:
@@ -38,7 +38,7 @@ def test_compose_without_inject_is_single_line_b64():
     assert "echo hi" in script
     # No wrapper writes and no bindir on PATH when inject is None.
     assert "base64 -d >" not in script
-    assert ".clawith-bin" not in script
+    assert ".jobs" not in script
 
 
 def test_compose_identity_lives_in_wrapper_not_session_export():
@@ -75,13 +75,13 @@ def test_compose_with_inject_order_and_path_prepend():
     script = _decode_cmd(cmd)
     cd_pos = script.index("cd '/data/agents/a1'")
     wrapper_pos = script.index("base64 -d >")
-    path_pos = script.index('export PATH="$HOME/.clawith-bin/abc123:$PATH"')
+    path_pos = script.index('export PATH="$HOME/.jobs/abc123/foreground/bin:$PATH"')
     user_pos = script.index("svc report list | head")
     assert cd_pos < wrapper_pos < path_pos < user_pos, (
         "expected: cd+HOME < wrapper_write < PATH prepend < user_code"
     )
     # Wrapper is written into the per-conversation bindir.
-    assert '"$HOME/.clawith-bin/abc123"/svc' in script
+    assert '"$HOME/.jobs/abc123/foreground/bin"/svc' in script
 
 
 def test_compose_bash_comment_and_multiline_survive():
@@ -117,7 +117,7 @@ def test_compose_reset_wrappers_clears_stale_dir_even_without_inject():
     )
     script = _decode_cmd(cmd)
     # The bindir is wiped (rm -rf) before the user code runs.
-    assert 'rm -rf "$HOME/.clawith-bin/abc123"' in script
+    assert 'rm -rf "$HOME/.jobs/abc123/foreground/bin"' in script
     # No wrapper is written (no inject), so svc is gone.
     assert "base64 -d >" not in script
 
@@ -130,7 +130,7 @@ def test_compose_no_reset_no_inject_leaves_bindir_untouched():
     )
     script = _decode_cmd(cmd)
     assert "rm -rf" not in script
-    assert ".clawith-bin" not in script
+    assert ".jobs" not in script
 
 
 def test_compose_inject_none_still_materializes_user_code():

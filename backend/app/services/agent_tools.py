@@ -9677,7 +9677,8 @@ async def _execute_code(
     Args:
         agent_id: The agent's UUID (used to fetch per-agent tool config).
         ws: Agent workspace root path.
-        arguments: Tool call arguments (language, code, timeout).
+        arguments: Tool call arguments (action, language, code,
+                   execution_mode, timeout, job_id, tail_lines).
         tool_name: The originating tool name — 'execute_code' (local subprocess),
                    'execute_code_e2b' (E2B cloud), or 'execute_code_aio'
                    (self-hosted AIO sandbox).  Used to look up the correct
@@ -9686,15 +9687,26 @@ async def _execute_code(
                     the backend as ``conversation_id`` so shell/jupyter sessions
                     are isolated per conversation, not per agent.
     """
+    action = str(arguments.get("action") or "execute").strip().lower()
+    execution_mode = str(
+        arguments.get("execution_mode") or "foreground"
+    ).strip().lower()
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
-    requested_timeout = arguments.get("timeout", 30)
 
-    if not code.strip():
+    valid_actions = {"execute", "list_jobs", "job_status", "job_logs", "job_stop"}
+    if action not in valid_actions:
+        return f"❌ Unsupported execute_code_aio action: {action}"
+    if action != "execute" and tool_name != "execute_code_aio":
+        return "❌ Background Job management is available only in execute_code_aio"
+    if action == "execute" and not code.strip():
         return "❌ No code provided"
-
-    if language not in ("python", "bash", "node"):
+    if action == "execute" and language not in ("python", "bash", "node"):
         return f"❌ Unsupported language: {language}. Use: python, bash, or node"
+    if execution_mode not in {"foreground", "background"}:
+        return "❌ execution_mode must be foreground or background"
+    if execution_mode == "background" and tool_name != "execute_code_aio":
+        return "❌ Managed background execution is available only in execute_code_aio"
 
     # Working directory is the agent's root directory (must be absolute).
     # This allows code to access skills/, workspace/, memory/ etc. directly.
@@ -9736,10 +9748,42 @@ async def _execute_code(
             sandbox_config = fallback_config
             logger.info(f"[Sandbox] No per-agent config found for '{tool_name}', using fallback")
 
-        # Clamp timeout by configured max_timeout (default 60s, up to 3600s)
-        timeout = min(requested_timeout, sandbox_config.max_timeout)
-
         backend = get_sandbox_backend(sandbox_config)
+
+        if action != "execute":
+            if not agent_id or not session_id:
+                return "❌ Background Job management requires an active chat session"
+            payload = await backend.manage_background_jobs(
+                action=action,
+                agent_id=str(agent_id),
+                conversation_id=session_id,
+                job_id=arguments.get("job_id"),
+                tail_lines=int(arguments.get("tail_lines") or 100),
+                work_dir=str(work_dir),
+            )
+            icon = "✅" if payload.get("success") else "❌"
+            return (
+                f"{icon} AIO background jobs:\n"
+                + json.dumps(payload, ensure_ascii=False, indent=2)
+            )
+
+        if execution_mode == "background":
+            if not agent_id or not session_id:
+                return "❌ Background execution requires an active chat session"
+            background_default = int(
+                (tool_config or {}).get("background_default_timeout", 900)
+            )
+            background_cap = int(
+                (tool_config or {}).get("background_max_timeout", 3600)
+            )
+            requested_timeout = int(
+                arguments.get("timeout") or background_default
+            )
+            timeout = max(1, min(requested_timeout, background_cap))
+        else:
+            requested_timeout = int(arguments.get("timeout") or 30)
+            timeout = max(1, min(requested_timeout, sandbox_config.max_timeout))
+
         logger.info(f"[Sandbox] Executing code with backend: {backend.__class__.__name__} (tool={tool_name}, timeout={timeout}s)")
         injection = None
         if cli_injection is not None:
@@ -9750,6 +9794,23 @@ async def _execute_code(
             # All languages (bash/node/python) get CLI wrappers + identity so
             # svc is transparently usable everywhere (incl. subprocess).
             injection = await build_cli_injection(agent_id, user_id)
+
+        if execution_mode == "background":
+            payload = await backend.start_background_job(
+                code=code,
+                language=language,
+                timeout=timeout,
+                work_dir=str(work_dir),
+                agent_id=str(agent_id),
+                conversation_id=session_id,
+                inject=injection,
+            )
+            icon = "✅" if payload.get("success") else "❌"
+            return (
+                f"{icon} AIO background job:\n"
+                + json.dumps(payload, ensure_ascii=False, indent=2)
+            )
+
         result = await backend.execute(
             code=code,
             language=language,
