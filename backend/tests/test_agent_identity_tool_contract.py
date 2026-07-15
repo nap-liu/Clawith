@@ -48,6 +48,49 @@ def _seed_schema(name: str) -> dict:
     raise AssertionError(f"Seeded tool {name!r} is missing")
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "set_trigger",
+        "update_trigger",
+        "cancel_trigger",
+        "list_triggers",
+        "send_channel_file",
+        "send_platform_message",
+        "send_channel_message",
+        "search_contacts",
+        "add_contact",
+        "remove_contact",
+        "send_message_to_agent",
+        "send_file_to_agent",
+        "send_feishu_message",
+        "feishu_user_search",
+        "feishu_calendar_list",
+        "feishu_calendar_create",
+        "feishu_calendar_update",
+        "feishu_calendar_delete",
+        "feishu_approval_create",
+    ],
+)
+def test_identity_related_seed_and_runtime_schemas_are_identical(name):
+    assert _seed_schema(name) == _agent_schema(name)
+
+
+def test_seeded_trigger_schema_exposes_real_webhook_runtime_contract():
+    schema = _seed_schema("set_trigger")
+    assert "webhook" in schema["properties"]["type"]["enum"]
+    assert schema["properties"]["webhook_mode"]["enum"] == [
+        "legacy",
+        "queue",
+        "merge",
+    ]
+    assert _seed_schema("update_trigger")["properties"]["webhook_mode"]["enum"] == [
+        "legacy",
+        "queue",
+        "merge",
+    ]
+
+
 def test_seeded_tool_strings_fit_persisted_column_contracts():
     for tool in BUILTIN_TOOLS:
         assert len(tool.get("icon") or "") <= 10, tool.get("name")

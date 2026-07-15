@@ -497,18 +497,23 @@ BUILTIN_TOOLS = [
     {
         "name": "set_trigger",
         "display_name": "Set Trigger",
-        "description": "Set a new trigger to wake yourself up at a specific time or condition. Every trigger is attached to a focus item; if focus_ref is omitted, the system creates a focus item from the reason. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or human user replies).",
+        "description": "Set a new trigger to wake yourself up at a specific time or condition. Use this to schedule future actions, monitor changes, or wait for messages. The trigger will fire and invoke you with the reason text as context. Every trigger is attached to a focus item; if focus_ref is omitted, the system will automatically create a focus item from the reason and attach the trigger to it. Trigger types: 'cron' (recurring schedule), 'once' (fire once at a time), 'interval' (every N minutes), 'poll' (HTTP monitoring), 'on_message' (when another agent or human replies — identify exactly one actor with from_agent_id or from_user_id), 'webhook' (receive external HTTP POST — system generates a unique URL, give it to the user so they can configure it in external services like GitHub, Grafana, etc.). For type=webhook you can also set webhook_mode to control how bursts of rapid triggers are handled — see the webhook_mode parameter.",
         "category": "aware",
         "icon": "⚡",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Unique name for this trigger"},
-                "type": {"type": "string", "enum": ["cron", "once", "interval", "poll", "on_message"], "description": "Trigger type"},
-                "config": {"type": "object", "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\"}. on_message requires exactly one canonical actor: {\"from_agent_id\": \"<agent_id>\"} or {\"from_user_id\": \"<user_id>\"}"},
-                "reason": {"type": "string", "description": "What to do when this trigger fires"},
-                "focus_ref": {"type": "string", "description": "Optional: which focus item this relates to. If omitted, one is created automatically."},
+                "name": {"type": "string", "description": "Unique name for this trigger, e.g. 'daily_briefing' or 'wait_<name>_reply'"},
+                "type": {"type": "string", "enum": ["cron", "once", "interval", "poll", "on_message", "webhook"], "description": "Trigger type"},
+                "config": {"type": "object", "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message must contain exactly one canonical actor: {\"from_agent_id\": \"<agent_id>\"} or {\"from_user_id\": \"<user_id>\"}. webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)"},
+                "reason": {"type": "string", "description": "What you should do when this trigger fires. This will be shown to you as context when you wake up."},
+                "focus_ref": {"type": "string", "description": "Optional: identifier of the structured Focus item that this trigger relates to. If omitted, a Focus item is created automatically from the trigger reason."},
+                "webhook_mode": {
+                    "type": "string",
+                    "enum": ["legacy", "queue", "merge"],
+                    "description": "Webhook processing mode (type=webhook only). Pick by scenario: legacy (default) = keep only the newest payload (overwrite earlier ones) — for low-frequency events where only the latest matters (e.g. a status ping). queue = handle each trigger one-by-one in FIFO order, serial, zero loss — for when EVERY event must be processed individually and in order (e.g. each reader's feedback, each ticket, each order). merge = accumulate all pending triggers and process them together in one session — for when you want to review/summarize multiple events at once (e.g. batch several alerts into one analysis).",
+                },
             },
             "required": ["name", "type", "config", "reason"],
         },
@@ -518,7 +523,7 @@ BUILTIN_TOOLS = [
     {
         "name": "update_trigger",
         "display_name": "Update Trigger",
-        "description": "Update an existing trigger's configuration or reason.",
+        "description": "Update an existing trigger's configuration or reason. Use this to adjust timing, change parameters, etc. For example, change interval from 5 minutes to 30 minutes.",
         "category": "aware",
         "icon": "🔄",
         "is_default": True,
@@ -526,8 +531,13 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "Name of the trigger to update"},
-                "config": {"type": "object", "description": "New config (replaces existing)"},
+                "config": {"type": "object", "description": "New config (replaces existing config)"},
                 "reason": {"type": "string", "description": "New reason text"},
+                "webhook_mode": {
+                    "type": "string",
+                    "enum": ["legacy", "queue", "merge"],
+                    "description": "For type=webhook only: switch the processing mode of an EXISTING webhook trigger (legacy/queue/merge — see set_trigger.webhook_mode for what each means). Preserves the existing webhook URL/token and any already-queued payloads.",
+                },
             },
             "required": ["name"],
         },
@@ -575,9 +585,9 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string", "description": "Workspace-relative path to the file"},
+                "file_path": {"type": "string", "description": "Workspace-relative path to the file, e.g. workspace/report.md"},
                 "user_id": {"type": "string", "description": "Canonical platform user_id. Omit only to reply to the current conversation."},
-                "channel": {"type": "string", "enum": ["feishu", "slack"], "description": "Executable explicit file route selected by the Agent."},
+                "channel": {"type": "string", "enum": ["feishu", "slack"], "description": "Executable explicit file route chosen by the Agent."},
                 "message": {"type": "string", "description": "Optional message to accompany the file"},
             },
             "required": ["file_path"],
@@ -598,8 +608,8 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "user_id": {"type": "string", "description": "Canonical platform user_id"},
-                "message": {"type": "string", "description": "Message content"},
+                "user_id": {"type": "string", "description": "Canonical platform user_id of the recipient."},
+                "message": {"type": "string", "description": "Message content to send"},
             },
             "required": ["user_id", "message"],
         },
@@ -616,9 +626,9 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "user_id": {"type": "string", "description": "Canonical platform user_id"},
-                "message": {"type": "string", "description": "Message content"},
-                "channel": {"type": "string", "enum": ["feishu", "dingtalk", "wecom", "slack", "teams", "wechat"], "description": "External route selected by the Agent when several are valid."},
+                "user_id": {"type": "string", "description": "Recipient's canonical platform user_id from Relationships/search results."},
+                "message": {"type": "string", "description": "Message content to send"},
+                "channel": {"type": "string", "enum": ["feishu", "dingtalk", "wecom", "slack", "teams", "wechat"], "description": "External route chosen by the Agent when multiple valid routes exist."},
             },
             "required": ["user_id", "message"],
         },
@@ -698,10 +708,10 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "agent_id": {"type": "string", "description": "Canonical target agent_id"},
-                "message": {"type": "string", "description": "Message content"},
-                "msg_type": {"type": "string", "enum": ["notify", "consult", "task_delegate"], "description": "(1) Target needs to DO WORK and return results? → task_delegate. (2) Just FYI? → notify. (3) Quick factual question? → consult. When unsure, prefer task_delegate."},
-                "new_conversation": {"type": "boolean", "description": "默认 false。仅当当前与该同事的对话明显异常时设为 true 来主动重置 —— 例如对话反复报同一个错、陷入循环、或历史上下文看起来已损坏/混乱。设为 true 会开启一条全新对话线程，丢弃旧的(可能已损坏的)历史，从干净状态重新开始。正常往来请保持 false 或省略。"},
+                "agent_id": {"type": "string", "description": "Target digital employee's canonical agent_id from Relationships/search results."},
+                "message": {"type": "string", "description": "Message content to send"},
+                "msg_type": {"type": "string", "enum": ["notify", "consult", "task_delegate"], "description": "Decision guide: (1) Will the target need to DO WORK and return results? → task_delegate. (2) Is this just a one-way FYI? → notify. (3) Quick factual question needing immediate answer? → consult. When unsure, prefer task_delegate."},
+                "new_conversation": {"type": "boolean", "description": "默认 false。仅当当前与该同事的对话明显异常时设为 true 来主动重置 —— 例如对话反复报同一个错、陷入循环、或历史上下文看起来已损坏/混乱。设为 true 会开启一条全新对话线程,丢弃旧的(可能已损坏的)历史,从干净状态重新开始。正常往来请保持 false 或省略。"},
             },
             "required": ["agent_id", "message", "msg_type"],
         },
@@ -751,9 +761,9 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "agent_id": {"type": "string", "description": "Canonical target agent_id"},
-                "file_path": {"type": "string", "description": "Workspace-relative source file path"},
-                "message": {"type": "string", "description": "Optional delivery note"},
+                "agent_id": {"type": "string", "description": "Target digital employee's canonical agent_id from Relationships/search results."},
+                "file_path": {"type": "string", "description": "Workspace-relative path of the source file, e.g. workspace/report.md"},
+                "message": {"type": "string", "description": "Optional delivery note for the target digital employee"},
             },
             "required": ["agent_id", "file_path"],
         },
@@ -2479,8 +2489,8 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "user_id": {"type": "string", "description": "Canonical Clawith user_id; Feishu endpoint is internal."},
-                "message": {"type": "string", "description": "Message content"},
+                "user_id": {"type": "string", "description": "Recipient's canonical Clawith user_id. Provider IDs are resolved internally."},
+                "message": {"type": "string", "description": "Message content to send"},
             },
             "required": ["user_id", "message"],
         },
@@ -2497,7 +2507,7 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "The colleague's name to search for"},
+                "name": {"type": "string", "description": "The colleague's name to search for, e.g. '覃睿' or '张三'"},
             },
             "required": ["name"],
         },
@@ -2762,11 +2772,12 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "start_time": {"type": "string", "description": "Range start, ISO 8601. Default: now."},
-                "end_time": {"type": "string", "description": "Range end, ISO 8601. Default: 7 days from now."},
-                "user_id": {"type": "string", "description": "Canonical platform user_id for freebusy. Omit to use the current Feishu sender."},
+                "start_time": {"type": "string", "description": "查询起始时间，ISO 8601 格式，例如 '2026-03-13T00:00:00+08:00'。默认：当前时间。"},
+                "end_time": {"type": "string", "description": "查询截止时间，ISO 8601 格式。默认：7天后。"},
+                "user_id": {"type": "string", "description": "要查询 freebusy 的 canonical platform user_id。不填则自动使用当前飞书对话发送者。"},
                 "max_results": {"type": "integer", "description": "Max events to return (default 20)"},
             },
+            "required": [],
         },
         "config": {},
         "config_schema": {},
@@ -2782,11 +2793,12 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "summary": {"type": "string", "description": "Event title"},
-                "start_time": {"type": "string", "description": "Event start in ISO 8601 with timezone"},
-                "end_time": {"type": "string", "description": "Event end in ISO 8601 with timezone"},
+                "start_time": {"type": "string", "description": "Event start in ISO 8601 with timezone, e.g. '2026-03-15T14:00:00+08:00'"},
+                "end_time": {"type": "string", "description": "Event end in ISO 8601 with timezone, e.g. '2026-03-15T15:00:00+08:00'"},
                 "description": {"type": "string", "description": "Event description or agenda"},
-                "attendee_user_ids": {"type": "array", "items": {"type": "string"}, "description": "Canonical platform user_ids to invite; use feishu_user_search for discovery."},
-                "location": {"type": "string", "description": "Event location"},
+                "attendee_user_ids": {"type": "array", "items": {"type": "string"}, "description": "Canonical platform user_ids to invite. Use feishu_user_search to discover exact IDs."},
+                "location": {"type": "string", "description": "Event location or meeting room"},
+                "timezone": {"type": "string", "description": "Timezone, e.g. 'Asia/Shanghai'. Defaults to Asia/Shanghai."},
             },
             "required": ["summary", "start_time", "end_time"],
         },
@@ -2805,8 +2817,10 @@ BUILTIN_TOOLS = [
             "properties": {
                 "event_id": {"type": "string", "description": "Event ID from feishu_calendar_list"},
                 "summary": {"type": "string", "description": "New title"},
+                "description": {"type": "string", "description": "New description"},
                 "start_time": {"type": "string", "description": "New start time (ISO 8601)"},
                 "end_time": {"type": "string", "description": "New end time (ISO 8601)"},
+                "location": {"type": "string", "description": "New location"},
             },
             "required": ["event_id"],
         },
