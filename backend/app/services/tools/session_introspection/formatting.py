@@ -107,12 +107,17 @@ def _snippet(content: str | None, keyword: str) -> str:
     return content[start:end].replace("\n", " ")
 
 
-def render_search_hits(hits, titles: dict, *, keyword: str) -> str:
+def render_search_hits(hits, titles: dict, *, keyword: str, channels: dict | None = None) -> str:
     if not hits:
         return f"没有找到包含「{keyword}」的消息。"
     lines = [f"命中 {len(hits)} 条包含「{keyword}」的消息（最多 {len(hits)} 条；如过多请缩小关键词）："]
+    channels = channels or {}
     for m in hits:
         ts = m.created_at.isoformat() if m.created_at else "—"
         title = titles.get(str(m.conversation_id), "?")
-        lines.append(f"- [session {m.conversation_id}] {title} · {ts}\n  …{_snippet(m.content, keyword)}…")
+        channel = channels.get(str(m.conversation_id), "?")
+        lines.append(
+            f"- [session {m.conversation_id}] {title} · 通道={channel} · {ts}"
+            f"\n  …{_snippet(m.content, keyword)}…"
+        )
     return "\n".join(lines)

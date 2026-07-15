@@ -438,7 +438,35 @@ async def test_search_scoped_to_own_sessions():
 
     out = await handle_search_sessions(agent.id, member.id, str(mine.id), {"query": "WIDGET"})
     assert str(mine.id) in out
+    assert "通道=web" in out
     assert str(theirs.id) not in out
+
+
+async def test_search_reports_exact_source_channel_for_each_hit():
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id)
+    agent = await _seed_agent(admin.id, tenant_id=t.id, access_mode="company")
+    peer = await _seed_agent(admin.id, tenant_id=t.id, name="Peer")
+    web = await _seed_session(agent.id, admin.id, channel="web", title="Web thread")
+    a2a = await _seed_session(
+        agent.id,
+        admin.id,
+        channel="agent",
+        peer=peer.id,
+        title="A2A thread",
+    )
+    await _seed_message(agent.id, admin.id, web.id, "user", "CHANNEL-MARKER")
+    await _seed_message(agent.id, admin.id, a2a.id, "assistant", "CHANNEL-MARKER")
+
+    out = await handle_search_sessions(
+        agent.id,
+        admin.id,
+        str(web.id),
+        {"query": "CHANNEL-MARKER"},
+    )
+
+    assert f"[session {web.id}] Web thread · 通道=web" in out
+    assert f"[session {a2a.id}] A2A thread · 通道=agent" in out
 
 
 # ── Task 5: seeded schema ──────────────────────────────────────────────────
@@ -456,6 +484,7 @@ def test_builtin_tools_seeded():
         assert t["parameters_schema"]["type"] == "object"
     assert by_name["read_session_messages"]["parameters_schema"]["required"] == ["session_id"]
     assert by_name["search_sessions"]["parameters_schema"]["required"] == ["query"]
+    assert "source channel" in by_name["search_sessions"]["description"]
 
 
 # ── Task 6: dispatch routing ───────────────────────────────────────────────

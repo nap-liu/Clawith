@@ -1804,7 +1804,7 @@ BUILTIN_TOOLS = [
     {
         "name": "search_sessions",
         "display_name": "Search Sessions",
-        "description": "Full-text search across the messages of the sessions you are allowed to see, returning matching sessions with a snippet. Read-only and permission-scoped exactly like list_sessions (admin partner → all users' sessions; regular user → own; A2A/trigger → autonomous-side only; never another agent's). Narrow the keyword if there are too many hits.",
+        "description": "Full-text search across the messages of the sessions you are allowed to see, returning each exact session_id, source channel, and matching snippet. Read-only and permission-scoped exactly like list_sessions (admin partner → all users' sessions; regular user → own; A2A/trigger → autonomous-side only; never another agent's). Narrow the keyword if there are too many hits.",
         "category": "discovery",
         "icon": "🔍",
         "is_default": True,

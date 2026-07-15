@@ -126,12 +126,18 @@ async def handle_search_sessions(agent_id, user_id, ctx_session_id, arguments) -
 
         limit = _clamp(arguments.get("limit"), default=20, lo=1, hi=50)
         channel = arguments.get("channel")
-        sess_q = select(ChatSession.id, ChatSession.title, ChatSession.group_name).where(where)
+        sess_q = select(
+            ChatSession.id,
+            ChatSession.title,
+            ChatSession.group_name,
+            ChatSession.source_channel,
+        ).where(where)
         if channel and channel != "all":
             sess_q = sess_q.where(ChatSession.source_channel == channel)
         sess_rows = (await db.execute(sess_q)).all()
         session_ids = [r[0] for r in sess_rows]
         titles = {str(r[0]): (r[2] or r[1] or "(无标题)") for r in sess_rows}
+        channels = {str(r[0]): r[3] for r in sess_rows}
         if not session_ids:
             return fmt.render_search_hits([], {}, keyword=keyword)
 
@@ -142,4 +148,4 @@ async def handle_search_sessions(agent_id, user_id, ctx_session_id, arguments) -
             f"[search_sessions] agent={agent.id} scope_sessions={len(session_ids)} "
             f"hits={len(hits)} {elapsed_ms:.0f}ms kw_len={len(keyword)}"
         )
-        return fmt.render_search_hits(hits, titles, keyword=keyword)
+        return fmt.render_search_hits(hits, titles, keyword=keyword, channels=channels)
