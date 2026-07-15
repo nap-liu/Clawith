@@ -1247,11 +1247,12 @@ BUILTIN_TOOLS = [
             "jobs in a long-lived per-session aio-sandbox environment.\n"
             "\n"
             "Actions:\n"
-            "- execute (default): run code. Use execution_mode=foreground for finite "
-            "commands and execution_mode=background for servers, listeners, watch "
-            "processes, device/OAuth authorization waits, continuous polling, or any "
-            "work that must survive later chat turns. Never add &, nohup, setsid, "
-            "tmux or screen in background mode; the tool creates a managed AIO job.\n"
+            "- execute (default): run code. execution_mode is required: choose "
+            "foreground for commands expected to finish in the current turn; choose "
+            "background for servers, listeners, watch processes, device/OAuth "
+            "authorization waits, continuous polling, or any work that must survive "
+            "later chat turns. In background mode, submit the command directly and "
+            "let the managed AIO job own its lifecycle.\n"
             "- list_jobs: list every background job owned by the current chat session.\n"
             "- job_status / job_logs / job_stop: inspect status, read live output "
             "(including while running), or stop the supplied job_id.\n"
@@ -1346,13 +1347,13 @@ BUILTIN_TOOLS = [
                 "execution_mode": {
                     "type": "string",
                     "enum": ["foreground", "background"],
-                    "default": "foreground",
-                    "description": "Use background for servers, listeners, authorization waits, polling and work that must survive later turns. Do not add shell detachment syntax.",
+                    "description": "Required. Choose foreground for work that finishes in the current turn. Choose background for servers, listeners, authorization waits, polling, and work that must survive later turns; submit the command directly and let the managed AIO job own its lifecycle.",
                 },
                 "timeout": {"type": "integer", "description": "Existing timeout. Foreground: command lifetime. Background: managed Job lifetime."},
                 "job_id": {"type": "string", "description": "Required for job_status, job_logs and job_stop; obtain it from background execute or list_jobs"},
                 "tail_lines": {"type": "integer", "description": "For job_logs, trailing lines to return (default 100, max 500)"},
             },
+            "required": ["execution_mode"],
         },
         "config": {
             "sandbox_type": "aio_sandbox",

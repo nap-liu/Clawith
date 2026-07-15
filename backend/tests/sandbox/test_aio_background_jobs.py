@@ -275,7 +275,9 @@ def test_seeded_tool_exposes_one_simple_execute_and_job_management_contract():
         "foreground",
         "background",
     ]
-    assert "required" not in schema
+    assert schema["required"] == ["execution_mode"]
+    assert "default" not in schema["properties"]["execution_mode"]
+    assert "device/OAuth authorization waits" in tool["description"]
     assert ".clawith-jobs" not in tool["description"]
     assert tool["config"]["background_default_timeout"] < tool["config"][
         "background_max_timeout"
