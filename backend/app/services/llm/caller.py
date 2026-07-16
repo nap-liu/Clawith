@@ -15,8 +15,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import unicodedata
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -252,6 +254,20 @@ REPEAT_TOOL_CALL_BREAK_MESSAGE = (
     "你可以换个问法、缩小范围，或稍后再试。"
 )
 
+REPEAT_FILE_FAILURE_NUDGE = 2
+REPEAT_FILE_FAILURE_BREAK = 3
+
+REPEAT_FILE_FAILURE_NUDGE_PROMPT = (
+    "⚠️ 你已经连续针对同一个文件得到路径不存在错误。不要再猜测工作目录、编码或挂载状态。"
+    "请使用附件提供的 canonical virtual path，或原样复制 list_files 返回的路径；"
+    "如果路径仍不可用，请停止尝试并如实说明。"
+)
+
+REPEAT_FILE_FAILURE_BREAK_MESSAGE = (
+    "抱歉，我连续尝试读取同一个文件，但使用的路径始终无法解析。"
+    "为避免继续浪费时间，我先停止重试。请确认附件仍存在，或重新上传后再试。"
+)
+
 
 def _tool_call_signature(tc: dict) -> tuple[str, str]:
     """Stable ``(name, canonical-args)`` identity for a tool call.
@@ -286,6 +302,55 @@ def _update_repeat_streaks(
     provider's 400 is about repetition *across* rounds).
     """
     return {sig: prev_streaks.get(sig, 0) + 1 for sig in round_signatures}
+
+
+_FILE_NOT_FOUND_PATTERNS = (
+    re.compile(r"File not found:\s*([^\r\n]+)", re.IGNORECASE),
+    re.compile(r"No such file or directory:\s*['\"]([^'\"]+)['\"]", re.IGNORECASE),
+    re.compile(r"cannot statx?\s+['\"]([^'\"]+)['\"]", re.IGNORECASE),
+)
+
+
+def _tool_failure_signature(content: object) -> tuple[str, str] | None:
+    """Identify repeated file-path failures even when tool arguments change.
+
+    Models often vary the surrounding Python program on every retry, so the
+    exact tool-call guard cannot see that every round targets the same missing
+    file.  Fingerprint the failed virtual path after Unicode/whitespace folding;
+    successful or unrelated tool results reset the consecutive streak.
+    """
+    if not isinstance(content, str):
+        return None
+    for pattern in _FILE_NOT_FOUND_PATTERNS:
+        match = pattern.search(content)
+        if not match:
+            continue
+        raw_path = match.group(1).strip().replace("\\", "/")
+        target = _collapse_failure_path(raw_path)
+        return ("file_not_found", target) if target else None
+    return None
+
+
+def _collapse_failure_path(raw_path: str) -> str:
+    """Normalize equivalent internal, virtual and code-relative file paths."""
+    parts = [part for part in PurePosixPath(raw_path).parts if part not in {"", "/", "."}]
+    if "workspace" in parts:
+        # ``/data/agents/<id>/workspace/uploads/x`` and
+        # ``workspace/uploads/x`` are the same agent-visible resource.
+        parts = parts[parts.index("workspace") + 1:]
+    normalized = unicodedata.normalize("NFKC", "/".join(parts) or raw_path).casefold()
+    return "".join(char for char in normalized if not char.isspace())
+
+
+def _tool_failure_signatures(messages: list[LLMMessage]) -> list[tuple[str, str]]:
+    signatures: list[tuple[str, str]] = []
+    for message in messages:
+        if message.role != "tool":
+            continue
+        signature = _tool_failure_signature(message.content)
+        if signature:
+            signatures.append(signature)
+    return signatures
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1002,6 +1067,9 @@ async def call_llm(
 
     # Repeated tool-call guard state: per-signature consecutive-round streaks.
     _repeat_streaks: dict[tuple[str, str], int] = {}
+    # File failures need a result-level guard because models often change the
+    # surrounding code on every retry while targeting the same missing file.
+    _file_failure_streaks: dict[tuple[str, str], int] = {}
 
     # Tool-calling loop
     for round_i in range(_max_tool_rounds):
@@ -1380,6 +1448,20 @@ async def call_llm(
                     )
                 )
 
+        _round_file_failures = _tool_failure_signatures(api_messages[fresh_start:])
+        _file_failure_streaks = _update_repeat_streaks(_file_failure_streaks, _round_file_failures)
+        _max_file_failure = max(_file_failure_streaks.values(), default=0)
+        if _max_file_failure >= REPEAT_FILE_FAILURE_BREAK:
+            logger.warning(
+                f"[LLM] Repeated file-path failure guard tripped (streak={_max_file_failure}, "
+                f"round {round_i + 1}, agent={agent_id}); stopping loop gracefully."
+            )
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client.close()
+            _log_turn_timing("file_failure_guard", round_i + 1)
+            return REPEAT_FILE_FAILURE_BREAK_MESSAGE
+
         # P2: A single round can produce many in-budget tool results whose
         # sum blows past the message-level cap (e.g. 3 × 30 KB RAGFlow
         # queries). Enforce the ceiling now, after every tool message for
@@ -1395,7 +1477,9 @@ async def call_llm(
         # corrective message (append-only → prefix cache stays intact) so the
         # model gets a chance to change approach or answer before the guard
         # above hard-stops it on the 3rd.
-        if _max_repeat == REPEAT_TOOL_CALL_NUDGE:
+        if _max_file_failure == REPEAT_FILE_FAILURE_NUDGE:
+            api_messages.append(LLMMessage(role="user", content=REPEAT_FILE_FAILURE_NUDGE_PROMPT))
+        elif _max_repeat == REPEAT_TOOL_CALL_NUDGE:
             api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))
 
         # Auto-compaction hook (P5).
@@ -1735,6 +1819,7 @@ async def call_agent_llm_with_tools(
             api_messages = list(messages)
             # Repeated tool-call guard state: per-signature consecutive-round streaks.
             _repeat_streaks: dict[tuple[str, str], int] = {}
+            _file_failure_streaks: dict[tuple[str, str], int] = {}
             for round_i in range(max_rounds):
                 # Check token usage limit mid-loop (every 3 rounds)
                 if round_i > 0 and round_i % 3 == 0:
@@ -1867,6 +1952,7 @@ async def call_agent_llm_with_tools(
                     )
                 )
 
+                round_tool_results: list[str] = []
                 for tc in sanitized_tool_calls or []:
                     args = _canonicalize_tc_arguments(tc, session_id)
                     tool_name = tc["function"]["name"]
@@ -1890,6 +1976,7 @@ async def call_agent_llm_with_tools(
                         logger.info(
                             f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}"
                         )
+                    round_tool_results.append(str(result))
                     api_messages.append(
                         LLMMessage(
                             role="tool",
@@ -1898,10 +1985,32 @@ async def call_agent_llm_with_tools(
                         )
                     )
 
+                _round_file_failures = [
+                    signature
+                    for result in round_tool_results
+                    if (signature := _tool_failure_signature(result)) is not None
+                ]
+                _file_failure_streaks = _update_repeat_streaks(
+                    _file_failure_streaks,
+                    _round_file_failures,
+                )
+                _max_file_failure = max(_file_failure_streaks.values(), default=0)
+                if _max_file_failure >= REPEAT_FILE_FAILURE_BREAK:
+                    logger.warning(
+                        f"[call_agent_llm_with_tools] Repeated file-path failure guard tripped "
+                        f"(streak={_max_file_failure}, round {round_i + 1}, agent={agent_id})."
+                    )
+                    if agent_id and _unsaved_usage.total_tokens > 0:
+                        await record_token_usage(agent_id, _unsaved_usage)
+                    await client.close()
+                    return REPEAT_FILE_FAILURE_BREAK_MESSAGE, True, tool_executed
+
                 # Repeated tool-call nudge (2nd identical round): one corrective
                 # message so the model can change approach or answer before the
                 # guard above hard-stops it on the 3rd.
-                if _max_repeat == REPEAT_TOOL_CALL_NUDGE:
+                if _max_file_failure == REPEAT_FILE_FAILURE_NUDGE:
+                    api_messages.append(LLMMessage(role="user", content=REPEAT_FILE_FAILURE_NUDGE_PROMPT))
+                elif _max_repeat == REPEAT_TOOL_CALL_NUDGE:
                     api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))
 
             if agent_id and _unsaved_usage.total_tokens > 0:

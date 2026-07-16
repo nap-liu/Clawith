@@ -2851,10 +2851,29 @@ async def _run_with_temp_workspace(
     runner,
     *,
     paths: list[str] | None = None,
+    source_paths: list[str] | None = None,
     sync_back: bool = False,
 ) -> str:
     """Materialize a temporary workspace for tools that require local files."""
-    temp_workspace = await _prepare_temp_workspace(agent_id, tenant_id=tenant_id, paths=paths)
+    materialized_paths = paths
+    if source_paths:
+        canonical_sources: dict[str, str] = {}
+        for source_path in source_paths:
+            resolved = await _resolve_storage_source_path(agent_id, source_path, tenant_id)
+            if resolved.ambiguous_candidates:
+                return _storage_source_error(source_path, resolved)
+            if resolved.exists:
+                canonical_sources[source_path] = resolved.virtual_path
+        if paths is not None:
+            materialized_paths = [canonical_sources.get(path, path) for path in paths]
+        else:
+            materialized_paths = [canonical_sources.get(path, path) for path in source_paths]
+
+    temp_workspace = await _prepare_temp_workspace(
+        agent_id,
+        tenant_id=tenant_id,
+        paths=materialized_paths,
+    )
     try:
         result = await runner(temp_workspace.root)
         if sync_back:
@@ -3315,6 +3334,7 @@ async def execute_tool(
                 _agent_tenant_id,
                 lambda temp_ws: _convert_csv_to_xlsx(agent_id, temp_ws, arguments),
                 paths=_non_empty_paths(arguments.get("source_path", ""), arguments.get("target_path", "")),
+                source_paths=_non_empty_paths(arguments.get("source_path", "")),
                 sync_back=True,
             )
         elif tool_name == "convert_html_to_pdf":
@@ -3323,6 +3343,7 @@ async def execute_tool(
                 _agent_tenant_id,
                 lambda temp_ws: _convert_html_to_pdf(agent_id, temp_ws, arguments),
                 paths=_non_empty_paths(arguments.get("source_path", ""), arguments.get("target_path", "")),
+                source_paths=_non_empty_paths(arguments.get("source_path", "")),
                 sync_back=True,
             )
         elif tool_name == "convert_html_to_pptx":
@@ -3331,6 +3352,7 @@ async def execute_tool(
                 _agent_tenant_id,
                 lambda temp_ws: _convert_html_to_pptx(agent_id, temp_ws, arguments),
                 paths=_non_empty_paths(arguments.get("source_path", ""), arguments.get("target_path", "")),
+                source_paths=_non_empty_paths(arguments.get("source_path", "")),
                 sync_back=True,
             )
         elif tool_name == "convert_markdown_to_docx":
@@ -3339,6 +3361,7 @@ async def execute_tool(
                 _agent_tenant_id,
                 lambda temp_ws: _convert_markdown_to_docx(agent_id, temp_ws, arguments),
                 paths=_non_empty_paths(arguments.get("source_path", ""), arguments.get("target_path", "")),
+                source_paths=_non_empty_paths(arguments.get("source_path", "")),
                 sync_back=True,
             )
         elif tool_name == "convert_markdown_to_pdf":
@@ -3347,6 +3370,7 @@ async def execute_tool(
                 _agent_tenant_id,
                 lambda temp_ws: _convert_markdown_to_pdf(agent_id, temp_ws, arguments),
                 paths=_non_empty_paths(arguments.get("source_path", ""), arguments.get("target_path", "")),
+                source_paths=_non_empty_paths(arguments.get("source_path", "")),
                 sync_back=True,
             )
         elif tool_name == "search_files":
@@ -3445,6 +3469,7 @@ async def execute_tool(
                     _agent_tenant_id,
                     lambda temp_ws: _send_channel_file(agent_id, temp_ws, arguments),
                     paths=[file_path],
+                    source_paths=[file_path],
                 )
         elif tool_name == "web_search":
             result = await _web_search(arguments, agent_id)
@@ -3487,6 +3512,7 @@ async def execute_tool(
                 _agent_tenant_id,
                 lambda temp_ws: _upload_image(agent_id, temp_ws, arguments),
                 paths=_non_empty_paths(file_path),
+                source_paths=_non_empty_paths(file_path),
             )
         elif tool_name == "generate_image_siliconflow":
             result = await _run_with_temp_workspace(
@@ -5062,7 +5088,15 @@ def _normalize_tool_rel_path(rel_path: str) -> str:
 
 
 def _collapse_filename_for_match(name: str) -> str:
-    return re.sub(r"\s+", "", unicodedata.normalize("NFC", name or "")).casefold()
+    """Return a comparison-only filename key for tolerant source lookup.
+
+    Exact storage paths always win.  This key is used only when an exact source
+    does not exist, and a match is accepted only when it is unique.  NFKC folds
+    full-width variants while ``isspace`` covers Unicode whitespace that a model
+    may insert when retyping a displayed filename (for example ``6 月``).
+    """
+    normalized = unicodedata.normalize("NFKC", name or "").casefold()
+    return "".join(char for char in normalized if not char.isspace())
 
 
 def _allowed_root_for_tool_path(ws: Path, rel_path: str, tenant_id: str | None = None) -> tuple[Path, str]:
@@ -5089,9 +5123,9 @@ def _resolve_tool_source_path(ws: Path, rel_path: str, tenant_id: str | None = N
     parent = candidate.parent
     if parent.exists():
         wanted = _collapse_filename_for_match(candidate.name)
-        for sibling in parent.iterdir():
-            if _collapse_filename_for_match(sibling.name) == wanted:
-                return sibling
+        matches = [sibling for sibling in parent.iterdir() if _collapse_filename_for_match(sibling.name) == wanted]
+        if len(matches) == 1:
+            return matches[0]
     return candidate
 
 
@@ -5113,6 +5147,82 @@ def _tool_storage_key(agent_id: uuid.UUID, rel_path: str, tenant_id: str | None 
         return normalize_storage_key(key), normalized, True
     key = f"{agent_id}/{normalized}" if normalized else str(agent_id)
     return normalize_storage_key(key), normalized, False
+
+
+@dataclass(frozen=True)
+class _ResolvedStorageSource:
+    """Canonical storage identity for one agent-visible source path."""
+
+    storage_key: str
+    virtual_path: str
+    is_enterprise: bool
+    exists: bool
+    ambiguous_candidates: tuple[str, ...] = ()
+
+
+async def _resolve_storage_source_path(
+    agent_id: uuid.UUID,
+    rel_path: str,
+    tenant_id: str | None = None,
+) -> _ResolvedStorageSource:
+    """Resolve a source path before selective workspace materialization.
+
+    Storage-backed tools previously materialized the model-provided exact key
+    first and only performed tolerant filename matching inside the resulting
+    temporary directory.  A miss therefore materialized nothing, making the
+    fallback unreachable.  Resolve against the storage directory first so all
+    file tools share the same canonical virtual path.
+    """
+    storage = get_storage_backend()
+    storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
+    if normalized and await storage.is_file(storage_key):
+        return _ResolvedStorageSource(storage_key, normalized, is_enterprise, True)
+
+    requested = PurePosixPath(normalized)
+    if not normalized or not requested.name:
+        return _ResolvedStorageSource(storage_key, normalized, is_enterprise, False)
+
+    parent_virtual = requested.parent.as_posix()
+    if parent_virtual == ".":
+        parent_virtual = ""
+    parent_key, _, parent_is_enterprise = _tool_storage_key(agent_id, parent_virtual, tenant_id)
+    if not await storage.is_dir(parent_key):
+        return _ResolvedStorageSource(storage_key, normalized, is_enterprise, False)
+
+    wanted = _collapse_filename_for_match(requested.name)
+    matches = [
+        entry
+        for entry in await storage.list_dir(parent_key)
+        if not entry.is_dir and _collapse_filename_for_match(entry.name) == wanted
+    ]
+    candidate_paths = tuple(
+        f"{parent_virtual}/{entry.name}" if parent_virtual else entry.name
+        for entry in matches
+    )
+    if len(matches) == 1:
+        return _ResolvedStorageSource(
+            matches[0].key,
+            candidate_paths[0],
+            parent_is_enterprise,
+            True,
+        )
+    return _ResolvedStorageSource(
+        storage_key,
+        normalized,
+        is_enterprise,
+        False,
+        ambiguous_candidates=candidate_paths,
+    )
+
+
+def _storage_source_error(rel_path: str, resolved: _ResolvedStorageSource) -> str:
+    if resolved.ambiguous_candidates:
+        candidates = "\n".join(f"- {path}" for path in resolved.ambiguous_candidates)
+        return (
+            f"File path is ambiguous after normalization: {rel_path}\n"
+            f"Use one exact path from these candidates:\n{candidates}"
+        )
+    return f"File not found: {rel_path}"
 
 
 def _display_size(size_bytes: int) -> str:
@@ -5166,13 +5276,13 @@ async def _storage_read_file(
     limit: int = 2000,
 ) -> str:
     storage = get_storage_backend()
-    storage_key, normalized, _ = _tool_storage_key(agent_id, rel_path, tenant_id)
-    if not normalized:
+    resolved = await _resolve_storage_source_path(agent_id, rel_path, tenant_id)
+    if not resolved.virtual_path:
         return "File not found: root"
-    if not await storage.is_file(storage_key):
-        return f"File not found: {rel_path}"
+    if not resolved.exists:
+        return _storage_source_error(rel_path, resolved)
     try:
-        content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
+        content = await storage.read_text(resolved.storage_key, encoding="utf-8", errors="replace")
         lines = content.splitlines()
         total_lines = len(lines)
         start = max(0, offset)
@@ -5183,7 +5293,10 @@ async def _storage_read_file(
         output = "\n".join(f"{i + 1:6}\t{line}" for i, line in enumerate(selected_lines, start=start))
         if total_lines > end:
             output += f"\n\n... [{total_lines - end} more lines not shown, lines {end + 1}-{total_lines}]"
-        header = f"📄 {rel_path} (lines {start + 1 if total_lines else 0}-{end} of {total_lines})\n"
+        header = (
+            f"📄 {resolved.virtual_path} "
+            f"(lines {start + 1 if total_lines else 0}-{end} of {total_lines})\n"
+        )
         return header + output
     except Exception as e:
         return f"Read failed: {e}"
@@ -5767,9 +5880,25 @@ async def _read_document_from_storage(
     max_chars: int = 8000,
     tenant_id: str | None = None,
 ) -> str:
-    temp_workspace = await _prepare_temp_workspace(agent_id, tenant_id=tenant_id, paths=[rel_path])
+    resolved = await _resolve_storage_source_path(agent_id, rel_path, tenant_id)
+    if not resolved.exists:
+        return _storage_source_error(rel_path, resolved)
+    temp_workspace = await _prepare_temp_workspace(
+        agent_id,
+        tenant_id=tenant_id,
+        paths=[resolved.virtual_path],
+    )
     try:
-        return await _read_document(temp_workspace.root, rel_path, max_chars=max_chars, tenant_id=None)
+        content = await _read_document(
+            temp_workspace.root,
+            resolved.virtual_path,
+            max_chars=max_chars,
+            tenant_id=None,
+        )
+        _, requested_virtual_path, _ = _tool_storage_key(agent_id, rel_path, tenant_id)
+        if requested_virtual_path != resolved.virtual_path:
+            return f"Resolved document path: {resolved.virtual_path}\n\n{content}"
+        return content
     finally:
         temp_workspace.cleanup()
 

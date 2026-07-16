@@ -162,6 +162,109 @@ async def test_agent_file_tools_use_storage_paths(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_storage_read_file_resolves_unique_normalized_filename(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend({
+        f"{agent_id}/workspace/uploads/6月稽核月报.xlsx": b"canonical content\n",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    read = await agent_tools._storage_read_file(
+        agent_id,
+        "workspace/uploads/６ 月稽核月报.xlsx",
+    )
+
+    assert "📄 workspace/uploads/6月稽核月报.xlsx" in read
+    assert "canonical content" in read
+
+
+@pytest.mark.asyncio
+async def test_storage_source_normalization_refuses_ambiguous_candidates(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend({
+        f"{agent_id}/workspace/uploads/6月报告.xlsx": b"compact",
+        f"{agent_id}/workspace/uploads/6 月报告.xlsx": b"spaced",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    read = await agent_tools._storage_read_file(
+        agent_id,
+        "workspace/uploads/６　月报告.xlsx",
+    )
+
+    assert "ambiguous after normalization" in read
+    assert "workspace/uploads/6月报告.xlsx" in read
+    assert "workspace/uploads/6 月报告.xlsx" in read
+    assert "compact" not in read
+    assert "spaced" not in read
+
+
+@pytest.mark.asyncio
+async def test_read_document_resolves_before_selective_materialization(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend({
+        f"{agent_id}/workspace/uploads/山东7月门店等级.xlsx": b"xlsx bytes",
+        f"{agent_id}/workspace/uploads/unrelated.xlsx": b"other",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    observed: dict[str, object] = {}
+
+    async def _fake_read_document(ws, rel_path, max_chars, tenant_id):
+        observed["rel_path"] = rel_path
+        observed["content"] = (ws / rel_path).read_bytes()
+        observed["unrelated_exists"] = (ws / "workspace/uploads/unrelated.xlsx").exists()
+        return "document ok"
+
+    monkeypatch.setattr(agent_tools, "_read_document", _fake_read_document)
+
+    result = await agent_tools._read_document_from_storage(
+        agent_id,
+        "workspace/uploads/山东 7 月门店等级.xlsx",
+    )
+
+    assert result == (
+        "Resolved document path: workspace/uploads/山东7月门店等级.xlsx\n\n"
+        "document ok"
+    )
+    assert observed == {
+        "rel_path": "workspace/uploads/山东7月门店等级.xlsx",
+        "content": b"xlsx bytes",
+        "unrelated_exists": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_temp_workspace_runner_canonicalizes_sources_but_not_targets(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend({
+        f"{agent_id}/workspace/uploads/6月源数据.csv": b"a,b\n1,2\n",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    source_path = "workspace/uploads/6 月源数据.csv"
+    target_path = "workspace/reports/6 月结果.xlsx"
+
+    async def _runner(ws):
+        resolved_source = agent_tools._resolve_tool_source_path(ws, source_path)
+        assert resolved_source.name == "6月源数据.csv"
+        assert resolved_source.read_bytes() == b"a,b\n1,2\n"
+        # A new target must retain the exact name requested by the caller.
+        assert not (ws / target_path).exists()
+        return "runner ok"
+
+    result = await agent_tools._run_with_temp_workspace(
+        agent_id,
+        None,
+        _runner,
+        paths=[source_path, target_path],
+        source_paths=[source_path],
+    )
+
+    assert result == "runner ok"
+
+
+@pytest.mark.asyncio
 async def test_temp_workspace_materializes_only_requested_paths(monkeypatch):
     agent_id = uuid.uuid4()
     storage = MemoryStorageBackend({

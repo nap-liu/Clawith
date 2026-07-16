@@ -54,7 +54,9 @@ const {
     assert.equal(payload.fileName, 'report.pdf');
     assert.equal(payload.imageUrl, undefined);
     assert.equal(payload.contentForLLM.includes('[File: report.pdf]'), true);
-    assert.equal(payload.contentForLLM.includes('File location: workspace/uploads/report.pdf'), true);
+    assert.equal(payload.contentForLLM.includes('Canonical virtual path: workspace/uploads/report.pdf'), true);
+    assert.equal(payload.contentForLLM.includes('Use this exact same path with read_file, read_document, and execute_code.'), true);
+    assert.equal(payload.contentForLLM.includes('relative path: "uploads/report.pdf"'), false);
     assert.equal(payload.contentForLLM.includes('Question: 总结一下'), true);
 }
 

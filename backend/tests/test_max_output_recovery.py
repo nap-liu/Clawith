@@ -25,6 +25,7 @@ E. If the re-streamed (resumed) response carries ``tool_calls``, the outer
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -32,6 +33,8 @@ import pytest
 
 from app.services.llm.caller import (
     MAX_OUTPUT_TOKENS_RECOVERY_LIMIT,
+    REPEAT_FILE_FAILURE_BREAK_MESSAGE,
+    REPEAT_FILE_FAILURE_NUDGE_PROMPT,
     RESUME_PROMPT,
     _response_was_truncated_by_length,
     call_llm,
@@ -348,3 +351,64 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
     # And the tool result follows right after the tool-calls assistant turn.
     assert round_1_msgs[tool_turn_idx + 1].role == "tool"
     assert round_1_msgs[tool_turn_idx + 1].content == "file-contents"
+
+
+@pytest.mark.asyncio
+async def test_file_failure_guard_stops_changing_code_after_three_rounds(monkeypatch):
+    def _tool_response(call_id: int, code: str) -> LLMResponse:
+        return LLMResponse(
+            content="trying another approach",
+            tool_calls=[{
+                "id": f"call_{call_id}",
+                "type": "function",
+                "function": {
+                    "name": "execute_code_aio",
+                    "arguments": json.dumps({
+                        "action": "execute",
+                        "execution_mode": "foreground",
+                        "language": "python",
+                        "code": code,
+                    }),
+                },
+            }],
+            finish_reason="tool_calls",
+        )
+
+    client = _ScriptedClient([
+        _tool_response(1, "open('uploads/6 月稽核月报.xlsx')"),
+        _tool_response(2, "import pandas as pd; pd.read_excel('workspace/uploads/6月稽核月报.xlsx')"),
+        _tool_response(3, "from pathlib import Path; Path('workspace/uploads/６　月稽核月报.xlsx').read_bytes()"),
+    ])
+    _patch_caller_collaborators(monkeypatch, client, tools=[
+        {"type": "function", "function": {"name": "execute_code_aio", "description": "run"}},
+    ])
+
+    errors = iter([
+        "FileNotFoundError: [Errno 2] No such file or directory: 'uploads/6 月稽核月报.xlsx'",
+        "File not found: workspace/uploads/6月稽核月报.xlsx",
+        "stat: cannot statx 'workspace/uploads/６　月稽核月报.xlsx': No such file or directory",
+    ])
+
+    async def _fake_tool(*_args, **_kwargs):
+        return next(errors)
+
+    monkeypatch.setattr("app.services.llm.caller.execute_tool", _fake_tool)
+
+    result = await call_llm(
+        model=_FakeModel(),
+        messages=[{"role": "user", "content": "analyze the attachment"}],
+        agent_name="T",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="s",
+    )
+
+    assert result == REPEAT_FILE_FAILURE_BREAK_MESSAGE
+    assert len(client.stream_calls) == 3
+    third_round_messages: list[LLMMessage] = client.stream_calls[2]["messages"]
+    assert any(
+        message.role == "user" and message.content == REPEAT_FILE_FAILURE_NUDGE_PROMPT
+        for message in third_round_messages
+    )
+    assert client.closed is True

@@ -117,9 +117,8 @@ export function buildChatAttachmentPayload({
                 filesPrompt += `[图片文件已上传: ${file.name}，保存在 ${file.path || ''}]\n`;
             } else {
                 const wsPath = file.path || '';
-                const codePath = wsPath.replace(/^workspace\//, '');
                 const fileLoc = wsPath
-                    ? `\nFile location: ${wsPath} (for read_file/read_document tools)\nIn execute_code, use relative path: "${codePath}" (working directory is workspace/)\n`
+                    ? `\nCanonical virtual path: ${wsPath}\nUse this exact same path with read_file, read_document, and execute_code.\n`
                     : '';
                 if (file.source === 'workspace_auto') {
                     filesPrompt += `[Workspace reference: ${file.name}]${fileLoc}\nUse read_file or read_document if you need the file contents.\n\n`;
