@@ -202,7 +202,13 @@ async def session():
     _register_all_models()
     from app.database import Base
     from app.models.agent import Agent, AgentPermission
-    from app.models.org import AgentAgentRelationship, RelationshipSuppression
+    from app.models.org import (
+        AgentAgentRelationship,
+        AgentRelationship,
+        OrgDepartment,
+        OrgMember,
+        RelationshipSuppression,
+    )
     from app.models.user import User
 
     eng = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -210,6 +216,9 @@ async def session():
         User.__table__,
         Agent.__table__,
         AgentPermission.__table__,
+        OrgDepartment.__table__,
+        OrgMember.__table__,
+        AgentRelationship.__table__,
         AgentAgentRelationship.__table__,
         RelationshipSuppression.__table__,
     ]
@@ -265,6 +274,65 @@ async def test_candidate_list_includes_visible_company_agent_user_cannot_manage(
 
     pub = next(r for r in result if r["agent_id"] == str(public.id))
     assert pub["can_manage"] is False  # regular user may relate without managing it
+
+
+@pytest.mark.asyncio
+async def test_visible_agents_query_includes_parent_department_grant(session):
+    from app.models.agent import AgentPermission
+    from app.models.org import OrgDepartment, OrgMember
+
+    tenant = uuid.uuid4()
+    user = _new_user(tenant)
+    parent = OrgDepartment(
+        id=uuid.uuid4(),
+        tenant_id=tenant,
+        name="信息技术部",
+        path="Root/信息技术部",
+        status="active",
+    )
+    child = OrgDepartment(
+        id=uuid.uuid4(),
+        tenant_id=tenant,
+        name="前端开发",
+        path="Root/信息技术部/前端开发",
+        parent_id=parent.id,
+        status="active",
+    )
+    custom = _new_agent(
+        tenant,
+        uuid.uuid4(),
+        name="department-bot",
+        access_mode="custom",
+    )
+    session.add_all(
+        [
+            user,
+            parent,
+            child,
+            custom,
+            OrgMember(
+                id=uuid.uuid4(),
+                tenant_id=tenant,
+                user_id=user.id,
+                name="Descendant member",
+                department_id=child.id,
+                department_path=child.path,
+                status="active",
+            ),
+            AgentPermission(
+                agent_id=custom.id,
+                scope_type="department",
+                scope_id=parent.id,
+                access_level="use",
+            ),
+        ]
+    )
+    await session.flush()
+
+    visible = list(
+        (await session.execute(permissions.build_visible_agents_query(user))).scalars()
+    )
+    assert [agent.id for agent in visible] == [custom.id]
 
 
 # ─── Change 2: save gate = visible (not manage) ───────────────────────────

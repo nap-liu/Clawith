@@ -1,4 +1,6 @@
 from __future__ import annotations
+import asyncio
+import json
 import uuid
 import pytest
 from types import SimpleNamespace
@@ -227,15 +229,17 @@ async def test_set_agent_relationships_requires_write():
     assert "需要 write" in out
 
 
-# ── New tests: set_agent_access, list_agent_triggers, update_agent_trigger ──
+# ── Access tools, list_agent_triggers, update_agent_trigger ──
 
-async def test_set_agent_access_requires_confirm():
-    from app.mcp_server.tools_config import set_agent_access_impl
+async def test_set_agent_access_mode_requires_confirm():
+    from app.mcp_server.tools_config import set_agent_access_mode_impl
     tenant = await _seed_tenant()
     user = await _seed_user(tenant_id=tenant.id)
     agent = await _seed_agent(user, access_mode="company")
     token = await _pat(user, scope="write")
-    out = await set_agent_access_impl(_ctx(token), agent=str(agent.id), access_mode="private")
+    out = await set_agent_access_mode_impl(
+        _ctx(token), agent=str(agent.id), access_mode="private"
+    )
     assert "confirm=true" in out.lower() or "confirm=True" in out
     # Agent access_mode must NOT have changed
     async with async_session() as db:
@@ -244,18 +248,432 @@ async def test_set_agent_access_requires_confirm():
     assert a.access_mode == "company"
 
 
-async def test_set_agent_access_confirmed():
-    from app.mcp_server.tools_config import set_agent_access_impl
-    from app.models.agent import Agent
+async def test_set_agent_access_mode_preserves_existing_grants():
+    from app.mcp_server.tools_config import set_agent_access_mode_impl
+    from app.models.agent import Agent, AgentPermission
+    from app.models.org import OrgDepartment
     tenant = await _seed_tenant()
     user = await _seed_user(tenant_id=tenant.id)
+    colleague = await _seed_user(tenant_id=tenant.id)
     agent = await _seed_agent(user, access_mode="company")
+    async with async_session() as db:
+        stored_agent = (await db.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        stored_agent.company_access_level = "manage"
+        department = OrgDepartment(
+            tenant_id=tenant.id,
+            name="Engineering",
+            path="Root/Engineering",
+            status="active",
+        )
+        db.add(department)
+        await db.flush()
+        db.add_all([
+            AgentPermission(
+                agent_id=agent.id,
+                scope_type="user",
+                scope_id=colleague.id,
+                access_level="use",
+            ),
+            AgentPermission(
+                agent_id=agent.id,
+                scope_type="department",
+                scope_id=department.id,
+                access_level="manage",
+            ),
+        ])
+        await db.commit()
+        department_id = department.id
     token = await _pat(user, scope="write")
-    out = await set_agent_access_impl(_ctx(token), agent=str(agent.id), access_mode="private", confirm=True)
+    out = await set_agent_access_mode_impl(
+        _ctx(token), agent=str(agent.id), access_mode="private", confirm=True
+    )
     assert "✅" in out
     async with async_session() as db:
         a = (await db.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+        grants = (
+            await db.execute(
+                select(AgentPermission).where(AgentPermission.agent_id == agent.id)
+            )
+        ).scalars().all()
     assert a.access_mode == "private"
+    assert a.company_access_level == "manage"
+    assert any(p.scope_type == "user" and p.scope_id == colleague.id for p in grants)
+    assert any(p.scope_type == "department" and p.scope_id == department_id for p in grants)
+
+
+async def test_set_agent_access_mode_company_level_change_is_explicit():
+    from app.mcp_server.tools_config import set_agent_access_mode_impl
+    from app.models.agent import Agent
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(owner, access_mode="company")
+    token = await _pat(owner, scope="write")
+
+    preview = await set_agent_access_mode_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        access_mode="company",
+        company_access_level="manage",
+    )
+    assert "company_access_level: use → manage" in preview
+    out = await set_agent_access_mode_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        access_mode="company",
+        company_access_level="manage",
+        confirm=True,
+    )
+    assert "company_access_level: use → manage" in out
+    async with async_session() as db:
+        stored = (await db.execute(select(Agent).where(Agent.id == agent.id))).scalar_one()
+    assert stored.company_access_level == "manage"
+
+
+async def test_grant_agent_access_is_incremental_and_atomic():
+    from app.mcp_server.tools_config import grant_agent_access_impl
+    from app.models.agent import AgentPermission
+    from app.models.org import OrgDepartment
+
+    tenant = await _seed_tenant()
+    other_tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    existing_user = await _seed_user(tenant_id=tenant.id)
+    new_user = await _seed_user(tenant_id=tenant.id)
+    foreign_user = await _seed_user(tenant_id=other_tenant.id)
+    agent = await _seed_agent(owner, access_mode="custom")
+    async with async_session() as db:
+        department = OrgDepartment(
+            tenant_id=tenant.id,
+            name="Product",
+            path="Root/Product",
+            status="active",
+        )
+        db.add(department)
+        await db.flush()
+        db.add(
+            AgentPermission(
+                agent_id=agent.id,
+                scope_type="user",
+                scope_id=existing_user.id,
+                access_level="use",
+            )
+        )
+        await db.commit()
+        department_id = department.id
+
+    token = await _pat(owner, scope="write")
+    rejected = await grant_agent_access_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        user_ids=[str(new_user.id), str(foreign_user.id)],
+        department_ids=[str(department_id)],
+        confirm=True,
+    )
+    assert "未执行任何修改" in rejected
+    async with async_session() as db:
+        rejected_rows = (
+            await db.execute(
+                select(AgentPermission).where(AgentPermission.agent_id == agent.id)
+            )
+        ).scalars().all()
+    assert not any(p.scope_id == new_user.id for p in rejected_rows)
+    assert not any(p.scope_id == department_id for p in rejected_rows)
+
+    out = await grant_agent_access_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        user_ids=[str(new_user.id)],
+        department_ids=[str(department_id)],
+        access_level="manage",
+        confirm=True,
+    )
+    assert "✅" in out
+    async with async_session() as db:
+        grants = (
+            await db.execute(
+                select(AgentPermission).where(AgentPermission.agent_id == agent.id)
+            )
+        ).scalars().all()
+    assert any(p.scope_id == existing_user.id for p in grants)
+    assert any(p.scope_id == new_user.id and p.access_level == "manage" for p in grants)
+    assert any(p.scope_id == department_id and p.access_level == "manage" for p in grants)
+
+
+async def test_grant_agent_access_is_concurrency_safe_for_same_department():
+    from app.mcp_server.tools_config import grant_agent_access_impl
+    from app.models.agent import AgentPermission
+    from app.models.org import OrgDepartment
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(owner, access_mode="custom")
+    async with async_session() as db:
+        baseline_department = OrgDepartment(
+            tenant_id=tenant.id,
+            name="Baseline",
+            path="Root/Baseline",
+            status="active",
+        )
+        concurrent_department = OrgDepartment(
+            tenant_id=tenant.id,
+            name="Concurrent",
+            path="Root/Concurrent",
+            status="active",
+        )
+        db.add_all([baseline_department, concurrent_department])
+        await db.commit()
+        baseline_department_id = baseline_department.id
+        concurrent_department_id = concurrent_department.id
+
+    token = await _pat(owner, scope="write")
+    baseline = await grant_agent_access_impl(
+        _ctx(token),
+        agent=str(agent.id),
+        department_ids=[str(baseline_department_id)],
+        confirm=True,
+    )
+    assert "✅" in baseline
+
+    results = await asyncio.gather(
+        *(
+            grant_agent_access_impl(
+                _ctx(token),
+                agent=str(agent.id),
+                department_ids=[str(concurrent_department_id)],
+                access_level="use",
+                confirm=True,
+            )
+            for _ in range(8)
+        )
+    )
+    assert all("✅" in result for result in results), results
+
+    async with async_session() as db:
+        grant_count = (
+            await db.execute(
+                select(func.count(AgentPermission.id)).where(
+                    AgentPermission.agent_id == agent.id,
+                    AgentPermission.scope_type == "department",
+                    AgentPermission.scope_id == concurrent_department_id,
+                )
+            )
+        ).scalar_one()
+        owner_grant_count = (
+            await db.execute(
+                select(func.count(AgentPermission.id)).where(
+                    AgentPermission.agent_id == agent.id,
+                    AgentPermission.scope_type == "user",
+                    AgentPermission.scope_id == owner.id,
+                )
+            )
+        ).scalar_one()
+    assert grant_count == 1
+    assert owner_grant_count == 1
+
+
+async def test_company_access_upsert_is_concurrency_safe_with_null_scope_id():
+    from app.mcp_server.tools_config import _upsert_access_permission
+    from app.models.agent import AgentPermission
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(owner, access_mode="company")
+
+    async def upsert_company_grant():
+        async with async_session() as db:
+            await _upsert_access_permission(
+                db,
+                agent_id=agent.id,
+                scope_type="company",
+                scope_id=None,
+                access_level="use",
+            )
+            await db.commit()
+
+    await asyncio.gather(*(upsert_company_grant() for _ in range(8)))
+
+    async with async_session() as db:
+        grants = (
+            await db.execute(
+                select(AgentPermission).where(
+                    AgentPermission.agent_id == agent.id,
+                    AgentPermission.scope_type == "company",
+                    AgentPermission.scope_id.is_(None),
+                )
+            )
+        ).scalars().all()
+    assert len(grants) == 1
+    assert grants[0].access_level == "use"
+
+
+async def test_revoke_agent_access_removes_only_named_grants_and_protects_owner():
+    from app.mcp_server.tools_config import revoke_agent_access_impl
+    from app.models.agent import AgentPermission
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    user_a = await _seed_user(tenant_id=tenant.id)
+    user_b = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(owner, access_mode="custom")
+    async with async_session() as db:
+        db.add_all([
+            AgentPermission(agent_id=agent.id, scope_type="user", scope_id=owner.id, access_level="manage"),
+            AgentPermission(agent_id=agent.id, scope_type="user", scope_id=user_a.id, access_level="use"),
+            AgentPermission(agent_id=agent.id, scope_type="user", scope_id=user_b.id, access_level="use"),
+        ])
+        await db.commit()
+    token = await _pat(owner, scope="write")
+
+    protected = await revoke_agent_access_impl(
+        _ctx(token), agent=str(agent.id), user_ids=[str(owner.id)], confirm=True
+    )
+    assert "不能撤销" in protected
+    out = await revoke_agent_access_impl(
+        _ctx(token), agent=str(agent.id), user_ids=[str(user_a.id)], confirm=True
+    )
+    assert "✅" in out
+    async with async_session() as db:
+        remaining_ids = set(
+            (
+                await db.execute(
+                    select(AgentPermission.scope_id).where(
+                        AgentPermission.agent_id == agent.id,
+                        AgentPermission.scope_type == "user",
+                    )
+                )
+            ).scalars().all()
+        )
+    assert owner.id in remaining_ids
+    assert user_a.id not in remaining_ids
+    assert user_b.id in remaining_ids
+
+
+async def test_get_agent_access_lists_department_grants():
+    from app.mcp_server.tools_config import get_agent_access_impl
+    from app.models.agent import AgentPermission
+    from app.models.org import OrgDepartment
+
+    tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    agent = await _seed_agent(owner, access_mode="custom")
+    async with async_session() as db:
+        department = OrgDepartment(
+            tenant_id=tenant.id,
+            name="Operations",
+            path="Root/Operations",
+            status="active",
+        )
+        db.add(department)
+        await db.flush()
+        db.add(
+            AgentPermission(
+                agent_id=agent.id,
+                scope_type="department",
+                scope_id=department.id,
+                access_level="use",
+            )
+        )
+        await db.commit()
+        department_id = department.id
+    token = await _pat(owner, scope="read")
+    out = await get_agent_access_impl(_ctx(token), agent=str(agent.id))
+    assert str(department_id) in out
+    assert "Operations" in out
+
+
+async def test_search_agent_access_subjects_discovers_ids_without_cross_tenant_leak():
+    from app.mcp_server.tools_config import search_agent_access_subjects_impl
+    from app.models.identity import IdentityProvider
+    from app.models.org import OrgDepartment
+
+    tenant = await _seed_tenant()
+    other_tenant = await _seed_tenant()
+    owner = await _seed_user(tenant_id=tenant.id)
+    local_user = await _seed_user(tenant_id=tenant.id)
+    foreign_user = await _seed_user(tenant_id=other_tenant.id)
+    agent = await _seed_agent(owner, access_mode="custom")
+    async with async_session() as db:
+        local = (await db.execute(select(User).where(User.id == local_user.id))).scalar_one()
+        local.display_name = "Needle Local"
+        foreign = (await db.execute(select(User).where(User.id == foreign_user.id))).scalar_one()
+        foreign.display_name = "Needle Foreign"
+        dingtalk_provider = IdentityProvider(
+            tenant_id=tenant.id,
+            provider_type="dingtalk",
+            name="华东钉钉",
+            is_active=True,
+        )
+        wecom_provider = IdentityProvider(
+            tenant_id=tenant.id,
+            provider_type="wecom",
+            name="华南企微",
+            is_active=True,
+        )
+        foreign_provider = IdentityProvider(
+            tenant_id=other_tenant.id,
+            provider_type="dingtalk",
+            name="其他租户钉钉",
+            is_active=True,
+        )
+        db.add_all([dingtalk_provider, wecom_provider, foreign_provider])
+        await db.flush()
+        local_department = OrgDepartment(
+            tenant_id=tenant.id,
+            provider_id=dingtalk_provider.id,
+            name="Needle Department",
+            path="Root/Needle Department",
+            status="active",
+        )
+        same_name_department = OrgDepartment(
+            tenant_id=tenant.id,
+            provider_id=wecom_provider.id,
+            name="Needle Department",
+            path="Root/Needle Department",
+            status="active",
+        )
+        foreign_department = OrgDepartment(
+            tenant_id=other_tenant.id,
+            provider_id=foreign_provider.id,
+            name="Needle Foreign Department",
+            path="Root/Needle Foreign Department",
+            status="active",
+        )
+        db.add_all([local_department, same_name_department, foreign_department])
+        await db.commit()
+        local_department_id = local_department.id
+        same_name_department_id = same_name_department.id
+        foreign_department_id = foreign_department.id
+        dingtalk_provider_id = dingtalk_provider.id
+        wecom_provider_id = wecom_provider.id
+
+    token = await _pat(owner, scope="read")
+    out = await search_agent_access_subjects_impl(
+        _ctx(token), agent=str(agent.id), query="Needle", subject_type="all"
+    )
+    payload = json.loads(out)
+    departments = {
+        item["department_id"]: item
+        for item in payload["items"]
+        if item["subject_type"] == "department"
+    }
+    assert str(local_user.id) in out
+    assert departments[str(local_department_id)] == {
+        "subject_type": "department",
+        "department_id": str(local_department_id),
+        "name": "Needle Department",
+        "path": "Root/Needle Department",
+        "provider_id": str(dingtalk_provider_id),
+        "provider_name": "华东钉钉",
+        "provider_type": "dingtalk",
+        "include_descendants": True,
+    }
+    assert departments[str(same_name_department_id)]["provider_id"] == str(wecom_provider_id)
+    assert departments[str(same_name_department_id)]["provider_name"] == "华南企微"
+    assert departments[str(same_name_department_id)]["provider_type"] == "wecom"
+    assert str(foreign_user.id) not in out
+    assert str(foreign_department_id) not in out
+    assert "其他租户钉钉" not in out
 
 
 async def test_list_agent_triggers():

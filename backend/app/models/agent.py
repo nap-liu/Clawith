@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -164,6 +164,23 @@ class AgentPermission(Base):
     """Access permission for a digital employee."""
 
     __tablename__ = "agent_permissions"
+    __table_args__ = (
+        Index(
+            "uq_agent_permissions_subject",
+            "agent_id",
+            "scope_type",
+            "scope_id",
+            unique=True,
+            postgresql_where=text("scope_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_agent_permissions_null_scope",
+            "agent_id",
+            "scope_type",
+            unique=True,
+            postgresql_where=text("scope_id IS NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=False)
@@ -171,7 +188,7 @@ class AgentPermission(Base):
         Enum("company", "department", "user", name="permission_scope_enum"),
         nullable=False,
     )
-    # scope_id: null for company, user_id for user scope
+    # scope_id: null for company, department_id/user_id for department/user scope
     scope_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     # access_level: 'use' = task/chat/tool/skill/workspace only, 'manage' = full access
     access_level: Mapped[str] = mapped_column(String(20), default="use", nullable=False)
