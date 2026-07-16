@@ -12,9 +12,14 @@ from app.models.agent import Agent, AgentPermission
 from app.models.org import (
     AgentAgentRelationship,
     AgentRelationship,
+    OrgMember,
     RelationshipSuppression,
 )
 from app.models.user import User
+from app.services.org_directory import (
+    agent_permission_department_subtree_cte,
+    same_directory_provider,
+)
 
 
 def build_visible_agents_query(
@@ -63,13 +68,36 @@ def build_visible_agents_query(
             )
         )
     )
+    department_grants = agent_permission_department_subtree_cte(
+        tenant_id=target_tenant_id,
+        name="visible_agent_department_grants",
+    )
+    department_agent_ids = (
+        select(department_grants.c.agent_id)
+        .select_from(department_grants)
+        .join(
+            OrgMember,
+            and_(
+                OrgMember.user_id == user.id,
+                OrgMember.tenant_id == target_tenant_id,
+                OrgMember.status == "active",
+                OrgMember.department_id == department_grants.c.department_id,
+                same_directory_provider(
+                    OrgMember.provider_id,
+                    department_grants.c.provider_id,
+                ),
+            ),
+        )
+        .distinct()
+    )
 
     return stmt.where(
         Agent.tenant_id == target_tenant_id,
         or_(
             Agent.creator_id == user.id,
             Agent.access_mode == "company",
-            Agent.id.in_(explicit_user_ids),
+            and_(Agent.access_mode == "custom", Agent.id.in_(explicit_user_ids)),
+            and_(Agent.access_mode == "custom", Agent.id.in_(department_agent_ids)),
         ),
     )
 
@@ -246,9 +274,18 @@ async def get_agent_access_level_for_user_id(
         return company_level or "use"
 
     if access_mode == "custom":
-        for perm in permissions:
-            if perm.scope_type == "user" and perm.scope_id == user.id:
-                return perm.access_level or "use"
+        levels = [
+            perm.access_level or "use"
+            for perm in permissions
+            if perm.scope_type == "user" and perm.scope_id == user.id
+        ]
+        department_level = await _get_department_permission_level(db, user.id, agent)
+        if department_level:
+            levels.append(department_level)
+        if "manage" in levels:
+            return "manage"
+        if levels:
+            return "use"
 
     return None
 
@@ -275,42 +312,119 @@ async def user_can_view_agent_id(
     return (await get_agent_access_level_for_user_id(db, user_id, agent)) is not None
 
 
-async def get_agent_accessible_user_ids(db: AsyncSession, agent: Agent) -> set[uuid.UUID]:
-    """Return platform users who can access an agent under current policy."""
-    access_mode = getattr(agent, "access_mode", None) or "company"
-    ids: set[uuid.UUID] = set()
-    if agent.creator_id:
-        ids.add(agent.creator_id)
-
-    if access_mode == "company":
-        result = await db.execute(
-            select(User.id).where(
-                User.tenant_id == agent.tenant_id,
-                User.is_active == True,  # noqa: E712
-            )
+async def _get_department_permission_level(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    agent: Agent,
+) -> str | None:
+    if not agent.tenant_id:
+        return None
+    department_grants = agent_permission_department_subtree_cte(
+        tenant_id=agent.tenant_id,
+        agent_id=agent.id,
+        name="access_level_department_grants",
+    )
+    result = await db.execute(
+        select(department_grants.c.access_level)
+        .select_from(department_grants)
+        .join(
+            OrgMember,
+            and_(
+                OrgMember.user_id == user_id,
+                OrgMember.tenant_id == agent.tenant_id,
+                OrgMember.status == "active",
+                OrgMember.department_id == department_grants.c.department_id,
+                same_directory_provider(
+                    OrgMember.provider_id,
+                    department_grants.c.provider_id,
+                ),
+            ),
         )
-        ids.update(row[0] for row in result.fetchall())
-        return ids
+        .where(
+            department_grants.c.agent_id == agent.id,
+        )
+        .distinct()
+    )
+    levels = [row[0] or "use" for row in result.all()]
+    if "manage" in levels:
+        return "manage"
+    return "use" if levels else None
+
+
+def build_agent_accessible_user_ids_query(
+    agent: Agent,
+    *,
+    include_department_members: bool = True,
+):
+    """Build a tenant-safe SQL query for users who can access ``agent``."""
+    access_mode = getattr(agent, "access_mode", None) or "company"
+    base_conditions = [
+        User.tenant_id == agent.tenant_id,
+        User.is_active == True,  # noqa: E712
+    ]
+    if access_mode == "company":
+        return select(User.id).where(*base_conditions)
 
     if access_mode == "custom":
-        result = await db.execute(
+        explicit_user_ids = (
             select(AgentPermission.scope_id).where(
                 AgentPermission.agent_id == agent.id,
                 AgentPermission.scope_type == "user",
                 AgentPermission.scope_id.isnot(None),
             )
         )
-        ids.update(row[0] for row in result.fetchall() if row[0])
-        admin_result = await db.execute(
-            select(User.id).where(
-                User.tenant_id == agent.tenant_id,
-                User.is_active == True,  # noqa: E712
-                User.role.in_(["platform_admin", "org_admin"]),
+        access_conditions = [
+            User.id == agent.creator_id,
+            User.id.in_(explicit_user_ids),
+            User.role.in_(["platform_admin", "org_admin"]),
+        ]
+        if include_department_members and agent.tenant_id:
+            department_grants = agent_permission_department_subtree_cte(
+                tenant_id=agent.tenant_id,
+                agent_id=agent.id,
+                name="accessible_user_department_grants",
             )
-        )
-        ids.update(row[0] for row in admin_result.fetchall())
+            department_user_ids = (
+                select(OrgMember.user_id)
+                .select_from(department_grants)
+                .join(
+                    OrgMember,
+                    and_(
+                        OrgMember.tenant_id == agent.tenant_id,
+                        OrgMember.status == "active",
+                        OrgMember.department_id == department_grants.c.department_id,
+                        same_directory_provider(
+                            OrgMember.provider_id,
+                            department_grants.c.provider_id,
+                        ),
+                    ),
+                )
+                .where(
+                    department_grants.c.agent_id == agent.id,
+                    OrgMember.user_id.is_not(None),
+                )
+                .distinct()
+            )
+            access_conditions.append(User.id.in_(department_user_ids))
+        return select(User.id).where(*base_conditions, or_(*access_conditions))
 
-    return ids
+    return select(User.id).where(*base_conditions, User.id == agent.creator_id)
+
+
+async def get_agent_accessible_user_ids(
+    db: AsyncSession,
+    agent: Agent,
+    *,
+    include_department_members: bool = True,
+) -> set[uuid.UUID]:
+    """Return platform users who can access an agent under current policy."""
+    result = await db.execute(
+        build_agent_accessible_user_ids_query(
+            agent,
+            include_department_members=include_department_members,
+        )
+    )
+    return {row[0] for row in result.fetchall() if row[0]}
 
 
 def _agent_available(agent: Agent | None) -> tuple[bool, str | None]:
@@ -518,9 +632,18 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
         return agent, company_level or "use"
 
     if access_mode == "custom":
-        for perm in permissions:
-            if perm.scope_type == "user" and perm.scope_id == user.id:
-                return agent, perm.access_level or "use"
+        levels = [
+            perm.access_level or "use"
+            for perm in permissions
+            if perm.scope_type == "user" and perm.scope_id == user.id
+        ]
+        department_level = await _get_department_permission_level(db, user.id, agent)
+        if department_level:
+            levels.append(department_level)
+        if "manage" in levels:
+            return agent, "manage"
+        if levels:
+            return agent, "use"
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to this agent")
 

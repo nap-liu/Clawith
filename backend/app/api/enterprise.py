@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +18,7 @@ from app.models.org import OrgDepartment, OrgMember
 from app.models.identity import IdentityProvider
 from app.models.user import User
 from app.services.org_sync_adapter import derive_member_department_paths
+from app.services.org_directory import canonical_org_member_id_subquery
 from app.models.agent import Agent
 from app.models.llm import LLMModel
 from app.models.audit import AuditLog, ApprovalRequest, EnterpriseInfo
@@ -1324,69 +1325,6 @@ async def list_org_departments(
 
 
 
-from sqlalchemy import or_, and_, case
-from app.models.org import AgentRelationship
-
-
-def _canonical_org_member_id_subquery(
-    *,
-    tenant_id: uuid.UUID | None = None,
-    provider_id: uuid.UUID | None = None,
-):
-    """Subquery exposing canonical OrgMember.id per user_id group.
-
-    A single platform user (user_id) can have multiple active OrgMember rows
-    accumulated from past SSO churn. We pick one canonical row per user_id by
-    ranking with ROW_NUMBER():
-
-      1. has at least one agent_relationships entry
-      2. has a non-null external_id
-      3. name is not a placeholder ("<Provider> User ...")
-      4. earliest synced_at (stable tie-breaker)
-
-    Rows where user_id IS NULL partition on the row's own id (= each its own
-    canonical), so they pass through unchanged.
-
-    Only status='active' rows participate; soft-deleted rows can't become
-    canonical. When a provider or tenant scope is supplied, canonical selection
-    happens inside that scope before the outer query applies the same filters.
-    """
-    rel_count = (
-        select(func.count(AgentRelationship.id))
-        .where(AgentRelationship.member_id == OrgMember.id)
-        .correlate(OrgMember)
-        .scalar_subquery()
-    )
-    is_real_name = case(
-        (
-            and_(
-                OrgMember.name.notlike("Oauth2 User %"),
-                OrgMember.name.notlike("Dingtalk User %"),
-                OrgMember.name.notlike("Wecom User %"),
-                OrgMember.name.notlike("Feishu User %"),
-            ),
-            1,
-        ),
-        else_=0,
-    )
-    rn = func.row_number().over(
-        partition_by=func.coalesce(OrgMember.user_id, OrgMember.id),
-        order_by=[
-            rel_count.desc(),
-            case((OrgMember.external_id.is_not(None), 1), else_=0).desc(),
-            is_real_name.desc(),
-            OrgMember.synced_at.asc(),
-        ],
-    ).label("rn")
-    conditions = [OrgMember.status == "active"]
-    if tenant_id:
-        conditions.append(OrgMember.tenant_id == tenant_id)
-    if provider_id:
-        conditions.append(OrgMember.provider_id == provider_id)
-
-    return select(OrgMember.id.label("om_id"), rn).where(*conditions).subquery()
-
-
 @router.get("/org/members")
 async def list_org_members(
     department_id: str | None = None,
@@ -1419,7 +1357,7 @@ async def list_org_members(
     tenant_uuid = uuid.UUID(tenant_id) if tenant_id else None
     provider_uuid = uuid.UUID(provider_id) if provider_id else None
 
-    canonical = _canonical_org_member_id_subquery(
+    canonical = canonical_org_member_id_subquery(
         tenant_id=tenant_uuid,
         provider_id=provider_uuid,
     )

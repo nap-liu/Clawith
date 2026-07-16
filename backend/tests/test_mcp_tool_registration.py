@@ -1,5 +1,4 @@
 from __future__ import annotations
-import pytest
 
 
 async def test_all_mcp_tools_registered():
@@ -16,7 +15,9 @@ async def test_all_mcp_tools_registered():
         "create_agent", "update_agent",
         # config
         "set_agent_tools", "set_agent_trigger", "delete_agent_trigger", "set_agent_relationships",
-        "set_agent_access", "list_agent_triggers", "update_agent_trigger", "set_agent_tool_config",
+        "get_agent_access", "search_agent_access_subjects", "set_agent_access_mode",
+        "grant_agent_access", "revoke_agent_access",
+        "list_agent_triggers", "update_agent_trigger", "set_agent_tool_config",
         # files
         "read_agent_file", "write_agent_file",
         # lifecycle
@@ -32,6 +33,8 @@ async def test_all_mcp_tools_registered():
     }
     missing = expected - names
     assert not missing, f"missing tools: {missing}"
+
+    assert "set_agent_access" not in names, "destructive access replacement tool must stay removed"
 
     # edit_agent_soul was superseded by write_agent_file and must not be registered
     assert "edit_agent_soul" not in names, "edit_agent_soul should not be registered (superseded by write_agent_file)"

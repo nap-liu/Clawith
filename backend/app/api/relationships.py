@@ -10,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 
 from app.core.permissions import (
+    build_agent_accessible_user_ids_query,
     build_visible_agents_query,
     check_agent_access,
     evaluate_agent_relationship_status,
-    get_agent_accessible_user_ids,
     get_agent_access_level_for_user_id,
     require_current_agent_tenant,
 )
@@ -227,9 +227,8 @@ async def search_human_relationship_candidates(
             )
         )
 
-    allowed_user_ids: set[uuid.UUID] | None = None
     if access_mode != "company":
-        allowed_user_ids = await get_agent_accessible_user_ids(db, agent)
+        allowed_user_ids = build_agent_accessible_user_ids_query(agent)
         query = query.where(
             or_(
                 LinkedUser.identity_id.is_(None),

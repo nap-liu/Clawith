@@ -32,7 +32,14 @@ async def ensure_access_granted_platform_relationships(
     if access_mode not in ("private", "custom") or not agent.tenant_id:
         return False
 
-    user_ids = await get_agent_accessible_user_ids(db, agent)
+    # Department grants stay dynamic and are intentionally not materialized as
+    # thousands of social-relationship rows. Explicit users and required
+    # managers still receive the existing relationship prerequisite.
+    user_ids = await get_agent_accessible_user_ids(
+        db,
+        agent,
+        include_department_members=False,
+    )
     if not user_ids:
         return False
 
