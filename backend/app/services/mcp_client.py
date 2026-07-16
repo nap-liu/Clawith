@@ -10,7 +10,6 @@ Reference: https://modelcontextprotocol.io/docs
 
 import httpx
 import json
-import asyncio
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from loguru import logger
@@ -36,9 +35,13 @@ class MCPClient:
         if not self.api_key and "apiKey" in qs:
             self.api_key = qs.pop("apiKey")[0]
 
-        # Rebuild URL without apiKey in query string
+        # Rebuild URL without apiKey in query string. Preserve the path exactly:
+        # some Streamable HTTP servers intentionally mount at a trailing-slash
+        # endpoint (for example ``/mcp/``), and changing it to ``/mcp`` can
+        # trigger a redirect to a different origin or port behind a reverse
+        # proxy.
         remaining_qs = urlencode({k: v[0] for k, v in qs.items()}) if qs else ""
-        self.server_url = urlunparse(parsed._replace(query=remaining_qs)).rstrip("/")
+        self.server_url = urlunparse(parsed._replace(query=remaining_qs))
 
         # Extra headers passed by the caller — e.g. from `mcpServers.<name>.headers`.
         # Applied on top of Auth so callers can override Authorization if needed.
@@ -114,6 +117,16 @@ class MCPClient:
             raise Exception("No valid JSON found in SSE response")
         return last_data
 
+    def _legacy_sse_url(self) -> str:
+        """Return the legacy SSE endpoint without altering the primary URL."""
+        base = self.server_url.rstrip("/")
+        return base if base.endswith("/sse") else f"{base}/sse"
+
+    @staticmethod
+    def _error_message(exc: Exception) -> str:
+        """Keep timeout and transport errors useful even when ``str`` is empty."""
+        return str(exc).strip() or type(exc).__name__
+
     # ── Streamable HTTP Transport ────────────────────────────────
 
     async def _streamable_initialize(self, client: httpx.AsyncClient) -> None:
@@ -167,7 +180,7 @@ class MCPClient:
         """
         # Determine SSE URL: if server_url ends with /sse use it directly,
         # otherwise append /sse
-        sse_url = self.server_url if self.server_url.endswith("/sse") else f"{self.server_url}/sse"
+        sse_url = self._legacy_sse_url()
         parsed = urlparse(sse_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -214,7 +227,7 @@ class MCPClient:
         sends the JSON-RPC request, then reads responses from the SSE stream.
         """
         # Connect to SSE to get the messages endpoint
-        sse_url = self.server_url if self.server_url.endswith("/sse") else f"{self.server_url}/sse"
+        sse_url = self._legacy_sse_url()
         parsed = urlparse(sse_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -335,8 +348,10 @@ class MCPClient:
             self._transport = "streamable"
             return result
         except Exception as streamable_err:
-            streamable_error_message = str(streamable_err)
-            logger.info(f"[MCPClient] Streamable HTTP failed ({streamable_err}), trying SSE transport...")
+            streamable_error_message = self._error_message(streamable_err)
+            logger.info(
+                f"[MCPClient] Streamable HTTP failed ({streamable_error_message}), trying SSE transport..."
+            )
 
         # Fallback to SSE
         try:
@@ -344,10 +359,11 @@ class MCPClient:
             self._transport = "sse"
             return result
         except Exception as sse_err:
+            sse_error_message = self._error_message(sse_err)
             raise Exception(
                 f"Both transports failed. "
                 f"Streamable HTTP: {streamable_error_message}; "
-                f"SSE: {sse_err}"
+                f"SSE: {sse_error_message}"
             )
 
     # ── Public API ───────────────────────────────────────────────

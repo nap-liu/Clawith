@@ -1,8 +1,9 @@
-"""When import_mcp_direct creates a Tool, the matching mcp_servers row
-is auto-upserted and the FK linked."""
+"""Direct MCP imports are atomic and bridge discovered tools to mcp_servers."""
 import uuid
 import pytest
 from sqlalchemy import select
+from unittest.mock import AsyncMock, patch
+
 from app.database import async_session, engine
 from app.models.tool import Tool
 from app.models.mcp_server import MCPServer
@@ -17,25 +18,11 @@ async def _isolate():
     await engine.dispose()
 
 
-async def test_import_mcp_direct_creates_mcp_server_row():
-    """Calling import_mcp_direct with a fresh URL should create both Tool
-    and mcp_servers row, with FK linked.
-
-    import_mcp_direct makes a live HTTP call to the MCP server URL. Since
-    the test environment has no external MCP server at a random URL, the
-    client.list_tools() call will fail gracefully and the function will
-    fall back to creating a single generic tool row (the ``else`` branch).
-    We verify that branch also runs the bridge.
-    """
+async def _make_agent(suffix: str):
     from app.main import app  # noqa: F401 — ensure all models are registered
-    from app.services.resource_discovery import import_mcp_direct
     from app.models.user import User, Identity
     from app.models.agent import Agent
 
-    suffix = uuid.uuid4().hex[:6]
-    url = f"https://import-{suffix}.test.invalid/mcp"
-
-    # Create a minimal agent so import_mcp_direct can look up tenant_id
     async with async_session() as db:
         identity = Identity(
             username=f"t_{suffix}",
@@ -55,30 +42,83 @@ async def test_import_mcp_direct_creates_mcp_server_row():
         db.add(agent)
         await db.commit()
         await db.refresh(agent)
-        agent_id = agent.id
+        return agent.id
 
-    # Call import_mcp_direct — will fail to connect (invalid host) and fall
-    # back to creating a single generic tool row. That path should still bridge.
-    result = await import_mcp_direct(
-        mcp_url=url,
-        agent_id=agent_id,
-        server_name=f"test_{suffix}",
-    )
-    # Result is a string status message; just check it didn't raise.
-    assert isinstance(result, str)
+
+async def test_import_mcp_direct_creates_mcp_server_row():
+    """A successful discovery creates real Tool rows linked to the server."""
+    from app.services.resource_discovery import import_mcp_direct
+
+    suffix = uuid.uuid4().hex[:6]
+    url = f"https://import-{suffix}.test.invalid/mcp/"
+    agent_id = await _make_agent(suffix)
+
+    fake_client = AsyncMock()
+    fake_client.server_instructions = "Use the bridge tool."
+    fake_client.list_tools.return_value = [
+        {
+            "name": "bridge_tool",
+            "description": "A discovered tool",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+    ]
+
+    with patch("app.services.mcp_client.MCPClient", return_value=fake_client):
+        result = await import_mcp_direct(
+            mcp_url=url,
+            agent_id=agent_id,
+            server_name=f"test_{suffix}",
+        )
+
+    assert "(1 tools)" in result
 
     # Verify the Tool + MCPServer row were created and linked.
     async with async_session() as db:
         tool = (await db.execute(
             select(Tool).where(Tool.mcp_server_url == url)
         )).scalar_one_or_none()
-        if tool is None:
-            pytest.skip(
-                "import_mcp_direct didn't create Tool (signature/behavior may differ); "
-                "bridge correctness is covered by test_tools_mcp_server_bridge.py"
-            )
+        assert tool is not None
+        assert tool.mcp_tool_name == "bridge_tool"
         assert tool.mcp_server_id is not None, "mcp_server_id should be set by auto-bridge"
         srv = (await db.execute(
             select(MCPServer).where(MCPServer.id == tool.mcp_server_id)
         )).scalar_one()
         assert srv.base_url_template == url
+
+
+@pytest.mark.parametrize("failure_mode", ["error", "empty"])
+async def test_failed_or_empty_discovery_creates_no_placeholder_rows(failure_mode):
+    """A direct import never reports success or persists a fake generic tool."""
+    from app.services.resource_discovery import import_mcp_direct
+
+    suffix = uuid.uuid4().hex[:6]
+    url = f"https://failed-{failure_mode}-{suffix}.test.invalid/mcp/"
+    agent_id = await _make_agent(suffix)
+
+    fake_client = AsyncMock()
+    fake_client.server_instructions = None
+    if failure_mode == "error":
+        fake_client.list_tools.side_effect = TimeoutError()
+    else:
+        fake_client.list_tools.return_value = []
+
+    with patch("app.services.mcp_client.MCPClient", return_value=fake_client):
+        result = await import_mcp_direct(
+            mcp_url=url,
+            agent_id=agent_id,
+            server_name=f"failed_{suffix}",
+        )
+
+    assert result.startswith("❌ MCP server import failed")
+    assert "No MCP server or tool records were created" in result
+
+    async with async_session() as db:
+        server = (await db.execute(
+            select(MCPServer).where(MCPServer.base_url_template == url)
+        )).scalar_one_or_none()
+        tool = (await db.execute(
+            select(Tool).where(Tool.mcp_server_url == url)
+        )).scalar_one_or_none()
+
+    assert server is None
+    assert tool is None

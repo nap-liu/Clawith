@@ -711,7 +711,22 @@ async def import_mcp_direct(
             + (f" with server instructions ({len(server_instructions)} chars)" if server_instructions else "")
         )
     except Exception as e:
-        logger.error(f"[DirectImport] Could not list tools from {mcp_url}: {e}")
+        error_message = str(e).strip() or type(e).__name__
+        logger.error(f"[DirectImport] Could not list tools from {mcp_url}: {error_message}")
+        return (
+            f"❌ MCP server import failed: **{display_name}**\n\n"
+            f"Could not discover tools from `{mcp_url}`.\n\n"
+            f"Cause: `{error_message[:500]}`\n\n"
+            "No MCP server or tool records were created. Check the endpoint, transport, and credentials, then retry."
+        )
+
+    if not tools_discovered:
+        logger.warning(f"[DirectImport] Server returned zero tools: {mcp_url}")
+        return (
+            f"❌ MCP server import failed: **{display_name}**\n\n"
+            f"`{mcp_url}` connected successfully but returned zero tools.\n\n"
+            "No MCP server or tool records were created. Confirm that this endpoint exposes MCP tools, then retry."
+        )
 
     # Config to store in AgentTool
     agent_tool_config: dict = {}
@@ -804,31 +819,21 @@ async def import_mcp_direct(
             await _ensure_agent_tool(tool.id)
             return True
 
-        if tools_discovered:
-            for mcp_tool in tools_discovered:
-                raw = mcp_tool["name"]
-                created = await _upsert_tool(
-                    raw,
-                    mcp_tool.get("description", ""),
-                    mcp_tool.get("inputSchema", {"type": "object", "properties": {}}),
-                    f"{display_name}: {raw}",
-                )
-                imported_tools.append(f"{'✅' if created else '⏭️'} {display_name}: {raw}" + ("" if created else " (updated)"))
-        else:
+        for mcp_tool in tools_discovered:
+            raw = mcp_tool["name"]
             created = await _upsert_tool(
-                None,
-                f"MCP Server: {mcp_url}",
-                {"type": "object", "properties": {}},
-                display_name,
+                raw,
+                mcp_tool.get("description", ""),
+                mcp_tool.get("inputSchema", {"type": "object", "properties": {}}),
+                f"{display_name}: {raw}",
             )
             imported_tools.append(
-                f"✅ {display_name} (tools couldn't be listed — server may need configuration)"
-                if created else f"⏭️ {display_name} is already imported."
+                f"{'✅' if created else '⏭️'} {display_name}: {raw}" + ("" if created else " (updated)")
             )
 
         await db.commit()
 
-    result = f"🔌 Imported MCP server: **{display_name}**\n\n"
+    result = f"🔌 Imported MCP server: **{display_name}** ({len(tools_discovered)} tools)\n\n"
     result += "\n".join(imported_tools)
     result += f"\n\n📡 MCP Server URL: `{mcp_url}`"
     result += "\n\n💡 The imported tools are now available for use."
