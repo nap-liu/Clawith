@@ -10,6 +10,7 @@ from app.services.llm.caller import (
     REPEAT_TOOL_CALL_NUDGE,
     _tool_failure_signature,
     _tool_call_signature,
+    _update_file_failure_counts,
     _update_repeat_streaks,
 )
 
@@ -158,7 +159,7 @@ def test_file_failure_streak_catches_changing_tool_programs():
     decisions = []
     for result in results:
         signature = _tool_failure_signature(result)
-        streaks = _update_repeat_streaks(streaks, [signature] if signature else [])
+        streaks = _update_file_failure_counts(streaks, [signature] if signature else [])
         level = max(streaks.values(), default=0)
         if level >= REPEAT_FILE_FAILURE_BREAK:
             decisions.append("break")
@@ -168,6 +169,17 @@ def test_file_failure_streak_catches_changing_tool_programs():
             decisions.append("run")
 
     assert decisions == ["run", "nudge", "break"]
+
+
+def test_file_failure_count_survives_successful_probe_round():
+    missing = _tool_failure_signature(
+        "FileNotFoundError: No such file or directory: 'workspace/uploads/6 月稽核月报.xlsx'"
+    )
+    counts = _update_file_failure_counts({}, [missing])
+    counts = _update_file_failure_counts(counts, [])  # list_files succeeded
+    counts = _update_file_failure_counts(counts, [missing])
+
+    assert counts[missing] == REPEAT_FILE_FAILURE_NUDGE
 
 
 # ── Loop-integration contract ───────────────────────────────────────────────

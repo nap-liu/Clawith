@@ -304,6 +304,23 @@ def _update_repeat_streaks(
     return {sig: prev_streaks.get(sig, 0) + 1 for sig in round_signatures}
 
 
+def _update_file_failure_counts(
+    previous: dict[tuple[str, str], int],
+    round_signatures: list[tuple[str, str]],
+) -> dict[tuple[str, str], int]:
+    """Accumulate per-file failures across one turn.
+
+    A model commonly inserts a successful ``list_files`` probe between two
+    failed reads.  That probe does not resolve the repeated missing-path
+    condition and must not reset the guard.  Duplicate failures for the same
+    path inside one round still count once.
+    """
+    counts = dict(previous)
+    for signature in set(round_signatures):
+        counts[signature] = counts.get(signature, 0) + 1
+    return counts
+
+
 _FILE_NOT_FOUND_PATTERNS = (
     re.compile(r"File not found:\s*([^\r\n]+)", re.IGNORECASE),
     re.compile(r"No such file or directory:\s*['\"]([^'\"]+)['\"]", re.IGNORECASE),
@@ -1449,7 +1466,7 @@ async def call_llm(
                 )
 
         _round_file_failures = _tool_failure_signatures(api_messages[fresh_start:])
-        _file_failure_streaks = _update_repeat_streaks(_file_failure_streaks, _round_file_failures)
+        _file_failure_streaks = _update_file_failure_counts(_file_failure_streaks, _round_file_failures)
         _max_file_failure = max(_file_failure_streaks.values(), default=0)
         if _max_file_failure >= REPEAT_FILE_FAILURE_BREAK:
             logger.warning(
@@ -1990,7 +2007,7 @@ async def call_agent_llm_with_tools(
                     for result in round_tool_results
                     if (signature := _tool_failure_signature(result)) is not None
                 ]
-                _file_failure_streaks = _update_repeat_streaks(
+                _file_failure_streaks = _update_file_failure_counts(
                     _file_failure_streaks,
                     _round_file_failures,
                 )

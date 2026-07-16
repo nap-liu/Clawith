@@ -264,6 +264,39 @@ async def test_temp_workspace_runner_canonicalizes_sources_but_not_targets(monke
     assert result == "runner ok"
 
 
+def test_execute_code_canonicalizes_unique_existing_upload_literals(tmp_path):
+    upload_dir = tmp_path / "workspace/uploads"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "6月稽核月报.xlsx").write_bytes(b"xlsx")
+    (upload_dir / "山东7月门店等级.xlsx").write_bytes(b"xlsx")
+
+    code = """\
+from openpyxl import load_workbook
+file1 = 'workspace/uploads/6 月稽核月报.xlsx'
+file2 = os.path.join(os.getcwd(), \"workspace/uploads/山东 7 月门店等级.xlsx\")
+target = 'workspace/reports/6 月结果.xlsx'
+"""
+    rewritten, replacements = agent_tools._canonicalize_execute_code_upload_paths(tmp_path, code)
+
+    assert "workspace/uploads/6月稽核月报.xlsx" in rewritten
+    assert "workspace/uploads/山东7月门店等级.xlsx" in rewritten
+    assert "workspace/reports/6 月结果.xlsx" in rewritten
+    assert len(replacements) == 2
+
+
+def test_execute_code_does_not_guess_ambiguous_upload_literal(tmp_path):
+    upload_dir = tmp_path / "workspace/uploads"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "6月报告.xlsx").write_bytes(b"compact")
+    (upload_dir / "6 月报告.xlsx").write_bytes(b"spaced")
+
+    original = "load_workbook('workspace/uploads/６　月报告.xlsx')"
+    rewritten, replacements = agent_tools._canonicalize_execute_code_upload_paths(tmp_path, original)
+
+    assert rewritten == original
+    assert replacements == []
+
+
 @pytest.mark.asyncio
 async def test_temp_workspace_materializes_only_requested_paths(monkeypatch):
     agent_id = uuid.uuid4()

@@ -5133,6 +5133,53 @@ def _resolve_tool_source_path(ws: Path, rel_path: str, tenant_id: str | None = N
     return candidate
 
 
+_QUOTED_UPLOAD_PATH_PATTERNS = (
+    re.compile(r"'(?P<path>[^'\r\n]*workspace/uploads/[^'\r\n]+)'"),
+    re.compile(r'"(?P<path>[^"\r\n]*workspace/uploads/[^"\r\n]+)"'),
+)
+
+
+def _canonicalize_execute_code_upload_paths(ws: Path, code: str) -> tuple[str, list[tuple[str, str]]]:
+    """Canonicalize unique existing upload paths embedded in code literals.
+
+    ``execute_code`` is intentionally generic, so target paths must not be
+    fuzzy-rewritten.  Uploaded attachments are the narrow safe exception:
+    when a quoted ``workspace/uploads/...`` literal does not exist but folds
+    to exactly one existing file, replace only that literal's upload suffix.
+    This covers model-generated ``6 月.xlsx`` variants while preserving new
+    output paths elsewhere in the workspace exactly as requested.
+    """
+    rewritten = code
+    replacements: list[tuple[str, str]] = []
+    root = ws.resolve()
+
+    for pattern in _QUOTED_UPLOAD_PATH_PATTERNS:
+        def _replace(match: re.Match[str]) -> str:
+            raw_path = match.group("path")
+            marker_index = raw_path.find("workspace/uploads/")
+            if marker_index < 0:
+                return match.group(0)
+            prefix = raw_path[:marker_index]
+            virtual_path = raw_path[marker_index:]
+            try:
+                resolved = _resolve_tool_source_path(root, virtual_path)
+                if not resolved.is_file():
+                    return match.group(0)
+                canonical = resolved.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                return match.group(0)
+            if canonical == virtual_path:
+                return match.group(0)
+            canonical_raw = f"{prefix}{canonical}"
+            replacements.append((raw_path, canonical_raw))
+            quote = match.group(0)[0]
+            return f"{quote}{canonical_raw}{quote}"
+
+        rewritten = pattern.sub(_replace, rewritten)
+
+    return rewritten, replacements
+
+
 def _resolve_tool_target_path(ws: Path, rel_path: str, tenant_id: str | None = None) -> Path:
     root, normalized = _allowed_root_for_tool_path(ws, rel_path, tenant_id=tenant_id)
     candidate = (root / normalized).resolve() if normalized else root
@@ -9532,6 +9579,13 @@ async def _execute_code(
     ).strip().lower()
     language = arguments.get("language", "python")
     code = arguments.get("code", "")
+    if action == "execute" and code:
+        code, canonicalized_uploads = _canonicalize_execute_code_upload_paths(ws, code)
+        if canonicalized_uploads:
+            logger.info(
+                f"[Sandbox] Canonicalized {len(canonicalized_uploads)} "
+                f"execute_code upload path(s): {canonicalized_uploads}"
+            )
 
     valid_actions = {"execute", "list_jobs", "job_status", "job_logs", "job_stop"}
     if action not in valid_actions:
