@@ -44,7 +44,8 @@ async def test_start_dingtalk_provisioning_api_returns_sanitized_payload(monkeyp
     async def fake_check_agent_access(_db, _user, _agent_id):
         return agent, None
 
-    async def fake_start(_db, *, agent, requested_by_user_id):
+    async def fake_start(_db, *, agent, requested_by_user_id, restart_existing):
+        assert restart_existing is False
         return {
             "status": "waiting_for_authorization",
             "provisioning_id": str(uuid.uuid4()),
@@ -69,3 +70,27 @@ async def test_start_dingtalk_provisioning_api_returns_sanitized_payload(monkeyp
     assert "Agent" not in result["message"]
     assert "client_secret" not in result
     assert "must-not-leak" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_start_dingtalk_provisioning_api_rejects_non_boolean_restart(monkeypatch):
+    from app.api import dingtalk_provisioning as api
+
+    current_user = _user()
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id, creator_id=current_user.id, tenant_id=current_user.tenant_id)
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, None
+
+    monkeypatch.setattr(api, "check_agent_access", fake_check_agent_access)
+
+    with pytest.raises(HTTPException) as exc:
+        await api.start_dingtalk_channel_provisioning_route(
+            agent_id=agent_id,
+            data={"restart_existing": "false"},
+            current_user=current_user,
+            db=object(),
+        )
+
+    assert exc.value.status_code == 422

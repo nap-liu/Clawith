@@ -800,9 +800,13 @@ AGENT_TOOLS = [
                 "properties": {
                     "restart_existing": {
                         "type": "boolean",
-                        "description": "如果已经存在未完成的授权流程，是否重新生成授权链接。默认 true。",
+                        "description": (
+                            "必填。false 表示复用仍有效的授权链接；true 表示先同步旧流程状态，"
+                            "尚未成功时再替换为新的授权链接。"
+                        ),
                     },
                 },
+                "required": ["restart_existing"],
             },
         },
     },
@@ -6730,6 +6734,10 @@ async def _start_dingtalk_channel_provisioning_tool(
     if not user_id:
         return "❌ 需要登录用户上下文才能为数字员工配置钉钉通道。请在用户会话中重新发起。"
 
+    restart_existing = (args or {}).get("restart_existing")
+    if not isinstance(restart_existing, bool):
+        return "❌ 缺少必填布尔参数 restart_existing，请明确选择复用现有流程或重新生成授权链接。"
+
     from app.core.permissions import user_can_manage_agent_id
     from app.models.agent import Agent as AgentModel
     from app.services.dingtalk_provisioning import start_dingtalk_channel_provisioning
@@ -6746,11 +6754,23 @@ async def _start_dingtalk_channel_provisioning_tool(
             db,
             agent=agent,
             requested_by_user_id=user_id,
+            restart_existing=restart_existing,
         )
         await db.commit()
 
+    flow_action = response.get("flow_action")
+    if flow_action == "configured_existing":
+        return (
+            "原钉钉授权已经成功，数字员工通道配置已完成。\n"
+            f"配置编号: {response['provisioning_id']}"
+        )
+    action_message = {
+        "reused": "当前授权流程仍有效，已复用原钉钉授权链接。",
+        "replaced": "已同步并替换原授权流程，请只使用下面的新链接。",
+        "created": "已创建钉钉数字员工机器人授权流程。",
+    }.get(flow_action, "钉钉数字员工机器人授权流程已就绪。")
     return (
-        "已创建钉钉数字员工机器人授权流程。\n"
+        f"{action_message}\n"
         f"授权链接: {response['authorization_url']}\n"
         f"配置编号: {response['provisioning_id']}\n"
         f"有效期至: {response['expires_at']}\n"

@@ -728,8 +728,15 @@ BUILTIN_TOOLS = [
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "restart_existing": {"type": "boolean", "description": "如果已经存在未完成的授权流程，是否重新生成授权链接。默认 true。"},
+                "restart_existing": {
+                    "type": "boolean",
+                    "description": (
+                        "必填。false 表示复用仍有效的授权链接；true 表示先同步旧流程状态，"
+                        "尚未成功时再替换为新的授权链接。"
+                    ),
+                },
             },
+            "required": ["restart_existing"],
         },
         "config": {},
         "config_schema": {},

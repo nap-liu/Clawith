@@ -1,7 +1,7 @@
 """DingTalk automatic channel provisioning.
 
-This service wraps DingTalk's registration device flow, persists bounded poll
-state, and writes successful credentials into the existing DingTalk
+This service wraps DingTalk's registration device flow, persists deadline-bound
+poll state, and writes successful credentials into the existing DingTalk
 ChannelConfig runtime path.
 """
 
@@ -16,7 +16,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 from loguru import logger
-from sqlalchemy import or_, select, update
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -117,8 +117,10 @@ def _bounded_polling_window(
         min(raw_interval, settings.DINGTALK_PROVISIONING_MAX_INTERVAL_SECONDS),
     )
 
-    attempts_by_time = max(1, ttl // poll_interval)
-    max_attempts = max(1, min(attempts_by_time, settings.DINGTALK_PROVISIONING_MAX_ATTEMPTS))
+    # Keep the persisted count as observability metadata. The authorization
+    # deadline is the only business stop condition; a second, shorter attempt
+    # cap would make a still-valid DingTalk link fail early.
+    max_attempts = max(1, math.ceil(ttl / poll_interval))
     return PollingWindow(
         expires_at=base + timedelta(seconds=ttl),
         next_poll_at=base + timedelta(seconds=poll_interval),
@@ -199,13 +201,73 @@ async def start_dingtalk_channel_provisioning(
     *,
     agent: Agent,
     requested_by_user_id: uuid.UUID | None,
+    restart_existing: bool,
     registration_client: DingTalkRegistrationClient | None = None,
+    stream_starter: StreamStarter | None = None,
+    stream_stopper: StreamStopper | None = None,
+    welcome_sender: WelcomeSender | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Start DingTalk provisioning and return a user authorization URL."""
+    """Start or reuse DingTalk provisioning and return its current state."""
     settings = get_settings()
     client = registration_client or _default_registration_client()
     base = _as_utc(now or _now())
+
+    # Serialize starts per Agent. This prevents two concurrent requests from
+    # both observing no active flow and creating competing authorization links.
+    await db.execute(select(Agent.id).where(Agent.id == agent.id).with_for_update())
+    active_result = await db.execute(
+        select(DingTalkChannelProvisioningSession)
+        .where(
+            DingTalkChannelProvisioningSession.agent_id == agent.id,
+            DingTalkChannelProvisioningSession.status.in_(DINGTALK_PROVISIONING_ACTIVE_STATUSES),
+        )
+        .order_by(
+            DingTalkChannelProvisioningSession.created_at.desc(),
+            DingTalkChannelProvisioningSession.id.desc(),
+        )
+        .with_for_update()
+    )
+    active_sessions = list(active_result.scalars())
+    active = active_sessions[0] if active_sessions else None
+
+    # Normalize any historical duplicate active rows while keeping the newest.
+    for stale in active_sessions[1:]:
+        _stop_session(
+            stale,
+            status=DINGTALK_PROVISIONING_STATUS_CANCELLED,
+            error="已由更新的钉钉授权流程替换",
+        )
+
+    if active and not restart_existing and _as_utc(active.expires_at) > base:
+        response = _session_response(
+            active,
+            message="当前钉钉授权流程仍有效，请继续使用原授权链接完成配置。",
+        )
+        response["flow_action"] = "reused"
+        return response
+
+    had_existing = active is not None
+    if active:
+        # Before replacing (or rolling an expired flow), reconcile once. This
+        # closes the propagation race where DingTalk has just switched to
+        # SUCCESS but the background poller has not consumed it yet.
+        await poll_dingtalk_provisioning_session(
+            db,
+            active,
+            registration_client=client,
+            stream_starter=stream_starter,
+            stream_stopper=stream_stopper,
+            welcome_sender=welcome_sender,
+            now=base,
+        )
+        if active.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED:
+            response = _session_response(active, message="原钉钉授权已成功，通道配置已经完成。")
+            response["flow_action"] = "configured_existing"
+            return response
+
+    # Do not invalidate a usable existing link until DingTalk has successfully
+    # issued the replacement. A transient begin failure therefore remains safe.
     begin = await client.begin()
     window = _bounded_polling_window(
         expires_in=begin.get("expires_in"),
@@ -213,18 +275,13 @@ async def start_dingtalk_channel_provisioning(
         now=base,
     )
 
-    await db.execute(
-        update(DingTalkChannelProvisioningSession)
-        .where(
-            DingTalkChannelProvisioningSession.agent_id == agent.id,
-            DingTalkChannelProvisioningSession.status.in_(DINGTALK_PROVISIONING_ACTIVE_STATUSES),
-        )
-        .values(
-            status=DINGTALK_PROVISIONING_STATUS_CANCELLED,
-            next_poll_at=None,
-            last_error="已由新的钉钉授权流程替换",
-        )
-    )
+    for previous in active_sessions:
+        if previous.status in DINGTALK_PROVISIONING_ACTIVE_STATUSES:
+            _stop_session(
+                previous,
+                status=DINGTALK_PROVISIONING_STATUS_CANCELLED,
+                error="已由新的钉钉授权流程替换",
+            )
 
     session = DingTalkChannelProvisioningSession(
         agent_id=agent.id,
@@ -244,10 +301,12 @@ async def start_dingtalk_channel_provisioning(
     db.add(session)
     await db.flush()
 
-    return _session_response(
+    response = _session_response(
         session,
         message="请打开授权链接，在钉钉中完成数字员工机器人授权。授权完成后平台会自动完成通道配置。",
     )
+    response["flow_action"] = "replaced" if had_existing else "created"
+    return response
 
 
 def _session_response(session: DingTalkChannelProvisioningSession, *, message: str | None = None) -> dict[str, Any]:
@@ -631,12 +690,8 @@ async def poll_dingtalk_provisioning_session(
     base = _as_utc(now or _now())
     if session.status not in DINGTALK_PROVISIONING_ACTIVE_STATUSES:
         return session.status
-    if _as_utc(session.expires_at) <= base:
-        _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_EXPIRED, error="钉钉授权链接已过期")
-        return session.status
-    if session.poll_attempt_count >= session.max_poll_attempts:
-        _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_FAILED, error="已达到最大轮询次数")
-        return session.status
+
+    deadline_reached = _as_utc(session.expires_at) <= base
 
     client = registration_client or _default_registration_client()
     session.poll_attempt_count += 1
@@ -645,18 +700,33 @@ async def poll_dingtalk_provisioning_session(
     try:
         poll_result = await client.poll(session.device_code)
     except Exception as exc:
-        session.last_error = f"钉钉授权结果查询失败: {type(exc).__name__}"
-        if session.poll_attempt_count >= session.max_poll_attempts:
-            _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_FAILED, error=session.last_error)
+        error = f"钉钉授权结果查询失败: {type(exc).__name__}"
+        if deadline_reached:
+            _stop_session(
+                session,
+                status=DINGTALK_PROVISIONING_STATUS_EXPIRED,
+                error=f"钉钉授权链接已过期；最后一次{error}",
+            )
         else:
+            session.last_error = error
             session.status = DINGTALK_PROVISIONING_STATUS_POLLING
-            session.next_poll_at = base + timedelta(seconds=session.poll_interval_seconds)
+            session.next_poll_at = min(
+                _as_utc(session.expires_at),
+                base + timedelta(seconds=session.poll_interval_seconds),
+            )
         return session.status
 
     status = _as_string(poll_result.get("status")).upper()
     if status == "WAITING":
-        session.status = DINGTALK_PROVISIONING_STATUS_POLLING
-        session.next_poll_at = base + timedelta(seconds=session.poll_interval_seconds)
+        if deadline_reached:
+            _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_EXPIRED, error="钉钉授权链接已过期")
+        else:
+            session.status = DINGTALK_PROVISIONING_STATUS_POLLING
+            session.next_poll_at = min(
+                _as_utc(session.expires_at),
+                base + timedelta(seconds=session.poll_interval_seconds),
+            )
+            session.last_error = None
         return session.status
     if status == "EXPIRED":
         _stop_session(
@@ -797,24 +867,10 @@ async def poll_due_dingtalk_provisioning_sessions(
 ) -> int:
     """Poll due active sessions. Returns the number of sessions polled."""
     base = _as_utc(now or _now())
-    await db.execute(
-        update(DingTalkChannelProvisioningSession)
-        .where(
-            DingTalkChannelProvisioningSession.status.in_(DINGTALK_PROVISIONING_ACTIVE_STATUSES),
-            DingTalkChannelProvisioningSession.expires_at <= base,
-        )
-        .values(
-            status=DINGTALK_PROVISIONING_STATUS_EXPIRED,
-            next_poll_at=None,
-            last_error="钉钉授权链接已过期",
-        )
-    )
-
     stmt = (
         select(DingTalkChannelProvisioningSession)
         .where(
             DingTalkChannelProvisioningSession.status.in_(DINGTALK_PROVISIONING_ACTIVE_STATUSES),
-            DingTalkChannelProvisioningSession.expires_at > base,
             DingTalkChannelProvisioningSession.next_poll_at.is_not(None),
             DingTalkChannelProvisioningSession.next_poll_at <= base,
         )

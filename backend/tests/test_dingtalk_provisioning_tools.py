@@ -1,4 +1,5 @@
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +42,10 @@ def test_dingtalk_provisioning_tools_are_seeded_for_digital_employee_copy():
         assert "client_secret" not in text
         assert tool["parameters_schema"]["type"] == "object"
 
+    start_schema = _seed_tool("start_dingtalk_channel_provisioning")["parameters_schema"]
+    assert start_schema["required"] == ["restart_existing"]
+    assert start_schema["properties"]["restart_existing"]["type"] == "boolean"
+
 
 def test_dingtalk_provisioning_tools_exist_in_fallback_definitions():
     for name in PROVISIONING_TOOL_NAMES:
@@ -49,6 +54,9 @@ def test_dingtalk_provisioning_tools_exist_in_fallback_definitions():
         assert "数字员工" in text
         assert "Agent" not in text
         assert function["parameters"]["type"] == "object"
+
+    start_parameters = _fallback_tool("start_dingtalk_channel_provisioning")["parameters"]
+    assert start_parameters["required"] == ["restart_existing"]
 
 
 @pytest.mark.asyncio
@@ -108,3 +116,67 @@ async def test_start_dingtalk_provisioning_tool_requires_user_context():
     assert "数字员工" in result
     assert "登录用户" in result
     assert "Agent" not in result
+
+
+@pytest.mark.asyncio
+async def test_start_dingtalk_provisioning_tool_requires_explicit_restart_choice():
+    from app.services import agent_tools
+
+    result = await agent_tools._start_dingtalk_channel_provisioning_tool(uuid.uuid4(), uuid.uuid4(), {})
+
+    assert "restart_existing" in result
+    assert "必填" in result
+
+
+@pytest.mark.asyncio
+async def test_start_dingtalk_provisioning_tool_passes_restart_choice_to_service(monkeypatch):
+    from app.core import permissions
+    from app.services import agent_tools, dingtalk_provisioning
+
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id)
+    captured = []
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return agent
+
+    class FakeSession:
+        async def execute(self, statement):
+            return FakeResult()
+
+        async def commit(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+    async def fake_can_manage(db, uid, target_agent):
+        return True
+
+    async def fake_start(db, *, agent, requested_by_user_id, restart_existing):
+        captured.append(restart_existing)
+        return {
+            "flow_action": "reused",
+            "authorization_url": "https://auth.example/existing",
+            "provisioning_id": str(uuid.uuid4()),
+            "expires_at": "2026-07-16T08:00:00+00:00",
+        }
+
+    monkeypatch.setattr(agent_tools, "async_session", lambda: FakeSession())
+    monkeypatch.setattr(permissions, "user_can_manage_agent_id", fake_can_manage)
+    monkeypatch.setattr(dingtalk_provisioning, "start_dingtalk_channel_provisioning", fake_start)
+
+    result = await agent_tools._start_dingtalk_channel_provisioning_tool(
+        agent_id,
+        user_id,
+        {"restart_existing": False},
+    )
+
+    assert captured == [False]
+    assert "复用原钉钉授权链接" in result
+    assert "https://auth.example/existing" in result
