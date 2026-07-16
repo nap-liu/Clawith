@@ -7,22 +7,27 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import cast, func, select, String
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import and_, cast, func, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from app.config import get_settings
 from app.core.permissions import build_visible_agents_query, check_agent_access, is_agent_creator
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent, AgentPermission
-from app.models.org import OrgMember
+from app.models.org import OrgDepartment, OrgMember
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.user import User
 from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate
 from app.services.access_relationships import ensure_access_granted_platform_relationships
+from app.services.org_directory import (
+    canonical_org_member_id_subquery,
+    department_subtree_cte,
+    same_directory_provider,
+)
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 settings = get_settings()
@@ -383,6 +388,7 @@ async def get_agent_permissions(
             "scope_type": access_mode,
             "scope_ids": [],
             "user_access": [],
+            "department_access": [],
             "access_level": "manage" if is_owner else "use",
             "effective_access_level": access_level,
             "can_manage": can_manage,
@@ -392,6 +398,9 @@ async def get_agent_permissions(
 
     scope_type = access_mode
     scope_ids = [str(p.scope_id) for p in perms if p.scope_type == "user" and p.scope_id]
+    department_perms = [
+        p for p in perms if p.scope_type == "department" and p.scope_id
+    ]
     perm_access_level = getattr(agent, "company_access_level", None) or next(
         (p.access_level for p in perms if p.scope_type == "company"),
         "use",
@@ -400,6 +409,33 @@ async def get_agent_permissions(
     # Resolve names for display
     scope_names = []
     user_access = []
+    department_access = []
+    if department_perms:
+        departments_result = await db.execute(
+            select(OrgDepartment)
+            .where(
+                OrgDepartment.id.in_([p.scope_id for p in department_perms]),
+                OrgDepartment.tenant_id == agent.tenant_id,
+                OrgDepartment.status == "active",
+            )
+            .order_by(OrgDepartment.path.asc())
+        )
+        departments_by_id = {
+            department.id: department
+            for department in departments_result.scalars().all()
+        }
+        for perm in department_perms:
+            department = departments_by_id.get(perm.scope_id)
+            if department:
+                department_access.append(
+                    {
+                        "id": str(department.id),
+                        "name": department.name,
+                        "path": department.path,
+                        "access_level": perm.access_level or "use",
+                        "include_descendants": True,
+                    }
+                )
     display_user_ids = {uuid.UUID(sid) for sid in scope_ids}
     if access_mode == "custom":
         if agent.creator_id:
@@ -407,8 +443,30 @@ async def get_agent_permissions(
         display_user_ids.update(admin.id for admin in await _get_active_admin_users(db, agent.tenant_id))
 
     if display_user_ids:
-        users_result = await db.execute(select(User).where(User.id.in_(display_user_ids)))
+        users_result = await db.execute(
+            select(User).where(
+                User.id.in_(display_user_ids),
+                User.tenant_id == agent.tenant_id,
+            )
+        )
         users_by_id = {str(u.id): u for u in users_result.scalars().all()}
+        canonical_members = canonical_org_member_id_subquery(
+            tenant_id=agent.tenant_id,
+            prefer_directory_profile=True,
+        )
+        members_result = await db.execute(
+            select(OrgMember)
+            .join(
+                canonical_members,
+                and_(OrgMember.id == canonical_members.c.om_id, canonical_members.c.rn == 1),
+            )
+            .where(OrgMember.user_id.in_(display_user_ids))
+        )
+        members_by_user_id = {
+            str(member.user_id): member
+            for member in members_result.scalars().all()
+            if member.user_id
+        }
         access_by_user_id = {
             str(perm.scope_id): (perm.access_level or "use")
             for perm in perms
@@ -427,6 +485,7 @@ async def get_agent_permissions(
             u = users_by_id.get(sid)
             if not u:
                 continue
+            member = members_by_user_id.get(sid)
             is_creator = agent.creator_id == u.id
             is_admin = u.role in ("platform_admin", "org_admin")
             is_required = access_mode == "custom" and (is_creator or is_admin)
@@ -435,6 +494,9 @@ async def get_agent_permissions(
                 "name": u.display_name or u.username,
                 "username": u.username,
                 "email": u.email,
+                "title": member.title if member else u.title,
+                "avatar_url": member.avatar_url if member else u.avatar_url,
+                "department_path": member.department_path if member else "",
                 "role": u.role,
                 "access_level": "manage" if is_required else access_by_user_id.get(sid, "use"),
                 "is_required": is_required,
@@ -448,6 +510,7 @@ async def get_agent_permissions(
         "scope_ids": scope_ids,
         "scope_names": scope_names,
         "user_access": user_access,
+        "department_access": department_access,
         "access_level": perm_access_level,
         "effective_access_level": access_level,
         "can_manage": can_manage,
@@ -471,6 +534,7 @@ async def update_agent_permissions(
     scope_type = data.get("scope_type", "company")
     scope_ids = data.get("scope_ids", [])
     user_access = data.get("user_access", [])
+    department_access = data.get("department_access", [])
     access_level = data.get("access_level", "use")
     if access_level not in ("use", "manage"):
         access_level = "use"
@@ -478,6 +542,65 @@ async def update_agent_permissions(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported scope_type")
     if scope_type == "user":
         scope_type = "private"
+
+    valid_user_ids: set[uuid.UUID] = set()
+    if scope_type == "custom":
+        try:
+            requested_user_ids = {
+                uuid.UUID(str(item.get("id") or item.get("user_id")))
+                for item in user_access
+                if item.get("id") or item.get("user_id")
+            }
+            requested_user_ids.update(uuid.UUID(str(scope_id)) for scope_id in scope_ids)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user id",
+            ) from exc
+        if requested_user_ids:
+            users_result = await db.execute(
+                select(User.id).where(
+                    User.id.in_(requested_user_ids),
+                    User.tenant_id == agent.tenant_id,
+                    User.is_active == True,  # noqa: E712
+                )
+            )
+            valid_user_ids = set(users_result.scalars().all())
+            if valid_user_ids != requested_user_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="User not found in this organization",
+                )
+
+    valid_departments: dict[uuid.UUID, OrgDepartment] = {}
+    if scope_type == "custom" and department_access:
+        try:
+            requested_department_ids = {
+                uuid.UUID(str(item.get("id") or item.get("department_id")))
+                for item in department_access
+                if item.get("id") or item.get("department_id")
+            }
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid department id",
+            ) from exc
+        departments_result = await db.execute(
+            select(OrgDepartment).where(
+                OrgDepartment.id.in_(requested_department_ids),
+                OrgDepartment.tenant_id == agent.tenant_id,
+                OrgDepartment.status == "active",
+            )
+        )
+        valid_departments = {
+            department.id: department
+            for department in departments_result.scalars().all()
+        }
+        if set(valid_departments) != requested_department_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Department not found in this organization",
+            )
 
     # Delete existing permissions
     from sqlalchemy import delete as sql_delete
@@ -525,6 +648,26 @@ async def update_agent_permissions(
                     scope_id=uid,
                     access_level="manage" if uid in required_manager_ids else access_level,
                 ))
+        seen_department_ids: set[uuid.UUID] = set()
+        for item in department_access:
+            sid = item.get("id") or item.get("department_id")
+            if not sid:
+                continue
+            department_id = uuid.UUID(str(sid))
+            if department_id in seen_department_ids or department_id not in valid_departments:
+                continue
+            level = item.get("access_level", "use")
+            if level not in ("use", "manage"):
+                level = "use"
+            seen_department_ids.add(department_id)
+            db.add(
+                AgentPermission(
+                    agent_id=agent_id,
+                    scope_type="department",
+                    scope_id=department_id,
+                    access_level=level,
+                )
+            )
         for uid in required_manager_ids:
             if uid not in seen_user_ids:
                 db.add(AgentPermission(agent_id=agent_id, scope_type="user", scope_id=uid, access_level="manage"))
@@ -541,6 +684,262 @@ async def update_agent_permissions(
 
     await db.commit()
     return {"status": "ok"}
+
+
+def _serialize_permission_department(
+    department: OrgDepartment,
+    *,
+    child_counts: dict[uuid.UUID, int],
+    member_counts: dict[uuid.UUID, int],
+) -> dict:
+    return {
+        "id": str(department.id),
+        "name": department.name,
+        "parent_id": str(department.parent_id) if department.parent_id else None,
+        "path": department.path,
+        "has_children": child_counts.get(department.id, 0) > 0,
+        "direct_member_count": member_counts.get(department.id, 0),
+    }
+
+
+@router.get("/{agent_id}/permissions/directory/departments")
+async def get_agent_permission_departments(
+    agent_id: uuid.UUID,
+    parent_id: uuid.UUID | None = None,
+    search: str | None = None,
+    limit: int = Query(default=100, ge=1, le=200),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return a lazy-loadable, tenant-scoped department directory."""
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can change permissions")
+    if not agent.tenant_id:
+        return {"items": [], "my_department": None}
+
+    conditions = [
+        OrgDepartment.tenant_id == agent.tenant_id,
+        OrgDepartment.status == "active",
+    ]
+    normalized_search = (search or "").strip()
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        conditions.append(or_(OrgDepartment.name.ilike(pattern), OrgDepartment.path.ilike(pattern)))
+    elif parent_id:
+        parent_result = await db.execute(
+            select(OrgDepartment).where(
+                OrgDepartment.id == parent_id,
+                OrgDepartment.tenant_id == agent.tenant_id,
+                OrgDepartment.status == "active",
+            )
+        )
+        parent = parent_result.scalar_one_or_none()
+        if not parent:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+        conditions.extend(
+            [
+                OrgDepartment.parent_id == parent_id,
+                (
+                    OrgDepartment.provider_id == parent.provider_id
+                    if parent.provider_id is not None
+                    else OrgDepartment.provider_id.is_(None)
+                ),
+            ]
+        )
+    else:
+        conditions.append(OrgDepartment.parent_id.is_(None))
+
+    departments_result = await db.execute(
+        select(OrgDepartment).where(*conditions).order_by(OrgDepartment.name.asc()).limit(limit)
+    )
+    departments = departments_result.scalars().all()
+
+    my_department = None
+    if not normalized_search and parent_id is None:
+        my_department_result = await db.execute(
+            select(OrgDepartment)
+            .join(OrgMember, OrgMember.department_id == OrgDepartment.id)
+            .where(
+                OrgMember.tenant_id == agent.tenant_id,
+                OrgMember.status == "active",
+                OrgMember.user_id == current_user.id,
+                OrgDepartment.status == "active",
+            )
+            .order_by(OrgMember.synced_at.desc())
+            .limit(1)
+        )
+        my_department = my_department_result.scalar_one_or_none()
+
+    target_department_ids = {department.id for department in departments}
+    if my_department:
+        target_department_ids.add(my_department.id)
+
+    child_counts: dict[uuid.UUID, int] = {}
+    member_counts: dict[uuid.UUID, int] = {}
+    if target_department_ids:
+        parent_department = aliased(OrgDepartment)
+        child_counts_result = await db.execute(
+            select(OrgDepartment.parent_id, func.count(OrgDepartment.id))
+            .join(parent_department, parent_department.id == OrgDepartment.parent_id)
+            .where(
+                OrgDepartment.tenant_id == agent.tenant_id,
+                OrgDepartment.status == "active",
+                OrgDepartment.parent_id.in_(target_department_ids),
+                parent_department.tenant_id == agent.tenant_id,
+                parent_department.status == "active",
+                same_directory_provider(
+                    OrgDepartment.provider_id,
+                    parent_department.provider_id,
+                ),
+            )
+            .group_by(OrgDepartment.parent_id)
+        )
+        child_counts = {row[0]: int(row[1]) for row in child_counts_result.all() if row[0]}
+
+        member_counts_result = await db.execute(
+            select(
+                OrgMember.department_id,
+                func.count(func.distinct(OrgMember.user_id)),
+            )
+            .join(User, User.id == OrgMember.user_id)
+            .where(
+                OrgMember.tenant_id == agent.tenant_id,
+                OrgMember.status == "active",
+                OrgMember.department_id.in_(target_department_ids),
+                User.tenant_id == agent.tenant_id,
+                User.is_active == True,  # noqa: E712
+            )
+            .group_by(OrgMember.department_id)
+        )
+        member_counts = {row[0]: int(row[1]) for row in member_counts_result.all() if row[0]}
+
+    return {
+        "items": [
+            _serialize_permission_department(
+                department,
+                child_counts=child_counts,
+                member_counts=member_counts,
+            )
+            for department in departments
+        ],
+        "my_department": (
+            _serialize_permission_department(
+                my_department,
+                child_counts=child_counts,
+                member_counts=member_counts,
+            )
+            if my_department
+            else None
+        ),
+    }
+
+
+@router.get("/{agent_id}/permissions/directory/members")
+async def get_agent_permission_members(
+    agent_id: uuid.UUID,
+    department_id: uuid.UUID | None = None,
+    include_descendants: bool = False,
+    search: str | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return canonical platform users for the permission picker."""
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can change permissions")
+    if not agent.tenant_id:
+        return {"items": [], "page": page, "page_size": page_size, "total": 0, "has_more": False}
+
+    filters = [
+        OrgMember.tenant_id == agent.tenant_id,
+        OrgMember.status == "active",
+        OrgMember.user_id.is_not(None),
+        User.tenant_id == agent.tenant_id,
+        User.is_active == True,  # noqa: E712
+    ]
+    canonical_department_ids = None
+
+    normalized_search = (search or "").strip()
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        filters.append(
+            or_(
+                OrgMember.name.ilike(pattern),
+                OrgMember.name_translit_full.ilike(pattern),
+                OrgMember.name_translit_initial.ilike(pattern),
+                OrgMember.department_path.ilike(pattern),
+                OrgMember.title.ilike(pattern),
+                OrgMember.email.ilike(pattern),
+            )
+        )
+    elif department_id:
+        department_result = await db.execute(
+            select(OrgDepartment).where(
+                OrgDepartment.id == department_id,
+                OrgDepartment.tenant_id == agent.tenant_id,
+                OrgDepartment.status == "active",
+            )
+        )
+        department = department_result.scalar_one_or_none()
+        if not department:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+        if include_descendants:
+            subtree = department_subtree_cte(
+                tenant_id=agent.tenant_id,
+                department_id=department.id,
+                name="permission_picker_department_subtree",
+            )
+            canonical_department_ids = select(subtree.c.department_id)
+            filters.append(OrgMember.department_id.in_(canonical_department_ids))
+        else:
+            canonical_department_ids = [department.id]
+            filters.append(OrgMember.department_id == department.id)
+
+    canonical = canonical_org_member_id_subquery(
+        tenant_id=agent.tenant_id,
+        department_ids=canonical_department_ids,
+        prefer_directory_profile=True,
+    )
+
+    base_query = (
+        select(OrgMember)
+        .join(canonical, and_(OrgMember.id == canonical.c.om_id, canonical.c.rn == 1))
+        .join(User, User.id == OrgMember.user_id)
+        .where(*filters)
+    )
+    count_result = await db.execute(select(func.count()).select_from(base_query.subquery()))
+    total = int(count_result.scalar_one() or 0)
+
+    members_result = await db.execute(
+        base_query
+        .order_by(OrgMember.name.asc(), OrgMember.id.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    members = members_result.scalars().all()
+
+    return {
+        "items": [
+            {
+                "id": str(member.user_id),
+                "member_id": str(member.id),
+                "name": member.name,
+                "department_id": str(member.department_id) if member.department_id else None,
+                "department_path": member.department_path or "",
+                "title": member.title or "",
+                "avatar_url": member.avatar_url,
+                "email": member.email,
+            }
+            for member in members
+        ],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "has_more": page * page_size < total,
+    }
 
 
 @router.get("/{agent_id}/permissions/candidates")

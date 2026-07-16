@@ -19,7 +19,12 @@ import { activityApi, agentApi, channelApi, chatSessionApi, enterpriseApi, fileA
 import type { FocusApiItem } from '../../services/api';
 import ModelSwitcher from '../../components/ModelSwitcher';
 import ConfirmationCard from '../../components/ConfirmationCard';
+import OrgMemberAccessPicker, {
+    type AgentAccessDepartment,
+    type AgentAccessUser,
+} from '../../components/OrgMemberAccessPicker';
 import { useAppStore } from '../../stores';
+import './AccessPermissionsPanel.css';
 
 // A confirmation card is just a `request_confirmation` tool_call rendered specially —
 // the left/right perspective logic stays unaware of it; the renderer keys off the tool name.
@@ -398,16 +403,8 @@ function CopyMessageButton({ text }: { text: string }) {
     );
 }
 
-type AccessUser = {
-    id: string;
-    name: string;
-    username?: string;
-    email?: string;
-    access_level: 'use' | 'manage';
-    is_required?: boolean;
-    required_reason?: 'creator' | 'company_admin' | string | null;
-};
-type AccessUserCandidate = { id: string; name: string; username?: string; email?: string };
+type AccessUser = AgentAccessUser;
+type AccessDepartment = AgentAccessDepartment;
 
 function AccessPermissionsPanel({
     agentId,
@@ -424,32 +421,41 @@ function AccessPermissionsPanel({
     const isChinese = i18n.language?.startsWith('zh');
     const canManagePermissions = permData?.can_manage ?? canManage;
     const isOwner = permData?.is_owner ?? false;
-    const creatorId = permData?.creator_id ? String(permData.creator_id) : null;
     const currentScope = permData?.scope_type === 'user' ? 'private' : (permData?.scope_type || 'company');
     const currentAccessLevel = permData?.access_level || 'use';
     const [localScope, setLocalScope] = useState(currentScope);
     const [localAccessLevel, setLocalAccessLevel] = useState(currentAccessLevel);
     const [savingScope, setSavingScope] = useState<string | null>(null);
     const [permissionError, setPermissionError] = useState<string | null>(null);
-    const [userSearch, setUserSearch] = useState('');
-    const [showUserDropdown, setShowUserDropdown] = useState(false);
-    const userSearchRef = useRef<HTMLDivElement | null>(null);
-    const userAccess: AccessUser[] = (permData?.user_access || []).map((u: any) => ({
-        id: u.id,
-        name: u.name,
-        username: u.username,
-        email: u.email,
-        access_level: u.access_level === 'manage' ? 'manage' : 'use',
-        is_required: !!u.is_required,
-        required_reason: u.required_reason || null,
-    }));
+    const [showMemberPicker, setShowMemberPicker] = useState(false);
+    const userAccess: AccessUser[] = useMemo(
+        () => (permData?.user_access || []).map((u: any) => ({
+            id: u.id,
+            name: u.name,
+            username: u.username,
+            email: u.email,
+            title: u.title,
+            avatar_url: u.avatar_url,
+            department_path: u.department_path,
+            access_level: u.access_level === 'manage' ? 'manage' : 'use',
+            is_required: !!u.is_required,
+            required_reason: u.required_reason || null,
+        })),
+        [permData?.user_access],
+    );
+    const departmentAccess: AccessDepartment[] = useMemo(
+        () => (permData?.department_access || []).map((department: any) => ({
+            id: department.id,
+            name: department.name,
+            path: department.path,
+            access_level: department.access_level === 'manage' ? 'manage' : 'use',
+            include_descendants: true,
+        })),
+        [permData?.department_access],
+    );
     const toPermissionPayloadScope = (scope: string) => scope === 'private' ? 'user' : scope;
-
-    const { data: candidates } = useQuery({
-        queryKey: ['agent-permission-candidates', agentId, userSearch],
-        queryFn: () => fetchAuth<{ users: AccessUserCandidate[]; agents: any[] }>(`/agents/${agentId}/permissions/candidates${userSearch.trim() ? `?search=${encodeURIComponent(userSearch.trim())}` : ''}`),
-        enabled: !!agentId && canManagePermissions,
-    });
+    const businessUsers = userAccess.filter(user => !user.is_required);
+    const requiredUsers = userAccess.filter(user => user.is_required);
 
     useEffect(() => {
         setLocalScope(currentScope);
@@ -484,7 +490,7 @@ function AccessPermissionsPanel({
             value: 'custom',
             icon: <IconLock size={14} stroke={1.8} />,
             label: isChinese ? '指定访问' : 'Custom',
-            desc: isChinese ? '指定可访问的平台用户；不可参与 Plaza。Agent 关系请在“关系”里配置。' : 'Choose platform users explicitly; Plaza is disabled. Agent relationships are configured in Relationships.',
+            desc: isChinese ? '指定可访问的部门或成员；不可参与 Plaza。Agent 关系请在“关系”里配置。' : 'Choose departments or members; Plaza is disabled. Agent relationships are configured in Relationships.',
         },
     ] as const;
 
@@ -507,6 +513,7 @@ function AccessPermissionsPanel({
                 scope_type: toPermissionPayloadScope(scope),
                 access_level: localAccessLevel,
                 user_access: userAccess,
+                department_access: departmentAccess,
             });
         } catch (e) {
             setLocalScope(previousScope);
@@ -526,6 +533,7 @@ function AccessPermissionsPanel({
                 scope_type: toPermissionPayloadScope(localScope),
                 access_level: level,
                 user_access: userAccess,
+                department_access: departmentAccess,
             });
         } catch (e) {
             setLocalAccessLevel(previousLevel);
@@ -536,50 +544,22 @@ function AccessPermissionsPanel({
         }
     };
 
-    const addUser = (userId: string) => {
-        const candidate = candidates?.users?.find(u => u.id === userId);
-        if (!candidate || userAccess.some(u => u.id === userId)) return;
-        savePermissions({
-            scope_type: 'custom',
-            access_level: currentAccessLevel,
-            user_access: [...userAccess, { ...candidate, access_level: creatorId === userId ? 'manage' : 'use' }],
-        }).catch(e => console.error('Failed to add user access', e));
-    };
-
-    const isLockedAccessUser = (user: AccessUser) => user.is_required || creatorId === user.id;
-    const lockedAccessTitle = (user: AccessUser) => {
-        if (user.required_reason === 'company_admin') {
-            return isChinese ? '公司管理员会自动保留管理权限' : 'Company admins automatically keep manage access';
+    const saveCustomAccess = async (
+        nextBusinessUsers: AccessUser[],
+        nextDepartments: AccessDepartment[],
+    ) => {
+        try {
+            await savePermissions({
+                scope_type: 'custom',
+                access_level: localAccessLevel,
+                user_access: nextBusinessUsers,
+                department_access: nextDepartments,
+            });
+        } catch (error) {
+            setPermissionError(error instanceof Error ? error.message : String(error));
+            throw error;
         }
-        return isChinese ? '创建者始终保留管理权限' : 'The creator always keeps manage access';
     };
-
-    const updateUserLevel = (userId: string, level: 'use' | 'manage') => {
-        const target = userAccess.find(u => u.id === userId);
-        if (target && isLockedAccessUser(target)) return;
-        savePermissions({
-            scope_type: 'custom',
-            access_level: currentAccessLevel,
-            user_access: userAccess.map(u => u.id === userId ? { ...u, access_level: level } : u),
-        }).catch(e => console.error('Failed to update user access', e));
-    };
-
-    const removeUser = (userId: string) => {
-        const target = userAccess.find(u => u.id === userId);
-        if (target && isLockedAccessUser(target)) return;
-        savePermissions({
-            scope_type: 'custom',
-            access_level: currentAccessLevel,
-            user_access: userAccess.filter(u => u.id !== userId),
-        }).catch(e => console.error('Failed to remove user access', e));
-    };
-
-    const toggleUser = (user: AccessUserCandidate) => {
-        if (userAccess.some(existing => existing.id === user.id)) return;
-        addUser(user.id);
-    };
-
-    const visibleUserResults = candidates?.users || [];
 
     return (
         <div className="card" style={{ marginBottom: '12px' }}>
@@ -676,125 +656,81 @@ function AccessPermissionsPanel({
             )}
 
             {localScope === 'custom' && canManagePermissions && (
-                <div
-                    style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}
-                    onMouseDownCapture={(e) => {
-                        const target = e.target as Node;
-                        if (userSearchRef.current && !userSearchRef.current.contains(target)) {
-                            setShowUserDropdown(false);
-                        }
-                    }}
-                >
-                    <div>
-                        <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                            <IconUser size={14} stroke={1.8} /> {isChinese ? '平台用户' : 'Platform Users'}
-                        </div>
-                        <div ref={userSearchRef} style={{ position: 'relative', marginBottom: '8px', maxWidth: '520px' }}>
-                            <input
-                                className="input"
-                                value={userSearch}
-                                onChange={(e) => {
-                                    setUserSearch(e.target.value);
-                                    setShowUserDropdown(true);
-                                }}
-                                onFocus={() => setShowUserDropdown(true)}
-                                placeholder={isChinese ? '搜索用户姓名或邮箱...' : 'Search users by name or email...'}
-                                style={{ fontSize: '12px', width: '100%' }}
-                            />
-                            {showUserDropdown && visibleUserResults.length > 0 && (
-                                <div style={{ position: 'absolute', top: '100%', left: 0, right: 0, background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', marginTop: '4px', maxHeight: '220px', overflowY: 'auto', zIndex: 20, boxShadow: '0 4px 12px rgba(0,0,0,0.15)' }}>
-                                    {visibleUserResults.map(u => {
-                                        const checked = userAccess.some(existing => existing.id === u.id);
-                                        const existingUser = userAccess.find(existing => existing.id === u.id);
-                                        return (
-                                            <div
-                                                key={u.id}
-                                                style={{ padding: '8px 12px', cursor: checked ? 'default' : 'pointer', fontSize: '13px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'flex-start', gap: '8px', opacity: checked ? 0.72 : 1 }}
-                                                onClick={() => toggleUser(u)}
-                                                onMouseEnter={e => (e.currentTarget.style.background = 'var(--bg-elevated)')}
-                                                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-                                            >
-                                                <input type="checkbox" checked={checked} readOnly disabled={checked} style={{ marginTop: '2px' }} />
-                                                <div style={{ minWidth: 0, flex: 1 }}>
-                                                    <div style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', gap: '6px', alignItems: 'center' }}>
-                                                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.name}</span>
-                                                        {checked && (
-                                                            <span className="badge" style={{ fontSize: '10px', flexShrink: 0 }}>
-                                                                {existingUser?.is_required
-                                                                    ? (existingUser.required_reason === 'company_admin' ? (isChinese ? '管理员' : 'Admin') : (isChinese ? '创建者' : 'Creator'))
-                                                                    : (isChinese ? '已添加' : 'Added')}
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    {(u.email || u.username) && (
-                                                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                            {[u.username, u.email].filter(Boolean).join(' · ')}
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        );
-                                    })}
-                                </div>
-                            )}
-                            {showUserDropdown && userSearch.trim() && visibleUserResults.length === 0 && (
-                                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '6px' }}>
-                                    {t('agent.detail.noSearchResults', 'No available results')}
-                                </div>
-                            )}
-                        </div>
-                        {userAccess.length > 0 && (
-                            <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '6px' }}>
-                                {isChinese ? '已授权用户' : 'Granted users'}
+                <div style={{ borderTop: '1px solid var(--border-subtle)', paddingTop: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '16px' }}>
+                        <div style={{ minWidth: 0 }}>
+                            <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <IconBuilding size={14} stroke={1.8} />
+                                {isChinese
+                                    ? `已指定 ${departmentAccess.length} 个部门节点、${businessUsers.length} 名成员`
+                                    : `${departmentAccess.length} departments and ${businessUsers.length} members selected`}
                             </div>
-                        )}
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                            {userAccess.map(u => {
-                                const isCreatorUser = creatorId === u.id;
-                                const lockedUser = isLockedAccessUser(u);
-                                return (
-                                <div key={u.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px', border: '1px solid var(--border-subtle)', borderRadius: '8px' }}>
-                                    <div style={{ flex: 1, minWidth: 0 }}>
-                                        <div style={{ fontSize: '12px', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                            {u.name}
-                                            {isCreatorUser && (
-                                                <span className="badge" style={{ fontSize: '10px', marginLeft: '6px' }}>
-                                                    {isChinese ? '创建者' : 'Creator'}
-                                                </span>
-                                            )}
-                                            {!isCreatorUser && u.required_reason === 'company_admin' && (
-                                                <span className="badge" style={{ fontSize: '10px', marginLeft: '6px' }}>
-                                                    {isChinese ? '管理员' : 'Admin'}
-                                                </span>
-                                            )}
-                                        </div>
-                                        {u.email && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{u.email}</div>}
-                                    </div>
-                                    <select
-                                        className="input"
-                                        value={lockedUser ? 'manage' : u.access_level}
-                                        disabled={lockedUser}
-                                        onChange={(e) => updateUserLevel(u.id, e.target.value as 'use' | 'manage')}
-                                        style={{ width: '92px', fontSize: '12px', opacity: lockedUser ? 0.65 : 1, cursor: lockedUser ? 'not-allowed' : 'pointer' }}
-                                        title={lockedUser ? lockedAccessTitle(u) : undefined}
-                                    >
-                                        <option value="use">{t('agent.settings.perm.useAccess', 'Use')}</option>
-                                        <option value="manage">{t('agent.settings.perm.manageAccess', 'Manage')}</option>
-                                    </select>
-                                    <button
-                                        className="btn btn-ghost btn-sm"
-                                        disabled={lockedUser}
-                                        onClick={() => removeUser(u.id)}
-                                        title={lockedUser ? lockedAccessTitle(u) : undefined}
-                                        style={{ opacity: lockedUser ? 0.35 : 1, cursor: lockedUser ? 'not-allowed' : 'pointer' }}
-                                    >
-                                        ×
-                                    </button>
-                                </div>
-                            );})}
-                            {userAccess.length === 0 && <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{isChinese ? '尚未指定用户。创建者会自动保留管理权限。' : 'No users selected. The creator keeps manage access automatically.'}</div>}
+                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                                {isChinese
+                                    ? `创建者及 ${Math.max(requiredUsers.length - 1, 0)} 名公司管理员保留管理权限`
+                                    : `The creator and ${Math.max(requiredUsers.length - 1, 0)} company administrators retain manage access`}
+                            </div>
                         </div>
+                        <button
+                            type="button"
+                            className="btn btn-primary btn-sm"
+                            onClick={() => setShowMemberPicker(true)}
+                            disabled={savingScope !== null}
+                        >
+                            {isChinese ? '选择部门或成员' : 'Choose Departments or Members'}
+                        </button>
                     </div>
+                    {(departmentAccess.length > 0 || businessUsers.length > 0) && (
+                        <div className="agent-access-summary">
+                            {departmentAccess.length > 0 && (
+                                <div className="agent-access-summary__group">
+                                    <div className="agent-access-summary__group-label">
+                                        <IconBuilding size={13} stroke={1.8} />
+                                        <span>{isChinese ? '部门权限' : 'Departments'}</span>
+                                    </div>
+                                    <div className="agent-access-summary__items">
+                                        {departmentAccess.slice(0, 4).map(department => (
+                                            <span key={department.id} className="agent-access-summary__item agent-access-summary__item--department" title={department.path}>
+                                                <strong>{department.name}</strong>
+                                                <span className="agent-access-summary__scope">{isChinese ? '含下级' : 'Descendants'}</span>
+                                                <span className={`agent-access-summary__level is-${department.access_level}`}>
+                                                    {department.access_level === 'manage' ? (isChinese ? '管理' : 'Manage') : (isChinese ? '使用' : 'Use')}
+                                                </span>
+                                            </span>
+                                        ))}
+                                        {departmentAccess.length > 4 && <span className="agent-access-summary__more">+{departmentAccess.length - 4}</span>}
+                                    </div>
+                                </div>
+                            )}
+                            {businessUsers.length > 0 && (
+                                <div className="agent-access-summary__group">
+                                    <div className="agent-access-summary__group-label">
+                                        <IconUser size={13} stroke={1.8} />
+                                        <span>{isChinese ? '成员权限' : 'Members'}</span>
+                                    </div>
+                                    <div className="agent-access-summary__items">
+                                        {businessUsers.slice(0, 6).map(user => (
+                                            <span key={user.id} className="agent-access-summary__item" title={user.department_path || user.email || user.name}>
+                                                <strong>{user.name}</strong>
+                                                <span className={`agent-access-summary__level is-${user.access_level}`}>
+                                                    {user.access_level === 'manage' ? (isChinese ? '管理' : 'Manage') : (isChinese ? '使用' : 'Use')}
+                                                </span>
+                                            </span>
+                                        ))}
+                                        {businessUsers.length > 6 && <span className="agent-access-summary__more">+{businessUsers.length - 6}</span>}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                    <OrgMemberAccessPicker
+                        open={showMemberPicker}
+                        agentId={agentId}
+                        users={userAccess}
+                        departments={departmentAccess}
+                        onClose={() => setShowMemberPicker(false)}
+                        onSave={saveCustomAccess}
+                    />
                 </div>
             )}
 

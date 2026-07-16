@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 
 # ─── Auth ───────────────────────────────────────────────
@@ -163,6 +163,12 @@ class UserOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("email_verified", mode="before")
+    @classmethod
+    def normalize_legacy_email_verified(cls, value: bool | None) -> bool:
+        """Directory-only users have no login identity; preserve the legacy default."""
+        return True if value is None else value
 
 
 class IdentityProviderOut(BaseModel):

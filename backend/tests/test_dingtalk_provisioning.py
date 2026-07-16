@@ -15,7 +15,6 @@ from app.models.dingtalk_provisioning import (
     DINGTALK_PROVISIONING_STATUS_CANCELLED,
     DINGTALK_PROVISIONING_STATUS_CONFIGURED,
     DINGTALK_PROVISIONING_STATUS_EXPIRED,
-    DINGTALK_PROVISIONING_STATUS_FAILED,
     DINGTALK_PROVISIONING_STATUS_POLLING,
     DINGTALK_PROVISIONING_STATUS_WAITING,
     DINGTALK_WELCOME_STATUS_FAILED,
@@ -121,7 +120,7 @@ def test_bounded_polling_window_caps_dingtalk_values():
     assert window.expires_at == now + timedelta(seconds=1800)
     assert window.poll_interval_seconds == 2
     assert window.next_poll_at == now + timedelta(seconds=2)
-    assert window.max_poll_attempts == 180
+    assert window.max_poll_attempts == 900
 
 
 @pytest.mark.asyncio
@@ -148,6 +147,7 @@ async def test_start_provisioning_persists_session_and_cancels_previous_pending(
         db_session,
         agent=agent,
         requested_by_user_id=user.id,
+        restart_existing=True,
         registration_client=fake_client,
         now=now,
     )
@@ -165,11 +165,140 @@ async def test_start_provisioning_persists_session_and_cancels_previous_pending(
     assert stored is not None
     assert stored.device_code == "device-code-1"
     assert stored.poll_interval_seconds == 2
-    assert stored.max_poll_attempts == 180
+    assert stored.max_poll_attempts == 900
 
 
 @pytest.mark.asyncio
-async def test_poll_waiting_reschedules_without_unbounded_attempts(db_session):
+async def test_start_provisioning_reuses_unexpired_flow_when_restart_is_false(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    existing = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="existing-device",
+        authorization_url="https://auth.example/existing",
+        expires_at=now + timedelta(minutes=20),
+        next_poll_at=now + timedelta(seconds=2),
+        poll_interval_seconds=2,
+        max_poll_attempts=900,
+    )
+    db_session.add(existing)
+    await db_session.flush()
+    fake_client = FakeRegistrationClient()
+
+    result = await start_dingtalk_channel_provisioning(
+        db_session,
+        agent=agent,
+        requested_by_user_id=user.id,
+        restart_existing=False,
+        registration_client=fake_client,
+        now=now,
+    )
+
+    assert result["flow_action"] == "reused"
+    assert result["provisioning_id"] == str(existing.id)
+    assert result["authorization_url"] == existing.authorization_url
+    assert existing.status == DINGTALK_PROVISIONING_STATUS_POLLING
+    assert fake_client.begin_calls == 0
+    assert fake_client.poll_calls == []
+
+
+@pytest.mark.asyncio
+async def test_restart_reconciles_success_before_creating_replacement(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    existing = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="existing-device",
+        authorization_url="https://auth.example/existing",
+        expires_at=now + timedelta(minutes=20),
+        next_poll_at=now + timedelta(seconds=2),
+        poll_interval_seconds=2,
+        max_poll_attempts=900,
+    )
+    db_session.add(existing)
+    await db_session.flush()
+    fake_client = FakeRegistrationClient(
+        poll_responses=[
+            {
+                "status": "SUCCESS",
+                "client_id": "ding-client-id",
+                "client_secret": "ding-client-secret",
+            }
+        ]
+    )
+    stream_starts = []
+
+    async def fake_stream_starter(agent_id, app_key, app_secret):
+        stream_starts.append((agent_id, app_key, app_secret))
+
+    result = await start_dingtalk_channel_provisioning(
+        db_session,
+        agent=agent,
+        requested_by_user_id=user.id,
+        restart_existing=True,
+        registration_client=fake_client,
+        stream_starter=fake_stream_starter,
+        now=now,
+    )
+
+    assert result["flow_action"] == "configured_existing"
+    assert result["provisioning_id"] == str(existing.id)
+    assert existing.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    assert fake_client.poll_calls == ["existing-device"]
+    assert fake_client.begin_calls == 0
+    assert stream_starts == [(agent.id, "ding-client-id", "ding-client-secret")]
+
+
+@pytest.mark.asyncio
+async def test_restart_begin_failure_keeps_existing_flow_active(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    existing = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_WAITING,
+        device_code="existing-device",
+        authorization_url="https://auth.example/existing",
+        expires_at=now + timedelta(minutes=20),
+        next_poll_at=now + timedelta(seconds=2),
+        poll_interval_seconds=2,
+        max_poll_attempts=900,
+    )
+    db_session.add(existing)
+    await db_session.flush()
+
+    class BeginFailureClient(FakeRegistrationClient):
+        async def begin(self):
+            self.begin_calls += 1
+            raise RuntimeError("temporary begin failure")
+
+    fake_client = BeginFailureClient(poll_responses=[{"status": "WAITING"}])
+
+    with pytest.raises(RuntimeError, match="temporary begin failure"):
+        await start_dingtalk_channel_provisioning(
+            db_session,
+            agent=agent,
+            requested_by_user_id=user.id,
+            restart_existing=True,
+            registration_client=fake_client,
+            now=now,
+        )
+
+    assert fake_client.poll_calls == ["existing-device"]
+    assert fake_client.begin_calls == 1
+    assert existing.status == DINGTALK_PROVISIONING_STATUS_POLLING
+    assert existing.next_poll_at == now + timedelta(seconds=2)
+
+
+@pytest.mark.asyncio
+async def test_poll_waiting_continues_past_observability_attempt_count_until_deadline(db_session):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
     session = DingTalkChannelProvisioningSession(
@@ -208,9 +337,206 @@ async def test_poll_waiting_reschedules_without_unbounded_attempts(db_session):
         now=now + timedelta(seconds=3),
     )
 
-    assert session.status == DINGTALK_PROVISIONING_STATUS_FAILED
-    assert len(fake_client.poll_calls) == 1
-    assert "最大轮询次数" in session.last_error
+    assert session.status == DINGTALK_PROVISIONING_STATUS_POLLING
+    assert session.poll_attempt_count == 2
+    assert fake_client.poll_calls == ["device-wait", "device-wait"]
+    assert session.last_error is None
+    assert session.next_poll_at == now + timedelta(seconds=6)
+
+
+@pytest.mark.asyncio
+async def test_poll_transport_errors_retry_past_legacy_attempt_cap_until_deadline(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="transport-error",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(seconds=10),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        poll_attempt_count=180,
+        max_poll_attempts=180,
+    )
+    db_session.add(session)
+    await db_session.flush()
+
+    class PollFailureClient(FakeRegistrationClient):
+        async def poll(self, device_code: str):
+            self.poll_calls.append(device_code)
+            raise RuntimeError("temporary poll failure")
+
+    fake_client = PollFailureClient()
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=fake_client,
+        now=now,
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_POLLING
+    assert session.poll_attempt_count == 181
+    assert session.next_poll_at == now + timedelta(seconds=2)
+    assert "RuntimeError" in session.last_error
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=fake_client,
+        now=now + timedelta(seconds=10),
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_EXPIRED
+    assert session.poll_attempt_count == 182
+    assert session.next_poll_at is None
+
+
+@pytest.mark.asyncio
+async def test_poll_success_is_consumed_at_deadline_after_legacy_attempt_cap(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="late-success",
+        authorization_url="https://auth.example",
+        expires_at=now,
+        next_poll_at=now,
+        last_poll_at=now - timedelta(seconds=2),
+        poll_interval_seconds=2,
+        poll_attempt_count=180,
+        max_poll_attempts=180,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    fake_client = FakeRegistrationClient(
+        poll_responses=[
+            {
+                "status": "SUCCESS",
+                "client_id": "late-client-id",
+                "client_secret": "late-client-secret",
+            }
+        ]
+    )
+
+    async def fake_stream_starter(agent_id, app_key, app_secret):
+        return None
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=fake_client,
+        stream_starter=fake_stream_starter,
+        now=now,
+    )
+
+    assert fake_client.poll_calls == ["late-success"]
+    assert session.poll_attempt_count == 181
+    assert session.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    config = (
+        await db_session.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "dingtalk",
+            )
+        )
+    ).scalar_one()
+    assert config.app_id == "late-client-id"
+
+
+@pytest.mark.asyncio
+async def test_final_deadline_poll_waiting_expires_instead_of_rescheduling(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="deadline-waiting",
+        authorization_url="https://auth.example",
+        expires_at=now,
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        poll_attempt_count=899,
+        max_poll_attempts=900,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    fake_client = FakeRegistrationClient(poll_responses=[{"status": "WAITING"}])
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=fake_client,
+        now=now,
+    )
+
+    assert fake_client.poll_calls == ["deadline-waiting"]
+    assert session.poll_attempt_count == 900
+    assert session.status == DINGTALK_PROVISIONING_STATUS_EXPIRED
+    assert session.next_poll_at is None
+
+
+@pytest.mark.asyncio
+async def test_full_30_minute_poll_window_consumes_success_on_attempt_900(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    started_at = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_WAITING,
+        device_code="full-window-success",
+        authorization_url="https://auth.example",
+        expires_at=started_at + timedelta(minutes=30),
+        next_poll_at=started_at + timedelta(seconds=2),
+        poll_interval_seconds=2,
+        max_poll_attempts=900,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    fake_client = FakeRegistrationClient(
+        poll_responses=[
+            *({"status": "WAITING"} for _ in range(899)),
+            {
+                "status": "SUCCESS",
+                "client_id": "attempt-900-client-id",
+                "client_secret": "attempt-900-client-secret",
+            },
+        ]
+    )
+
+    async def fake_stream_starter(agent_id, app_key, app_secret):
+        return None
+
+    for attempt in range(1, 901):
+        await poll_dingtalk_provisioning_session(
+            db_session,
+            session,
+            registration_client=fake_client,
+            stream_starter=fake_stream_starter,
+            now=started_at + timedelta(seconds=attempt * 2),
+        )
+
+    assert session.poll_attempt_count == 900
+    assert len(fake_client.poll_calls) == 900
+    assert session.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    config = (
+        await db_session.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "dingtalk",
+            )
+        )
+    ).scalar_one()
+    assert config.app_id == "attempt-900-client-id"
 
 
 @pytest.mark.asyncio
@@ -785,8 +1111,8 @@ async def test_poll_due_sessions_resumes_only_unexpired_due_sessions(db_session)
         limit=10,
     )
 
-    assert count == 1
-    assert fake_client.poll_calls == ["due"]
+    assert count == 2
+    assert sorted(fake_client.poll_calls) == ["due", "expired"]
     assert due.poll_attempt_count == 1
     assert future.poll_attempt_count == 0
     assert expired.status == DINGTALK_PROVISIONING_STATUS_EXPIRED
