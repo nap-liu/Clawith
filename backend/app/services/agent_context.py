@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 
 from app.config import get_settings
+from app.services.agent_memory import MEMORY_SYSTEM_PROMPT, load_agent_memory_snapshot
 from app.services.storage import get_storage_backend, normalize_storage_key
 
 settings = get_settings()
@@ -471,13 +472,6 @@ async def build_agent_context(
     if soul.startswith("# "):
         soul = "\n".join(soul.split("\n")[1:]).strip()
 
-    # --- Memory --- (max_chars=None: never truncate long-term memory)
-    memory = await _read_file_safe(normalize_storage_key(f"{agent_id}/memory/memory.md"), None)
-    if not memory:
-        memory = await _read_file_safe(normalize_storage_key(f"{agent_id}/memory.md"), None)
-    if memory.startswith("# "):
-        memory = "\n".join(memory.split("\n")[1:]).strip()
-
     # --- Skills index (progressive disclosure) ---
     skills_text = await _load_skills_index(agent_id)
 
@@ -501,6 +495,8 @@ async def build_agent_context(
 
     agent_tz_name = await get_agent_timezone(agent_id)
     agent_local_now = now_in_timezone(agent_tz_name)
+    memory_snapshot = await load_agent_memory_snapshot(agent_id, today=agent_local_now.date())
+    memory_context = memory_snapshot.render()
     # Date granularity only. A passively-injected clock is approximate by
     # nature; anything finer than a day changes within the 5-minute prefix-cache
     # TTL and busts the cached system prefix — most acutely on the heartbeat /
@@ -546,6 +542,7 @@ When installing or importing an MCP server via `discover_resources` / `import_mc
 - Do **NOT** ask the user for tool-specific tokens (GitHub PAT, Notion integration secret, etc.) when the Smithery flow supports OAuth.
 - Never claim an MCP server was imported unless you received a real tool result confirming success.
 """)
+    static_parts.append(MEMORY_SYSTEM_PROMPT)
 
     dynamic_parts = []
 
@@ -623,7 +620,9 @@ You have a dedicated workspace with this structure:
   - Focus tools    → Your current focus items — use list_focus_items, upsert_focus_item, complete_focus_item
   - task_history.md → Archive of completed tasks
   - soul.md        → Your personality definition
-  - memory/memory.md → Your long-term memory and notes
+  - memory/memory.md → Your stable Core Memory
+  - memory/MEMORY_INDEX.md → Ordinary file that explains the memory layout and older-record lookup
+  - memory/<YYYY-MM-DD>/memory.md → Detailed Daily Memory for one date
   - memory/reflections.md → Your autonomous thinking journal
   - skills/        → Your skill definition files (one .md per skill)
   - workspace/     → Your work files (reports, documents, etc.)
@@ -680,7 +679,7 @@ Default visual style for generated HTML or rich visual documents:
 3. **NEVER fabricate file contents or tool results from memory.**
    Even if you saw a file before, you MUST call the tool again to get current data.
 
-4. **Use `write_file` to update memory/memory.md with important information.**
+4. **Maintain memory according to the Persistent Memory System rules above.**
 
 5. **Use Focus tools to manage your current working state.**
    - To inspect current work → CALL `list_focus_items`
@@ -817,11 +816,8 @@ Strict rules:
     if relationships and "暂无" not in relationships and "None yet" not in relationships:
         static_parts.append(f"\n## Relationships\n{relationships}")
 
-    if memory and memory not in (
-        "_这里记录重要的信息和学到的知识。_",
-        "_Record important information and knowledge here._",
-    ):
-        dynamic_parts.append(f"\n## Memory\n{memory}")
+    if memory_context:
+        dynamic_parts.append(f"\n{memory_context}")
 
     if channel_context:
         channel_lines = ["\n## Current Channel"]

@@ -269,10 +269,38 @@ class S3StorageBackend(StorageBackend):
         condition: WriteCondition | None = None,
         content_type: str | None = None,
     ) -> ConditionalWriteResult:
+        if condition and condition.require_absent:
+            resolved_ct = content_type or "application/octet-stream"
+            try:
+                async with self._async_client() as client:
+                    await client.put_object(
+                        Bucket=self.bucket,
+                        Key=self._object_key(key),
+                        Body=data,
+                        ContentType=resolved_ct,
+                        IfNoneMatch="*",
+                    )
+            except Exception as exc:
+                response = getattr(exc, "response", {}) or {}
+                error_code = str((response.get("Error") or {}).get("Code") or "")
+                status_code = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+                if status_code in {409, 412} or error_code in {
+                    "ConditionalRequestConflict",
+                    "PreconditionFailed",
+                }:
+                    return ConditionalWriteResult(
+                        ok=False,
+                        conflict=True,
+                        current_version=await self.get_version(key),
+                    )
+                raise
+            return ConditionalWriteResult(
+                ok=True,
+                current_version=await self.get_version(key),
+            )
+
         current = await self.get_version(key)
         if condition:
-            if condition.require_absent and current.exists:
-                return ConditionalWriteResult(ok=False, conflict=True, current_version=current)
             if condition.version_token is not None and current.token != condition.version_token:
                 return ConditionalWriteResult(ok=False, conflict=True, current_version=current)
         await self.write_bytes(key, data, content_type=content_type)

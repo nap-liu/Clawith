@@ -49,6 +49,9 @@ class _FakeStorage:
     async def is_file(self, key: str) -> bool:
         return key in self._files
 
+    async def list_dir(self, key: str) -> list:
+        return []
+
     async def read_text(self, key: str, encoding: str = "utf-8", errors: str = "replace") -> str:
         return self._files[key]
 
@@ -91,11 +94,12 @@ async def test_build_agent_context_injects_full_memory():
 
     with (
         patch("app.services.agent_context.get_storage_backend", return_value=fake),
+        patch("app.services.agent_memory.get_storage_backend", return_value=fake),
         patch("app.services.agent_context._load_skills_index", new_callable=AsyncMock, return_value=""),
         patch("app.services.timezone_utils.get_agent_timezone", new_callable=AsyncMock, return_value="UTC"),
     ):
         _static, dynamic = await build_agent_context(agent_id, "TestAgent")
 
-    assert "## Memory" in dynamic
+    assert "## Core Memory" in dynamic
     assert _TAIL in dynamic  # tail past the old 2000-char cap reached the context
     assert "...(truncated)" not in dynamic

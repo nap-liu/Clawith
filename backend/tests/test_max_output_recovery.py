@@ -10,14 +10,12 @@ Cases locked in here:
 
 A. ``finish_reason == "stop"`` → no recovery, normal return.
 B. First response truncated (``"length"``) + partial text, second response
-   ``"stop"`` + remainder → caller returns full concatenated content and a
-   single resume pair was added to and then popped from history (final
-   api_messages seen by downstream code keeps "one logical turn =
-   one assistant message" shape).
+   ``"stop"`` + remainder → caller returns full concatenated content and the
+   dispatched recovery transcript remains append-only.
 C. Three consecutive truncated responses + a fourth still truncated →
    caller returns the exhaustion error string verbatim.
-D. During recovery the dispatch ``messages`` sent to ``client.stream`` carry
-   a transient ``assistant(partial) + user(RESUME_PROMPT)`` tail.
+D. During recovery the dispatch ``messages`` sent to ``client.stream`` retain
+   an append-only ``assistant(partial) + user(RESUME_PROMPT)`` tail.
 E. If the re-streamed (resumed) response carries ``tool_calls``, the outer
    tool-calling loop handles it normally — truncation recovery and tool
    calling compose cleanly without interfering.
@@ -176,7 +174,7 @@ async def test_case_a_no_truncation_returns_direct(monkeypatch):
     assert client.closed is True
 
 
-# ─── Case B: one recovery → content concatenated, transient pair popped ────────
+# ─── Case B: one recovery → user-visible content concatenated ─────────────────
 
 @pytest.mark.asyncio
 async def test_case_b_single_recovery_concatenates_content(monkeypatch):
@@ -257,10 +255,13 @@ async def test_case_d_dispatched_messages_carry_resume_pair(monkeypatch):
     # First call (initial): tail is the single wrapped user message.
     call_0: list[LLMMessage] = client.stream_calls[0]["messages"]
     assert call_0[-1].role == "user"
+    assert "DYN" in call_0[-1].content
     assert call_0[-1].content.endswith("keep going")
 
     # Second call (first resume): tail should be …user, assistant(part-a), user(RESUME_PROMPT)
     call_1: list[LLMMessage] = client.stream_calls[1]["messages"]
+    assert call_1[: len(call_0)] == call_0
+    assert "DYN" in call_1[-3].content
     assert call_1[-2].role == "assistant"
     assert call_1[-2].content == "part-a "
     assert call_1[-1].role == "user"
@@ -268,6 +269,8 @@ async def test_case_d_dispatched_messages_carry_resume_pair(monkeypatch):
 
     # Third call (second resume): tail should have TWO (assistant, user) resume pairs.
     call_2: list[LLMMessage] = client.stream_calls[2]["messages"]
+    assert call_2[: len(call_1)] == call_1
+    assert "DYN" in call_2[-5].content
     assert call_2[-4].role == "assistant" and call_2[-4].content == "part-a "
     assert call_2[-3].role == "user" and call_2[-3].content == RESUME_PROMPT
     assert call_2[-2].role == "assistant" and call_2[-2].content == "part-b "
@@ -325,10 +328,12 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
     # 3 stream calls: initial + 1 resume + 1 follow-up round
     assert len(client.stream_calls) == 3
 
-    # Round 1's dispatched messages should contain the CONCATENATED assistant
-    # content ("thinking... going to call a tool") as a single turn, plus the
-    # tool message — NOT the transient (partial_assistant, resume_user) pair.
+    # Round 1 must retain the exact recovery request as its prefix, then append
+    # the resumed assistant tool call and tool result.
     round_1_msgs: list[LLMMessage] = client.stream_calls[2]["messages"]
+    recovery_request: list[LLMMessage] = client.stream_calls[1]["messages"]
+    assert round_1_msgs[: len(recovery_request)] == recovery_request
+
     # Find the assistant turn with tool_calls
     tool_turn_idx = None
     for i, m in enumerate(round_1_msgs):
@@ -337,17 +342,11 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
             break
     assert tool_turn_idx is not None, "expected an assistant/tool_calls message"
     tool_turn = round_1_msgs[tool_turn_idx]
-    assert tool_turn.content == "thinking... going to call a tool", (
-        "partial and resumed content should be stitched into the single "
-        "assistant turn that carries the tool_calls"
+    assert tool_turn.content == "going to call a tool", (
+        "the tool-call turn contains only the resumed segment; the earlier "
+        "partial remains in the immutable recovery prefix"
     )
-    # Verify the transient RESUME_PROMPT user message is NOT in history.
-    for m in round_1_msgs:
-        if m.role == "user":
-            assert m.content != RESUME_PROMPT, (
-                "RESUME_PROMPT transient pair must be popped before the "
-                "next round so history stays 'one turn = one message'"
-            )
+    assert any(m.role == "user" and m.content == RESUME_PROMPT for m in round_1_msgs)
     # And the tool result follows right after the tool-calls assistant turn.
     assert round_1_msgs[tool_turn_idx + 1].role == "tool"
     assert round_1_msgs[tool_turn_idx + 1].content == "file-contents"

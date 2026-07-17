@@ -169,7 +169,7 @@ BUILTIN_TOOLS = [
     {
         "name": "write_file",
         "display_name": "Write File",
-        "description": "Write or update a file in the workspace. Before creating a new document under workspace/, first inspect the relevant directories with list_files, prefer an existing topical subfolder over the workspace root, and create a new subfolder when the content belongs to a new category. Avoid placing standalone document files directly in workspace/ root unless the user explicitly wants that. Can update memory/memory.md, create documents in workspace/, create skills in skills/.",
+        "description": "Write or update a file in the workspace. Before creating a new document under workspace/, first inspect the relevant directories with list_files, prefer an existing topical subfolder over the workspace root, and create a new subfolder when the content belongs to a new category. Avoid placing standalone document files directly in workspace/ root unless the user explicitly wants that. Can update memory/memory.md, create documents in workspace/, create skills in skills/. When meaningful work produces reusable results, create the current Daily Memory at memory/<YYYY-MM-DD>/memory.md if needed; otherwise read and edit the existing file. Record outcomes rather than transcripts and avoid duplicate entries.",
         "category": "file",
         "icon": "✏️",
         "is_default": True,
@@ -224,7 +224,7 @@ BUILTIN_TOOLS = [
     {
         "name": "edit_file",
         "display_name": "Edit File",
-        "description": "Surgically replace a specific string inside an existing file without rewriting the whole content. Prefer this over write_file when you only need to change one or more sections.",
+        "description": "Surgically replace a specific string inside an existing file without rewriting the whole content. Prefer this over write_file when you only need to change one or more sections. When meaningful work produces reusable results, maintain the existing current Daily Memory at memory/<YYYY-MM-DD>/memory.md after reading it; record outcomes rather than transcripts and avoid duplicate entries.",
         "category": "file",
         "icon": "✂️",
         "is_default": True,
