@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.agent import Agent
 from app.models.llm import LLMModel
+from app.services.agent_memory import CORE_MEMORY_TEMPLATE, MEMORY_INDEX_TEMPLATE
 from app.services.llm import get_model_api_key
 from app.services.storage import get_storage_backend, normalize_storage_key
 
@@ -163,7 +164,13 @@ class AgentManager:
         # Ensure memory.md exists
         mem_key = f"{agent_prefix}/memory/memory.md"
         if not await storage.exists(mem_key):
-            await storage.write_text(mem_key, "# Memory\n\n_Record important information and knowledge here._\n", encoding="utf-8")
+            await storage.write_text(mem_key, CORE_MEMORY_TEMPLATE, encoding="utf-8")
+
+        # Seed the ordinary memory-structure guide once.  It is not protected
+        # or recreated later if an agent chooses to change/remove it.
+        memory_index_key = f"{agent_prefix}/memory/MEMORY_INDEX.md"
+        if not await storage.exists(memory_index_key):
+            await storage.write_text(memory_index_key, MEMORY_INDEX_TEMPLATE, encoding="utf-8")
 
         # Ensure reflections.md exists — copy from central template
         refl_key = f"{agent_prefix}/memory/reflections.md"

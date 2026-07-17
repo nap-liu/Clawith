@@ -601,35 +601,34 @@ def _convert_messages_for_vision(api_messages: list, supports_vision: bool) -> l
     return new_messages
 
 
-def _inject_first_hop_context(
-    api_messages: list,
-    dynamic_prompt: str | None,
-    *,
-    inject: bool,
-) -> list:
-    """Return a copy of ``api_messages`` with dynamic context wrapped around
-    the last ``user`` message — only when ``inject`` is True.
+def _attach_turn_context(api_messages: list, dynamic_prompt: str | None) -> list:
+    """Attach one immutable runtime-context snapshot to the current turn.
 
     Layout after injection:
         last_user.content = f"<context>\\n{dynamic_prompt}\\n</context>\\n\\n{original}"
 
-    Why a wrapper instead of a separate message?
-    - Keeps message count stable (Qwen/DashScope prefix cache is byte-level).
-    - Keeps append-only history: we never mutate ``api_messages`` in place;
-      only the dispatched copy carries the wrapper.
+    The returned list becomes the caller's canonical in-memory message list for
+    the complete tool loop.  Every later LLM request therefore sees the same
+    memory/runtime snapshot, while assistant/tool messages are appended after
+    it without changing any previously-dispatched bytes.
 
-    When there is no ``user`` message in history, or dynamic_prompt is empty,
-    or inject is False, we return a shallow list copy unchanged. The caller
-    must pass ``inject=True`` only on the first hop of the tool loop — on
-    continuation rounds the tail is assistant/tool messages and wrapping would
-    have no valid target anyway.
+    Why a wrapper instead of a separate message or dynamic system content?
+    - Keeps message count stable (Qwen/DashScope prefix cache is byte-level).
+    - Leaves the stable system + persisted conversation prefix untouched.
+    - Places turn-volatile data at the tail, after the cacheable history.
+    - Does not persist the wrapper to ChatMessage; the next turn rebuilds a
+      fresh snapshot around its own current user message.
+
+    When there is no user message, append a context-only user message so
+    unattended executions still receive the snapshot.  With no dynamic
+    context, return a shallow copy unchanged.  The input list is never mutated.
 
     The returned list contains fresh ``LLMMessage`` instances for any message
     we modify, so the caller's ``api_messages`` stays byte-identical for the
     next round's cache prefix.
     """
     out = list(api_messages)
-    if not inject or not dynamic_prompt:
+    if not dynamic_prompt:
         return out
 
     # Find the last role="user" index
@@ -639,6 +638,12 @@ def _inject_first_hop_context(
             last_user_idx = i
             break
     if last_user_idx < 0:
+        out.append(
+            LLMMessage(
+                role="user",
+                content=f"<context>\n{dynamic_prompt}\n</context>",
+            )
+        )
         return out
 
     original = out[last_user_idx]
@@ -1031,12 +1036,10 @@ async def call_llm(
         )
     allowed_tool_names = _allowed_tool_names(tools_for_llm)
 
-    # Convert messages to LLMMessage format.
-    # IMPORTANT (context-v2 / P1-A): system holds ONLY the static prompt so the
-    # system prefix stays byte-identical across calls — Anthropic prompt cache
-    # and Qwen/DashScope automatic prefix cache need this to hit. Dynamic bits
-    # (current time, memory, focus, round warnings) are injected into the
-    # last-user-message on the "first hop" below, so history stays append-only.
+    # Convert messages to LLMMessage format.  The system message contains only
+    # the byte-stable static prompt.  Per-turn context (memory, current user,
+    # channel, time, triggers) is attached to the current user message at the
+    # tail, preserving the cacheable system + historical prefix.
     api_messages = [LLMMessage(role="system", content=static_prompt)]
     for msg in messages:
         api_messages.append(
@@ -1050,6 +1053,11 @@ async def call_llm(
 
     # Vision format conversion
     api_messages = _convert_messages_for_vision(api_messages, supports_vision)
+
+    # Freeze one runtime-context snapshot into the canonical message list for
+    # this turn.  It is not persisted to DB, but it remains byte-identical and
+    # present in every continuation request throughout the tool loop.
+    api_messages = _attach_turn_context(api_messages, dynamic_prompt)
 
     # Create the unified LLM client
     try:
@@ -1118,18 +1126,9 @@ async def call_llm(
                 )
             )
 
-        # Build the "dispatch" view of api_messages sent this round.
-        # Only on round 0 (the first hop) do we wrap the last user message in a
-        # <context>…</context> prefix carrying dynamic_prompt (current time,
-        # memory, focus, …). Subsequent rounds are tool-calling continuations
-        # whose trailing items are assistant/tool messages — the LLM already
-        # has the context from round 0 in its own cached prefix, and we don't
-        # want to mutate the original history (breaks append-only + cache).
-        dispatch_messages = _inject_first_hop_context(
-            api_messages,
-            dynamic_prompt,
-            inject=(round_i == 0),
-        )
+        # Dispatch a shallow view.  api_messages already contains the immutable
+        # turn-context snapshot; later rounds only append assistant/tool items.
+        dispatch_messages = list(api_messages)
 
         # Check token usage limit mid-loop (every 3 rounds)
         if round_i > 0 and round_i % 3 == 0:
@@ -1196,13 +1195,9 @@ async def call_llm(
                     f"(round {round_i + 1}, this-round {recovery_count_this_round})"
                 )
 
-                # Re-build dispatch view. Dynamic <context> injection is a
-                # FIRST-hop-only nudge — do not re-inject on resumes.
-                dispatch_messages = _inject_first_hop_context(
-                    api_messages,
-                    dynamic_prompt,
-                    inject=False,
-                )
+                # Rebuild the shallow dispatch view.  The original turn-context
+                # snapshot remains in api_messages and is carried into resumes.
+                dispatch_messages = list(api_messages)
                 response = await _stream_with_throttle_retry(
                     client,
                     model=model,

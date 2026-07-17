@@ -494,3 +494,29 @@ async def test_delete_workspace_directory_uses_prefix_existence(monkeypatch, tmp
     assert result.ok is True
     assert f"{agent_id}/workspace/dir/a.txt" not in storage.files
     assert f"{agent_id}/workspace/dir/nested/b.txt" not in storage.files
+
+
+@pytest.mark.asyncio
+async def test_memory_index_is_an_ordinary_deletable_workspace_file(monkeypatch, tmp_path):
+    agent_id = uuid.uuid4()
+    key = f"{agent_id}/memory/MEMORY_INDEX.md"
+    storage = MemoryStorageBackend({key: b"agent-owned ordinary file"})
+    monkeypatch.setattr(workspace_collaboration, "get_storage_backend", lambda: storage)
+
+    async def _noop_revision(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(workspace_collaboration, "record_revision", _noop_revision)
+
+    result = await workspace_collaboration.delete_workspace_file(
+        db=None,
+        agent_id=agent_id,
+        base_dir=tmp_path / str(agent_id),
+        path="memory/MEMORY_INDEX.md",
+        actor_type="agent",
+        actor_id=agent_id,
+        enforce_human_lock=False,
+    )
+
+    assert result.ok is True
+    assert key not in storage.files

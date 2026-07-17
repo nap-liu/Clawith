@@ -257,10 +257,13 @@ async def test_case_d_dispatched_messages_carry_resume_pair(monkeypatch):
     # First call (initial): tail is the single wrapped user message.
     call_0: list[LLMMessage] = client.stream_calls[0]["messages"]
     assert call_0[-1].role == "user"
+    assert "DYN" in call_0[-1].content
     assert call_0[-1].content.endswith("keep going")
 
     # Second call (first resume): tail should be …user, assistant(part-a), user(RESUME_PROMPT)
     call_1: list[LLMMessage] = client.stream_calls[1]["messages"]
+    assert call_1[: len(call_0)] == call_0
+    assert "DYN" in call_1[-3].content
     assert call_1[-2].role == "assistant"
     assert call_1[-2].content == "part-a "
     assert call_1[-1].role == "user"
@@ -268,6 +271,8 @@ async def test_case_d_dispatched_messages_carry_resume_pair(monkeypatch):
 
     # Third call (second resume): tail should have TWO (assistant, user) resume pairs.
     call_2: list[LLMMessage] = client.stream_calls[2]["messages"]
+    assert call_2[: len(call_1)] == call_1
+    assert "DYN" in call_2[-5].content
     assert call_2[-4].role == "assistant" and call_2[-4].content == "part-a "
     assert call_2[-3].role == "user" and call_2[-3].content == RESUME_PROMPT
     assert call_2[-2].role == "assistant" and call_2[-2].content == "part-b "

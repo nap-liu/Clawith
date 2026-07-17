@@ -42,6 +42,7 @@ from app.models.chat_session import ChatSession
 from app.models.channel_config import ChannelConfig
 from app.models.user import User as UserModel
 from app.services.auth_registry import auth_provider_registry
+from app.services.agent_memory import CORE_MEMORY_TEMPLATE
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import get_platform_user_by_org_member
 from app.services.document_conversion import (
@@ -360,7 +361,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Create or fully overwrite a file in the workspace. Use this when writing a new file or replacing the entire content. For targeted edits to an existing file (change one section without rewriting everything), prefer edit_file instead. Before creating a new document under workspace/, first inspect the relevant directories with list_files, prefer an existing topical subfolder (for example workspace/reports/, workspace/knowledge_base/, workspace/research/) over the workspace root, and create a new subfolder when the content belongs to a new category. Avoid placing standalone document files directly in workspace/ root unless the user explicitly wants that. Can update memory/memory.md, task_history.md, create documents in workspace/, create skills in skills/. Focus is managed with Focus tools, not files. enterprise_info/ is shared company context and is read-only for agents.",
+            "description": "Create or fully overwrite a file in the workspace. Use this when writing a new file or replacing the entire content. For targeted edits to an existing file (change one section without rewriting everything), prefer edit_file instead. Before creating a new document under workspace/, first inspect the relevant directories with list_files, prefer an existing topical subfolder (for example workspace/reports/, workspace/knowledge_base/, workspace/research/) over the workspace root, and create a new subfolder when the content belongs to a new category. Avoid placing standalone document files directly in workspace/ root unless the user explicitly wants that. Can update memory/memory.md, task_history.md, create documents in workspace/, create skills in skills/. When meaningful work produces reusable results, create the current Daily Memory at memory/<YYYY-MM-DD>/memory.md if it does not exist; read and edit the existing file when it does. Record outcomes rather than transcripts and avoid duplicate entries. Focus is managed with Focus tools, not files. enterprise_info/ is shared company context and is read-only for agents.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -424,7 +425,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Surgically replace a specific string inside an existing file without rewriting the whole content. Prefer this over write_file when you only need to change one or more sections — it avoids accidentally overwriting content outside the edit target and is safer in multi-agent scenarios. enterprise_info/ is shared company context and is read-only for agents. The old_string must match exactly (including all whitespace and newlines).",
+            "description": "Surgically replace a specific string inside an existing file without rewriting the whole content. Prefer this over write_file when you only need to change one or more sections — it avoids accidentally overwriting content outside the edit target and is safer in multi-agent scenarios. When meaningful work produces reusable results, maintain the existing current Daily Memory at memory/<YYYY-MM-DD>/memory.md after reading it; record outcomes rather than transcripts and avoid duplicate entries. enterprise_info/ is shared company context and is read-only for agents. The old_string must match exactly (including all whitespace and newlines).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2551,7 +2552,7 @@ async def initialize_agent_workspace(agent_id: uuid.UUID) -> None:
     if not await storage.is_file(mem_key):
         await storage.write_text(
             mem_key,
-            "# Memory\n\n_Record important information and knowledge here._\n",
+            CORE_MEMORY_TEMPLATE,
             encoding="utf-8",
         )
 
