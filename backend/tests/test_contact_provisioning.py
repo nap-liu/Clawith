@@ -13,6 +13,7 @@ from app.models.participant import Participant
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services.contact_provisioning import contact_provisioning
+from app.services.canonical_user_resolver import CanonicalUserConflict
 
 
 pytestmark = pytest.mark.asyncio
@@ -210,7 +211,7 @@ async def test_provision_org_member_links_existing_user_by_normalized_mobile():
         assert member.user_id == user_id
 
 
-async def test_provision_org_member_phone_match_replaces_stale_existing_user_link():
+async def test_provision_org_member_rejects_stale_nonempty_identity_link():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     stale_phone = _phone()
@@ -248,7 +249,6 @@ async def test_provision_org_member_phone_match_replaces_stale_existing_user_lin
         db.add_all([stale_user, correct_user])
         await db.commit()
         stale_user_id = stale_user.id
-        correct_user_id = correct_user.id
 
     member = await _seed_org_member(tenant.id, provider.id, phone=correct_phone)
     async with async_session() as db:
@@ -258,12 +258,13 @@ async def test_provision_org_member_phone_match_replaces_stale_existing_user_lin
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
-        await db.commit()
+        member_id = member.id
+        with pytest.raises(CanonicalUserConflict):
+            await contact_provisioning.ensure_user_for_org_member(db, member)
+        await db.rollback()
 
-        assert result.user.id == correct_user_id
-        assert result.user.id != stale_user_id
-        assert member.user_id == correct_user_id
+        member = await db.get(OrgMember, member_id)
+        assert member.user_id == stale_user_id
 
 
 async def test_provision_org_member_keeps_existing_active_link_when_no_phone_match_exists():
@@ -350,7 +351,7 @@ async def test_provision_org_member_normalizes_existing_link_phone():
         assert result.user.identity.phone == normalized_phone
 
 
-async def test_provision_org_member_does_not_overwrite_existing_link_with_other_identity_phone():
+async def test_provision_org_member_rejects_phone_owned_by_other_identity():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     owned_phone = _phone()
@@ -389,11 +390,12 @@ async def test_provision_org_member_does_not_overwrite_existing_link_with_other_
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
-        await db.commit()
+        member_id = member.id
+        with pytest.raises(CanonicalUserConflict):
+            await contact_provisioning.ensure_user_for_org_member(db, member)
+        await db.rollback()
 
-        assert result.user.id == user_id
-        assert result.user.identity.phone is None
+        member = await db.get(OrgMember, member_id)
         assert member.user_id == user_id
 
 

@@ -78,6 +78,22 @@ class ContactProvisioningService:
         *,
         provider: IdentityProvider | None = None,
     ) -> ContactProvisioningResult:
+        # Directory sync and inbound IM can provision the same member at the
+        # same time. Serialize on the shared directory row and overwrite any
+        # stale ORM state so only one identityless tenant User can be minted.
+        await db.flush()
+        locked_member = (
+            await db.execute(
+                select(OrgMember)
+                .where(OrgMember.id == org_member.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if locked_member is None:
+            return ContactProvisioningResult(skipped_reason="missing_org_member")
+        org_member = locked_member
+
         tenant_id = org_member.tenant_id
         if tenant_id is None:
             return ContactProvisioningResult(skipped_reason="missing_tenant")
@@ -91,51 +107,90 @@ class ContactProvisioningService:
             (getattr(provider, "config", None) or {}).get("verified_contact_identity")
         )
         mobile = normalize_mobile(org_member.phone) if verified_contact else None
+        email = _clean_email(org_member.email) if verified_contact else None
 
-        active_user = (
-            await self._find_active_tenant_user_by_phone(db, tenant_id, mobile)
-            if mobile
+        from app.services.canonical_user_resolver import canonical_user_resolver
+
+        claims = await canonical_user_resolver.resolve_identity_claims(
+            db,
+            email=email,
+            phone=mobile,
+            enrich=True,
+        )
+        identity = claims.identity
+        linked_user = (
+            await self._get_tenant_user(db, org_member.user_id, tenant_id)
+            if org_member.user_id
             else None
         )
-        if active_user:
-            org_member.user_id = active_user.id
-            await self._sync_user_profile(db, active_user, org_member, provider, mobile, verified_contact)
-            await self._ensure_participant(db, active_user)
-            await db.flush()
+
+        if linked_user and not linked_user.is_active:
             return ContactProvisioningResult(
-                user=active_user,
-                user_linked=True,
-                tenant_user_matched=True,
+                skipped_reason="skipped_requires_confirmation"
             )
 
-        if org_member.user_id:
-            linked_user = await self._get_tenant_user(db, org_member.user_id, tenant_id)
-            if linked_user and linked_user.is_active:
-                await self._sync_user_profile(db, linked_user, org_member, provider, mobile, verified_contact)
-                await self._ensure_participant(db, linked_user)
-                await db.flush()
-                return ContactProvisioningResult(user=linked_user, user_linked=True)
-
-        inactive_user = (
-            await self._find_inactive_tenant_user_by_phone(db, tenant_id, mobile)
-            if mobile
-            else None
-        )
-        if inactive_user:
-            return ContactProvisioningResult(skipped_reason="skipped_requires_confirmation")
-
-        identity = await self._find_identity_by_phone(db, mobile) if mobile else None
-        reused_global_identity = identity is not None
         if identity:
-            await self._sync_identity_contact(db, identity, org_member, provider, mobile, verified_contact)
+            identity_user = await canonical_user_resolver.get_tenant_user(
+                db,
+                tenant_id=tenant_id,
+                identity_id=identity.id,
+                lock=True,
+            )
+            if identity_user and not identity_user.is_active:
+                return ContactProvisioningResult(
+                    skipped_reason="skipped_requires_confirmation"
+                )
+            resolved_user = await canonical_user_resolver.reconcile_identity_user(
+                db,
+                tenant_id=tenant_id,
+                identity=identity,
+                candidate_user=linked_user,
+            )
+            user_created = False
+            if resolved_user is None:
+                resolved_user, user_created = (
+                    await canonical_user_resolver.get_or_create_tenant_user(
+                        db,
+                        tenant_id=tenant_id,
+                        identity=identity,
+                        display_name=org_member.name or identity.username or "User",
+                        avatar_url=org_member.avatar_url,
+                        registration_source=f"{provider_type}_org_sync",
+                    )
+                )
+            if not resolved_user.is_active:
+                return ContactProvisioningResult(
+                    skipped_reason="skipped_requires_confirmation"
+                )
+            org_member.user_id = resolved_user.id
+            await self._sync_user_profile(
+                db, resolved_user, org_member, provider, mobile, verified_contact
+            )
+            await self._ensure_participant(db, resolved_user)
+            await db.flush()
+            return ContactProvisioningResult(
+                user=resolved_user,
+                user_created=user_created,
+                user_linked=True,
+                tenant_user_matched=not user_created,
+                global_identity_matched_no_tenant_user=user_created,
+            )
+
+        if linked_user and linked_user.is_active:
+            await self._sync_user_profile(
+                db, linked_user, org_member, provider, mobile, verified_contact
+            )
+            await self._ensure_participant(db, linked_user)
+            await db.flush()
+            return ContactProvisioningResult(user=linked_user, user_linked=True)
 
         user = User(
             # Directory/channel-only people are real tenant Users but are not
             # login principals.  Only reuse a pre-existing, verified login
             # Identity; never mint a synthetic username/email/password here.
-            identity=identity,
+            identity=None,
             tenant_id=tenant_id,
-            display_name=org_member.name or (identity.username if identity else None) or "User",
+            display_name=org_member.name or "User",
             avatar_url=org_member.avatar_url,
             title=org_member.title or None,
             role="member",
@@ -153,8 +208,7 @@ class ContactProvisioningService:
         return ContactProvisioningResult(
             user=user,
             user_created=True,
-            global_identity_matched_no_tenant_user=reused_global_identity,
-            external_only_user_created=identity is None,
+            external_only_user_created=True,
         )
 
     async def sync_linked_user_profile(

@@ -56,6 +56,15 @@ class User(Base):
     """
 
     __tablename__ = "users"
+    __table_args__ = (
+        sa.Index(
+            "uq_users_tenant_identity_not_null",
+            "tenant_id",
+            "identity_id",
+            unique=True,
+            postgresql_where=sa.text("identity_id IS NOT NULL"),
+        ),
+    )
     # Note: Unique constraints for (tenant_id, username), (tenant_id, email) and (tenant_id, primary_mobile)
     # are handled via partial unique indexes in migration to allow NULL values
 

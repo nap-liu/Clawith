@@ -211,9 +211,19 @@ class ChannelUserService:
         ).scalars().all()
         user_ids = {row.user_id for row in rows}
         if len(user_ids) > 1:
-            raise ChannelUserResolutionError(
-                "Channel subjects resolve to multiple users; refusing ambiguous attribution"
+            normalized = self._normalize_channel_type(channel_type)
+            priority = (
+                {"staff_id": 0, "union_id": 1, "open_id": 2}
+                if normalized == "dingtalk"
+                else {id_type: index for index, (id_type, _subject) in enumerate(subjects)}
             )
+            rows.sort(key=lambda row: priority.get(row.id_type, 99))
+            logger.error(
+                "[{}] installation-scoped subjects map to multiple users; "
+                "routing by the current event's strongest exact subject and scheduling repair",
+                channel_type,
+            )
+            user_ids = {rows[0].user_id}
         if not user_ids:
             return None
         user = await _load_user_with_identity(db, next(iter(user_ids)), provider.tenant_id)
@@ -254,9 +264,12 @@ class ChannelUserService:
             pending.append((id_type, subject))
 
         if len(existing_user_ids) > 1:
-            raise ChannelUserResolutionError(
-                "Channel subjects resolve to multiple users; refusing ambiguous attribution"
+            logger.error(
+                "[{}] refusing to rewrite conflicting installation-scoped bindings; "
+                "continuing with the already resolved exact sender",
+                channel_type,
             )
+            return user, False
         if existing_user_ids:
             canonical = await _load_user_with_identity(
                 db, next(iter(existing_user_ids)), provider.tenant_id
@@ -357,6 +370,7 @@ class ChannelUserService:
                 bound_user,
             )
             if normalized_channel == "dingtalk":
+                exact_route_user = canonical_user
                 member = await self._find_existing_org_member_for_user(
                     db,
                     canonical_user.id,
@@ -364,34 +378,73 @@ class ChannelUserService:
                     tenant_id,
                 )
                 if member:
-                    self._merge_channel_info_into_member(member, channel_type, extra_info)
-                    from app.services.contact_provisioning import contact_provisioning
-
-                    await contact_provisioning.sync_linked_user_profile(
-                        db,
-                        canonical_user,
-                        member,
-                        provider=provider,
-                    )
+                    try:
+                        async with db.begin_nested():
+                            self._merge_channel_info_into_member(
+                                member, channel_type, extra_info
+                            )
+                            reconciled = await self._provision_user_from_member(
+                                db, member, provider
+                            )
+                            if reconciled:
+                                canonical_user, _ = await self._ensure_bindings(
+                                    db,
+                                    provider,
+                                    channel_type,
+                                    external_user_id,
+                                    extra_info,
+                                    reconciled,
+                                )
+                    except Exception:
+                        canonical_user = exact_route_user
+                        logger.exception(
+                            "[DingTalk] canonical reconciliation failed; "
+                            "continuing with the exact installation binding user {}",
+                            canonical_user.id,
+                        )
             return canonical_user
 
         # Step 2: Try to find OrgMember by external identity
-        org_member = await self._find_org_member(
-            db, provider.id, channel_type, external_user_id, extra_info
-        )
+        try:
+            org_member = await self._find_org_member(
+                db, provider.id, channel_type, external_user_id, extra_info
+            )
+        except ChannelUserResolutionError:
+            if normalized_channel != "dingtalk":
+                raise
+            # Corrupt/ambiguous historical directory rows must not stop an
+            # otherwise attributable DingTalk event.  The installation-scoped
+            # sender binding below remains exact and can be reconciled later.
+            logger.exception(
+                "[DingTalk] directory identity lookup is ambiguous; "
+                "continuing with exact sender routing"
+            )
+            org_member = None
 
         # Step 3: Resolve User from OrgMember or other means
         user = None
         if org_member:
+            org_member_id = org_member.id
             if org_member.tenant_id is None and provider.tenant_id:
                 org_member.tenant_id = provider.tenant_id
             if normalized_channel == "dingtalk":
-                self._merge_channel_info_into_member(org_member, channel_type, extra_info)
-                provisioned_user = await self._provision_user_from_member(
-                    db,
-                    org_member,
-                    provider,
-                )
+                provisioned_user = None
+                try:
+                    async with db.begin_nested():
+                        self._merge_channel_info_into_member(
+                            org_member, channel_type, extra_info
+                        )
+                        provisioned_user = await self._provision_user_from_member(
+                            db,
+                            org_member,
+                            provider,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[DingTalk] OrgMember reconciliation failed; "
+                        "falling back to exact sender routing"
+                    )
+                    org_member = await db.get(OrgMember, org_member_id)
                 if provisioned_user:
                     provisioned_user, _binding_created = await self._ensure_bindings(
                         db, provider, channel_type, external_user_id, extra_info, provisioned_user
@@ -415,9 +468,20 @@ class ChannelUserService:
                     return user
 
             if normalized_channel == "dingtalk":
-                raise ChannelUserResolutionError(
-                    f"DingTalk OrgMember {org_member.id} could not be provisioned safely by mobile"
+                fallback_user = await self._create_channel_user(
+                    db, channel_type, external_user_id, extra_info, tenant_id
                 )
+                fallback_user, _ = await self._ensure_bindings(
+                    db,
+                    provider,
+                    channel_type,
+                    external_user_id,
+                    extra_info,
+                    fallback_user,
+                )
+                org_member.user_id = fallback_user.id
+                await db.flush()
+                return fallback_user
 
         # Step 4: Try to find User by email/mobile from extra_info
         verified_contact = extra_info.get("identity_verified") is True
@@ -427,8 +491,39 @@ class ChannelUserService:
         should_persist_member = True
 
         if not org_member and should_persist_member and normalized_channel == "dingtalk":
-            if mobile:
-                user = await sso_service.match_user_by_mobile(db, mobile, tenant_id)
+            if verified_contact and (email or mobile):
+                from app.services.canonical_user_resolver import (
+                    CanonicalIdentityConflict,
+                    CanonicalUserConflict,
+                    canonical_user_resolver,
+                )
+
+                try:
+                    async with db.begin_nested():
+                        claims = await canonical_user_resolver.resolve_identity_claims(
+                            db, email=email, phone=mobile, enrich=True
+                        )
+                        if claims.identity:
+                            user = await canonical_user_resolver.get_tenant_user(
+                                db,
+                                tenant_id=tenant_id,
+                                identity_id=claims.identity.id,
+                                lock=True,
+                            )
+                            if user is None:
+                                user, _ = await canonical_user_resolver.get_or_create_tenant_user(
+                                    db,
+                                    tenant_id=tenant_id,
+                                    identity=claims.identity,
+                                    display_name=extra_info.get("name") or claims.identity.username or "User",
+                                    avatar_url=extra_info.get("avatar_url"),
+                                    registration_source="dingtalk",
+                                )
+                except (CanonicalIdentityConflict, CanonicalUserConflict):
+                    logger.exception(
+                        "[DingTalk] verified contact is conflicted; "
+                        "creating an identityless exact-route user so delivery continues"
+                    )
             # One-release migration bridge for the historical DingTalk login
             # principal. Verified enterprise contact evidence is stronger and
             # has already been checked above. Use this exact legacy principal
@@ -448,10 +543,11 @@ class ChannelUserService:
                     )
                 ).scalars().all()
                 if len(legacy_users) > 1:
-                    raise ChannelUserResolutionError(
-                        "Legacy DingTalk subject maps to multiple tenant users; migration_required"
+                    logger.error(
+                        "[DingTalk] legacy principal maps to multiple tenant users; "
+                        "ignoring the legacy bridge and continuing with exact sender routing"
                     )
-                if legacy_users:
+                elif legacy_users:
                     user = legacy_users[0]
             proposed_user = None
             if not user:
@@ -571,11 +667,19 @@ class ChannelUserService:
     ) -> User | None:
         from app.services.contact_provisioning import contact_provisioning
 
-        result = await contact_provisioning.ensure_user_for_org_member(
-            db,
-            org_member,
-            provider=provider,
+        from app.services.canonical_user_resolver import (
+            CanonicalIdentityConflict,
+            CanonicalUserConflict,
         )
+
+        try:
+            result = await contact_provisioning.ensure_user_for_org_member(
+                db,
+                org_member,
+                provider=provider,
+            )
+        except (CanonicalIdentityConflict, CanonicalUserConflict) as exc:
+            raise ChannelUserResolutionError(str(exc)) from exc
         if not result.user:
             return None
         return await _load_user_with_identity(db, result.user.id, org_member.tenant_id)

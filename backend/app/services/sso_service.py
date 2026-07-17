@@ -268,6 +268,10 @@ class SSOService:
             )
         elif provider_type == "wecom":
             external_id = provider_user_id
+        else:
+            # Generic OAuth providers have no union/open/user-id taxonomy.
+            # Their provider-scoped subject is the stable external identifier.
+            external_id = provider_user_id
 
         open_id = (raw_open_id or "").strip() or None
         union_id = (raw_union_id or "").strip() or None

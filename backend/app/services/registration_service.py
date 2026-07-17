@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select, or_, and_
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -142,20 +143,15 @@ class RegistrationService:
     ) -> Identity:
         """Find an existing identity or create a new one.
 
-        Security note: only email and phone are authoritative identity claims.
+        Email and phone are equal authoritative claims.  If both are supplied
+        they must resolve to the same physical Identity.
         """
-        identity = None
+        from app.services.canonical_user_resolver import canonical_user_resolver
 
-        # Match by email (primary ownership claim)
-        if email:
-            res = await db.execute(select(Identity).where(Identity.email == email))
-            identity = res.scalar_one_or_none()
-
-        # Match by phone (secondary ownership claim)
-        if not identity and phone:
-            normalized_phone = re.sub(r"[\s\-\+]", "", phone)
-            res = await db.execute(select(Identity).where(Identity.phone == normalized_phone))
-            identity = res.scalar_one_or_none()
+        claims = await canonical_user_resolver.resolve_identity_claims(
+            db, email=email, phone=phone, enrich=False
+        )
+        identity = claims.identity
 
         if identity:
             # Auto-verify if SMTP is not configured
@@ -167,7 +163,10 @@ class RegistrationService:
                 if not identity.email_verified:
                     identity.email_verified = True
                     db.add(identity)
-            return identity
+            enriched = await canonical_user_resolver.resolve_identity_claims(
+                db, email=claims.email, phone=claims.phone, enrich=True
+            )
+            return enriched.identity or identity
 
         # Check if SMTP is configured for auto-verification
         if not email_config:
@@ -176,7 +175,9 @@ class RegistrationService:
         
         is_verified = not email_config  # Auto-verify only if no SMTP configured
 
-        # Resolve a safe username
+        # Resolve a safe username.  INSERT .. ON CONFLICT plus a re-read makes
+        # concurrent OAuth/IM/directory creation converge instead of failing
+        # the outer login/message transaction.
         final_username = username
         if username:
             # Use EXISTS for faster lookup
@@ -191,19 +192,45 @@ class RegistrationService:
                     final_username,
                 )
 
-        # Create new identity
-        normalized_phone = re.sub(r"[\s\-\+]", "", phone) if phone else None
-        identity = Identity(
-            email=email,
-            phone=normalized_phone,
-            username=final_username,
-            password_hash=await hash_password_async(password) if password else None,
-            is_platform_admin=is_platform_admin,
-            email_verified=is_verified,
-        )
-        db.add(identity)
-        await db.flush()
-        return identity
+        password_hash = await hash_password_async(password) if password else None
+        for attempt in range(3):
+            identity_id = await db.scalar(
+                pg_insert(Identity)
+                .values(
+                    id=uuid.uuid4(),
+                    email=claims.email,
+                    phone=claims.phone,
+                    username=final_username,
+                    password_hash=password_hash,
+                    is_platform_admin=is_platform_admin,
+                    email_verified=is_verified,
+                    is_active=True,
+                )
+                .on_conflict_do_nothing()
+                .returning(Identity.id)
+            )
+            if identity_id:
+                identity = await db.get(Identity, identity_id)
+                if identity is None:  # pragma: no cover - RETURNING guarantees it
+                    raise RuntimeError("inserted identity could not be reloaded")
+                return identity
+
+            claims = await canonical_user_resolver.resolve_identity_claims(
+                db, email=claims.email, phone=claims.phone, enrich=True
+            )
+            if claims.identity:
+                return claims.identity
+            # The conflict was only on username; generate an unambiguous login
+            # handle and retry without changing either authoritative claim.
+            if final_username:
+                final_username = f"{username}_{uuid.uuid4().hex[:6]}"
+                logger.info(
+                    "Concurrent username conflict; assigned '%s'", final_username
+                )
+                continue
+            raise RuntimeError("identity insert conflicted without a resolvable claim")
+
+        raise RuntimeError("could not allocate a unique identity username")
 
     async def create_user_with_identity(
         self,

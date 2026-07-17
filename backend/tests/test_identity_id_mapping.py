@@ -107,6 +107,18 @@ def test_sso_extract_identity_ids_handles_registration_wrapped_payload():
     assert external_id is None
 
 
+def test_sso_extract_identity_ids_uses_generic_oauth_subject_as_external_id():
+    union_id, open_id, external_id = sso_service._extract_identity_ids(
+        "oauth2",
+        "oauth_subject_123",
+        {},
+    )
+
+    assert union_id is None
+    assert open_id is None
+    assert external_id == "oauth_subject_123"
+
+
 def test_channel_user_service_keeps_feishu_user_id_out_of_unionid():
     service = ChannelUserService()
 
@@ -589,7 +601,7 @@ async def test_channel_user_service_unverified_contact_payload_does_not_merge_em
 
 
 @pytest.mark.asyncio
-async def test_channel_user_service_dingtalk_without_mobile_does_not_bind_by_email():
+async def test_channel_user_service_dingtalk_directory_email_is_authoritative_without_mobile():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
     shared_email = f"dingtalk-no-phone-{uuid.uuid4().hex[:8]}@example.com"
@@ -644,8 +656,8 @@ async def test_channel_user_service_dingtalk_without_mobile_does_not_bind_by_ema
         await db.commit()
         member = await db.get(OrgMember, member_id)
         assert member.user_id == user.id
-        assert user.id != email_user.id
-        assert user.identity_id is None
+        assert user.id == email_user.id
+        assert user.identity_id == identity.id
 
 
 @pytest.mark.asyncio

@@ -257,7 +257,7 @@ async def test_same_subject_in_two_bot_installations_does_not_cross_bind():
 
 
 @pytest.mark.asyncio
-async def test_duplicate_directory_subject_with_different_users_fails_closed():
+async def test_duplicate_dingtalk_directory_subject_routes_without_guessing():
     suffix = uuid.uuid4().hex[:12]
     subject = f"staff-{suffix}"
     async with async_session() as db:
@@ -318,14 +318,26 @@ async def test_duplicate_directory_subject_with_different_users_fails_closed():
 
     async with async_session() as db:
         agent = await db.get(Agent, agent_id)
-        with pytest.raises(ChannelUserResolutionError, match="migration_required"):
-            await ChannelUserService().resolve_channel_user(
-                db,
-                agent,
-                "dingtalk",
-                subject,
-                {"external_id": subject},
+        routed = await ChannelUserService().resolve_channel_user(
+            db,
+            agent,
+            "dingtalk",
+            subject,
+            {"external_id": subject},
+        )
+        await db.commit()
+        assert routed.id not in {first_user.id, second_user.id}
+        assert routed.identity_id is None
+        binding = (
+            await db.execute(
+                select(ChannelUserBinding).where(
+                    ChannelUserBinding.user_id == routed.id,
+                    ChannelUserBinding.id_type == "staff_id",
+                    ChannelUserBinding.subject == subject,
+                )
             )
+        ).scalar_one()
+        assert binding.user_id == routed.id
 
 
 @pytest.mark.asyncio

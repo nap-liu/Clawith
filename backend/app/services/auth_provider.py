@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.security import create_access_token, hash_password
 from app.models.identity import IdentityProvider
@@ -110,6 +111,14 @@ class BaseAuthProvider(ABC):
 
         # Ensure provider exists
         await self._ensure_provider(db, tenant_id)
+
+        # Enterprise login has a trusted tenant boundary.  Resolve all strong
+        # claims through the shared canonical path so directory/OAuth/IM order
+        # cannot create a second tenant User.
+        if tenant_id:
+            return await self._find_or_create_enterprise_user(
+                db, user_info, tenant_id
+            )
 
         # 1. Try lookup via sso_service (which now uses OrgMember)
         provider_user_id = user_info.provider_user_id
@@ -210,6 +219,117 @@ class BaseAuthProvider(ABC):
 
         return user, is_new
 
+    async def _find_or_create_enterprise_user(
+        self,
+        db: AsyncSession,
+        user_info: ExternalUserInfo,
+        tenant_id: str,
+    ) -> tuple[User, bool]:
+        import uuid
+
+        from app.services.canonical_user_resolver import (
+            CanonicalIdentityConflict,
+            CanonicalUserConflict,
+            canonical_user_resolver,
+        )
+        from app.services.registration_service import registration_service
+        from app.services.sso_service import sso_service
+
+        tenant_uuid = uuid.UUID(str(tenant_id))
+        try:
+            exact_user = await sso_service.resolve_user_identity(
+                db,
+                user_info.provider_user_id,
+                self.provider_type,
+                tenant_id=str(tenant_uuid),
+                identity_data=user_info.raw_data,
+            )
+            if exact_user is not None and not (user_info.email or user_info.mobile):
+                if not exact_user.is_active:
+                    raise HTTPException(
+                        status_code=403, detail="User account is disabled"
+                    )
+                await self._update_existing_user(db, exact_user, user_info)
+                await sso_service.link_identity(
+                    db,
+                    str(exact_user.id),
+                    self.provider_type,
+                    user_info.provider_user_id,
+                    user_info.raw_data,
+                    tenant_id=str(tenant_uuid),
+                )
+                await registration_service.ensure_web_org_member(db, exact_user)
+                return exact_user, False
+
+            identity = await registration_service.find_or_create_identity(
+                db,
+                email=user_info.email,
+                phone=user_info.mobile,
+                username=user_info.email.split("@")[0] if user_info.email else None,
+                password=(
+                    user_info.provider_user_id
+                    or user_info.provider_union_id
+                    or "oauth"
+                ),
+            )
+
+            directory_user = await canonical_user_resolver.find_verified_directory_user(
+                db,
+                tenant_id=tenant_uuid,
+                email=user_info.email,
+                phone=user_info.mobile,
+            )
+
+            user = None
+            for candidate in (exact_user, directory_user):
+                if candidate is None or (user is not None and candidate.id == user.id):
+                    continue
+                user = await canonical_user_resolver.reconcile_identity_user(
+                    db,
+                    tenant_id=tenant_uuid,
+                    identity=identity,
+                    candidate_user=candidate,
+                )
+
+            created = False
+            if user is None:
+                user, created = await canonical_user_resolver.get_or_create_tenant_user(
+                    db,
+                    tenant_id=tenant_uuid,
+                    identity=identity,
+                    display_name=user_info.name or identity.username or "User",
+                    avatar_url=user_info.avatar_url or None,
+                    registration_source=self.provider_type,
+                )
+            if not user.is_active:
+                raise HTTPException(status_code=403, detail="User account is disabled")
+
+            # Re-load after a possible SQL-level convergence, then update only
+            # non-identity profile fields. Identity claims were already checked
+            # together by find_or_create_identity.
+            user = (
+                await db.execute(
+                    select(User)
+                    .where(User.id == user.id)
+                    .options(selectinload(User.identity))
+                )
+            ).scalar_one()
+            await self._update_existing_user(db, user, user_info)
+
+            await sso_service.link_identity(
+                db,
+                str(user.id),
+                self.provider_type,
+                user_info.provider_user_id,
+                user_info.raw_data,
+                tenant_id=str(tenant_uuid),
+            )
+            await registration_service.ensure_web_org_member(db, user)
+            return user, created
+        except (CanonicalIdentityConflict, CanonicalUserConflict) as exc:
+            logger.warning("Enterprise identity reconciliation failed: {}", exc)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     async def _ensure_provider(self, db: AsyncSession, tenant_id: str | None = None) -> IdentityProvider:
         """Get or create IdentityProvider record."""
         if self.provider:
@@ -248,13 +368,23 @@ class BaseAuthProvider(ABC):
         if user_info.avatar_url and not user.avatar_url:
             user.avatar_url = user_info.avatar_url
 
-        # Update identity fields (email/mobile/username) through the identity relationship
+        # Identity fields are authoritative claims and must be checked together.
         identity = user.identity
         if identity:
-            if user_info.email and not identity.email:
-                identity.email = user_info.email
-            if user_info.mobile and not identity.phone:
-                identity.phone = user_info.mobile
+            from app.services.canonical_user_resolver import canonical_user_resolver
+
+            claims = await canonical_user_resolver.resolve_identity_claims(
+                db,
+                email=user_info.email,
+                phone=user_info.mobile,
+                enrich=True,
+            )
+            if claims.identity and claims.identity.id != identity.id:
+                from app.services.canonical_user_resolver import CanonicalIdentityConflict
+
+                raise CanonicalIdentityConflict(
+                    "OAuth claims resolve to another identity"
+                )
             # OAuth2 登录时用 provider_user_id 更新 dingtalk_ 开头的临时用户名
             if (
                 user_info.provider_user_id

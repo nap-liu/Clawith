@@ -22,6 +22,7 @@ from app.services.org_sync_adapter import (
     build_department_path_map,
     normalize_contact_for_match,
 )
+from app.services.canonical_user_resolver import CanonicalIdentityConflict
 
 
 @pytest.fixture(autouse=True)
@@ -746,14 +747,14 @@ async def test_org_sync_refreshes_real_name_without_changing_username_or_nicknam
 
 
 @pytest.mark.asyncio
-async def test_org_sync_links_existing_user_by_mobile_before_email():
+async def test_org_sync_rejects_email_phone_split_across_identities():
     tenant = await _seed_tenant()
     provider = await _seed_dingtalk_provider(tenant.id)
     adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
     phone = f"8613{uuid.uuid4().int % 10**9:09d}"
     shared_email = f"shared-{uuid.uuid4().hex[:8]}@example.com"
-    email_user = await _seed_user(tenant.id, email=shared_email, phone=f"8613{uuid.uuid4().int % 10**9:09d}")
-    mobile_user = await _seed_user(tenant.id, email=f"mobile-{uuid.uuid4().hex[:8]}@example.com", phone=phone)
+    await _seed_user(tenant.id, email=shared_email, phone=f"8613{uuid.uuid4().int % 10**9:09d}")
+    await _seed_user(tenant.id, email=f"mobile-{uuid.uuid4().hex[:8]}@example.com", phone=phone)
 
     external_user = ExternalUser(
         external_id=f"dt_{uuid.uuid4().hex[:8]}",
@@ -765,21 +766,9 @@ async def test_org_sync_links_existing_user_by_mobile_before_email():
 
     async with async_session() as db:
         provider = await db.get(IdentityProvider, provider.id)
-        stats = await adapter._upsert_member(db, provider, external_user, "1")
-        await db.commit()
-
-        member = (
-            await db.execute(
-                select(OrgMember).where(
-                    OrgMember.provider_id == provider.id,
-                    OrgMember.external_id == external_user.external_id,
-                )
-            )
-        ).scalar_one()
-        assert stats["user_created"] is False
-        assert stats["user_linked"] is True
-        assert member.user_id == mobile_user.id
-        assert member.user_id != email_user.id
+        with pytest.raises(CanonicalIdentityConflict):
+            await adapter._upsert_member(db, provider, external_user, "1")
+        await db.rollback()
 
 
 @pytest.mark.asyncio
