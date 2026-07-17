@@ -868,6 +868,7 @@ async def get_agent_permission_members(
         filters.append(
             or_(
                 OrgMember.name.ilike(pattern),
+                OrgMember.nickname.ilike(pattern),
                 OrgMember.name_translit_full.ilike(pattern),
                 OrgMember.name_translit_initial.ilike(pattern),
                 OrgMember.department_path.ilike(pattern),
@@ -927,6 +928,7 @@ async def get_agent_permission_members(
                 "id": str(member.user_id),
                 "member_id": str(member.id),
                 "name": member.name,
+                "nickname": member.nickname,
                 "department_id": str(member.department_id) if member.department_id else None,
                 "department_path": member.department_path or "",
                 "title": member.title or "",
@@ -967,6 +969,7 @@ async def get_agent_permission_candidates(
         pattern = f"%{search}%"
         member_query = member_query.where(
             OrgMember.name.ilike(pattern) |
+            OrgMember.nickname.ilike(pattern) |
             OrgMember.email.ilike(pattern) |
             OrgMember.name_translit_full.ilike(pattern) |
             OrgMember.name_translit_initial.ilike(pattern)
@@ -1009,6 +1012,7 @@ async def get_agent_permission_candidates(
         candidates.append({
             "id": str(u.id),  # always a valid User.id
             "name": m.name,
+            "nickname": m.nickname,
             "username": u.username if u else None,
             "email": m.email or (u.email if u else None),
             "title": m.title or None,

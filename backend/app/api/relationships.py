@@ -221,6 +221,7 @@ async def search_human_relationship_candidates(
         query = query.where(
             or_(
                 OrgMember.name.ilike(pattern),
+                OrgMember.nickname.ilike(pattern),
                 OrgMember.name_translit_full.ilike(pattern),
                 OrgMember.name_translit_initial.ilike(pattern),
                 OrgMember.email.ilike(pattern),
@@ -267,6 +268,7 @@ async def search_human_relationship_candidates(
         {
             "user_id": str(linked_user_id),
             "name": m.name,
+            "nickname": m.nickname,
             "email": m.email,
             "title": m.title,
             "department_path": member_paths.get(m.id, m.department_path),

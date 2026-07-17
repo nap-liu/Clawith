@@ -332,6 +332,7 @@ class ChannelUserService:
         """
         tenant_id = agent.tenant_id
         extra_info = dict(extra_info or {})
+        normalized_channel = self._normalize_channel_type(channel_type)
         extra_info["_installation_scope"] = await self._resolve_installation_scope(
             db, agent, channel_type, extra_info
         )
@@ -354,13 +355,29 @@ class ChannelUserService:
                 extra_info,
                 bound_user,
             )
+            if normalized_channel == "dingtalk":
+                member = await self._find_existing_org_member_for_user(
+                    db,
+                    canonical_user.id,
+                    provider.id,
+                    tenant_id,
+                )
+                if member:
+                    self._merge_channel_info_into_member(member, channel_type, extra_info)
+                    from app.services.contact_provisioning import contact_provisioning
+
+                    await contact_provisioning.sync_linked_user_profile(
+                        db,
+                        canonical_user,
+                        member,
+                        provider=provider,
+                    )
             return canonical_user
 
         # One-release migration bridge for the historical DingTalk login
         # principal. It is exact, tenant-scoped, unique and active; no display
         # name/contact guessing is involved. The scoped binding becomes the
         # only lookup path after this first successful message.
-        normalized_channel = self._normalize_channel_type(channel_type)
         if normalized_channel == "dingtalk" and external_user_id:
             legacy_username = f"dingtalk_{external_user_id}"
             legacy_users = (
@@ -544,8 +561,16 @@ class ChannelUserService:
         identity_seed = org_member.external_id or org_member.open_id or org_member.id.hex
         generated_name = f"{channel_type.capitalize()} User {identity_seed[:8]}"
         incoming_name = (extra_info.get("name") or "").strip()
-        if incoming_name and (not org_member.name or org_member.name == generated_name):
+        directory_name_verified = extra_info.get("directory_name_verified") is True
+        if incoming_name and (
+            directory_name_verified
+            or not org_member.name
+            or org_member.name == generated_name
+        ):
             org_member.name = incoming_name
+        incoming_nickname = (extra_info.get("nickname") or "").strip()
+        if incoming_nickname and org_member.nickname != incoming_nickname:
+            org_member.nickname = incoming_nickname
         contact_verified = extra_info.get("identity_verified") is True
         if contact_verified and extra_info.get("email") and not org_member.email:
             org_member.email = extra_info["email"]
@@ -770,11 +795,16 @@ class ChannelUserService:
             or (extra_info.get("open_id") or "").strip()
             or uuid.uuid4().hex
         )
-        name = extra_info.get("name") or f"{channel_type.capitalize()} User {identity_seed[:8]}"
+        name = (
+            extra_info.get("name")
+            or extra_info.get("nickname")
+            or f"{channel_type.capitalize()} User {identity_seed[:8]}"
+        )
         unionid, open_id, external_id = self._get_channel_ids(channel_type, external_user_id, extra_info)
 
         member = OrgMember(
             name=name,
+            nickname=(extra_info.get("nickname") or "").strip() or None,
             email=extra_info.get("email") if extra_info.get("identity_verified") is True else None,
             provider_id=provider.id,
             user_id=linked_user_id,
@@ -827,7 +857,11 @@ class ChannelUserService:
             or (extra_info.get("open_id") or "").strip()
             or uuid.uuid4().hex
         )
-        name = extra_info.get("name") or f"{channel_type.capitalize()} {identity_seed[:8]}"
+        name = (
+            extra_info.get("name")
+            or extra_info.get("nickname")
+            or f"{channel_type.capitalize()} {identity_seed[:8]}"
+        )
 
         user = User(
             identity_id=None,

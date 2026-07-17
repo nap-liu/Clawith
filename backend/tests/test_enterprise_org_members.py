@@ -35,6 +35,7 @@ async def test_list_org_members_handles_user_display_name_column(monkeypatch):
     member = SimpleNamespace(
         id=uuid.uuid4(),
         name="刘喜",
+        nickname="喜茶",
         email="liuxi@example.com",
         phone=None,
         title="",
@@ -60,6 +61,7 @@ async def test_list_org_members_handles_user_display_name_column(monkeypatch):
         {
             "id": str(member.id),
             "name": "刘喜",
+            "nickname": "喜茶",
             "email": "liuxi@example.com",
             "phone": None,
             "title": "",

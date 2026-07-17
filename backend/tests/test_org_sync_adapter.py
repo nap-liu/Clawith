@@ -685,6 +685,67 @@ async def test_org_sync_auto_creates_user_from_dingtalk_member_mobile():
 
 
 @pytest.mark.asyncio
+async def test_org_sync_refreshes_real_name_without_changing_username_or_nickname():
+    tenant = await _seed_tenant()
+    provider = await _seed_dingtalk_provider(tenant.id)
+    adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
+    phone = f"8613{uuid.uuid4().int % 10**9:09d}"
+    external_id = f"dt_{uuid.uuid4().hex[:8]}"
+    unionid = f"union_{uuid.uuid4().hex[:8]}"
+    username = f"stable_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        identity = Identity(username=username, phone=phone, password_hash="x")
+        db.add(identity)
+        await db.flush()
+        user = User(
+            identity_id=identity.id,
+            tenant_id=tenant.id,
+            display_name="旧昵称",
+            role="member",
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            user_id=user.id,
+            external_id=external_id,
+            unionid=unionid,
+            name="旧昵称",
+            nickname="旧昵称",
+            phone=phone,
+            status="active",
+        )
+        db.add(member)
+        await db.commit()
+        user_id = user.id
+        member_id = member.id
+
+    external_user = ExternalUser(
+        external_id=external_id,
+        unionid=unionid,
+        name="目录真实姓名",
+        mobile=phone,
+    )
+
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, provider.id)
+        await adapter._upsert_member(db, provider, external_user, "1")
+        await db.commit()
+
+        refreshed_user = await db.get(User, user_id)
+        refreshed_member = await db.get(OrgMember, member_id)
+        refreshed_identity = await db.get(Identity, refreshed_user.identity_id)
+
+        assert refreshed_identity.username == username
+        assert refreshed_user.display_name == "目录真实姓名"
+        assert refreshed_member.name == "目录真实姓名"
+        assert refreshed_member.nickname == "旧昵称"
+
+
+@pytest.mark.asyncio
 async def test_org_sync_links_existing_user_by_mobile_before_email():
     tenant = await _seed_tenant()
     provider = await _seed_dingtalk_provider(tenant.id)

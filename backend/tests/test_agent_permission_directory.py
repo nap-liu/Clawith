@@ -259,7 +259,8 @@ async def test_permission_members_prefers_directory_profile_and_supports_descend
         {
             "id": str(user_id),
             "member_id": str(directory_member.id),
-            "name": "刘喜",
+                "name": "刘喜",
+                "nickname": None,
             "department_id": str(team.id),
             "department_path": team.path,
             "title": "前端开发",

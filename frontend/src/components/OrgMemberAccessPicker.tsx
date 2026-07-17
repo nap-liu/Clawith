@@ -18,6 +18,7 @@ import './OrgMemberAccessPicker.css';
 export type AgentAccessUser = {
     id: string;
     name: string;
+    nickname?: string;
     username?: string;
     email?: string;
     title?: string;
@@ -54,6 +55,7 @@ type DirectoryMember = {
     id: string;
     member_id: string;
     name: string;
+    nickname?: string | null;
     department_id: string | null;
     department_path: string;
     title: string;
@@ -335,6 +337,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
                 next.set(member.id, {
                     id: member.id,
                     name: member.name,
+                    nickname: member.nickname || undefined,
                     email: member.email || undefined,
                     title: member.title,
                     avatar_url: member.avatar_url,
@@ -355,6 +358,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
                     next.set(member.id, {
                         id: member.id,
                         name: member.name,
+                        nickname: member.nickname || undefined,
                         email: member.email || undefined,
                         title: member.title,
                         avatar_url: member.avatar_url,
@@ -617,6 +621,9 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
                                                 {member.avatar_url ? <img src={member.avatar_url} alt="" /> : <span className="org-access-picker__avatar">{initials(member.name)}</span>}
                                                 <span className="org-access-picker__member-copy">
                                                     <strong>{member.name}</strong>
+                                                    {member.nickname && member.nickname !== member.name && (
+                                                        <small>{isChinese ? '昵称' : 'Nickname'}: {member.nickname}</small>
+                                                    )}
                                                     <small>{[compactDepartmentPath(member.department_path), member.title].filter(Boolean).join(' · ')}</small>
                                                 </span>
                                                 {required && <span className="badge">{isChinese ? '系统保留' : 'Required'}</span>}

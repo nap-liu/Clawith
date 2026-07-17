@@ -45,6 +45,7 @@ class OrgMember(Base):
     provider_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # No FK - soft coupling
 
     name: Mapped[str] = mapped_column(String(100), nullable=False)
+    nickname: Mapped[str | None] = mapped_column(String(100))
     name_translit_full: Mapped[str | None] = mapped_column(String(255), index=True)
     name_translit_initial: Mapped[str | None] = mapped_column(String(50), index=True)
     email: Mapped[str | None] = mapped_column(String(200))

@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
+from app.models.org import OrgMember
 from app.models.user import Identity, User
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -27,6 +28,7 @@ class UserOut(BaseModel):
     username: str | None = None
     email: str | None = None
     display_name: str | None = None
+    nickname: str | None = None
     primary_mobile: str | None = None
     role: str
     is_active: bool
@@ -92,6 +94,12 @@ async def list_users(
                 Identity.username.ilike(pattern),
                 Identity.email.ilike(pattern),
                 Identity.phone.ilike(pattern),
+                select(OrgMember.id)
+                .where(
+                    OrgMember.user_id == User.id,
+                    OrgMember.nickname.ilike(pattern),
+                )
+                .exists(),
             )
         )
 
@@ -114,9 +122,25 @@ async def list_users(
     )
 
     order_column = User.created_at.asc() if sort_order == "asc" else User.created_at.desc()
+    nickname_subquery = (
+        select(OrgMember.nickname)
+        .where(
+            OrgMember.user_id == User.id,
+            OrgMember.nickname.is_not(None),
+            OrgMember.status == "active",
+        )
+        .order_by(OrgMember.synced_at.desc(), OrgMember.id.desc())
+        .limit(1)
+        .correlate(User)
+        .scalar_subquery()
+    )
     offset = (page - 1) * page_size
     rows_result = await db.execute(
-        select(User, func.coalesce(agent_counts.c.agents_count, 0).label("agents_count"))
+        select(
+            User,
+            func.coalesce(agent_counts.c.agents_count, 0).label("agents_count"),
+            nickname_subquery.label("nickname"),
+        )
         .outerjoin(Identity, User.identity_id == Identity.id)
         .outerjoin(agent_counts, agent_counts.c.creator_id == User.id)
         .options(selectinload(User.identity))
@@ -128,12 +152,13 @@ async def list_users(
     rows = rows_result.all()
 
     out = []
-    for u, agents_count in rows:
+    for u, agents_count, nickname in rows:
         user_dict = {
             "id": u.id,
             "username": u.username or u.email or f"{u.registration_source or 'user'}_{str(u.id)[:8]}",
             "email": u.email or "",
             "display_name": u.display_name or u.username or "",
+            "nickname": nickname,
             "primary_mobile": u.primary_mobile,
             "role": u.role,
             "is_active": u.is_active,

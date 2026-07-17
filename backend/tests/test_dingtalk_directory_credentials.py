@@ -65,7 +65,7 @@ async def test_directory_lookup_falls_back_and_never_logs_identity_values(monkey
     async def fake_get_detail(app_key: str, app_secret: str, staff_id: str):
         calls.append((app_key, app_secret, staff_id))
         if app_key == "enterprise-key":
-            return {"unionid": "union-private", "email": email, "mobile": ""}
+            return {"name": "Directory Real Name", "unionid": "union-private", "email": email, "mobile": ""}
         return {"mobile": mobile}
 
     monkeypatch.setattr("app.api.dingtalk._get_dingtalk_user_detail", fake_get_detail)
@@ -84,6 +84,7 @@ async def test_directory_lookup_falls_back_and_never_logs_identity_values(monkey
         logger.remove(sink_id)
 
     assert detail == {
+        "name": "Directory Real Name",
         "unionid": "union-private",
         "email": email,
         "mobile": mobile,
@@ -235,7 +236,12 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
         captured["credentials"] = credentials
         captured["staff_id"] = staff_id
         captured["provider_id"] = selected_provider_id
-        return {"unionid": f"union-{suffix}", "mobile": mobile, "email": real_email}
+        return {
+            "name": "Directory Real Name",
+            "unionid": f"union-{suffix}",
+            "mobile": mobile,
+            "email": real_email,
+        }
 
     async def fake_call_agent_llm(*_args, **_kwargs):
         return "identity enriched"
@@ -274,8 +280,18 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
         conversation_id=f"conversation-{suffix}",
         conversation_type="1",
         session_webhook="https://example.invalid/dingtalk-webhook",
-        sender_nick="Existing DingTalk User",
+        sender_nick="DingTalk Nickname",
         message_id=f"message-{suffix}",
+    )
+    await process_dingtalk_message(
+        agent_id=agent_id,
+        sender_staff_id=sender_staff_id,
+        user_text="refresh my bound identity",
+        conversation_id=f"conversation-{suffix}",
+        conversation_type="1",
+        session_webhook="https://example.invalid/dingtalk-webhook",
+        sender_nick="Updated DingTalk Nickname",
+        message_id=f"message-bound-{suffix}",
     )
 
     assert captured == {
@@ -289,6 +305,7 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
 
     async with async_session() as db:
         identity = await db.get(Identity, identity_id)
+        refreshed_user = await db.get(User, user_id)
         member = (
             await db.execute(
                 select(OrgMember).where(
@@ -299,8 +316,12 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
         ).scalar_one()
 
     assert identity.phone == mobile
+    assert identity.username == f"dingtalk_{sender_staff_id}"
     assert identity.email == (placeholder_email if email_already_claimed else real_email)
+    assert refreshed_user.display_name == "Directory Real Name"
     assert member.user_id == user_id
+    assert member.name == "Directory Real Name"
+    assert member.nickname == "Updated DingTalk Nickname"
     assert member.phone == mobile
     assert member.email == real_email
     assert member.unionid == f"union-{suffix}"

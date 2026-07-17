@@ -106,7 +106,7 @@ async def _get_dingtalk_user_detail(
     app_secret: str,
     staff_id: str,
 ) -> dict | None:
-    """Query DingTalk user detail via corp API to get unionId/mobile/email.
+    """Query DingTalk user detail via corp API for directory identity/profile data.
 
     Uses /topapi/v2/user/get, requires contact.user.read permission.
     Returns None on failure (graceful degradation).
@@ -136,6 +136,7 @@ async def _get_dingtalk_user_detail(
 
             result = user_data.get("result", {})
             return {
+                "name": result.get("name", ""),
                 "unionid": result.get("unionid", ""),
                 "mobile": result.get("mobile", ""),
                 "email": result.get("email", "") or result.get("org_email", ""),
@@ -165,7 +166,7 @@ async def _get_dingtalk_user_detail_with_fallback(
             )
             continue
 
-        for field in ("unionid", "mobile", "email", "org_email"):
+        for field in ("name", "unionid", "mobile", "email", "org_email"):
             if not merged.get(field) and detail.get(field):
                 merged[field] = detail[field]
 
@@ -436,6 +437,7 @@ async def process_dingtalk_message(
         dt_unionid = ""
         dt_mobile = ""
         dt_email = ""
+        dt_real_name = ""
 
         # Company-level credentials are primary; the agent robot is the fallback.
         _dingtalk_provider = await _get_tenant_dingtalk_provider(
@@ -465,6 +467,7 @@ async def process_dingtalk_message(
                 getattr(_dingtalk_provider, "id", None),
             )
             if dt_user_detail:
+                dt_real_name = dt_user_detail.get("name", "")
                 dt_unionid = dt_user_detail.get("unionid", "")
                 dt_mobile = dt_user_detail.get("mobile", "")
                 dt_email = dt_user_detail.get("email", "") or dt_user_detail.get("org_email", "")
@@ -481,7 +484,9 @@ async def process_dingtalk_message(
                 "unionid": dt_unionid,
                 "mobile": dt_mobile,
                 "email": dt_email,
-                "name": sender_nick,
+                "name": dt_real_name,
+                "nickname": sender_nick,
+                "directory_name_verified": bool(dt_real_name),
                 "identity_verified": bool(dt_mobile or dt_email),
             },
         )
@@ -538,6 +543,7 @@ async def process_dingtalk_message(
                 getattr(_dingtalk_provider, "id", None),
             )
             if dt_user_detail:
+                dt_real_name = dt_real_name or dt_user_detail.get("name", "")
                 dt_unionid = dt_unionid or dt_user_detail.get("unionid", "")
                 dt_mobile = dt_mobile or dt_user_detail.get("mobile", "")
                 dt_email = dt_email or dt_user_detail.get("email", "") or dt_user_detail.get("org_email", "")
@@ -603,11 +609,10 @@ async def process_dingtalk_message(
             await db.flush()
             logger.info(f"[DingTalk] Step4: Created new user: {dt_username}")
         else:
-            # Update display_name, source, mobile, email for existing users
+            # Update source and verified contact data for existing users. The
+            # canonical display name is owned by the directory profile; an
+            # inbound senderNick must never overwrite it.
             updated = False
-            if sender_nick and platform_user.display_name != sender_nick:
-                platform_user.display_name = sender_nick
-                updated = True
             if not platform_user.source or platform_user.source == "web":
                 platform_user.source = "dingtalk"
                 updated = True
@@ -659,7 +664,8 @@ async def process_dingtalk_message(
                     unionid=dt_unionid or None,
                     phone=dt_mobile or None,
                     email=dt_email or None,
-                    name=sender_nick or platform_user.display_name or dt_username,
+                    name=dt_real_name or platform_user.display_name or sender_nick or dt_username,
+                    nickname=sender_nick or None,
                     status="active",
                     tenant_id=agent_obj.tenant_id,
                 )
@@ -679,6 +685,12 @@ async def process_dingtalk_message(
                     updated_member = True
                 if dt_email and not _existing_om.email:
                     _existing_om.email = dt_email
+                    updated_member = True
+                if dt_real_name and _existing_om.name != dt_real_name:
+                    _existing_om.name = dt_real_name
+                    updated_member = True
+                if sender_nick and _existing_om.nickname != sender_nick:
+                    _existing_om.nickname = sender_nick
                     updated_member = True
                 if updated_member:
                     await db.flush()
@@ -764,6 +776,10 @@ async def process_dingtalk_message(
             provider_event_id=message_id or None,
             channel_config_id=_early_cfg.id if _early_cfg else None,
             actor_ref=sender_staff_id,
+            message_meta={
+                "sender_display_name": platform_user.display_name,
+                "sender_nickname": sender_nick or None,
+            },
         )
         turn_anchor_id = ingested.message.id
         sess.last_message_at = datetime.now(timezone.utc)
@@ -775,7 +791,8 @@ async def process_dingtalk_message(
         from app.services.channel_llm import broadcast_channel_user_message
         await broadcast_channel_user_message(
             agent_id, session_conv_id, content=saved_content,
-            sender_name=sender_nick or None, user_id=platform_user_id,
+            sender_name=platform_user.display_name or sender_nick or None,
+            user_id=platform_user_id,
         )
 
         if ingested.consumed_by_onmessage:
@@ -892,7 +909,7 @@ async def process_dingtalk_message(
             llm_user_text = wrap_with_sender(
                 user_text,
                 platform_user_id,
-                sender_nick or platform_user.display_name,
+                platform_user.display_name or sender_nick,
             )
 
         # Call LLM

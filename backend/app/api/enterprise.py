@@ -1399,6 +1399,7 @@ async def list_org_members(
         query = query.where(
             or_(
                 OrgMember.name.ilike(f"%{search}%"),
+                OrgMember.nickname.ilike(f"%{search}%"),
                 OrgMember.name_translit_full.ilike(f"%{search}%"),
                 OrgMember.name_translit_initial.ilike(f"%{search}%"),
             )
@@ -1414,6 +1415,7 @@ async def list_org_members(
         {
             "id": str(m.id),
             "name": m.name,
+            "nickname": m.nickname,
             "email": m.email,
             "phone": m.phone,
             "title": m.title,

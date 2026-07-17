@@ -14,6 +14,7 @@ interface UserInfo {
     username: string;
     email: string;
     display_name: string;
+    nickname?: string;
     role: string;
     is_active: boolean;
     quota_message_limit: number;
@@ -387,6 +388,11 @@ export default function UserManagement() {
                                         {user.display_name || user.username}
                                         {roleBadge(user.role)}
                                     </div>
+                                    {user.nickname && user.nickname !== user.display_name && (
+                                        <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                                            {isChinese ? `昵称：${user.nickname}` : `Nickname: ${user.nickname}`}
+                                        </div>
+                                    )}
                                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>@{user.username}</div>
                                 </div>
                                 <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>{user.email}</div>
