@@ -58,6 +58,7 @@ def _seed_schema(name: str) -> dict:
         "send_channel_file",
         "send_platform_message",
         "send_channel_message",
+        "send_group_session_message",
         "search_contacts",
         "add_contact",
         "remove_contact",
@@ -112,6 +113,13 @@ def test_message_tool_schemas_use_only_canonical_recipient_ids(name, canonical_f
         assert canonical_field in properties
         assert canonical_field in schema["required"]
         assert LEGACY_EXECUTION_FIELDS.isdisjoint(properties)
+
+
+def test_group_session_message_uses_only_exact_session_address():
+    for schema in (_agent_schema("send_group_session_message"), _seed_schema("send_group_session_message")):
+        assert set(schema["properties"]) == {"session_id", "message"}
+        assert schema["required"] == ["session_id", "message"]
+        assert schema["additionalProperties"] is False
 
 
 @pytest.mark.parametrize("name", ["add_contact", "remove_contact"])

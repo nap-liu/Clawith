@@ -108,40 +108,69 @@ async def deliver_recovered_reply_to_origin(
             runtime.external_conv_id,
         )
         return False
+    return await deliver_message_to_runtime(
+        agent_id=agent_id,
+        runtime=runtime,
+        message=reply,
+        require_transport=require_transport,
+        origin_actor_ref=origin_actor_ref,
+        origin_actor_ref_type=origin_actor_ref_type,
+    )
+
+
+async def deliver_message_to_runtime(
+    *,
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    message: str,
+    require_transport: bool = True,
+    origin_actor_ref: str | None = None,
+    origin_actor_ref_type: str | None = None,
+    allow_wecom_group_actor_fallback: bool = True,
+) -> bool:
+    """Deliver text through the exact transport bound to a loaded Session runtime.
+
+    This is the shared transport layer for restart recovery and explicit group
+    Session delivery. Callers remain responsible for authorizing the Session;
+    this function never selects a different Session or channel.
+    """
+    if not (message or "").strip():
+        return True
     channel = runtime.source_channel
     if channel in {"web", "wechat_miniprogram", "mcp"}:
-        return await _deliver_web(agent_id, runtime, reply)
+        return await _deliver_web(agent_id, runtime, message)
     if channel == "dingtalk":
-        return await _deliver_dingtalk(agent_id, runtime, reply)
+        return await _deliver_dingtalk(agent_id, runtime, message)
 
     delivered: bool | None = None
     if channel == "feishu":
         delivered = await _deliver_feishu(
             agent_id,
             runtime,
-            reply,
+            message,
             origin_actor_ref=origin_actor_ref,
             origin_actor_ref_type=origin_actor_ref_type,
         )
     elif channel == "slack":
-        delivered = await _deliver_slack(agent_id, runtime, reply)
+        delivered = await _deliver_slack(agent_id, runtime, message)
     elif channel == "wecom":
         delivered = await _deliver_wecom(
             agent_id,
             runtime,
-            reply,
+            message,
             origin_actor_ref=origin_actor_ref,
+            allow_group_actor_fallback=allow_wecom_group_actor_fallback,
         )
     elif channel in {"teams", "microsoft_teams"}:
-        delivered = await _deliver_teams(agent_id, runtime, reply)
+        delivered = await _deliver_teams(agent_id, runtime, message)
     elif channel == "whatsapp":
-        delivered = await _deliver_whatsapp(agent_id, runtime, reply)
+        delivered = await _deliver_whatsapp(agent_id, runtime, message)
     elif channel == "wechat":
-        delivered = await _deliver_wechat(agent_id, runtime, reply)
+        delivered = await _deliver_wechat(agent_id, runtime, message)
     elif channel == "discord":
-        delivered = await _deliver_discord(agent_id, runtime, reply)
+        delivered = await _deliver_discord(agent_id, runtime, message)
     elif channel in {"agent", "trigger"}:
-        return await _deliver_web(agent_id, runtime, reply)
+        return await _deliver_web(agent_id, runtime, message)
 
     if delivered is not None:
         if delivered or require_transport:
@@ -156,7 +185,7 @@ async def deliver_recovered_reply_to_origin(
         "[turn_runtime] no restart delivery adapter for channel=%s conversation=%s; "
         "DB history remains authoritative",
         channel,
-        conversation_id,
+        runtime.conversation_id,
     )
     return not require_transport
 
@@ -185,6 +214,7 @@ async def _load_channel_config(agent_id: uuid.UUID, channel_type: str) -> Channe
                 select(ChannelConfig).where(
                     ChannelConfig.agent_id == agent_id,
                     ChannelConfig.channel_type == channel_type,
+                    ChannelConfig.is_configured.is_(True),
                 )
             )
         ).scalar_one_or_none()
@@ -296,6 +326,7 @@ async def _deliver_wecom(
     reply: str,
     *,
     origin_actor_ref: str | None = None,
+    allow_group_actor_fallback: bool = True,
 ) -> bool:
     target = str(runtime.external_conv_id or "")
     cfg = await _load_channel_config(agent_id, "wecom")
@@ -332,6 +363,8 @@ async def _deliver_wecom(
         # Some inbound group transports cannot be addressed by appchat/send.
         # Preserve the current platform behavior by falling back to the exact
         # human actor who created the originating turn, never an arbitrary user.
+        if not allow_group_actor_fallback:
+            return False
         user_id = str(origin_actor_ref or "").strip()
     elif target.startswith("wecom_p2p_"):
         user_id = target.removeprefix("wecom_p2p_")
@@ -358,8 +391,6 @@ async def _deliver_wecom(
 async def _deliver_teams(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) -> bool:
     conversation_id = str(runtime.external_conv_id or "")
     cfg = await _load_channel_config(agent_id, "microsoft_teams")
-    if cfg is None:
-        cfg = await _load_channel_config(agent_id, "teams")
     if not conversation_id or cfg is None:
         return False
     try:

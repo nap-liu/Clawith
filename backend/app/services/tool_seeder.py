@@ -636,6 +636,33 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "send_group_session_message",
+        "display_name": "Group Session Message",
+        "description": (
+            "Send a text message to one existing external-IM group conversation by its exact "
+            "Clawith session_id from list_sessions/search_sessions. The target Session is the only "
+            "routing authority: its bound channel and external conversation ID are resolved internally. "
+            "This tool accepts group Sessions only; use send_channel_message for a person."
+        ),
+        "category": "communication",
+        "icon": "📣",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Exact group ChatSession UUID returned by list_sessions/search_sessions.",
+                },
+                "message": {"type": "string", "description": "Text content to send to the bound group."},
+            },
+            "required": ["session_id", "message"],
+            "additionalProperties": False,
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "search_contacts",
         "display_name": "Search Contacts",
         "description": "Search people and digital employees as candidates for relationship network editing. Only use this tool when the user explicitly asks you to search, review, or edit the relationship network. Do not use it proactively just because you want to contact someone. Human results contain user_id; digital employee results contain agent_id. Names are display-only.",

@@ -38,8 +38,10 @@ from app.models.task import Task
 from app.models.agent import Agent as AgentModel
 from app.models.org import AgentRelationship, OrgMember, AgentAgentRelationship
 from app.models.audit import ChatMessage, AuditLog
+from app.models.chat_compaction import ChatCompaction  # noqa: F401 - register ChatMessage FK target
 from app.models.chat_session import ChatSession
 from app.models.channel_config import ChannelConfig
+from app.models.participant import Participant  # noqa: F401 - register chat FK target
 from app.models.user import User as UserModel
 from app.services.auth_registry import auth_provider_registry
 from app.services.agent_memory import CORE_MEMORY_TEMPLATE
@@ -79,6 +81,7 @@ from app.services.recipient_resolver import (
     resolve_human_channel_recipient,
     resolve_platform_user_recipient,
 )
+from app.services.turn_runtime import TurnRuntime, deliver_message_to_runtime
 
 
 _settings = get_settings()
@@ -763,6 +766,33 @@ AGENT_TOOLS = [
                     },
                 },
                 "required": ["user_id", "message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_group_session_message",
+            "description": (
+                "Send a text message to one existing external-IM group conversation by its exact "
+                "Clawith session_id from list_sessions/search_sessions. The target Session is the only "
+                "routing authority: its bound channel and external conversation ID are resolved internally. "
+                "This tool accepts group Sessions only; use send_channel_message for a person."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Exact group ChatSession UUID returned by list_sessions/search_sessions.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Text content to send to the bound group.",
+                    },
+                },
+                "required": ["session_id", "message"],
+                "additionalProperties": False,
             },
         },
     },
@@ -2123,6 +2153,7 @@ _ALWAYS_INCLUDE_CORE = {
 # Channel message tool - available when any channel (Feishu/DingTalk/WeCom) is configured
 _CHANNEL_MESSAGE_TOOL_NAMES = {
     "send_channel_message",
+    "send_group_session_message",
 }
 # Feishu tools are ONLY included when the agent has a configured Feishu channel,
 # to avoid exposing unnecessary tools to non-Feishu agents (reduces hallucination risk).
@@ -3214,6 +3245,7 @@ async def execute_tool(
     # internal: the tool schema and model-visible arguments remain unchanged.
     if tool_name in {
         "send_channel_message",
+        "send_group_session_message",
         "send_feishu_message",
         "send_platform_message",
         "send_message_to_agent",
@@ -3446,6 +3478,14 @@ async def execute_tool(
                 arguments,
                 origin_session_id=session_id,
                 origin_user_id=user_id,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=turn_anchor_id,
+            )
+        elif tool_name == "send_group_session_message":
+            result = await _send_group_session_message(
+                agent_id,
+                arguments,
+                origin_session_id=session_id,
                 tool_call_id=tool_call_id,
                 origin_turn_anchor_id=turn_anchor_id,
             )
@@ -3782,7 +3822,13 @@ async def execute_tool(
                 detail={"tool": tool_name, "args": {k: str(v)[:100] for k, v in _log_args.items()}, "result": result[:300]},
             )
         # Save error message to current session if a messaging tool fails, so the user is notified
-        if session_id and tool_name in ("send_channel_message", "send_feishu_message", "send_platform_message", "send_message_to_agent") and isinstance(result, str) and result.startswith("❌"):
+        if session_id and tool_name in (
+            "send_channel_message",
+            "send_group_session_message",
+            "send_feishu_message",
+            "send_platform_message",
+            "send_message_to_agent",
+        ) and isinstance(result, str) and result.startswith("❌"):
             try:
                 async with async_session() as _err_db:
                     from app.models.audit import ChatMessage as _CM
@@ -7068,7 +7114,7 @@ async def _persist_outbound_channel_message(
     db,
     *,
     agent_id: uuid.UUID,
-    user_id: uuid.UUID,
+    user_id: uuid.UUID | None,
     session: ChatSession,
     content: str,
     source_channel: str,
@@ -7113,7 +7159,8 @@ async def _persist_outbound_channel_message(
             "direction": "outbound",
             "source_channel": source_channel,
             "actor_ref": str(actor_ref),
-            "target_user_id": str(user_id),
+            "target_user_id": str(user_id or ""),
+            "target_session_id": str(session.id),
             "target_name": str(target_name),
             "origin_session_id": str(origin_session_id or ""),
             "origin_source_channel": str(origin_source_channel or ""),
@@ -7127,6 +7174,153 @@ async def _persist_outbound_channel_message(
     session.last_message_at = datetime.now(timezone.utc)
     await db.flush()
     return row
+
+
+_SUPPORTED_GROUP_SESSION_CHANNELS = frozenset(
+    {"dingtalk", "feishu", "wecom", "slack", "teams", "microsoft_teams"}
+)
+_GROUP_SESSION_DENIAL = "❌ 无法投递：该群会话不存在，或不属于当前数字员工。"
+
+
+async def _send_group_session_message(
+    agent_id: uuid.UUID,
+    args: dict,
+    *,
+    origin_session_id: str | None = None,
+    tool_call_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
+) -> str:
+    """Send text through the exact external-group route bound to one ChatSession."""
+    raw_session_id = str(args.get("session_id") or "").strip()
+    message_text = str(args.get("message") or "").strip()
+    if not raw_session_id:
+        return "❌ Please provide the exact group session_id"
+    if not message_text:
+        return "❌ Please provide message content"
+    try:
+        target_session_id = uuid.UUID(raw_session_id)
+    except (TypeError, ValueError):
+        return _GROUP_SESSION_DENIAL
+
+    operation_key = _build_outbound_operation_key(
+        agent_id=agent_id,
+        origin_session_id=origin_session_id,
+        tool_call_id=tool_call_id,
+        origin_turn_anchor_id=origin_turn_anchor_id,
+    )
+    target_name = "group"
+    target_channel = ""
+
+    try:
+        async with async_session() as db:
+            await _lock_outbound_operation(db, operation_key)
+            if operation_key:
+                existing = (
+                    await db.execute(
+                        select(ChatMessage).where(ChatMessage.external_event_key == operation_key)
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    meta = existing.message_meta if isinstance(existing.message_meta, dict) else {}
+                    return json.dumps(
+                        {
+                            "status": "already_sent",
+                            "session_id": str(existing.conversation_id),
+                            "channel": str(meta.get("source_channel") or ""),
+                            "group_name": str(meta.get("target_name") or "group"),
+                        },
+                        ensure_ascii=False,
+                    )
+
+            session = (
+                await db.execute(
+                    select(ChatSession)
+                    .where(
+                        ChatSession.id == target_session_id,
+                        ChatSession.agent_id == agent_id,
+                        ChatSession.is_group.is_(True),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if session is None:
+                return _GROUP_SESSION_DENIAL
+
+            target_channel = str(session.source_channel or "").strip()
+            external_conv_id = str(session.external_conv_id or "").strip()
+            if "__archived_" in external_conv_id or not external_conv_id:
+                return "❌ 无法投递：该群会话已归档或通道绑定已失效。"
+            if target_channel not in _SUPPORTED_GROUP_SESSION_CHANNELS:
+                return f"❌ Group Session delivery is not supported for channel: {target_channel or 'unknown'}"
+
+            target_name = str(session.group_name or session.title or "group")
+            runtime = TurnRuntime(
+                session_found=True,
+                source_channel=target_channel,
+                conversation_id=str(session.id),
+                external_conv_id=external_conv_id,
+                is_group=True,
+            )
+            delivered = await deliver_message_to_runtime(
+                agent_id=agent_id,
+                runtime=runtime,
+                message=message_text,
+                require_transport=True,
+                allow_wecom_group_actor_fallback=False,
+            )
+            if not delivered:
+                return f"❌ Group message delivery failed via {target_channel}; no receipt was persisted."
+
+            await _persist_outbound_channel_message(
+                db,
+                agent_id=agent_id,
+                user_id=None,
+                session=session,
+                content=message_text,
+                source_channel=target_channel,
+                actor_ref=external_conv_id,
+                target_name=target_name,
+                origin_session_id=origin_session_id,
+                origin_source_channel=None,
+                tool_call_id=tool_call_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+            )
+            await db.commit()
+
+        try:
+            from app.api.websocket import manager as ws_manager
+
+            await ws_manager.send_to_session(
+                str(agent_id),
+                str(target_session_id),
+                {
+                    "type": "done",
+                    "role": "assistant",
+                    "content": message_text,
+                    "session_id": str(target_session_id),
+                },
+            )
+        except Exception:
+            logger.opt(exception=True).warning(
+                "[GroupSessionMessage] Web live mirror failed after external delivery"
+            )
+
+        return json.dumps(
+            {
+                "status": "sent",
+                "session_id": str(target_session_id),
+                "channel": target_channel,
+                "group_name": target_name,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        logger.opt(exception=True).error(
+            "[GroupSessionMessage] delivery failed agent={} session={}",
+            agent_id,
+            target_session_id,
+        )
+        return f"❌ Group Session message error: {type(exc).__name__}: {str(exc)[:200]}"
 
 
 async def _send_channel_message(

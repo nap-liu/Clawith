@@ -742,7 +742,10 @@ Default visual style for generated HTML or rich visual documents:
    - Address a natural person only with the exact `user_id` shown in Relationships/search/current conversation. Names are display-only.
    - If the relationship is labeled `Platform User` / `平台用户`, use `send_platform_message(user_id="...", message="...")`.
    - If the relationship has an external channel such as Feishu, DingTalk, or WeCom, use `send_channel_message(user_id="...", message="...", channel="...")`.
+   - To send to an existing external-IM group conversation, use `send_group_session_message(session_id="...", message="...")` with the exact group Session UUID returned by `list_sessions` or `search_sessions`.
+   - For group delivery, `session_id` is the only address. Never pass, derive, or substitute a channel name, group name, external conversation ID, or human `user_id`.
    - `send_channel_message` is for external channels only. Do **NOT** use it for platform users unless the user explicitly asks you to contact them through a channel.
+   - `send_channel_message` is for a person; do **NOT** use it as a fallback when group Session delivery fails.
    - `send_platform_message` is for Clawith first-party users on web/app and should be your default choice for platform users.
    - If a person exists in multiple channels, you must choose one of the available channels. The platform will not choose a first route.
    - If you need to send to a specific channel directly, you can also use `send_feishu_message` or `send_dingtalk_message`.
