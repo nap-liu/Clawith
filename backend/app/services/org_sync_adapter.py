@@ -167,6 +167,7 @@ class ExternalUser:
 
     external_id: str  # The unique, platform-stable ID (e.g., userid)
     name: str
+    nickname: str = ""
     open_id: str = ""  # OAuth open_id
     unionid: str = ""  # Union ID for cross-app identification
     email: str = ""
@@ -637,6 +638,8 @@ class BaseOrgSyncAdapter(ABC):
             if existing_member.tenant_id is None and member_tenant_id:
                 existing_member.tenant_id = member_tenant_id
             existing_member.name = user.name
+            if user.nickname:
+                existing_member.nickname = user.nickname
             # Generate transliteration using layered strategy:
             # 1. pypinyin converts CJK characters to pinyin
             # 2. anyascii handles remaining non-ASCII scripts (Korean, Japanese kana, Arabic, etc.)
@@ -679,6 +682,7 @@ class BaseOrgSyncAdapter(ABC):
                 provider_id=provider.id,
                 user_id=None,
                 name=user.name,
+                nickname=user.nickname or None,
                 name_translit_full=translit_full,
                 name_translit_initial=translit_initial,
                 email=email,
@@ -1380,6 +1384,7 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
                         unionid=item.get("unionid", "") or "",
                         open_id=item.get("openid", "") or "",
                         name=item.get("name", ""),
+                        nickname=item.get("nick", "") or item.get("nickname", "") or "",
                         email=item.get("email", "") or "",
                         avatar_url=item.get("avatar", "") or "",
                         title=item.get("title", "") or "",

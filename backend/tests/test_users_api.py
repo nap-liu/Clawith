@@ -94,7 +94,7 @@ async def test_list_users_returns_paginated_page_with_total_and_agent_counts():
     db = RecordingDB(
         [
             ScalarResult(12),
-            RowsResult([(page_users[0], 2), *[(u, 0) for u in page_users[1:]]]),
+            RowsResult([(page_users[0], 2, "Tea"), *[(u, 0, None) for u in page_users[1:]]]),
         ]
     )
     current_user = SimpleNamespace(role="org_admin", tenant_id=tenant_id)
@@ -119,6 +119,7 @@ async def test_list_users_returns_paginated_page_with_total_and_agent_counts():
         "User 00",
     ]
     assert result["items"][0].agents_count == 2
+    assert result["items"][0].nickname == "Tea"
 
     list_query = db.executed[1]
     assert "LIMIT" in list_query["sql"]
@@ -137,7 +138,7 @@ async def test_list_users_searches_identity_fields_and_org_admin_stays_inside_te
         phone="13800000001",
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
-    db = RecordingDB([ScalarResult(1), RowsResult([(matched, 0)])])
+    db = RecordingDB([ScalarResult(1), RowsResult([(matched, 0, None)])])
     current_user = SimpleNamespace(role="org_admin", tenant_id=tenant_a)
 
     result = await users_api.list_users(
@@ -157,6 +158,7 @@ async def test_list_users_searches_identity_fields_and_org_admin_stays_inside_te
     assert "identities.username" in count_query["sql"]
     assert "identities.email" in count_query["sql"]
     assert "identities.phone" in count_query["sql"]
+    assert "org_members.nickname" in count_query["sql"]
     assert tenant_a in count_query["params"].values()
     assert tenant_b not in count_query["params"].values()
 
@@ -169,7 +171,7 @@ async def test_platform_admin_can_page_requested_tenant():
         display_name="Tenant B User",
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
-    db = RecordingDB([ScalarResult(1), RowsResult([(matched, 0)])])
+    db = RecordingDB([ScalarResult(1), RowsResult([(matched, 0, None)])])
     current_user = SimpleNamespace(role="platform_admin", tenant_id=tenant_a)
 
     result = await users_api.list_users(

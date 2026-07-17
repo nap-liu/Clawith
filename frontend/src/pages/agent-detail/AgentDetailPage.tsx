@@ -1692,6 +1692,11 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                                                             </span>
                                                         )}
                                                     </div>
+                                                    {m.nickname && m.nickname !== m.name && (
+                                                        <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                                                            {isChinese ? '昵称' : 'Nickname'}: {m.nickname}
+                                                        </div>
+                                                    )}
                                                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
                                                         {renderHumanMemberSourceBadge(m)}
                                                         {m.department_path} · {m.email}
@@ -1730,6 +1735,11 @@ function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; re
                                         </div>
                                         <div style={{ minWidth: 0 }}>
                                             <div style={{ fontWeight: 600 }}>{member.name}</div>
+                                            {member.nickname && member.nickname !== member.name && (
+                                                <div style={{ color: 'var(--text-secondary)', fontSize: '11px' }}>
+                                                    {isChinese ? '昵称' : 'Nickname'}: {member.nickname}
+                                                </div>
+                                            )}
                                             <div style={{ color: 'var(--text-tertiary)', fontSize: '11px' }}>{member.department_path || member.email || ''}</div>
                                         </div>
                                         <button className="btn btn-ghost" type="button" style={{ fontSize: '12px', padding: 0, minWidth: 'auto', marginLeft: '2px' }} onClick={() => toggleMemberSelection(member)}>×</button>

@@ -238,6 +238,7 @@ async def test_search_contacts_returns_dingtalk_human_and_visible_agent(contact_
             "user_id": str(ctx["member_user_id"]),
             "type": "human",
             "name": "刘喜",
+            "nickname": None,
             "title": "前端开发",
             "channel": "dingtalk",
             "department_path": "Root/信息技术部/技术部/前端开发",

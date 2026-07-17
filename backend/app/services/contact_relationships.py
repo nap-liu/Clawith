@@ -196,6 +196,7 @@ async def search_contacts_for_agent(
         pattern = f"%{search_text}%"
         human_conditions = [
             OrgMember.name.ilike(pattern),
+            OrgMember.nickname.ilike(pattern),
             OrgMember.name_translit_full.ilike(pattern),
             OrgMember.name_translit_initial.ilike(pattern),
             OrgMember.email.ilike(pattern),
@@ -262,6 +263,7 @@ async def search_contacts_for_agent(
                     "user_id": str(user.id),
                     "type": "human",
                     "name": member.name,
+                    "nickname": member.nickname,
                     "title": member.title or "",
                     "channel": channel or "platform",
                     "department_path": member.department_path or "",
@@ -399,6 +401,7 @@ async def _add_human_contact(
         "user_id": str(target_user.id),
         "type": "human",
         "name": member.name,
+        "nickname": member.nickname,
         "relationship_status": status_info["access_status"],
     }
 

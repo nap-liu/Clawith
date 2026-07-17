@@ -945,6 +945,11 @@ export default function OrgTab({ tenant }: { tenant: any }) {
                                     <div style={{ width: '32px', height: '32px', borderRadius: '50%', background: 'var(--bg-tertiary)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: 600 }}>{m.name?.[0]}</div>
                                     <div>
                                         <div style={{ fontWeight: 500, fontSize: '13px' }}>{m.name}</div>
+                                        {m.nickname && m.nickname !== m.name && (
+                                            <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                                                {t('enterprise.org.nickname', 'Nickname')}: {m.nickname}
+                                            </div>
+                                        )}
                                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
                                             {m.provider_type && <span style={{ marginRight: '4px', padding: '1px 4px', borderRadius: '3px', background: 'var(--bg-secondary)', fontSize: '10px' }}>{m.provider_type}</span>}
                                             {m.title || '-'} · {m.department_path || m.department_id || '-'}

@@ -157,6 +157,24 @@ class ContactProvisioningService:
             external_only_user_created=identity is None,
         )
 
+    async def sync_linked_user_profile(
+        self,
+        db: AsyncSession,
+        user: User,
+        org_member: OrgMember,
+        *,
+        provider: IdentityProvider | None = None,
+    ) -> None:
+        """Refresh one already-resolved canonical User from its directory profile."""
+        provider = provider or await self._get_provider(db, org_member.provider_id)
+        verified_contact = self._provider_type(provider) == "dingtalk" or bool(
+            (getattr(provider, "config", None) or {}).get("verified_contact_identity")
+        )
+        mobile = normalize_mobile(org_member.phone) if verified_contact else None
+        await self._sync_user_profile(db, user, org_member, provider, mobile, verified_contact)
+        await self._ensure_participant(db, user)
+        await db.flush()
+
     async def _get_provider(
         self,
         db: AsyncSession,

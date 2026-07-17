@@ -411,6 +411,12 @@ class SSOService:
             # become accurate after the user's first SSO login, without needing
             # IP-whitelisted batch calls.
             if identity_data:
+                incoming_nickname = (
+                    identity_data.get("nick")
+                    or identity_data.get("nickname")
+                )
+                if provider_type == "dingtalk" and incoming_nickname:
+                    member.nickname = incoming_nickname
                 incoming_name = (
                     identity_data.get("name")
                     or identity_data.get("display_name")
@@ -442,11 +448,20 @@ class SSOService:
             # Create a shell OrgMember if not synced yet.
             # This handles organizations that skip org-sync and rely purely on SSO.
             member_name = (
-                (identity_data.get("name") or identity_data.get("display_name"))
+                (
+                    identity_data.get("name")
+                    or identity_data.get("display_name")
+                    or (identity_data.get("nick") if provider_type == "dingtalk" else None)
+                )
                 if identity_data else None
             )
             member = OrgMember(
                 name=member_name or f"{provider_type.capitalize()} User {provider_user_id[:8]}",
+                nickname=(
+                    identity_data.get("nick") or identity_data.get("nickname")
+                    if identity_data and provider_type == "dingtalk"
+                    else None
+                ),
                 email=(identity_data.get("email") or identity_data.get("biz_mail")) if identity_data else None,
                 avatar_url=identity_data.get("avatar") if identity_data else None,
                 phone=identity_data.get("mobile") if identity_data else None,
