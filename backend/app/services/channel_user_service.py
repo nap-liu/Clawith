@@ -315,10 +315,11 @@ class ChannelUserService:
         """Resolve channel user identity, find or create platform User.
 
         Priority order:
-        1. OrgMember already linked to User → return existing User
-        2. OrgMember exists but not linked → create User and link
-        3. User matched by email/mobile → return User and link OrgMember
-        4. No match → create new User and OrgMember (lazy registration)
+        1. Existing installation-scoped binding → return canonical User
+        2. Exact OrgMember identity → resolve/link canonical User and bind
+        3. Verified contact match → return User and link OrgMember
+        4. Historical channel principal → migrate only when no verified identity exists
+        5. No match → create new User and OrgMember (lazy registration)
 
         Args:
             db: Database session
@@ -374,49 +375,6 @@ class ChannelUserService:
                     )
             return canonical_user
 
-        # One-release migration bridge for the historical DingTalk login
-        # principal. It is exact, tenant-scoped, unique and active; no display
-        # name/contact guessing is involved. The scoped binding becomes the
-        # only lookup path after this first successful message.
-        if normalized_channel == "dingtalk" and external_user_id:
-            legacy_username = f"dingtalk_{external_user_id}"
-            legacy_users = (
-                await db.execute(
-                    select(User)
-                    .join(User.identity)
-                    .where(
-                        User.tenant_id == tenant_id,
-                        User.is_active == True,  # noqa: E712
-                        Identity.username == legacy_username,
-                    )
-                    .options(selectinload(User.identity))
-                )
-            ).scalars().all()
-            if len(legacy_users) > 1:
-                raise ChannelUserResolutionError(
-                    "Legacy DingTalk subject maps to multiple tenant users; migration_required"
-                )
-            if legacy_users:
-                legacy_user = legacy_users[0]
-                canonical_user, binding_created = await self._ensure_bindings(
-                    db, provider, channel_type, external_user_id, extra_info, legacy_user
-                )
-                if binding_created:
-                    legacy_member = await self._create_org_member_shell(
-                        db,
-                        provider,
-                        channel_type,
-                        external_user_id,
-                        extra_info,
-                        linked_user_id=canonical_user.id,
-                    )
-                    from app.services.contact_provisioning import contact_provisioning
-
-                    await contact_provisioning.ensure_user_for_org_member(
-                        db, legacy_member, provider=provider
-                    )
-                return canonical_user
-
         # Step 2: Try to find OrgMember by external identity
         org_member = await self._find_org_member(
             db, provider.id, channel_type, external_user_id, extra_info
@@ -471,6 +429,30 @@ class ChannelUserService:
         if not org_member and should_persist_member and normalized_channel == "dingtalk":
             if mobile:
                 user = await sso_service.match_user_by_mobile(db, mobile, tenant_id)
+            # One-release migration bridge for the historical DingTalk login
+            # principal. Verified enterprise contact evidence is stronger and
+            # has already been checked above. Use this exact legacy principal
+            # only when neither an OrgMember nor a verified tenant User exists.
+            if not user and external_user_id:
+                legacy_username = f"dingtalk_{external_user_id}"
+                legacy_users = (
+                    await db.execute(
+                        select(User)
+                        .join(User.identity)
+                        .where(
+                            User.tenant_id == tenant_id,
+                            User.is_active == True,  # noqa: E712
+                            Identity.username == legacy_username,
+                        )
+                        .options(selectinload(User.identity))
+                    )
+                ).scalars().all()
+                if len(legacy_users) > 1:
+                    raise ChannelUserResolutionError(
+                        "Legacy DingTalk subject maps to multiple tenant users; migration_required"
+                    )
+                if legacy_users:
+                    user = legacy_users[0]
             proposed_user = None
             if not user:
                 proposed_user = await self._create_channel_user(

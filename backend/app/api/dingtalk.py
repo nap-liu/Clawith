@@ -619,8 +619,20 @@ async def process_dingtalk_message(
             # 补充 mobile/email（通讯录获取的信息写入已有用户的 Identity）
             if platform_user.identity:
                 if dt_mobile and not platform_user.identity.phone:
-                    platform_user.identity.phone = dt_mobile
-                    updated = True
+                    _claimed_phone_r = await db.execute(
+                        _select(_IdentityModel.id).where(
+                            _IdentityModel.phone == dt_mobile,
+                            _IdentityModel.id != platform_user.identity.id,
+                        ).limit(1)
+                    )
+                    if _claimed_phone_r.scalar_one_or_none() is None:
+                        platform_user.identity.phone = dt_mobile
+                        updated = True
+                    else:
+                        logger.warning(
+                            "[DingTalk] Skipped identity phone backfill because the number "
+                            "is already claimed by another identity"
+                        )
                 if dt_email and (not platform_user.identity.email or platform_user.identity.email.endswith((".local",))):
                     from sqlalchemy import func as _func
 

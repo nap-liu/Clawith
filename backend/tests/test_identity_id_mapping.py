@@ -9,7 +9,7 @@ from app.services.channel_user_service import ChannelUserService
 from app.services.channel_user_service import get_platform_user_by_org_member
 from app.database import async_session, engine
 from app.models.identity import IdentityProvider
-from app.models.org import OrgMember
+from app.models.org import ChannelUserBinding, OrgMember
 from app.models.participant import Participant
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
@@ -357,6 +357,174 @@ async def test_channel_user_service_uses_org_member_provisioning_before_lazy_reg
         assert member.user_id == user.id
         assert user.registration_source == "dingtalk_org_sync"
         assert user.identity_id is None
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_exact_org_member_beats_split_legacy_principal():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id)
+    phone = _phone()
+    external_id = f"staff_{uuid.uuid4().hex[:8]}"
+    unionid = f"union_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        canonical_identity = Identity(
+            username=f"canonical_{uuid.uuid4().hex[:8]}",
+            phone=phone,
+            password_hash="x",
+        )
+        legacy_identity = Identity(
+            username=f"dingtalk_{external_id}",
+            password_hash="x",
+        )
+        db.add_all([canonical_identity, legacy_identity])
+        await db.flush()
+        canonical_user = User(
+            identity_id=canonical_identity.id,
+            tenant_id=tenant.id,
+            display_name="Canonical DingTalk User",
+            role="member",
+            source="dingtalk",
+            is_active=True,
+        )
+        legacy_user = User(
+            identity_id=legacy_identity.id,
+            tenant_id=tenant.id,
+            display_name="Legacy DingTalk User",
+            role="member",
+            source="dingtalk",
+            is_active=True,
+        )
+        db.add_all([canonical_user, legacy_user])
+        await db.flush()
+        db.add(
+            OrgMember(
+                tenant_id=tenant.id,
+                provider_id=provider.id,
+                external_id=external_id,
+                unionid=unionid,
+                user_id=canonical_user.id,
+                name="Canonical DingTalk User",
+                phone=phone,
+                status="active",
+            )
+        )
+        await db.commit()
+        canonical_user_id = canonical_user.id
+        legacy_identity_id = legacy_identity.id
+
+    service = ChannelUserService()
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant.id)
+    async with async_session() as db:
+        resolved = await service.resolve_channel_user(
+            db=db,
+            agent=agent,
+            channel_type="dingtalk",
+            external_user_id=external_id,
+            extra_info={
+                "unionid": unionid,
+                "mobile": phone,
+                "identity_verified": True,
+                "_installation_scope": "test:dingtalk:split-member",
+            },
+        )
+        await db.commit()
+
+        bindings = (
+            await db.execute(
+                select(ChannelUserBinding).where(
+                    ChannelUserBinding.installation_scope == "test:dingtalk:split-member",
+                    ChannelUserBinding.subject.in_([external_id, unionid]),
+                )
+            )
+        ).scalars().all()
+        legacy_identity = await db.get(Identity, legacy_identity_id)
+
+        assert resolved.id == canonical_user_id
+        assert len(bindings) == 2
+        assert {binding.user_id for binding in bindings} == {canonical_user_id}
+        assert legacy_identity.phone is None
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_verified_mobile_beats_legacy_principal_before_org_sync():
+    tenant = await _seed_tenant()
+    provider = await _seed_provider(tenant.id)
+    phone = _phone()
+    external_id = f"staff_{uuid.uuid4().hex[:8]}"
+    unionid = f"union_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        canonical_identity = Identity(
+            username=f"canonical_{uuid.uuid4().hex[:8]}",
+            phone=phone,
+            password_hash="x",
+        )
+        legacy_identity = Identity(
+            username=f"dingtalk_{external_id}",
+            password_hash="x",
+        )
+        db.add_all([canonical_identity, legacy_identity])
+        await db.flush()
+        canonical_user = User(
+            identity_id=canonical_identity.id,
+            tenant_id=tenant.id,
+            display_name="Canonical Mobile User",
+            role="member",
+            source="web",
+            is_active=True,
+        )
+        legacy_user = User(
+            identity_id=legacy_identity.id,
+            tenant_id=tenant.id,
+            display_name="Legacy DingTalk User",
+            role="member",
+            source="dingtalk",
+            is_active=True,
+        )
+        db.add_all([canonical_user, legacy_user])
+        await db.commit()
+        canonical_user_id = canonical_user.id
+
+    service = ChannelUserService()
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant.id)
+    async with async_session() as db:
+        resolved = await service.resolve_channel_user(
+            db=db,
+            agent=agent,
+            channel_type="dingtalk",
+            external_user_id=external_id,
+            extra_info={
+                "unionid": unionid,
+                "mobile": phone,
+                "name": "Canonical Mobile User",
+                "identity_verified": True,
+                "_installation_scope": "test:dingtalk:split-mobile",
+            },
+        )
+        await db.commit()
+
+        member = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.external_id == external_id,
+                )
+            )
+        ).scalar_one()
+        bindings = (
+            await db.execute(
+                select(ChannelUserBinding).where(
+                    ChannelUserBinding.installation_scope == "test:dingtalk:split-mobile",
+                    ChannelUserBinding.subject.in_([external_id, unionid]),
+                )
+            )
+        ).scalars().all()
+
+        assert resolved.id == canonical_user_id
+        assert member.user_id == canonical_user_id
+        assert len(bindings) == 2
+        assert {binding.user_id for binding in bindings} == {canonical_user_id}
 
 
 @pytest.mark.asyncio
