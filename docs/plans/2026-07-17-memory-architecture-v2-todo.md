@@ -3,7 +3,7 @@
 > Created: 2026-07-17
 > Branch: `feat/memory-architecture-v2`
 > Baseline: `company/main@3803d7a60fa7d706a72ad273b07306d077c75822`
-> Status: implementation and local verification complete
+> Status: implementation, neutral audit remediation, and local verification complete
 
 ## Governance
 
@@ -31,9 +31,18 @@
 
 ## Verification evidence
 
-- Focused memory/context/tool-loop/workspace/backfill suite: 39 passed in the production-dependency Docker image; the final boundary addition raises the focused count to 40.
-- Full backend suite in an isolated schema-only `clawith_test` Postgres: 1,471 passed, 28 skipped, with two unrelated `test_pages_csp.py` failures reproduced unchanged on clean `company/main` under the same container and environment.
+- Focused memory/context/tool-loop/workspace/backfill suite: 44 passed in Docker; the four neutral-audit boundary fixes plus S3 conditional-create contract passed 21 focused tests.
+- Confirmation/recovery compatibility passed 29 associated tests, and the DB-backed turn-recovery suite passed 21 tests in its own isolated Docker process.
+- Full backend suite in isolated `clawith_test` Postgres using the production-dependency Docker image: 1,479 passed, 28 skipped, with the same two unrelated `test_pages_csp.py` 404 failures previously reproduced unchanged on clean `company/main`.
 - Runtime DB source of truth: `seed_builtin_tools()` updated both file-tool descriptions, and `get_agent_tools_for_llm()` returned both `write_file` and `edit_file` with the Daily Memory path and maintenance guidance.
-- Prefix contract: two-round tool calls and max-output resume tests prove the memory snapshot remains in every dispatch and prior message bytes stay append-only.
-- Ordinary file contract: `memory/MEMORY_INDEX.md` passed normal workspace deletion, while the one-time backfill never overwrites an existing custom file.
+- Prefix contract: confirmation continuation appends a context-only tail without rewriting historical User messages; primary/fallback share the exact same frozen context tuple; max-output resume and later tool rounds preserve every prior dispatched message byte.
+- Ordinary file contract: `memory/MEMORY_INDEX.md` passed normal workspace deletion, while local and S3 `require_absent` writes are atomic and the one-time backfill retains concurrent Agent/admin writes and the unverified legacy source.
 - Production-version startup smoke: worktree code started successfully on backend image `v1.10.3-3803d7a` with `PROCESS_ROLE=api`, returned health version `1.10.3`, and started no connector/IM role. Existing local 3008 health also remained `1.10.3` after cleanup.
+
+## Appended decision record
+
+### 2026-07-17 — Neutral audit P1 remediation
+
+- A read-only neutral Subagent audit found no P0 and four P1 boundary defects after the original implementation: confirmation continuation could wrap an old User message, provider failover rebuilt the turn context, backfill creation was non-atomic, and max-output recovery removed already-dispatched messages.
+- The user approved remediation without changing the seven frozen workstreams or the memory-file architecture.
+- The accepted direction is minimal and source-level: wrap only a tail User or append context-only User; build one frozen context per failover turn; use storage-native atomic conditional create; and retain the full recovery transcript as an append-only prefix.

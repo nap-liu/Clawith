@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.services.llm.caller import _attach_turn_context, call_llm
+from app.services.llm.caller import _attach_turn_context, call_llm, call_llm_with_failover
 from app.services.llm.client import LLMMessage, LLMResponse
 
 
@@ -81,6 +81,71 @@ def test_unattended_turn_without_user_message_still_receives_context():
     assert original == [LLMMessage(role="system", content="STATIC")]
     assert [message.role for message in attached] == ["system", "user"]
     assert attached[-1].content == "<context>\nMEMORY-SNAPSHOT\n</context>"
+
+
+def test_confirmation_continuation_appends_context_without_rewriting_old_user():
+    original = [
+        LLMMessage(role="system", content="STATIC"),
+        LLMMessage(role="user", content="historical request"),
+        LLMMessage(
+            role="assistant",
+            content="please confirm",
+            tool_calls=[{
+                "id": "confirmation-1",
+                "type": "function",
+                "function": {"name": "request_confirmation", "arguments": "{}"},
+            }],
+        ),
+        LLMMessage(role="tool", content="approved", tool_call_id="confirmation-1"),
+    ]
+
+    attached = _attach_turn_context(original, "CURRENT-SNAPSHOT")
+
+    assert attached[: len(original)] == original
+    assert attached[1].content == "historical request"
+    assert attached[-1] == LLMMessage(
+        role="user",
+        content="<context>\nCURRENT-SNAPSHOT\n</context>",
+    )
+
+
+@pytest.mark.asyncio
+async def test_failover_reuses_one_frozen_turn_context(monkeypatch):
+    built_context = ("STATIC-ONCE", "DYNAMIC-ONCE")
+    context_builder = AsyncMock(return_value=built_context)
+    monkeypatch.setattr(
+        "app.services.agent_context.build_agent_context",
+        context_builder,
+    )
+    monkeypatch.setattr(
+        "app.services.llm.caller._get_user_name",
+        AsyncMock(return_value="Current User"),
+    )
+
+    call_contexts: list[tuple[str, str] | None] = []
+
+    async def fake_call_llm(*args, prepared_turn_context=None, **kwargs):
+        call_contexts.append(prepared_turn_context)
+        if len(call_contexts) == 1:
+            return "[LLM Error] connection timeout"
+        return "fallback-ok"
+
+    monkeypatch.setattr("app.services.llm.caller.call_llm", fake_call_llm)
+
+    result = await call_llm_with_failover(
+        primary_model=_FakeModel(),
+        fallback_model=_FakeModel(),
+        messages=[{"role": "user", "content": "hello"}],
+        agent_name="T",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+    )
+
+    assert result == "fallback-ok"
+    assert context_builder.await_count == 1
+    assert call_contexts == [built_context, built_context]
+    assert call_contexts[0] is call_contexts[1]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,9 @@
-from unittest.mock import Mock
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, Mock
 
+import pytest
+
+from app.services.storage_runtime.base import StorageVersion, WriteCondition
 from app.services.storage_runtime.s3 import S3StorageBackend
 
 
@@ -42,3 +46,40 @@ def test_s3_backend_passes_max_pool_connections(monkeypatch):
     assert config_instances[0].kwargs["max_pool_connections"] == 64
     assert len(client_calls) == 1
     assert client_calls[0]["config"] is config_instances[0]
+
+
+@pytest.mark.asyncio
+async def test_s3_require_absent_uses_atomic_put_precondition(monkeypatch):
+    put_calls: list[dict] = []
+
+    class FakeClient:
+        async def put_object(self, **kwargs):
+            put_calls.append(kwargs)
+
+    @asynccontextmanager
+    async def fake_async_client():
+        yield FakeClient()
+
+    backend = S3StorageBackend(bucket="bucket", prefix="agents")
+    monkeypatch.setattr(backend, "_async_client", fake_async_client)
+    monkeypatch.setattr(
+        backend,
+        "get_version",
+        AsyncMock(return_value=StorageVersion(key="a/memory.md", exists=True, is_dir=False)),
+    )
+
+    result = await backend.write_bytes_if_match(
+        "a/memory.md",
+        b"memory",
+        condition=WriteCondition(require_absent=True),
+        content_type="text/markdown",
+    )
+
+    assert result.ok is True
+    assert put_calls == [{
+        "Bucket": "bucket",
+        "Key": "agents/a/memory.md",
+        "Body": b"memory",
+        "ContentType": "text/markdown",
+        "IfNoneMatch": "*",
+    }]

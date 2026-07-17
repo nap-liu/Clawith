@@ -30,6 +30,7 @@ from app.database import async_session
 from app.models.agent import Agent
 from app.services.agent_memory import CORE_MEMORY_TEMPLATE, MEMORY_INDEX_TEMPLATE
 from app.services.storage import get_storage_backend, normalize_storage_key
+from app.services.storage_runtime.base import WriteCondition
 
 
 @dataclass
@@ -53,6 +54,7 @@ async def backfill_agent_memory(
     index_key = normalize_storage_key(f"{prefix}/memory/MEMORY_INDEX.md")
     legacy_key = normalize_storage_key(f"{prefix}/memory.md")
     result = BackfillResult(agent_id=agent_id)
+    core_create_conflicted = False
 
     core_exists = await storage.is_file(core_key)
     legacy_exists = await storage.is_file(legacy_key)
@@ -64,17 +66,34 @@ async def backfill_agent_memory(
             core_bytes = CORE_MEMORY_TEMPLATE.encode("utf-8")
             result.core_action = "create_template"
         if apply:
-            await storage.write_bytes(core_key, core_bytes, content_type="text/markdown; charset=utf-8")
-            core_exists = True
+            write_result = await storage.write_bytes_if_match(
+                core_key,
+                core_bytes,
+                condition=WriteCondition(require_absent=True),
+                content_type="text/markdown; charset=utf-8",
+            )
+            if write_result.ok:
+                core_exists = True
+            else:
+                core_create_conflicted = True
+                core_exists = bool(write_result.current_version and write_result.current_version.exists)
+                result.core_action = "unchanged_concurrent"
 
     if not await storage.is_file(index_key):
         result.index_action = "create_template"
         if apply:
-            await storage.write_text(index_key, MEMORY_INDEX_TEMPLATE, encoding="utf-8")
+            write_result = await storage.write_bytes_if_match(
+                index_key,
+                MEMORY_INDEX_TEMPLATE.encode("utf-8"),
+                condition=WriteCondition(require_absent=True),
+                content_type="text/markdown; charset=utf-8",
+            )
+            if not write_result.ok:
+                result.index_action = "unchanged_concurrent"
 
     if remove_legacy_root and legacy_exists:
         result.legacy_action = "retain_not_verified"
-        if apply and core_exists:
+        if apply and core_exists and not core_create_conflicted:
             canonical_bytes = await storage.read_bytes(core_key)
             legacy_bytes = await storage.read_bytes(legacy_key)
             if canonical_bytes == legacy_bytes:

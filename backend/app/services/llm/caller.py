@@ -612,8 +612,11 @@ def _attach_turn_context(api_messages: list, dynamic_prompt: str | None) -> list
     memory/runtime snapshot, while assistant/tool messages are appended after
     it without changing any previously-dispatched bytes.
 
-    Why a wrapper instead of a separate message or dynamic system content?
-    - Keeps message count stable (Qwen/DashScope prefix cache is byte-level).
+    Why wrap only a *tail* user instead of searching history?
+    - A tail user is the current turn and can safely receive volatile context.
+    - A non-user tail means the execution is resuming from assistant/tool
+      history (for example after confirmation); rewriting an older user would
+      corrupt persisted-history semantics and invalidate prefix caching.
     - Leaves the stable system + persisted conversation prefix untouched.
     - Places turn-volatile data at the tail, after the cacheable history.
     - Does not persist the wrapper to ChatMessage; the next turn rebuilds a
@@ -631,13 +634,10 @@ def _attach_turn_context(api_messages: list, dynamic_prompt: str | None) -> list
     if not dynamic_prompt:
         return out
 
-    # Find the last role="user" index
-    last_user_idx = -1
-    for i in range(len(out) - 1, -1, -1):
-        if out[i].role == "user":
-            last_user_idx = i
-            break
-    if last_user_idx < 0:
+    # Only the final message can be the current user turn.  Confirmation
+    # continuation and other resume paths intentionally end in assistant/tool;
+    # append a context-only tail there rather than modifying historical input.
+    if not out or out[-1].role != "user":
         out.append(
             LLMMessage(
                 role="user",
@@ -646,6 +646,7 @@ def _attach_turn_context(api_messages: list, dynamic_prompt: str | None) -> list
         )
         return out
 
+    last_user_idx = len(out) - 1
     original = out[last_user_idx]
     original_content = original.content
     # If content is a vision list, wrap the trailing text part (vision_convert
@@ -680,6 +681,35 @@ def _attach_turn_context(api_messages: list, dynamic_prompt: str | None) -> list
         reasoning_signature=original.reasoning_signature,
     )
     return out
+
+
+async def _build_turn_context(
+    *,
+    agent_id,
+    agent_name: str,
+    role_description: str,
+    user_id,
+    current_user_name_override: str | None,
+    is_group: bool,
+    channel_context: dict | None,
+) -> tuple[str, str]:
+    """Build the immutable static/dynamic context pair for one logical turn."""
+    if current_user_name_override:
+        user_name = current_user_name_override
+    else:
+        user_name = await _get_user_name(user_id)
+
+    from app.services.agent_context import build_agent_context
+
+    return await build_agent_context(
+        agent_id,
+        agent_name,
+        role_description,
+        current_user_name=user_name,
+        current_user_id=None if current_user_name_override else user_id,
+        is_group=is_group,
+        channel_context=channel_context,
+    )
 
 
 def _check_tool_requires_args(tool_name: str, args: dict) -> tuple[bool, str]:
@@ -973,6 +1003,7 @@ async def call_llm(
     current_user_name_override: str | None = None,
     channel_context: dict | None = None,
     turn_anchor_id: uuid.UUID | None = None,
+    prepared_turn_context: tuple[str, str] | None = None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     # Get agent config for tool rounds
@@ -981,12 +1012,6 @@ async def call_llm(
         return _token_limit_msg
     if max_tool_rounds_override and max_tool_rounds_override < _max_tool_rounds:
         _max_tool_rounds = max_tool_rounds_override
-
-    # Get user's name for personalized context
-    if current_user_name_override:
-        _user_name = current_user_name_override
-    else:
-        _user_name = await _get_user_name(user_id)
 
     # Auto-assign fallback tool call logger if none provided but conversation context exists
     if on_tool_call is None and session_id:
@@ -1003,19 +1028,21 @@ async def call_llm(
                 )
         on_tool_call = _default_on_tool_call
 
-    # Build rich prompt with soul, memory, skills, relationships
-    from app.services.agent_context import build_agent_context
-
-    # Look up current user's display name so the agent knows who it's talking to
-    static_prompt, dynamic_prompt = await build_agent_context(
-        agent_id,
-        agent_name,
-        role_description,
-        current_user_name=_user_name,
-        current_user_id=None if current_user_name_override else user_id,
-        is_group=is_group,
-        channel_context=channel_context,
-    )
+    # Direct callers build their own turn snapshot.  The failover wrapper passes
+    # one prepared pair to both providers so a single logical turn cannot cross
+    # a memory/date/trigger boundary between primary and fallback attempts.
+    if prepared_turn_context is None:
+        static_prompt, dynamic_prompt = await _build_turn_context(
+            agent_id=agent_id,
+            agent_name=agent_name,
+            role_description=role_description,
+            user_id=user_id,
+            current_user_name_override=current_user_name_override,
+            is_group=is_group,
+            channel_context=channel_context,
+        )
+    else:
+        static_prompt, dynamic_prompt = prepared_turn_context
 
     # Load tools dynamically from DB. `skip_tools=True` is set by the WS
     # handler on the onboarding greeting turn — the bootstrap response is a
@@ -1161,9 +1188,10 @@ async def call_llm(
             # If the response was cut off because we hit the per-call output
             # cap, push the partial text into history as an assistant turn,
             # nudge the model to "continue", and re-stream. Accumulate the
-            # partial pieces so the final ``response.content`` returned to
-            # the caller is the complete concatenation — downstream DB
-            # persistence and tool-calling handling stay unchanged.
+            # partial pieces so the caller still receives the complete text.
+            # Every partial/resume pair remains in the canonical transcript:
+            # once bytes have been dispatched, later tool rounds may only
+            # append to them.
             accumulated_partials: list[str] = []
             recovery_count_this_round = 0
             while (
@@ -1173,10 +1201,9 @@ async def call_llm(
                 recovery_count_this_round += 1
                 partial_text = response.content or ""
                 accumulated_partials.append(partial_text)
-                # Transient scaffolding so the next stream call has a clear
-                # "here is what you just said, now continue" context. We pop
-                # these back off once the recovery loop succeeds so the final
-                # assistant turn lands as a single clean message.
+                # Durable in-turn recovery transcript.  Do not remove these
+                # messages after dispatch: a later tool round must retain this
+                # request as an exact prefix.
                 api_messages.append(
                     LLMMessage(
                         role="assistant",
@@ -1224,15 +1251,10 @@ async def call_llm(
                 _log_turn_timing("output_limit", round_i + 1)
                 return "[LLM Error] Output token limit exceeded after 3 resume attempts"
 
-            # Recovery succeeded (or never happened). If we accumulated any
-            # partials, stitch them onto the final content and pop the
-            # transient (partial_assistant, resume_user) pairs so history
-            # keeps its "one logical turn = one message" shape.
-            if recovery_count_this_round:
-                full_content = "".join(accumulated_partials) + (response.content or "")
-                # Each recovery appended exactly 2 messages.
-                del api_messages[-(2 * recovery_count_this_round) :]
-                response.content = full_content
+            # Keep the provider response as the final continuation segment for
+            # message-history correctness.  The assembled value is used only
+            # for the user-visible reply/card text.
+            complete_response_content = "".join(accumulated_partials) + (response.content or "")
         except ProviderThrottleExhausted as e:
             logger.error(
                 f"[LLM] Provider throttle exhausted: "
@@ -1282,7 +1304,7 @@ async def call_llm(
                 await record_token_usage(agent_id, _unsaved_usage)
             await client.close()
             _log_turn_timing("reply", round_i + 1)
-            return response.content or "[LLM returned empty content]"
+            return complete_response_content or "[LLM returned empty content]"
 
         # Execute tool calls
         logger.info(f"[LLM] Round {round_i + 1}: {len(response.tool_calls)} tool call(s)")
@@ -1306,7 +1328,7 @@ async def call_llm(
                     chat_session_id=None,
                     source_channel="web",
                     user_id=user_id,
-                    intro_text=response.content,
+                    intro_text=complete_response_content,
                     title=conf_call.title,
                     summary=conf_call.summary,
                     action=conf_call.action,
@@ -1360,7 +1382,7 @@ async def call_llm(
                 await record_token_usage(agent_id, _unsaved_usage)
             await client.close()
             _log_turn_timing("repeat_guard", round_i + 1)
-            return response.content or REPEAT_TOOL_CALL_BREAK_MESSAGE
+            return complete_response_content or REPEAT_TOOL_CALL_BREAK_MESSAGE
 
         # Remember where this round's appended entries begin. The message-level
         # budget enforcer operates only on items at or beyond this index —
@@ -1573,6 +1595,19 @@ async def call_llm_with_failover(
     if primary_model is None:
         return "⚠️ 未配置 LLM 模型"
 
+    # Freeze one context snapshot for the whole logical turn.  Runtime
+    # failover is a provider retry, not a new Agent turn, so both models must
+    # see the same memory, clock, trigger and relationship state.
+    prepared_turn_context = await _build_turn_context(
+        agent_id=agent_id,
+        agent_name=agent_name,
+        role_description=role_description,
+        user_id=user_id,
+        current_user_name_override=current_user_name_override,
+        is_group=is_group,
+        channel_context=channel_context,
+    )
+
     # Wrapper callbacks to track state for guard checks
     async def _wrapped_on_chunk(text: str):
         guard.mark_streaming_started()
@@ -1605,6 +1640,7 @@ async def call_llm_with_failover(
         current_user_name_override=current_user_name_override,
         channel_context=channel_context,
         turn_anchor_id=turn_anchor_id,
+        prepared_turn_context=prepared_turn_context,
     )
 
     # Check if we need to failover
@@ -1676,6 +1712,7 @@ async def call_llm_with_failover(
         current_user_name_override=current_user_name_override,
         channel_context=channel_context,
         turn_anchor_id=turn_anchor_id,
+        prepared_turn_context=prepared_turn_context,
     )
 
     # Combine error messages if fallback also failed

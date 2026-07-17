@@ -142,10 +142,24 @@ class LocalStorageBackend(StorageBackend):
         condition: WriteCondition | None = None,
         content_type: str | None = None,
     ) -> ConditionalWriteResult:
+        if condition and condition.require_absent:
+            path = self._full_path(key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                await asyncio.to_thread(_local_create_exclusive, path, data)
+            except FileExistsError:
+                return ConditionalWriteResult(
+                    ok=False,
+                    conflict=True,
+                    current_version=await self.get_version(key),
+                )
+            return ConditionalWriteResult(
+                ok=True,
+                current_version=await self.get_version(key),
+            )
+
         current = await self.get_version(key)
         if condition:
-            if condition.require_absent and current.exists:
-                return ConditionalWriteResult(ok=False, conflict=True, current_version=current)
             if condition.version_token is not None and current.token != condition.version_token:
                 return ConditionalWriteResult(ok=False, conflict=True, current_version=current)
         await self.write_bytes(key, data, content_type=content_type)
@@ -159,6 +173,12 @@ def _local_delete_tree(path: Path) -> None:
     import shutil
 
     shutil.rmtree(path)
+
+
+def _local_create_exclusive(path: Path, data: bytes) -> None:
+    """Atomically create ``path`` and fail if another writer won the race."""
+    with path.open("xb") as file_obj:
+        file_obj.write(data)
 
 
 def _local_version_token(stat, file_hash: str | None) -> str:
