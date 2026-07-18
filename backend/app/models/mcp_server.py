@@ -35,18 +35,6 @@ class MCPServer(Base):
         nullable=True,
         index=True,
     )
-    # Agent-owned servers are private self-service installations.  Enterprise
-    # and platform-managed servers keep this NULL and use created_by_user_id.
-    owner_agent_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("agents.id", ondelete="CASCADE"),
-        nullable=True,
-        index=True,
-    )
-    # Stable, opaque identity of one private installation.  Credentials are
-    # deliberately excluded from this key so rotating a key updates the same
-    # installation instead of creating another server.
-    installation_key: Mapped[str | None] = mapped_column(String(100), nullable=True)
     placeholder_allowlist: Mapped[list[str] | None] = mapped_column(
         JSONB, nullable=True, default=None,
     )
@@ -61,16 +49,6 @@ class MCPServer(Base):
 
     __table_args__ = (
         CheckConstraint("transport IN ('http', 'stdio')", name="ck_mcp_servers_transport"),
-        CheckConstraint(
-            "(owner_agent_id IS NULL AND installation_key IS NULL) OR "
-            "(owner_agent_id IS NOT NULL AND installation_key IS NOT NULL)",
-            name="ck_mcp_servers_private_identity",
-        ),
-        UniqueConstraint(
-            "owner_agent_id",
-            "installation_key",
-            name="uq_mcp_servers_owner_installation",
-        ),
     )
 
 

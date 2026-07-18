@@ -318,30 +318,23 @@ def select_cache_breakpoints(messages_payload: list[dict]) -> list[int]:
     return ordered
 
 
-def _message_payload_log_metadata(messages_payload: list[dict]) -> dict[str, Any]:
-    """Describe request shape without retaining any message text.
+def _observable_messages_payload(messages_payload: list[dict]) -> list[dict]:
+    """Keep the request diagnosable while masking explicit credential fields."""
+    from app.utils.sanitize import sanitize_sensitive_values
 
-    Messages may contain user data, credentials, private tool results, files,
-    and system prompts. Debug logs must therefore expose only counts and sizes.
-    """
-
-    def _text_chars(value: Any) -> int:
-        if isinstance(value, str):
-            return len(value)
-        if isinstance(value, list):
-            return sum(_text_chars(item) for item in value)
-        if isinstance(value, dict):
-            return sum(_text_chars(item) for item in value.values())
-        return 0
-
-    return {
-        "message_count": len(messages_payload),
-        "roles": [str(message.get("role") or "") for message in messages_payload],
-        "content_chars": sum(_text_chars(message.get("content")) for message in messages_payload),
-        "tool_call_count": sum(
-            len(message.get("tool_calls") or []) for message in messages_payload
-        ),
-    }
+    observable = sanitize_sensitive_values(messages_payload)
+    for message in observable:
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            decoded = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        message["content"] = json.dumps(
+            sanitize_sensitive_values(decoded), ensure_ascii=False, default=str
+        )
+    return observable
 
 
 class OpenAICompatibleClient(LLMClient):
@@ -451,9 +444,13 @@ class OpenAICompatibleClient(LLMClient):
         if self._is_dashscope_channel():
             self._apply_dashscope_cache_markers(messages_payload)
         logger.debug(
-            "[LLM-Debug] OpenAICompatibleClient request metadata model={} metadata={}",
+            "[LLM-Debug] OpenAICompatibleClient payload messages for model {}: {}",
             self.model,
-            _message_payload_log_metadata(messages_payload),
+            json.dumps(
+                _observable_messages_payload(messages_payload),
+                indent=2,
+                ensure_ascii=False,
+            ),
         )
         payload: dict[str, Any] = {
             "model": self.model,

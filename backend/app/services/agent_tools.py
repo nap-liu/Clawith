@@ -1778,7 +1778,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_installed_mcp_servers",
-            "description": "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. No arguments are needed. The platform automatically includes complete URL, headers, credentials, command, args, and env only for MCP servers created by you; sensitive config from enterprise or other creators is never returned.",
+            "description": "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. No arguments are needed. For MCP bindings installed by you, the platform also returns the installation config saved on your own binding. Shared server credentials are never inferred or copied into the result.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -3854,27 +3854,28 @@ async def execute_tool(
                     tool_call_id=tool_call_id,
                 )
 
-        # Log tool call activity (skip noisy read operations).  The private MCP
-        # inventory is intentionally result-free here: its raw result can
-        # contain creator-only URLs, headers, credentials, commands and env.
-        # The LLM caller applies a separate public projection for history/WS,
-        # but activity logging happens below that layer and must be safe itself.
+        # Log tool call activity (skip noisy read operations). Keep the result
+        # shape intact for diagnostics and mask only explicit credential values.
         if tool_name not in ("list_files", "read_file", "read_document"):
             from app.services.activity_logger import log_activity
-            from app.utils.sanitize import sanitize_tool_args
+            from app.utils.sanitize import sanitize_sensitive_values, sanitize_tool_args
             _log_args = sanitize_tool_args(arguments) or {}
-            _private_inventory = tool_name == "list_installed_mcp_servers"
-            _summary = (
-                f"Called tool {tool_name}"
-                if _private_inventory
-                else f"Called tool {tool_name}: {result[:80]}"
-            )
+            _log_result = result
+            if tool_name == "list_installed_mcp_servers":
+                try:
+                    _log_result = json.dumps(
+                        sanitize_sensitive_values(json.loads(result)),
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                except Exception:
+                    pass
+            _summary = f"Called tool {tool_name}: {_log_result[:80]}"
             _detail = {
                 "tool": tool_name,
                 "args": {k: str(v)[:100] for k, v in _log_args.items()},
+                "result": _log_result[:300],
             }
-            if not _private_inventory:
-                _detail["result"] = result[:300]
             await log_activity(
                 agent_id, "tool_call",
                 _summary,
@@ -4898,8 +4899,17 @@ async def _execute_mcp_tool(
                             ws = _agent_workspace_root(uuid.UUID(str(agent_id)))
                             ws.mkdir(parents=True, exist_ok=True)
                             work_dir = str(ws.resolve())
-                        except Exception:
-                            pass  # non-fatal — fall back to no cwd
+                        except Exception as workspace_exc:
+                            logger.error(
+                                "[MCP] agent workspace unavailable agent={} server_id={}: {}",
+                                agent_id,
+                                srv.id,
+                                workspace_exc,
+                            )
+                            return (
+                                f"❌ MCP tool {tool_name}: agent workspace unavailable — "
+                                f"{type(workspace_exc).__name__}: {workspace_exc}"
+                            )
                     host = SandboxMcpHost(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
                     # Provider tool_call_id values are not guaranteed unique
                     # across sessions or requests.  Include correlation data
@@ -4915,6 +4925,16 @@ async def _execute_mcp_tool(
                         cwd=work_dir,
                         invocation_id=invocation_id,
                     )
+                    logger.info(
+                        "[MCP] stdio call start agent={} session={} tool_call={} "
+                        "server_id={} entry={} workspace={}",
+                        agent_id,
+                        session_id or "no-session",
+                        tool_call_id or "no-tool-call",
+                        srv.id,
+                        entry,
+                        work_dir or "default",
+                    )
                     hub = SandboxMcpHubClient(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
                     try:
                         return await hub.call_tool(entry, tool.mcp_tool_name or tool_name, arguments)
@@ -4924,10 +4944,20 @@ async def _execute_mcp_tool(
                         # a process that poisons later MCP calls in the sandbox.
                         try:
                             await host.deregister(entry)
+                            logger.info(
+                                "[MCP] stdio call cleanup complete agent={} server_id={} entry={} workspace={}",
+                                agent_id,
+                                srv.id,
+                                entry,
+                                work_dir or "default",
+                            )
                         except Exception as cleanup_exc:
                             logger.warning(
-                                "[MCP] stdio runtime cleanup failed entry={}: {}",
+                                "[MCP] stdio runtime cleanup failed agent={} server_id={} entry={} workspace={}: {}",
+                                agent_id,
+                                srv.id,
                                 entry,
+                                work_dir or "default",
                                 cleanup_exc,
                             )
                 # else: existing http path continues below.

@@ -172,6 +172,26 @@ async def test_stdio_call_error_still_deregisters_runtime():
     host.deregister.assert_awaited_once_with("yx__error")
 
 
+async def test_stdio_workspace_failure_fails_closed_before_registration():
+    agent_id, user_id, tool_name = await _make_stdio_fixture()
+
+    with patch("app.services.agent_tools.SandboxMcpHost") as MockHost, patch(
+        "app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()
+    ), patch(
+        "app.services.agent_tools.Path.mkdir",
+        side_effect=PermissionError("workspace denied"),
+    ):
+        from app.services.agent_tools import _execute_mcp_tool
+
+        result = await _execute_mcp_tool(
+            tool_name, {}, agent_id=agent_id, user_id=user_id
+        )
+
+    assert "agent workspace unavailable" in result
+    assert "workspace denied" in result
+    MockHost.assert_not_called()
+
+
 async def test_concurrent_sessions_with_same_provider_call_id_use_distinct_runtime_entries():
     agent_id, user_id, tool_name = await _make_stdio_fixture()
 
@@ -214,6 +234,12 @@ async def test_concurrent_sessions_with_same_provider_call_id_use_distinct_runti
     assert len(set(results)) == 2
     assert any("session-1:call-0:" in result for result in results)
     assert any("session-2:call-0:" in result for result in results)
+    registrations = host.ensure_registered.await_args_list
+    assert len(registrations) == 2
+    # The unique invocation id is only a process handle. Both concurrent calls
+    # from the same Agent must share the exact same workspace/cwd.
+    assert registrations[0].kwargs["cwd"] == registrations[1].kwargs["cwd"]
+    assert str(agent_id) in registrations[0].kwargs["cwd"]
     cleaned = {call.args[0] for call in host.deregister.await_args_list}
     assert cleaned == set(results)
 

@@ -22,6 +22,8 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "jina_search",
     "jina_read",
     "update_objective",
+    "list_installed_mcp_servers",
+    "uninstall_mcp_server",
     # request_confirmation is OPT-IN (is_default=False); it was briefly seeded is_default=True,
     # so sync the correction to the DB on deploy (otherwise existing rows keep is_default=True).
     "request_confirmation",
@@ -1920,9 +1922,8 @@ BUILTIN_TOOLS = [
         "display_name": "List Installed MCP Servers",
         "description": (
             "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. "
-            "No arguments are needed. The platform automatically includes complete URL, headers, credentials, "
-            "command, args, and env only for MCP servers created by you; sensitive config from enterprise or "
-            "other creators is never returned."
+            "No arguments are needed. For MCP bindings installed by you, the platform also returns the installation "
+            "config saved on your own binding. Shared server credentials are never inferred or copied into the result."
         ),
         "category": "discovery",
         "icon": "📋",

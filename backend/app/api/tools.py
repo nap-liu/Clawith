@@ -378,31 +378,18 @@ async def update_mcp_server(
             tool.config = _encrypt_sensitive_fields(current_config, tool.config_schema)
         # If api_key is None (not provided), preserve the existing encrypted key
 
-    # Preserve logical server identity when its URL changes. Looking up by the
-    # new URL would merge two differently-named servers that happen to share an
-    # endpoint and can cross-wire their tools/credentials.
-    if srv is not None:
-        srv.base_url_template = data.server_url
-        if data.system_prompt_block is not None:
-            srv.system_prompt_block = data.system_prompt_block
-        if data.headers_template is not None:
-            srv.headers_template = data.headers_template
-        if data.api_key is not None:
-            srv.credential_template = data.api_key
-        mcp_server_id = srv.id
-    else:
-        from app.services.mcp_server_service import upsert_mcp_server_from_tools
-
-        mcp_server_id = await upsert_mcp_server_from_tools(
-            db,
-            tenant_id=target_tenant_id,
-            server_url=data.server_url,
-            server_name=data.server_name,
-            system_prompt_block=data.system_prompt_block,
-            headers_template=data.headers_template,
-            api_key=data.api_key,
-            created_by_user_id=current_user.id,
-        )
+    # NEW: bridge to mcp_servers table
+    from app.services.mcp_server_service import upsert_mcp_server_from_tools
+    mcp_server_id = await upsert_mcp_server_from_tools(
+        db,
+        tenant_id=target_tenant_id,
+        server_url=data.server_url,
+        server_name=data.server_name,
+        system_prompt_block=data.system_prompt_block,
+        headers_template=data.headers_template,
+        api_key=data.api_key,
+        created_by_user_id=current_user.id,
+    )
     # Link tools rows to the upserted mcp_servers row
     for tool in tools:
         if tool.mcp_server_id != mcp_server_id:

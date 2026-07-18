@@ -54,9 +54,6 @@ TOOL_OUTPUT_MAX_CHARS: dict[str, int | float] = {
     "read_document": 40_000,
     "read_file": float("inf"),
     "list_files": 100_000,
-    # Contains creator-only MCP credentials. It must stay in the current LLM
-    # message and must never be materialized into the workspace.
-    "list_installed_mcp_servers": float("inf"),
     "_default": 100_000,
 }
 
@@ -393,9 +390,6 @@ def enforce_message_budget(
             if not isinstance(c, str):
                 continue
             if PERSISTED_OPEN in c:
-                continue
-            call_id = getattr(m, "tool_call_id", "") or ""
-            if _tool_name_for_call_id(api_messages, i, call_id) == "list_installed_mcp_servers":
                 continue
             out.append((len(c), i))
         # Largest first.

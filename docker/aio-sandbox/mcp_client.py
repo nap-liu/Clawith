@@ -195,6 +195,13 @@ class MCPClient:
                             f"Successfully retrieved {len(result.tools)} tools from '{server_name}'"
                         )
                         return result
+        except TimeoutError as e:
+            message = (
+                f"MCP server '{server_name}' list_tools timed out after "
+                f"{timeout_seconds:g}s; stdio session cleanup completed"
+            )
+            logger.error(message, exc_info=True)
+            raise TimeoutError(message) from e
         except Exception as e:
             logger.error(
                 f'Error listing tools from {server_name}: {type(e).__name__}: {e}',
@@ -242,6 +249,13 @@ class MCPClient:
                 return await self._execute_tool_core(
                     server_name, tool_name, arguments, stateless=False
                 )
+        except TimeoutError as e:
+            message = (
+                f"MCP tool '{tool_name}' on '{server_name}' timed out after "
+                f"{timeout_seconds:g}s; stdio session cleanup completed"
+            )
+            logger.error(message, exc_info=True)
+            raise TimeoutError(message) from e
         except Exception as e:
             logger.error(
                 f'Error executing tool {tool_name} on {server_name}: {type(e).__name__}: {e}',

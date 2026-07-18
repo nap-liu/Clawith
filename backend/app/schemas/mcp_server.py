@@ -175,22 +175,22 @@ class MCPServerOverrideOut(BaseModel):
     env_template: dict | None = None
 
     @classmethod
-    def from_orm_model(cls, ovr, *, redact_values: bool = False) -> "MCPServerOverrideOut":
+    def from_orm_model(cls, ovr) -> "MCPServerOverrideOut":
         return cls(
             id=ovr.id,
             mcp_server_id=ovr.mcp_server_id,
             scope_type=ovr.scope_type,  # type: ignore[arg-type]
             scope_id=ovr.scope_id,
-            system_prompt_block=None if redact_values else ovr.system_prompt_block,
-            url_template=None if redact_values else ovr.url_template,
-            headers_template=None if redact_values else ovr.headers_template,
+            system_prompt_block=ovr.system_prompt_block,
+            url_template=ovr.url_template,
+            headers_template=ovr.headers_template,
             credential_state="set" if (ovr.credential_template or "").strip() else "unset",
             last_modified_by_user_id=ovr.last_modified_by_user_id,
             created_at=ovr.created_at,
             updated_at=ovr.updated_at,
-            command_template=None if redact_values else getattr(ovr, "command_template", None),
-            args_template=None if redact_values else getattr(ovr, "args_template", None),
-            env_template=None if redact_values else getattr(ovr, "env_template", None),
+            command_template=getattr(ovr, "command_template", None),
+            args_template=getattr(ovr, "args_template", None),
+            env_template=getattr(ovr, "env_template", None),
         )
 
 

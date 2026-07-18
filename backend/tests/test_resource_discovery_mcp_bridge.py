@@ -5,8 +5,8 @@ from sqlalchemy import select
 from unittest.mock import AsyncMock, patch
 
 from app.database import async_session, engine
-from app.models.tool import Tool
-from app.models.mcp_server import MCPServer, MCPServerOverride
+from app.models.tool import AgentTool, Tool
+from app.models.mcp_server import MCPServer
 
 pytestmark = pytest.mark.asyncio
 
@@ -71,25 +71,141 @@ async def test_import_mcp_direct_creates_mcp_server_row():
         )
 
     assert "(1 tools)" in result
+    assert "MCP Server ID" in result
 
     # Verify the Tool + MCPServer row were created and linked.
     async with async_session() as db:
-        tool = (
-            await db.execute(
-                select(Tool)
-                .join(MCPServer, MCPServer.id == Tool.mcp_server_id)
-                .join(MCPServerOverride, MCPServerOverride.mcp_server_id == MCPServer.id)
-                .where(MCPServerOverride.scope_id == agent_id, MCPServerOverride.url_template == url)
-            )
-        ).scalar_one_or_none()
+        tool = (await db.execute(
+            select(Tool).where(Tool.mcp_server_url == url)
+        )).scalar_one_or_none()
         assert tool is not None
         assert tool.mcp_tool_name == "bridge_tool"
         assert tool.mcp_server_id is not None, "mcp_server_id should be set by auto-bridge"
         srv = (await db.execute(
             select(MCPServer).where(MCPServer.id == tool.mcp_server_id)
         )).scalar_one()
-        assert srv.base_url_template == ""
-        assert srv.owner_agent_id == agent_id
+        assert srv.base_url_template == url
+        assignment = (await db.execute(
+            select(AgentTool).where(
+                AgentTool.agent_id == agent_id,
+                AgentTool.tool_id == tool.id,
+            )
+        )).scalar_one()
+        assert assignment.installed_by_agent_id == agent_id
+        assert assignment.config["mcp_url"] == url
+        assert assignment.config["server_name"] == f"test_{suffix}"
+
+
+async def test_smithery_import_links_existing_model_and_returns_exact_server_id():
+    """Smithery keeps its install path but bridges tools to the existing server table."""
+    from app.models.tool import AgentTool
+    from app.services.resource_discovery import import_mcp_from_smithery
+
+    suffix = uuid.uuid4().hex[:6]
+    agent_id = await _make_agent(suffix)
+
+    class _Response:
+        def __init__(self, payload=None, *, text="", status_code=200):
+            self._payload = payload or {}
+            self.text = text
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            if url.endswith("/servers"):
+                return _Response(
+                    {
+                        "servers": [
+                            {
+                                "qualifiedName": "vendor/example",
+                                "displayName": "Example",
+                                "description": "Example MCP",
+                                "remote": True,
+                            }
+                        ]
+                    }
+                )
+            return _Response(
+                {
+                    "deploymentUrl": "https://vendor-example.run.tools",
+                    "tools": [
+                        {
+                            "name": "lookup",
+                            "description": "Lookup",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            )
+
+        async def post(self, url, **kwargs):
+            return _Response(
+                text=(
+                    'data: {"result":{"tools":[{"name":"lookup",'
+                    '"description":"Lookup","inputSchema":{"type":"object",'
+                    '"properties":{}}}]}}\n'
+                )
+            )
+
+    connection = {
+        "namespace": "creator-ns",
+        "connection_id": "creator-conn",
+        "auth_url": None,
+    }
+    with patch("app.services.resource_discovery.httpx.AsyncClient", _Client), patch(
+        "app.services.resource_discovery._get_smithery_api_key",
+        AsyncMock(return_value="smithery-secret"),
+    ), patch(
+        "app.services.resource_discovery._ensure_smithery_connection",
+        AsyncMock(return_value=connection),
+    ):
+        first = await import_mcp_from_smithery("vendor/example", agent_id)
+        second = await import_mcp_from_smithery("vendor/example", agent_id)
+
+    assert "MCP Server ID" in first
+    assert "MCP Server ID" in second
+    async with async_session() as db:
+        servers = (
+            await db.execute(
+                select(MCPServer).where(
+                    MCPServer.base_url_template == "https://vendor-example.run.tools"
+                )
+            )
+        ).scalars().all()
+        assert len(servers) == 1
+        tools = (
+            await db.execute(
+                select(Tool).where(
+                    Tool.mcp_server_id == servers[0].id,
+                    Tool.mcp_tool_name == "lookup",
+                )
+            )
+        ).scalars().all()
+        assert len(tools) == 1
+        assignments = (
+            await db.execute(
+                select(AgentTool).where(
+                    AgentTool.agent_id == agent_id,
+                    AgentTool.tool_id == tools[0].id,
+                )
+            )
+        ).scalars().all()
+        assert len(assignments) == 1
+        assert assignments[0].installed_by_agent_id == agent_id
+        assert assignments[0].config["smithery_api_key"] == "smithery-secret"
+        assert assignments[0].config["mcp_url"] == "https://vendor-example.run.tools"
 
 
 @pytest.mark.parametrize("failure_mode", ["error", "empty"])

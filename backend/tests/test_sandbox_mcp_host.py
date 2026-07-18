@@ -301,33 +301,8 @@ async def test_deregister_rejects_unsafe_name(monkeypatch):
         await host.deregister('evil"; rm -rf /')
 
 
-async def test_deregister_prefix_emits_atomic_prefix_filter(monkeypatch):
-    calls = []
-
-    async def fake_exec(self, command: str):
-        calls.append(command)
-        return {"success": True}
-
-    monkeypatch.setattr(SandboxMcpHost, "_exec_admin_shell", fake_exec)
-    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
-    await host.deregister_prefix("private-server__")
-
-    assert len(calls) == 1
-    command = calls[0]
-    assert "flock" in command
-    assert "with_entries" in command
-    assert "startswith(\\$p)" in command
-    assert 'private-server__' in command
-
-
-async def test_deregister_prefix_rejects_unsafe_prefix():
-    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
-    with pytest.raises(ValueError, match="unsafe"):
-        await host.deregister_prefix("private;rm")
-
-
 # ---------------------------------------------------------------------------
-# Per-agent working-path isolation tests
+# Per-agent shared working-path tests
 # ---------------------------------------------------------------------------
 
 

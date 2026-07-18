@@ -451,24 +451,24 @@ def _coerce_uuid(value) -> uuid.UUID | None:
         return None
 
 
-_PRIVATE_RESULT_TOOLS = {"list_installed_mcp_servers"}
+_SENSITIVE_RESULT_TOOLS = {"list_installed_mcp_servers"}
 
 
-def _public_tool_result(tool_name: str, result: str) -> str:
-    """Remove creator-only fields before history, WS events, or logs see them.
-
-    The full value still goes to the current LLM tool message.  It is never
-    persisted, so a later turn must call the zero-argument list tool again.
-    """
-    if tool_name not in _PRIVATE_RESULT_TOOLS:
+def _observable_tool_result(tool_name: str, result: str) -> str:
+    """Mask credential values while preserving the complete diagnostic shape."""
+    if tool_name not in _SENSITIVE_RESULT_TOOLS:
         return result
     try:
+        from app.utils.sanitize import sanitize_sensitive_values
+
         payload = json.loads(result)
-        for server in payload.get("mcp_servers", []):
-            server.pop("config", None)
-        return json.dumps(payload, ensure_ascii=False, default=str)
+        return json.dumps(
+            sanitize_sensitive_values(payload),
+            ensure_ascii=False,
+            default=str,
+        )
     except Exception:
-        return "{\"mcp_servers\":[],\"sensitive_result\":\"available only to the creator in the current call\"}"
+        return result
 
 
 async def _persist_tool_call_events_strict(
@@ -933,8 +933,8 @@ async def _process_tool_call(
         on_output=_on_output,
     )
     logger.info(f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}")
-    public_result = _public_tool_result(tool_name, result)
-    logger.debug(f"[LLM] Tool result: {public_result[:100]}")
+    observable_result = _observable_tool_result(tool_name, result)
+    logger.debug(f"[LLM] Tool result: {observable_result[:100]}")
 
     # Materialize oversize output and produce the canonical llm_view string.
     # This is the single shape point — DB, WS live stream, historical replay
@@ -971,7 +971,7 @@ async def _process_tool_call(
         "call_id": tc.get("id", ""),
         "args": args,
         "status": "done",
-        "result": _public_tool_result(tool_name, llm_view),
+        "result": _observable_tool_result(tool_name, llm_view),
         "reasoning_content": full_reasoning_content,
     }
     if await _persist_tool_call_events_strict(
