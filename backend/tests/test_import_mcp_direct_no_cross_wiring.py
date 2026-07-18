@@ -14,7 +14,7 @@ from sqlalchemy import select
 
 from app.database import async_session, engine
 from app.models.tool import Tool, AgentTool
-from app.models.mcp_server import MCPServer
+from app.models.mcp_server import MCPServer, MCPServerOverride
 from app.models.agent import Agent
 from app.models.user import User, Identity
 
@@ -88,8 +88,25 @@ async def test_cjk_named_servers_do_not_cross_wire():
         await import_mcp_direct(mcp_url=url_b, agent_id=agent_b, server_name="钉钉日志")
 
     async with async_session() as db:
-        srv_a = (await db.execute(select(MCPServer).where(MCPServer.base_url_template == url_a))).scalar_one_or_none()
-        srv_b = (await db.execute(select(MCPServer).where(MCPServer.base_url_template == url_b))).scalar_one_or_none()
+        srv_a = (
+            await db.execute(
+                select(MCPServer)
+                .join(MCPServerOverride, MCPServerOverride.mcp_server_id == MCPServer.id)
+                .where(MCPServerOverride.scope_id == agent_a, MCPServerOverride.url_template == url_a)
+            )
+        ).scalar_one_or_none()
+        srv_b = (
+            await db.execute(
+                select(MCPServer)
+                .join(MCPServerOverride, MCPServerOverride.mcp_server_id == MCPServer.id)
+                .where(MCPServerOverride.scope_id == agent_b, MCPServerOverride.url_template == url_b)
+            )
+        ).scalar_one_or_none()
+
+        # Private runtime configuration is never duplicated into the shared
+        # registry row or Tool/AgentTool records.
+        assert srv_a.base_url_template == ""
+        assert srv_b.base_url_template == ""
 
     assert srv_a is not None, "server A row missing"
     assert srv_b is not None, "server B row was never created (bridge skipped on collision)"

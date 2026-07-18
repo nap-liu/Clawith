@@ -30,9 +30,11 @@ async def test_call_tool_parses_envelope(monkeypatch):
         async def __aexit__(self, *a):
             return False
 
-        async def post(self, url, json, headers, timeout):
+        async def post(self, url, json, params, headers, timeout):
             captured["url"] = url
             captured["json"] = json
+            captured["params"] = params
+            captured["timeout"] = timeout
             return FakeResp()
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())
@@ -41,6 +43,8 @@ async def test_call_tool_parses_envelope(monkeypatch):
     assert "hi" in out
     assert captured["url"].endswith("/v1/mcp/yx__abc/tools/get_current_user")
     assert captured["json"] == {}
+    assert captured["params"] == {"timeout": 120.0}
+    assert captured["timeout"] == 130.0
 
 
 async def test_call_tool_surfaces_failure(monkeypatch):
@@ -81,7 +85,7 @@ async def test_call_tool_with_api_key_sends_auth_header(monkeypatch):
         async def __aexit__(self, *a):
             return False
 
-        async def post(self, url, json, headers, timeout):
+        async def post(self, url, json, params, headers, timeout):
             captured["headers"] = headers
             return FakeResp()
 
@@ -149,7 +153,9 @@ async def test_list_tools_returns_normalized(monkeypatch):
         async def __aexit__(self, *a):
             return False
 
-        async def get(self, url, headers, timeout):
+        async def get(self, url, params, headers, timeout):
+            assert params == {"timeout": 120.0}
+            assert timeout == 130.0
             return FakeResp()
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: FakeClient())

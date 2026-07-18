@@ -70,6 +70,7 @@ class ListToolsResultModel(_LazyMCPType):
 @router.get('/{server_name}/tools', response_model=Response[ListToolsResultModel])
 async def list_mcp_tools(
     server_name: str = Path(..., description='Name of the MCP server'),
+    timeout: float = Query(120.0, gt=0, le=3600),
 ):
     """
     List all available tools from the specified MCP server
@@ -82,7 +83,9 @@ async def list_mcp_tools(
     """
     try:
         mcp_client: 'MCPClient' = services.require('mcp_client')
-        tools_result: 'ListToolsResultType' = await mcp_client.list_tools(server_name)
+        tools_result: 'ListToolsResultType' = await mcp_client.list_tools(
+            server_name, timeout_seconds=timeout
+        )
         return Response(
             success=True,
             message=f"Successfully retrieved tools from MCP server '{server_name}'",
@@ -107,6 +110,7 @@ async def execute_mcp_tool(
     server_name: str = Path(..., description='Name of the MCP server'),
     tool_name: str = Path(..., description='Name of the tool to execute'),
     arguments: Dict[str, Any] = {},
+    timeout: float = Query(120.0, gt=0, le=3600),
 ):
     """
     Execute a specific tool on the specified MCP server
@@ -125,7 +129,10 @@ async def execute_mcp_tool(
         tool_arguments = arguments or {}
 
         execution_result: 'CallToolResultType' = await mcp_client.execute_tool(
-            server_name=server_name, tool_name=tool_name, arguments=tool_arguments
+            server_name=server_name,
+            tool_name=tool_name,
+            arguments=tool_arguments,
+            timeout_seconds=timeout,
         )
 
         return Response(

@@ -51,7 +51,13 @@ ADMIN_SESSION = "clawith-mcp-admin"
 _SAFE_SERVER_NAME = re.compile(r"^[a-z0-9_-]+$")
 
 
-def entry_name(server_name: str, agent_id: str, cfg: dict, cwd: str | None = None) -> str:
+def entry_name(
+    server_name: str,
+    agent_id: str,
+    cfg: dict,
+    cwd: str | None = None,
+    invocation_id: str | None = None,
+) -> str:
     """Compute a deterministic per-agent hub entry name.
 
     The name is ``{server_name}__{sha256[:12]}`` where the fingerprint covers
@@ -70,7 +76,10 @@ def entry_name(server_name: str, agent_id: str, cfg: dict, cwd: str | None = Non
         raise ValueError(
             f"server_name {server_name!r} contains unsafe characters; only [a-z0-9_-] allowed"
         )
-    raw = f"{server_name}|{agent_id}|{json.dumps(cfg, sort_keys=True)}|{cwd or ''}"
+    raw = (
+        f"{server_name}|{agent_id}|{json.dumps(cfg, sort_keys=True)}|"
+        f"{cwd or ''}|{invocation_id or ''}"
+    )
     fingerprint = hashlib.sha256(raw.encode()).hexdigest()[:12]
     return f"{server_name}__{fingerprint}"
 
@@ -132,7 +141,12 @@ class SandboxMcpHost:
     # ------------------------------------------------------------------ Public API
 
     async def ensure_registered(
-        self, server_name: str, agent_id: str, cfg: dict, cwd: str | None = None
+        self,
+        server_name: str,
+        agent_id: str,
+        cfg: dict,
+        cwd: str | None = None,
+        invocation_id: str | None = None,
     ) -> str:
         """Merge a stdio MCP entry into the sandbox hub config and return its name.
 
@@ -158,7 +172,13 @@ class SandboxMcpHost:
         if not cfg.get("command"):
             raise ValueError("cfg must contain a non-empty 'command' key")
 
-        name = entry_name(server_name, agent_id, cfg, cwd=cwd)
+        name = entry_name(
+            server_name,
+            agent_id,
+            cfg,
+            cwd=cwd,
+            invocation_id=invocation_id,
+        )
         entry: dict = {
             "type": "stdio",
             "command": cfg["command"],
@@ -244,6 +264,23 @@ class SandboxMcpHost:
         del_cmd = (
             f"flock {_LOCK_FILE} -c "
             f"'jq --arg n \"{name}\" \"del(.mcpServers[\\$n])\" "
+            f"{_HUB_JSON} > {tmp_hub} "
+            f"&& cat {tmp_hub} > {_HUB_JSON}'"
+        )
+        await self._exec_admin_shell(del_cmd)
+
+    async def deregister_prefix(self, prefix: str) -> None:
+        """Atomically remove every runtime entry belonging to one private server."""
+        if not _SAFE_SERVER_NAME.match(prefix):
+            raise ValueError(
+                f"entry prefix {prefix!r} contains unsafe characters; only [a-z0-9_-] allowed"
+            )
+        digest = hashlib.sha256(prefix.encode()).hexdigest()[:12]
+        tmp_hub = f"/tmp/mcp-prefix-{digest}.del.json"
+        del_cmd = (
+            f"flock {_LOCK_FILE} -c "
+            f"'jq --arg p \"{prefix}\" "
+            f"\".mcpServers |= with_entries(select(.key | startswith(\\$p) | not))\" "
             f"{_HUB_JSON} > {tmp_hub} "
             f"&& cat {tmp_hub} > {_HUB_JSON}'"
         )

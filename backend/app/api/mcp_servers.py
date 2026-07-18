@@ -399,6 +399,12 @@ async def list_mcp_overrides(
     Non-admin with agent_id: returns only that agent's overrides (after creator check).
     Non-admin without agent_id: 403.
     """
+    server = (
+        await db.execute(select(MCPServer).where(MCPServer.id == server_id))
+    ).scalar_one_or_none()
+    if server is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    redact_values = server.owner_agent_id is not None
     is_platform = (current_user.role == "platform_admin"
                    or (current_user.identity and current_user.identity.is_platform_admin))
     if not is_platform:
@@ -415,7 +421,9 @@ async def list_mcp_overrides(
         )).scalars().all()
         grouped = OverridesGroupedOut()
         for r in rows:
-            grouped.agent.append(MCPServerOverrideOut.from_orm_model(r))
+            grouped.agent.append(
+                MCPServerOverrideOut.from_orm_model(r, redact_values=redact_values)
+            )
         return grouped
 
     rows = (await db.execute(
@@ -424,7 +432,9 @@ async def list_mcp_overrides(
     grouped = OverridesGroupedOut()
     for r in rows:
         target_list = grouped.tenant if r.scope_type == "tenant" else grouped.agent
-        target_list.append(MCPServerOverrideOut.from_orm_model(r))
+        target_list.append(
+            MCPServerOverrideOut.from_orm_model(r, redact_values=redact_values)
+        )
     return grouped
 
 
@@ -437,7 +447,8 @@ async def put_tenant_override(
     db: AsyncSession = Depends(get_db),
 ) -> MCPServerOverrideOut:
     await _require_tenant_override_access(current_user, tenant_id)
-    if (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none() is None:
+    server = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
+    if server is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
     ovr = await _upsert_override(db, server_id, "tenant", tenant_id, payload, current_user.id)
     await write_audit_log(
@@ -445,7 +456,9 @@ async def put_tenant_override(
         details={"server_id": str(server_id), "scope_type": "tenant", "scope_id": str(tenant_id)},
         user_id=current_user.id,
     )
-    return MCPServerOverrideOut.from_orm_model(ovr)
+    return MCPServerOverrideOut.from_orm_model(
+        ovr, redact_values=server.owner_agent_id is not None
+    )
 
 
 @router.delete("/{server_id}/overrides/tenant/{tenant_id}", status_code=204)
@@ -482,7 +495,8 @@ async def put_agent_override(
     db: AsyncSession = Depends(get_db),
 ) -> MCPServerOverrideOut:
     await _require_agent_override_access(current_user, agent_id, db)
-    if (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none() is None:
+    server = (await db.execute(select(MCPServer).where(MCPServer.id == server_id))).scalar_one_or_none()
+    if server is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
     ovr = await _upsert_override(db, server_id, "agent", agent_id, payload, current_user.id)
     await write_audit_log(
@@ -490,7 +504,9 @@ async def put_agent_override(
         details={"server_id": str(server_id), "scope_type": "agent", "scope_id": str(agent_id)},
         user_id=current_user.id,
     )
-    return MCPServerOverrideOut.from_orm_model(ovr)
+    return MCPServerOverrideOut.from_orm_model(
+        ovr, redact_values=server.owner_agent_id is not None
+    )
 
 
 @router.delete("/{server_id}/overrides/agent/{agent_id}", status_code=204)
@@ -590,6 +606,16 @@ async def dry_run_mcp_server(
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
     await _assert_can_edit_server(current_user, srv)
+    if srv.owner_agent_id is not None:
+        # A private installation's resolved URL, headers, command/env and
+        # prompt are creator-only values.  Admin dry-run is a projection API,
+        # so ordinary edit permission must never turn into read permission for
+        # those values.  The owning Agent can inspect its configuration through
+        # list_installed_mcp_servers inside its current LLM call.
+        raise HTTPException(
+            status_code=403,
+            detail="private Agent-owned MCP configuration is not available through dry-run",
+        )
 
     # Determine layers + lookup overrides
     used: list[str] = ["platform"]

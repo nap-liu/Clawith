@@ -27,9 +27,10 @@ _UNAUTH = "❌ 未鉴权：请在 MCP 客户端配置 Authorization: Bearer <clw
 
 def _visible_server_clause(tenant_id):
     """MCP servers a caller may reference: same tenant + global (tenant_id IS NULL) templates."""
+    public_server = MCPServer.owner_agent_id.is_(None)
     if tenant_id:
-        return or_(MCPServer.tenant_id == tenant_id, MCPServer.tenant_id.is_(None))
-    return MCPServer.tenant_id.is_(None)
+        return public_server & or_(MCPServer.tenant_id == tenant_id, MCPServer.tenant_id.is_(None))
+    return public_server & MCPServer.tenant_id.is_(None)
 
 
 async def _resolve_local_mcp_server(db, tenant_id, server_id: str):

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.database import async_session, engine
 from app.models.tool import Tool
-from app.models.mcp_server import MCPServer
+from app.models.mcp_server import MCPServer, MCPServerOverride
 
 pytestmark = pytest.mark.asyncio
 
@@ -74,16 +74,22 @@ async def test_import_mcp_direct_creates_mcp_server_row():
 
     # Verify the Tool + MCPServer row were created and linked.
     async with async_session() as db:
-        tool = (await db.execute(
-            select(Tool).where(Tool.mcp_server_url == url)
-        )).scalar_one_or_none()
+        tool = (
+            await db.execute(
+                select(Tool)
+                .join(MCPServer, MCPServer.id == Tool.mcp_server_id)
+                .join(MCPServerOverride, MCPServerOverride.mcp_server_id == MCPServer.id)
+                .where(MCPServerOverride.scope_id == agent_id, MCPServerOverride.url_template == url)
+            )
+        ).scalar_one_or_none()
         assert tool is not None
         assert tool.mcp_tool_name == "bridge_tool"
         assert tool.mcp_server_id is not None, "mcp_server_id should be set by auto-bridge"
         srv = (await db.execute(
             select(MCPServer).where(MCPServer.id == tool.mcp_server_id)
         )).scalar_one()
-        assert srv.base_url_template == url
+        assert srv.base_url_template == ""
+        assert srv.owner_agent_id == agent_id
 
 
 @pytest.mark.parametrize("failure_mode", ["error", "empty"])

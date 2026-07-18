@@ -242,6 +242,7 @@ async def persist_stdio_discovered_tools(
     Returns the number of tools persisted.
     """
     from app.models.tool import Tool
+    from app.services.agent_mcp_lifecycle import build_mcp_tool_name
     from sqlalchemy import select
 
     upserted = 0
@@ -252,7 +253,7 @@ async def persist_stdio_discovered_tools(
         if not raw_name:
             continue
 
-        tool_name = f"mcp_{srv.name}_{raw_name}"
+        tool_name = build_mcp_tool_name(srv.name, raw_name)
         display_name = raw_name.replace("_", " ").title()
 
         existing = (await db.execute(

@@ -39,7 +39,7 @@ class SandboxMcpHubClient:
 
     # ------------------------------------------------------------------ Public API
 
-    async def list_tools(self, server_name: str) -> list[dict]:
+    async def list_tools(self, server_name: str, timeout: float = 120.0) -> list[dict]:
         """List tools exposed by *server_name* via the hub.
 
         Returns a list of ``{name, description, inputSchema}`` dicts.
@@ -50,8 +50,9 @@ class SandboxMcpHubClient:
             async with httpx.AsyncClient() as c:
                 r = await c.get(
                     f"{self.base}/v1/mcp/{server_name}/tools",
+                    params={"timeout": timeout},
                     headers=self._headers(),
-                    timeout=120.0,
+                    timeout=timeout + 10.0,
                 )
         except httpx.HTTPError as e:
             raise Exception(f"MCP hub list_tools network error: {e}") from e
@@ -80,7 +81,13 @@ class SandboxMcpHubClient:
             for t in raw_tools
         ]
 
-    async def call_tool(self, server_name: str, tool_name: str, arguments: dict) -> str:
+    async def call_tool(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: dict,
+        timeout: float = 120.0,
+    ) -> str:
         """Call *tool_name* on *server_name* via the hub.
 
         Returns the concatenated text content on success.
@@ -93,8 +100,9 @@ class SandboxMcpHubClient:
                 r = await c.post(
                     f"{self.base}/v1/mcp/{server_name}/tools/{tool_name}",
                     json=arguments or {},
+                    params={"timeout": timeout},
                     headers=self._headers(),
-                    timeout=120.0,
+                    timeout=timeout + 10.0,
                 )
 
             if r.status_code != 200:

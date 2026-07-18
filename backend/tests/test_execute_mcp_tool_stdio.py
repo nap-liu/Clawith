@@ -4,6 +4,7 @@ Verifies:
 - transport=stdio tools route through SandboxMcpHost + SandboxMcpHubClient
 - transport=http tools still route through MCPClient (no stdio host called)
 """
+import asyncio
 import uuid
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -95,6 +96,7 @@ async def test_stdio_routes_through_sandbox():
          patch("app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()):
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(return_value="yx__abc123456789")
+        mock_host_inst.deregister = AsyncMock(return_value=None)
         MockHost.return_value = mock_host_inst
 
         mock_hub_inst = MagicMock()
@@ -111,6 +113,7 @@ async def test_stdio_routes_through_sandbox():
     mock_host_inst.ensure_registered.assert_awaited_once()
     # call_tool should be called with the hub entry name, the MCP tool name, and args
     mock_hub_inst.call_tool.assert_awaited_once_with("yx__abc123456789", "get_current_user", {})
+    mock_host_inst.deregister.assert_awaited_once_with("yx__abc123456789")
 
 
 async def test_stdio_ensure_registered_receives_rendered_cfg():
@@ -122,6 +125,7 @@ async def test_stdio_ensure_registered_receives_rendered_cfg():
          patch("app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()):
         mock_host_inst = MagicMock()
         mock_host_inst.ensure_registered = AsyncMock(return_value="yx__entry")
+        mock_host_inst.deregister = AsyncMock(return_value=None)
         MockHost.return_value = mock_host_inst
 
         mock_hub_inst = MagicMock()
@@ -143,6 +147,75 @@ async def test_stdio_ensure_registered_receives_rendered_cfg():
     assert cfg_arg["command"] == "npx"
     assert cfg_arg["args"] == ["-y", "alibabacloud-devops-mcp-server"]
     assert cfg_arg["env"]["YUNXIAO_ACCESS_TOKEN"] == "tok-literal"
+    mock_host_inst.deregister.assert_awaited_once_with("yx__entry")
+
+
+async def test_stdio_call_error_still_deregisters_runtime():
+    agent_id, user_id, tool_name = await _make_stdio_fixture()
+
+    with patch("app.services.agent_tools.SandboxMcpHost") as MockHost, patch(
+        "app.services.agent_tools.SandboxMcpHubClient"
+    ) as MockHub, patch("app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()):
+        host = MagicMock()
+        host.ensure_registered = AsyncMock(return_value="yx__error")
+        host.deregister = AsyncMock(return_value=None)
+        MockHost.return_value = host
+        hub = MagicMock()
+        hub.call_tool = AsyncMock(side_effect=RuntimeError("hub exploded"))
+        MockHub.return_value = hub
+
+        from app.services.agent_tools import _execute_mcp_tool
+
+        result = await _execute_mcp_tool(tool_name, {}, agent_id=agent_id, user_id=user_id)
+
+    assert "hub exploded" in result
+    host.deregister.assert_awaited_once_with("yx__error")
+
+
+async def test_concurrent_sessions_with_same_provider_call_id_use_distinct_runtime_entries():
+    agent_id, user_id, tool_name = await _make_stdio_fixture()
+
+    with patch("app.services.agent_tools.SandboxMcpHost") as MockHost, patch(
+        "app.services.agent_tools.SandboxMcpHubClient"
+    ) as MockHub, patch("app.services.agent_tools.get_settings", return_value=_SettingsWithSandbox()):
+        host = MagicMock()
+
+        async def register(*_args, **kwargs):
+            return f"yx__{kwargs['invocation_id']}"
+
+        host.ensure_registered = AsyncMock(side_effect=register)
+        host.deregister = AsyncMock(return_value=None)
+        MockHost.return_value = host
+        hub = MagicMock()
+        hub.call_tool = AsyncMock(side_effect=lambda entry, *_args: entry)
+        MockHub.return_value = hub
+
+        from app.services.agent_tools import _execute_mcp_tool
+
+        results = await asyncio.gather(
+            _execute_mcp_tool(
+                tool_name,
+                {},
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id="session-1",
+                tool_call_id="call-0",
+            ),
+            _execute_mcp_tool(
+                tool_name,
+                {},
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id="session-2",
+                tool_call_id="call-0",
+            ),
+        )
+
+    assert len(set(results)) == 2
+    assert any("session-1:call-0:" in result for result in results)
+    assert any("session-2:call-0:" in result for result in results)
+    cleaned = {call.args[0] for call in host.deregister.await_args_list}
+    assert cleaned == set(results)
 
 
 async def _make_http_fixture():

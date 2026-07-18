@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -53,13 +53,17 @@ class Tool(Base):
 
     mcp_server_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("mcp_servers.id", ondelete="SET NULL"),
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"),
         nullable=True,
     )
 
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("mcp_server_id", "mcp_tool_name", name="uq_tools_mcp_server_tool"),
+    )
 
 
 class AgentTool(Base):
@@ -74,3 +78,7 @@ class AgentTool(Base):
     source: Mapped[str] = mapped_column(String(20), default="system")  # "system" | "user_installed"
     installed_by_agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # agent that installed this tool
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("agent_id", "tool_id", name="uq_agent_tools_agent_tool"),
+    )

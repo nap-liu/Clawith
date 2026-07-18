@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -173,25 +174,27 @@ class MCPClient:
                 f'Failed to create session for {server_name} ({server_type}): {e}'
             )
 
-    async def list_tools(self, server_name: str) -> 'ListToolsResult':
+    async def list_tools(
+        self, server_name: str, timeout_seconds: float = 120.0
+    ) -> 'ListToolsResult':
         """List available tools from an MCP server"""
         try:
             from mcp import ClientSession
 
             logger.info(f"Attempting to list tools from MCP server '{server_name}'")
-            client_context = self._create_session(server_name)
-
-            async with client_context as (read_stream, write_stream, *_):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    logger.info(
-                        f"Session created successfully for '{server_name}', calling list_tools()"
-                    )
-                    result = await session.list_tools()
-                    logger.info(
-                        f"Successfully retrieved {len(result.tools)} tools from '{server_name}'"
-                    )
-                    return result
+            async with asyncio.timeout(timeout_seconds):
+                client_context = self._create_session(server_name)
+                async with client_context as (read_stream, write_stream, *_):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        logger.info(
+                            f"Session created successfully for '{server_name}', calling list_tools()"
+                        )
+                        result = await session.list_tools()
+                        logger.info(
+                            f"Successfully retrieved {len(result.tools)} tools from '{server_name}'"
+                        )
+                        return result
         except Exception as e:
             logger.error(
                 f'Error listing tools from {server_name}: {type(e).__name__}: {e}',
@@ -227,13 +230,18 @@ class MCPClient:
 
     @trace_api('mcp')
     async def execute_tool(
-        self, server_name: str, tool_name: str, arguments: Dict[str, Any]
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        timeout_seconds: float = 120.0,
     ) -> 'CallToolResult':
         """Execute a tool on an MCP server"""
         try:
-            return await self._execute_tool_core(
-                server_name, tool_name, arguments, stateless=False
-            )
+            async with asyncio.timeout(timeout_seconds):
+                return await self._execute_tool_core(
+                    server_name, tool_name, arguments, stateless=False
+                )
         except Exception as e:
             logger.error(
                 f'Error executing tool {tool_name} on {server_name}: {type(e).__name__}: {e}',

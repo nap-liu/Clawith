@@ -1915,6 +1915,46 @@ BUILTIN_TOOLS = [
             ]
         },
     },
+    {
+        "name": "list_installed_mcp_servers",
+        "display_name": "List Installed MCP Servers",
+        "description": (
+            "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. "
+            "No arguments are needed. The platform automatically includes complete URL, headers, credentials, "
+            "command, args, and env only for MCP servers created by you; sensitive config from enterprise or "
+            "other creators is never returned."
+        ),
+        "category": "discovery",
+        "icon": "📋",
+        "is_default": True,
+        "parameters_schema": {"type": "object", "properties": {}, "required": []},
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
+        "name": "uninstall_mcp_server",
+        "display_name": "Uninstall MCP Server",
+        "description": (
+            "Uninstall one MCP server from yourself using the exact mcp_server_id returned by "
+            "list_installed_mcp_servers or import_mcp_server. This only removes your self-installed binding; "
+            "enterprise/shared MCP definitions and other agents are never affected. The removal is effective immediately."
+        ),
+        "category": "discovery",
+        "icon": "🧹",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "mcp_server_id": {
+                    "type": "string",
+                    "description": "Exact MCP server UUID. Names and fuzzy identifiers are not accepted.",
+                }
+            },
+            "required": ["mcp_server_id"],
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
     # --- Email tools ---
     {
         "name": "send_email",

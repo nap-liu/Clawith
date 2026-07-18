@@ -57,6 +57,14 @@ def test_entry_name_changes_with_cfg():
     assert n1 != n2
 
 
+def test_entry_name_is_unique_per_runtime_invocation():
+    cfg = {"command": "npx", "args": ["-y", "pkg"], "env": {}}
+    first = entry_name("srv", "agentA", cfg, invocation_id="call-1")
+    second = entry_name("srv", "agentA", cfg, invocation_id="call-2")
+    assert first != second
+    assert first.startswith("srv__") and second.startswith("srv__")
+
+
 async def test_ensure_registered_writes_merge(monkeypatch):
     calls = []
 
@@ -291,6 +299,31 @@ async def test_deregister_rejects_unsafe_name(monkeypatch):
     host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
     with pytest.raises(ValueError, match="unsafe"):
         await host.deregister('evil"; rm -rf /')
+
+
+async def test_deregister_prefix_emits_atomic_prefix_filter(monkeypatch):
+    calls = []
+
+    async def fake_exec(self, command: str):
+        calls.append(command)
+        return {"success": True}
+
+    monkeypatch.setattr(SandboxMcpHost, "_exec_admin_shell", fake_exec)
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    await host.deregister_prefix("private-server__")
+
+    assert len(calls) == 1
+    command = calls[0]
+    assert "flock" in command
+    assert "with_entries" in command
+    assert "startswith(\\$p)" in command
+    assert 'private-server__' in command
+
+
+async def test_deregister_prefix_rejects_unsafe_prefix():
+    host = SandboxMcpHost(base_url="http://x:8080", api_key=None)
+    with pytest.raises(ValueError, match="unsafe"):
+        await host.deregister_prefix("private;rm")
 
 
 # ---------------------------------------------------------------------------
