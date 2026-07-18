@@ -1,7 +1,7 @@
 # clawith-aio-sandbox patched overlay
 
-Thin overlay image on top of `all-in-one-sandbox:1.9.3` that fixes two bugs in
-`/opt/python3.12/lib/python3.12/site-packages/app/services/mcp_client.py`.
+Thin overlay image on top of `all-in-one-sandbox:1.9.3` that carries the
+Clawith lifecycle fixes which are not yet available in the upstream image.
 
 This is a **temporary overlay** pending an upstream fix in agent-infra/sandbox.
 
@@ -80,6 +80,21 @@ code.
 10). For a higher-capacity production host, validate a synthetic ceiling on
 that same host and configure no more than 80% of the last fully stable level;
 for a business target of 100, the 125-session gate must pass first.
+
+### 6. AIO-enforced MCP deadline and stdio child cleanup (`mcp.py`, `mcp_client.py`)
+
+The backend HTTP timeout alone cannot guarantee cleanup of a stdio MCP child:
+the request may disappear while the AIO process is still blocked in MCP
+initialization or tool execution. Both MCP REST endpoints now accept the same
+`timeout` query parameter (default 120 seconds) and enforce it inside AIO around
+the complete `stdio_client` and `ClientSession` context. On timeout, cancellation
+unwinds those context managers and terminates the child process before AIO
+returns an error.
+
+Clawith forwards the requested deadline to AIO and gives the HTTP transport a
+small additional grace period for cleanup and error delivery. Runtime MCP
+registration also uses a unique entry per tool invocation, so concurrent calls
+to the same installed server cannot deregister each other's configuration.
 
 ## Build
 

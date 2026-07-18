@@ -355,7 +355,12 @@ async def import_mcp_from_smithery(
                 )
             )
             existing_server_tools = existing_server_r.scalars().all()
-            if existing_server_tools and not config and not reauthorize:
+            if (
+                existing_server_tools
+                and all(tool.mcp_server_id is not None for tool in existing_server_tools)
+                and not config
+                and not reauthorize
+            ):
                 # Check if this agent has assignments for these tools
                 tool_ids = [t.id for t in existing_server_tools]
                 agent_assignments_r = await db.execute(
@@ -371,6 +376,7 @@ async def import_mcp_from_smithery(
                     return (
                         f"⏭️ You already have **{len(existing_server_tools)}** tools from this MCP server installed:\n"
                         + "\n".join(f"  • {n}" for n in tool_names) + more
+                        + f"\n\n🆔 MCP Server ID: `{existing_server_tools[0].mcp_server_id}`"
                         + "\n\nNo action needed. These tools are ready to use."
                         + "\n\n💡 If tools stopped working (e.g. OAuth expired), use `import_mcp_server(server_id=\"....\", reauthorize=true)` to re-authorize."
                     )
@@ -525,10 +531,29 @@ async def import_mcp_from_smithery(
             )
 
     # Merge smithery_config + user config for AgentTool
-    agent_tool_config = {**smithery_config, **config}
+    agent_tool_config = {
+        **smithery_config,
+        **config,
+        "server_id": qualified_name,
+        "mcp_url": base_mcp_url,
+        "smithery_api_key": api_key,
+    }
 
     async with async_session() as db:
+        from app.models.agent import Agent as _Agent
+        from app.services.mcp_server_service import upsert_mcp_server_from_tools
+
         imported_tools = []
+        agent_row = (
+            await db.execute(select(_Agent).where(_Agent.id == agent_id))
+        ).scalar_one_or_none()
+        tenant_id = agent_row.tenant_id if agent_row else None
+        mcp_server_id = await upsert_mcp_server_from_tools(
+            db,
+            tenant_id=tenant_id,
+            server_url=base_mcp_url,
+            server_name=display_name,
+        )
 
         # Helper: ensure AgentTool link exists and save config
         async def _ensure_agent_tool(tool_id: uuid.UUID):
@@ -578,6 +603,7 @@ async def import_mcp_from_smithery(
                 existing_tool = existing_r.scalar_one_or_none()
                 if existing_tool:
                     existing_tool.mcp_server_url = base_mcp_url
+                    existing_tool.mcp_server_id = mcp_server_id
                     await _ensure_agent_tool(existing_tool.id)
                     if reauthorize:
                         imported_tools.append(f"🔄 {tool_display} (reauthorized)")
@@ -598,6 +624,7 @@ async def import_mcp_from_smithery(
                     mcp_server_url=base_mcp_url,
                     mcp_server_name=display_name,
                     mcp_tool_name=mcp_tool["name"],
+                    mcp_server_id=mcp_server_id,
                     enabled=True,
                     is_default=False,
                     source="agent",
@@ -615,12 +642,16 @@ async def import_mcp_from_smithery(
             existing_tool = existing_r.scalar_one_or_none()
             if existing_tool:
                 existing_tool.mcp_server_url = base_mcp_url
+                existing_tool.mcp_server_id = mcp_server_id
                 await _ensure_agent_tool(existing_tool.id)
+                await db.commit()
                 if config:
-                    await db.commit()
                     return f"🔄 {tool_display} config updated. The tool is now ready to use."
                 else:
-                    return f"⏭️ {tool_display} is already imported."
+                    return (
+                        f"⏭️ {tool_display} is already imported.\n\n"
+                        f"🆔 MCP Server ID: `{mcp_server_id}`"
+                    )
 
             tool = Tool(
                 name=tool_name,
@@ -632,6 +663,7 @@ async def import_mcp_from_smithery(
                 parameters_schema={"type": "object", "properties": {}},
                 mcp_server_url=base_mcp_url,
                 mcp_server_name=display_name,
+                mcp_server_id=mcp_server_id,
                 enabled=True,
                 is_default=False,
                 source="agent",
@@ -645,6 +677,7 @@ async def import_mcp_from_smithery(
 
     result = f"🔌 Imported MCP server: **{display_name}** (`{server_id}`)\n\n"
     result += "\n".join(imported_tools)
+    result += f"\n\n🆔 MCP Server ID: `{mcp_server_id}`"
     result += f"\n\n📡 MCP Server URL: `{base_mcp_url}`"
     if auth_message:
         result += auth_message
@@ -729,7 +762,10 @@ async def import_mcp_direct(
         )
 
     # Config to store in AgentTool
-    agent_tool_config: dict = {}
+    agent_tool_config: dict = {
+        "mcp_url": mcp_url,
+        "server_name": display_name,
+    }
     if api_key:
         agent_tool_config["api_key"] = api_key
     if isinstance(headers, dict) and headers:
@@ -835,6 +871,7 @@ async def import_mcp_direct(
 
     result = f"🔌 Imported MCP server: **{display_name}** ({len(tools_discovered)} tools)\n\n"
     result += "\n".join(imported_tools)
+    result += f"\n\n🆔 MCP Server ID: `{srv.id}`"
     result += f"\n\n📡 MCP Server URL: `{mcp_url}`"
     result += "\n\n💡 The imported tools are now available for use."
     return result
@@ -1012,14 +1049,20 @@ async def import_mcp_stdio_direct(agent_id, parsed: dict) -> str:
                 AgentTool.agent_id == agent_id, AgentTool.tool_id == tool.id))).scalar_one_or_none()
             if at is None:
                 db.add(AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True,
-                                 source="user_installed", installed_by_agent_id=agent_id, config={}))
+                                 source="user_installed", installed_by_agent_id=agent_id,
+                                 config=dict(cfg)))
+            else:
+                at.enabled = True
+                at.source = "user_installed"
+                at.installed_by_agent_id = agent_id
+                at.config = dict(cfg)
             assigned.append(tool.mcp_tool_name)
         await db.commit()
 
         lines = "\n".join(f"• {n}" for n in assigned[:20])
         more = f"\n…共 {len(assigned)} 个" if len(assigned) > 20 else ""
         return (
-            f"✅ 已安装 stdio MCP 服务 `{srv.name}`,发现并分配 {count} 个工具:\n{lines}{more}\n\n"
+            f"✅ 已安装 stdio MCP 服务 `{srv.name}` (`{srv.id}`),发现并分配 {count} 个工具:\n{lines}{more}\n\n"
             f"⚠️ 重要:这 {count} 个工具会在**下一轮对话**才进入你的可用工具列表,"
             f"**本轮还调用不了**。请现在就**结束本轮回复**(不要在本轮尝试调用它们),"
             f"告诉用户工具已安装就绪,请用户在下一条消息里让你执行需要这些工具的任务。"

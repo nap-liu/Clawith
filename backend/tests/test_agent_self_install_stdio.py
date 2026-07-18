@@ -133,6 +133,7 @@ async def test_import_mcp_stdio_direct_discovers_and_assigns():
     # callable next turn), so it doesn't fumble calling them in the same turn.
     assert "下一轮" in result
     assert "结束本轮" in result
+    assert "MCP 服务" in result and str(agent_id).replace("-", "")[:8] in result
 
     # Find the tool scoped to this agent's server (name ends with -a{agent8})
     agent8 = str(agent_id).replace("-", "")[:8]
@@ -149,6 +150,12 @@ async def test_import_mcp_stdio_direct_discovers_and_assigns():
             AgentTool.agent_id == agent_id, AgentTool.tool_id == t.id))).scalar_one_or_none()
         assert at is not None
         assert at.source == "user_installed"
+        assert at.installed_by_agent_id == agent_id
+        assert at.config == {
+            "command": "npx",
+            "args": ["-y", "alibabacloud-devops-mcp-server"],
+            "env": {"YUNXIAO_ACCESS_TOKEN": "tok"},
+        }
 
 
 async def test_import_mcp_stdio_direct_no_sandbox_url():

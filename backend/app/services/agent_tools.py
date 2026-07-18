@@ -1774,6 +1774,31 @@ AGENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_installed_mcp_servers",
+            "description": "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. No arguments are needed. For MCP bindings installed by you, the platform also returns the installation config saved on your own binding. Shared server credentials are never inferred or copied into the result.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "uninstall_mcp_server",
+            "description": "Uninstall one MCP server from yourself using the exact mcp_server_id returned by list_installed_mcp_servers or import_mcp_server. This only removes your self-installed binding; enterprise/shared MCP definitions and other agents are never affected. The removal is effective immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mcp_server_id": {
+                        "type": "string",
+                        "description": "Exact MCP server UUID. Names and fuzzy identifiers are not accepted.",
+                    }
+                },
+                "required": ["mcp_server_id"],
+            },
+        },
+    },
     # ─── Email Tools ────────────────────────
     {
         "type": "function",
@@ -3591,6 +3616,17 @@ async def execute_tool(
             result = await _discover_resources(agent_id, arguments)
         elif tool_name == "import_mcp_server":
             result = await _import_mcp_server(agent_id, arguments)
+        elif tool_name == "list_installed_mcp_servers":
+            from app.services.agent_mcp_lifecycle import list_installed_mcp_servers
+            result = await list_installed_mcp_servers(agent_id)
+        elif tool_name == "uninstall_mcp_server":
+            from app.services.agent_mcp_lifecycle import uninstall_mcp_server
+            try:
+                _server_id = uuid.UUID(str(arguments.get("mcp_server_id") or ""))
+            except (ValueError, TypeError):
+                result = "❌ mcp_server_id must be an exact UUID from list_installed_mcp_servers."
+            else:
+                result = await uninstall_mcp_server(agent_id, _server_id)
         # ── Feishu Bitable Tools ──
         elif tool_name == "bitable_create_app":
             result = await _bitable_create_app(agent_id, arguments)
@@ -3809,17 +3845,41 @@ async def execute_tool(
             if cli_result is not None:
                 result = cli_result
             else:
-                result = await _execute_mcp_tool(tool_name, arguments, agent_id=agent_id, user_id=user_id, session_id=session_id)
+                result = await _execute_mcp_tool(
+                    tool_name,
+                    arguments,
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                )
 
-        # Log tool call activity (skip noisy read operations)
+        # Log tool call activity (skip noisy read operations). Keep the result
+        # shape intact for diagnostics and mask only explicit credential values.
         if tool_name not in ("list_files", "read_file", "read_document"):
             from app.services.activity_logger import log_activity
-            from app.utils.sanitize import sanitize_tool_args
+            from app.utils.sanitize import sanitize_sensitive_values, sanitize_tool_args
             _log_args = sanitize_tool_args(arguments) or {}
+            _log_result = result
+            if tool_name == "list_installed_mcp_servers":
+                try:
+                    _log_result = json.dumps(
+                        sanitize_sensitive_values(json.loads(result)),
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                except Exception:
+                    pass
+            _summary = f"Called tool {tool_name}: {_log_result[:80]}"
+            _detail = {
+                "tool": tool_name,
+                "args": {k: str(v)[:100] for k, v in _log_args.items()},
+                "result": _log_result[:300],
+            }
             await log_activity(
                 agent_id, "tool_call",
-                f"Called tool {tool_name}: {result[:80]}",
-                detail={"tool": tool_name, "args": {k: str(v)[:100] for k, v in _log_args.items()}, "result": result[:300]},
+                _summary,
+                detail=_detail,
             )
         # Save error message to current session if a messaging tool fails, so the user is notified
         if session_id and tool_name in (
@@ -4721,6 +4781,7 @@ async def _execute_mcp_tool(
     agent_id=None,
     user_id=None,
     session_id: str = "",
+    tool_call_id: str = "",
 ) -> str:
     """Execute a tool via MCP if it exists in the DB as an MCP tool."""
     try:
@@ -4738,21 +4799,57 @@ async def _execute_mcp_tool(
         async with async_session() as db:
             # Primary lookup: clawith-prefixed name (e.g.
             # mcp_shibui_finance_unlock_financial_analysis).
-            result = await db.execute(select(Tool).where(Tool.name == tool_name, Tool.type == "mcp"))
+            result = await db.execute(
+                select(Tool).where(Tool.name == tool_name, Tool.type == "mcp", Tool.enabled == True)
+            )
             tool = result.scalar_one_or_none()
 
             # Fallback: LLM sometimes drops the mcp_<server>_ prefix and calls
             # the bare MCP-side tool name (e.g. unlock_financial_analysis).
             # Resolve by mcp_tool_name when the prefixed name doesn't match.
             if not tool:
-                result = await db.execute(
-                    select(Tool).where(Tool.mcp_tool_name == tool_name, Tool.type == "mcp")
-                )
-                tool = result.scalar_one_or_none()
+                if not agent_id:
+                    return f"❌ MCP tool {tool_name}: current agent identity is required"
+                candidates = (
+                    await db.execute(
+                        select(Tool)
+                        .join(AgentTool, AgentTool.tool_id == Tool.id)
+                        .where(
+                            Tool.mcp_tool_name == tool_name,
+                            Tool.type == "mcp",
+                            Tool.enabled == True,
+                            AgentTool.agent_id == agent_id,
+                            AgentTool.enabled == True,
+                        )
+                    )
+                ).scalars().all()
+                if len(candidates) > 1:
+                    return (
+                        f"❌ MCP tool name '{tool_name}' is ambiguous for this agent; "
+                        "use the exact platform tool name."
+                    )
+                tool = candidates[0] if candidates else None
 
             if not tool:
                 logger.warning(f"[MCP] Unknown tool: {tool_name}")
                 return f"Unknown tool: {tool_name}"
+
+            # The LLM tool schema is frozen at the beginning of a turn.  A
+            # server may be uninstalled later in that same turn, so execution
+            # must re-check the live assignment immediately before every call.
+            if not agent_id:
+                return f"❌ MCP tool {tool_name}: current agent identity is required"
+            live_assignment = (
+                await db.execute(
+                    select(AgentTool).where(
+                        AgentTool.agent_id == agent_id,
+                        AgentTool.tool_id == tool.id,
+                        AgentTool.enabled == True,
+                    )
+                )
+            ).scalar_one_or_none()
+            if live_assignment is None:
+                return f"❌ MCP tool {tool_name}: no longer installed or enabled for this agent"
 
             # NEW PATH: when tool.mcp_server_id is populated (P0a migration done),
             # use the mcp_servers table + overrides + placeholder rendering.
@@ -4802,15 +4899,67 @@ async def _execute_mcp_tool(
                             ws = _agent_workspace_root(uuid.UUID(str(agent_id)))
                             ws.mkdir(parents=True, exist_ok=True)
                             work_dir = str(ws.resolve())
-                        except Exception:
-                            pass  # non-fatal — fall back to no cwd
+                        except Exception as workspace_exc:
+                            logger.error(
+                                "[MCP] agent workspace unavailable agent={} server_id={}: {}",
+                                agent_id,
+                                srv.id,
+                                workspace_exc,
+                            )
+                            return (
+                                f"❌ MCP tool {tool_name}: agent workspace unavailable — "
+                                f"{type(workspace_exc).__name__}: {workspace_exc}"
+                            )
                     host = SandboxMcpHost(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
+                    # Provider tool_call_id values are not guaranteed unique
+                    # across sessions or requests.  Include correlation data
+                    # for diagnostics, but always add a backend nonce so two
+                    # real executions can never share/deregister one entry.
+                    invocation_id = (
+                        f"{session_id or 'no-session'}:"
+                        f"{tool_call_id or 'no-tool-call'}:"
+                        f"{uuid.uuid4().hex}"
+                    )
                     entry = await host.ensure_registered(
                         srv.name, str(agent_id), {"command": r_cmd, "args": r_args, "env": r_env},
                         cwd=work_dir,
+                        invocation_id=invocation_id,
+                    )
+                    logger.info(
+                        "[MCP] stdio call start agent={} session={} tool_call={} "
+                        "server_id={} entry={} workspace={}",
+                        agent_id,
+                        session_id or "no-session",
+                        tool_call_id or "no-tool-call",
+                        srv.id,
+                        entry,
+                        work_dir or "default",
                     )
                     hub = SandboxMcpHubClient(_settings_now.SANDBOX_API_URL, _settings_now.SANDBOX_API_KEY)
-                    return await hub.call_tool(entry, tool.mcp_tool_name or tool_name, arguments)
+                    try:
+                        return await hub.call_tool(entry, tool.mcp_tool_name or tool_name, arguments)
+                    finally:
+                        # A hub registration is per call. Removing it on every
+                        # exit path prevents failed/timed-out calls from leaving
+                        # a process that poisons later MCP calls in the sandbox.
+                        try:
+                            await host.deregister(entry)
+                            logger.info(
+                                "[MCP] stdio call cleanup complete agent={} server_id={} entry={} workspace={}",
+                                agent_id,
+                                srv.id,
+                                entry,
+                                work_dir or "default",
+                            )
+                        except Exception as cleanup_exc:
+                            logger.warning(
+                                "[MCP] stdio runtime cleanup failed agent={} server_id={} entry={} workspace={}: {}",
+                                agent_id,
+                                srv.id,
+                                entry,
+                                work_dir or "default",
+                                cleanup_exc,
+                            )
                 # else: existing http path continues below.
 
                 # Render — MCP connection-time gets the FULL ALL_ROOTS context.
@@ -4854,6 +5003,7 @@ async def _execute_mcp_tool(
                     # Smithery path expects merged_config dict with credential and headers.
                     # Adapter: stuff resolved values back into a dict matching the legacy contract.
                     smithery_cfg = {
+                        **(live_assignment.config or {}),
                         "smithery_api_key": resolved_credential,
                         "headers": resolved_headers if resolved_headers else None,
                     }

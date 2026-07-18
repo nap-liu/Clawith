@@ -6,7 +6,10 @@ RUN echo "28dec0a9b8b53cd603ffc8468eb8d45b477d62aa6d23505cc3a026b219a6b9f4  /opt
     | sha256sum -c -
 RUN echo "2319d2f771361250f4c101b920ceb82e7929507459b779579f7cbc1c3a1c4dae  /opt/python3.12/lib/python3.12/site-packages/app/api/v1/shell.py" \
     | sha256sum -c -
-# Patch 1+2: stdio unpack fix + config hot-reload (cached_property -> property).
+# Patch 1+2+6: stdio unpack fix, config hot-reload, and a server-side
+# per-request deadline that encloses the complete MCP stdio session lifecycle.
+# Cancellation exits stdio_client's context manager so a stuck child process is
+# terminated even if the Clawith backend request disappears.
 COPY mcp_client.py /opt/python3.12/lib/python3.12/site-packages/app/services/mcp_client.py
 # Patch 3: make the generated mcp-hub.json writable by the `gem` API user so
 # Clawith can register stdio MCP servers at runtime via the sandbox API
@@ -17,7 +20,8 @@ RUN chmod +x /opt/gem/run.sh
 # exception and returned a generic "Failed to execute tool" 500 while logging the
 # real error — so the upstream API message (e.g. "Yunxiao API error: invalid
 # workitemTypeId") never reached the caller, and the LLM kept blindly retrying.
-# The only change vs upstream mcp.py is appending `: {e}` to the 500 detail.
+# It also forwards the existing request timeout into the MCP client so the
+# deadline is enforced inside AIO rather than only by its HTTP caller.
 COPY mcp.py /opt/python3.12/lib/python3.12/site-packages/app/api/v1/mcp.py
 # Patch 5: make the existing /v1/shell timeout actually terminate the
 # foreground process group while keeping the stateful tmux shell and prior

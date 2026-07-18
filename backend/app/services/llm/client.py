@@ -318,6 +318,25 @@ def select_cache_breakpoints(messages_payload: list[dict]) -> list[int]:
     return ordered
 
 
+def _observable_messages_payload(messages_payload: list[dict]) -> list[dict]:
+    """Keep the request diagnosable while masking explicit credential fields."""
+    from app.utils.sanitize import sanitize_sensitive_values
+
+    observable = sanitize_sensitive_values(messages_payload)
+    for message in observable:
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        try:
+            decoded = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        message["content"] = json.dumps(
+            sanitize_sensitive_values(decoded), ensure_ascii=False, default=str
+        )
+    return observable
+
+
 class OpenAICompatibleClient(LLMClient):
     """Client for OpenAI-compatible APIs (OpenAI, DeepSeek, Qwen, etc.)."""
 
@@ -424,7 +443,15 @@ class OpenAICompatibleClient(LLMClient):
         messages_payload = self._messages_to_openai_payload(messages)
         if self._is_dashscope_channel():
             self._apply_dashscope_cache_markers(messages_payload)
-        logger.debug(f"[LLM-Debug] OpenAICompatibleClient payload messages for model {self.model}: {json.dumps(messages_payload, indent=2, ensure_ascii=False)}")
+        logger.debug(
+            "[LLM-Debug] OpenAICompatibleClient payload messages for model {}: {}",
+            self.model,
+            json.dumps(
+                _observable_messages_payload(messages_payload),
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages_payload,

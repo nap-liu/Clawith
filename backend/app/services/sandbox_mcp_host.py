@@ -35,10 +35,13 @@ Usage::
 import base64
 import hashlib
 import json
+import logging
 import re
 import shlex
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 # Hub config path inside the sandbox container.
 _HUB_JSON = "/opt/gem/mcp-hub.json"
@@ -51,15 +54,21 @@ ADMIN_SESSION = "clawith-mcp-admin"
 _SAFE_SERVER_NAME = re.compile(r"^[a-z0-9_-]+$")
 
 
-def entry_name(server_name: str, agent_id: str, cfg: dict, cwd: str | None = None) -> str:
-    """Compute a deterministic per-agent hub entry name.
+def entry_name(
+    server_name: str,
+    agent_id: str,
+    cfg: dict,
+    cwd: str | None = None,
+    invocation_id: str | None = None,
+) -> str:
+    """Compute a collision-free per-invocation hub entry name.
 
     The name is ``{server_name}__{sha256[:12]}`` where the fingerprint covers
     ``server_name``, ``agent_id``, the sorted-key JSON of ``cfg``, and
     optionally ``cwd`` (so two different working directories yield different names).
 
     Properties guaranteed by construction:
-    - **Deterministic**: same inputs always produce the same name.
+    - **Per-invocation**: a unique invocation id prevents concurrent cleanup races.
     - **Per-agent**: changing ``agent_id``, ``cfg``, or ``cwd`` changes the name.
     - **Safe for hub JSON keys**: only ``[a-z0-9_-]`` characters.
 
@@ -70,7 +79,10 @@ def entry_name(server_name: str, agent_id: str, cfg: dict, cwd: str | None = Non
         raise ValueError(
             f"server_name {server_name!r} contains unsafe characters; only [a-z0-9_-] allowed"
         )
-    raw = f"{server_name}|{agent_id}|{json.dumps(cfg, sort_keys=True)}|{cwd or ''}"
+    raw = (
+        f"{server_name}|{agent_id}|{json.dumps(cfg, sort_keys=True)}|"
+        f"{cwd or ''}|{invocation_id or ''}"
+    )
     fingerprint = hashlib.sha256(raw.encode()).hexdigest()[:12]
     return f"{server_name}__{fingerprint}"
 
@@ -132,7 +144,12 @@ class SandboxMcpHost:
     # ------------------------------------------------------------------ Public API
 
     async def ensure_registered(
-        self, server_name: str, agent_id: str, cfg: dict, cwd: str | None = None
+        self,
+        server_name: str,
+        agent_id: str,
+        cfg: dict,
+        cwd: str | None = None,
+        invocation_id: str | None = None,
     ) -> str:
         """Merge a stdio MCP entry into the sandbox hub config and return its name.
 
@@ -146,11 +163,11 @@ class SandboxMcpHost:
         Idempotent: calling again with the same inputs overwrites the same key
         with the same value (no-op from the hub's perspective).
 
-        ``cwd`` — when provided — sets the working directory for the npx/stdio
-        process inside the sandbox, isolating each agent's working state under
-        its own workspace path (e.g. ``/data/agents/{agent_id}``).  It is also
-        folded into the fingerprint so two agents get distinct hub entries even
-        when their ``cfg`` is identical.
+        ``cwd`` — when provided — is the stable Agent workspace. Every stdio MCP
+        invocation for the same Agent receives this same directory and therefore
+        shares files and local IPC state. ``invocation_id`` changes only the hub
+        entry/process handle used for precise timeout cleanup; it never creates a
+        separate workspace or filesystem namespace.
 
         Raises ``ValueError`` if *server_name* contains unsafe characters or if
         *cfg* does not contain a non-empty ``"command"`` key.
@@ -158,7 +175,13 @@ class SandboxMcpHost:
         if not cfg.get("command"):
             raise ValueError("cfg must contain a non-empty 'command' key")
 
-        name = entry_name(server_name, agent_id, cfg, cwd=cwd)
+        name = entry_name(
+            server_name,
+            agent_id,
+            cfg,
+            cwd=cwd,
+            invocation_id=invocation_id,
+        )
         entry: dict = {
             "type": "stdio",
             "command": cfg["command"],
@@ -218,6 +241,13 @@ class SandboxMcpHost:
         if not res.get("success") or exit_code != 0:
             raise Exception(f"hub register failed (exit_code={exit_code}): {res}")
 
+        logger.info(
+            "registered stdio MCP entry=%s agent=%s cwd=%s",
+            name,
+            agent_id,
+            cwd or "default",
+        )
+
         # No restart or reload required — the patched sandbox image reads
         # mcp-hub.json on every request (@property instead of @cached_property).
         return name
@@ -248,3 +278,4 @@ class SandboxMcpHost:
             f"&& cat {tmp_hub} > {_HUB_JSON}'"
         )
         await self._exec_admin_shell(del_cmd)
+        logger.info("deregistered stdio MCP entry=%s", name)

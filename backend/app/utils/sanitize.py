@@ -2,7 +2,7 @@
 
 import re
 from copy import deepcopy
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunparse, urlunsplit
 
 # Data-URL for inline images — redacted to prevent base64 payload pollution
 # in audit logs, WebSocket broadcasts, and session history.
@@ -30,11 +30,65 @@ def _redact_if_base64_image(value):
 SENSITIVE_FIELD_NAMES = {
     "password", "secret", "token", "api_key", "apikey", "api_secret",
     "access_token", "refresh_token", "private_key", "secret_key",
-    "authorization", "credentials", "auth",
+    "authorization", "credential", "credentials", "auth", "cookie",
     # Connection/credential strings — hide entirely, not partially
     "connection_string", "database_url", "db_url", "dsn", "uri",
     "connection_uri", "jdbc_url", "mongo_uri", "redis_url",
 }
+
+
+def _is_sensitive_field_name(name: str) -> bool:
+    """Match explicit credential fields while preserving ordinary debug data."""
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+    return (
+        normalized in SENSITIVE_FIELD_NAMES
+        or normalized.endswith("_password")
+        or normalized.endswith("_secret")
+        or normalized.endswith("_token")
+        or normalized.endswith("_api_key")
+        or normalized.endswith("_access_key")
+    )
+
+
+def _mask_sensitive_url_query(value: str) -> str:
+    """Mask known credential query parameters without hiding the useful URL."""
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc or not parsed.query:
+            return value
+        changed = False
+        query = []
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+            if _is_sensitive_field_name(key) or key.lower() in {"key", "sig", "signature"}:
+                item = "******"
+                changed = True
+            query.append((key, item))
+        if not changed:
+            return value
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
+    except Exception:
+        return value
+
+
+def sanitize_sensitive_values(value):
+    """Recursively mask only known credential values and preserve structure.
+
+    This is intended for observable logs/history: IDs, commands, arguments,
+    phases and error text remain intact so MCP failures stay diagnosable.
+    """
+    if isinstance(value, dict):
+        return {
+            key: "******" if _is_sensitive_field_name(str(key))
+            else sanitize_sensitive_values(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_sensitive_values(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_sensitive_values(item) for item in value)
+    if isinstance(value, str):
+        return _mask_sensitive_url_query(_redact_if_base64_image(value))
+    return value
 
 
 def sanitize_tool_args(args: dict | None) -> dict | None:

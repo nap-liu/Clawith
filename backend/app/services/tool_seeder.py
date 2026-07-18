@@ -22,6 +22,8 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "jina_search",
     "jina_read",
     "update_objective",
+    "list_installed_mcp_servers",
+    "uninstall_mcp_server",
     # request_confirmation is OPT-IN (is_default=False); it was briefly seeded is_default=True,
     # so sync the correction to the DB on deploy (otherwise existing rows keep is_default=True).
     "request_confirmation",
@@ -1914,6 +1916,45 @@ BUILTIN_TOOLS = [
                 },
             ]
         },
+    },
+    {
+        "name": "list_installed_mcp_servers",
+        "display_name": "List Installed MCP Servers",
+        "description": (
+            "List every MCP server currently assigned to you with its exact mcp_server_id and uninstallability. "
+            "No arguments are needed. For MCP bindings installed by you, the platform also returns the installation "
+            "config saved on your own binding. Shared server credentials are never inferred or copied into the result."
+        ),
+        "category": "discovery",
+        "icon": "📋",
+        "is_default": True,
+        "parameters_schema": {"type": "object", "properties": {}, "required": []},
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
+        "name": "uninstall_mcp_server",
+        "display_name": "Uninstall MCP Server",
+        "description": (
+            "Uninstall one MCP server from yourself using the exact mcp_server_id returned by "
+            "list_installed_mcp_servers or import_mcp_server. This only removes your self-installed binding; "
+            "enterprise/shared MCP definitions and other agents are never affected. The removal is effective immediately."
+        ),
+        "category": "discovery",
+        "icon": "🧹",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "mcp_server_id": {
+                    "type": "string",
+                    "description": "Exact MCP server UUID. Names and fuzzy identifiers are not accepted.",
+                }
+            },
+            "required": ["mcp_server_id"],
+        },
+        "config": {},
+        "config_schema": {"fields": []},
     },
     # --- Email tools ---
     {

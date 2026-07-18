@@ -57,6 +57,14 @@ def test_entry_name_changes_with_cfg():
     assert n1 != n2
 
 
+def test_entry_name_is_unique_per_runtime_invocation():
+    cfg = {"command": "npx", "args": ["-y", "pkg"], "env": {}}
+    first = entry_name("srv", "agentA", cfg, invocation_id="call-1")
+    second = entry_name("srv", "agentA", cfg, invocation_id="call-2")
+    assert first != second
+    assert first.startswith("srv__") and second.startswith("srv__")
+
+
 async def test_ensure_registered_writes_merge(monkeypatch):
     calls = []
 
@@ -294,7 +302,7 @@ async def test_deregister_rejects_unsafe_name(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Per-agent working-path isolation tests
+# Per-agent shared working-path tests
 # ---------------------------------------------------------------------------
 
 
