@@ -397,6 +397,50 @@ async def test_cli_tool_is_standalone_function_not_folded(llm_tools_session):
 
 
 @pytest.mark.asyncio
+async def test_non_agentbay_context_does_not_read_agentbay_os_config(
+    llm_tools_session, monkeypatch
+):
+    """Ordinary context construction must not touch retired AgentBay config."""
+    import app.services.agent_tools as at_mod
+    from app.models.tool import AgentTool, Tool
+
+    agent_id = _uuid.uuid4()
+
+    async def _unexpected_agentbay_config_read(*_args, **_kwargs):
+        raise AssertionError("AgentBay OS config must not be read")
+
+    monkeypatch.setattr(
+        at_mod, "_get_computer_os_type", _unexpected_agentbay_config_read
+    )
+
+    async with llm_tools_session() as s:
+        tool = Tool(
+            name="execute_code_aio",
+            display_name="Sandbox",
+            description="Run code in sandbox.",
+            type="builtin",
+            category="code",
+            icon="💻",
+            source="builtin",
+            enabled=True,
+            is_default=True,
+            parameters_schema={"type": "object", "properties": {}},
+            config={},
+            config_schema={},
+        )
+        s.add(tool)
+        await s.flush()
+        s.add(AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True))
+        await s.commit()
+
+    tools = await at_mod.get_agent_tools_for_llm(agent_id)
+
+    names = [item["function"]["name"] for item in tools]
+    assert "execute_code_aio" in names
+    assert not any(name.startswith("agentbay_") for name in names)
+
+
+@pytest.mark.asyncio
 async def test_cli_tool_without_binary_not_surfaced(llm_tools_session):
     """A CLI tool with no uploaded binary does not appear as an LLM function.
 

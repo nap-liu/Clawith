@@ -59,6 +59,28 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "agentbay_file_transfer",
 }
 
+# AgentBay is retained in the codebase for compatibility with historical data,
+# but the product capability is globally disabled.  Keep this as a category
+# invariant rather than relying on a one-off production database edit: a fresh
+# database or a restored old dump must seed/sync every AgentBay tool disabled.
+FORCE_DISABLED_BUILTIN_CATEGORIES = {"agentbay"}
+
+
+def builtin_tool_enabled(seed: dict) -> bool:
+    """Return the canonical global enabled state for a builtin seed."""
+    if seed.get("category") in FORCE_DISABLED_BUILTIN_CATEGORIES:
+        return False
+    return bool(seed.get("enabled", True))
+
+
+def should_sync_builtin_default(seed: dict) -> bool:
+    """Whether an existing row must follow the seed's default flag."""
+    return (
+        seed.get("name") in SYNC_IS_DEFAULT_TOOL_NAMES
+        or seed.get("category") in FORCE_DISABLED_BUILTIN_CATEGORIES
+    )
+
+
 LEGACY_IMAGE_TOOL_MODEL_DEFAULTS = {
     "generate_image_siliconflow": "black-forest-labs/FLUX.1-schnell",
     "generate_image_openai": "dall-e-3",
@@ -4263,6 +4285,7 @@ async def seed_builtin_tools():
         new_tool_ids = []
         for t in BUILTIN_TOOLS:
             seed_config = _global_builtin_config(t)
+            seed_enabled = builtin_tool_enabled(t)
             result = await db.execute(select(Tool).where(Tool.name == t["name"]))
             existing = result.scalar_one_or_none()
             if not existing:
@@ -4273,6 +4296,7 @@ async def seed_builtin_tools():
                     type="builtin",
                     category=t["category"],
                     icon=t["icon"],
+                    enabled=seed_enabled,
                     is_default=t["is_default"],
                     parameters_schema=t.get("parameters_schema", {"type": "object", "properties": {}}),
                     config=seed_config,
@@ -4299,9 +4323,15 @@ async def seed_builtin_tools():
                 if existing.icon != t["icon"]:
                     existing.icon = t["icon"]
                     updated_fields.append("icon")
-                if t["name"] in SYNC_IS_DEFAULT_TOOL_NAMES and existing.is_default != t["is_default"]:
+                if should_sync_builtin_default(t) and existing.is_default != t["is_default"]:
                     existing.is_default = t["is_default"]
                     updated_fields.append("is_default")
+                if (
+                    t["category"] in FORCE_DISABLED_BUILTIN_CATEGORIES
+                    and existing.enabled != seed_enabled
+                ):
+                    existing.enabled = seed_enabled
+                    updated_fields.append("enabled")
                 if t.get("config_schema") and existing.config_schema != t["config_schema"]:
                     existing.config_schema = t["config_schema"]
                     updated_fields.append("config_schema")
@@ -4354,128 +4384,6 @@ async def seed_builtin_tools():
                     if not check.scalar_one_or_none():
                         db.add(AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=True))
             logger.info(f"[ToolSeeder] Auto-assigned {len(new_tool_ids)} new tools to {len(agent_ids)} agents")
-
-        # AgentBay desktop window helpers are non-default tools, but should be
-        # available wherever the user has already enabled Cloud Desktop tools.
-        computer_anchor_names = [
-            "agentbay_computer_screenshot",
-            "agentbay_computer_precision_screenshot",
-            "agentbay_computer_click",
-            "agentbay_computer_get_active_window",
-            "agentbay_computer_activate_window",
-        ]
-        computer_helper_names = [
-            "agentbay_computer_precision_screenshot",
-            "agentbay_computer_save_screenshot",
-            "agentbay_computer_list_windows",
-            "agentbay_computer_close_window",
-            "agentbay_computer_dismiss_dialog",
-        ]
-        anchor_tools_r = await db.execute(select(Tool.id).where(Tool.name.in_(computer_anchor_names)))
-        anchor_tool_ids = [row[0] for row in anchor_tools_r.fetchall()]
-        helper_tools_r = await db.execute(select(Tool).where(Tool.name.in_(computer_helper_names)))
-        helper_tools = helper_tools_r.scalars().all()
-        if anchor_tool_ids and helper_tools:
-            enabled_agent_r = await db.execute(
-                select(AgentTool.agent_id)
-                .where(AgentTool.tool_id.in_(anchor_tool_ids), AgentTool.enabled == True)  # noqa: E712
-                .distinct()
-            )
-            enabled_agent_ids = [row[0] for row in enabled_agent_r.fetchall()]
-            assigned_count = 0
-            for agent_id in enabled_agent_ids:
-                for helper_tool in helper_tools:
-                    existing_assignment = await db.execute(
-                        select(AgentTool).where(
-                            AgentTool.agent_id == agent_id,
-                            AgentTool.tool_id == helper_tool.id,
-                        )
-                    )
-                    if not existing_assignment.scalar_one_or_none():
-                        db.add(AgentTool(agent_id=agent_id, tool_id=helper_tool.id, enabled=True))
-                        assigned_count += 1
-            if assigned_count:
-                logger.info(
-                    f"[ToolSeeder] Auto-assigned {assigned_count} AgentBay computer helper tool(s) "
-                    f"to {len(enabled_agent_ids)} agent(s)"
-                )
-
-        # Save-screenshot is non-default, but should be available wherever the
-        # user has enabled the AgentBay browser screenshot tool.
-        browser_anchor_names = [
-            "agentbay_browser_navigate",
-            "agentbay_browser_screenshot",
-        ]
-        browser_helper_names = ["agentbay_browser_save_screenshot"]
-        browser_anchor_tools_r = await db.execute(select(Tool.id).where(Tool.name.in_(browser_anchor_names)))
-        browser_anchor_tool_ids = [row[0] for row in browser_anchor_tools_r.fetchall()]
-        browser_helper_tools_r = await db.execute(select(Tool).where(Tool.name.in_(browser_helper_names)))
-        browser_helper_tools = browser_helper_tools_r.scalars().all()
-        if browser_anchor_tool_ids and browser_helper_tools:
-            browser_enabled_agent_r = await db.execute(
-                select(AgentTool.agent_id)
-                .where(AgentTool.tool_id.in_(browser_anchor_tool_ids), AgentTool.enabled == True)  # noqa: E712
-                .distinct()
-            )
-            browser_enabled_agent_ids = [row[0] for row in browser_enabled_agent_r.fetchall()]
-            browser_assigned_count = 0
-            for agent_id in browser_enabled_agent_ids:
-                for helper_tool in browser_helper_tools:
-                    existing_assignment = await db.execute(
-                        select(AgentTool).where(
-                            AgentTool.agent_id == agent_id,
-                            AgentTool.tool_id == helper_tool.id,
-                        )
-                    )
-                    if not existing_assignment.scalar_one_or_none():
-                        db.add(AgentTool(agent_id=agent_id, tool_id=helper_tool.id, enabled=True))
-                        browser_assigned_count += 1
-            if browser_assigned_count:
-                logger.info(
-                    f"[ToolSeeder] Auto-assigned {browser_assigned_count} AgentBay browser helper tool(s) "
-                    f"to {len(browser_enabled_agent_ids)} agent(s)"
-                )
-
-        # Code sandbox file helpers are non-default, but should be available
-        # wherever the user has already enabled AgentBay code execution tools.
-        code_anchor_names = [
-            "agentbay_code_execute",
-            "agentbay_command_exec",
-            "agentbay_file_transfer",
-        ]
-        code_helper_names = [
-            "agentbay_code_write_file",
-            "agentbay_code_read_file",
-            "agentbay_code_edit_file",
-        ]
-        code_anchor_tools_r = await db.execute(select(Tool.id).where(Tool.name.in_(code_anchor_names)))
-        code_anchor_tool_ids = [row[0] for row in code_anchor_tools_r.fetchall()]
-        code_helper_tools_r = await db.execute(select(Tool).where(Tool.name.in_(code_helper_names)))
-        code_helper_tools = code_helper_tools_r.scalars().all()
-        if code_anchor_tool_ids and code_helper_tools:
-            code_enabled_agent_r = await db.execute(
-                select(AgentTool.agent_id)
-                .where(AgentTool.tool_id.in_(code_anchor_tool_ids), AgentTool.enabled == True)  # noqa: E712
-                .distinct()
-            )
-            code_enabled_agent_ids = [row[0] for row in code_enabled_agent_r.fetchall()]
-            code_assigned_count = 0
-            for agent_id in code_enabled_agent_ids:
-                for helper_tool in code_helper_tools:
-                    existing_assignment = await db.execute(
-                        select(AgentTool).where(
-                            AgentTool.agent_id == agent_id,
-                            AgentTool.tool_id == helper_tool.id,
-                        )
-                    )
-                    if not existing_assignment.scalar_one_or_none():
-                        db.add(AgentTool(agent_id=agent_id, tool_id=helper_tool.id, enabled=True))
-                        code_assigned_count += 1
-            if code_assigned_count:
-                logger.info(
-                    f"[ToolSeeder] Auto-assigned {code_assigned_count} AgentBay code file helper tool(s) "
-                    f"to {len(code_enabled_agent_ids)} agent(s)"
-                )
 
         OBSOLETE_TOOLS = ["bing_search", "manage_tasks"]
         for obsolete_name in OBSOLETE_TOOLS:

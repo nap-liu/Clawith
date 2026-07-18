@@ -4,7 +4,13 @@ import uuid
 from types import SimpleNamespace
 
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
-from app.services.tool_seeder import BUILTIN_TOOLS, SYNC_IS_DEFAULT_TOOL_NAMES
+from app.services.tool_seeder import (
+    BUILTIN_TOOLS,
+    FORCE_DISABLED_BUILTIN_CATEGORIES,
+    SYNC_IS_DEFAULT_TOOL_NAMES,
+    builtin_tool_enabled,
+    should_sync_builtin_default,
+)
 from scripts.refresh_default_agent_tools import POLICY, plan_assignment_changes
 
 
@@ -26,6 +32,20 @@ def test_requested_builtin_flags_are_synced_to_existing_databases():
         "read_image",
         "request_confirmation",
     }.issubset(SYNC_IS_DEFAULT_TOOL_NAMES)
+
+
+def test_agentbay_builtin_tools_are_globally_and_by_default_disabled():
+    agentbay_tools = [tool for tool in BUILTIN_TOOLS if tool["category"] == "agentbay"]
+
+    assert FORCE_DISABLED_BUILTIN_CATEGORIES == {"agentbay"}
+    assert agentbay_tools
+    assert all(tool["is_default"] is False for tool in agentbay_tools)
+    assert all(builtin_tool_enabled(tool) is False for tool in agentbay_tools)
+    assert all(should_sync_builtin_default(tool) is True for tool in agentbay_tools)
+
+
+def test_non_agentbay_builtin_enabled_state_is_unchanged():
+    assert builtin_tool_enabled(_seed("execute_code_aio")) is True
 
 
 def test_refresh_plan_enables_six_tools_and_disables_lightweight_executor():
