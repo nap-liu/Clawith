@@ -2428,8 +2428,10 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     except Exception:
         pass
 
-    # Read os_type once; used to patch agentbay_file_transfer paths below
-    computer_os_type = await _get_computer_os_type(agent_id)
+    # AgentBay is globally disabled in the current product.  Defaulting here
+    # avoids reading its retired config on every ordinary context build (which
+    # produced a misleading ERROR even though no AgentBay tool reached the LLM).
+    computer_os_type = "windows"
 
     try:
         from app.models.tool import Tool, AgentTool
@@ -2567,6 +2569,8 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                     logger.debug(
                         f"[Tools] agent={agent_id} added from _always_tools: {always_added}"
                     )
+                if "agentbay_file_transfer" in db_tool_names:
+                    computer_os_type = await _get_computer_os_type(agent_id)
                 # Inject OS-aware paths into computer-related tool descriptions
                 result = _patch_computer_tool_descriptions(result, computer_os_type)
                 # Strip msg_type from send_message_to_agent when async A2A is disabled
