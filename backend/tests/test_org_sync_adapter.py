@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 
 from app.database import async_session, engine
 from app.models.identity import IdentityProvider
@@ -23,6 +24,9 @@ from app.services.org_sync_adapter import (
     normalize_contact_for_match,
 )
 from app.services.canonical_user_resolver import CanonicalIdentityConflict
+from app.services.dingtalk_identity_reconciliation import (
+    dingtalk_legacy_identity_reconciler,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -586,6 +590,25 @@ def test_normalize_contact_for_match_keeps_email_lowercase():
     assert normalize_contact_for_match(" Alice@Example.COM ") == "alice@example.com"
 
 
+def test_dingtalk_fresh_claims_reject_different_email_variants():
+    from app.services.directory_identity_claims import VerifiedDirectoryClaims
+
+    claims = VerifiedDirectoryClaims(
+        tenant_id=uuid.uuid4(),
+        provider_id=uuid.uuid4(),
+        external_id="staff-conflict",
+        observed_at=datetime.now(timezone.utc),
+        raw_email="personal@example.com",
+        raw_org_email="employee@example.com",
+        raw_mobile="13800138000",
+        source="test",
+    )
+
+    assert claims.has_alternate_email_conflict is True
+    assert claims.email is None
+    assert claims.phone == "13800138000"
+
+
 async def _seed_tenant() -> Tenant:
     async with async_session() as db:
         tenant = Tenant(name="Org Sync Tenant", slug=f"org-sync-{uuid.uuid4().hex[:10]}")
@@ -608,6 +631,179 @@ async def _seed_dingtalk_provider(tenant_id: uuid.UUID) -> IdentityProvider:
         await db.commit()
         await db.refresh(provider)
         return provider
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_sync_releases_each_subject_lock_before_outer_commit():
+    tenant = await _seed_tenant()
+    seeded_provider = await _seed_dingtalk_provider(tenant.id)
+    external_ids = [
+        f"staff-lock-{uuid.uuid4().hex[:8]}",
+        f"staff-lock-{uuid.uuid4().hex[:8]}",
+    ]
+    async with async_session() as sync_db:
+        provider = await sync_db.get(IdentityProvider, seeded_provider.id)
+        adapter = DingTalkOrgSyncAdapter(
+            provider=provider,
+            tenant_id=tenant.id,
+        )
+        for index, external_id in enumerate(external_ids):
+            await adapter._upsert_member(
+                sync_db,
+                provider,
+                ExternalUser(
+                    external_id=external_id,
+                    unionid=f"union-lock-{index}-{uuid.uuid4().hex[:8]}",
+                    name=f"Lock User {index}",
+                    email=f"lock-{uuid.uuid4().hex[:8]}@example.com",
+                    mobile="",
+                    status="active",
+                    raw_data={
+                        "userid": external_id,
+                        "email": "",
+                        "org_email": f"lock-{uuid.uuid4().hex[:8]}@example.com",
+                        "mobile": "",
+                    },
+                ),
+                "",
+            )
+
+        # The sync transaction is deliberately still open. A different
+        # connection must nevertheless acquire the first employee's subject.
+        async with async_session() as other_db:
+            await asyncio.wait_for(
+                dingtalk_legacy_identity_reconciler.acquire_subject_lock(
+                    other_db,
+                    tenant_id=tenant.id,
+                    provider_id=provider.id,
+                    external_id=external_ids[0],
+                ),
+                timeout=1,
+            )
+            await other_db.rollback()
+        await sync_db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_sync_releases_subject_lock_after_failed_savepoint():
+    tenant = await _seed_tenant()
+    provider = await _seed_dingtalk_provider(tenant.id)
+    external_id = f"staff-lock-error-{uuid.uuid4().hex[:8]}"
+    async with async_session() as sync_db:
+        with pytest.raises(DBAPIError):
+            async with sync_db.begin_nested():
+                async with dingtalk_legacy_identity_reconciler.session_subject_lock(
+                    sync_db,
+                    tenant_id=tenant.id,
+                    provider_id=provider.id,
+                    external_id=external_id,
+                ):
+                    await sync_db.execute(text("SELECT 1 / 0"))
+
+        async with async_session() as other_db:
+            await asyncio.wait_for(
+                dingtalk_legacy_identity_reconciler.acquire_subject_lock(
+                    other_db,
+                    tenant_id=tenant.id,
+                    provider_id=provider.id,
+                    external_id=external_id,
+                ),
+                timeout=1,
+            )
+            await other_db.rollback()
+        await sync_db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_duplicate_member_and_channel_row_lock_do_not_deadlock():
+    tenant = await _seed_tenant()
+    seeded_provider = await _seed_dingtalk_provider(tenant.id)
+    external_id = f"staff-duplicate-{uuid.uuid4().hex[:8]}"
+    unionid = f"union-duplicate-{uuid.uuid4().hex[:8]}"
+    email = f"duplicate-{uuid.uuid4().hex[:8]}@example.com"
+    async with async_session() as db:
+        provider = await db.get(IdentityProvider, seeded_provider.id)
+        provider.config = {"auto_create_users_on_sync": False}
+        await db.commit()
+
+    adapter = DingTalkOrgSyncAdapter(tenant_id=tenant.id)
+
+    def external_user() -> ExternalUser:
+        return ExternalUser(
+            external_id=external_id,
+            unionid=unionid,
+            name="Duplicate Department User",
+            email=email,
+            mobile="",
+            status="active",
+            raw_data={
+                "userid": external_id,
+                "unionid": unionid,
+                "email": "",
+                "org_email": email,
+                "mobile": "",
+            },
+        )
+
+    await adapter._upsert_member_in_short_transaction(
+        seeded_provider.id,
+        external_user(),
+        "dept-a",
+    )
+
+    channel_has_member_lock = asyncio.Event()
+    release_channel = asyncio.Event()
+
+    async def channel_like_update():
+        async with async_session() as db:
+            await dingtalk_legacy_identity_reconciler.acquire_subject_lock(
+                db,
+                tenant_id=tenant.id,
+                provider_id=seeded_provider.id,
+                external_id=external_id,
+            )
+            member = (
+                await db.execute(
+                    select(OrgMember)
+                    .where(
+                        OrgMember.provider_id == seeded_provider.id,
+                        OrgMember.external_id == external_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one()
+            member.nickname = "channel-held"
+            channel_has_member_lock.set()
+            await release_channel.wait()
+            await db.commit()
+
+    async def repeated_sync():
+        await channel_has_member_lock.wait()
+        return await adapter._upsert_member_in_short_transaction(
+            seeded_provider.id,
+            external_user(),
+            "dept-b",
+        )
+
+    channel_task = asyncio.create_task(channel_like_update())
+    repeated_task = asyncio.create_task(repeated_sync())
+    await asyncio.wait_for(channel_has_member_lock.wait(), timeout=2)
+    release_channel.set()
+    await asyncio.wait_for(
+        asyncio.gather(channel_task, repeated_task),
+        timeout=5,
+    )
+
+    async with async_session() as db:
+        members = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == seeded_provider.id,
+                    OrgMember.external_id == external_id,
+                )
+            )
+        ).scalars().all()
+        assert len(members) == 1
 
 
 async def _seed_provider(tenant_id: uuid.UUID, provider_type: str) -> IdentityProvider:
@@ -747,7 +943,7 @@ async def test_org_sync_refreshes_real_name_without_changing_username_or_nicknam
 
 
 @pytest.mark.asyncio
-async def test_org_sync_rejects_email_phone_split_across_identities():
+async def test_org_sync_persists_contact_when_identity_reconciliation_conflicts():
     tenant = await _seed_tenant()
     provider = await _seed_dingtalk_provider(tenant.id)
     adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
@@ -766,9 +962,20 @@ async def test_org_sync_rejects_email_phone_split_across_identities():
 
     async with async_session() as db:
         provider = await db.get(IdentityProvider, provider.id)
-        with pytest.raises(CanonicalIdentityConflict):
-            await adapter._upsert_member(db, provider, external_user, "1")
-        await db.rollback()
+        stats = await adapter._upsert_member(db, provider, external_user, "1")
+        await db.commit()
+
+        member = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider.id,
+                    OrgMember.external_id == external_user.external_id,
+                )
+            )
+        ).scalar_one()
+        assert stats["identity_conflict"] is True
+        assert member.email == shared_email
+        assert member.phone == phone
 
 
 @pytest.mark.asyncio
@@ -840,7 +1047,7 @@ async def test_org_sync_non_dingtalk_still_links_existing_user_by_email():
 
 
 @pytest.mark.asyncio
-async def test_org_sync_dingtalk_missing_mobile_clears_phone_and_keeps_canonical_user():
+async def test_org_sync_dingtalk_missing_mobile_preserves_display_phone_without_reusing_it():
     tenant = await _seed_tenant()
     provider = await _seed_dingtalk_provider(tenant.id)
     adapter = _DummyAdapter(provider=provider, tenant_id=tenant.id)
@@ -878,10 +1085,63 @@ async def test_org_sync_dingtalk_missing_mobile_clears_phone_and_keeps_canonical
         member = await db.get(OrgMember, member_id)
         assert stats["user_created"] is True
         assert stats["user_skipped_no_phone"] is False
-        assert member.phone is None
+        assert member.phone == old_phone
         assert member.user_id is not None
         canonical_user = await db.get(User, member.user_id)
         assert canonical_user.identity_id is None
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_user_list_uses_org_email_without_collapsing_raw_fields(
+    monkeypatch,
+):
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, params=None, json=None):
+            assert url == DingTalkOrgSyncAdapter.DINGTALK_USER_LIST_URL
+            return _FakeDingTalkResponse(
+                {
+                    "errcode": 0,
+                    "result": {
+                        "list": [
+                            {
+                                "userid": "staff-org-email",
+                                "name": "Org Email User",
+                                "email": "",
+                                "org_email": "Org.User@Example.COM",
+                                "mobile": "13800138000",
+                                "dept_id_list": [42],
+                            }
+                        ],
+                        "has_more": False,
+                    },
+                }
+            )
+
+    async def fake_token():
+        return "token"
+
+    async def no_sleep(_seconds):
+        return None
+
+    adapter = DingTalkOrgSyncAdapter(
+        config={"app_key": "key", "app_secret": "secret"}
+    )
+    adapter.get_access_token = fake_token
+    monkeypatch.setattr("app.services.org_sync_adapter.httpx.AsyncClient", FakeClient)
+    monkeypatch.setattr("app.services.org_sync_adapter.asyncio.sleep", no_sleep)
+
+    users = await adapter.fetch_users("42")
+
+    assert len(users) == 1
+    assert users[0].email == "Org.User@Example.COM"
+    assert users[0].raw_data["email"] == ""
+    assert users[0].raw_data["org_email"] == "Org.User@Example.COM"
 
 
 @pytest.mark.asyncio

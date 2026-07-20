@@ -7,6 +7,7 @@ and OrgMember-based identity management.
 
 import hashlib
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger
@@ -20,6 +21,7 @@ from app.models.identity import IdentityProvider
 from app.models.org import ChannelUserBinding, OrgMember
 from app.models.user import Identity, User
 from app.services.sso_service import sso_service
+from app.services.directory_identity_claims import VerifiedDirectoryClaims
 
 
 class ChannelUserResolutionError(ValueError):
@@ -179,6 +181,42 @@ class ChannelUserService:
                 seen.add(key)
                 subjects.append(key)
         return subjects
+
+    def _fresh_dingtalk_claims(
+        self,
+        provider: IdentityProvider,
+        external_user_id: str | None,
+        extra_info: dict[str, Any],
+    ) -> VerifiedDirectoryClaims | None:
+        if (
+            provider.provider_type != "dingtalk"
+            or provider.tenant_id is None
+            or extra_info.get("identity_verified") is not True
+        ):
+            return None
+        external_id = str(
+            extra_info.get("external_id") or external_user_id or ""
+        ).strip()
+        if not external_id:
+            return None
+        return VerifiedDirectoryClaims(
+            tenant_id=provider.tenant_id,
+            provider_id=provider.id,
+            external_id=external_id,
+            observed_at=datetime.now(timezone.utc),
+            raw_email=(
+                extra_info.get("raw_email")
+                if "raw_email" in extra_info
+                else extra_info.get("email")
+            ),
+            raw_org_email=extra_info.get("raw_org_email"),
+            raw_mobile=(
+                extra_info.get("raw_mobile")
+                if "raw_mobile" in extra_info
+                else extra_info.get("mobile")
+            ),
+            source="dingtalk_user_get",
+        )
 
     async def _find_bound_user(
         self,
@@ -353,6 +391,22 @@ class ChannelUserService:
 
         # Step 1: Ensure IdentityProvider exists
         provider = await self._ensure_provider(db, channel_type, tenant_id)
+        fresh_claims = (
+            self._fresh_dingtalk_claims(provider, external_user_id, extra_info)
+            if normalized_channel == "dingtalk"
+            else None
+        )
+        if fresh_claims:
+            from app.services.dingtalk_identity_reconciliation import (
+                dingtalk_legacy_identity_reconciler,
+            )
+
+            await dingtalk_legacy_identity_reconciler.acquire_subject_lock(
+                db,
+                tenant_id=fresh_claims.tenant_id,
+                provider_id=fresh_claims.provider_id,
+                external_id=fresh_claims.external_id,
+            )
 
         bound_user = await self._find_bound_user(
             db, provider, channel_type, external_user_id, extra_info
@@ -384,7 +438,10 @@ class ChannelUserService:
                                 member, channel_type, extra_info
                             )
                             reconciled = await self._provision_user_from_member(
-                                db, member, provider
+                                db,
+                                member,
+                                provider,
+                                fresh_claims=fresh_claims,
                             )
                             if reconciled:
                                 canonical_user, _ = await self._ensure_bindings(
@@ -438,6 +495,7 @@ class ChannelUserService:
                             db,
                             org_member,
                             provider,
+                            fresh_claims=fresh_claims,
                         )
                 except Exception:
                     logger.exception(
@@ -485,8 +543,12 @@ class ChannelUserService:
 
         # Step 4: Try to find User by email/mobile from extra_info
         verified_contact = extra_info.get("identity_verified") is True
-        email = extra_info.get("email") if verified_contact else None
-        mobile = extra_info.get("mobile") if verified_contact else None
+        if normalized_channel == "dingtalk":
+            email = fresh_claims.email if fresh_claims else None
+            mobile = fresh_claims.phone if fresh_claims else None
+        else:
+            email = extra_info.get("email") if verified_contact else None
+            mobile = extra_info.get("mobile") if verified_contact else None
 
         should_persist_member = True
 
@@ -650,10 +712,12 @@ class ChannelUserService:
         if incoming_nickname and org_member.nickname != incoming_nickname:
             org_member.nickname = incoming_nickname
         contact_verified = extra_info.get("identity_verified") is True
-        if contact_verified and extra_info.get("email") and not org_member.email:
-            org_member.email = extra_info["email"]
-        if contact_verified and extra_info.get("mobile") and not org_member.phone:
-            org_member.phone = extra_info["mobile"]
+        display_email = extra_info.get("raw_org_email") or extra_info.get("raw_email")
+        if contact_verified and display_email and not org_member.email:
+            org_member.email = display_email
+        display_mobile = extra_info.get("raw_mobile")
+        if contact_verified and display_mobile and not org_member.phone:
+            org_member.phone = display_mobile
         if extra_info.get("avatar_url") and not org_member.avatar_url:
             org_member.avatar_url = extra_info["avatar_url"]
         if extra_info.get("title") and not org_member.title:
@@ -664,6 +728,8 @@ class ChannelUserService:
         db: AsyncSession,
         org_member: OrgMember,
         provider: IdentityProvider,
+        *,
+        fresh_claims: VerifiedDirectoryClaims | None = None,
     ) -> User | None:
         from app.services.contact_provisioning import contact_provisioning
 
@@ -677,6 +743,7 @@ class ChannelUserService:
                 db,
                 org_member,
                 provider=provider,
+                fresh_claims=fresh_claims,
             )
         except (CanonicalIdentityConflict, CanonicalUserConflict) as exc:
             raise ChannelUserResolutionError(str(exc)) from exc

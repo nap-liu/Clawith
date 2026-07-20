@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import func, select
@@ -14,6 +15,7 @@ from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services.contact_provisioning import contact_provisioning
 from app.services.canonical_user_resolver import CanonicalUserConflict
+from app.services.directory_identity_claims import VerifiedDirectoryClaims
 
 
 pytestmark = pytest.mark.asyncio
@@ -80,6 +82,18 @@ async def _seed_org_member(
         return member
 
 
+def _fresh_claims(member: OrgMember) -> VerifiedDirectoryClaims:
+    return VerifiedDirectoryClaims(
+        tenant_id=member.tenant_id,
+        provider_id=member.provider_id,
+        external_id=member.external_id,
+        observed_at=datetime.now(timezone.utc),
+        raw_org_email=member.email,
+        raw_mobile=member.phone,
+        source="test",
+    )
+
+
 async def test_provision_org_member_creates_external_only_user_and_participant():
     tenant = await _seed_tenant()
     provider = await _seed_provider(tenant.id)
@@ -96,7 +110,11 @@ async def test_provision_org_member_creates_external_only_user_and_participant()
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         await db.commit()
 
         assert result.user_created is True
@@ -160,7 +178,11 @@ async def test_provision_org_member_reuses_global_identity_but_creates_current_t
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         await db.commit()
 
         assert result.user_created is True
@@ -201,7 +223,11 @@ async def test_provision_org_member_links_existing_user_by_normalized_mobile():
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         await db.commit()
 
         assert result.user_created is False
@@ -260,7 +286,11 @@ async def test_provision_org_member_rejects_stale_nonempty_identity_link():
         member = await db.get(OrgMember, member.id)
         member_id = member.id
         with pytest.raises(CanonicalUserConflict):
-            await contact_provisioning.ensure_user_for_org_member(db, member)
+            await contact_provisioning.ensure_user_for_org_member(
+                db,
+                member,
+                fresh_claims=_fresh_claims(member),
+            )
         await db.rollback()
 
         member = await db.get(OrgMember, member_id)
@@ -300,7 +330,11 @@ async def test_provision_org_member_keeps_existing_active_link_when_no_phone_mat
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         await db.commit()
 
         assert result.user.id == user_id
@@ -344,7 +378,11 @@ async def test_provision_org_member_normalizes_existing_link_phone():
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         await db.commit()
 
         assert result.user.id == user_id
@@ -392,7 +430,11 @@ async def test_provision_org_member_rejects_phone_owned_by_other_identity():
         member = await db.get(OrgMember, member.id)
         member_id = member.id
         with pytest.raises(CanonicalUserConflict):
-            await contact_provisioning.ensure_user_for_org_member(db, member)
+            await contact_provisioning.ensure_user_for_org_member(
+                db,
+                member,
+                fresh_claims=_fresh_claims(member),
+            )
         await db.rollback()
 
         member = await db.get(OrgMember, member_id)
@@ -428,7 +470,11 @@ async def test_provision_org_member_does_not_link_inactive_tenant_user():
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         await db.commit()
 
         assert result.user is None
@@ -444,7 +490,11 @@ async def test_provision_org_member_without_mobile_still_gets_exact_external_use
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         await db.commit()
 
         assert result.user is not None
@@ -486,7 +536,11 @@ async def test_provision_org_member_upserts_participant_idempotently():
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        result = await contact_provisioning.ensure_user_for_org_member(db, member)
+        result = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         await db.commit()
 
         assert result.user_created is False
@@ -516,17 +570,29 @@ async def test_provision_org_member_never_mints_login_identity_from_directory_em
 
     async with async_session() as db:
         member = await db.get(OrgMember, member.id)
-        first = await contact_provisioning.ensure_user_for_org_member(db, member)
+        first = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         assert first.user.identity is None
 
         real_email = f"real-{uuid.uuid4().hex[:10]}@example.com"
         member.email = real_email
-        second = await contact_provisioning.ensure_user_for_org_member(db, member)
+        second = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         assert second.user.id == first.user.id
         assert second.user.identity is None
 
         member.email = None
-        third = await contact_provisioning.ensure_user_for_org_member(db, member)
+        third = await contact_provisioning.ensure_user_for_org_member(
+            db,
+            member,
+            fresh_claims=_fresh_claims(member),
+        )
         await db.commit()
         assert third.user.id == first.user.id
         assert third.user.identity is None

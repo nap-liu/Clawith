@@ -237,6 +237,28 @@ class BaseAuthProvider(ABC):
 
         tenant_uuid = uuid.UUID(str(tenant_id))
         try:
+            repaired_user = await self._repair_legacy_dingtalk_oauth_user(
+                db,
+                tenant_id=tenant_uuid,
+                user_info=user_info,
+            )
+            if repaired_user is not None:
+                if not repaired_user.is_active:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="User account is disabled",
+                    )
+                await sso_service.link_identity(
+                    db,
+                    str(repaired_user.id),
+                    self.provider_type,
+                    user_info.provider_user_id,
+                    user_info.raw_data,
+                    tenant_id=str(tenant_uuid),
+                )
+                await registration_service.ensure_web_org_member(db, repaired_user)
+                return repaired_user, False
+
             exact_user = await sso_service.resolve_user_identity(
                 db,
                 user_info.provider_user_id,
@@ -266,22 +288,14 @@ class BaseAuthProvider(ABC):
                 email=user_info.email,
                 phone=user_info.mobile,
                 username=user_info.email.split("@")[0] if user_info.email else None,
-                password=(
-                    user_info.provider_user_id
-                    or user_info.provider_union_id
-                    or "oauth"
-                ),
-            )
-
-            directory_user = await canonical_user_resolver.find_verified_directory_user(
-                db,
-                tenant_id=tenant_uuid,
-                email=user_info.email,
-                phone=user_info.mobile,
+                password=None,
             )
 
             user = None
-            for candidate in (exact_user, directory_user):
+            # Persisted OrgMember contact fields are profile data and may be
+            # stale.  Cross-provider login reconciliation uses an exact scoped
+            # subject binding or the fresh DingTalk repair path above.
+            for candidate in (exact_user,):
                 if candidate is None or (user is not None and candidate.id == user.id):
                     continue
                 user = await canonical_user_resolver.reconcile_identity_user(
@@ -329,6 +343,236 @@ class BaseAuthProvider(ABC):
         except (CanonicalIdentityConflict, CanonicalUserConflict) as exc:
             logger.warning("Enterprise identity reconciliation failed: {}", exc)
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def _repair_legacy_dingtalk_oauth_user(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id,
+        user_info: ExternalUserInfo,
+    ) -> User | None:
+        """Resolve an explicitly scoped OAuth principal to one DingTalk member."""
+        if self.provider_type not in {"dingtalk", "oauth2"}:
+            return None
+
+        from app.models.org import OrgMember
+        from app.services.canonical_user_resolver import CanonicalUserConflict
+        from app.services.dingtalk_identity_reconciliation import (
+            dingtalk_legacy_identity_reconciler,
+            fetch_fresh_dingtalk_claims,
+        )
+
+        auth_provider = self.provider
+        if auth_provider is None or auth_provider.tenant_id != tenant_id:
+            raise CanonicalUserConflict("OAuth provider has no exact tenant scope")
+
+        if self.provider_type == "dingtalk":
+            if (
+                auth_provider.provider_type != "dingtalk"
+                or not auth_provider.is_active
+            ):
+                return None
+            provider = auth_provider
+            directory_subject = (
+                user_info.provider_union_id
+                or user_info.raw_data.get("unionId")
+                or user_info.raw_data.get("unionid")
+            )
+            if not directory_subject:
+                return None
+            # Keep the direct DingTalk OAuth binding provider-scoped by unionId.
+            if not user_info.provider_user_id:
+                user_info.provider_user_id = str(directory_subject)
+            member_subject_clause = OrgMember.unionid == str(directory_subject)
+        else:
+            # A generic OAuth subject has no inherent relationship to DingTalk.
+            # Cross-provider routing is permitted only by an explicit provider
+            # configuration that names the exact directory provider.
+            configured_directory_id = (auth_provider.config or {}).get(
+                "directory_provider_id"
+            )
+            if not configured_directory_id or not user_info.provider_user_id:
+                return None
+            try:
+                import uuid
+
+                directory_provider_id = uuid.UUID(str(configured_directory_id))
+            except (TypeError, ValueError) as exc:
+                raise CanonicalUserConflict(
+                    "OAuth directory_provider_id is invalid"
+                ) from exc
+            provider = await db.get(IdentityProvider, directory_provider_id)
+            if (
+                provider is None
+                or provider.tenant_id != tenant_id
+                or provider.provider_type != "dingtalk"
+                or not provider.is_active
+            ):
+                raise CanonicalUserConflict(
+                    "OAuth directory_provider_id is not an active tenant DingTalk provider"
+                )
+            member_subject_clause = (
+                OrgMember.external_id == user_info.provider_user_id
+            )
+
+        members = (
+            await db.execute(
+                select(OrgMember).where(
+                    OrgMember.tenant_id == tenant_id,
+                    OrgMember.provider_id == provider.id,
+                    member_subject_clause,
+                    OrgMember.status == "active",
+                )
+            )
+        ).scalars().all()
+        if not members:
+            return None
+        if len(members) != 1:
+            raise CanonicalUserConflict(
+                "OAuth subject maps to multiple DingTalk directory members"
+            )
+        member = members[0]
+        if member.user_id is None:
+            return None
+        linked_user = (
+            await db.execute(
+                select(User)
+                .where(User.id == member.user_id, User.tenant_id == tenant_id)
+                .options(selectinload(User.identity))
+            )
+        ).scalar_one_or_none()
+        if linked_user is None:
+            return None
+
+        from app.services.canonical_user_resolver import (
+            canonical_user_resolver,
+        )
+        from app.services.registration_service import registration_service
+
+        is_legacy_placeholder = bool(
+            linked_user.identity
+            and (linked_user.identity.username or "").startswith("dingtalk_")
+        )
+        if linked_user.identity is not None and not is_legacy_placeholder:
+            # The explicit provider-scoped directory route already identifies
+            # this formal account. Do not make healthy logins depend on a second
+            # DingTalk API call.
+            return linked_user
+
+        if is_legacy_placeholder and not bool(
+            (provider.config or {}).get(
+                "auto_repair_legacy_identity_split",
+                False,
+            )
+        ):
+            raise CanonicalUserConflict(
+                "legacy DingTalk OAuth principal requires an approved repair"
+            )
+
+        if not member.external_id:
+            raise CanonicalUserConflict(
+                "exact DingTalk directory member has no staff identifier"
+            )
+        fresh_claims = await fetch_fresh_dingtalk_claims(
+            provider,
+            member.external_id,
+        )
+        if fresh_claims is None:
+            raise CanonicalUserConflict(
+                "fresh DingTalk directory claims are required for legacy OAuth repair"
+            )
+        if fresh_claims.has_alternate_email_conflict:
+            from app.services.canonical_user_resolver import CanonicalIdentityConflict
+
+            raise CanonicalIdentityConflict("DingTalk email and org_email disagree")
+        user_info.email = fresh_claims.email or user_info.email
+        user_info.mobile = fresh_claims.phone or user_info.mobile
+
+        if linked_user.identity is None:
+            await dingtalk_legacy_identity_reconciler.acquire_subject_lock(
+                db,
+                tenant_id=tenant_id,
+                provider_id=provider.id,
+                external_id=member.external_id,
+            )
+            # Re-read after acquiring the shared subject lock. Another entry
+            # path may have attached or repaired the member while claims were
+            # fetched.
+            member = (
+                await db.execute(
+                    select(OrgMember).where(
+                        OrgMember.id == member.id,
+                        OrgMember.tenant_id == tenant_id,
+                        OrgMember.provider_id == provider.id,
+                        OrgMember.external_id == fresh_claims.external_id,
+                        OrgMember.status == "active",
+                    )
+                )
+            ).scalar_one_or_none()
+            if member is None or member.user_id is None:
+                raise CanonicalUserConflict(
+                    "exact DingTalk directory member changed during OAuth login"
+                )
+            linked_user = (
+                await db.execute(
+                    select(User)
+                    .where(
+                        User.id == member.user_id,
+                        User.tenant_id == tenant_id,
+                    )
+                    .options(selectinload(User.identity))
+                )
+            ).scalar_one_or_none()
+            if linked_user is None:
+                raise CanonicalUserConflict(
+                    "exact DingTalk directory user changed during OAuth login"
+                )
+            if linked_user.identity is not None:
+                if (linked_user.identity.username or "").startswith("dingtalk_"):
+                    is_legacy_placeholder = True
+                else:
+                    return linked_user
+
+        if linked_user.identity is None:
+            identity = await registration_service.find_or_create_identity(
+                db,
+                email=fresh_claims.email,
+                phone=fresh_claims.phone,
+                username=(
+                    fresh_claims.email.split("@", 1)[0]
+                    if fresh_claims.email
+                    else None
+                ),
+                password=None,
+            )
+            resolved = await canonical_user_resolver.reconcile_identity_user(
+                db,
+                tenant_id=tenant_id,
+                identity=identity,
+                candidate_user=linked_user,
+            )
+            return resolved or linked_user
+
+        outcome = await dingtalk_legacy_identity_reconciler.reconcile(
+            db,
+            provider=provider,
+            org_member=member,
+            claims=fresh_claims,
+            apply=True,
+        )
+        if outcome.repaired and outcome.user:
+            return outcome.user
+        if (
+            outcome.status in {"already_repaired", "not_split"}
+            and outcome.user
+            and outcome.user.identity
+            and not (outcome.user.identity.username or "").startswith("dingtalk_")
+        ):
+            return outcome.user
+        raise CanonicalUserConflict(
+            f"legacy DingTalk OAuth principal cannot be safely repaired: "
+            f"{outcome.reason or outcome.status}"
+        )
 
     async def _ensure_provider(self, db: AsyncSession, tenant_id: str | None = None) -> IdentityProvider:
         """Get or create IdentityProvider record."""
@@ -385,17 +629,6 @@ class BaseAuthProvider(ABC):
                 raise CanonicalIdentityConflict(
                     "OAuth claims resolve to another identity"
                 )
-            # OAuth2 登录时用 provider_user_id 更新 dingtalk_ 开头的临时用户名
-            if (
-                user_info.provider_user_id
-                and identity.username
-                and identity.username.startswith("dingtalk_")
-                and self.provider_type == "oauth2"
-            ):
-                old_username = identity.username
-                identity.username = user_info.provider_user_id
-                logger.info(f"[SSO] Updated username from {old_username} to {user_info.provider_user_id}")
-
         # Update legacy fields if applicable
         await self._update_legacy_user_fields(user, user_info)
 
@@ -414,7 +647,7 @@ class BaseAuthProvider(ABC):
             email=user_info.email,
             phone=user_info.mobile,
             username=user_info.email.split("@")[0] if user_info.email else None,
-            password=effective_id,
+            password=None,
         )
 
         # 2. Prepare Tenant user fields
@@ -664,6 +897,7 @@ class DingTalkAuthProvider(BaseAuthProvider):
             logger.info(f"DingTalk user info: {info_data}")
             return ExternalUserInfo(
                 provider_type=self.provider_type,
+                provider_user_id=info_data.get("unionId"),
                 provider_union_id=info_data.get("unionId"),
                 name=info_data.get("nick", ""),
                 email=info_data.get("email", ""),
@@ -1040,7 +1274,7 @@ class OAuth2AuthProvider(BaseAuthProvider):
             email=email,
             phone=user_info.mobile,
             username=username,
-            password=user_info.provider_user_id or username,
+            password=None,
         )
 
         # Create tenant-scoped User

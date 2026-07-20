@@ -7,7 +7,6 @@ SSO identity binding remain owned by registration_service and sso_service.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import re
 import uuid
 
 from sqlalchemy import select
@@ -19,6 +18,8 @@ from app.models.identity import IdentityProvider
 from app.models.org import OrgMember
 from app.models.participant import Participant
 from app.models.user import Identity, User
+from app.services.canonical_user_resolver import normalize_email, normalize_phone
+from app.services.directory_identity_claims import VerifiedDirectoryClaims
 
 
 _LOCAL_EMAIL_SUFFIX = ".local"
@@ -32,6 +33,7 @@ class ContactProvisioningResult:
     tenant_user_matched: bool = False
     global_identity_matched_no_tenant_user: bool = False
     external_only_user_created: bool = False
+    legacy_split_repaired: bool = False
     skipped_reason: str | None = None
 
     @property
@@ -53,10 +55,7 @@ class ContactProvisioningResult:
 
 def normalize_mobile(value: str | None) -> str | None:
     """Normalize phone numbers using the project's registration semantics."""
-    if not value:
-        return None
-    normalized = re.sub(r"[\s\-\+]", "", str(value)).strip()
-    return normalized or None
+    return normalize_phone(value)
 
 
 def _is_local_email(value: str | None) -> bool:
@@ -77,7 +76,23 @@ class ContactProvisioningService:
         org_member: OrgMember,
         *,
         provider: IdentityProvider | None = None,
+        fresh_claims: VerifiedDirectoryClaims | None = None,
+        subject_lock_held: bool = False,
     ) -> ContactProvisioningResult:
+        if fresh_claims is not None:
+            from app.services.dingtalk_identity_reconciliation import (
+                dingtalk_legacy_identity_reconciler,
+            )
+
+        if fresh_claims is not None and not subject_lock_held:
+            # Every DingTalk entry path uses advisory -> member/User/Identity.
+            # Taking this before flush is essential for newly synced members.
+            await dingtalk_legacy_identity_reconciler.acquire_subject_lock(
+                db,
+                tenant_id=fresh_claims.tenant_id,
+                provider_id=fresh_claims.provider_id,
+                external_id=fresh_claims.external_id,
+            )
         # Directory sync and inbound IM can provision the same member at the
         # same time. Serialize on the shared directory row and overwrite any
         # stale ORM state so only one identityless tenant User can be minted.
@@ -106,18 +121,28 @@ class ContactProvisioningService:
         verified_contact = provider_type == "dingtalk" or bool(
             (getattr(provider, "config", None) or {}).get("verified_contact_identity")
         )
-        mobile = normalize_mobile(org_member.phone) if verified_contact else None
-        email = _clean_email(org_member.email) if verified_contact else None
+        if provider_type == "dingtalk":
+            claims_in_scope = bool(
+                fresh_claims
+                and provider
+                and fresh_claims.matches_scope(
+                    tenant_id=tenant_id,
+                    provider_id=provider.id,
+                    external_id=org_member.external_id or "",
+                )
+            )
+            if fresh_claims and fresh_claims.has_alternate_email_conflict:
+                from app.services.canonical_user_resolver import CanonicalIdentityConflict
 
-        from app.services.canonical_user_resolver import canonical_user_resolver
+                raise CanonicalIdentityConflict(
+                    "DingTalk email and org_email disagree"
+                )
+            email = fresh_claims.email if claims_in_scope and fresh_claims else None
+            mobile = fresh_claims.phone if claims_in_scope and fresh_claims else None
+        else:
+            mobile = normalize_mobile(org_member.phone) if verified_contact else None
+            email = _clean_email(org_member.email) if verified_contact else None
 
-        claims = await canonical_user_resolver.resolve_identity_claims(
-            db,
-            email=email,
-            phone=mobile,
-            enrich=True,
-        )
-        identity = claims.identity
         linked_user = (
             await self._get_tenant_user(db, org_member.user_id, tenant_id)
             if org_member.user_id
@@ -128,6 +153,54 @@ class ContactProvisioningService:
             return ContactProvisioningResult(
                 skipped_reason="skipped_requires_confirmation"
             )
+
+        if provider_type == "dingtalk" and fresh_claims and linked_user:
+            legacy = await dingtalk_legacy_identity_reconciler.reconcile(
+                db,
+                provider=provider,
+                org_member=org_member,
+                claims=fresh_claims,
+                apply=bool(
+                    (provider.config or {}).get(
+                        "auto_repair_legacy_identity_split",
+                        False,
+                    )
+                ),
+                lock_already_held=subject_lock_held,
+            )
+            if legacy.repaired and legacy.user:
+                await self._sync_user_profile(
+                    db,
+                    legacy.user,
+                    org_member,
+                    provider,
+                    mobile,
+                    email,
+                    verified_contact,
+                )
+                await self._ensure_participant(db, legacy.user)
+                return ContactProvisioningResult(
+                    user=legacy.user,
+                    user_linked=True,
+                    tenant_user_matched=True,
+                    legacy_split_repaired=True,
+                )
+            if legacy.candidate:
+                from app.services.canonical_user_resolver import CanonicalUserConflict
+
+                raise CanonicalUserConflict(
+                    f"legacy DingTalk identity split requires repair: {legacy.reason or legacy.status}"
+                )
+
+        from app.services.canonical_user_resolver import canonical_user_resolver
+
+        claims = await canonical_user_resolver.resolve_identity_claims(
+            db,
+            email=email,
+            phone=mobile,
+            enrich=True,
+        )
+        identity = claims.identity
 
         if identity:
             identity_user = await canonical_user_resolver.get_tenant_user(
@@ -164,7 +237,13 @@ class ContactProvisioningService:
                 )
             org_member.user_id = resolved_user.id
             await self._sync_user_profile(
-                db, resolved_user, org_member, provider, mobile, verified_contact
+                db,
+                resolved_user,
+                org_member,
+                provider,
+                mobile,
+                email,
+                verified_contact,
             )
             await self._ensure_participant(db, resolved_user)
             await db.flush()
@@ -178,7 +257,13 @@ class ContactProvisioningService:
 
         if linked_user and linked_user.is_active:
             await self._sync_user_profile(
-                db, linked_user, org_member, provider, mobile, verified_contact
+                db,
+                linked_user,
+                org_member,
+                provider,
+                mobile,
+                email,
+                verified_contact,
             )
             await self._ensure_participant(db, linked_user)
             await db.flush()
@@ -218,14 +303,39 @@ class ContactProvisioningService:
         org_member: OrgMember,
         *,
         provider: IdentityProvider | None = None,
+        fresh_claims: VerifiedDirectoryClaims | None = None,
     ) -> None:
         """Refresh one already-resolved canonical User from its directory profile."""
         provider = provider or await self._get_provider(db, org_member.provider_id)
         verified_contact = self._provider_type(provider) == "dingtalk" or bool(
             (getattr(provider, "config", None) or {}).get("verified_contact_identity")
         )
-        mobile = normalize_mobile(org_member.phone) if verified_contact else None
-        await self._sync_user_profile(db, user, org_member, provider, mobile, verified_contact)
+        provider_type = self._provider_type(provider)
+        if provider_type == "dingtalk":
+            claims_in_scope = bool(
+                fresh_claims
+                and provider
+                and org_member.tenant_id
+                and fresh_claims.matches_scope(
+                    tenant_id=org_member.tenant_id,
+                    provider_id=provider.id,
+                    external_id=org_member.external_id or "",
+                )
+            )
+            email = fresh_claims.email if claims_in_scope and fresh_claims else None
+            mobile = fresh_claims.phone if claims_in_scope and fresh_claims else None
+        else:
+            email = _clean_email(org_member.email) if verified_contact else None
+            mobile = normalize_mobile(org_member.phone) if verified_contact else None
+        await self._sync_user_profile(
+            db,
+            user,
+            org_member,
+            provider,
+            mobile,
+            email,
+            verified_contact,
+        )
         await self._ensure_participant(db, user)
         await db.flush()
 
@@ -308,6 +418,7 @@ class ContactProvisioningService:
         org_member: OrgMember,
         provider: IdentityProvider | None,
         mobile: str | None,
+        email: str | None,
         verified_contact: bool,
     ) -> None:
         if org_member.name and user.display_name != org_member.name:
@@ -322,7 +433,13 @@ class ContactProvisioningService:
             user.registration_source = f"{self._provider_type(provider)}_org_sync"
         if user.identity is not None:
             await self._sync_identity_contact(
-                db, user.identity, org_member, provider, mobile, verified_contact
+                db,
+                user.identity,
+                org_member,
+                provider,
+                mobile,
+                email,
+                verified_contact,
             )
         await db.flush()
 
@@ -333,12 +450,13 @@ class ContactProvisioningService:
         org_member: OrgMember,
         provider: IdentityProvider | None,
         mobile: str | None,
+        email: str | None,
         verified_contact: bool,
     ) -> None:
         if mobile and identity.phone != mobile and await self._phone_available_for_identity(db, mobile, identity.id):
             identity.phone = mobile
 
-        incoming_email = _clean_email(org_member.email) if verified_contact else None
+        incoming_email = normalize_email(email) if verified_contact else None
         if (
             incoming_email
             and (not identity.email or _is_local_email(identity.email))

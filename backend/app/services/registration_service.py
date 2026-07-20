@@ -352,7 +352,7 @@ class RegistrationService:
             email=email,
             phone=user_info.get("mobile") or user_info.get("phone"),
             username=username,
-            password=effective_id, # Placeholder for SSO users
+            password=None,
         )
 
 

@@ -20,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.identity import IdentityProvider
 from app.models.org import OrgDepartment, OrgMember
 from app.models.user import User, Identity
+from app.services.canonical_user_resolver import normalize_email, normalize_phone
+from app.services.directory_identity_claims import VerifiedDirectoryClaims
 
 try:
     from anyascii import anyascii as _anyascii
@@ -135,15 +137,9 @@ async def derive_member_department_paths(
 
 def normalize_contact_for_match(value: str | None) -> str | None:
     """Normalize synced contact identifiers before matching platform users."""
-    if value is None:
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    if "@" in value:
-        return value.lower()
-    digits = "".join(ch for ch in value if ch.isdigit())
-    return digits or value
+    if value and "@" in value:
+        return normalize_email(value)
+    return normalize_phone(value)
 
 
 def _normalize_contact(value: str | None) -> str | None:
@@ -258,6 +254,8 @@ class BaseOrgSyncAdapter(ABC):
         user_skipped_confirmation_count = 0
         user_fetch_skipped_dept_count = 0
         profile_count = 0
+        identity_conflict_count = 0
+        legacy_split_repaired_count = 0
         sync_start = _utcnow()
         partial_failure = False
 
@@ -279,6 +277,21 @@ class BaseOrgSyncAdapter(ABC):
 
             await self._rebuild_department_paths(db, provider.id)
             await db.flush()
+            per_member_transactions = (
+                (
+                    getattr(provider, "provider_type", None)
+                    or self.provider_type
+                    or ""
+                ).lower()
+                == "dingtalk"
+                and isinstance(db, AsyncSession)
+            )
+            if per_member_transactions:
+                # Make the normalized department tree visible, then give each
+                # DingTalk employee a real top-level transaction. This releases
+                # advisory plus member/User/Identity row locks together instead
+                # of retaining them for the entire full sync.
+                await db.commit()
 
             # Fetch and sync users (from all departments)
             for dept in departments:
@@ -299,20 +312,36 @@ class BaseOrgSyncAdapter(ABC):
 
                 for user in users:
                     try:
-                        async with db.begin_nested():
-                            stats = await self._upsert_member(db, provider, user, dept.external_id)
-                            if stats.get("user_created"):
-                                user_count += 1
-                            if stats.get("user_linked"):
-                                user_linked_count += 1
-                            if stats.get("global_identity_matched_no_tenant_user"):
-                                global_identity_reused_count += 1
-                            if stats.get("user_skipped_no_phone"):
-                                user_skipped_no_phone_count += 1
-                            if stats.get("user_skipped_requires_confirmation"):
-                                user_skipped_confirmation_count += 1
-                            if stats.get("profile_synced"):
-                                profile_count += 1
+                        if per_member_transactions:
+                            stats = await self._upsert_member_in_short_transaction(
+                                provider.id,
+                                user,
+                                dept.external_id,
+                            )
+                        else:
+                            async with db.begin_nested():
+                                stats = await self._upsert_member(
+                                    db,
+                                    provider,
+                                    user,
+                                    dept.external_id,
+                                )
+                        if stats.get("user_created"):
+                            user_count += 1
+                        if stats.get("user_linked"):
+                            user_linked_count += 1
+                        if stats.get("global_identity_matched_no_tenant_user"):
+                            global_identity_reused_count += 1
+                        if stats.get("user_skipped_no_phone"):
+                            user_skipped_no_phone_count += 1
+                        if stats.get("user_skipped_requires_confirmation"):
+                            user_skipped_confirmation_count += 1
+                        if stats.get("profile_synced"):
+                            profile_count += 1
+                        if stats.get("identity_conflict"):
+                            identity_conflict_count += 1
+                        if stats.get("legacy_split_repaired"):
+                            legacy_split_repaired_count += 1
                         member_count += 1
                     except Exception as e:
                         partial_failure = True
@@ -364,10 +393,35 @@ class BaseOrgSyncAdapter(ABC):
             "users_skipped_requires_confirmation": user_skipped_confirmation_count,
             "user_fetch_skipped_departments": user_fetch_skipped_dept_count,
             "profiles_synced": profile_count,
+            "identity_conflicts": identity_conflict_count,
+            "legacy_splits_repaired": legacy_split_repaired_count,
             "errors": errors,
             "provider": self.provider_type,
             "synced_at": _utcnow().isoformat()
         }
+
+    async def _upsert_member_in_short_transaction(
+        self,
+        provider_id: uuid.UUID,
+        user: ExternalUser,
+        department_external_id: str,
+    ) -> dict[str, Any]:
+        from app.database import async_session
+
+        async with async_session() as member_db:
+            async with member_db.begin():
+                provider = await member_db.get(IdentityProvider, provider_id)
+                if provider is None or not provider.is_active:
+                    raise RuntimeError(
+                        "DingTalk provider became unavailable during sync"
+                    )
+                return await self._upsert_member(
+                    member_db,
+                    provider,
+                    user,
+                    department_external_id,
+                    transaction_scoped_subject_lock=True,
+                )
 
     def _should_skip_department_user_fetch(self, dept: ExternalDepartment) -> bool:
         return False
@@ -586,8 +640,100 @@ class BaseOrgSyncAdapter(ABC):
         provider: IdentityProvider,
         user: ExternalUser,
         department_external_id: str,
+        *,
+        transaction_scoped_subject_lock: bool = False,
     ) -> dict[str, Any]:
-        """Insert or update a member, platform user, and identity."""
+        """Insert/update one member under a short-lived subject lock."""
+        self._validate_member_identifiers(provider, user)
+        now = _utcnow()
+        provider_type = (provider.provider_type or self.provider_type or "").lower()
+        member_tenant_id = self.tenant_id or provider.tenant_id
+        fresh_claims = None
+        if (
+            provider_type == "dingtalk"
+            and member_tenant_id
+            and provider.id
+            and user.external_id
+        ):
+            fresh_claims = VerifiedDirectoryClaims.from_dingtalk_payload(
+                tenant_id=member_tenant_id,
+                provider_id=provider.id,
+                external_id=user.external_id,
+                payload=(
+                    user.raw_data
+                    if user.raw_data
+                    else {
+                        "email": user.email,
+                        "mobile": user.mobile,
+                    }
+                ),
+                source="dingtalk_user_list",
+                observed_at=now,
+            )
+            from app.services.dingtalk_identity_reconciliation import (
+                dingtalk_legacy_identity_reconciler,
+            )
+
+            if transaction_scoped_subject_lock:
+                await dingtalk_legacy_identity_reconciler.acquire_subject_lock(
+                    db,
+                    tenant_id=member_tenant_id,
+                    provider_id=provider.id,
+                    external_id=user.external_id,
+                )
+                return await self._upsert_member_locked(
+                    db,
+                    provider,
+                    user,
+                    department_external_id,
+                    now=now,
+                    provider_type=provider_type,
+                    member_tenant_id=member_tenant_id,
+                    fresh_claims=fresh_claims,
+                )
+
+            # Direct single-member callers may still own a longer transaction.
+            # A paired session lock avoids accumulating transaction locks there;
+            # full sync uses the top-level transaction path above.
+            async with dingtalk_legacy_identity_reconciler.session_subject_lock(
+                db,
+                tenant_id=member_tenant_id,
+                provider_id=provider.id,
+                external_id=user.external_id,
+            ):
+                return await self._upsert_member_locked(
+                    db,
+                    provider,
+                    user,
+                    department_external_id,
+                    now=now,
+                    provider_type=provider_type,
+                    member_tenant_id=member_tenant_id,
+                    fresh_claims=fresh_claims,
+                )
+        return await self._upsert_member_locked(
+            db,
+            provider,
+            user,
+            department_external_id,
+            now=now,
+            provider_type=provider_type,
+            member_tenant_id=member_tenant_id,
+            fresh_claims=None,
+        )
+
+    async def _upsert_member_locked(
+        self,
+        db: AsyncSession,
+        provider: IdentityProvider,
+        user: ExternalUser,
+        department_external_id: str,
+        *,
+        now: datetime,
+        provider_type: str,
+        member_tenant_id: uuid.UUID | None,
+        fresh_claims: VerifiedDirectoryClaims | None,
+    ) -> dict[str, Any]:
         stats = {
             "user_created": False,
             "user_linked": False,
@@ -595,8 +741,9 @@ class BaseOrgSyncAdapter(ABC):
             "user_skipped_requires_confirmation": False,
             "user_skipped_no_phone": False,
             "profile_synced": False,
+            "identity_conflict": False,
+            "legacy_split_repaired": False,
         }
-        self._validate_member_identifiers(provider, user)
 
         # Find department using user's actual department list.
         # DingTalk's dept_id_list last item is the most specific (leaf) department.
@@ -626,12 +773,8 @@ class BaseOrgSyncAdapter(ABC):
 
         existing_member = await self._find_existing_member(db, provider, user)
 
-        now = _utcnow()
-
         email = _normalize_contact(user.email)
         mobile = _normalize_contact(user.mobile)
-        provider_type = (provider.provider_type or self.provider_type or "").lower()
-        member_tenant_id = self.tenant_id or provider.tenant_id
 
         # Update/Create OrgMember
         if existing_member:
@@ -652,9 +795,10 @@ class BaseOrgSyncAdapter(ABC):
             existing_member.title = user.title
             existing_member.department_id = department.id if department else None
             existing_member.department_path = department.path if department else user.department_path
-            if provider_type == "dingtalk":
-                existing_member.phone = mobile
-            elif mobile is not None:
+            # A protected field may be blank because it was not returned under
+            # the current app permissions.  Retain the display value, but never
+            # reuse it as fresh identity evidence.
+            if mobile is not None:
                 existing_member.phone = mobile
             existing_member.status = user.status
             
@@ -705,19 +849,42 @@ class BaseOrgSyncAdapter(ABC):
 
         if auto_create_users:
             from app.services.contact_provisioning import contact_provisioning
+            from app.services.canonical_user_resolver import (
+                CanonicalIdentityConflict,
+                CanonicalUserConflict,
+            )
 
-            provisioning = await contact_provisioning.ensure_user_for_org_member(
-                db,
-                member,
-                provider=provider,
-            )
-            stats["user_created"] = provisioning.user_created
-            stats["user_linked"] = provisioning.user_linked
-            stats["global_identity_matched_no_tenant_user"] = (
-                provisioning.global_identity_matched_no_tenant_user
-            )
-            stats["user_skipped_requires_confirmation"] = provisioning.skipped_requires_confirmation
-            stats["user_skipped_no_phone"] = provisioning.skipped_missing_mobile
+            # Contact persistence and identity reconciliation intentionally use
+            # different savepoints.  A historical identity conflict must not
+            # discard newly observed directory profile data.
+            try:
+                async with db.begin_nested():
+                    provisioning = await contact_provisioning.ensure_user_for_org_member(
+                        db,
+                        member,
+                        provider=provider,
+                        fresh_claims=fresh_claims,
+                        subject_lock_held=fresh_claims is not None,
+                    )
+                stats["user_created"] = provisioning.user_created
+                stats["user_linked"] = provisioning.user_linked
+                stats["global_identity_matched_no_tenant_user"] = (
+                    provisioning.global_identity_matched_no_tenant_user
+                )
+                stats["user_skipped_requires_confirmation"] = (
+                    provisioning.skipped_requires_confirmation
+                )
+                stats["user_skipped_no_phone"] = provisioning.skipped_missing_mobile
+                stats["legacy_split_repaired"] = provisioning.legacy_split_repaired
+            except (CanonicalIdentityConflict, CanonicalUserConflict) as exc:
+                stats["identity_conflict"] = True
+                logger.warning(
+                    "[OrgSync][{}] Fresh directory claims could not be reconciled "
+                    "for member_id={}: {}",
+                    provider_type,
+                    member.id,
+                    type(exc).__name__,
+                )
         else:
             platform_user = await self._resolve_platform_user(
                 db,
@@ -1385,7 +1552,9 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
                         open_id=item.get("openid", "") or "",
                         name=item.get("name", ""),
                         nickname=item.get("nick", "") or item.get("nickname", "") or "",
-                        email=item.get("email", "") or "",
+                        # DingTalk commonly returns the corporate mailbox in
+                        # org_email while leaving email present but blank.
+                        email=item.get("org_email", "") or item.get("email", "") or "",
                         avatar_url=item.get("avatar", "") or "",
                         title=item.get("title", "") or "",
                         department_external_id=last_dept_id,

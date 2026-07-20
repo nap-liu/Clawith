@@ -138,8 +138,11 @@ async def _get_dingtalk_user_detail(
             return {
                 "name": result.get("name", ""),
                 "unionid": result.get("unionid", ""),
-                "mobile": result.get("mobile", ""),
-                "email": result.get("email", "") or result.get("org_email", ""),
+                # Keep the raw fields separate through reconciliation.  A
+                # collapsed fallback would hide email/org_email disagreement.
+                "mobile": result.get("mobile"),
+                "email": result.get("email"),
+                "org_email": result.get("org_email"),
             }
 
     except Exception as exc:
@@ -437,6 +440,8 @@ async def process_dingtalk_message(
         dt_unionid = ""
         dt_mobile = ""
         dt_email = ""
+        dt_raw_email = None
+        dt_raw_org_email = None
         dt_real_name = ""
 
         # Company-level credentials are primary; the agent robot is the fallback.
@@ -469,8 +474,10 @@ async def process_dingtalk_message(
             if dt_user_detail:
                 dt_real_name = dt_user_detail.get("name", "")
                 dt_unionid = dt_user_detail.get("unionid", "")
-                dt_mobile = dt_user_detail.get("mobile", "")
-                dt_email = dt_user_detail.get("email", "") or dt_user_detail.get("org_email", "")
+                dt_mobile = dt_user_detail.get("mobile") or ""
+                dt_raw_email = dt_user_detail.get("email")
+                dt_raw_org_email = dt_user_detail.get("org_email")
+                dt_email = dt_raw_org_email or dt_raw_email or ""
 
         from app.services.channel_user_service import channel_user_service
 
@@ -484,6 +491,9 @@ async def process_dingtalk_message(
                 "unionid": dt_unionid,
                 "mobile": dt_mobile,
                 "email": dt_email,
+                "raw_email": dt_raw_email,
+                "raw_org_email": dt_raw_org_email,
+                "raw_mobile": dt_mobile,
                 "name": dt_real_name,
                 "nickname": sender_nick,
                 "directory_name_verified": bool(dt_real_name),
@@ -545,8 +555,10 @@ async def process_dingtalk_message(
             if dt_user_detail:
                 dt_real_name = dt_real_name or dt_user_detail.get("name", "")
                 dt_unionid = dt_unionid or dt_user_detail.get("unionid", "")
-                dt_mobile = dt_mobile or dt_user_detail.get("mobile", "")
-                dt_email = dt_email or dt_user_detail.get("email", "") or dt_user_detail.get("org_email", "")
+                dt_mobile = dt_mobile or dt_user_detail.get("mobile") or ""
+                dt_raw_email = dt_user_detail.get("email")
+                dt_raw_org_email = dt_user_detail.get("org_email")
+                dt_email = dt_email or dt_raw_org_email or dt_raw_email or ""
 
         # 3a: unionId 查 org_members（跨通道匹配 SSO 用户）
         if dt_unionid and _dingtalk_provider and not platform_user:

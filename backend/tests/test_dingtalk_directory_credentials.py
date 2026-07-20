@@ -149,7 +149,8 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
         identity = Identity(
             username=f"dingtalk_{sender_staff_id}",
             email=placeholder_email,
-            password_hash="x",
+            phone=mobile,
+            password_hash=None,
         )
         db.add(identity)
         await db.flush()
@@ -160,11 +161,19 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
             display_name="Existing DingTalk User",
             role="member",
             source="dingtalk",
+            registration_source="dingtalk_org_sync",
             is_active=True,
+            quota_message_limit=50,
+            quota_message_period="permanent",
+            quota_messages_used=0,
+            quota_max_agents=2,
+            quota_agent_ttl_hours=0,
         )
         db.add(user)
         await db.flush()
 
+        claimed_identity_id = None
+        claimed_user_id = None
         if email_already_claimed:
             claimed_identity = Identity(
                 username=f"email-owner-{suffix}",
@@ -173,17 +182,18 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
             )
             db.add(claimed_identity)
             await db.flush()
-            db.add(
-                User(
-                    identity_id=claimed_identity.id,
-                    tenant_id=tenant.id,
-                    display_name="Existing Email Owner",
-                    role="member",
-                    source="web",
-                    is_active=True,
-                )
+            claimed_user = User(
+                identity_id=claimed_identity.id,
+                tenant_id=tenant.id,
+                display_name="Existing Email Owner",
+                role="member",
+                source="web",
+                is_active=True,
             )
+            db.add(claimed_user)
             await db.flush()
+            claimed_identity_id = claimed_identity.id
+            claimed_user_id = claimed_user.id
 
         model = LLMModel(
             tenant_id=tenant.id,
@@ -212,7 +222,11 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
             provider_type="dingtalk",
             name=f"DingTalk Provider {suffix}",
             is_active=True,
-            config={"app_key": enterprise_key, "app_secret": enterprise_secret},
+            config={
+                "app_key": enterprise_key,
+                "app_secret": enterprise_secret,
+                "auto_repair_legacy_identity_split": True,
+            },
         )
         db.add(provider)
         db.add(
@@ -315,11 +329,20 @@ async def test_existing_dingtalk_user_is_enriched_with_enterprise_identity(
             )
         ).scalar_one()
 
-    assert identity.phone == mobile
-    assert identity.username == f"dingtalk_{sender_staff_id}"
-    assert identity.email == (placeholder_email if email_already_claimed else real_email)
-    assert refreshed_user.display_name == "Directory Real Name"
-    assert member.user_id == user_id
+    if email_already_claimed:
+        assert identity is None
+        assert refreshed_user is None
+        async with async_session() as db:
+            claimed_identity = await db.get(Identity, claimed_identity_id)
+        assert claimed_identity.phone == mobile
+        assert claimed_identity.email == real_email
+        assert member.user_id == claimed_user_id
+    else:
+        assert identity.phone == mobile
+        assert identity.username == f"dingtalk_{sender_staff_id}"
+        assert identity.email == real_email
+        assert refreshed_user.display_name == "Directory Real Name"
+        assert member.user_id == user_id
     assert member.name == "Directory Real Name"
     assert member.nickname == "Updated DingTalk Nickname"
     assert member.phone == mobile

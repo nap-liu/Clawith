@@ -650,6 +650,10 @@ async def test_channel_user_service_dingtalk_directory_email_is_authoritative_wi
             extra_info={
                 "unionid": unionid,
                 "email": shared_email,
+                "raw_email": "",
+                "raw_org_email": shared_email,
+                "raw_mobile": None,
+                "identity_verified": True,
                 "_installation_scope": "test:dingtalk",
             },
         )

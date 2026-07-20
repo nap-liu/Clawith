@@ -318,7 +318,7 @@ class FeishuService:
                 email=email,
                 phone=feishu_user.get("mobile"),
                 username=username,
-                password=open_id,
+                password=None,
             )
 
             # Step 2: Create tenant-scoped User linked to Identity

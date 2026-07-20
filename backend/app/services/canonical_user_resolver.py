@@ -425,6 +425,21 @@ class CanonicalUserResolver:
                 ),
                 {"source": source.id, "target": target.id},
             )
+        if await self._table_exists(db, "channel_user_bindings"):
+            await db.execute(
+                text(
+                    """
+                    DELETE FROM channel_user_bindings s
+                    USING channel_user_bindings t
+                    WHERE s.user_id = :source AND t.user_id = :target
+                      AND s.tenant_id = t.tenant_id
+                      AND s.installation_scope = t.installation_scope
+                      AND s.id_type = t.id_type
+                      AND s.subject = t.subject
+                    """
+                ),
+                {"source": source.id, "target": target.id},
+            )
 
         # Preserve the strongest explicit per-agent user permission.
         await db.execute(
