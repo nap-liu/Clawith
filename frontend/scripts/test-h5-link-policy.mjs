@@ -28,19 +28,15 @@ vm.runInNewContext(compiled, {
     URL,
 }, { filename: sourcePath });
 
-const { isWechatMiniProgramWebView, resolveExternalHttpLink } = module.exports;
+const {
+    resolveExternalHttpLink,
+    resolveH5LinkAction,
+} = module.exports;
 
-assert.equal(
-    isWechatMiniProgramWebView('Mozilla/5.0 MicroMessenger/8.0.50 miniProgram'),
-    true,
-);
-assert.equal(
-    isWechatMiniProgramWebView('Mozilla/5.0 MICROMESSENGER/8.0.50 MINIPROGRAM'),
-    true,
-);
-assert.equal(isWechatMiniProgramWebView('Mozilla/5.0 MicroMessenger/8.0.50'), false);
-assert.equal(isWechatMiniProgramWebView('Mozilla/5.0 DingTalk/7.6.0'), false);
-assert.equal(isWechatMiniProgramWebView('Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36'), false);
+function assertLinkAction(actual, expected) {
+    assert.equal(actual.type, expected.type);
+    assert.equal(actual.url, expected.url);
+}
 
 const current = 'https://ai.example.test/h5/agents/a1/chat?channel=wechat_miniprogram';
 assert.equal(resolveExternalHttpLink('/api/health', current), null);
@@ -56,5 +52,61 @@ assert.equal(
 assert.equal(resolveExternalHttpLink('mailto:help@example.com', current), null);
 assert.equal(resolveExternalHttpLink('javascript:alert(1)', current), null);
 assert.equal(resolveExternalHttpLink('https://[invalid', current), null);
+
+assertLinkAction(
+    resolveH5LinkAction('https://docs.example.com/path?q=中文#part', {
+        currentHref: current,
+    }),
+    { type: 'native' },
+);
+assertLinkAction(
+    resolveH5LinkAction('https://docs.example.com/path?q=中文#part', {
+        currentHref: current,
+        runtime: 'dingtalk-miniapp-webview',
+    }),
+    {
+        type: 'dingtalk-open',
+        url: 'https://docs.example.com/path?q=%E4%B8%AD%E6%96%87#part',
+    },
+);
+assertLinkAction(
+    resolveH5LinkAction('https://docs.example.com/path', {
+        currentHref: current,
+        runtime: 'wechat-miniapp-webview',
+    }),
+    {
+        type: 'wechat-miniapp-open',
+        url: 'https://docs.example.com/path',
+    },
+);
+assertLinkAction(
+    resolveH5LinkAction('https://docs.example.com/path', {
+        currentHref: `${current}&channel=dingtalk`,
+    }),
+    { type: 'native' },
+);
+assertLinkAction(
+    resolveH5LinkAction('https://docs.example.com/path', {
+        currentHref: current,
+        runtime: 'standard',
+    }),
+    { type: 'native' },
+);
+assertLinkAction(
+    resolveH5LinkAction('/docs', {
+        currentHref: current,
+        runtime: 'dingtalk-miniapp-webview',
+    }),
+    { type: 'native' },
+);
+for (const href of ['mailto:help@example.com', 'tel:10086', 'javascript:alert(1)']) {
+    assertLinkAction(
+        resolveH5LinkAction(href, {
+            currentHref: current,
+            runtime: 'dingtalk-miniapp-webview',
+        }),
+        { type: 'native' },
+    );
+}
 
 console.log('h5 link policy tests passed');

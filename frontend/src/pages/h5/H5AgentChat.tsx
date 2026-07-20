@@ -51,8 +51,13 @@ import {
 } from './chatTimeline';
 import { parseH5Theme } from './h5Params';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
+import { openExternalLinkWithBrowserDefault } from '../../utils/browserLink';
 import { copyToClipboard } from '../../utils/clipboard';
-import { isWechatMiniProgramWebView, resolveExternalHttpLink } from '../../utils/h5LinkPolicy';
+import {
+    detectH5ContainerRuntime,
+    type H5ContainerRuntime,
+} from '../../utils/h5ContainerRuntime';
+import { resolveH5LinkAction } from '../../utils/h5LinkPolicy';
 import { installThemeController, resolveThemeMode } from '../../utils/themeMode';
 import { insertSpeechTranscript, useSpeechInput } from '../../hooks/useSpeechInput';
 import './H5AgentChat.css';
@@ -332,8 +337,8 @@ export default function H5AgentChat() {
     const oauthState = useMemo(() => new URLSearchParams(searchString).get('state'), [searchString]);
     const themeMode = useMemo(() => parseH5Theme(new URLSearchParams(searchString).get('theme')), [searchString]);
     const initialSessionId = useMemo(() => parseChatSessionId(new URLSearchParams(searchString).get('session_id')), [searchString]);
-    const isWechatMiniProgram = useMemo(() => isWechatMiniProgramWebView(), []);
     const [resolvedTheme, setResolvedTheme] = useState(() => resolveThemeMode(themeMode));
+    const [containerRuntime, setContainerRuntime] = useState<H5ContainerRuntime>('standard');
 
     const token = useAuthStore((s) => s.token);
     const setAuth = useAuthStore((s) => s.setAuth);
@@ -440,6 +445,21 @@ export default function H5AgentChat() {
     useEffect(() => {
         document.body.classList.add('h5-chat-active');
         return () => document.body.classList.remove('h5-chat-active');
+    }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+        void detectH5ContainerRuntime()
+            .then((runtime) => {
+                if (!cancelled) setContainerRuntime(runtime);
+            })
+            .catch((error) => {
+                console.warn('H5 container runtime detection failed', error);
+                if (!cancelled) setContainerRuntime('standard');
+            });
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     useLayoutEffect(() => installThemeController({
@@ -1112,21 +1132,38 @@ export default function H5AgentChat() {
         </article>
     ), []);
 
+    const handlePlatformLinkFailure = useCallback(async (
+        platform: 'DingTalk' | 'WeChat',
+        url: string,
+        error: unknown,
+    ) => {
+        console.warn(`${platform} mini-program link open failed`, error);
+        if (openExternalLinkWithBrowserDefault(url)) return;
+
+        const copied = await copyToClipboard(url);
+        if (copied) {
+            toast.error('系统打开失败，链接已复制');
+        } else {
+            toast.error('链接打开失败，请稍后重试');
+        }
+    }, [toast]);
+
     const handleMarkdownLinkClick = useCallback((href: string): boolean => {
-        if (!isWechatMiniProgram) return false;
+        const action = resolveH5LinkAction(href, { runtime: containerRuntime });
+        if (action.type === 'native') return false;
 
-        const externalUrl = resolveExternalHttpLink(href);
-        if (!externalUrl) return false;
+        if (action.type === 'dingtalk-open') {
+            void import('../../utils/dingtalkLink')
+                .then(({ openDingTalkExternalLink }) => openDingTalkExternalLink(action.url))
+                .catch((error) => handlePlatformLinkFailure('DingTalk', action.url, error));
+            return true;
+        }
 
-        void copyToClipboard(externalUrl).then((copied) => {
-            if (copied) {
-                toast.success('链接已复制，请在外部浏览器中打开');
-            } else {
-                toast.error('链接复制失败，请稍后重试');
-            }
-        });
+        void import('../../utils/wechatMiniProgramLink')
+            .then(({ openWechatMiniProgramWebview }) => openWechatMiniProgramWebview(action.url))
+            .catch((error) => handlePlatformLinkFailure('WeChat', action.url, error));
         return true;
-    }, [isWechatMiniProgram, toast]);
+    }, [containerRuntime, handlePlatformLinkFailure]);
 
     const renderConversationEntry = useCallback((entry: (typeof conversationEntries)[number]) => {
         if (entry.type === 'analysis_group') {
