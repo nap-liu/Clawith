@@ -5,6 +5,7 @@ import { IconArrowRight } from '@tabler/icons-react';
 import { onboardingApi } from '../services/api';
 import { useAuthStore } from '../stores';
 import { AtlasFrame, StarField, OrbitPlate, UniverseMap } from '../components/atlas';
+import { applyDocumentTheme, readSavedTheme } from '../utils/themeMode';
 
 type Step = 'assistant' | 'opening';
 
@@ -31,7 +32,7 @@ export default function Onboarding() {
     const [error, setError] = useState('');
 
     useEffect(() => {
-        document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
+        applyDocumentTheme(readSavedTheme());
     }, []);
 
     useEffect(() => {

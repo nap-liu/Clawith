@@ -36,6 +36,7 @@ import {
 import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
 import PatManager from '../components/PatManager';
+import { applyDocumentTheme, readSavedTheme, saveTheme } from '../utils/themeMode';
 
 /* ────── Tabler Icons ────── */
 const SidebarIcons = {
@@ -605,13 +606,11 @@ export default function Layout() {
     };
 
     // Theme
-    const [theme, setTheme] = useState<'dark' | 'light'>(() => {
-        return (localStorage.getItem('theme') as 'dark' | 'light') || 'light';
-    });
+    const [theme, setTheme] = useState<'dark' | 'light'>(() => readSavedTheme());
 
     useEffect(() => {
-        document.documentElement.setAttribute('data-theme', theme);
-        localStorage.setItem('theme', theme);
+        applyDocumentTheme(theme);
+        saveTheme(theme);
     }, [theme]);
 
     const toggleTheme = () => setTheme(prev => prev === 'dark' ? 'light' : 'dark');

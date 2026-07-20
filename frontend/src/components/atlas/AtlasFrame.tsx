@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { IconWorld } from '@tabler/icons-react';
+import { readSavedTheme } from '../../utils/themeMode';
 
 interface Props {
     /** When provided, replaces the Clawith brand with a "← BACK" pill button */
@@ -16,7 +17,7 @@ export default function AtlasFrame({ onBack, onToggleLang, className, children }
     const { t } = useTranslation();
     const pageClass = ['atlas-page', className].filter(Boolean).join(' ');
     // Theme-aware brand mark: white logo on Night Atlas (dark), black on Paper Atlas (light) — mirrors Layout.
-    const logoSrc = (typeof window !== 'undefined' && localStorage.getItem('theme') === 'dark')
+    const logoSrc = (typeof window !== 'undefined' && readSavedTheme() === 'dark')
         ? '/logo-white.png'
         : '/logo-black.png';
     return (

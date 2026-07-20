@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "npm run test:h5-theme",
     "build": "tsc && vite build",
+    "test:h5-theme": "node scripts/test-h5-url-params.mjs && node scripts/test-h5-theme-tokens.mjs && node scripts/test-h5-theme-runtime.mjs",
     "check:identity-contract": "node scripts/check-identity-contract.mjs",
     "preview": "vite preview"
   },

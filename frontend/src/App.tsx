@@ -3,6 +3,7 @@ import { useAuthStore } from './stores';
 import { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { authApi } from './services/api';
+import { applyDocumentTheme, readSavedTheme } from './utils/themeMode';
 
 const Login = lazy(() => import('./pages/Login'));
 const ForgotPassword = lazy(() => import('./pages/ForgotPassword'));
@@ -216,11 +217,13 @@ export default function App() {
     const location = useLocation();
     const isH5Route = location.pathname.startsWith('/h5/');
 
-    useEffect(() => {
-        // Initialize theme on app mount (ensures login page gets correct theme)
-        const savedTheme = localStorage.getItem('theme') || 'light';
-        document.documentElement.setAttribute('data-theme', savedTheme);
+    useLayoutEffect(() => {
+        if (isH5Route) return;
+        const savedTheme = readSavedTheme();
+        applyDocumentTheme(savedTheme);
+    }, [isH5Route]);
 
+    useEffect(() => {
         // Cross-domain tenant switch: the backend appends ?token=<jwt> to the redirect URL
         // so the new domain receives a fresh scoped token. Consume it here (before any other
         // auth logic) so it always takes precedence over a stale token in localStorage.

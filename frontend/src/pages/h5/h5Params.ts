@@ -1,5 +1,5 @@
-export type H5Theme = 'light' | 'dark';
+import { parseThemeMode, type ThemeMode } from '../../utils/themeMode';
 
-export function parseH5Theme(value: string | null | undefined): H5Theme {
-    return value === 'dark' ? 'dark' : 'light';
-}
+export type H5Theme = ThemeMode;
+
+export const parseH5Theme = parseThemeMode;

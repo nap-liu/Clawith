@@ -6,6 +6,52 @@
   <link rel="icon" type="image/png" href="/logo.png" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="description" content="企业数字员工平台" />
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#f8f8f7" />
+  <script id="theme-bootstrap">
+    (function () {
+      var root = document.documentElement;
+      var isH5 = window.location.pathname.indexOf('/h5/') === 0;
+      var mode = 'light';
+      var resolved = 'light';
+
+      if (isH5) {
+        try {
+          var value = new URLSearchParams(window.location.search).get('theme');
+          value = typeof value === 'string' ? value.trim().toLowerCase() : '';
+          mode = value === 'light' || value === 'dark' ? value : 'system';
+        } catch (_error) {
+          mode = 'system';
+        }
+
+        if (mode === 'light' || mode === 'dark') {
+          resolved = mode;
+        } else {
+          try {
+            resolved = window.matchMedia
+              && window.matchMedia('(prefers-color-scheme: dark)').matches
+              ? 'dark'
+              : 'light';
+          } catch (_error) {
+            resolved = 'light';
+          }
+        }
+      } else {
+        try {
+          resolved = window.localStorage.getItem('theme') === 'dark' ? 'dark' : 'light';
+        } catch (_error) {
+          resolved = 'light';
+        }
+        mode = resolved;
+      }
+
+      root.setAttribute('data-theme', resolved);
+      root.setAttribute('data-theme-mode', mode);
+      root.style.colorScheme = resolved;
+      var themeColor = document.querySelector('meta[name="theme-color"]');
+      if (themeColor) themeColor.setAttribute('content', resolved === 'dark' ? '#0a0a0f' : '#f8f8f7');
+    }());
+  </script>
   <title>数字员工平台</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />

@@ -57,8 +57,18 @@ for (const color of h5PrivatePalette) {
 
 assert.match(
     tsx,
-    /document\.documentElement\.setAttribute\(['"]data-theme['"],\s*theme\)/,
-    'H5 theme URL param must apply to the global data-theme token source',
+    /installThemeController\(\{\s*mode:\s*themeMode,/,
+    'H5 theme mode must install the shared document theme controller',
+);
+assert.match(
+    tsx,
+    /h5-chat--\$\{resolvedTheme\}/,
+    'H5 root class must use the resolved light/dark theme',
+);
+assert.match(
+    tsx,
+    /data-theme-mode=\{themeMode\}/,
+    'H5 root must expose its light/dark/system preference for diagnostics',
 );
 
 console.log('h5 theme token tests passed');

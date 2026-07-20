@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
@@ -53,6 +53,7 @@ import { parseH5Theme } from './h5Params';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import { copyToClipboard } from '../../utils/clipboard';
 import { isWechatMiniProgramWebView, resolveExternalHttpLink } from '../../utils/h5LinkPolicy';
+import { installThemeController, resolveThemeMode } from '../../utils/themeMode';
 import { insertSpeechTranscript, useSpeechInput } from '../../hooks/useSpeechInput';
 import './H5AgentChat.css';
 
@@ -329,9 +330,10 @@ export default function H5AgentChat() {
     const provider = useMemo(() => new URLSearchParams(searchString).get('provider') || '', [searchString]);
     const code = useMemo(() => new URLSearchParams(searchString).get('code') || '', [searchString]);
     const oauthState = useMemo(() => new URLSearchParams(searchString).get('state'), [searchString]);
-    const theme = useMemo(() => parseH5Theme(new URLSearchParams(searchString).get('theme')), [searchString]);
+    const themeMode = useMemo(() => parseH5Theme(new URLSearchParams(searchString).get('theme')), [searchString]);
     const initialSessionId = useMemo(() => parseChatSessionId(new URLSearchParams(searchString).get('session_id')), [searchString]);
     const isWechatMiniProgram = useMemo(() => isWechatMiniProgramWebView(), []);
+    const [resolvedTheme, setResolvedTheme] = useState(() => resolveThemeMode(themeMode));
 
     const token = useAuthStore((s) => s.token);
     const setAuth = useAuthStore((s) => s.setAuth);
@@ -440,19 +442,17 @@ export default function H5AgentChat() {
         return () => document.body.classList.remove('h5-chat-active');
     }, []);
 
-    useEffect(() => {
-        const previousTheme = document.documentElement.getAttribute('data-theme');
-        document.documentElement.setAttribute('data-theme', theme);
-        document.body.dataset.h5Theme = theme;
+    useLayoutEffect(() => installThemeController({
+        mode: themeMode,
+        onThemeChange: setResolvedTheme,
+    }), [themeMode]);
+
+    useLayoutEffect(() => {
+        document.body.dataset.h5Theme = resolvedTheme;
         return () => {
-            if (previousTheme) {
-                document.documentElement.setAttribute('data-theme', previousTheme);
-            } else {
-                document.documentElement.removeAttribute('data-theme');
-            }
             delete document.body.dataset.h5Theme;
         };
-    }, [theme]);
+    }, [resolvedTheme]);
 
     useEffect(() => {
         const textarea = textareaRef.current;
@@ -1252,7 +1252,11 @@ export default function H5AgentChat() {
     const agentAvatarUrl = resolveAgentAvatarUrl(agent?.avatar_url, token);
 
     return (
-        <main className={`h5-chat h5-chat--${theme}`} data-theme={theme}>
+        <main
+            className={`h5-chat h5-chat--${resolvedTheme}`}
+            data-theme={resolvedTheme}
+            data-theme-mode={themeMode}
+        >
             <header className="h5-chat__header">
                 <div className="h5-chat__agent">
                     <div className="h5-chat__avatar">

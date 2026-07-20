@@ -10,6 +10,7 @@ import {
     IconCheck,
 } from '@tabler/icons-react';
 import { AtlasFrame, OriginPlate } from '../components/atlas';
+import { applyDocumentTheme, readSavedTheme } from '../utils/themeMode';
 
 export default function Login() {
     const { t, i18n } = useTranslation();
@@ -45,7 +46,7 @@ export default function Login() {
     });
 
     useEffect(() => {
-        document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
+        applyDocumentTheme(readSavedTheme());
 
         // If arriving via invitation link with email, check whether the email is already registered
         // to decide whether to show login or register form.

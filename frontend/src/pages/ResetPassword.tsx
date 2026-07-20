@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { IconAlertTriangle, IconCheck } from '@tabler/icons-react';
 import { authApi } from '../services/api';
+import { applyDocumentTheme, readSavedTheme } from '../utils/themeMode';
 
 export default function ResetPassword() {
     const { t } = useTranslation();
@@ -16,7 +17,7 @@ export default function ResetPassword() {
     const [success, setSuccess] = useState(false);
 
     useEffect(() => {
-        document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
+        applyDocumentTheme(readSavedTheme());
     }, []);
 
     const handleSubmit = async (e: React.FormEvent) => {
