@@ -114,6 +114,7 @@ assert.equal(await isDingTalkMiniProgramWebViewRuntime({
 
 const navigateCalls = [];
 await openDingTalkMiniProgramWebview('https://docs.example.com/a?name=中文#part', {
+    currentHref: 'https://docs.example.com/h5/agents/a1/chat',
     targetWindow: {
         dd: {
             navigateTo(options) {
@@ -132,6 +133,7 @@ assert.deepEqual(navigateCalls, [
 
 await assert.rejects(
     openDingTalkMiniProgramWebview('https://direct.example.com/path', {
+        currentHref: 'https://direct.example.com/h5/agents/a1/chat',
         targetWindow: {
             dd: {
                 navigateTo() {},
@@ -152,6 +154,7 @@ await assert.rejects(
 );
 await assert.rejects(
     openDingTalkMiniProgramWebview('https://failure.example.com/path', {
+        currentHref: 'https://failure.example.com/h5/agents/a1/chat',
         targetWindow: {
             dd: {
                 navigateTo(options) {
@@ -167,6 +170,7 @@ await assert.rejects(
 );
 await assert.rejects(
     openDingTalkMiniProgramWebview('https://timeout.example.com/path', {
+        currentHref: 'https://timeout.example.com/h5/agents/a1/chat',
         targetWindow: {
             dd: {
                 navigateTo() {},
@@ -179,8 +183,36 @@ await assert.rejects(
     /Timed out navigating/,
 );
 
+let crossOriginNavigateCalls = 0;
+await assert.rejects(
+    openDingTalkMiniProgramWebview('https://external.example.com/path', {
+        currentHref: 'https://ai.example.com/h5/agents/a1/chat',
+        targetWindow: {
+            dd: {
+                navigateTo() {
+                    crossOriginNavigateCalls += 1;
+                },
+            },
+        },
+        userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
+        duplicateWindowMs: 0,
+    }),
+    /only allows same-origin URLs/,
+);
+assert.equal(crossOriginNavigateCalls, 0);
+await assert.rejects(
+    openDingTalkMiniProgramWebview('https://ai.example.com/path', {
+        currentHref: 'not-a-valid-h5-url',
+        targetWindow: loadedWindow,
+        userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
+        duplicateWindowMs: 0,
+    }),
+    /Current H5 origin is unavailable/,
+);
+
 let duplicateCalls = 0;
 const duplicateOptions = {
+    currentHref: 'https://duplicate.example.com/h5/agents/a1/chat',
     targetWindow: {
         dd: {
             navigateTo(options) {

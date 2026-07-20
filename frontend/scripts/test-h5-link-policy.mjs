@@ -66,8 +66,19 @@ assertLinkAction(
         runtime: 'dingtalk-miniapp-webview',
     }),
     {
-        type: 'dingtalk-open',
+        type: 'blocked',
+        reason: 'dingtalk-cross-origin',
         url: 'https://docs.example.com/path?q=%E4%B8%AD%E6%96%87#part',
+    },
+);
+assertLinkAction(
+    resolveH5LinkAction('https://ai.example.test/docs?q=中文#part', {
+        currentHref: current,
+        runtime: 'dingtalk-miniapp-webview',
+    }),
+    {
+        type: 'dingtalk-open',
+        url: 'https://ai.example.test/docs?q=%E4%B8%AD%E6%96%87#part',
     },
 );
 assertLinkAction(
@@ -97,17 +108,22 @@ for (const href of [
     'https://sub.ai.example.test/docs',
     'https://ai.example.test.evil.test/docs',
 ]) {
-    assertLinkAction(
-        resolveH5LinkAction(href, {
-            currentHref: current,
-            runtime: 'wechat-miniapp-webview',
-        }),
-        {
-            type: 'blocked',
-            reason: 'wechat-cross-origin',
-            url: new URL(href).href,
-        },
-    );
+    for (const [runtime, reason] of [
+        ['wechat-miniapp-webview', 'wechat-cross-origin'],
+        ['dingtalk-miniapp-webview', 'dingtalk-cross-origin'],
+    ]) {
+        assertLinkAction(
+            resolveH5LinkAction(href, {
+                currentHref: current,
+                runtime,
+            }),
+            {
+                type: 'blocked',
+                reason,
+                url: new URL(href).href,
+            },
+        );
+    }
 }
 assertLinkAction(
     resolveH5LinkAction('https://docs.example.com/path', {

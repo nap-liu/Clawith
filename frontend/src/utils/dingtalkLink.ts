@@ -29,6 +29,7 @@ type DetectDingTalkMiniProgramOptions = {
 };
 
 type OpenDingTalkMiniProgramLinkOptions = DetectDingTalkMiniProgramOptions & {
+    currentHref?: string;
     route?: string;
     navigateTimeoutMs?: number;
     duplicateWindowMs?: number;
@@ -204,6 +205,17 @@ export async function openDingTalkMiniProgramWebview(
     }
     if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
         throw new Error('DingTalk mini-program WebView only accepts HTTP(S) URLs');
+    }
+    const currentHref = options.currentHref
+        ?? (typeof window !== 'undefined' ? window.location.href : '');
+    let currentUrl: URL;
+    try {
+        currentUrl = new URL(currentHref);
+    } catch {
+        throw new Error('Current H5 origin is unavailable for DingTalk navigation');
+    }
+    if (parsedUrl.origin !== currentUrl.origin) {
+        throw new Error('DingTalk mini-program WebView only allows same-origin URLs');
     }
 
     const targetWindow = options.targetWindow ?? defaultTargetWindow();

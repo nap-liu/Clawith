@@ -1136,7 +1136,7 @@ export default function H5AgentChat() {
     const copyLinkWithFeedback = useCallback(async (url: string) => {
         await copyH5LinkWithFeedback(url, {
             copy: copyToClipboard,
-            onCopied: () => toast.success('已复制'),
+            onCopied: () => toast.success('已复制请到浏览器中打开'),
             onCopyFailed: () => toast.error('复制失败，请稍后重试'),
         });
     }, [toast]);
