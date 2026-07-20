@@ -2464,7 +2464,16 @@ export default function AgentDetailPage() {
             if (res.ok) {
                 const newSess = normalizeChatSession(await res.json());
                 setChatScope('mine');
-                setSessions((prev) => [newSess, ...prev]);
+                setSessions((prev) => [
+                    newSess,
+                    ...prev.map((session) => (
+                        String(session.id) !== String(newSess.id)
+                        && sessionUserIdStr(session) === sessionUserIdStr(newSess)
+                        && session.source_channel === newSess.source_channel
+                            ? { ...session, is_primary: false }
+                            : session
+                    )),
+                ]);
                 setIsStreaming(false);
                 setIsWaiting(false);
                 setIsStopping(false);
@@ -3033,9 +3042,22 @@ export default function AgentDetailPage() {
                 }
             }
 
-            if (mySessions.length > 0) {
+            const webSessions = mySessions.filter((session: any) => (
+                String(session.source_channel || 'web').toLowerCase() === 'web'
+                && !session.is_group
+            ));
+            const defaultWebSession = webSessions.find((session: any) => session.is_primary)
+                || webSessions.reduce((latest: any | null, session: any) => {
+                    if (!latest) return session;
+                    const createdAt = String(session.created_at || '');
+                    const latestCreatedAt = String(latest.created_at || '');
+                    if (createdAt !== latestCreatedAt) return createdAt > latestCreatedAt ? session : latest;
+                    return String(session.id) > String(latest.id) ? session : latest;
+                }, null);
+
+            if (defaultWebSession) {
                 setChatScope('mine');
-                await selectSession(mySessions[0], 'mine');
+                await selectSession(defaultWebSession, 'mine');
             } else {
                 clearChatSelection();
             }

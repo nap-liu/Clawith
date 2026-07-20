@@ -481,32 +481,16 @@ class WebSocketChatHandler:
                         await self.websocket.close(code=4003)
                         return None
         if not conv_id:
-            _sr = await db.execute(
-                select(ChatSession)
-                .where(
-                    ChatSession.agent_id == self.agent_id,
-                    ChatSession.user_id == user_id,
-                    ChatSession.source_channel == self.source_channel,
-                    ChatSession.is_group.is_(False),
-                    ChatSession.is_primary,
-                )
-                .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
-                .limit(1)
+            _latest = await ensure_primary_platform_session(
+                db,
+                self.agent_id,
+                user_id,
+                source_channel=self.source_channel,
             )
-            _latest = _sr.scalar_one_or_none()
-            if _latest:
-                conv_id = str(_latest.id)
-            else:
-                _new_session = await ensure_primary_platform_session(
-                    db,
-                    self.agent_id,
-                    user_id,
-                    source_channel=self.source_channel,
-                )
-                await db.commit()
-                await db.refresh(_new_session)
-                conv_id = str(_new_session.id)
-                logger.info(f"[WS] Selected primary session {conv_id}")
+            await db.commit()
+            await db.refresh(_latest)
+            conv_id = str(_latest.id)
+            logger.info(f"[WS] Selected primary session {conv_id}")
         return conv_id
 
     def _channel_context(self) -> dict:

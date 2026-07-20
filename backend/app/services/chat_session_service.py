@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import case, cast, func, select, String
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import ChatMessage
@@ -13,13 +13,13 @@ from app.models.chat_session import ChatSession
 from app.services.session_identity import require_same_tenant_session_user
 
 
-async def get_primary_platform_session(
+async def get_latest_platform_session(
     db: AsyncSession,
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
     source_channel: str = "web",
 ) -> ChatSession | None:
-    """Return the current primary first-party session for a user+agent pair, if any."""
+    """Return the newest first-party session for one user+agent+channel."""
 
     result = await db.execute(
         select(ChatSession)
@@ -28,11 +28,37 @@ async def get_primary_platform_session(
             ChatSession.user_id == user_id,
             ChatSession.source_channel == source_channel,
             ChatSession.is_group == False,
-            ChatSession.is_primary == True,
         )
+        .order_by(ChatSession.created_at.desc().nulls_last(), ChatSession.id.desc())
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def promote_platform_session(
+    db: AsyncSession,
+    session: ChatSession,
+) -> ChatSession:
+    """Make ``session`` the sole primary for its user+agent+channel."""
+
+    if session.user_id is None or session.is_group:
+        return session
+    if not session.is_primary:
+        await db.execute(
+            update(ChatSession)
+            .where(
+                ChatSession.agent_id == session.agent_id,
+                ChatSession.user_id == session.user_id,
+                ChatSession.source_channel == session.source_channel,
+                ChatSession.is_group == False,
+                ChatSession.is_primary == True,
+                ChatSession.id != session.id,
+            )
+            .values(is_primary=False)
+        )
+        session.is_primary = True
+        await db.flush()
+    return session
 
 
 async def ensure_primary_platform_session(
@@ -43,49 +69,19 @@ async def ensure_primary_platform_session(
 ) -> ChatSession:
     """Return a guaranteed primary platform session for a given user+agent pair.
 
-    The upgrade strategy is intentionally lazy:
-    - Reuse the existing primary session when it exists.
-    - Otherwise promote the most relevant existing web session.
-    - Only create a brand new primary session when the pair has never talked on-platform.
+    The newest created session is always primary. Runtime reconciliation keeps
+    the invariant intact after the one-time data migration.
     """
 
     await require_same_tenant_session_user(db, agent_id, user_id)
-    primary = await get_primary_platform_session(db, agent_id, user_id, source_channel=source_channel)
-    if primary:
-        return primary
-
-    # Prefer a session with at least one user-authored message so we anchor the long-lived
-    # primary conversation to the user's real historical thread when possible.
-    user_message_count = (
-        select(
-            ChatMessage.conversation_id.label("conversation_id"),
-            func.sum(case((ChatMessage.role == "user", 1), else_=0)).label("user_msg_count"),
-        )
-        .group_by(ChatMessage.conversation_id)
-        .subquery()
+    latest = await get_latest_platform_session(
+        db,
+        agent_id,
+        user_id,
+        source_channel=source_channel,
     )
-
-    result = await db.execute(
-        select(ChatSession)
-        .outerjoin(user_message_count, user_message_count.c.conversation_id == cast(ChatSession.id, String))
-        .where(
-            ChatSession.agent_id == agent_id,
-            ChatSession.user_id == user_id,
-            ChatSession.source_channel == source_channel,
-            ChatSession.is_group == False,
-        )
-        .order_by(
-            case((func.coalesce(user_message_count.c.user_msg_count, 0) > 0, 0), else_=1),
-            ChatSession.last_message_at.desc().nulls_last(),
-            ChatSession.created_at.desc(),
-        )
-        .limit(1)
-    )
-    existing = result.scalar_one_or_none()
-    if existing:
-        existing.is_primary = True
-        await db.flush()
-        return existing
+    if latest:
+        return await promote_platform_session(db, latest)
 
     now = datetime.now(timezone.utc)
     session = ChatSession(

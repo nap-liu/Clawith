@@ -23,6 +23,10 @@ from app.models.chat_session import ChatSession
 from app.models.agent import Agent
 from app.models.user import Identity, User
 from app.services.auth_code_exchange import validate_platform_login_channel
+from app.services.chat_session_service import (
+    get_latest_platform_session,
+    promote_platform_session,
+)
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
@@ -292,7 +296,7 @@ async def list_sessions(
 
         for session in sessions:
             count = message_counts.get(str(session.id), 0)
-            if count == 0:
+            if count == 0 and not session.is_primary:
                 continue  # hide empty sessions
 
             display = None
@@ -374,7 +378,12 @@ async def list_sessions(
             query = query.where(ChatSession.source_channel == source_channel)
         result = await db.execute(
             query
-            .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
+            .order_by(
+                ChatSession.is_primary.desc(),
+                ChatSession.last_message_at.desc().nulls_last(),
+                ChatSession.created_at.desc().nulls_last(),
+                ChatSession.id.desc(),
+            )
             .offset(offset)
             .limit(limit)
         )
@@ -426,7 +435,7 @@ async def list_sessions(
             # user messages (the agent greets first) but do have assistant
             # turns, so count ALL messages here — not just user ones.
             count = total_counts.get(str(session.id), 0)
-            if count == 0:
+            if count == 0 and not session.is_primary:
                 continue
             out.append(SessionOut(
                 id=str(session.id),
@@ -483,6 +492,8 @@ async def create_session(
         created_at=now,
     )
     db.add(session)
+    await db.flush()
+    await promote_platform_session(db, session)
     await db.commit()
     await db.refresh(session)
     return SessionOut(
@@ -495,7 +506,7 @@ async def create_session(
         last_message_at=None,
         message_count=0,
         unread_count=0,
-        is_primary=False,
+        is_primary=bool(session.is_primary),
         participant_type="user",
         is_group=False,
     )
@@ -547,10 +558,25 @@ async def delete_session(
     if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
         raise HTTPException(status_code=403, detail="Not authorized")
 
+    was_primary = bool(session.is_primary)
+    owner_user_id = session.user_id
+    owner_agent_id = session.agent_id
+    owner_source_channel = session.source_channel
+
     # Delete associated messages first
     from sqlalchemy import delete as sql_delete
     await db.execute(sql_delete(ChatMessage).where(ChatMessage.conversation_id == str(session_id)))
     await db.delete(session)
+    await db.flush()
+    if was_primary and owner_user_id is not None and not session.is_group:
+        successor = await get_latest_platform_session(
+            db,
+            owner_agent_id,
+            owner_user_id,
+            source_channel=owner_source_channel,
+        )
+        if successor:
+            await promote_platform_session(db, successor)
     await db.commit()
     return None
 

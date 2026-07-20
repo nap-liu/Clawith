@@ -892,7 +892,16 @@ export default function H5AgentChat() {
             setSessionsPanelOpen(false);
             window.history.replaceState({}, '', writeChatSessionIdToHref(window.location.href, nextSessionId));
             if (summary) {
-                setSessions((prev) => [summary, ...prev.filter((item) => item.id !== summary.id)]);
+                setSessions((prev) => [
+                    summary,
+                    ...prev
+                        .filter((item) => item.id !== summary.id)
+                        .map((item) => (
+                            item.source_channel === summary.source_channel
+                                ? { ...item, is_primary: false }
+                                : item
+                        )),
+                ]);
             }
             manualCloseRef.current = true;
             wsRef.current?.close();

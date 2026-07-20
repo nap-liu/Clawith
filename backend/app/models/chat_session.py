@@ -67,8 +67,8 @@ class ChatSession(Base):
     participant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("participants.id"), nullable=True)
     # For agent-to-agent sessions: the other agent in the conversation
     peer_agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True)
-    # Primary platform session: the long-lived first-party conversation that agent-initiated
-    # messages should land in. User-created side-topic sessions remain temporary (`is_primary=false`).
+    # Primary platform session: the newest first-party conversation for this
+    # user+agent+channel and the target for agent-initiated platform messages.
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False, index=True)
     # Tracks when the owning platform user last opened/read this session. Unread badges are derived
     # from non-user messages created after this timestamp.

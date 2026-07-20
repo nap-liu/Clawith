@@ -38,6 +38,7 @@ class RecordingDB:
         self.added = []
         self.committed = False
         self.refreshed = []
+        self.flush_count = 0
 
     async def execute(self, _statement, _params=None):
         self.statements.append(_statement)
@@ -47,6 +48,9 @@ class RecordingDB:
 
     def add(self, value):
         self.added.append(value)
+
+    async def flush(self):
+        self.flush_count += 1
 
     async def commit(self):
         self.committed = True
@@ -618,7 +622,12 @@ async def test_create_session_returns_web_session_shape(monkeypatch):
     async def fake_check_agent_access(_db, _user, _agent_id):
         return SimpleNamespace(id=agent_id), "use"
 
+    async def fake_promote_platform_session(_db, session):
+        session.is_primary = True
+        return session
+
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+    monkeypatch.setattr(chat_sessions_api, "promote_platform_session", fake_promote_platform_session)
 
     session = await chat_sessions_api.create_session(
         agent_id=agent_id,
@@ -629,7 +638,9 @@ async def test_create_session_returns_web_session_shape(monkeypatch):
     assert session.agent_id == str(agent_id)
     assert session.user_id == str(user_id)
     assert session.source_channel == "web"
+    assert session.is_primary is True
     assert session.participant_type == "user"
     assert session.is_group is False
     assert db.committed is True
+    assert db.flush_count == 1
     assert len(db.added) == 1
