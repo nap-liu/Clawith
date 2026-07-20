@@ -34,8 +34,10 @@ import uuid
 from sqlalchemy import select
 
 from app.database import async_session
+from app.models.agent import Agent  # noqa: F401
 from app.models.identity import IdentityProvider
 from app.models.org import OrgMember
+from app.models.tenant import Tenant  # noqa: F401
 from app.services.dingtalk_identity_reconciliation import (
     dingtalk_legacy_identity_reconciler,
     fetch_fresh_dingtalk_claims,
