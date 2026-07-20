@@ -37,6 +37,41 @@ assert.equal(await isWechatMiniProgramWebViewRuntime({
 }), false);
 assert.equal(directWechatSdkLoads, 0);
 
+const failedWechatScriptListeners = new Map();
+const failedWechatScript = {
+    dataset: {},
+    parentNode: {
+        removeChild() {},
+    },
+    addEventListener(type, listener) {
+        failedWechatScriptListeners.set(type, listener);
+    },
+    removeEventListener(type) {
+        failedWechatScriptListeners.delete(type);
+    },
+};
+assert.equal(await isWechatMiniProgramWebViewRuntime({
+    targetWindow: {
+        __wxjs_environment: 'miniprogram',
+    },
+    targetDocument: {
+        addEventListener() {},
+        removeEventListener() {},
+        querySelector() {
+            return null;
+        },
+        createElement() {
+            return failedWechatScript;
+        },
+        head: {
+            appendChild() {
+                queueMicrotask(() => failedWechatScriptListeners.get('error')?.());
+            },
+        },
+    },
+    envTimeoutMs: 50,
+}), true);
+
 const miniProgramWindow = {
     __wxjs_environment: 'miniprogram',
     wx: {
@@ -71,6 +106,7 @@ assert.equal(await isWechatMiniProgramWebViewRuntime({
 
 const navigateCalls = [];
 await openWechatMiniProgramWebview('https://docs.example.com/a?name=中文#part', {
+    currentHref: 'https://docs.example.com/h5/chat',
     targetWindow: {
         __wxjs_environment: 'miniprogram',
         wx: {
@@ -90,6 +126,7 @@ assert.deepEqual(navigateCalls, [
 
 await assert.rejects(
     openWechatMiniProgramWebview('https://direct.example.com/path', {
+        currentHref: 'https://direct.example.com/h5/chat',
         targetWindow: {
             wx: {
                 miniProgram: {
@@ -103,6 +140,7 @@ await assert.rejects(
 );
 await assert.rejects(
     openWechatMiniProgramWebview('javascript:alert(1)', {
+        currentHref: 'https://docs.example.com/h5/chat',
         targetWindow: miniProgramWindow,
         duplicateWindowMs: 0,
     }),
@@ -110,6 +148,7 @@ await assert.rejects(
 );
 await assert.rejects(
     openWechatMiniProgramWebview('https://failure.example.com/path', {
+        currentHref: 'https://failure.example.com/h5/chat',
         targetWindow: {
             __wxjs_environment: 'miniprogram',
             wx: {
@@ -127,6 +166,7 @@ await assert.rejects(
 
 let duplicateCalls = 0;
 const duplicateOptions = {
+    currentHref: 'https://duplicate.example.com/h5/chat',
     targetWindow: {
         __wxjs_environment: 'miniprogram',
         wx: {
@@ -144,5 +184,14 @@ const duplicateOptions = {
 await openWechatMiniProgramWebview('https://duplicate.example.com/path', duplicateOptions);
 await openWechatMiniProgramWebview('https://duplicate.example.com/path', duplicateOptions);
 assert.equal(duplicateCalls, 1);
+
+await assert.rejects(
+    openWechatMiniProgramWebview('https://external.example.com/path', {
+        currentHref: 'https://ai.example.test/h5/chat',
+        targetWindow: miniProgramWindow,
+        duplicateWindowMs: 0,
+    }),
+    /only allows same-origin URLs/,
+);
 
 console.log('wechat mini-program link runtime tests passed');

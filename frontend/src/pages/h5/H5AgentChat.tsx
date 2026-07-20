@@ -1154,8 +1154,15 @@ export default function H5AgentChat() {
 
         if (action.type === 'dingtalk-open') {
             void import('../../utils/dingtalkLink')
-                .then(({ openDingTalkExternalLink }) => openDingTalkExternalLink(action.url))
+                .then(({ openDingTalkMiniProgramWebview }) => (
+                    openDingTalkMiniProgramWebview(action.url)
+                ))
                 .catch((error) => handlePlatformLinkFailure('DingTalk', action.url, error));
+            return true;
+        }
+
+        if (action.type === 'blocked') {
+            toast.error('微信小程序内仅支持打开本站链接');
             return true;
         }
 
@@ -1163,7 +1170,7 @@ export default function H5AgentChat() {
             .then(({ openWechatMiniProgramWebview }) => openWechatMiniProgramWebview(action.url))
             .catch((error) => handlePlatformLinkFailure('WeChat', action.url, error));
         return true;
-    }, [containerRuntime, handlePlatformLinkFailure]);
+    }, [containerRuntime, handlePlatformLinkFailure, toast]);
 
     const renderConversationEntry = useCallback((entry: (typeof conversationEntries)[number]) => {
         if (entry.type === 'analysis_group') {

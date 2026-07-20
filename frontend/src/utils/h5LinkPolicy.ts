@@ -32,6 +32,7 @@ export function resolveExternalHttpLink(
 export type H5LinkAction =
     | { type: 'dingtalk-open'; url: string }
     | { type: 'wechat-miniapp-open'; url: string }
+    | { type: 'blocked'; reason: 'wechat-cross-origin'; url: string }
     | { type: 'native' };
 
 type ResolveH5LinkActionOptions = {
@@ -42,8 +43,8 @@ type ResolveH5LinkActionOptions = {
 /**
  * Decide how an H5 chat link should be handled.
  *
- * Only cross-origin HTTP(S) links are intercepted. Same-origin and non-HTTP
- * links retain the renderer/browser behavior.
+ * Standard browsers retain native behavior. Embedded mini-program WebViews
+ * receive explicit navigation actions, while WeChat blocks cross-origin URLs.
  */
 export function resolveH5LinkAction(
     href: string,
@@ -51,16 +52,31 @@ export function resolveH5LinkAction(
 ): H5LinkAction {
     const currentHref = options.currentHref
         ?? (typeof window !== 'undefined' ? window.location.href : '');
-    const externalUrl = resolveExternalHttpLink(href, currentHref);
-
-    if (!externalUrl) return { type: 'native' };
+    let current: URL;
+    let target: URL;
+    try {
+        current = new URL(currentHref);
+        target = new URL(href, current);
+    } catch {
+        return { type: 'native' };
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+        return { type: 'native' };
+    }
 
     if (options.runtime === 'dingtalk-miniapp-webview') {
-        return { type: 'dingtalk-open', url: externalUrl };
+        return { type: 'dingtalk-open', url: target.href };
     }
 
     if (options.runtime === 'wechat-miniapp-webview') {
-        return { type: 'wechat-miniapp-open', url: externalUrl };
+        if (target.origin !== current.origin) {
+            return {
+                type: 'blocked',
+                reason: 'wechat-cross-origin',
+                url: target.href,
+            };
+        }
+        return { type: 'wechat-miniapp-open', url: target.href };
     }
 
     return { type: 'native' };

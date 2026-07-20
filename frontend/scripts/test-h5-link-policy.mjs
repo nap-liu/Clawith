@@ -36,6 +36,7 @@ const {
 function assertLinkAction(actual, expected) {
     assert.equal(actual.type, expected.type);
     assert.equal(actual.url, expected.url);
+    assert.equal(actual.reason, expected.reason);
 }
 
 const current = 'https://ai.example.test/h5/agents/a1/chat?channel=wechat_miniprogram';
@@ -75,10 +76,39 @@ assertLinkAction(
         runtime: 'wechat-miniapp-webview',
     }),
     {
-        type: 'wechat-miniapp-open',
+        type: 'blocked',
+        reason: 'wechat-cross-origin',
         url: 'https://docs.example.com/path',
     },
 );
+assertLinkAction(
+    resolveH5LinkAction('/docs?q=中文#part', {
+        currentHref: current,
+        runtime: 'wechat-miniapp-webview',
+    }),
+    {
+        type: 'wechat-miniapp-open',
+        url: 'https://ai.example.test/docs?q=%E4%B8%AD%E6%96%87#part',
+    },
+);
+for (const href of [
+    'http://ai.example.test/docs',
+    'https://ai.example.test:8443/docs',
+    'https://sub.ai.example.test/docs',
+    'https://ai.example.test.evil.test/docs',
+]) {
+    assertLinkAction(
+        resolveH5LinkAction(href, {
+            currentHref: current,
+            runtime: 'wechat-miniapp-webview',
+        }),
+        {
+            type: 'blocked',
+            reason: 'wechat-cross-origin',
+            url: new URL(href).href,
+        },
+    );
+}
 assertLinkAction(
     resolveH5LinkAction('https://docs.example.com/path', {
         currentHref: `${current}&channel=dingtalk`,
@@ -97,7 +127,7 @@ assertLinkAction(
         currentHref: current,
         runtime: 'dingtalk-miniapp-webview',
     }),
-    { type: 'native' },
+    { type: 'dingtalk-open', url: 'https://ai.example.test/docs' },
 );
 for (const href of ['mailto:help@example.com', 'tel:10086', 'javascript:alert(1)']) {
     assertLinkAction(

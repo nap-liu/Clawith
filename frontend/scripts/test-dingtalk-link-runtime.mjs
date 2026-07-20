@@ -5,138 +5,197 @@ import { loadTypeScriptModule } from './load-typescript-module.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const {
-    hasDingTalkMiniProgramOpenLink,
-    openDingTalkExternalLink,
-} = loadTypeScriptModule(resolve(__dirname, '../src/utils/dingtalkLink.ts'));
+    buildDingTalkMiniProgramWebviewRoute,
+    isDingTalkMiniProgramWebViewCandidate,
+    isDingTalkMiniProgramWebViewRuntime,
+    openDingTalkMiniProgramWebview,
+} = loadTypeScriptModule(
+    resolve(__dirname, '../src/utils/dingtalkLink.ts'),
+    { clearTimeout, setTimeout },
+);
 const {
     openExternalLinkWithBrowserDefault,
 } = loadTypeScriptModule(resolve(__dirname, '../src/utils/browserLink.ts'));
 
-assert.equal(hasDingTalkMiniProgramOpenLink({}), false);
-assert.equal(hasDingTalkMiniProgramOpenLink({ dd: { openLink() {} } }), false);
-assert.equal(hasDingTalkMiniProgramOpenLink({
-    dd: { env: { appType: 'WEB' }, openLink() {} },
-}), false);
-assert.equal(hasDingTalkMiniProgramOpenLink({
-    dd: { env: { appType: 'WEBVIEW_IN_MINIAPP' }, openLink() {} },
-}), true);
-assert.equal(hasDingTalkMiniProgramOpenLink({
-    dd: { biz: { util: { openLink() {} } } },
-}), false);
-
-let directClientCalls = 0;
-await assert.rejects(
-    openDingTalkExternalLink('https://direct.example.com/path', {
-        targetWindow: {
-            dd: {
-                env: { appType: 'WEB' },
-                openLink() {
-                    directClientCalls += 1;
-                    return Promise.resolve();
-                },
-            },
-        },
-        duplicateWindowMs: 0,
-    }),
-    /SDK is unavailable/,
+assert.equal(
+    buildDingTalkMiniProgramWebviewRoute('https://docs.example.com/a?name=中文#part'),
+    '/subPackages/webview/index?url=https%3A%2F%2Fdocs.example.com%2Fa%3Fname%3D%E4%B8%AD%E6%96%87%23part',
 );
-assert.equal(directClientCalls, 0);
+assert.equal(isDingTalkMiniProgramWebViewCandidate('Mozilla/5.0 DingTalk/8.0'), false);
+assert.equal(
+    isDingTalkMiniProgramWebViewCandidate('Mozilla/5.0 DingTalk/8.0 dd-web'),
+    true,
+);
 
-const directCalls = [];
-await openDingTalkExternalLink('https://docs.example.com/a?name=中文#part', {
-    targetWindow: {
-        dd: {
-            env: { appType: 'WEBVIEW_IN_MINIAPP' },
-            openLink(params) {
-                directCalls.push(params.url);
-                return Promise.resolve();
+let directClientSdkLoads = 0;
+assert.equal(await isDingTalkMiniProgramWebViewRuntime({
+    targetWindow: {},
+    targetDocument: {
+        querySelector() {
+            return null;
+        },
+        createElement() {
+            directClientSdkLoads += 1;
+            throw new Error('SDK must not load in a direct DingTalk browser');
+        },
+    },
+    userAgent: 'Mozilla/5.0 DingTalk/8.0',
+}), false);
+assert.equal(directClientSdkLoads, 0);
+
+const failedScriptListeners = new Map();
+const failedScript = {
+    dataset: {},
+    parentNode: {
+        removeChild() {},
+    },
+    addEventListener(type, listener) {
+        failedScriptListeners.set(type, listener);
+    },
+    removeEventListener(type) {
+        failedScriptListeners.delete(type);
+    },
+};
+assert.equal(await isDingTalkMiniProgramWebViewRuntime({
+    targetWindow: {},
+    targetDocument: {
+        querySelector() {
+            return null;
+        },
+        createElement() {
+            return failedScript;
+        },
+        head: {
+            appendChild() {
+                queueMicrotask(() => failedScriptListeners.get('error')?.());
             },
         },
     },
+    userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
+    loadTimeoutMs: 50,
+}), false);
+
+const loadedWindow = {};
+const loadedScriptListeners = new Map();
+const loadedScript = {
+    dataset: {},
+    parentNode: null,
+    addEventListener(type, listener) {
+        loadedScriptListeners.set(type, listener);
+    },
+    removeEventListener(type) {
+        loadedScriptListeners.delete(type);
+    },
+};
+const loadedDocument = {
+    querySelector() {
+        return null;
+    },
+    createElement() {
+        return loadedScript;
+    },
+    head: {
+        appendChild(script) {
+            assert.equal(script.src, 'https://appx/web-view.min.js');
+            assert.equal(script.dataset.clawithDingtalkWebviewSdk, '1');
+            loadedWindow.dd = {
+                navigateTo() {},
+            };
+            queueMicrotask(() => loadedScriptListeners.get('load')?.());
+        },
+    },
+};
+assert.equal(await isDingTalkMiniProgramWebViewRuntime({
+    targetWindow: loadedWindow,
+    targetDocument: loadedDocument,
+    userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
+    loadTimeoutMs: 50,
+}), true);
+
+const navigateCalls = [];
+await openDingTalkMiniProgramWebview('https://docs.example.com/a?name=中文#part', {
+    targetWindow: {
+        dd: {
+            navigateTo(options) {
+                navigateCalls.push(options.url);
+                options.success?.();
+            },
+        },
+    },
+    userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
     duplicateWindowMs: 0,
+    navigateTimeoutMs: 50,
 });
-assert.deepEqual(directCalls, [
-    'https://docs.example.com/a?name=%E4%B8%AD%E6%96%87#part',
+assert.deepEqual(navigateCalls, [
+    '/subPackages/webview/index?url=https%3A%2F%2Fdocs.example.com%2Fa%3Fname%3D%25E4%25B8%25AD%25E6%2596%2587%23part',
 ]);
 
 await assert.rejects(
-    openDingTalkExternalLink('https://void.example.com/path', {
+    openDingTalkMiniProgramWebview('https://direct.example.com/path', {
         targetWindow: {
             dd: {
-                env: { appType: 'WEBVIEW_IN_MINIAPP' },
-                openLink() {},
+                navigateTo() {},
             },
         },
+        userAgent: 'Mozilla/5.0 DingTalk/8.0',
         duplicateWindowMs: 0,
     }),
-    /did not return a Promise/,
+    /navigation SDK is unavailable/,
 );
-
 await assert.rejects(
-    openDingTalkExternalLink('javascript:alert(1)', {
-        targetWindow: {
-            dd: {
-                env: { appType: 'WEBVIEW_IN_MINIAPP' },
-                openLink() {},
-            },
-        },
+    openDingTalkMiniProgramWebview('javascript:alert(1)', {
+        targetWindow: loadedWindow,
+        userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
         duplicateWindowMs: 0,
     }),
     /only accepts HTTP\(S\)/,
 );
 await assert.rejects(
-    openDingTalkExternalLink('https://missing.example.com', {
-        targetWindow: {},
-        duplicateWindowMs: 0,
-    }),
-    /SDK is unavailable/,
-);
-await assert.rejects(
-    openDingTalkExternalLink('https://failure.example.com', {
+    openDingTalkMiniProgramWebview('https://failure.example.com/path', {
         targetWindow: {
             dd: {
-                env: { appType: 'WEBVIEW_IN_MINIAPP' },
-                openLink() {
-                    return Promise.reject(new Error('native failure'));
+                navigateTo(options) {
+                    options.fail?.(new Error('route failure'));
                 },
             },
         },
+        userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
         duplicateWindowMs: 0,
+        navigateTimeoutMs: 50,
     }),
-    /native failure/,
+    /route failure/,
 );
 await assert.rejects(
-    openDingTalkExternalLink('https://throw.example.com', {
+    openDingTalkMiniProgramWebview('https://timeout.example.com/path', {
         targetWindow: {
             dd: {
-                env: { appType: 'WEBVIEW_IN_MINIAPP' },
-                openLink() {
-                    throw new Error('synchronous failure');
-                },
+                navigateTo() {},
             },
         },
+        userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
         duplicateWindowMs: 0,
+        navigateTimeoutMs: 0,
     }),
-    /synchronous failure/,
+    /Timed out navigating/,
 );
 
 let duplicateCalls = 0;
-const duplicateWindow = {
-    dd: {
-        env: { appType: 'WEBVIEW_IN_MINIAPP' },
-        openLink() {
-            duplicateCalls += 1;
-            return Promise.resolve();
+const duplicateOptions = {
+    targetWindow: {
+        dd: {
+            navigateTo(options) {
+                duplicateCalls += 1;
+                options.success?.();
+            },
         },
     },
-};
-const duplicateOptions = {
-    targetWindow: duplicateWindow,
+    userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
     duplicateWindowMs: 500,
+    navigateTimeoutMs: 50,
     now: () => 10_000,
 };
-await openDingTalkExternalLink('https://duplicate.example.com/path', duplicateOptions);
-await openDingTalkExternalLink('https://duplicate.example.com/path', duplicateOptions);
+await openDingTalkMiniProgramWebview('https://duplicate.example.com/path', duplicateOptions);
+await openDingTalkMiniProgramWebview('https://duplicate.example.com/path', duplicateOptions);
 assert.equal(duplicateCalls, 1);
 
 const popup = { opener: {} };
@@ -165,25 +224,5 @@ assert.equal(openExternalLinkWithBrowserDefault('https://same-window.example.com
     },
 }), true);
 assert.equal(sameWindowUrl, 'https://same-window.example.com/path');
-
-let unsafeOpenCalls = 0;
-assert.equal(openExternalLinkWithBrowserDefault('javascript:alert(1)', {
-    open() {
-        unsafeOpenCalls += 1;
-        return popup;
-    },
-}), false);
-assert.equal(unsafeOpenCalls, 0);
-
-assert.equal(openExternalLinkWithBrowserDefault('https://blocked.example.com/path', {
-    open() {
-        throw new Error('popup blocked');
-    },
-    location: {
-        assign() {
-            throw new Error('navigation blocked');
-        },
-    },
-}), false);
 
 console.log('dingtalk link runtime tests passed');

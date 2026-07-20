@@ -6,30 +6,15 @@ import { loadTypeScriptModule } from './load-typescript-module.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const {
     detectH5ContainerRuntime,
-    isDingTalkMiniProgramWebViewRuntime,
 } = loadTypeScriptModule(
     resolve(__dirname, '../src/utils/h5ContainerRuntime.ts'),
     { clearTimeout, setTimeout },
 );
 
-assert.equal(isDingTalkMiniProgramWebViewRuntime({
-    dd: {
-        env: { appType: 'WEB' },
-        openLink() {},
-    },
-}), false);
-assert.equal(isDingTalkMiniProgramWebViewRuntime({
-    dd: {
-        env: { appType: 'WEBVIEW_IN_MINIAPP' },
-        openLink() {},
-    },
-}), true);
-
 assert.equal(await detectH5ContainerRuntime({
     targetWindow: {
         dd: {
-            env: { appType: 'WEB' },
-            openLink() {},
+            navigateTo() {},
         },
     },
     userAgent: 'Mozilla/5.0 DingTalk/8.0',
@@ -38,8 +23,7 @@ assert.equal(await detectH5ContainerRuntime({
 assert.equal(await detectH5ContainerRuntime({
     targetWindow: {
         dd: {
-            env: { appType: 'WEBVIEW_IN_MINIAPP' },
-            openLink() {},
+            navigateTo() {},
         },
     },
     userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
@@ -74,6 +58,41 @@ assert.equal(await detectH5ContainerRuntime({
     },
     userAgent: 'Mozilla/5.0 MicroMessenger/8.0 miniProgram',
     wechatEnvTimeoutMs: 50,
+}), 'wechat-miniapp-webview');
+
+const failedWechatScriptListeners = new Map();
+const failedWechatScript = {
+    dataset: {},
+    parentNode: {
+        removeChild() {},
+    },
+    addEventListener(type, listener) {
+        failedWechatScriptListeners.set(type, listener);
+    },
+    removeEventListener(type) {
+        failedWechatScriptListeners.delete(type);
+    },
+};
+assert.equal(await detectH5ContainerRuntime({
+    targetWindow: {
+        __wxjs_environment: 'miniprogram',
+    },
+    targetDocument: {
+        addEventListener() {},
+        removeEventListener() {},
+        querySelector() {
+            return null;
+        },
+        createElement() {
+            return failedWechatScript;
+        },
+        head: {
+            appendChild() {
+                queueMicrotask(() => failedWechatScriptListeners.get('error')?.());
+            },
+        },
+    },
+    userAgent: 'Mozilla/5.0 MicroMessenger/8.0 miniProgram',
 }), 'wechat-miniapp-webview');
 
 console.log('h5 container runtime tests passed');

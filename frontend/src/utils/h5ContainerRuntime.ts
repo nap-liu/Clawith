@@ -3,40 +3,25 @@ export type H5ContainerRuntime =
     | 'wechat-miniapp-webview'
     | 'dingtalk-miniapp-webview';
 
-type DingTalkRuntimeWindow = {
-    dd?: {
-        env?: {
-            appType?: string;
-        };
-        openLink?: unknown;
-    };
-};
+import type { DingTalkHostWindow } from './dingtalkLink';
 
 type WeChatRuntimeWindow = {
     __wxjs_environment?: string;
 };
 
 export type DetectH5ContainerRuntimeOptions = {
-    targetWindow?: DingTalkRuntimeWindow & WeChatRuntimeWindow;
+    targetWindow?: DingTalkHostWindow & WeChatRuntimeWindow;
     targetDocument?: Document;
     userAgent?: string;
+    dingtalkSdkLoadTimeoutMs?: number;
     wechatBridgeWaitTimeoutMs?: number;
     wechatEnvTimeoutMs?: number;
 };
 
 function defaultTargetWindow(): DetectH5ContainerRuntimeOptions['targetWindow'] {
     return typeof window !== 'undefined'
-        ? (window as unknown as DingTalkRuntimeWindow & WeChatRuntimeWindow)
+        ? (window as unknown as DingTalkHostWindow & WeChatRuntimeWindow)
         : undefined;
-}
-
-export function isDingTalkMiniProgramWebViewRuntime(
-    targetWindow: DingTalkRuntimeWindow | undefined = defaultTargetWindow(),
-): boolean {
-    return (
-        targetWindow?.dd?.env?.appType === 'WEBVIEW_IN_MINIAPP'
-        && typeof targetWindow.dd.openLink === 'function'
-    );
 }
 
 function isWeChatRuntimeCandidate(
@@ -53,12 +38,22 @@ export async function detectH5ContainerRuntime(
     options: DetectH5ContainerRuntimeOptions = {},
 ): Promise<H5ContainerRuntime> {
     const targetWindow = options.targetWindow ?? defaultTargetWindow();
-    if (isDingTalkMiniProgramWebViewRuntime(targetWindow)) {
-        return 'dingtalk-miniapp-webview';
-    }
-
     const userAgent = options.userAgent
         ?? (typeof navigator !== 'undefined' ? navigator.userAgent : '');
+    const {
+        isDingTalkMiniProgramWebViewCandidate,
+        isDingTalkMiniProgramWebViewRuntime,
+    } = await import('./dingtalkLink');
+    if (isDingTalkMiniProgramWebViewCandidate(userAgent)) {
+        const isDingTalkMiniProgram = await isDingTalkMiniProgramWebViewRuntime({
+            targetWindow,
+            targetDocument: options.targetDocument,
+            userAgent,
+            loadTimeoutMs: options.dingtalkSdkLoadTimeoutMs,
+        });
+        if (isDingTalkMiniProgram) return 'dingtalk-miniapp-webview';
+    }
+
     if (!isWeChatRuntimeCandidate(targetWindow, userAgent)) {
         return 'standard';
     }

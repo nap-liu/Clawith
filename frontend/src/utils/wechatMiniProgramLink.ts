@@ -30,6 +30,7 @@ type DetectWeChatMiniProgramOptions = {
 
 type OpenWeChatMiniProgramLinkOptions = {
     targetWindow?: WeChatHostWindow;
+    currentHref?: string;
     route?: string;
     duplicateWindowMs?: number;
     now?: () => number;
@@ -187,7 +188,10 @@ export async function isWechatMiniProgramWebViewRuntime(
             options.jssdkUrl ?? DEFAULT_JSSDK_URL,
         );
     } catch {
-        return false;
+        // The platform marker is authoritative. Keep the mini-program policy
+        // active even when the optional SDK enhancement fails to load, so a
+        // cross-origin link cannot bypass the allowlist through native fallback.
+        return true;
     }
 
     return verifyMiniProgramEnvironment(
@@ -235,6 +239,17 @@ export async function openWechatMiniProgramWebview(
     }
     if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
         throw new Error('WeChat mini-program WebView only accepts HTTP(S) URLs');
+    }
+    const currentHref = options.currentHref
+        ?? (typeof window !== 'undefined' ? window.location.href : '');
+    let currentUrl: URL;
+    try {
+        currentUrl = new URL(currentHref);
+    } catch {
+        throw new Error('Current H5 origin is unavailable for WeChat navigation');
+    }
+    if (parsedUrl.origin !== currentUrl.origin) {
+        throw new Error('WeChat mini-program WebView only allows same-origin URLs');
     }
 
     const targetWindow = options.targetWindow ?? defaultTargetWindow();
