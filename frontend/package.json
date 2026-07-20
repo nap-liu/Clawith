@@ -9,7 +9,7 @@
     "prebuild": "npm run test:h5-theme && npm run test:h5-link",
     "build": "tsc && vite build",
     "test:h5-theme": "node scripts/test-h5-url-params.mjs && node scripts/test-h5-theme-tokens.mjs && node scripts/test-h5-theme-runtime.mjs",
-    "test:h5-link": "node scripts/test-h5-link-policy.mjs && node scripts/test-h5-container-runtime.mjs && node scripts/test-dingtalk-link-runtime.mjs && node scripts/test-wechat-miniprogram-link-runtime.mjs",
+    "test:h5-link": "node scripts/test-h5-link-policy.mjs && node scripts/test-h5-link-feedback.mjs && node scripts/test-h5-container-runtime.mjs && node scripts/test-dingtalk-link-runtime.mjs && node scripts/test-wechat-miniprogram-link-runtime.mjs",
     "check:identity-contract": "node scripts/check-identity-contract.mjs",
     "preview": "vite preview"
   },

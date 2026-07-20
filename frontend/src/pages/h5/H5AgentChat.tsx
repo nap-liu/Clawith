@@ -53,6 +53,7 @@ import { parseH5Theme } from './h5Params';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import { openExternalLinkWithBrowserDefault } from '../../utils/browserLink';
 import { copyToClipboard } from '../../utils/clipboard';
+import { copyH5LinkWithFeedback } from '../../utils/h5LinkFeedback';
 import {
     detectH5ContainerRuntime,
     type H5ContainerRuntime,
@@ -1132,6 +1133,14 @@ export default function H5AgentChat() {
         </article>
     ), []);
 
+    const copyLinkWithFeedback = useCallback(async (url: string) => {
+        await copyH5LinkWithFeedback(url, {
+            copy: copyToClipboard,
+            onCopied: () => toast.success('已复制'),
+            onCopyFailed: () => toast.error('复制失败，请稍后重试'),
+        });
+    }, [toast]);
+
     const handlePlatformLinkFailure = useCallback(async (
         platform: 'DingTalk' | 'WeChat',
         url: string,
@@ -1140,13 +1149,8 @@ export default function H5AgentChat() {
         console.warn(`${platform} mini-program link open failed`, error);
         if (openExternalLinkWithBrowserDefault(url)) return;
 
-        const copied = await copyToClipboard(url);
-        if (copied) {
-            toast.error('系统打开失败，链接已复制');
-        } else {
-            toast.error('链接打开失败，请稍后重试');
-        }
-    }, [toast]);
+        await copyLinkWithFeedback(url);
+    }, [copyLinkWithFeedback]);
 
     const handleMarkdownLinkClick = useCallback((href: string): boolean => {
         const action = resolveH5LinkAction(href, { runtime: containerRuntime });
@@ -1162,7 +1166,7 @@ export default function H5AgentChat() {
         }
 
         if (action.type === 'blocked') {
-            toast.error('微信小程序内仅支持打开本站链接');
+            void copyLinkWithFeedback(action.url);
             return true;
         }
 
@@ -1170,7 +1174,7 @@ export default function H5AgentChat() {
             .then(({ openWechatMiniProgramWebview }) => openWechatMiniProgramWebview(action.url))
             .catch((error) => handlePlatformLinkFailure('WeChat', action.url, error));
         return true;
-    }, [containerRuntime, handlePlatformLinkFailure, toast]);
+    }, [containerRuntime, copyLinkWithFeedback, handlePlatformLinkFailure]);
 
     const renderConversationEntry = useCallback((entry: (typeof conversationEntries)[number]) => {
         if (entry.type === 'analysis_group') {
