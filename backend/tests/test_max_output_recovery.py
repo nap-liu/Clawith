@@ -31,8 +31,6 @@ import pytest
 
 from app.services.llm.caller import (
     MAX_OUTPUT_TOKENS_RECOVERY_LIMIT,
-    REPEAT_FILE_FAILURE_BREAK_MESSAGE,
-    REPEAT_FILE_FAILURE_NUDGE_PROMPT,
     RESUME_PROMPT,
     _response_was_truncated_by_length,
     call_llm,
@@ -353,7 +351,7 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_file_failure_guard_stops_changing_code_after_three_rounds(monkeypatch):
+async def test_changing_file_failures_remain_visible_to_model_until_it_replies(monkeypatch):
     def _tool_response(call_id: int, code: str) -> LLMResponse:
         return LLMResponse(
             content="trying another approach",
@@ -377,6 +375,7 @@ async def test_file_failure_guard_stops_changing_code_after_three_rounds(monkeyp
         _tool_response(1, "open('uploads/6 月稽核月报.xlsx')"),
         _tool_response(2, "import pandas as pd; pd.read_excel('workspace/uploads/6月稽核月报.xlsx')"),
         _tool_response(3, "from pathlib import Path; Path('workspace/uploads/６　月稽核月报.xlsx').read_bytes()"),
+        _stop_response("I could not find the exact requested path after three different attempts."),
     ])
     _patch_caller_collaborators(monkeypatch, client, tools=[
         {"type": "function", "function": {"name": "execute_code_aio", "description": "run"}},
@@ -403,11 +402,13 @@ async def test_file_failure_guard_stops_changing_code_after_three_rounds(monkeyp
         session_id="s",
     )
 
-    assert result == REPEAT_FILE_FAILURE_BREAK_MESSAGE
-    assert len(client.stream_calls) == 3
-    third_round_messages: list[LLMMessage] = client.stream_calls[2]["messages"]
-    assert any(
-        message.role == "user" and message.content == REPEAT_FILE_FAILURE_NUDGE_PROMPT
-        for message in third_round_messages
-    )
+    assert result == "I could not find the exact requested path after three different attempts."
+    assert len(client.stream_calls) == 4
+    final_round_messages: list[LLMMessage] = client.stream_calls[3]["messages"]
+    tool_results = [message.content for message in final_round_messages if message.role == "tool"]
+    assert tool_results == [
+        "FileNotFoundError: [Errno 2] No such file or directory: 'uploads/6 月稽核月报.xlsx'",
+        "File not found: workspace/uploads/6月稽核月报.xlsx",
+        "stat: cannot statx 'workspace/uploads/６　月稽核月报.xlsx': No such file or directory",
+    ]
     assert client.closed is True

@@ -256,7 +256,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and folders in a directory within my workspace. Use this before writing new workspace documents so you can inspect the current folder structure, reuse existing topical subfolders when appropriate, and avoid dumping files directly into the workspace root unless there is a clear reason. Can also list enterprise_info/ for shared company information.",
+            "description": "List files and folders in a directory within my workspace. Every displayed path is the canonical virtual path reported by storage; copy it exactly when calling another file tool. Use this before writing new workspace documents so you can inspect the current folder structure, reuse existing topical subfolders when appropriate, and avoid dumping files directly into the workspace root unless there is a clear reason. Can also list enterprise_info/ for shared company information.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -272,7 +272,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read file contents from the workspace. Can read soul.md for personality, memory/memory.md for memory, skills/ for skill files, and enterprise_info/ for shared company info. Focus is not stored in files; use list_focus_items and upsert_focus_item for Focus. Use offset and limit for reading large files in chunks.",
+            "description": "Read the requested workspace file as UTF-8 text. The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. This tool accepts any file type but does not parse document formats; binary content may be unreadable as text. Can read soul.md for personality, memory/memory.md for memory, skills/ for skill files, and enterprise_info/ for shared company info. Focus is not stored in files; use list_focus_items and upsert_focus_item for Focus. Use offset and limit for reading large files in chunks.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -992,7 +992,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_document",
-            "description": "Read office document contents (PDF, Word, Excel, PPT, etc.) and extract text. Suitable for reading knowledge base documents.",
+            "description": "Extract text from an office document (PDF, Word, Excel, PPT). The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. Storage, materialization, size-limit, timeout, and parser failures are reported as distinct results.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2677,6 +2677,7 @@ async def _prepare_temp_workspace(
     agent_id: uuid.UUID,
     tenant_id: str | None = None,
     paths: list[str] | None = None,
+    max_file_bytes: int = TOOL_MATERIALIZE_MAX_FILE_BYTES,
 ) -> TempWorkspace:
     tmp = tempfile.TemporaryDirectory(prefix=f"clawith-agent-{str(agent_id)[:8]}-")
     temp_ws = Path(tmp.name)
@@ -2691,7 +2692,15 @@ async def _prepare_temp_workspace(
         storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
         if is_enterprise:
             continue
-        await _materialize_storage_path_with_budget(storage, storage_key, normalized, temp_ws, budget, manifest)
+        await _materialize_storage_path_with_budget(
+            storage,
+            storage_key,
+            normalized,
+            temp_ws,
+            budget,
+            manifest,
+            max_file_bytes=max_file_bytes,
+        )
     return TempWorkspace(
         temp_dir=tmp,
         root=temp_ws,
@@ -2709,10 +2718,12 @@ async def _materialize_storage_path_with_budget(
     local_root: Path,
     budget: dict,
     manifest: dict[str, TempWorkspaceManifestEntry],
+    *,
+    max_file_bytes: int = TOOL_MATERIALIZE_MAX_FILE_BYTES,
 ) -> None:
     if await storage.is_file(storage_key):
         version = await storage.get_version(storage_key)
-        if version.size > TOOL_MATERIALIZE_MAX_FILE_BYTES:
+        if version.size > max_file_bytes:
             return
         if budget["total"] + version.size > TOOL_MATERIALIZE_MAX_TOTAL_BYTES:
             return
@@ -2736,7 +2747,15 @@ async def _materialize_storage_path_with_budget(
         (local_root / rel_path).mkdir(parents=True, exist_ok=True)
         for entry in await storage.list_dir(storage_key):
             child_rel = f"{rel_path.rstrip('/')}/{entry.name}" if rel_path else entry.name
-            await _materialize_storage_path_with_budget(storage, entry.key, child_rel, local_root, budget, manifest)
+            await _materialize_storage_path_with_budget(
+                storage,
+                entry.key,
+                child_rel,
+                local_root,
+                budget,
+                manifest,
+                max_file_bytes=max_file_bytes,
+            )
 
 
 async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
@@ -5412,6 +5431,24 @@ class _ResolvedStorageSource:
     ambiguous_candidates: tuple[str, ...] = ()
 
 
+async def _resolve_exact_storage_source_path(
+    agent_id: uuid.UUID,
+    rel_path: str,
+    tenant_id: str | None = None,
+) -> _ResolvedStorageSource:
+    """Resolve a file-tool source by its exact canonical storage key.
+
+    File-reading tools must report what the caller actually requested.  They
+    therefore do not fold whitespace, width variants, case, or neighboring
+    filenames.  Structural workspace normalization remains in
+    ``_tool_storage_key`` for traversal safety and virtual-root handling.
+    """
+    storage = get_storage_backend()
+    storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
+    exists = bool(normalized) and await storage.is_file(storage_key)
+    return _ResolvedStorageSource(storage_key, normalized, is_enterprise, exists)
+
+
 async def _resolve_storage_source_path(
     agent_id: uuid.UUID,
     rel_path: str,
@@ -5477,6 +5514,16 @@ def _storage_source_error(rel_path: str, resolved: _ResolvedStorageSource) -> st
     return f"File not found: {rel_path}"
 
 
+def _exact_storage_source_error(resolved: _ResolvedStorageSource) -> str:
+    requested = resolved.virtual_path or "root"
+    return (
+        "File not found.\n"
+        f"Requested path: {requested}\n"
+        "The requested path was not modified. "
+        "Use list_files and copy an exact returned path."
+    )
+
+
 def _display_size(size_bytes: int) -> str:
     return f"{size_bytes}B" if size_bytes < 1024 else f"{size_bytes / 1024:.1f}KB"
 
@@ -5485,8 +5532,16 @@ async def _storage_list_dir(agent_id: uuid.UUID, rel_path: str, tenant_id: str |
     storage = get_storage_backend()
     storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
 
-    exists = await storage.exists(storage_key)
-    is_dir = await storage.is_dir(storage_key)
+    try:
+        exists = await storage.exists(storage_key)
+        is_dir = await storage.is_dir(storage_key)
+    except Exception as exc:
+        return (
+            "Directory listing failed.\n"
+            "Stage: storage_lookup\n"
+            f"Requested path: {normalized or 'root'}\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
     if exists and not is_dir:
         return f"Path is not a directory: {rel_path}"
     if not exists and not is_dir and normalized:
@@ -5499,20 +5554,30 @@ async def _storage_list_dir(agent_id: uuid.UUID, rel_path: str, tenant_id: str |
         items.append("  📁 enterprise_info/ (shared company info)")
         dir_count += 1
 
-    entries = await storage.list_dir(storage_key) if exists or is_dir else []
+    try:
+        entries = await storage.list_dir(storage_key) if exists or is_dir else []
+    except Exception as exc:
+        return (
+            "Directory listing failed.\n"
+            "Stage: storage_list\n"
+            f"Requested path: {normalized or 'root'}\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
     for entry in entries:
         if entry.name.startswith("."):
             continue
+        display_path = f"{normalized.rstrip('/')}/{entry.name}" if normalized else entry.name
         if entry.is_dir:
             dir_count += 1
             try:
                 child_count = len([c for c in await storage.list_dir(entry.key) if not c.name.startswith(".")])
-            except Exception:
-                child_count = 0
-            items.append(f"  📁 {entry.name}/ ({child_count} items)")
+                child_summary = f"{child_count} items"
+            except Exception as exc:
+                child_summary = f"item count unavailable: {type(exc).__name__}: {str(exc)[:120]}"
+            items.append(f"  📁 {display_path}/ ({child_summary})")
         else:
             file_count += 1
-            items.append(f"  📄 {entry.name} ({_display_size(entry.size)})")
+            items.append(f"  📄 {display_path} ({_display_size(entry.size)})")
 
     if not items:
         return f"📂 {rel_path or 'root'}: Empty directory (0 files, 0 folders)"
@@ -5528,11 +5593,19 @@ async def _storage_read_file(
     limit: int = 2000,
 ) -> str:
     storage = get_storage_backend()
-    resolved = await _resolve_storage_source_path(agent_id, rel_path, tenant_id)
+    try:
+        resolved = await _resolve_exact_storage_source_path(agent_id, rel_path, tenant_id)
+    except Exception as exc:
+        return (
+            "File read failed.\n"
+            "Stage: storage_lookup\n"
+            f"Requested path: {rel_path}\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
     if not resolved.virtual_path:
-        return "File not found: root"
+        return _exact_storage_source_error(resolved)
     if not resolved.exists:
-        return _storage_source_error(rel_path, resolved)
+        return _exact_storage_source_error(resolved)
     try:
         content = await storage.read_text(resolved.storage_key, encoding="utf-8", errors="replace")
         lines = content.splitlines()
@@ -5550,8 +5623,13 @@ async def _storage_read_file(
             f"(lines {start + 1 if total_lines else 0}-{end} of {total_lines})\n"
         )
         return header + output
-    except Exception as e:
-        return f"Read failed: {e}"
+    except Exception as exc:
+        return (
+            "File read failed.\n"
+            "Stage: storage_read\n"
+            f"Requested path: {resolved.virtual_path}\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
 
 
 async def _storage_walk_files(storage, root_key: str) -> list:
@@ -6132,24 +6210,72 @@ async def _read_document_from_storage(
     max_chars: int = 8000,
     tenant_id: str | None = None,
 ) -> str:
-    resolved = await _resolve_storage_source_path(agent_id, rel_path, tenant_id)
-    if not resolved.exists:
-        return _storage_source_error(rel_path, resolved)
-    temp_workspace = await _prepare_temp_workspace(
-        agent_id,
-        tenant_id=tenant_id,
-        paths=[resolved.virtual_path],
-    )
+    storage = get_storage_backend()
     try:
+        resolved = await _resolve_exact_storage_source_path(agent_id, rel_path, tenant_id)
+    except Exception as exc:
+        return (
+            "Document read was not started.\n"
+            "Stage: storage_lookup\n"
+            f"Requested path: {rel_path}\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
+    if not resolved.exists:
+        return _exact_storage_source_error(resolved)
+
+    try:
+        version = await storage.get_version(resolved.storage_key)
+    except Exception as exc:
+        return (
+            "Document read was not started.\n"
+            "Stage: storage_metadata\n"
+            f"Requested path: {resolved.virtual_path}\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
+    if not version.exists or version.is_dir:
+        return _exact_storage_source_error(resolved)
+    if version.size > _READ_DOCUMENT_MAX_FILE_BYTES:
+        return (
+            "Document read was not started.\n"
+            "Stage: materialization\n"
+            f"Requested path: {resolved.virtual_path}\n"
+            "File exists: true\n"
+            f"File size: {version.size} bytes\n"
+            f"Limit: {_READ_DOCUMENT_MAX_FILE_BYTES} bytes\n"
+            "Reason: file exceeds the document-processing limit."
+        )
+
+    try:
+        temp_workspace = await _prepare_temp_workspace(
+            agent_id,
+            tenant_id=tenant_id,
+            paths=[resolved.virtual_path],
+            max_file_bytes=_READ_DOCUMENT_MAX_FILE_BYTES,
+        )
+    except Exception as exc:
+        return (
+            "Document read was not started.\n"
+            "Stage: materialization\n"
+            f"Requested path: {resolved.virtual_path}\n"
+            "File exists: true\n"
+            f"Reason: {type(exc).__name__}: {str(exc)[:200]}"
+        )
+    try:
+        materialized_path = temp_workspace.root / resolved.virtual_path
+        if not materialized_path.is_file():
+            return (
+                "Document read was not started.\n"
+                "Stage: materialization\n"
+                f"Requested path: {resolved.virtual_path}\n"
+                "File exists: true\n"
+                "Reason: storage file was not materialized into the document workspace."
+            )
         content = await _read_document(
             temp_workspace.root,
             resolved.virtual_path,
             max_chars=max_chars,
             tenant_id=None,
         )
-        _, requested_virtual_path, _ = _tool_storage_key(agent_id, rel_path, tenant_id)
-        if requested_virtual_path != resolved.virtual_path:
-            return f"Resolved document path: {resolved.virtual_path}\n\n{content}"
         return content
     finally:
         temp_workspace.cleanup()

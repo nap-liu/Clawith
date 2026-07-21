@@ -4,13 +4,9 @@ Covers the logic that prevents the provider 400 "Repetitive tool calls detected"
 from crashing a turn: signature normalisation + consecutive-round streak counting.
 """
 from app.services.llm.caller import (
-    REPEAT_FILE_FAILURE_BREAK,
-    REPEAT_FILE_FAILURE_NUDGE,
     REPEAT_TOOL_CALL_BREAK,
     REPEAT_TOOL_CALL_NUDGE,
-    _tool_failure_signature,
     _tool_call_signature,
-    _update_file_failure_counts,
     _update_repeat_streaks,
 )
 
@@ -123,63 +119,6 @@ def test_partial_overlap_only_repeated_sig_climbs():
 def test_thresholds_ordered():
     assert REPEAT_TOOL_CALL_NUDGE < REPEAT_TOOL_CALL_BREAK
     assert REPEAT_TOOL_CALL_NUDGE >= 2
-
-
-# ── Result-level file failure guard ─────────────────────────────────────────
-
-def test_file_failure_signature_matches_python_and_tool_errors():
-    python_error = (
-        "FileNotFoundError: [Errno 2] No such file or directory: "
-        "'/data/agents/id/workspace/uploads/6 月稽核月报.xlsx'"
-    )
-    tool_error = "File not found: workspace/uploads/6月稽核月报.xlsx"
-
-    assert _tool_failure_signature(python_error) == _tool_failure_signature(tool_error)
-    assert _tool_failure_signature(tool_error) == ("file_not_found", "uploads/6月稽核月报.xlsx")
-
-
-def test_file_failure_signature_keeps_distinct_virtual_directories_separate():
-    uploads = "File not found: workspace/uploads/report.xlsx"
-    reports = "File not found: workspace/reports/report.xlsx"
-    assert _tool_failure_signature(uploads) != _tool_failure_signature(reports)
-
-
-def test_file_failure_signature_ignores_unrelated_or_success_results():
-    assert _tool_failure_signature("document loaded") is None
-    assert _tool_failure_signature([{"type": "text", "text": "File not found: x"}]) is None
-
-
-def test_file_failure_streak_catches_changing_tool_programs():
-    results = [
-        "FileNotFoundError: [Errno 2] No such file or directory: 'uploads/6 月稽核月报.xlsx'",
-        "File not found: workspace/uploads/6月稽核月报.xlsx",
-        "stat: cannot statx 'workspace/uploads/６　月稽核月报.xlsx': No such file or directory",
-    ]
-    streaks: dict = {}
-    decisions = []
-    for result in results:
-        signature = _tool_failure_signature(result)
-        streaks = _update_file_failure_counts(streaks, [signature] if signature else [])
-        level = max(streaks.values(), default=0)
-        if level >= REPEAT_FILE_FAILURE_BREAK:
-            decisions.append("break")
-        elif level == REPEAT_FILE_FAILURE_NUDGE:
-            decisions.append("nudge")
-        else:
-            decisions.append("run")
-
-    assert decisions == ["run", "nudge", "break"]
-
-
-def test_file_failure_count_survives_successful_probe_round():
-    missing = _tool_failure_signature(
-        "FileNotFoundError: No such file or directory: 'workspace/uploads/6 月稽核月报.xlsx'"
-    )
-    counts = _update_file_failure_counts({}, [missing])
-    counts = _update_file_failure_counts(counts, [])  # list_files succeeded
-    counts = _update_file_failure_counts(counts, [missing])
-
-    assert counts[missing] == REPEAT_FILE_FAILURE_NUDGE
 
 
 # ── Loop-integration contract ───────────────────────────────────────────────

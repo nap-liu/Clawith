@@ -141,6 +141,37 @@ class MemoryStorageBackend(StorageBackend):
         return ConditionalWriteResult(ok=True, current_version=await self.get_version(key))
 
 
+class FailingStorageBackend(MemoryStorageBackend):
+    def __init__(self, *, fail_operation: str, files: dict[str, bytes] | None = None):
+        super().__init__(files)
+        self.fail_operation = fail_operation
+
+    async def exists(self, key: str) -> bool:
+        if self.fail_operation == "exists":
+            raise ConnectionError("storage unavailable")
+        return await super().exists(key)
+
+    async def is_file(self, key: str) -> bool:
+        if self.fail_operation == "is_file":
+            raise ConnectionError("storage unavailable")
+        return await super().is_file(key)
+
+    async def read_bytes(self, key: str) -> bytes:
+        if self.fail_operation == "read_bytes":
+            raise OSError("object read interrupted")
+        return await super().read_bytes(key)
+
+    async def read_text(
+        self,
+        key: str,
+        encoding: str = "utf-8",
+        errors: str = "strict",
+    ) -> str:
+        if self.fail_operation == "read_text":
+            raise OSError("object read interrupted")
+        return (await self.read_bytes(key)).decode(encoding, errors=errors)
+
+
 @pytest.mark.asyncio
 async def test_agent_file_tools_use_storage_paths(monkeypatch):
     agent_id = uuid.uuid4()
@@ -162,7 +193,72 @@ async def test_agent_file_tools_use_storage_paths(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_storage_read_file_resolves_unique_normalized_filename(monkeypatch):
+async def test_storage_read_file_accepts_binary_content_without_format_guard(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend({
+        f"{agent_id}/workspace/uploads/sample.xlsx": b"PK\x03\x04\xffbinary",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    read = await agent_tools._storage_read_file(
+        agent_id,
+        "workspace/uploads/sample.xlsx",
+    )
+
+    assert "📄 workspace/uploads/sample.xlsx" in read
+    assert "PK" in read
+    assert "Unsupported" not in read
+
+
+@pytest.mark.asyncio
+async def test_storage_read_file_reports_lookup_failure_instead_of_not_found(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = FailingStorageBackend(fail_operation="is_file")
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    read = await agent_tools._storage_read_file(agent_id, "workspace/report.txt")
+
+    assert "File read failed." in read
+    assert "Stage: storage_lookup" in read
+    assert "Requested path: workspace/report.txt" in read
+    assert "ConnectionError: storage unavailable" in read
+    assert "File not found" not in read
+
+
+@pytest.mark.asyncio
+async def test_storage_read_file_reports_read_failure_with_exact_path(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = FailingStorageBackend(
+        fail_operation="read_text",
+        files={f"{agent_id}/workspace/report.txt": b"content"},
+    )
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    read = await agent_tools._storage_read_file(agent_id, "workspace/report.txt")
+
+    assert "File read failed." in read
+    assert "Stage: storage_read" in read
+    assert "Requested path: workspace/report.txt" in read
+    assert "OSError: object read interrupted" in read
+
+
+@pytest.mark.asyncio
+async def test_storage_list_dir_reports_lookup_failure_instead_of_empty(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = FailingStorageBackend(fail_operation="exists")
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    listing = await agent_tools._storage_list_dir(agent_id, "workspace/uploads")
+
+    assert "Directory listing failed." in listing
+    assert "Stage: storage_lookup" in listing
+    assert "Requested path: workspace/uploads" in listing
+    assert "ConnectionError: storage unavailable" in listing
+    assert "Empty directory" not in listing
+
+
+@pytest.mark.asyncio
+async def test_storage_read_file_does_not_guess_normalized_filename(monkeypatch):
     agent_id = uuid.uuid4()
     storage = MemoryStorageBackend({
         f"{agent_id}/workspace/uploads/6月稽核月报.xlsx": b"canonical content\n",
@@ -174,12 +270,14 @@ async def test_storage_read_file_resolves_unique_normalized_filename(monkeypatch
         "workspace/uploads/６ 月稽核月报.xlsx",
     )
 
-    assert "📄 workspace/uploads/6月稽核月报.xlsx" in read
-    assert "canonical content" in read
+    assert "File not found." in read
+    assert "Requested path: workspace/uploads/６ 月稽核月报.xlsx" in read
+    assert "The requested path was not modified." in read
+    assert "canonical content" not in read
 
 
 @pytest.mark.asyncio
-async def test_storage_source_normalization_refuses_ambiguous_candidates(monkeypatch):
+async def test_storage_read_file_does_not_offer_similar_candidates(monkeypatch):
     agent_id = uuid.uuid4()
     storage = MemoryStorageBackend({
         f"{agent_id}/workspace/uploads/6月报告.xlsx": b"compact",
@@ -192,15 +290,53 @@ async def test_storage_source_normalization_refuses_ambiguous_candidates(monkeyp
         "workspace/uploads/６　月报告.xlsx",
     )
 
-    assert "ambiguous after normalization" in read
-    assert "workspace/uploads/6月报告.xlsx" in read
-    assert "workspace/uploads/6 月报告.xlsx" in read
+    assert "File not found." in read
+    assert "Requested path: workspace/uploads/６　月报告.xlsx" in read
+    assert "6月报告.xlsx" not in read
+    assert "6 月报告.xlsx" not in read
     assert "compact" not in read
     assert "spaced" not in read
 
 
 @pytest.mark.asyncio
-async def test_read_document_resolves_before_selective_materialization(monkeypatch):
+async def test_read_document_requires_exact_path_before_materialization(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend({
+        f"{agent_id}/workspace/uploads/山东7月门店等级.xlsx": b"xlsx bytes",
+        f"{agent_id}/workspace/uploads/unrelated.xlsx": b"other",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    result = await agent_tools._read_document_from_storage(
+        agent_id,
+        "workspace/uploads/山东 7 月门店等级.xlsx",
+    )
+
+    assert "File not found." in result
+    assert "Requested path: workspace/uploads/山东 7 月门店等级.xlsx" in result
+    assert "The requested path was not modified." in result
+
+
+@pytest.mark.asyncio
+async def test_read_document_reports_storage_lookup_failure_instead_of_not_found(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = FailingStorageBackend(fail_operation="is_file")
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    result = await agent_tools._read_document_from_storage(
+        agent_id,
+        "workspace/uploads/report.xlsx",
+    )
+
+    assert "Document read was not started." in result
+    assert "Stage: storage_lookup" in result
+    assert "Requested path: workspace/uploads/report.xlsx" in result
+    assert "ConnectionError: storage unavailable" in result
+    assert "File not found" not in result
+
+
+@pytest.mark.asyncio
+async def test_read_document_materializes_exact_source_only(monkeypatch):
     agent_id = uuid.uuid4()
     storage = MemoryStorageBackend({
         f"{agent_id}/workspace/uploads/山东7月门店等级.xlsx": b"xlsx bytes",
@@ -220,18 +356,74 @@ async def test_read_document_resolves_before_selective_materialization(monkeypat
 
     result = await agent_tools._read_document_from_storage(
         agent_id,
-        "workspace/uploads/山东 7 月门店等级.xlsx",
+        "workspace/uploads/山东7月门店等级.xlsx",
     )
 
-    assert result == (
-        "Resolved document path: workspace/uploads/山东7月门店等级.xlsx\n\n"
-        "document ok"
-    )
+    assert result == "document ok"
     assert observed == {
         "rel_path": "workspace/uploads/山东7月门店等级.xlsx",
         "content": b"xlsx bytes",
         "unrelated_exists": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_read_document_materializes_file_larger_than_generic_tool_limit(monkeypatch):
+    agent_id = uuid.uuid4()
+    content = b"x" * (agent_tools.TOOL_MATERIALIZE_MAX_FILE_BYTES + 1)
+    storage = MemoryStorageBackend({
+        f"{agent_id}/workspace/uploads/large.xlsx": content,
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    async def _fake_read_document(ws, rel_path, max_chars, tenant_id):
+        return f"materialized={int((ws / rel_path).is_file())};size={(ws / rel_path).stat().st_size}"
+
+    monkeypatch.setattr(agent_tools, "_read_document", _fake_read_document)
+
+    result = await agent_tools._read_document_from_storage(
+        agent_id,
+        "workspace/uploads/large.xlsx",
+    )
+
+    assert result == f"materialized=1;size={len(content)}"
+
+
+@pytest.mark.asyncio
+async def test_read_document_reports_existing_file_over_document_limit(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend({
+        f"{agent_id}/workspace/uploads/large.xlsx": b"123456",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+    monkeypatch.setattr(agent_tools, "_READ_DOCUMENT_MAX_FILE_BYTES", 5)
+
+    result = await agent_tools._read_document_from_storage(
+        agent_id,
+        "workspace/uploads/large.xlsx",
+    )
+
+    assert "Document read was not started." in result
+    assert "Stage: materialization" in result
+    assert "File exists: true" in result
+    assert "File size: 6 bytes" in result
+    assert "Limit: 5 bytes" in result
+    assert "file exceeds the document-processing limit" in result
+
+
+@pytest.mark.asyncio
+async def test_storage_list_dir_returns_full_canonical_virtual_paths(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend({
+        f"{agent_id}/workspace/uploads/report.xlsx": b"xlsx",
+        f"{agent_id}/workspace/uploads/archive/old.xlsx": b"old",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    result = await agent_tools._storage_list_dir(agent_id, "workspace/uploads")
+
+    assert "📄 workspace/uploads/report.xlsx" in result
+    assert "📁 workspace/uploads/archive/" in result
 
 
 @pytest.mark.asyncio
