@@ -116,7 +116,7 @@ BUILTIN_TOOLS = [
     {
         "name": "read_file",
         "display_name": "Read File",
-        "description": "Read the requested workspace file as UTF-8 text. The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. This tool accepts any file type but does not parse document formats; binary content may be unreadable as text. Can read soul.md, memory/memory.md, skills/, and enterprise_info/. Focus is stored in system tools, not focus.md. Use offset and limit for reading large files in chunks.",
+        "description": "Read the requested workspace file as UTF-8 text. The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. This tool accepts any file type but does not parse document formats; binary content may be unreadable as text. Can read soul.md, memory/memory.md, skills/, and enterprise_info/. Focus is stored in system tools, not focus.md. Use offset and limit for ordinary text pagination, but note that line limits do not bound characters when HTML, JSON, or generated data is stored on one long line. For large or data-heavy files, use execute_code_aio to inspect and process the original path directly, write the result to a file, and print only a bounded summary, validation result, and output path.",
         "category": "file",
         "icon": "📄",
         "is_default": True,

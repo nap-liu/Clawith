@@ -124,6 +124,29 @@ async def _call_agent_llm(
     from app.models.agent import Agent
     from app.models.llm import LLMModel
     from app.services.llm import call_llm_with_failover
+    from app.services.llm.session_context_guard import (
+        CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE,
+        CONTEXT_REQUEST_TOO_LARGE_MESSAGE,
+        IM_SESSION_CONTEXT_TERMINATED_MESSAGE,
+        SESSION_CONTEXT_TERMINATED_MESSAGE,
+        get_session_context_termination,
+        terminate_session_context,
+    )
+
+    def _context_reply(reply: str) -> str:
+        if recovery_hint and reply in {
+            SESSION_CONTEXT_TERMINATED_MESSAGE,
+            CONTEXT_REQUEST_TOO_LARGE_MESSAGE,
+        }:
+            return IM_SESSION_CONTEXT_TERMINATED_MESSAGE
+        return reply
+
+    async def _terminate_context(reason: str) -> str:
+        return _context_reply(await terminate_session_context(session_id, reason))
+
+    _terminated = await get_session_context_termination(session_id)
+    if _terminated:
+        return _context_reply(_terminated)
 
     # A2A sessions store their shared history under the session owner (the
     # stable min-id side), while the model and tools execute as the agent being
@@ -197,15 +220,37 @@ async def _call_agent_llm(
             load_recoverable_history_for_turn,
             strip_leading_orphan_tool_messages,
         )
-        from app.services.llm.compactor import maybe_precompact_prompt
+        from app.services.llm.compactor import (
+            maybe_precompact_prompt,
+            prompt_exceeds_preflight_limit,
+        )
 
+        _preflight_required = False
         try:
-            if await maybe_precompact_prompt(
+            _preflight_required = prompt_exceeds_preflight_limit(
+                model=model,
+                prompt_messages=messages,
+            )
+            _precompact = await maybe_precompact_prompt(
                 agent_id=history_agent_id,
                 conversation_id=session_id,
                 model=model,
                 prompt_messages=messages,
-            ):
+            )
+        except Exception as _compact_exc:
+            logger.error(f"[Channel] pre-flight compaction failed: {_compact_exc}")
+            if _preflight_required:
+                return await _terminate_context(
+                    f"preflight_compaction_exception:{type(_compact_exc).__name__}"
+                )
+            return CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
+
+        if _precompact.required and not _precompact.triggered:
+            return await _terminate_context(
+                f"preflight_compaction_failed:{_precompact.skipped_reason}"
+            )
+        if _precompact.triggered:
+            try:
                 if recovery_mode and turn_anchor_id is not None:
                     fresh = await load_recoverable_history_for_turn(
                         db,
@@ -237,8 +282,13 @@ async def _call_agent_llm(
                     else:
                         rebuilt.append({"role": "user", "content": user_text})
                         messages = rebuilt
-        except Exception as _pf_exc:
-            logger.warning(f"[Channel] pre-flight compaction skipped (non-fatal): {_pf_exc}")
+                if prompt_exceeds_preflight_limit(model=model, prompt_messages=messages):
+                    return await _terminate_context("preflight_compaction_still_oversized")
+            except Exception as _reload_exc:
+                # Compaction already committed successfully.  A transient
+                # history/image reload failure must not poison the session.
+                logger.error(f"[Channel] post-compaction history reload failed: {_reload_exc}")
+                return CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
 
     # Use actual user_id so the system prompt knows who it's chatting with
     effective_user_id = user_id or agent_id
@@ -322,6 +372,7 @@ async def _call_agent_llm(
         is_group=is_group,
         turn_anchor_id=turn_anchor_id,
     )
+    reply = _context_reply(reply)
 
     # Finalize the streamed bubble for any web client watching this session, so
     # an IM-driven conversation updates live in the web UI (not only on reload).

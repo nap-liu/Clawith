@@ -13,6 +13,7 @@ from app.services.storage_runtime.base import (
     StorageBackend,
     StorageEntry,
     StorageVersion,
+    TextLineRange,
     WriteCondition,
     content_hash_bytes,
 )
@@ -66,6 +67,25 @@ class LocalStorageBackend(StorageBackend):
         path = self._full_path(key)
         async with aiofiles.open(path, "rb") as f:
             return await f.read()
+
+    async def read_text_lines(
+        self,
+        key: str,
+        *,
+        offset: int = 0,
+        limit: int = 2000,
+        encoding: str = "utf-8",
+        errors: str = "replace",
+    ) -> TextLineRange:
+        path = self._full_path(key)
+        return await asyncio.to_thread(
+            _local_read_text_lines,
+            path,
+            max(0, offset),
+            max(0, limit),
+            encoding,
+            errors,
+        )
 
     async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
         path = self._full_path(key)
@@ -179,6 +199,24 @@ def _local_create_exclusive(path: Path, data: bytes) -> None:
     """Atomically create ``path`` and fail if another writer won the race."""
     with path.open("xb") as file_obj:
         file_obj.write(data)
+
+
+def _local_read_text_lines(
+    path: Path,
+    offset: int,
+    limit: int,
+    encoding: str,
+    errors: str,
+) -> TextLineRange:
+    selected: list[str] = []
+    end = offset + limit
+    total_lines = 0
+    with path.open("r", encoding=encoding, errors=errors, newline=None) as file_obj:
+        for line_index, line in enumerate(file_obj):
+            total_lines = line_index + 1
+            if offset <= line_index < end:
+                selected.append(line.removesuffix("\n").removesuffix("\r"))
+    return TextLineRange(lines=selected, total_lines=total_lines)
 
 
 def _local_version_token(stat, file_hash: str | None) -> str:

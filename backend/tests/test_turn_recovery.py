@@ -131,7 +131,9 @@ async def test_call_agent_llm_recovery_mode_precompacts_with_recoverable_reload(
         return "done"
 
     async def fake_precompact(**_kwargs):
-        return True
+        from app.services.llm.compactor import CompactionResult
+
+        return CompactionResult(triggered=True, required=True)
 
     async def fake_recoverable_reload(*_args, **kwargs):
         captured["reload_kwargs"] = kwargs

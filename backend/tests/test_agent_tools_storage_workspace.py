@@ -6,6 +6,7 @@ from app.services import agent_tools
 from app.services import workspace_collaboration
 from app.services import workspace_locking
 from app.services.storage_runtime.base import StorageBackend, StorageEntry, StorageVersion, WriteCondition, ConditionalWriteResult
+from app.services.storage_runtime.local import LocalStorageBackend
 
 
 class _FakeRedis:
@@ -208,6 +209,34 @@ async def test_storage_read_file_accepts_binary_content_without_format_guard(mon
     assert "📄 workspace/uploads/sample.xlsx" in read
     assert "PK" in read
     assert "Unsupported" not in read
+
+
+@pytest.mark.asyncio
+async def test_storage_read_file_streams_requested_local_range(monkeypatch, tmp_path):
+    agent_id = uuid.uuid4()
+    storage = LocalStorageBackend(str(tmp_path))
+    key = f"{agent_id}/workspace/large.txt"
+    path = tmp_path / key
+    path.parent.mkdir(parents=True)
+    path.write_text("".join(f"line-{i}\n" for i in range(10_000)), encoding="utf-8")
+
+    async def _full_read_must_not_run(_key):
+        raise AssertionError("read_file range path must not load the entire local file")
+
+    monkeypatch.setattr(storage, "read_bytes", _full_read_must_not_run)
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    read = await agent_tools._storage_read_file(
+        agent_id,
+        "workspace/large.txt",
+        offset=9_998,
+        limit=2,
+    )
+
+    assert "lines 9999-10000 of 10000" in read
+    assert "line-9998" in read
+    assert "line-9999" in read
+    assert "line-0" not in read
 
 
 @pytest.mark.asyncio

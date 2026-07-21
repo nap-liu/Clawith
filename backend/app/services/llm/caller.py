@@ -252,6 +252,88 @@ REPEAT_TOOL_CALL_BREAK_MESSAGE = (
     "你可以换个问法、缩小范围，或稍后再试。"
 )
 
+# Provider requests are stopped before dispatch when the final assembled
+# prompt cannot fit.  DashScope additionally enforces an input-character limit
+# below one million characters; keep a safety margin for JSON protocol
+# overhead that is not represented by the message bodies themselves.
+QWEN_INPUT_CHAR_HARD_LIMIT = 900_000
+PROVIDER_CONTEXT_BLOCKED_MESSAGE = (
+    "上下文过长，请新开会话。"
+)
+
+
+def _dispatch_context_size(messages: list, tools: list[dict] | None) -> tuple[int, int]:
+    """Return conservative ``(characters, estimated_tokens)`` for one request."""
+    chunks: list[str] = []
+    for msg in messages:
+        content = getattr(msg, "content", None)
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        chunks.append(text)
+                    elif "image_url" in block or block.get("type") == "image":
+                        chunks.append("x" * 1024)
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if tool_calls:
+            chunks.append(json.dumps(tool_calls, ensure_ascii=False, default=str))
+        reasoning = getattr(msg, "reasoning_content", None)
+        if isinstance(reasoning, str):
+            chunks.append(reasoning)
+    if tools:
+        chunks.append(json.dumps(tools, ensure_ascii=False, default=str))
+
+    combined = "".join(chunks)
+    chars = len(combined)
+    # CJK is commonly close to one token per character.  ASCII-heavy JSON and
+    # prose are conservatively estimated at three characters per token.
+    cjk = sum(
+        1
+        for ch in combined
+        if "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff"
+    )
+    estimated_tokens = cjk + (chars - cjk + 2) // 3
+    return chars, estimated_tokens
+
+
+async def _guard_provider_dispatch(
+    *,
+    model,
+    messages: list,
+    tools: list[dict] | None,
+    max_output_tokens: int,
+    session_id: str,
+) -> str | None:
+    """Block oversized provider I/O without claiming persistent termination.
+
+    Persistent session termination belongs to the compaction orchestration
+    path, where the platform can prove that compaction was required and failed.
+    This final dispatch guard is deliberately stateless: it covers estimation
+    gaps (system prompt, tool schemas, provider-specific character limits) and
+    leaves the failover wrapper free to try a model with a larger window.
+    """
+    chars, estimated_tokens = _dispatch_context_size(messages, tools)
+    context_window = int(getattr(model, "context_window", 0) or 0)
+    token_limit = max(1, context_window - max(0, int(max_output_tokens or 0)))
+    token_overflow = context_window > 0 and estimated_tokens >= token_limit
+    char_overflow = (
+        str(getattr(model, "provider", "")).lower() == "qwen"
+        and chars >= QWEN_INPUT_CHAR_HARD_LIMIT
+    )
+    if not token_overflow and not char_overflow:
+        return None
+
+    reason = (
+        f"provider_dispatch_oversized:chars={chars},estimated_tokens={estimated_tokens},"
+        f"token_limit={token_limit},provider={getattr(model, 'provider', '?')},"
+        f"model={getattr(model, 'model', '?')}"
+    )
+    logger.error(f"[context_guard] blocked provider dispatch session={session_id} {reason}")
+    return PROVIDER_CONTEXT_BLOCKED_MESSAGE
+
 def _tool_call_signature(tc: dict) -> tuple[str, str]:
     """Stable ``(name, canonical-args)`` identity for a tool call.
 
@@ -329,7 +411,9 @@ def is_error_result(result: str) -> bool:
     The LLM/tool layer signals failures by returning a string prefixed with one
     of these markers instead of raising, so a successful reply never matches.
     """
-    return result.startswith(("[LLM Error]", "[LLM call error]", "[Error]"))
+    return result == PROVIDER_CONTEXT_BLOCKED_MESSAGE or result.startswith(
+        ("[LLM Error]", "[LLM call error]", "[Error]")
+    )
 
 
 def is_retryable_error(result: str) -> bool:
@@ -1103,6 +1187,20 @@ async def call_llm(
                     _log_turn_timing("token_limit", round_i + 1)
                     return _token_limit_msg
 
+        context_stop = await _guard_provider_dispatch(
+            model=model,
+            messages=dispatch_messages,
+            tools=tools_for_llm if tools_for_llm else None,
+            max_output_tokens=max_tokens,
+            session_id=session_id,
+        )
+        if context_stop:
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+            await client.close()
+            _log_turn_timing("context_blocked", round_i + 1)
+            return context_stop
+
         try:
             # Use streaming API for real-time responses
             response = await _stream_with_throttle_retry(
@@ -1159,6 +1257,19 @@ async def call_llm(
                 # Rebuild the shallow dispatch view.  The original turn-context
                 # snapshot remains in api_messages and is carried into resumes.
                 dispatch_messages = list(api_messages)
+                context_stop = await _guard_provider_dispatch(
+                    model=model,
+                    messages=dispatch_messages,
+                    tools=tools_for_llm if tools_for_llm else None,
+                    max_output_tokens=max_tokens,
+                    session_id=session_id,
+                )
+                if context_stop:
+                    if agent_id and _unsaved_usage.total_tokens > 0:
+                        await record_token_usage(agent_id, _unsaved_usage)
+                    await client.close()
+                    _log_turn_timing("context_blocked", round_i + 1)
+                    return context_stop
                 response = await _stream_with_throttle_retry(
                     client,
                     model=model,
@@ -1451,8 +1562,15 @@ async def call_llm(
             if response and response.usage:
                 last_prompt_tokens = response.usage.get("prompt_tokens")
             if last_prompt_tokens:
+                compaction_required = False
                 try:
-                    from app.services.llm.compactor import maybe_compact
+                    from app.services.llm.compactor import maybe_compact, should_compact
+
+                    compaction_required, _, _ = should_compact(
+                        model=model,
+                        last_prompt_tokens=last_prompt_tokens,
+                        pre_flight_estimate=None,
+                    )
 
                     compaction_result = await maybe_compact(
                         agent_id=agent_id,
@@ -1460,16 +1578,42 @@ async def call_llm(
                         model=model,
                         last_prompt_tokens=last_prompt_tokens,
                     )
+                    if compaction_result.required and not compaction_result.triggered:
+                        from .session_context_guard import terminate_session_context
+
+                        context_stop = await terminate_session_context(
+                            session_id,
+                            f"post_round_compaction_failed:{compaction_result.skipped_reason}",
+                        )
+                        if agent_id and _unsaved_usage.total_tokens > 0:
+                            await record_token_usage(agent_id, _unsaved_usage)
+                        await client.close()
+                        _log_turn_timing("context_terminated", round_i + 1)
+                        return context_stop
                     if compaction_result.progress_notice and on_chunk:
-                        await on_chunk(f"\n\n{compaction_result.progress_notice}\n\n")
+                        try:
+                            await on_chunk(f"\n\n{compaction_result.progress_notice}\n\n")
+                        except Exception as notice_exc:
+                            logger.warning(
+                                "[LLM] failed to emit compaction notice: "
+                                f"{type(notice_exc).__name__}: {notice_exc}"
+                            )
                 except Exception as compact_exc:
-                    # Compaction is opportunistic — never let its
-                    # failure abort the live conversation. The session
-                    # falls back to ctx_size truncation on the next
-                    # call_llm if context keeps growing.
-                    logger.warning(
-                        f"[LLM] auto-compaction hook failed (non-fatal): {type(compact_exc).__name__}: {compact_exc}"
+                    logger.error(
+                        f"[LLM] auto-compaction hook failed: {type(compact_exc).__name__}: {compact_exc}"
                     )
+                    if compaction_required:
+                        from .session_context_guard import terminate_session_context
+
+                        context_stop = await terminate_session_context(
+                            session_id,
+                            f"post_round_compaction_exception:{type(compact_exc).__name__}",
+                        )
+                        if agent_id and _unsaved_usage.total_tokens > 0:
+                            await record_token_usage(agent_id, _unsaved_usage)
+                        await client.close()
+                        _log_turn_timing("context_terminated", round_i + 1)
+                        return context_stop
 
     # Record tokens even on "too many rounds" exit
     if agent_id and _unsaved_usage.total_tokens > 0:
@@ -1512,6 +1656,13 @@ async def call_llm_with_failover(
 
     if primary_model is None:
         return "⚠️ 未配置 LLM 模型"
+
+    if session_id:
+        from .session_context_guard import get_session_context_termination
+
+        terminated = await get_session_context_termination(session_id)
+        if terminated:
+            return terminated
 
     # Freeze one context snapshot for the whole logical turn.  Runtime
     # failover is a provider retry, not a new Agent turn, so both models must
@@ -1633,6 +1784,12 @@ async def call_llm_with_failover(
         prepared_turn_context=prepared_turn_context,
     )
 
+    if (
+        primary_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE
+        and fallback_result == PROVIDER_CONTEXT_BLOCKED_MESSAGE
+    ):
+        return PROVIDER_CONTEXT_BLOCKED_MESSAGE
+
     # Combine error messages if fallback also failed
     if is_retryable_error(fallback_result) or fallback_result.startswith("⚠️") or fallback_result.startswith("[Error]"):
         return f"⚠️ 调用模型出错: Primary: {primary_result[:80]} | Fallback: {fallback_result[:80]}"
@@ -1732,6 +1889,13 @@ async def call_agent_llm_with_tools(
     from app.models.agent import Agent
     from app.models.llm import LLMModel
 
+    if session_id:
+        from .session_context_guard import get_session_context_termination
+
+        terminated = await get_session_context_termination(session_id)
+        if terminated:
+            return terminated
+
     # Load agent and models
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent: Agent | None = agent_result.scalar_one_or_none()
@@ -1797,6 +1961,19 @@ async def call_agent_llm_with_tools(
                             logger.warning(f"[call_agent_llm_with_tools] Token limit exceeded mid-loop: {_token_limit_msg}")
                             await client.close()
                             return _token_limit_msg, False, tool_executed
+
+                context_stop = await _guard_provider_dispatch(
+                    model=model,
+                    messages=api_messages,
+                    tools=tools_for_llm if tools_for_llm else None,
+                    max_output_tokens=max_tokens,
+                    session_id=session_id,
+                )
+                if context_stop:
+                    if agent_id and _unsaved_usage.total_tokens > 0:
+                        await record_token_usage(agent_id, _unsaved_usage)
+                    await client.close()
+                    return context_stop, False, tool_executed
 
                 try:
                     _round_t0 = perf_counter()
@@ -1941,11 +2118,18 @@ async def call_agent_llm_with_tools(
                         logger.info(
                             f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}"
                         )
+                    llm_view = finalize_tool_output(
+                        result,
+                        tool_name=tool_name,
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        tool_call_id=str(tc.get("id") or ""),
+                    )
                     api_messages.append(
                         LLMMessage(
                             role="tool",
                             tool_call_id=tc["id"],
-                            content=str(result),
+                            content=llm_view,
                         )
                     )
 
@@ -1984,6 +2168,12 @@ async def call_agent_llm_with_tools(
     reply2, success2, _fallback_tool_executed = await _try_model(fallback_model)
     if success2:
         return reply2
+
+    if (
+        reply == PROVIDER_CONTEXT_BLOCKED_MESSAGE
+        and reply2 == PROVIDER_CONTEXT_BLOCKED_MESSAGE
+    ):
+        return PROVIDER_CONTEXT_BLOCKED_MESSAGE
 
     return f"⚠️ Both models failed | Primary: {reply[:80]} | Fallback: {reply2[:80]}"
 

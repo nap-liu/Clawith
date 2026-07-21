@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
@@ -154,6 +154,10 @@ class CompactionResult:
     """
 
     triggered: bool
+    # True means the configured threshold was crossed and compaction was
+    # required for a safe provider request.  ``required and not triggered`` is
+    # therefore a terminal failure, not the ordinary below-threshold no-op.
+    required: bool = False
     summary_id: uuid.UUID | None = None
     epoch: int | None = None
     summary_tokens: int | None = None
@@ -166,35 +170,74 @@ class CompactionResult:
 
 
 def estimate_prompt_tokens(api_messages: list[dict]) -> int:
-    """Char-count-based prompt-token estimate for the pre-flight path.
+    """Conservative mixed CJK/ASCII estimate for the pre-flight path.
 
     Used only when no real usage observation is available yet. The
     real post-round path uses ``response.usage.prompt_tokens`` directly
     (via ``last_prompt_tokens`` argument).
     """
-    total_chars = 0
+    chunks: list[str] = []
     for msg in api_messages:
         c = msg.get("content")
         if isinstance(c, str):
-            total_chars += len(c)
+            chunks.append(c)
         elif isinstance(c, list):
             for block in c:
                 if isinstance(block, dict):
                     t = block.get("text")
                     if isinstance(t, str):
-                        total_chars += len(t)
+                        chunks.append(t)
                     elif "image_url" in block or block.get("type") == "image":
                         # Count placeholder cost; vision tokens are
                         # provider-specific and hard to estimate.
-                        total_chars += 1024
+                        chunks.append("x" * 1024)
         for tc in msg.get("tool_calls", []) or []:
             args = tc.get("function", {}).get("arguments", "")
             if isinstance(args, str):
-                total_chars += len(args)
+                chunks.append(args)
             elif isinstance(args, dict):
                 import json as _j
-                total_chars += len(_j.dumps(args, ensure_ascii=False))
-    return int(total_chars / ESTIMATE_CHARS_PER_TOKEN)
+                chunks.append(_j.dumps(args, ensure_ascii=False))
+        reasoning = msg.get("reasoning_content")
+        if isinstance(reasoning, str):
+            chunks.append(reasoning)
+
+    combined = "".join(chunks)
+    cjk_chars = sum(
+        1
+        for ch in combined
+        if "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff"
+    )
+    return cjk_chars + (len(combined) - cjk_chars + 2) // 3
+
+
+def _preflight_trigger_ratio(model: LLMModel) -> float:
+    """Return a conservative trigger ratio that reserves response capacity."""
+    context_window = int(getattr(model, "context_window", 0) or 0)
+    if context_window <= 0:
+        return PRE_FLIGHT_TRIGGER_RATIO
+
+    from app.services.llm.client import get_max_tokens
+
+    max_output_tokens = get_max_tokens(
+        str(getattr(model, "provider", "") or ""),
+        str(getattr(model, "model", "") or ""),
+        getattr(model, "max_output_tokens", None),
+    )
+    input_capacity = max(1, context_window - max(0, int(max_output_tokens or 0)))
+    # Keep five percent of the actual input capacity for protocol/tool-schema
+    # estimation variance.  Never trigger later than the historical 95% cap.
+    return min(PRE_FLIGHT_TRIGGER_RATIO, (input_capacity / context_window) * 0.95)
+
+
+def prompt_exceeds_preflight_limit(*, model: LLMModel, prompt_messages: list[dict]) -> bool:
+    """Return whether this message view requires pre-flight compaction."""
+    fire, _, _ = should_compact(
+        model=model,
+        last_prompt_tokens=None,
+        pre_flight_estimate=estimate_prompt_tokens(prompt_messages),
+    )
+    return fire
 
 
 def should_compact(
@@ -209,7 +252,7 @@ def should_compact(
     analysis; ``reason`` is a short tag — ``post_round`` /
     ``pre_flight`` / ``below_threshold``.
     """
-    cw = model.context_window
+    cw = getattr(model, "context_window", 0)
     if cw is None or cw <= 0:
         return False, 0.0, "no_context_window_configured"
 
@@ -220,7 +263,7 @@ def should_compact(
 
     if pre_flight_estimate is not None:
         ratio = pre_flight_estimate / cw
-        if ratio >= PRE_FLIGHT_TRIGGER_RATIO:
+        if ratio >= _preflight_trigger_ratio(model):
             return True, ratio, "pre_flight"
 
     # Take the larger of the two for visibility even when not firing.
@@ -522,12 +565,34 @@ async def maybe_compact(
 
     session_id = conversation_id
     lock = await _get_session_lock(session_id)
-    if lock.locked():
-        return CompactionResult(triggered=False, skipped_reason="lock_held_by_concurrent_compaction")
-
+    waited_for_concurrent = lock.locked()
+    state_before = None
+    if waited_for_concurrent:
+        state_before = await _load_compaction_state(
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            session_id=session_id,
+        )
+    # A concurrent compaction is work in progress, not a failure. Wait for it
+    # and inspect fresh DB state before deciding whether another summary is
+    # needed.  A changed state means the first request already did the work.
     async with lock:
+        if waited_for_concurrent:
+            state_after = await _load_compaction_state(
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                session_id=session_id,
+            )
+            marker_changed = state_after[1] != state_before[1]
+            active_rows_reduced = state_after[0] < state_before[0]
+            if marker_changed or active_rows_reduced:
+                return CompactionResult(
+                    triggered=True,
+                    required=True,
+                    skipped_reason="completed_by_concurrent_compaction",
+                )
         try:
-            return await _do_compact(
+            result = await _do_compact(
                 agent_id=agent_id,
                 session_id=session_id,
                 conversation_id=conversation_id,
@@ -536,6 +601,26 @@ async def maybe_compact(
                 trigger_ratio=ratio,
                 trigger_reason=reason,
             )
+            if (
+                waited_for_concurrent
+                and not result.triggered
+                and result.skipped_reason
+                in {
+                    "span_too_small_to_be_worth_compacting",
+                    "span_mass_too_small_to_matter",
+                }
+            ):
+                # The waiter started from an old oversized prompt.  If the
+                # first request compacted just before our initial state read,
+                # the fresh history can legitimately have no useful span.
+                # Tell the caller to reload and perform its normal size recheck.
+                return CompactionResult(
+                    triggered=True,
+                    required=True,
+                    skipped_reason="concurrent_compaction_requires_recheck",
+                )
+            result.required = True
+            return result
         except Exception as exc:
             logger.error(
                 f"[compactor] unexpected failure for session={session_id}: "
@@ -543,6 +628,7 @@ async def maybe_compact(
             )
             return CompactionResult(
                 triggered=False,
+                required=True,
                 skipped_reason=f"exception:{type(exc).__name__}",
             )
 
@@ -553,7 +639,7 @@ async def maybe_precompact_prompt(
     conversation_id: str,
     model: LLMModel,
     prompt_messages: list[dict],
-) -> bool:
+) -> CompactionResult:
     """Pre-flight compaction guard for the channel / web entry points.
 
     Estimates the about-to-be-sent prompt's token count; if it crosses the
@@ -564,21 +650,19 @@ async def maybe_precompact_prompt(
     message, accumulated tool output — would otherwise be rejected by the
     provider before compaction ever ran.)
 
-    Returns ``True`` when compaction fired, in which case the caller MUST
-    reload history before sending. Cheap no-op below the threshold: no DB
-    write and no summary LLM call (``should_compact`` short-circuits inside
-    ``maybe_compact``).
+    Returns an explicit result.  ``triggered`` means compaction was applied and
+    the caller MUST reload history before sending.  ``required`` distinguishes
+    a threshold-crossing failure from the ordinary cheap below-threshold no-op.
     """
     if not (agent_id and conversation_id and model):
-        return False
+        return CompactionResult(triggered=False, skipped_reason="missing_preflight_context")
     estimate = estimate_prompt_tokens(prompt_messages)
-    result = await maybe_compact(
+    return await maybe_compact(
         agent_id=agent_id,
         conversation_id=conversation_id,
         model=model,
         pre_flight_estimate=estimate,
     )
-    return result.triggered
 
 
 async def _do_compact(
@@ -796,6 +880,27 @@ async def _load_active_rows(
         .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
     )
     return list(result.scalars().all())
+
+
+async def _load_compaction_state(
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    session_id: str,
+) -> tuple[int, uuid.UUID | None]:
+    """Return the minimal persisted state needed to detect concurrent work."""
+    async with async_session() as db:
+        active_count = (
+            await db.execute(
+                select(func.count(ChatMessage.id)).where(
+                    ChatMessage.agent_id == agent_id,
+                    ChatMessage.conversation_id == conversation_id,
+                    ChatMessage.compacted_into.is_(None),
+                )
+            )
+        ).scalar_one()
+        _, _, marker_id = await _load_active_marker(db, session_id=session_id)
+    return int(active_count or 0), marker_id
 
 
 async def _load_active_marker(

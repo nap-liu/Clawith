@@ -15,6 +15,7 @@ from app.services.storage_runtime.base import (
     StorageBackend,
     StorageEntry,
     StorageVersion,
+    TextLineRange,
     WriteCondition,
 )
 from app.services.storage_runtime.utils import normalize_storage_key
@@ -185,6 +186,27 @@ class S3StorageBackend(StorageBackend):
         body = response["Body"]
         return await asyncio.to_thread(body.read)
 
+    async def read_text_lines(
+        self,
+        key: str,
+        *,
+        offset: int = 0,
+        limit: int = 2000,
+        encoding: str = "utf-8",
+        errors: str = "replace",
+    ) -> TextLineRange:
+        client = self._client_or_raise()
+        return await asyncio.to_thread(
+            _s3_read_text_lines,
+            client,
+            self.bucket,
+            self._object_key(key),
+            max(0, offset),
+            max(0, limit),
+            encoding,
+            errors,
+        )
+
     async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
         # GCS S3-compatible API requires an explicit Content-Type; without it
         # the V4 signature body-hash is calculated on an empty content-type,
@@ -353,6 +375,30 @@ def _strip_prefix(raw_key: str, prefix: str) -> str:
     if prefix and raw_key.startswith(prefix + "/"):
         return raw_key[len(prefix) + 1:]
     return raw_key
+
+
+def _s3_read_text_lines(
+    client,
+    bucket: str,
+    object_key: str,
+    offset: int,
+    limit: int,
+    encoding: str,
+    errors: str,
+) -> TextLineRange:
+    response = client.get_object(Bucket=bucket, Key=object_key)
+    body = response["Body"]
+    selected: list[str] = []
+    end = offset + limit
+    total_lines = 0
+    try:
+        for line_index, raw_line in enumerate(body.iter_lines()):
+            total_lines = line_index + 1
+            if offset <= line_index < end:
+                selected.append(raw_line.decode(encoding, errors=errors))
+    finally:
+        body.close()
+    return TextLineRange(lines=selected, total_lines=total_lines)
 
 
 def _is_header_parsing_error(exc: Exception) -> bool:

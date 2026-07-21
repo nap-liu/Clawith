@@ -6,13 +6,15 @@ Large tool results are written to a per-agent, per-session file under
 and can call `read_file` (or other workspace tools) to fetch the rest
 on demand.
 
-This is the single write path for tool output. DB persistence, LLM
+This is the single shaping path for tool output. DB persistence, LLM
 context replay, and the frontend all observe the same string — the
 "llm_view" produced here. Downstream code never re-shapes it, so the
 messages sequence becomes append-only (good for prompt caching).
 
 The module intentionally does only two things:
-  1. Decide inline vs. materialize for a given (tool, result).
+  1. Decide inline vs. materialize for a given (tool, result). If the
+     configured backend has no locally readable write path, keep a bounded
+     inline result instead of claiming an unreadable file was saved.
   2. Produce a deterministic llm_view string.
 
 Everything else (caching, budgets, message layout) is layered above it.
@@ -52,7 +54,11 @@ TOOL_OUTPUT_MAX_CHARS: dict[str, int | float] = {
     # modest budget makes large documents overflow to a .tool_results/ file early
     # so the agent pages through them via read_file instead of flooding context.
     "read_document": 40_000,
-    "read_file": float("inf"),
+    # read_file itself remains format-agnostic and exact-path.  Its line-based
+    # pagination cannot bound context size when a minified HTML/JSON payload is
+    # stored on one very long line, so the platform output layer must still
+    # materialize oversized results before they enter or re-enter LLM history.
+    "read_file": 60_000,
     "list_files": 100_000,
     "_default": 100_000,
 }
@@ -88,8 +94,14 @@ def _sanitize(name: str) -> str:
 
 def _store_dir(agent_id, session_id: str) -> Path:
     settings = get_settings()
+    storage_backend = (settings.STORAGE_BACKEND or "local").strip().lower()
+    if storage_backend == "s3" and not settings.STORAGE_LOCAL_FALLBACK_ENABLED:
+        # This materializer is synchronous and cannot truthfully claim that a
+        # file was saved into an async-only remote backend.  The public caller
+        # will return a bounded inline result instead of an unreadable path.
+        raise RuntimeError("tool-output materialization requires local-readable storage")
     return (
-        Path(settings.AGENT_DATA_DIR)
+        Path(settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR)
         / str(agent_id)
         / ".tool_results"
         / _sanitize(session_id or "nosession")
@@ -128,15 +140,22 @@ def _render_persisted(
     size_bytes: int,
     preview: str,
 ) -> str:
+    bounded_read_hint = (
+        "For ordinary multi-line text, use read_file with a small line range. "
+        if tool_name != "read_file"
+        else ""
+    )
     return (
         f"{PERSISTED_OPEN}\n"
         f"Output too large ({_format_size(size_bytes)}). "
         f"Full output saved to: {rel_path}\n\n"
         f"Preview (first {PREVIEW_CHARS:,} chars):\n"
         f"{preview}\n"
-        f"{'...' if size_bytes > len(preview) else ''}\n\n"
-        f"Use read_file to access full content, "
-        f"or grep/search_files to find specific content.\n"
+        f"{'...' if size_bytes > len(preview.encode('utf-8')) else ''}\n\n"
+        f"{bounded_read_hint}Use grep/search_files for targeted lookup, or execute_code_aio to "
+        f"process the referenced output or original source file directly. "
+        f"Keep code output bounded to summaries, validation results, and file paths; "
+        f"do not read the full bulk output back into chat.\n"
         f"{PERSISTED_CLOSE}"
     )
 
@@ -173,7 +192,7 @@ def _materialize_to_file(
     view = _render_persisted(
         tool_name=tool_name,
         rel_path=rel_path,
-        size_bytes=len(result),
+        size_bytes=len(result.encode("utf-8")),
         preview=preview,
     )
     logger.info(

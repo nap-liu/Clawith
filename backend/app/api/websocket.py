@@ -950,6 +950,16 @@ class WebSocketChatHandler:
             async def _call_with_failover():
                 nonlocal needs_onboarding_mark, onboarding_target_phase
 
+                from app.services.llm.session_context_guard import (
+                    CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE,
+                    get_session_context_termination,
+                    terminate_session_context,
+                )
+
+                _terminated = await get_session_context_termination(self.conv_id)
+                if _terminated:
+                    return _terminated
+
                 async def _on_failover(reason: str):
                     await self._safe_send({"type": "info", "content": f"Primary model error, {reason}"})
 
@@ -959,16 +969,41 @@ class WebSocketChatHandler:
                 # a connection (not reloaded per turn), so without this rebuild a
                 # single oversized turn would overflow before the post-round hook
                 # could help. The current user message is already persisted, so the
-                # rebuild includes it. Best-effort: failure leaves it untouched.
+                # rebuild includes it. If compaction is required but cannot be
+                # applied, this session is stopped before provider dispatch.
+                _preflight_required = False
                 try:
-                    from app.services.llm.compactor import maybe_precompact_prompt
+                    from app.services.llm.compactor import (
+                        maybe_precompact_prompt,
+                        prompt_exceeds_preflight_limit,
+                    )
 
-                    if await maybe_precompact_prompt(
+                    _preflight_required = prompt_exceeds_preflight_limit(
+                        model=effective_llm_model,
+                        prompt_messages=self.conversation[-self.ctx_size :],
+                    )
+                    _precompact = await maybe_precompact_prompt(
                         agent_id=self.agent_id,
                         conversation_id=self.conv_id,
                         model=effective_llm_model,
                         prompt_messages=self.conversation[-self.ctx_size :],
-                    ):
+                    )
+                except Exception as _compact_exc:
+                    logger.error(f"[WS] pre-flight compaction failed: {_compact_exc}")
+                    if _preflight_required:
+                        return await terminate_session_context(
+                            self.conv_id,
+                            f"preflight_compaction_exception:{type(_compact_exc).__name__}",
+                        )
+                    return CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
+
+                if _precompact.required and not _precompact.triggered:
+                    return await terminate_session_context(
+                        self.conv_id,
+                        f"preflight_compaction_failed:{_precompact.skipped_reason}",
+                    )
+                if _precompact.triggered:
+                    try:
                         from app.services.chat_history import (
                             build_llm_messages_from_rows,
                             load_messages_for_session,
@@ -983,8 +1018,20 @@ class WebSocketChatHandler:
                         # build, so vision context survives a compaction rebuild.
                         self.conversation = build_llm_messages_from_rows(_pf_rows, include_thinking=True)
                         self.conversation = rehydrate_image_messages(self.conversation, self.agent_id, max_images=3)
-                except Exception as _pf_exc:
-                    logger.warning(f"[WS] pre-flight compaction skipped (non-fatal): {_pf_exc}")
+                        if prompt_exceeds_preflight_limit(
+                            model=effective_llm_model,
+                            prompt_messages=self.conversation[-self.ctx_size :],
+                        ):
+                            return await terminate_session_context(
+                                self.conv_id,
+                                "preflight_compaction_still_oversized",
+                            )
+                    except Exception as _reload_exc:
+                        # Compaction already committed successfully.  A
+                        # transient history/image reload failure must not mark
+                        # the session permanently unusable.
+                        logger.error(f"[WS] post-compaction history reload failed: {_reload_exc}")
+                        return CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
 
                 # Drop orphan tool messages left if the ctx_size slice cut a
                 # tool-call pair (shared guard with the IM history path).

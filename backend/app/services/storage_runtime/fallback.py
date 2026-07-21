@@ -9,6 +9,7 @@ from app.services.storage_runtime.base import (
     StorageBackend,
     StorageEntry,
     StorageVersion,
+    TextLineRange,
     WriteCondition,
 )
 
@@ -48,6 +49,33 @@ class FallbackStorageBackend(StorageBackend):
         data = await self.fallback.read_bytes(key)
         await self.primary.write_bytes(key, data)
         return data
+
+    async def read_text_lines(
+        self,
+        key: str,
+        *,
+        offset: int = 0,
+        limit: int = 2000,
+        encoding: str = "utf-8",
+        errors: str = "replace",
+    ) -> TextLineRange:
+        if await self.primary.exists(key) and await self.primary.is_file(key):
+            return await self.primary.read_text_lines(
+                key,
+                offset=offset,
+                limit=limit,
+                encoding=encoding,
+                errors=errors,
+            )
+        data = await self.fallback.read_bytes(key)
+        await self.primary.write_bytes(key, data)
+        return await self.primary.read_text_lines(
+            key,
+            offset=offset,
+            limit=limit,
+            encoding=encoding,
+            errors=errors,
+        )
 
     async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
         await self.primary.write_bytes(key, data, content_type=content_type)

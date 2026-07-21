@@ -102,11 +102,11 @@ async def _pick_existing_agent_id() -> uuid.UUID:
         return agent_id
 
 
-async def _pick_existing_user_id() -> uuid.UUID:
-    """Same idea for chat_messages.user_id."""
+async def _pick_existing_user_id(agent_id: uuid.UUID) -> uuid.UUID:
+    """Use the selected agent's creator so tenant-edge triggers remain valid."""
     from sqlalchemy import select as _sa_select
     async with async_session() as db:
-        r = await db.execute(_sa_select(User.id).limit(1))
+        r = await db.execute(_sa_select(Agent.creator_id).where(Agent.id == agent_id))
         user_id = r.scalar_one_or_none()
         if user_id is None:
             pytest.skip("No users in DB; cannot run compaction integration tests")
@@ -123,7 +123,7 @@ async def _setup(rows_spec, marker_spec=None):
         passed (bool, default True), superseded_by (None or another marker_spec)
     """
     agent_id = await _pick_existing_agent_id()
-    user_id = await _pick_existing_user_id()
+    user_id = await _pick_existing_user_id(agent_id)
     conv_id = f"compaction-test-{uuid.uuid4().hex[:8]}"
 
     async with async_session() as db:
@@ -279,7 +279,7 @@ async def test_superseded_marker_is_ignored_only_active_used():
         ("assistant", "recent a", 100),
     ]
     agent_id = await _pick_existing_agent_id()
-    user_id = await _pick_existing_user_id()
+    user_id = await _pick_existing_user_id(agent_id)
     conv_id = f"compaction-test-{uuid.uuid4().hex[:8]}"
 
     try:
@@ -419,13 +419,14 @@ async def test_precompact_noop_below_threshold():
 
     conv_id, agent_id, _, _ = await _setup([("user", "hi", 100), ("assistant", "hello", 50)])
     try:
-        triggered = await maybe_precompact_prompt(
+        result = await maybe_precompact_prompt(
             agent_id=agent_id,
             conversation_id=conv_id,
             model=_precompact_model(context_window=131072),
             prompt_messages=[{"role": "user", "content": "short"}],
         )
-        assert triggered is False
+        assert result.triggered is False
+        assert result.required is False
         assert await _markers_for(conv_id) == []
     finally:
         await _cleanup(conv_id)
@@ -439,26 +440,83 @@ async def test_precompact_noop_when_history_too_small():
 
     conv_id, agent_id, _, _ = await _setup([("user", "hi", 100), ("assistant", "hello", 50)])
     try:
-        triggered = await maybe_precompact_prompt(
+        result = await maybe_precompact_prompt(
             agent_id=agent_id,
             conversation_id=conv_id,
             model=_precompact_model(context_window=100),  # tiny window → estimate >> 95%
             prompt_messages=[{"role": "user", "content": "x" * 4000}],
         )
-        assert triggered is False  # select_compaction_span returns None (too few rows)
+        assert result.triggered is False  # select_compaction_span returns None (too few rows)
+        assert result.required is True
+        assert result.skipped_reason == "span_too_small_to_be_worth_compacting"
         assert await _markers_for(conv_id) == []
     finally:
         await _cleanup(conv_id)
 
 
 async def test_precompact_noop_without_conversation_id():
-    """No conversation_id → pre-flight is a no-op (returns False, never raises)."""
+    """No conversation_id → pre-flight returns an explicit no-op result."""
     from app.services.llm.compactor import maybe_precompact_prompt
 
-    triggered = await maybe_precompact_prompt(
+    result = await maybe_precompact_prompt(
         agent_id=uuid.uuid4(),
         conversation_id="",
         model=_precompact_model(context_window=100),
         prompt_messages=[{"role": "user", "content": "x" * 4000}],
     )
-    assert triggered is False
+    assert result.triggered is False
+    assert result.required is False
+
+
+async def test_concurrent_compaction_rechecks_persisted_state_after_lock(monkeypatch):
+    """A waiter reloads when the lock holder already changed compaction state."""
+    from unittest.mock import AsyncMock
+
+    import app.services.llm.compactor as compactor
+
+    class _HeldLock:
+        def locked(self):
+            return True
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    marker_id = uuid.uuid4()
+    monkeypatch.setattr(compactor, "_get_session_lock", AsyncMock(return_value=_HeldLock()))
+    monkeypatch.setattr(
+        compactor,
+        "_load_compaction_state",
+        AsyncMock(side_effect=[(12, None), (5, marker_id)]),
+    )
+    do_compact = AsyncMock()
+    monkeypatch.setattr(compactor, "_do_compact", do_compact)
+
+    result = await compactor.maybe_compact(
+        agent_id=uuid.uuid4(),
+        conversation_id=str(uuid.uuid4()),
+        model=_precompact_model(context_window=100),
+        pre_flight_estimate=500,
+    )
+
+    assert result.triggered is True
+    assert result.required is True
+    assert result.skipped_reason == "completed_by_concurrent_compaction"
+    do_compact.assert_not_awaited()
+
+
+async def test_preflight_threshold_reserves_configured_output_tokens():
+    """Preflight must fire before the final dispatch guard's input ceiling."""
+    from app.services.llm.compactor import prompt_exceeds_preflight_limit
+
+    model = _precompact_model(context_window=1_000)
+    model.provider = "custom"
+    model.model = "test"
+    model.max_output_tokens = 250
+
+    assert prompt_exceeds_preflight_limit(
+        model=model,
+        prompt_messages=[{"role": "user", "content": "数" * 1_800}],
+    )

@@ -83,3 +83,36 @@ async def test_s3_require_absent_uses_atomic_put_precondition(monkeypatch):
         "ContentType": "text/markdown",
         "IfNoneMatch": "*",
     }]
+
+
+@pytest.mark.asyncio
+async def test_s3_read_text_lines_streams_and_closes_body(monkeypatch):
+    class FakeBody:
+        def __init__(self):
+            self.closed = False
+
+        def iter_lines(self):
+            yield from [b"zero", b"one", "二".encode(), b"three"]
+
+        def close(self):
+            self.closed = True
+
+    body = FakeBody()
+    client = Mock()
+    client.get_object.return_value = {"Body": body}
+    backend = S3StorageBackend(bucket="bucket", prefix="agents")
+    monkeypatch.setattr(backend, "_client_or_raise", lambda: client)
+
+    result = await backend.read_text_lines(
+        "a/report.txt",
+        offset=1,
+        limit=2,
+    )
+
+    assert result.lines == ["one", "二"]
+    assert result.total_lines == 4
+    assert body.closed is True
+    client.get_object.assert_called_once_with(
+        Bucket="bucket",
+        Key="agents/a/report.txt",
+    )

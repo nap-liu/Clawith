@@ -59,6 +59,22 @@ async def test_fallback_storage_backfills_primary_on_read():
     assert primary.files["agent-id/focus.md"] == fallback.files["agent-id/focus.md"]
 
 
+async def test_fallback_line_range_preserves_read_through_backfill():
+    primary = MemoryStorageBackend()
+    fallback = MemoryStorageBackend({"agent-id/data.txt": b"zero\none\ntwo\nthree\n"})
+    storage = FallbackStorageBackend(primary=primary, fallback=fallback)
+
+    result = await storage.read_text_lines(
+        "agent-id/data.txt",
+        offset=1,
+        limit=2,
+    )
+
+    assert result.lines == ["one", "two"]
+    assert result.total_lines == 4
+    assert primary.files["agent-id/data.txt"] == fallback.files["agent-id/data.txt"]
+
+
 async def test_fallback_storage_writes_only_to_primary():
     primary = MemoryStorageBackend()
     fallback = MemoryStorageBackend()

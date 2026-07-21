@@ -14,7 +14,6 @@ Covers the contract that downstream code relies on:
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from pathlib import Path
 
@@ -31,6 +30,8 @@ def agent_id() -> str:
 @pytest.fixture
 def tmp_workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    monkeypatch.setenv("STORAGE_LOCAL_ROOT", str(tmp_path))
     # Invalidate cached settings so AGENT_DATA_DIR is re-read
     from app.config import get_settings
 
@@ -106,11 +107,17 @@ def test_per_tool_budget_beats_default(tmp_workspace, agent_id):
     assert view_default == s
 
 
-def test_read_file_is_infinite(tmp_workspace, agent_id):
-    # read_file must never be materialized — it has its own pagination.
+def test_read_file_large_single_line_is_materialized(tmp_workspace, agent_id):
+    # Line pagination does not protect a minified HTML/JSON file whose payload
+    # lives on one huge line. The platform output layer must keep that body out
+    # of LLM history while preserving every byte on disk.
     huge = "z" * 5_000_000
     view = _finalize(huge, tool_name="read_file", agent_id=agent_id, tool_call_id="c")
-    assert view == huge
+    assert tos.PERSISTED_OPEN in view
+    assert len(view) < len(huge)
+    written = tmp_workspace / agent_id / ".tool_results" / "sess1" / "read_file_c.txt"
+    assert written.read_text() == huge
+    assert "execute_code_aio" in view
 
 
 def test_env_override_changes_default(tmp_workspace, agent_id, monkeypatch):
@@ -152,6 +159,44 @@ def test_materialize_failure_falls_back_to_inline_shape(tmp_workspace, agent_id,
     assert "truncated" in view
 
 
+def test_materialization_uses_configured_local_storage_root(tmp_workspace, tmp_path, agent_id, monkeypatch):
+    storage_root = tmp_path / "configured-storage"
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    monkeypatch.setenv("STORAGE_LOCAL_ROOT", str(storage_root))
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        big = "r" * 60_000
+        view = _finalize(big, tool_name="grep", agent_id=agent_id, tool_call_id="root")
+    finally:
+        get_settings.cache_clear()
+
+    assert tos.PERSISTED_OPEN in view
+    written = storage_root / agent_id / ".tool_results" / "sess1" / "grep_root.txt"
+    assert written.read_text() == big
+
+
+def test_pure_s3_materialization_never_claims_an_unreadable_saved_path(
+    tmp_workspace,
+    agent_id,
+    monkeypatch,
+):
+    monkeypatch.setenv("STORAGE_BACKEND", "s3")
+    monkeypatch.setenv("STORAGE_LOCAL_FALLBACK_ENABLED", "false")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    try:
+        view = _finalize("s" * 60_000, tool_name="grep", agent_id=agent_id, tool_call_id="s3")
+    finally:
+        get_settings.cache_clear()
+
+    assert tos.PERSISTED_OPEN not in view
+    assert "Full output saved to" not in view
+    assert "truncated" in view
+
+
 def test_filename_sanitizes_unsafe_tool_call_id(tmp_workspace, agent_id):
     # tool_call_id is LLM-generated and may contain slashes etc.
     big = "c" * 60_000
@@ -178,3 +223,4 @@ def test_budget_for_unknown_tool_uses_default():
 def test_budget_for_known_tool_uses_registry():
     assert tos.budget_for("grep") == 40_000
     assert tos.budget_for("execute_code") == 60_000
+    assert tos.budget_for("read_file") == 60_000

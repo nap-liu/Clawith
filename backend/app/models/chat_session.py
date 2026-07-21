@@ -80,6 +80,11 @@ class ChatSession(Base):
         default=dict,
         server_default=text("'{}'"),
     )
+    # Non-null means the conversation can no longer be sent to an LLM because
+    # its context exceeded the configured/provider limit and compaction could
+    # not recover it.  Users must start a new session; keeping this state on the
+    # session prevents every later message from repeating the same failed call.
+    context_terminated_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

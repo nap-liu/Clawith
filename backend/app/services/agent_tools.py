@@ -272,7 +272,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the requested workspace file as UTF-8 text. The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. This tool accepts any file type but does not parse document formats; binary content may be unreadable as text. Can read soul.md for personality, memory/memory.md for memory, skills/ for skill files, and enterprise_info/ for shared company info. Focus is not stored in files; use list_focus_items and upsert_focus_item for Focus. Use offset and limit for reading large files in chunks.",
+            "description": "Read the requested workspace file as UTF-8 text. The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. This tool accepts any file type but does not parse document formats; binary content may be unreadable as text. Can read soul.md for personality, memory/memory.md for memory, skills/ for skill files, and enterprise_info/ for shared company info. Focus is not stored in files; use list_focus_items and upsert_focus_item for Focus. Use offset and limit for ordinary text pagination, but note that line limits do not bound characters when HTML, JSON, or generated data is stored on one long line. For large or data-heavy files, use execute_code_aio to inspect and process the original path directly, write the result to a file, and print only a bounded summary, validation result, and output path.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -5607,15 +5607,19 @@ async def _storage_read_file(
     if not resolved.exists:
         return _exact_storage_source_error(resolved)
     try:
-        content = await storage.read_text(resolved.storage_key, encoding="utf-8", errors="replace")
-        lines = content.splitlines()
-        total_lines = len(lines)
         start = max(0, offset)
-        end = min(total_lines, start + limit)
+        line_range = await storage.read_text_lines(
+            resolved.storage_key,
+            offset=start,
+            limit=max(0, limit),
+            encoding="utf-8",
+            errors="replace",
+        )
+        total_lines = line_range.total_lines
+        end = min(total_lines, start + max(0, limit))
         if start >= total_lines and total_lines > 0:
             return f"Offset {offset} exceeds file length ({total_lines} lines total)"
-        selected_lines = lines[start:end]
-        output = "\n".join(f"{i + 1:6}\t{line}" for i, line in enumerate(selected_lines, start=start))
+        output = "\n".join(f"{i + 1:6}\t{line}" for i, line in enumerate(line_range.lines, start=start))
         if total_lines > end:
             output += f"\n\n... [{total_lines - end} more lines not shown, lines {end + 1}-{total_lines}]"
         header = (

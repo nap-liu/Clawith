@@ -20,6 +20,14 @@ class StorageEntry:
 
 
 @dataclass
+class TextLineRange:
+    """Selected text lines plus the file's total line count."""
+
+    lines: list[str]
+    total_lines: int
+
+
+@dataclass
 class StorageVersion:
     key: str
     exists: bool
@@ -67,6 +75,26 @@ class StorageBackend:
     async def read_text(self, key: str, encoding: str = "utf-8", errors: str = "replace") -> str:
         raw = await self.read_bytes(key)
         return raw.decode(encoding, errors=errors)
+
+    async def read_text_lines(
+        self,
+        key: str,
+        *,
+        offset: int = 0,
+        limit: int = 2000,
+        encoding: str = "utf-8",
+        errors: str = "replace",
+    ) -> TextLineRange:
+        """Read a line range.
+
+        Backends may override this with a streaming implementation. The base
+        fallback preserves compatibility for lightweight/custom backends.
+        """
+        content = await self.read_text(key, encoding=encoding, errors=errors)
+        lines = content.splitlines()
+        start = max(0, offset)
+        end = min(len(lines), start + max(0, limit))
+        return TextLineRange(lines=lines[start:end], total_lines=len(lines))
 
     async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
         raise NotImplementedError

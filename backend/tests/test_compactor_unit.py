@@ -18,7 +18,6 @@ from types import SimpleNamespace
 import pytest
 
 from app.services.llm.compactor import (
-    ESTIMATE_CHARS_PER_TOKEN,
     PRE_FLIGHT_TRIGGER_RATIO,
     UUID_RECALL_THRESHOLD,
     estimate_prompt_tokens,
@@ -32,6 +31,9 @@ from app.services.llm.compactor import (
 def _model(context_window=131072, ratio=0.85, keep=8, summary_max=2000):
     """A SimpleNamespace duck-typing the LLMModel surface compactor reads."""
     return SimpleNamespace(
+        provider="custom",
+        model="test-model",
+        max_output_tokens=1,
         context_window=context_window,
         compact_trigger_ratio=ratio,
         keep_recent_turns=keep,
@@ -310,8 +312,7 @@ class TestEstimatePromptTokens:
             {"role": "system", "content": "x" * 100},
             {"role": "user", "content": "y" * 250},
         ]
-        # 350 chars / 2.5 = 140 tokens
-        assert estimate_prompt_tokens(msgs) == int(350 / ESTIMATE_CHARS_PER_TOKEN)
+        assert estimate_prompt_tokens(msgs) == 117
 
     def test_list_content_with_text_blocks(self):
         msgs = [
@@ -320,7 +321,7 @@ class TestEstimatePromptTokens:
                 {"type": "text", "text": "b" * 50},
             ]}
         ]
-        assert estimate_prompt_tokens(msgs) == int(100 / ESTIMATE_CHARS_PER_TOKEN)
+        assert estimate_prompt_tokens(msgs) == 34
 
     def test_image_blocks_get_fixed_cost(self):
         msgs = [
@@ -328,8 +329,8 @@ class TestEstimatePromptTokens:
                 {"type": "image", "source": {"type": "base64", "data": "..."}},
             ]}
         ]
-        # 1024 chars per image
-        assert estimate_prompt_tokens(msgs) == int(1024 / ESTIMATE_CHARS_PER_TOKEN)
+        # 1024 placeholder chars per image, estimated at three ASCII chars/token.
+        assert estimate_prompt_tokens(msgs) == 342
 
     def test_tool_call_arguments_counted(self):
         msgs = [
@@ -341,5 +342,8 @@ class TestEstimatePromptTokens:
                 ],
             }
         ]
-        # 107 chars (the JSON string) / 2.5 = 42
-        assert estimate_prompt_tokens(msgs) >= 40
+        assert estimate_prompt_tokens(msgs) >= 35
+
+    def test_cjk_characters_are_counted_conservatively(self):
+        msgs = [{"role": "user", "content": "数" * 901}]
+        assert estimate_prompt_tokens(msgs) == 901
