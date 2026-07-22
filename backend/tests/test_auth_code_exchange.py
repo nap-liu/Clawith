@@ -1,6 +1,7 @@
 """Tests for platform-login OAuth code exchange used by H5 chat."""
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -8,11 +9,14 @@ from sqlalchemy import delete, select
 
 from app.database import async_session, engine
 from app.main import app
-from app.models.identity import IdentityProvider
+from app.models.audit import AuditLog
+from app.models.identity import IdentityProvider, SSOScanSession
+from app.models.org import ChannelUserBinding, OrgMember
 from app.models.tenant import Tenant
-from app.models.user import User
+from app.models.user import Identity, User
 from app.services.auth_provider import OAuth2AuthProvider
 from app.services.auth_registry import auth_provider_registry
+from app.services.oauth_identity import oauth_authority_scope, sign_oauth2_sso_state
 
 pytestmark = pytest.mark.asyncio
 
@@ -106,31 +110,41 @@ async def test_oauth2_token_exchange_can_omit_redirect_uri(monkeypatch):
 
 async def test_h5_and_regular_sso_share_code_only_token_exchange(monkeypatch):
     async with async_session() as db:
-        db.add(
-            IdentityProvider(
-                provider_type="oauth2",
-                name="H5 OAuth",
-                is_active=True,
-                sso_login_enabled=True,
-                config={
-                    "provider_key": "oauth-h5",
-                    "app_id": "h5-client",
-                    "app_secret": "h5-secret",
-                    "token_url": "https://oauth.example.com/token",
-                    "user_info_url": "https://oauth.example.com/userinfo",
-                    "field_mapping": {
-                        "user_id": "userId",
-                        "name": "userName",
-                        "email": "email",
-                        "mobile": "mobile",
-                    },
-                    "allowed_purposes": ["h5_agent_chat"],
-                    "allowed_redirect_hosts": ["app.example.com"],
-                    "allowed_redirect_paths": ["/h5/agents/*/chat"],
+        tenant = Tenant(name="H5 OAuth Tenant", slug=f"h5-oauth-{uuid.uuid4().hex[:10]}")
+        db.add(tenant)
+        await db.flush()
+        provider = IdentityProvider(
+            provider_type="oauth2",
+            name="H5 OAuth",
+            is_active=True,
+            sso_login_enabled=True,
+            tenant_id=tenant.id,
+            config={
+                "provider_key": "oauth-h5",
+                "app_id": "h5-client",
+                "app_secret": "h5-secret",
+                "token_url": "https://oauth.example.com/token",
+                "user_info_url": "https://oauth.example.com/userinfo",
+                "field_mapping": {
+                    "user_id": "userId",
+                    "name": "userName",
+                    "email": "email",
+                    "mobile": "mobile",
                 },
-            )
+                "allowed_purposes": ["h5_agent_chat"],
+                "allowed_redirect_hosts": ["app.example.com"],
+                "allowed_redirect_paths": ["/h5/agents/*/chat"],
+            },
         )
+        scan_session = SSOScanSession(
+            status="pending",
+            tenant_id=tenant.id,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+        db.add_all([provider, scan_session])
         await db.commit()
+        tenant_id = tenant.id
+        sso_state = sign_oauth2_sso_state(scan_session.id, provider.id)
 
     captured_token_forms: list[dict[str, str]] = []
 
@@ -178,7 +192,7 @@ async def test_h5_and_regular_sso_share_code_only_token_exchange(monkeypatch):
         )
         sso_resp = await client.get(
             "/api/auth/oauth2/callback",
-            params={"code": "CODE-SSO"},
+            params={"code": "CODE-SSO", "state": sso_state},
         )
 
     assert resp.status_code == 200, resp.text
@@ -186,9 +200,9 @@ async def test_h5_and_regular_sso_share_code_only_token_exchange(monkeypatch):
     assert body["access_token"]
     assert body["token_type"] == "bearer"
     assert body["user"]["display_name"] == "H5 User"
-    assert body["needs_company_setup"] is True
+    assert body["needs_company_setup"] is False
     assert sso_resp.status_code == 200
-    assert "Logged in successfully" in sso_resp.text
+    assert "SSO login successful" in sso_resp.text
     assert captured_token_forms == [
         {"grant_type": "authorization_code", "code": "CODE-H5"},
         {"grant_type": "authorization_code", "code": "CODE-SSO"},
@@ -197,10 +211,141 @@ async def test_h5_and_regular_sso_share_code_only_token_exchange(monkeypatch):
     async with async_session() as db:
         user = (
             await db.execute(
-                select(User).join(User.identity).where(User.display_name == "H5 User")
+                select(User)
+                .join(User.identity)
+                .where(User.tenant_id == tenant_id, User.display_name == "H5 User")
             )
         ).scalar_one()
         assert user.registration_source == "oauth2"
+
+
+async def test_qr_oauth_failure_rolls_back_authoritative_email_and_audit(monkeypatch):
+    suffix = uuid.uuid4().hex[:10]
+    old_email = f"qr-old-{suffix}@example.com"
+    new_email = f"qr-new-{suffix}@example.com"
+    subject = f"qr-subject-{suffix}"
+    async with async_session() as db:
+        tenant = Tenant(name="QR Rollback", slug=f"qr-rollback-{suffix}")
+        db.add(tenant)
+        await db.flush()
+        provider = IdentityProvider(
+            provider_type="oauth2",
+            name="QR OAuth",
+            is_active=True,
+            sso_login_enabled=True,
+            tenant_id=tenant.id,
+            config={
+                "app_id": "qr-client",
+                "app_secret": "qr-secret",
+                "token_url": "https://qr.example.com/token",
+                "user_info_url": "https://qr.example.com/userinfo",
+                "field_mapping": {
+                    "user_id": "userId",
+                    "name": "userName",
+                    "email": "email",
+                    "mobile": "mobile",
+                },
+            },
+        )
+        identity = Identity(
+            username=f"qr-user-{suffix}",
+            email=old_email,
+            phone=f"138{uuid.uuid4().int % 10**8:08d}",
+            email_verified=True,
+        )
+        conflicting_identity = Identity(
+            username=f"qr-conflict-{suffix}",
+            email=f"qr-conflict-{suffix}@example.com",
+            phone=f"139{uuid.uuid4().int % 10**8:08d}",
+            email_verified=True,
+        )
+        db.add_all([provider, identity, conflicting_identity])
+        await db.flush()
+        user = User(
+            identity_id=identity.id,
+            tenant_id=tenant.id,
+            display_name="QR User",
+            role="member",
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        member = OrgMember(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            external_id=subject,
+            name="QR User",
+            email=old_email,
+            phone=identity.phone,
+            user_id=user.id,
+            status="active",
+        )
+        binding = ChannelUserBinding(
+            tenant_id=tenant.id,
+            provider_id=provider.id,
+            installation_scope=oauth_authority_scope(provider),
+            channel_type="oauth2",
+            id_type="subject",
+            subject=subject,
+            user_id=user.id,
+        )
+        scan_session = SSOScanSession(
+            status="pending",
+            tenant_id=tenant.id,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+        db.add_all([member, binding, scan_session])
+        await db.commit()
+        identity_id = identity.id
+        user_id = user.id
+        member_id = member.id
+        scan_session_id = scan_session.id
+        state = sign_oauth2_sso_state(scan_session.id, provider.id)
+        conflicting_phone = conflicting_identity.phone
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://qr.example.com/token":
+            return httpx.Response(200, json={"access_token": "AT-QR"})
+        if str(request.url) == "https://qr.example.com/userinfo":
+            return httpx.Response(
+                200,
+                json={
+                    "userId": subject,
+                    "userName": "QR User",
+                    "email": new_email,
+                    "mobile": conflicting_phone,
+                },
+            )
+        return httpx.Response(404)
+
+    class _PatchedAsyncClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr("app.services.auth_provider.httpx.AsyncClient", _PatchedAsyncClient)
+    transport = httpx.ASGITransport(app=app)
+    async with real_async_client(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api/auth/oauth2/callback",
+            params={"code": "CODE-QR", "state": state},
+        )
+
+    assert response.status_code == 200
+    assert "Auth failed" in response.text
+    async with async_session() as db:
+        assert (await db.get(Identity, identity_id)).email == old_email
+        assert (await db.get(OrgMember, member_id)).email == old_email
+        assert (await db.get(SSOScanSession, scan_session_id)).status == "pending"
+        audits = (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.user_id == user_id,
+                    AuditLog.action == "oauth_identity_email_refreshed",
+                )
+            )
+        ).scalars().all()
+        assert audits == []
 
 
 async def test_auth_code_exchange_returns_safe_provider_rejection(monkeypatch):

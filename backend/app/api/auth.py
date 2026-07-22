@@ -928,6 +928,7 @@ _OAUTH_PENDING_TTL = 600  # 10 minutes
 async def _cache_oauth_pending(
     pending_token: str,
     provider_type: str,
+    provider_id: uuid.UUID,
     user_info_dict: dict,
     token_data: dict,
 ) -> None:
@@ -937,6 +938,7 @@ async def _cache_oauth_pending(
     r = await get_redis()
     payload = json.dumps({
         "provider_type": provider_type,
+        "provider_id": str(provider_id),
         "user_info": user_info_dict,
         "token_data": token_data,
     })
@@ -1061,12 +1063,30 @@ async def oauth_callback(
                 detail="OAuth session expired or invalid. Please sign in again.",
             )
 
-        auth_provider = await auth_provider_registry.get_provider(db, pending["provider_type"])
-        if not auth_provider:
+        from app.models.identity import IdentityProvider
+        from app.services.auth_provider import PROVIDER_CLASSES
+
+        try:
+            pending_provider_id = _uuid.UUID(pending["provider_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="OAuth session has no exact provider") from exc
+        provider_model = await db.get(IdentityProvider, pending_provider_id)
+        provider_class = PROVIDER_CLASSES.get(pending["provider_type"])
+        if (
+            provider_model is None
+            or provider_class is None
+            or str(provider_model.provider_type) != pending["provider_type"]
+            or not provider_model.is_active
+            or (
+                provider_model.tenant_id is not None
+                and str(provider_model.tenant_id) != str(data.tenant_id)
+            )
+        ):
             raise HTTPException(
                 status_code=404,
                 detail=f"Provider '{pending['provider_type']}' not supported",
             )
+        auth_provider = provider_class(provider=provider_model)
 
         from app.services.auth_provider import ExternalUserInfo
         user_info = ExternalUserInfo(**pending["user_info"])
@@ -1126,6 +1146,7 @@ async def oauth_callback(
             await _cache_oauth_pending(
                 pending_token,
                 provider,
+                auth_provider.provider.id,
                 {
                     "provider_type": user_info.provider_type,
                     "provider_union_id": user_info.provider_union_id,
