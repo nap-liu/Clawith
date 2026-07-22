@@ -1,7 +1,7 @@
 """Add the neutral mini-program primary-session index.
 
 Revision ID: miniprogram_primary_session
-Revises: session_context_termination
+Revises: oauth_subject_bindings
 Create Date: 2026-07-22
 """
 
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision: str = "miniprogram_primary_session"
-down_revision: Union[str, Sequence[str], None] = "session_context_termination"
+down_revision: Union[str, Sequence[str], None] = "oauth_subject_bindings"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

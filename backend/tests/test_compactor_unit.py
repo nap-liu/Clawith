@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -26,7 +27,9 @@ from app.services.llm.compactor import (
     select_compaction_span,
     should_compact,
     validate_summary,
+    _summarize_via_llm,
 )
+from app.services.llm.caller import measure_dispatch
 
 
 def _model(context_window=131072, ratio=0.85, keep=8, summary_max=2000):
@@ -39,6 +42,7 @@ def _model(context_window=131072, ratio=0.85, keep=8, summary_max=2000):
         compact_trigger_ratio=ratio,
         keep_recent_turns=keep,
         compact_summary_max_tokens=summary_max,
+        base_url=None,
     )
 
 
@@ -140,16 +144,16 @@ class TestSelectCompactionSpan:
         assert rows[to_idx].role == "assistant"
 
     def test_span_end_snaps_to_assistant_boundary(self):
-        # Insert tool_call rows that should NOT end the span
+        # A tool-heavy turn ends at its final assistant, never at tool_call.
         rows = []
         for _ in range(10):
             rows.append(_Row(role="user"))
+            rows.append(_Row(role="tool_call"))
             rows.append(_Row(role="assistant"))
-            rows.append(_Row(role="tool_call"))  # tool happens between assistant's reply
         span = select_compaction_span(rows, keep_recent_turns=3)
         assert span is not None
         _, to_idx = span
-        # End MUST be assistant, not tool_call
+        # End MUST be the final assistant, not tool_call.
         assert rows[to_idx].role == "assistant"
 
     def test_refuses_too_short_span(self):
@@ -402,3 +406,51 @@ class TestEstimatePromptTokens:
     def test_cjk_characters_are_counted_conservatively(self):
         msgs = [{"role": "user", "content": "数" * 901}]
         assert estimate_prompt_tokens(msgs) == 901
+
+
+@pytest.mark.asyncio
+async def test_summary_provider_request_is_bounded_before_dispatch(monkeypatch):
+    captured = {}
+
+    class _Client:
+        async def complete(self, messages, **_kwargs):
+            captured["messages"] = messages
+            return SimpleNamespace(content="summary", usage={"completion_tokens": 1})
+
+    monkeypatch.setattr("app.services.llm.create_llm_client", lambda **_kwargs: _Client())
+    monkeypatch.setattr("app.services.llm.get_model_api_key", lambda _model: "key")
+    model = _model(context_window=8_000, summary_max=500)
+
+    await _summarize_via_llm(
+        span_text="历史" * 50_000,
+        prior_summary=None,
+        model=model,
+    )
+
+    assert measure_dispatch(
+        model=model,
+        messages=captured["messages"],
+        tools=None,
+        max_output_tokens=model.compact_summary_max_tokens,
+    ).fits
+
+
+@pytest.mark.asyncio
+async def test_provider_hard_limit_forces_compaction_below_token_ratio(monkeypatch):
+    from app.services.llm import compactor
+
+    applied = compactor.CompactionResult(triggered=True)
+    do_compact = AsyncMock(return_value=applied)
+    monkeypatch.setattr(compactor, "_do_compact", do_compact)
+
+    result = await compactor.maybe_compact(
+        agent_id=uuid.uuid4(),
+        conversation_id="qwen-char-limit",
+        model=_model(context_window=500_000),
+        pre_flight_estimate=300_000,
+        force_required=True,
+    )
+
+    assert result.triggered is True
+    assert result.required is True
+    assert do_compact.await_args.kwargs["trigger_reason"] == "provider_hard_limit"

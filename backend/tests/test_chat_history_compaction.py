@@ -15,7 +15,7 @@ import pytest
 # Import the full model graph so FK references resolve at table-mapping time.
 # SQLAlchemy needs this when an FK column points at a parent model that
 # this test file doesn't otherwise touch (e.g. ChatMessage.user_id → users.id).
-from app.models.user import User  # noqa: F401
+from app.models.user import Identity, User  # noqa: F401
 from app.models.agent import Agent, AgentPermission, AgentTemplate  # noqa: F401
 from app.models.tenant import Tenant  # noqa: F401
 from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
@@ -27,6 +27,7 @@ from app.services.chat_history import (
     _SyntheticSummaryMessage,
     load_history_for_llm,
     load_messages_for_session,
+    load_recoverable_messages_for_turn,
 )
 from app.services.llm.compactor import select_compaction_span
 
@@ -35,23 +36,17 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_compaction_span_preserves_recent_turns_by_message_boundary():
-    """Auto-compaction relies on user/assistant message boundaries, not explicit turn markers."""
-    rows = [
-        SimpleNamespace(role="user"),
-        SimpleNamespace(role="assistant"),
-        SimpleNamespace(role="user"),
-        SimpleNamespace(role="assistant"),
-        SimpleNamespace(role="user"),
-        SimpleNamespace(role="assistant"),
-        SimpleNamespace(role="user"),
-        SimpleNamespace(role="tool_call"),
-        SimpleNamespace(role="user"),
-        SimpleNamespace(role="assistant"),
-        SimpleNamespace(role="user"),
-        SimpleNamespace(role="assistant"),
-    ]
+    """The hard floor keeps eight full turns even when config asks for one."""
+    rows = []
+    for _ in range(9):
+        rows.extend(
+            [
+                SimpleNamespace(role="user"),
+                SimpleNamespace(role="assistant"),
+            ]
+        )
 
-    assert select_compaction_span(rows, keep_recent_turns=1) == (0, 9)
+    assert select_compaction_span(rows, keep_recent_turns=1) == (0, 1)
 
 
 @pytest.fixture(autouse=True)
@@ -98,7 +93,36 @@ async def _pick_existing_agent_id() -> uuid.UUID:
         r = await db.execute(_sa_select(Agent.id).limit(1))
         agent_id = r.scalar_one_or_none()
         if agent_id is None:
-            pytest.skip("No agents in DB; cannot run compaction integration tests")
+            tenant = Tenant(
+                name="Compaction Test",
+                slug=f"compaction-{uuid.uuid4().hex[:10]}",
+            )
+            db.add(tenant)
+            await db.flush()
+            identity = Identity(
+                username=f"compaction_{uuid.uuid4().hex[:10]}",
+                email=f"{uuid.uuid4().hex[:10]}@test.local",
+                password_hash="x",
+            )
+            db.add(identity)
+            await db.flush()
+            user = User(
+                identity_id=identity.id,
+                display_name="Compaction User",
+                role="member",
+                is_active=True,
+                tenant_id=tenant.id,
+            )
+            db.add(user)
+            await db.flush()
+            agent = Agent(
+                name="Compaction Agent",
+                creator_id=user.id,
+                tenant_id=tenant.id,
+            )
+            db.add(agent)
+            await db.commit()
+            agent_id = agent.id
         return agent_id
 
 
@@ -194,6 +218,79 @@ async def test_no_compaction_returns_active_rows_in_order():
             )
         assert [r.id for r in rows] == [m.id for m in inserted]
         assert all(not isinstance(r, _SyntheticSummaryMessage) for r in rows)
+    finally:
+        await _cleanup(conv_id)
+
+
+async def test_row_limit_never_splits_or_drops_twelve_recent_tool_turns():
+    import json as _json
+
+    rows_spec = []
+    age = 10_000
+    for turn in range(12):
+        rows_spec.append(("user", f"user-{turn}", age))
+        age -= 1
+        for tool in range(5):
+            rows_spec.append(
+                (
+                    "tool_call",
+                    _json.dumps(
+                        {
+                            "name": "test_tool",
+                            "args": {"turn": turn, "tool": tool},
+                            "status": "done",
+                            "result": "ok",
+                        }
+                    ),
+                    age,
+                )
+            )
+            age -= 1
+        rows_spec.append(("assistant", f"assistant-{turn}", age))
+        age -= 1
+
+    conv_id, agent_id, inserted, _ = await _setup(rows_spec)
+    try:
+        async with async_session() as db:
+            rows = await load_messages_for_session(
+                db,
+                agent_id=agent_id,
+                conversation_id=conv_id,
+                ctx_size=3,
+            )
+
+        assert [row.id for row in rows] == [row.id for row in inserted]
+        assert all(row.compacted_into is None for row in rows)
+    finally:
+        await _cleanup(conv_id)
+
+
+async def test_recoverable_loader_never_row_slices_complete_turns():
+    rows_spec = []
+    age = 10_000
+    for turn in range(9):
+        rows_spec.extend(
+            [
+                ("user", f"user-{turn}", age),
+                ("tool_call", '{"status":"done"}', age - 1),
+                ("assistant", f"assistant-{turn}", age - 2),
+            ]
+        )
+        age -= 3
+    rows_spec.append(("user", "interrupted-current", age))
+
+    conv_id, agent_id, inserted, _ = await _setup(rows_spec)
+    try:
+        async with async_session() as db:
+            rows = await load_recoverable_messages_for_turn(
+                db,
+                agent_id=agent_id,
+                conversation_id=conv_id,
+                turn_anchor_id=inserted[-1].id,
+                ctx_size=3,
+            )
+
+        assert [row.id for row in rows] == [row.id for row in inserted]
     finally:
         await _cleanup(conv_id)
 
@@ -466,6 +563,126 @@ async def test_precompact_noop_without_conversation_id():
     )
     assert result.triggered is False
     assert result.required is False
+
+
+async def test_compaction_never_marks_recent_eight_or_current_turn(monkeypatch):
+    from sqlalchemy import select as _select
+    from unittest.mock import AsyncMock
+
+    import app.services.llm.compactor as compactor
+
+    rows_spec = []
+    age = 20_000
+    for turn in range(9):
+        body = ("old bulk " * 800) if turn == 0 else f"turn-{turn}"
+        rows_spec.append(("user", body, age))
+        age -= 1
+        rows_spec.append(("assistant", f"answer-{turn}", age))
+        age -= 1
+    rows_spec.append(("user", "current", age))
+
+    conv_id, agent_id, inserted, _ = await _setup(rows_spec)
+    current_anchor = inserted[-1].id
+    summary = (
+        "## Work summary\n\n"
+        "### Decisions\n"
+        + ("The oldest completed turn was condensed safely. " * 8)
+    )
+    monkeypatch.setattr(
+        compactor,
+        "_summarize_via_llm",
+        AsyncMock(return_value=(summary, {"completion_tokens": 100})),
+    )
+
+    try:
+        result = await compactor.maybe_compact(
+            agent_id=agent_id,
+            conversation_id=conv_id,
+            model=_precompact_model(context_window=100, keep=2),
+            pre_flight_estimate=10_000,
+            current_anchor_id=current_anchor,
+        )
+        assert result.triggered is True
+
+        async with async_session() as db:
+            rows = (
+                await db.execute(
+                    _select(ChatMessage)
+                    .where(ChatMessage.conversation_id == conv_id)
+                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                )
+            ).scalars().all()
+
+        assert rows[0].compacted_into is not None
+        assert rows[1].compacted_into == rows[0].compacted_into
+        assert all(row.compacted_into is None for row in rows[2:])
+        assert [row.content for row in rows[2:]] == [row.content for row in inserted[2:]]
+    finally:
+        await _cleanup(conv_id)
+
+
+async def test_consumed_onmessage_event_does_not_block_compaction(monkeypatch):
+    from sqlalchemy import select as _select
+    from unittest.mock import AsyncMock
+
+    import app.services.llm.compactor as compactor
+
+    rows_spec = [("user", "consumed event", 30_000)]
+    age = 20_000
+    for turn in range(9):
+        body = ("old bulk " * 800) if turn == 0 else f"turn-{turn}"
+        rows_spec.extend(
+            [
+                ("user", body, age),
+                ("assistant", f"answer-{turn}", age - 1),
+            ]
+        )
+        age -= 2
+    rows_spec.append(("user", "current", age))
+
+    conv_id, agent_id, inserted, _ = await _setup(rows_spec)
+    current_anchor = inserted[-1].id
+    async with async_session() as db:
+        consumed = await db.get(ChatMessage, inserted[0].id)
+        consumed.message_meta = {"consumed_by_onmessage": True}
+        await db.commit()
+
+    summary = (
+        "## Work summary\n\n"
+        "### Decisions\n"
+        + ("The oldest completed turn was condensed safely. " * 8)
+    )
+    monkeypatch.setattr(
+        compactor,
+        "_summarize_via_llm",
+        AsyncMock(return_value=(summary, {"completion_tokens": 100})),
+    )
+
+    try:
+        result = await compactor.maybe_compact(
+            agent_id=agent_id,
+            conversation_id=conv_id,
+            model=_precompact_model(context_window=100, keep=8),
+            pre_flight_estimate=10_000,
+            current_anchor_id=current_anchor,
+        )
+        assert result.triggered is True
+
+        async with async_session() as db:
+            rows = (
+                await db.execute(
+                    _select(ChatMessage)
+                    .where(ChatMessage.conversation_id == conv_id)
+                    .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                )
+            ).scalars().all()
+
+        assert rows[0].compacted_into is None
+        assert rows[1].compacted_into is not None
+        assert rows[2].compacted_into == rows[1].compacted_into
+        assert all(row.compacted_into is None for row in rows[3:])
+    finally:
+        await _cleanup(conv_id)
 
 
 async def test_concurrent_compaction_rechecks_persisted_state_after_lock(monkeypatch):

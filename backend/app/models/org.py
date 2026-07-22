@@ -80,6 +80,10 @@ class ChannelUserBinding(Base):
             "subject",
             name="uq_channel_user_binding_subject",
         ),
+        CheckConstraint(
+            "channel_type <> 'oauth2' OR (provider_id IS NOT NULL AND id_type = 'subject')",
+            name="ck_oauth_binding_provider_required",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

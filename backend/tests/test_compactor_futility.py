@@ -12,7 +12,7 @@ round. Also locks the savings figure to what actually leaves the prompt
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -22,11 +22,13 @@ from app.services.llm.compactor import _do_compact
 
 
 class _Row:
-    def __init__(self, role: str, content: str):
+    def __init__(self, role: str, content: str, *, offset: int):
         self.id = uuid.uuid4()
         self.role = role
         self.content = content
-        self.created_at = datetime(2026, 7, 2, tzinfo=timezone.utc)
+        self.created_at = datetime(2026, 7, 2, tzinfo=timezone.utc) + timedelta(
+            seconds=offset
+        )
 
 
 class _FakeModel:
@@ -51,7 +53,10 @@ class _FakeDB:
         pass
 
     async def execute(self, *_a, **_k):
-        pass
+        class _Result:
+            rowcount = 6
+
+        return _Result()
 
     async def commit(self):
         self.committed = True
@@ -73,14 +78,25 @@ def _fake_session_factory(db):
 
 def _rows_with_span(span_content_chars_each: int, n_span_rows: int = 6):
     """History whose compactable span (everything before the trailing
-    keep_recent_turns=2 user rounds) has n_span_rows rows of the given size."""
+    protected eight user turns) has n_span_rows rows of the given size."""
     span = []
     for i in range(n_span_rows):
-        span.append(_Row("user" if i % 2 == 0 else "assistant", "x" * span_content_chars_each))
-    trailing = [
-        _Row("user", "q1"), _Row("assistant", "a1"),
-        _Row("user", "q2"), _Row("assistant", "a2"),
-    ]
+        span.append(
+            _Row(
+                "user" if i % 2 == 0 else "assistant",
+                "x" * span_content_chars_each,
+                offset=i,
+            )
+        )
+    trailing = []
+    for turn in range(8):
+        offset = n_span_rows + turn * 2
+        trailing.extend(
+            [
+                _Row("user", f"q{turn}", offset=offset),
+                _Row("assistant", f"a{turn}", offset=offset + 1),
+            ]
+        )
     return span + trailing
 
 

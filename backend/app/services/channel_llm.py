@@ -4,8 +4,8 @@
 channel (Feishu / DingTalk / WeCom / Slack / Discord / Teams / WhatsApp /
 WeChat) — the SAME failover-aware caller the WebSocket chat endpoint uses, so
 every provider behaves identically on both surfaces. It centralizes tool-call
-persistence and pre-flight compaction so all channels share one canonical
-schema.
+persistence and first-dispatch context recovery so all channels share one
+canonical schema.
 
 It lives here in ``services/`` (rather than in any one channel module) because
 it is channel-agnostic: channels import it from here instead of reaching across
@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import is_agent_expired
+from app.database import async_session
 
 # LLM-layer error sentinels surfaced verbatim to the IM user, followed by a
 # recovery hint that guides them to reset the session with /new.
@@ -128,12 +129,9 @@ async def _call_agent_llm(
     from app.models.llm import LLMModel
     from app.services.llm import call_llm_with_failover
     from app.services.llm.session_context_guard import (
-        CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE,
         CONTEXT_REQUEST_TOO_LARGE_MESSAGE,
         IM_SESSION_CONTEXT_TERMINATED_MESSAGE,
         SESSION_CONTEXT_TERMINATED_MESSAGE,
-        get_session_context_termination,
-        terminate_session_context,
     )
 
     def _context_reply(reply: str) -> str:
@@ -143,13 +141,6 @@ async def _call_agent_llm(
         }:
             return IM_SESSION_CONTEXT_TERMINATED_MESSAGE
         return reply
-
-    async def _terminate_context(reason: str) -> str:
-        return _context_reply(await terminate_session_context(session_id, reason))
-
-    _terminated = await get_session_context_termination(session_id)
-    if _terminated:
-        return _context_reply(_terminated)
 
     # A2A sessions store their shared history under the session owner (the
     # stable min-id side), while the model and tools execute as the agent being
@@ -204,94 +195,57 @@ async def _call_agent_llm(
         from app.services.chat_history import strip_leading_orphan_tool_messages
 
         normalized_history = _normalize_history_messages(history)
-        if recovery_mode:
-            messages.extend(strip_leading_orphan_tool_messages(normalized_history))
-        else:
-            messages.extend(strip_leading_orphan_tool_messages(normalized_history[-ctx_size:]))
+        messages.extend(strip_leading_orphan_tool_messages(normalized_history))
     if not continue_turn:
         messages.append({"role": "user", "content": user_text})
 
-    # Pre-flight compaction: if the about-to-be-sent prompt is near the model
-    # window, compact NOW and reload so THIS request doesn't overflow (the
-    # post-round hook only slims the NEXT turn). The reload already includes the
-    # just-saved current user message — channels save it before calling — so we
-    # rebuild from the fresh history WITHOUT re-appending user_text. Best-effort:
-    # any failure leaves the original messages untouched.
-    if session_id:
-        from app.services.chat_history import (
-            load_history_for_llm,
-            load_recoverable_history_for_turn,
-            strip_leading_orphan_tool_messages,
-        )
-        from app.services.llm.compactor import (
-            maybe_precompact_prompt,
-            prompt_exceeds_preflight_limit,
-        )
+    # Exact first-dispatch recovery. Only a fresh, durably anchored user turn
+    # is eligible; confirmation/startup continuations retain their in-memory
+    # transcript and fail safely rather than risking a replay.
+    context_recovery = None
+    if session_id and turn_anchor_id is not None and not continue_turn and not recovery_mode:
+        from app.services.llm.turn_partition import effective_keep_recent_turns
 
-        _preflight_required = False
-        try:
-            _preflight_required = prompt_exceeds_preflight_limit(
-                model=model,
-                prompt_messages=messages,
-            )
-            _precompact = await maybe_precompact_prompt(
+        frozen_current_suffix = [dict(messages[-1])]
+        protected_keep_recent_turns = effective_keep_recent_turns(model, fallback_model)
+
+        async def _recover_context(_recovery_model, dispatch_budget):
+            from app.services.chat_history import load_history_prefix_before_anchor
+            from app.services.llm.compactor import maybe_compact
+
+            compacted = await maybe_compact(
                 agent_id=history_agent_id,
                 conversation_id=session_id,
-                model=model,
-                prompt_messages=messages,
+                model=_recovery_model,
+                pre_flight_estimate=dispatch_budget.estimated_tokens,
+                current_anchor_id=turn_anchor_id,
+                force_required=dispatch_budget.char_overflow,
+                keep_recent_turns_override=protected_keep_recent_turns,
             )
-        except Exception as _compact_exc:
-            logger.error(f"[Channel] pre-flight compaction failed: {_compact_exc}")
-            if _preflight_required:
-                return await _terminate_context(
-                    f"preflight_compaction_exception:{type(_compact_exc).__name__}"
+            if not compacted.triggered:
+                logger.warning(
+                    "[Channel] context recovery could not compact session="
+                    f"{session_id}: {compacted.skipped_reason}"
                 )
-            return CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
+                return None
+            async with async_session() as recovery_db:
+                prefix = await load_history_prefix_before_anchor(
+                    recovery_db,
+                    agent_id=history_agent_id,
+                    conversation_id=session_id,
+                    turn_anchor_id=turn_anchor_id,
+                    ctx_size=ctx_size,
+                    is_group=is_group,
+                    rehydrate_images_max=3,
+                )
+            if prefix is None:
+                logger.warning(
+                    f"[Channel] context recovery lost latest-anchor race session={session_id}"
+                )
+                return None
+            return _normalize_history_messages(prefix) + frozen_current_suffix
 
-        if _precompact.required and not _precompact.triggered:
-            return await _terminate_context(
-                f"preflight_compaction_failed:{_precompact.skipped_reason}"
-            )
-        if _precompact.triggered:
-            try:
-                if recovery_mode and turn_anchor_id is not None:
-                    fresh = await load_recoverable_history_for_turn(
-                        db,
-                        agent_id=history_agent_id,
-                        conversation_id=session_id,
-                        turn_anchor_id=turn_anchor_id,
-                        ctx_size=ctx_size,
-                        is_group=is_group,
-                        rehydrate_images_max=3,
-                    )
-                    messages = strip_leading_orphan_tool_messages(_normalize_history_messages(fresh))
-                else:
-                    fresh = await load_history_for_llm(
-                        db,
-                        agent_id=history_agent_id,
-                        conversation_id=session_id,
-                        ctx_size=ctx_size,
-                        is_group=is_group,
-                        rehydrate_images_max=3,
-                    )
-                    rebuilt = strip_leading_orphan_tool_messages(_normalize_history_messages(fresh)[-ctx_size:])
-                    if continue_turn:
-                        # Resume mode: history already ends with the tool result — don't
-                        # graft a user message onto it.
-                        messages = rebuilt
-                    elif rebuilt and rebuilt[-1].get("role") == "user":
-                        rebuilt[-1] = {"role": "user", "content": user_text}
-                        messages = rebuilt
-                    else:
-                        rebuilt.append({"role": "user", "content": user_text})
-                        messages = rebuilt
-                if prompt_exceeds_preflight_limit(model=model, prompt_messages=messages):
-                    return await _terminate_context("preflight_compaction_still_oversized")
-            except Exception as _reload_exc:
-                # Compaction already committed successfully.  A transient
-                # history/image reload failure must not poison the session.
-                logger.error(f"[Channel] post-compaction history reload failed: {_reload_exc}")
-                return CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
+        context_recovery = _recover_context
 
     # Use actual user_id so the system prompt knows who it's chatting with
     effective_user_id = user_id or agent_id
@@ -374,6 +328,7 @@ async def _call_agent_llm(
         supports_vision=getattr(model, "supports_vision", False),
         is_group=is_group,
         turn_anchor_id=turn_anchor_id,
+        context_recovery=context_recovery,
     )
     reply = _context_reply(reply)
 

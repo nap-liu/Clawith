@@ -188,6 +188,8 @@ class SSOService:
         provider_type: AuthProviderType | str,
         tenant_id: str | None = None,
         identity_data: dict[str, Any] | None = None,
+        *,
+        provider_model: IdentityProvider | None = None,
     ) -> User | None:
         """Resolve user from external identity via OrgMember.
 
@@ -201,8 +203,16 @@ class SSOService:
             User if found via OrgMember, None otherwise
         """
 
-        # Get provider
-        provider = await get_preferred_identity_provider(db, provider_type, tenant_id)
+        # Authentication callers can pin the concrete provider that issued the
+        # subject.  Falling back by type is retained only for legacy callers.
+        provider = provider_model
+        if provider is not None:
+            if str(provider.provider_type) != str(provider_type):
+                raise ValueError("Identity provider type does not match the requested provider")
+            if tenant_id is not None and str(provider.tenant_id) != str(tenant_id):
+                raise ValueError("Identity provider tenant does not match the requested tenant")
+        else:
+            provider = await get_preferred_identity_provider(db, provider_type, tenant_id)
 
         if not provider:
             return None
@@ -213,6 +223,7 @@ class SSOService:
             provider_type,
             provider_user_id,
             identity_data,
+            tenant_id=tenant_id,
         )
 
         if not member or not member.user_id:
@@ -220,9 +231,10 @@ class SSOService:
 
         # Get user
         from sqlalchemy.orm import selectinload
-        user_result = await db.execute(
-            select(User).where(User.id == member.user_id).options(selectinload(User.identity))
-        )
+        user_query = select(User).where(User.id == member.user_id).options(selectinload(User.identity))
+        if tenant_id is not None:
+            user_query = user_query.where(User.tenant_id == tenant_id)
+        user_result = await db.execute(user_query)
         return user_result.scalar_one_or_none()
 
     def _get_identity_payload(self, identity_data: dict[str, Any] | None) -> dict[str, Any]:
@@ -312,21 +324,29 @@ class SSOService:
         provider_type: AuthProviderType | str,
         provider_user_id: str,
         identity_data: dict[str, Any] | None = None,
+        tenant_id: str | uuid.UUID | None = None,
     ):
         from app.models.org import OrgMember
 
         for field, lookup_value in self._identity_lookup_chain(provider_type, provider_user_id, identity_data):
             column = getattr(OrgMember, field)
-            member_result = await db.execute(
-                select(OrgMember).where(
-                    OrgMember.provider_id == provider_id,
-                    OrgMember.status == "active",
-                    column == lookup_value,
-                )
+            query = select(OrgMember).where(
+                OrgMember.provider_id == provider_id,
+                OrgMember.status == "active",
+                column == lookup_value,
             )
-            member = member_result.scalar_one_or_none()
-            if member:
-                return member
+            if tenant_id is not None:
+                query = query.where(OrgMember.tenant_id == tenant_id)
+            member_result = await db.execute(query)
+            members = member_result.scalars().all()
+            if not members:
+                continue
+            user_ids = {member.user_id for member in members if member.user_id is not None}
+            if len(user_ids) > 1:
+                from app.services.canonical_user_resolver import CanonicalUserConflict
+
+                raise CanonicalUserConflict("Provider subject maps to multiple users")
+            return min(members, key=lambda member: (member.user_id is None, str(member.id)))
 
         return None
 
@@ -338,6 +358,8 @@ class SSOService:
         provider_user_id: str,
         identity_data: dict[str, Any] | None = None,
         tenant_id: str | None = None,
+        *,
+        provider_model: IdentityProvider | None = None,
     ) -> Any:
         """Link an external identity to an existing user via OrgMember.
 
@@ -359,8 +381,16 @@ class SSOService:
         """
         from app.models.org import OrgMember
 
-        # Get or create provider
-        provider = await get_preferred_identity_provider(db, provider_type, tenant_id)
+        # Authentication callers pin the provider model so subject bindings
+        # cannot drift to another provider of the same type.
+        provider = provider_model
+        if provider is not None:
+            if str(provider.provider_type) != str(provider_type):
+                raise ValueError("Identity provider type does not match the requested provider")
+            if tenant_id is not None and str(provider.tenant_id) != str(tenant_id):
+                raise ValueError("Identity provider tenant does not match the requested tenant")
+        else:
+            provider = await get_preferred_identity_provider(db, provider_type, tenant_id)
 
         if not provider:
             raise ValueError(f"Provider {provider_type} not found for tenant {tenant_id}")
@@ -376,6 +406,7 @@ class SSOService:
             provider_type,
             provider_user_id,
             identity_data,
+            tenant_id=tenant_id,
         )
 
         if not member:
@@ -383,9 +414,8 @@ class SSOService:
             # _find_identity_member misses (e.g. oauth2 providers whose payloads carry no
             # external_id/open_id/unionid → lookup chain has nothing to match on). Without
             # this fallback every SSO login created a fresh OrgMember row.
-            fallback_result = await db.execute(
-                select(OrgMember)
-                .where(
+            fallback_query = (
+                select(OrgMember).where(
                     OrgMember.provider_id == provider.id,
                     OrgMember.user_id == uid,
                     OrgMember.status == "active",
@@ -393,6 +423,9 @@ class SSOService:
                 .order_by(OrgMember.synced_at)
                 .limit(1)
             )
+            if tenant_id is not None:
+                fallback_query = fallback_query.where(OrgMember.tenant_id == tenant_id)
+            fallback_result = await db.execute(fallback_query)
             member = fallback_result.scalar_one_or_none()
 
         if member:

@@ -950,94 +950,16 @@ class WebSocketChatHandler:
             async def _call_with_failover():
                 nonlocal needs_onboarding_mark, onboarding_target_phase
 
-                from app.services.llm.session_context_guard import (
-                    CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE,
-                    get_session_context_termination,
-                    terminate_session_context,
-                )
-
-                _terminated = await get_session_context_termination(self.conv_id)
-                if _terminated:
-                    return _terminated
-
                 async def _on_failover(reason: str):
                     await self._safe_send({"type": "info", "content": f"Primary model error, {reason}"})
 
-                # Pre-flight compaction: if the about-to-be-sent prompt is near the
-                # model window, compact NOW and rebuild conversation from DB so THIS
-                # request stays under it. The web conversation lives in memory across
-                # a connection (not reloaded per turn), so without this rebuild a
-                # single oversized turn would overflow before the post-round hook
-                # could help. The current user message is already persisted, so the
-                # rebuild includes it. If compaction is required but cannot be
-                # applied, this session is stopped before provider dispatch.
-                _preflight_required = False
-                try:
-                    from app.services.llm.compactor import (
-                        maybe_precompact_prompt,
-                        prompt_exceeds_preflight_limit,
-                    )
-
-                    _preflight_required = prompt_exceeds_preflight_limit(
-                        model=effective_llm_model,
-                        prompt_messages=self.conversation[-self.ctx_size :],
-                    )
-                    _precompact = await maybe_precompact_prompt(
-                        agent_id=self.agent_id,
-                        conversation_id=self.conv_id,
-                        model=effective_llm_model,
-                        prompt_messages=self.conversation[-self.ctx_size :],
-                    )
-                except Exception as _compact_exc:
-                    logger.error(f"[WS] pre-flight compaction failed: {_compact_exc}")
-                    if _preflight_required:
-                        return await terminate_session_context(
-                            self.conv_id,
-                            f"preflight_compaction_exception:{type(_compact_exc).__name__}",
-                        )
-                    return CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
-
-                if _precompact.required and not _precompact.triggered:
-                    return await terminate_session_context(
-                        self.conv_id,
-                        f"preflight_compaction_failed:{_precompact.skipped_reason}",
-                    )
-                if _precompact.triggered:
-                    try:
-                        from app.services.chat_history import (
-                            build_llm_messages_from_rows,
-                            load_messages_for_session,
-                        )
-                        from app.services.image_context import rehydrate_image_messages
-
-                        async with async_session() as _pf_db:
-                            _pf_rows = await load_messages_for_session(
-                                _pf_db, agent_id=self.agent_id, conversation_id=self.conv_id, ctx_size=self.ctx_size
-                            )
-                        # Same shared builder + image rehydration as the initial
-                        # build, so vision context survives a compaction rebuild.
-                        self.conversation = build_llm_messages_from_rows(_pf_rows, include_thinking=True)
-                        self.conversation = rehydrate_image_messages(self.conversation, self.agent_id, max_images=3)
-                        if prompt_exceeds_preflight_limit(
-                            model=effective_llm_model,
-                            prompt_messages=self.conversation[-self.ctx_size :],
-                        ):
-                            return await terminate_session_context(
-                                self.conv_id,
-                                "preflight_compaction_still_oversized",
-                            )
-                    except Exception as _reload_exc:
-                        # Compaction already committed successfully.  A
-                        # transient history/image reload failure must not mark
-                        # the session permanently unusable.
-                        logger.error(f"[WS] post-compaction history reload failed: {_reload_exc}")
-                        return CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
-
-                # Drop orphan tool messages left if the ctx_size slice cut a
-                # tool-call pair (shared guard with the IM history path).
+                # History loading is turn-aware, so do not re-apply a row/message
+                # slice here: it could split one tool-heavy protected turn.
                 from app.services.chat_history import strip_leading_orphan_tool_messages
 
-                _truncated = strip_leading_orphan_tool_messages(self.conversation[-self.ctx_size :])
+                persisted_view = strip_leading_orphan_tool_messages(self.conversation)
+                _truncated = list(persisted_view)
+                ephemeral_overlays: list[dict] = []
 
                 # Resolve onboarding prompt
                 skip_tools_for_greeting = False
@@ -1051,7 +973,8 @@ class WebSocketChatHandler:
                             user_locale=self.lang,
                         )
                     if _onb:
-                        _truncated = [{"role": "system", "content": _onb.prompt}] + _truncated
+                        ephemeral_overlays = [{"role": "system", "content": _onb.prompt}]
+                        _truncated = ephemeral_overlays + _truncated
                         if _onb.lock_on_first_chunk:
                             needs_onboarding_mark = True
                             onboarding_target_phase = _onb.target_phase
@@ -1059,6 +982,57 @@ class WebSocketChatHandler:
                             skip_tools_for_greeting = True
                 except Exception as _onb_err:
                     logger.warning(f"[WS] Onboarding prompt resolve failed (non-fatal): {_onb_err}")
+
+                context_recovery = None
+                if turn_anchor_id is not None and persisted_view:
+                    from app.services.llm.turn_partition import effective_keep_recent_turns
+
+                    frozen_current_suffix = [dict(persisted_view[-1])]
+                    protected_keep_recent_turns = effective_keep_recent_turns(
+                        effective_llm_model,
+                        self.fallback_llm_model,
+                    )
+
+                    async def _recover_context(_recovery_model, dispatch_budget):
+                        from app.services.chat_history import load_history_prefix_before_anchor
+                        from app.services.llm.compactor import maybe_compact
+
+                        compacted = await maybe_compact(
+                            agent_id=self.agent_id,
+                            conversation_id=self.conv_id,
+                            model=_recovery_model,
+                            pre_flight_estimate=dispatch_budget.estimated_tokens,
+                            current_anchor_id=turn_anchor_id,
+                            force_required=dispatch_budget.char_overflow,
+                            keep_recent_turns_override=protected_keep_recent_turns,
+                        )
+                        if not compacted.triggered:
+                            logger.warning(
+                                "[WS] context recovery could not compact session="
+                                f"{self.conv_id}: {compacted.skipped_reason}"
+                            )
+                            return None
+                        async with async_session() as recovery_db:
+                            prefix = await load_history_prefix_before_anchor(
+                                recovery_db,
+                                agent_id=self.agent_id,
+                                conversation_id=self.conv_id,
+                                turn_anchor_id=turn_anchor_id,
+                                ctx_size=self.ctx_size,
+                                rehydrate_images_max=3,
+                                include_thinking=True,
+                            )
+                        if prefix is None:
+                            logger.warning(
+                                f"[WS] context recovery lost latest-anchor race session={self.conv_id}"
+                            )
+                            return None
+                        # Keep only the persisted projection on the long-lived WS
+                        # state. Onboarding/dynamic overlays remain turn-local.
+                        self.conversation = prefix + frozen_current_suffix
+                        return ephemeral_overlays + self.conversation
+
+                    context_recovery = _recover_context
 
                 live_code_chars_sent = 0
                 live_code_truncated_sent = False
@@ -1113,6 +1087,7 @@ class WebSocketChatHandler:
                     on_code_output=code_output_to_ws,
                     channel_context=self._channel_context(),
                     turn_anchor_id=turn_anchor_id,
+                    context_recovery=context_recovery,
                 )
 
             llm_task = asyncio.create_task(_call_with_failover())

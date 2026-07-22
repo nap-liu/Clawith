@@ -132,9 +132,12 @@ async def test_failover_reuses_one_frozen_turn_context(monkeypatch):
 
     monkeypatch.setattr("app.services.llm.caller.call_llm", fake_call_llm)
 
+    primary = _FakeModel()
+    fallback = _FakeModel()
+    fallback.id = "model-y"
     result = await call_llm_with_failover(
-        primary_model=_FakeModel(),
-        fallback_model=_FakeModel(),
+        primary_model=primary,
+        fallback_model=fallback,
         messages=[{"role": "user", "content": "hello"}],
         agent_name="T",
         role_description="",

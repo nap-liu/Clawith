@@ -237,6 +237,53 @@ class BaseAuthProvider(ABC):
 
         tenant_uuid = uuid.UUID(str(tenant_id))
         try:
+            provider_model = await self._ensure_provider(db, tenant_id)
+            exact_provider_model = provider_model if provider_model.tenant_id == tenant_uuid else None
+            oauth_subject = None
+            if self.provider_type == "oauth2" and exact_provider_model is not None:
+                from app.services.oauth_identity import (
+                    normalize_oauth_email,
+                    oauth_identity_service,
+                )
+
+                oauth_subject = await oauth_identity_service.acquire_subject_lock(
+                    db,
+                    tenant_id=tenant_uuid,
+                    provider=exact_provider_model,
+                    subject=user_info.provider_user_id,
+                )
+                trusted_user = await oauth_identity_service.resolve_bound_user(
+                    db,
+                    tenant_id=tenant_uuid,
+                    provider=exact_provider_model,
+                    subject=oauth_subject,
+                )
+                if trusted_user is not None:
+                    if not trusted_user.is_active:
+                        raise HTTPException(status_code=403, detail="Account is disabled")
+                    # Validate the claim before any profile or projection write.
+                    normalize_oauth_email(user_info.email)
+                    trusted_user, _ = await oauth_identity_service.refresh_authoritative_email(
+                        db,
+                        tenant_id=tenant_uuid,
+                        provider=exact_provider_model,
+                        subject=oauth_subject,
+                        user=trusted_user,
+                        email=user_info.email,
+                    )
+                    await sso_service.link_identity(
+                        db,
+                        str(trusted_user.id),
+                        self.provider_type,
+                        oauth_subject,
+                        user_info.raw_data,
+                        tenant_id=str(tenant_uuid),
+                        provider_model=exact_provider_model,
+                    )
+                    await self._update_existing_user(db, trusted_user, user_info)
+                    await registration_service.ensure_web_org_member(db, trusted_user)
+                    return trusted_user, False
+
             repaired_user = await self._repair_legacy_dingtalk_oauth_user(
                 db,
                 tenant_id=tenant_uuid,
@@ -255,8 +302,17 @@ class BaseAuthProvider(ABC):
                     user_info.provider_user_id,
                     user_info.raw_data,
                     tenant_id=str(tenant_uuid),
+                    provider_model=exact_provider_model,
                 )
                 await registration_service.ensure_web_org_member(db, repaired_user)
+                if oauth_subject is not None:
+                    await oauth_identity_service.ensure_binding(
+                        db,
+                        tenant_id=tenant_uuid,
+                        provider=exact_provider_model,
+                        subject=oauth_subject,
+                        user=repaired_user,
+                    )
                 return repaired_user, False
 
             exact_user = await sso_service.resolve_user_identity(
@@ -265,6 +321,7 @@ class BaseAuthProvider(ABC):
                 self.provider_type,
                 tenant_id=str(tenant_uuid),
                 identity_data=user_info.raw_data,
+                provider_model=exact_provider_model,
             )
             if exact_user is not None and not (user_info.email or user_info.mobile):
                 if not exact_user.is_active:
@@ -279,8 +336,17 @@ class BaseAuthProvider(ABC):
                     user_info.provider_user_id,
                     user_info.raw_data,
                     tenant_id=str(tenant_uuid),
+                    provider_model=exact_provider_model,
                 )
                 await registration_service.ensure_web_org_member(db, exact_user)
+                if oauth_subject is not None:
+                    await oauth_identity_service.ensure_binding(
+                        db,
+                        tenant_id=tenant_uuid,
+                        provider=exact_provider_model,
+                        subject=oauth_subject,
+                        user=exact_user,
+                    )
                 return exact_user, False
 
             identity = await registration_service.find_or_create_identity(
@@ -337,8 +403,17 @@ class BaseAuthProvider(ABC):
                 user_info.provider_user_id,
                 user_info.raw_data,
                 tenant_id=str(tenant_uuid),
+                provider_model=exact_provider_model,
             )
             await registration_service.ensure_web_org_member(db, user)
+            if oauth_subject is not None:
+                await oauth_identity_service.ensure_binding(
+                    db,
+                    tenant_id=tenant_uuid,
+                    provider=exact_provider_model,
+                    subject=oauth_subject,
+                    user=user,
+                )
             return user, created
         except (CanonicalIdentityConflict, CanonicalUserConflict) as exc:
             logger.warning("Enterprise identity reconciliation failed: {}", exc)

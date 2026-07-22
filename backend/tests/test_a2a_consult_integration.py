@@ -334,12 +334,21 @@ async def test_consult_persist_tool_call_stores_raw_connection_string():
             await on_tool_call(tool_call_evt)
         return "Query succeeded"
 
-    async def fake_persist(session_factory, *, agent_id, user_id, conversation_id, evt):
+    async def fake_persist(
+        session_factory,
+        *,
+        agent_id,
+        user_id,
+        conversation_id,
+        evt,
+        turn_anchor_id=None,
+    ):
         persist_calls.append({
             "agent_id": agent_id,
             "user_id": user_id,
             "conversation_id": conversation_id,
             "evt": evt,
+            "turn_anchor_id": turn_anchor_id,
         })
 
     # NOTE: agent_tools.py imports call_llm_with_failover / persist_tool_call lazily
@@ -382,3 +391,4 @@ async def test_consult_persist_tool_call_stores_raw_connection_string():
     assert captured["agent_id"] == session_agent_id, (
         f"Tool call stored under wrong agent_id. Expected {session_agent_id}, got {captured['agent_id']}"
     )
+    assert captured["turn_anchor_id"] is not None

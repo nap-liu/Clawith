@@ -157,14 +157,14 @@ async def get_sso_config(sid: uuid.UUID, request: Request, db: AsyncSession = De
                 auth_urls.append({"provider_type": "google_workspace", "name": p.name, "url": url})
 
         elif p.provider_type == "oauth2":
-            from app.services.auth_registry import auth_provider_registry
-            auth_provider = await auth_provider_registry.get_provider(
-                db, "oauth2", str(session.tenant_id) if session.tenant_id else None
-            )
-            if auth_provider:
-                redir = f"{public_base}/api/auth/oauth2/callback"
-                url = await auth_provider.get_authorization_url(redir, str(sid))
-                auth_urls.append({"provider_type": "oauth2", "name": p.name, "url": url})
+            from app.services.auth_provider import OAuth2AuthProvider
+            from app.services.oauth_identity import sign_oauth2_sso_state
+
+            auth_provider = OAuth2AuthProvider(provider=p)
+            redir = f"{public_base}/api/auth/oauth2/callback"
+            state = sign_oauth2_sso_state(sid, p.id)
+            url = await auth_provider.get_authorization_url(redir, state)
+            auth_urls.append({"provider_type": "oauth2", "name": p.name, "url": url})
 
     return auth_urls
 
@@ -177,27 +177,36 @@ async def oauth2_callback(
     """Callback for Generic OAuth2 SSO login."""
     from app.core.security import create_access_token
     from fastapi.responses import HTMLResponse
-    from app.services.auth_registry import auth_provider_registry
+    from app.services.auth_provider import OAuth2AuthProvider
+    from app.services.canonical_user_resolver import CanonicalUserConflict
+    from app.services.oauth_identity import oauth_identity_service, parse_oauth2_sso_state
 
-    # 1. 从 state (=sid) 获取 tenant 上下文
-    tenant_id = None
-    sid = None
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                tenant_id = session.tenant_id
-        except (ValueError, AttributeError):
-            pass
+    # The signed state binds this callback to both the short-lived scan session
+    # and the exact provider that issued the authorization code.
+    parsed_state = parse_oauth2_sso_state(state)
+    if parsed_state is None:
+        return HTMLResponse("Auth failed: Invalid or expired OAuth state", status_code=400)
+    sid, provider_id = parsed_state
+    s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+    session = s_res.scalar_one_or_none()
+    if (
+        session is None
+        or session.expires_at < datetime.now(timezone.utc)
+        or session.status not in {"pending", "scanned"}
+        or session.tenant_id is None
+    ):
+        return HTMLResponse("Auth failed: Invalid or expired OAuth session", status_code=400)
 
-    # 2. 获取 OAuth2 provider
-    auth_provider = await auth_provider_registry.get_provider(
-        db, "oauth2", str(tenant_id) if tenant_id else None
-    )
-    if not auth_provider:
-        return HTMLResponse("Auth failed: OAuth2 provider not configured")
+    provider_result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
+    provider_model = provider_result.scalar_one_or_none()
+    if provider_model is None:
+        return HTMLResponse("Auth failed: OAuth2 provider not configured", status_code=404)
+    try:
+        oauth_identity_service.validate_enterprise_provider(provider_model, session.tenant_id)
+    except CanonicalUserConflict:
+        return HTMLResponse("Auth failed: OAuth2 provider is not valid for this session", status_code=400)
+    auth_provider = OAuth2AuthProvider(provider=provider_model)
+    tenant_id = session.tenant_id
 
     # 3. 换 token → 获取用户信息 → 查找/创建用户
     try:
@@ -209,6 +218,7 @@ async def oauth2_callback(
         )
         user = login_result.user
     except OAuthCodeLoginError as e:
+        await db.rollback()
         logger.warning(
             "OAuth2 login rejected: reason={} status_code={}",
             e.reason,
@@ -216,30 +226,27 @@ async def oauth2_callback(
         )
         return HTMLResponse(f"Auth failed: {e.public_message}")
     except Exception as e:
+        await db.rollback()
         logger.error("OAuth2 login error: error_type={}", type(e).__name__)
         return HTMLResponse("Auth failed: OAuth authentication failed")
 
     # 4. 生成 JWT，更新 SSO session
     token = create_access_token(str(user.id), user.role)
 
-    if sid:
-        try:
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                session.status = "authorized"
-                session.provider_type = "oauth2"
-                session.user_id = user.id
-                session.access_token = token
-                session.error_msg = None
-                await db.commit()
-                return HTMLResponse(
-                    f'<html><head><meta charset="utf-8" /></head>'
-                    f'<body><div>SSO login successful. Redirecting...</div>'
-                    f'<script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>'
-                    f'</body></html>'
-                )
-        except Exception as e:
-            logger.exception("Failed to update SSO session (oauth2) %s", e)
+    try:
+        session.status = "authorized"
+        session.provider_type = "oauth2"
+        session.user_id = user.id
+        session.access_token = token
+        session.error_msg = None
+        await db.commit()
+        return HTMLResponse(
+            f'<html><head><meta charset="utf-8" /></head>'
+            f'<body><div>SSO login successful. Redirecting...</div>'
+            f'<script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>'
+            f'</body></html>'
+        )
+    except Exception as e:
+        logger.exception("Failed to update SSO session (oauth2) %s", e)
 
     return HTMLResponse(f"Logged in successfully.")

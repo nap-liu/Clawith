@@ -1,10 +1,10 @@
 """Single source of truth for loading chat history into LLM context.
 
 Before this module, every channel handler (websocket / feishu / dingtalk /
-wecom / discord / teams / slack) carried its own copy of the same SELECT —
-desc + limit(ctx_size) + reverse + map to ``[{"role", "content"}]``. The
-duplication made it hard to evolve history-handling (compaction, image
-rehydration, …) without touching seven files at once.
+wecom / discord / teams / slack) carried its own history query and row slice.
+The duplication made it hard to evolve history-handling (complete-turn
+protection, compaction, image rehydration, …) without touching seven files at
+once.
 
 The module exposes two layers:
 
@@ -142,8 +142,10 @@ async def load_messages_for_session(
     conversation_id: str,
     ctx_size: int,
 ) -> list[Any]:
-    """Return the last ``ctx_size`` active messages for this (agent,
-    conversation), oldest-first, with compaction-aware injection.
+    """Return active context for this session with complete-turn protection.
+
+    ``ctx_size`` is retained for API compatibility but is not applied as a row
+    cut. Results are oldest-first and compaction-aware.
 
     "Active" = ``compacted_into IS NULL`` — rows folded into a prior
     compaction's summary are skipped. If a compaction marker exists
@@ -167,20 +169,24 @@ async def load_messages_for_session(
         # txn-start) can tie within the same microsecond. Without a secondary
         # sort the order would flap between reloads.
         .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        # Over-fetch so rows consumed by exact on_message subscriptions can be
-        # removed without needlessly shrinking the normal-session context.
-        .limit(max(ctx_size * 2, ctx_size))
     )
-    rows = [
+    all_active_rows = [
         row
         for row in reversed(rows_q.scalars().all())
         if not (
             isinstance(getattr(row, "message_meta", None), dict)
             and row.message_meta.get("consumed_by_onmessage")
         )
-    ][-ctx_size:]
+    ]
 
     marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)
+    # Never apply a row-count cut here. Before the first compaction, the exact
+    # dispatch guard decides whether the full active history fits and compacts
+    # only complete old turns when necessary. After compaction, all surviving
+    # rows are the protected suffix. Either way, slicing by rows could split a
+    # tool-heavy turn or silently violate a model's larger keep_recent_turns.
+    rows = all_active_rows
+
     if marker is not None:
         rows.insert(
             0,
@@ -236,15 +242,17 @@ async def load_recoverable_messages_for_turn(
         )
         return []
 
-    prefix_budget = max(ctx_size, 0)
     prefix = active_rows[:anchor_idx]
-    bounded_prefix = prefix[-prefix_budget:] if prefix_budget else []
     tail: list[Any] = []
     for row in active_rows[anchor_idx:]:
         if tail and getattr(row, "role", None) == "user":
             break
         tail.append(row)
-    rows = bounded_prefix + tail
+    # Startup recovery must not invent a row boundary either. It cannot safely
+    # compact/replay an already-started turn, so retain the full active prefix;
+    # the stateless dispatch guard will stop if that exact continuation cannot
+    # fit.
+    rows = prefix + tail
 
     marker = await _load_active_compaction_marker(db, conversation_id=conversation_id)
     if marker is not None:
@@ -699,6 +707,11 @@ async def persist_tool_call_row(
         role="tool_call",
         content=content,
         conversation_id=conversation_id,
+        message_meta=(
+            {"turn_anchor_id": str(turn_anchor_id)}
+            if turn_anchor_id is not None
+            else {}
+        ),
     )
     db.add(row)
     await db.flush()
@@ -972,7 +985,7 @@ async def load_history_for_llm(
         conversation_id: Channel-specific session key (e.g.
             ``feishu_p2p_<open_id>``, ``dingtalk_p2p_<staff_id>``, web
             ``conversation_id`` UUID).
-        ctx_size: Per-agent ``context_window_size`` cap on message count.
+        ctx_size: Retained for caller compatibility; no row-level cut is made.
         rehydrate_images_max: When set, post-process with
             ``image_context.rehydrate_image_messages`` so vision models
             still see prior image uploads. Only the most recent ``N``
@@ -1017,6 +1030,75 @@ async def load_history_for_llm(
 
         history = rehydrate_image_messages(history, agent_id, max_images=rehydrate_images_max)
 
+    return history
+
+
+async def load_history_prefix_before_anchor(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    turn_anchor_id: uuid.UUID,
+    ctx_size: int,
+    rehydrate_images_max: int | None = None,
+    is_group: bool = False,
+    include_thinking: bool = False,
+) -> list[dict[str, Any]] | None:
+    """Reload the compacted persisted prefix for one fresh user turn.
+
+    Recovery is fail-safe: the anchor must still be the newest persisted row.
+    Only rows before it are returned, so the caller can append its frozen
+    current-turn message and ephemeral overlays without losing their exact
+    in-memory shape.
+    """
+    rows = await load_messages_for_session(
+        db,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        ctx_size=ctx_size,
+    )
+    real_rows = [row for row in rows if not isinstance(row, _SyntheticSummaryMessage)]
+    if not real_rows or str(real_rows[-1].id) != str(turn_anchor_id):
+        return None
+
+    prefix_rows = [
+        row
+        for row in rows
+        if isinstance(row, _SyntheticSummaryMessage) or str(row.id) != str(turn_anchor_id)
+    ]
+    wrap_users = False
+    name_map: dict[uuid.UUID, str] = {}
+    if is_group:
+        user_ids = {
+            getattr(row, "sender_user_id", None) or getattr(row, "user_id", None)
+            for row in prefix_rows
+            if row.role == "user"
+            and (getattr(row, "sender_user_id", None) or getattr(row, "user_id", None))
+            is not None
+        }
+        try:
+            name_map = await _batch_load_display_names(db, user_ids)
+            wrap_users = True
+        except Exception as exc:
+            logger.warning(
+                "[chat_history] prefix display-name lookup failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    history = build_llm_messages_from_rows(
+        prefix_rows,
+        wrap_user_names=wrap_users,
+        name_map=name_map,
+        include_thinking=include_thinking,
+    )
+    if rehydrate_images_max is not None:
+        from app.services.image_context import rehydrate_image_messages
+
+        history = rehydrate_image_messages(
+            history,
+            agent_id,
+            max_images=rehydrate_images_max,
+        )
     return history
 
 
