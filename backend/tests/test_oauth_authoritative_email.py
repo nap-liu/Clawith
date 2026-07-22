@@ -631,5 +631,6 @@ async def test_oauth_sso_state_binds_session_and_exact_provider_and_rejects_tamp
     state = sign_oauth2_sso_state(session_id, provider_id)
 
     assert parse_oauth2_sso_state(state) == (session_id, provider_id)
-    assert parse_oauth2_sso_state(f"{state[:-1]}0") is None
+    tampered_last_char = "0" if state[-1] != "0" else "1"
+    assert parse_oauth2_sso_state(f"{state[:-1]}{tampered_last_char}") is None
     assert parse_oauth2_sso_state(str(session_id)) is None
