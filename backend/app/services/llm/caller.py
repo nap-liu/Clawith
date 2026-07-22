@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
@@ -257,9 +258,34 @@ REPEAT_TOOL_CALL_BREAK_MESSAGE = (
 # below one million characters; keep a safety margin for JSON protocol
 # overhead that is not represented by the message bodies themselves.
 QWEN_INPUT_CHAR_HARD_LIMIT = 900_000
+DISPATCH_INPUT_SAFETY_RATIO = 0.95
 PROVIDER_CONTEXT_BLOCKED_MESSAGE = (
     "上下文过长，请新开会话。"
 )
+
+
+@dataclass(frozen=True)
+class DispatchBudget:
+    chars: int
+    estimated_tokens: int
+    physical_input_capacity: int
+    safe_input_limit: int
+    token_overflow: bool
+    char_overflow: bool
+
+    @property
+    def fits(self) -> bool:
+        return not self.token_overflow and not self.char_overflow
+
+    @property
+    def reason(self) -> str:
+        if self.token_overflow and self.char_overflow:
+            return "token_and_qwen_char_limit"
+        if self.token_overflow:
+            return "token_limit"
+        if self.char_overflow:
+            return "qwen_char_limit"
+        return "fits"
 
 
 def _dispatch_context_size(messages: list, tools: list[dict] | None) -> tuple[int, int]:
@@ -280,9 +306,18 @@ def _dispatch_context_size(messages: list, tools: list[dict] | None) -> tuple[in
         tool_calls = getattr(msg, "tool_calls", None) or []
         if tool_calls:
             chunks.append(json.dumps(tool_calls, ensure_ascii=False, default=str))
+        tool_call_id = getattr(msg, "tool_call_id", None)
+        if isinstance(tool_call_id, str):
+            chunks.append(tool_call_id)
         reasoning = getattr(msg, "reasoning_content", None)
         if isinstance(reasoning, str):
             chunks.append(reasoning)
+        reasoning_signature = getattr(msg, "reasoning_signature", None)
+        if isinstance(reasoning_signature, str):
+            chunks.append(reasoning_signature)
+        dynamic_content = getattr(msg, "dynamic_content", None)
+        if isinstance(dynamic_content, str):
+            chunks.append(dynamic_content)
     if tools:
         chunks.append(json.dumps(tools, ensure_ascii=False, default=str))
 
@@ -299,6 +334,39 @@ def _dispatch_context_size(messages: list, tools: list[dict] | None) -> tuple[in
     return chars, estimated_tokens
 
 
+def measure_dispatch(
+    *,
+    model,
+    messages: list,
+    tools: list[dict] | None,
+    max_output_tokens: int,
+) -> DispatchBudget:
+    """Measure the exact request shape used by every provider dispatch."""
+    chars, estimated_tokens = _dispatch_context_size(messages, tools)
+    context_window = int(getattr(model, "context_window", 0) or 0)
+    physical_input_capacity = max(
+        1,
+        context_window - max(0, int(max_output_tokens or 0)),
+    )
+    safe_input_limit = max(
+        1,
+        int(physical_input_capacity * DISPATCH_INPUT_SAFETY_RATIO),
+    )
+    token_overflow = context_window > 0 and estimated_tokens >= safe_input_limit
+    char_overflow = (
+        str(getattr(model, "provider", "")).lower() == "qwen"
+        and chars >= QWEN_INPUT_CHAR_HARD_LIMIT
+    )
+    return DispatchBudget(
+        chars=chars,
+        estimated_tokens=estimated_tokens,
+        physical_input_capacity=physical_input_capacity,
+        safe_input_limit=safe_input_limit,
+        token_overflow=token_overflow,
+        char_overflow=char_overflow,
+    )
+
+
 async def _guard_provider_dispatch(
     *,
     model,
@@ -307,28 +375,28 @@ async def _guard_provider_dispatch(
     max_output_tokens: int,
     session_id: str,
 ) -> str | None:
-    """Block oversized provider I/O without claiming persistent termination.
+    """Block oversized provider I/O without mutating persistent session state.
 
-    Persistent session termination belongs to the compaction orchestration
-    path, where the platform can prove that compaction was required and failed.
-    This final dispatch guard is deliberately stateless: it covers estimation
-    gaps (system prompt, tool schemas, provider-specific character limits) and
-    leaves the failover wrapper free to try a model with a larger window.
+    This final guard is deliberately stateless. It covers system prompts, tool
+    schemas, provider-specific character limits, and estimation variance while
+    leaving a safe fallback model eligible when no output or tool side effect
+    has occurred.
     """
-    chars, estimated_tokens = _dispatch_context_size(messages, tools)
-    context_window = int(getattr(model, "context_window", 0) or 0)
-    token_limit = max(1, context_window - max(0, int(max_output_tokens or 0)))
-    token_overflow = context_window > 0 and estimated_tokens >= token_limit
-    char_overflow = (
-        str(getattr(model, "provider", "")).lower() == "qwen"
-        and chars >= QWEN_INPUT_CHAR_HARD_LIMIT
+    budget = measure_dispatch(
+        model=model,
+        messages=messages,
+        tools=tools,
+        max_output_tokens=max_output_tokens,
     )
-    if not token_overflow and not char_overflow:
+    if budget.fits:
         return None
 
     reason = (
-        f"provider_dispatch_oversized:chars={chars},estimated_tokens={estimated_tokens},"
-        f"token_limit={token_limit},provider={getattr(model, 'provider', '?')},"
+        f"provider_dispatch_oversized:chars={budget.chars},"
+        f"estimated_tokens={budget.estimated_tokens},"
+        f"physical_input_capacity={budget.physical_input_capacity},"
+        f"safe_input_limit={budget.safe_input_limit},reason={budget.reason},"
+        f"provider={getattr(model, 'provider', '?')},"
         f"model={getattr(model, 'model', '?')}"
     )
     logger.error(f"[context_guard] blocked provider dispatch session={session_id} {reason}")
@@ -425,6 +493,19 @@ def is_retryable_error(result: str) -> bool:
         return False
 
     return classify_error(Exception(result)) != FailoverErrorType.NON_RETRYABLE
+
+
+def _same_model_record(primary_model, fallback_model) -> bool:
+    """True only for the same configured DB model record.
+
+    Two records with the same provider/model name may intentionally use a
+    different endpoint or credential and remain a valid fallback.
+    """
+    if primary_model is None or fallback_model is None:
+        return False
+    primary_id = getattr(primary_model, "id", None)
+    fallback_id = getattr(fallback_model, "id", None)
+    return primary_id is not None and fallback_id is not None and primary_id == fallback_id
 
 
 def _get_model_timeout(model: "LLMModel") -> float:
@@ -1026,6 +1107,8 @@ async def call_llm(
     channel_context: dict | None = None,
     turn_anchor_id: uuid.UUID | None = None,
     prepared_turn_context: tuple[str, str] | None = None,
+    prepared_tools: list[dict] | None = None,
+    context_recovery=None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     # Get agent config for tool rounds
@@ -1073,7 +1156,9 @@ async def call_llm(
     # Sort by function.name so Anthropic's tools[-1] cache_control lands on a
     # stable tool block across calls — DB iteration-order churn would otherwise
     # invalidate the tools prefix cache every request.
-    if skip_tools:
+    if prepared_tools is not None:
+        tools_for_llm = list(prepared_tools)
+    elif skip_tools:
         tools_for_llm = []
     else:
         from app.services.agent_tools import AGENT_TOOLS
@@ -1089,24 +1174,21 @@ async def call_llm(
     # the byte-stable static prompt.  Per-turn context (memory, current user,
     # channel, time, triggers) is attached to the current user message at the
     # tail, preserving the cacheable system + historical prefix.
-    api_messages = [LLMMessage(role="system", content=static_prompt)]
-    for msg in messages:
-        api_messages.append(
-            LLMMessage(
-                role=msg.get("role", "user"),
-                content=msg.get("content"),
-                tool_calls=msg.get("tool_calls"),
-                tool_call_id=msg.get("tool_call_id"),
+    def _assemble_api_messages(source_messages: list[dict]) -> list[LLMMessage]:
+        assembled = [LLMMessage(role="system", content=static_prompt)]
+        for msg in source_messages:
+            assembled.append(
+                LLMMessage(
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                    tool_calls=msg.get("tool_calls"),
+                    tool_call_id=msg.get("tool_call_id"),
+                )
             )
-        )
+        assembled = _convert_messages_for_vision(assembled, supports_vision)
+        return _attach_turn_context(assembled, dynamic_prompt)
 
-    # Vision format conversion
-    api_messages = _convert_messages_for_vision(api_messages, supports_vision)
-
-    # Freeze one runtime-context snapshot into the canonical message list for
-    # this turn.  It is not persisted to DB, but it remains byte-identical and
-    # present in every continuation request throughout the tool loop.
-    api_messages = _attach_turn_context(api_messages, dynamic_prompt)
+    api_messages = _assemble_api_messages(messages)
 
     # Create the unified LLM client
     try:
@@ -1187,13 +1269,38 @@ async def call_llm(
                     _log_turn_timing("token_limit", round_i + 1)
                     return _token_limit_msg
 
-        context_stop = await _guard_provider_dispatch(
+        dispatch_budget = measure_dispatch(
             model=model,
             messages=dispatch_messages,
             tools=tools_for_llm if tools_for_llm else None,
             max_output_tokens=max_tokens,
-            session_id=session_id,
         )
+        if (
+            not dispatch_budget.fits
+            and round_i == 0
+            and turn_anchor_id is not None
+            and context_recovery is not None
+        ):
+            recovered_messages = await context_recovery(model, dispatch_budget)
+            if recovered_messages is not None:
+                api_messages = _assemble_api_messages(recovered_messages)
+                dispatch_messages = list(api_messages)
+                dispatch_budget = measure_dispatch(
+                    model=model,
+                    messages=dispatch_messages,
+                    tools=tools_for_llm if tools_for_llm else None,
+                    max_output_tokens=max_tokens,
+                )
+
+        context_stop = None
+        if not dispatch_budget.fits:
+            context_stop = await _guard_provider_dispatch(
+                model=model,
+                messages=dispatch_messages,
+                tools=tools_for_llm if tools_for_llm else None,
+                max_output_tokens=max_tokens,
+                session_id=session_id,
+            )
         if context_stop:
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
@@ -1545,76 +1652,6 @@ async def call_llm(
         if _max_repeat == REPEAT_TOOL_CALL_NUDGE:
             api_messages.append(LLMMessage(role="user", content=REPEAT_TOOL_CALL_NUDGE_PROMPT))
 
-        # Auto-compaction hook (P5).
-        # When this round's prompt_tokens crosses the per-model
-        # `compact_trigger_ratio` (default 0.85 of context_window), kick
-        # off a structured-summary compaction so the NEXT call_llm
-        # invocation loads a slimmer history. We deliberately do NOT
-        # mutate `api_messages` in place — the in-memory list still
-        # carries the long prefix for the remainder of this round, and
-        # the channel's next history load through chat_history's
-        # compaction-aware path picks up the new shape transparently.
-        # 15% safety margin in the current request is enough to cover
-        # the ~2 additional tool rounds that may follow before the
-        # tool loop exits.
-        if agent_id and session_id:
-            last_prompt_tokens = None
-            if response and response.usage:
-                last_prompt_tokens = response.usage.get("prompt_tokens")
-            if last_prompt_tokens:
-                compaction_required = False
-                try:
-                    from app.services.llm.compactor import maybe_compact, should_compact
-
-                    compaction_required, _, _ = should_compact(
-                        model=model,
-                        last_prompt_tokens=last_prompt_tokens,
-                        pre_flight_estimate=None,
-                    )
-
-                    compaction_result = await maybe_compact(
-                        agent_id=agent_id,
-                        conversation_id=session_id,
-                        model=model,
-                        last_prompt_tokens=last_prompt_tokens,
-                    )
-                    if compaction_result.required and not compaction_result.triggered:
-                        from .session_context_guard import terminate_session_context
-
-                        context_stop = await terminate_session_context(
-                            session_id,
-                            f"post_round_compaction_failed:{compaction_result.skipped_reason}",
-                        )
-                        if agent_id and _unsaved_usage.total_tokens > 0:
-                            await record_token_usage(agent_id, _unsaved_usage)
-                        await client.close()
-                        _log_turn_timing("context_terminated", round_i + 1)
-                        return context_stop
-                    if compaction_result.progress_notice and on_chunk:
-                        try:
-                            await on_chunk(f"\n\n{compaction_result.progress_notice}\n\n")
-                        except Exception as notice_exc:
-                            logger.warning(
-                                "[LLM] failed to emit compaction notice: "
-                                f"{type(notice_exc).__name__}: {notice_exc}"
-                            )
-                except Exception as compact_exc:
-                    logger.error(
-                        f"[LLM] auto-compaction hook failed: {type(compact_exc).__name__}: {compact_exc}"
-                    )
-                    if compaction_required:
-                        from .session_context_guard import terminate_session_context
-
-                        context_stop = await terminate_session_context(
-                            session_id,
-                            f"post_round_compaction_exception:{type(compact_exc).__name__}",
-                        )
-                        if agent_id and _unsaved_usage.total_tokens > 0:
-                            await record_token_usage(agent_id, _unsaved_usage)
-                        await client.close()
-                        _log_turn_timing("context_terminated", round_i + 1)
-                        return context_stop
-
     # Record tokens even on "too many rounds" exit
     if agent_id and _unsaved_usage.total_tokens > 0:
         await record_token_usage(agent_id, _unsaved_usage)
@@ -1644,6 +1681,7 @@ async def call_llm_with_failover(
     current_user_name_override: str | None = None,
     channel_context: dict | None = None,
     turn_anchor_id: uuid.UUID | None = None,
+    context_recovery=None,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -1657,12 +1695,30 @@ async def call_llm_with_failover(
     if primary_model is None:
         return "⚠️ 未配置 LLM 模型"
 
-    if session_id:
-        from .session_context_guard import get_session_context_termination
+    if _same_model_record(primary_model, fallback_model):
+        logger.info("[Failover] Primary and fallback reference the same model id; skipping fallback")
+        fallback_model = None
 
-        terminated = await get_session_context_termination(session_id)
-        if terminated:
-            return terminated
+    turn_messages = list(messages)
+    recovery_used = False
+
+    async def _recover_once(model, budget):
+        nonlocal recovery_used, turn_messages
+        if recovery_used or context_recovery is None:
+            return None
+        recovery_used = True
+        try:
+            recovered = await context_recovery(model, budget)
+        except Exception as exc:
+            logger.error(
+                "[context_guard] safe context recovery failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+        if recovered is not None:
+            turn_messages = list(recovered)
+            return turn_messages
+        return None
 
     # Freeze one context snapshot for the whole logical turn.  Runtime
     # failover is a provider retry, not a new Agent turn, so both models must
@@ -1676,12 +1732,32 @@ async def call_llm_with_failover(
         is_group=is_group,
         channel_context=channel_context,
     )
+    if skip_tools:
+        prepared_tools: list[dict] = []
+    else:
+        from app.services.agent_tools import AGENT_TOOLS
+
+        prepared_tools = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
+        prepared_tools = sorted(
+            prepared_tools or [],
+            key=lambda tool: tool.get("function", {}).get("name", ""),
+        )
 
     # Wrapper callbacks to track state for guard checks
     async def _wrapped_on_chunk(text: str):
         guard.mark_streaming_started()
         if on_chunk:
             await on_chunk(text)
+
+    async def _wrapped_on_thinking(text: str):
+        guard.mark_streaming_started()
+        if on_thinking:
+            await on_thinking(text)
+
+    async def _wrapped_on_tool_delta(data: dict):
+        guard.mark_streaming_started()
+        if on_tool_delta:
+            await on_tool_delta(data)
 
     async def _wrapped_on_tool_call(data: dict):
         if data.get("status") in {"running", "done"}:
@@ -1692,7 +1768,7 @@ async def call_llm_with_failover(
     # Try primary model
     primary_result = await call_llm(
         primary_model,
-        messages,
+        turn_messages,
         agent_name,
         role_description,
         agent_id=agent_id,
@@ -1700,8 +1776,8 @@ async def call_llm_with_failover(
         session_id=session_id,
         on_chunk=_wrapped_on_chunk,
         on_tool_call=_wrapped_on_tool_call,
-        on_tool_delta=on_tool_delta,
-        on_thinking=on_thinking,
+        on_tool_delta=_wrapped_on_tool_delta,
+        on_thinking=_wrapped_on_thinking,
         supports_vision=supports_vision,
         skip_tools=skip_tools,
         is_group=is_group,
@@ -1710,6 +1786,8 @@ async def call_llm_with_failover(
         channel_context=channel_context,
         turn_anchor_id=turn_anchor_id,
         prepared_turn_context=prepared_turn_context,
+        prepared_tools=prepared_tools,
+        context_recovery=_recover_once,
     )
 
     # Check if we need to failover
@@ -1756,6 +1834,16 @@ async def call_llm_with_failover(
         if on_chunk:
             await on_chunk(text)
 
+    async def _fallback_on_thinking(text: str):
+        fallback_guard.mark_streaming_started()
+        if on_thinking:
+            await on_thinking(text)
+
+    async def _fallback_on_tool_delta(data: dict):
+        fallback_guard.mark_streaming_started()
+        if on_tool_delta:
+            await on_tool_delta(data)
+
     async def _fallback_on_tool_call(data: dict):
         if data.get("status") in {"running", "done"}:
             fallback_guard.mark_tool_executed()
@@ -1764,7 +1852,7 @@ async def call_llm_with_failover(
 
     fallback_result = await call_llm(
         fallback_model,
-        messages,
+        turn_messages,
         agent_name,
         role_description,
         agent_id=agent_id,
@@ -1772,8 +1860,8 @@ async def call_llm_with_failover(
         session_id=session_id,
         on_chunk=_fallback_on_chunk,
         on_tool_call=_fallback_on_tool_call,
-        on_tool_delta=on_tool_delta,
-        on_thinking=on_thinking,
+        on_tool_delta=_fallback_on_tool_delta,
+        on_thinking=_fallback_on_thinking,
         supports_vision=getattr(fallback_model, "supports_vision", False),
         skip_tools=skip_tools,
         is_group=is_group,
@@ -1782,6 +1870,11 @@ async def call_llm_with_failover(
         channel_context=channel_context,
         turn_anchor_id=turn_anchor_id,
         prepared_turn_context=prepared_turn_context,
+        prepared_tools=prepared_tools,
+        # A normal primary provider request has already occurred. Even when it
+        # failed before yielding output, fallback is a retry and may not mutate
+        # persisted history or trigger compaction after that first dispatch.
+        context_recovery=None,
     )
 
     if (
@@ -1889,13 +1982,6 @@ async def call_agent_llm_with_tools(
     from app.models.agent import Agent
     from app.models.llm import LLMModel
 
-    if session_id:
-        from .session_context_guard import get_session_context_termination
-
-        terminated = await get_session_context_termination(session_id)
-        if terminated:
-            return terminated
-
     # Load agent and models
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent: Agent | None = agent_result.scalar_one_or_none()
@@ -1920,6 +2006,13 @@ async def call_agent_llm_with_tools(
 
     if not primary_model:
         return f"⚠️ {agent.name} has no LLM model configured"
+
+    if _same_model_record(primary_model, fallback_model):
+        logger.info(
+            "[call_agent_llm_with_tools] Primary and fallback reference the same model id; "
+            "skipping fallback"
+        )
+        fallback_model = None
 
     # Build messages
     messages = [

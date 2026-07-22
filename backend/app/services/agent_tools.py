@@ -9245,21 +9245,63 @@ async def _send_message_to_agent(
             history = await load_history_for_llm(
                 db, agent_id=session_agent_id, conversation_id=session_id, ctx_size=ctx_size,
             )
-            # tool_call rows expand to assistant+tool pairs, so history can be up to
-            # ~2×ctx_size messages; re-slice to cap the LLM window AFTER expansion.
-            # (This is NOT a no-op despite load_history_for_llm's row-level limit.)
-            messages = strip_leading_orphan_tool_messages(history[-ctx_size:])
+            # The shared loader protects complete recent turns. Never re-slice
+            # its expanded assistant/tool pairs by message count.
+            messages = strip_leading_orphan_tool_messages(history)
             turn_text = "[From " + source_name + "] " + message_text + "\n\n" + A2A_DELIVERY_GUIDANCE
             if messages and messages[-1].get("role") == "user":
                 messages[-1] = {"role": "user", "content": turn_text}
             else:
                 messages.append({"role": "user", "content": turn_text})
 
+            frozen_current_suffix = [dict(messages[-1])]
+            from app.services.llm.turn_partition import effective_keep_recent_turns
+
+            protected_keep_recent_turns = effective_keep_recent_turns(
+                target_model,
+                target_fallback,
+            )
+
+            async def _a2a_context_recovery(_recovery_model, dispatch_budget):
+                from app.services.chat_history import load_history_prefix_before_anchor
+                from app.services.llm.compactor import maybe_compact
+
+                compacted = await maybe_compact(
+                    agent_id=session_agent_id,
+                    conversation_id=session_id,
+                    model=_recovery_model,
+                    pre_flight_estimate=dispatch_budget.estimated_tokens,
+                    current_anchor_id=outbound_a2a_message.id,
+                    force_required=dispatch_budget.char_overflow,
+                    keep_recent_turns_override=protected_keep_recent_turns,
+                )
+                if not compacted.triggered:
+                    logger.warning(
+                        "[A2A] context recovery could not compact session="
+                        f"{session_id}: {compacted.skipped_reason}"
+                    )
+                    return None
+                async with async_session() as recovery_db:
+                    prefix = await load_history_prefix_before_anchor(
+                        recovery_db,
+                        agent_id=session_agent_id,
+                        conversation_id=session_id,
+                        turn_anchor_id=outbound_a2a_message.id,
+                        ctx_size=ctx_size,
+                    )
+                if prefix is None:
+                    logger.warning(
+                        f"[A2A] context recovery lost latest-anchor race session={session_id}"
+                    )
+                    return None
+                return prefix + frozen_current_suffix
+
             # 3) persist callback stores tool calls under session_agent_id, RAW
             async def _a2a_persist(evt: dict):
                 await persist_tool_call(
                     async_session, agent_id=session_agent_id, user_id=owner_id,
                     conversation_id=session_id, evt=evt,
+                    turn_anchor_id=outbound_a2a_message.id,
                 )
 
             # Collect the target's reasoning/thinking for UI persistence — shown
@@ -9281,6 +9323,8 @@ async def _send_message_to_agent(
                 on_tool_call=_a2a_persist,
                 on_thinking=_a2a_on_thinking,
                 supports_vision=getattr(target_model, "supports_vision", False),
+                turn_anchor_id=outbound_a2a_message.id,
+                context_recovery=_a2a_context_recovery,
             )
 
             if not target_reply:
@@ -9300,6 +9344,10 @@ async def _send_message_to_agent(
                     conversation_id=session_id,
                     participant_id=tgt_part.id if tgt_part else None,
                     thinking=cap_thinking("".join(_a2a_thinking)),
+                    message_meta={
+                        "turn_anchor_id": str(outbound_a2a_message.id),
+                        "turn_status": "completed",
+                    },
                 ))
                 await db2.commit()
 

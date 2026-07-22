@@ -304,7 +304,11 @@ async def test_recoverable_history_preserves_processing_user_tail_that_normal_lo
         )
 
     assert [m["content"] for m in normal] == ["old question", "old answer"]
-    assert [m["content"] for m in recoverable] == ["old answer", "interrupted question"]
+    assert [m["content"] for m in recoverable] == [
+        "old question",
+        "old answer",
+        "interrupted question",
+    ]
 
 
 async def test_recoverable_history_skips_when_anchor_is_not_active():

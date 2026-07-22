@@ -117,8 +117,8 @@ async def test_call_agent_llm_recovery_mode_keeps_supplied_history_and_appends_n
     assert captured["messages"] == history
 
 
-async def test_call_agent_llm_recovery_mode_precompacts_with_recoverable_reload(monkeypatch):
-    """Recovery preflight compaction must reload through the recoverable turn projection."""
+async def test_call_agent_llm_recovery_mode_never_compacts_or_reloads(monkeypatch):
+    """An interrupted turn is never rewritten or replayed during recovery."""
     import app.services.llm as llm_module
     from app.services.channel_llm import _call_agent_llm
 
@@ -128,20 +128,14 @@ async def test_call_agent_llm_recovery_mode_precompacts_with_recoverable_reload(
 
     async def fake_failover(**kwargs):
         captured["messages"] = kwargs["messages"]
+        captured["context_recovery"] = kwargs.get("context_recovery")
         return "done"
 
-    async def fake_precompact(**_kwargs):
-        from app.services.llm.compactor import CompactionResult
-
-        return CompactionResult(triggered=True, required=True)
-
-    async def fake_recoverable_reload(*_args, **kwargs):
-        captured["reload_kwargs"] = kwargs
-        return [{"role": "user", "content": "reloaded interrupted question"}]
+    async def must_not_compact(**_kwargs):
+        raise AssertionError("recovery continuations must never compact")
 
     monkeypatch.setattr(llm_module, "call_llm_with_failover", fake_failover)
-    monkeypatch.setattr("app.services.llm.compactor.maybe_precompact_prompt", fake_precompact)
-    monkeypatch.setattr("app.services.chat_history.load_recoverable_history_for_turn", fake_recoverable_reload)
+    monkeypatch.setattr("app.services.llm.compactor.maybe_compact", must_not_compact)
 
     async with async_session() as db:
         reply = await _call_agent_llm(
@@ -157,8 +151,8 @@ async def test_call_agent_llm_recovery_mode_precompacts_with_recoverable_reload(
         )
 
     assert reply == "done"
-    assert captured["messages"] == [{"role": "user", "content": "reloaded interrupted question"}]
-    assert captured["reload_kwargs"]["turn_anchor_id"] == anchor_id
+    assert captured["messages"] == [{"role": "user", "content": "interrupted question"}]
+    assert captured["context_recovery"] is None
 
 
 async def _make_user_anchor(agent_id, user_id, *, conv: str, content: str = "message") -> uuid.UUID:

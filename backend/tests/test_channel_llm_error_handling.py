@@ -40,9 +40,11 @@ class _Result:
         return self._obj
 
 
-def _make_db(agent, model):
+def _make_db(agent, model, fallback_model=None):
     """Minimal AsyncSession double: returns agent then model on .execute()."""
     results = [_Result(agent), _Result(model)]
+    if fallback_model is not None:
+        results.append(_Result(fallback_model))
     state = {"n": 0}
 
     async def _execute(*_args, **_kwargs):
@@ -167,32 +169,17 @@ async def test_context_limit_uses_short_im_reset_message(monkeypatch):
     assert "不要在同一条消息中添加其他文字或附件" in reply
 
 
-async def test_required_preflight_compaction_failure_terminates_without_llm(monkeypatch):
-    """A threshold-crossing compaction failure is terminal and never dispatched."""
-    from app.services.llm.compactor import CompactionResult
-    from app.services.llm.session_context_guard import (
-        IM_SESSION_CONTEXT_TERMINATED_MESSAGE,
-        SESSION_CONTEXT_TERMINATED_MESSAGE,
-    )
-
+async def test_channel_does_not_consult_or_write_persistent_context_termination(monkeypatch):
+    """Old termination rows are audit-only and cannot brick later turns."""
     agent, model = _make_agent_and_model()
-    llm = AsyncMock(return_value="must not run")
+    llm = AsyncMock(return_value="继续成功")
     monkeypatch.setattr("app.services.llm.call_llm_with_failover", llm, raising=False)
-    monkeypatch.setattr(
-        "app.services.llm.compactor.maybe_precompact_prompt",
-        AsyncMock(
-            return_value=CompactionResult(
-                triggered=False,
-                required=True,
-                skipped_reason="validation_failed:low_id_recall",
-            )
-        ),
-    )
+    get_termination = AsyncMock(return_value="must not block")
+    terminate = AsyncMock(return_value="must not write")
     monkeypatch.setattr(
         "app.services.llm.session_context_guard.get_session_context_termination",
-        AsyncMock(return_value=None),
+        get_termination,
     )
-    terminate = AsyncMock(return_value=SESSION_CONTEXT_TERMINATED_MESSAGE)
     monkeypatch.setattr(
         "app.services.llm.session_context_guard.terminate_session_context",
         terminate,
@@ -206,84 +193,76 @@ async def test_required_preflight_compaction_failure_terminates_without_llm(monk
         user_id=agent.id,
     )
 
-    assert reply == IM_SESSION_CONTEXT_TERMINATED_MESSAGE
-    llm.assert_not_awaited()
-    terminate.assert_awaited_once()
-
-
-async def test_successful_compaction_reload_error_does_not_terminate(monkeypatch):
-    """A transient reload failure after a committed compaction is not terminal."""
-    from app.services.llm.compactor import CompactionResult
-    from app.services.llm.session_context_guard import CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
-
-    agent, model = _make_agent_and_model()
-    llm = AsyncMock(return_value="must not run")
-    monkeypatch.setattr("app.services.llm.call_llm_with_failover", llm, raising=False)
-    monkeypatch.setattr(
-        "app.services.llm.compactor.maybe_precompact_prompt",
-        AsyncMock(return_value=CompactionResult(triggered=True, required=True)),
-    )
-    monkeypatch.setattr(
-        "app.services.llm.session_context_guard.get_session_context_termination",
-        AsyncMock(return_value=None),
-    )
-    monkeypatch.setattr(
-        "app.services.chat_history.load_history_for_llm",
-        AsyncMock(side_effect=RuntimeError("temporary reload failure")),
-    )
-    terminate = AsyncMock(return_value="terminated")
-    monkeypatch.setattr(
-        "app.services.llm.session_context_guard.terminate_session_context",
-        terminate,
-    )
-
-    reply = await channel_llm._call_agent_llm(
-        _make_db(agent, model),
-        agent.id,
-        "继续处理",
-        session_id=str(agent.id),
-        user_id=agent.id,
-    )
-
-    assert reply == CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
-    llm.assert_not_awaited()
+    assert reply == "继续成功"
+    get_termination.assert_not_awaited()
     terminate.assert_not_awaited()
 
 
-async def test_below_threshold_preflight_exception_does_not_terminate_session(monkeypatch):
-    """An ordinary platform preflight error is reported without poisoning the session."""
-    from app.services.llm.session_context_guard import (
-        CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE,
-    )
+async def test_fresh_channel_turn_recovery_reloads_only_prefix_and_keeps_current(monkeypatch):
+    from app.services.llm.compactor import CompactionResult
 
     agent, model = _make_agent_and_model()
-    llm = AsyncMock(return_value="must not run")
-    monkeypatch.setattr("app.services.llm.call_llm_with_failover", llm, raising=False)
-    monkeypatch.setattr(
-        "app.services.llm.compactor.maybe_precompact_prompt",
-        AsyncMock(side_effect=RuntimeError("temporary preflight failure")),
+    model.keep_recent_turns = 8
+    fallback_model = SimpleNamespace(
+        id=uuid.uuid4(),
+        model="fallback-model",
+        enabled=True,
+        supports_vision=False,
+        request_timeout=None,
+        keep_recent_turns=12,
     )
-    monkeypatch.setattr(
-        "app.services.llm.session_context_guard.get_session_context_termination",
-        AsyncMock(return_value=None),
+    agent.fallback_model_id = fallback_model.id
+    anchor = uuid.uuid4()
+    compact = AsyncMock(return_value=CompactionResult(triggered=True, required=True))
+    load_prefix = AsyncMock(
+        return_value=[{"role": "user", "content": "<conversation-summary>old</conversation-summary>"}]
     )
-    terminate = AsyncMock(return_value="terminated")
+    monkeypatch.setattr("app.services.llm.compactor.maybe_compact", compact)
     monkeypatch.setattr(
-        "app.services.llm.session_context_guard.terminate_session_context",
-        terminate,
+        "app.services.chat_history.load_history_prefix_before_anchor",
+        load_prefix,
     )
+
+    class _SessionContext:
+        async def __aenter__(self):
+            return SimpleNamespace()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(channel_llm, "async_session", lambda: _SessionContext())
+    recovered = []
+
+    async def fake_llm(*_args, context_recovery=None, primary_model=None, **_kwargs):
+        assert context_recovery is not None
+        recovered.extend(
+                await context_recovery(
+                    primary_model,
+                    SimpleNamespace(estimated_tokens=999, char_overflow=True),
+                )
+        )
+        return "恢复成功"
+
+    monkeypatch.setattr("app.services.llm.call_llm_with_failover", fake_llm, raising=False)
 
     reply = await channel_llm._call_agent_llm(
-        _make_db(agent, model),
+        _make_db(agent, model, fallback_model),
         agent.id,
-        "继续处理",
+        "当前问题原文",
         session_id=str(agent.id),
         user_id=agent.id,
+        history=[{"role": "user", "content": "旧历史"}],
+        turn_anchor_id=anchor,
     )
 
-    assert reply == CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE
-    llm.assert_not_awaited()
-    terminate.assert_not_awaited()
+    assert reply == "恢复成功"
+    assert recovered == [
+        {"role": "user", "content": "<conversation-summary>old</conversation-summary>"},
+        {"role": "user", "content": "当前问题原文"},
+    ]
+    assert compact.await_args.kwargs["force_required"] is True
+    assert compact.await_args.kwargs["current_anchor_id"] == anchor
+    assert compact.await_args.kwargs["keep_recent_turns_override"] == 12
 
 
 async def test_im_turn_broadcasts_events_to_web_session(monkeypatch):

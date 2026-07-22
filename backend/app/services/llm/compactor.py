@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import func, select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
@@ -52,6 +52,7 @@ from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction
 from app.models.llm import LLMModel
 from app.services.image_context import IMAGE_DATA_PATTERN
+from app.services.llm.turn_partition import partition_turns
 
 
 # ─── Configuration constants ─────────────────────────────────────────
@@ -321,50 +322,19 @@ def select_compaction_span(
     rows: list[ChatMessage],
     keep_recent_turns: int,
 ) -> tuple[int, int] | None:
-    """Pick the ``[from_idx, to_idx]`` slice of ``rows`` to compact.
+    """Pick a continuous prefix of complete turns for compaction.
 
-    ``rows`` is the active (``compacted_into IS NULL``) message stream
-    in chronological order, excluding any prior compaction's summary.
-    Returns ``None`` when there isn't enough history to be worth
-    compacting (fewer than ``keep_recent_turns`` complete rounds in
-    the trailing window plus at least one round of older content to
-    fold into the summary).
-
-    Algorithm:
-    1. Walk backward through ``rows``, counting user-message
-       boundaries until we've seen ``keep_recent_turns`` of them. The
-       message *before* that boundary is the natural cut point.
-    2. The compacted span is ``rows[0:cut]``; the active trailing
-       window is ``rows[cut:]``.
-    3. Refuse to compact a span shorter than 4 rows — too little gain.
+    At least eight recent complete turns, plus every incomplete or ambiguous
+    turn, remain byte-for-byte active. Token mass, not row count, decides
+    whether the selected prefix is worth summarising.
     """
-    if not rows:
+    compactable = partition_turns(
+        rows,
+        keep_recent_turns=keep_recent_turns,
+    ).compactable_rows
+    if not compactable:
         return None
-
-    user_boundaries_seen = 0
-    cut_idx: int | None = None
-    for i in range(len(rows) - 1, -1, -1):
-        if rows[i].role == "user":
-            user_boundaries_seen += 1
-            if user_boundaries_seen >= keep_recent_turns:
-                cut_idx = i
-                break
-
-    if cut_idx is None or cut_idx < 4:
-        return None
-
-    # The compacted span ends at the message immediately *before* the
-    # trailing keep window's first user message — that's cut_idx - 1.
-    # We further enforce that the span itself ends on a round boundary
-    # (no orphan tool_call dangling at compacted_to).
-    span_to = cut_idx - 1
-    while span_to > 0 and rows[span_to].role != "assistant":
-        span_to -= 1
-
-    if span_to < 1:
-        return None
-
-    return (0, span_to)
+    return (0, len(compactable) - 1)
 
 
 # ─── Pre-filtering ───────────────────────────────────────────────────
@@ -552,6 +522,65 @@ async def _summarize_via_llm(
     LLM client directly.
     """
     from app.services.llm import create_llm_client, get_model_api_key, LLMMessage
+    from app.services.llm.caller import measure_dispatch
+
+    def _messages(candidate_span: str) -> list[LLMMessage]:
+        user_payload = []
+        if prior_summary:
+            user_payload.append(
+                "<prior-summary epoch_n_minus_1>\n"
+                + prior_summary
+                + "\n</prior-summary>\n"
+            )
+        user_payload.append("<chat-segment>\n" + candidate_span + "\n</chat-segment>")
+        return [
+            LLMMessage(role="system", content=SUMMARY_SYSTEM_PROMPT),
+            LLMMessage(role="user", content="\n\n".join(user_payload)),
+        ]
+
+    messages = _messages(span_text)
+    budget = measure_dispatch(
+        model=model,
+        messages=messages,
+        tools=None,
+        max_output_tokens=model.compact_summary_max_tokens,
+    )
+    if not budget.fits:
+        identifiers = sorted(extract_preserved_identifiers(span_text))
+        identifier_block = "\n\n### Exact identifiers\n" + "\n".join(
+            f"- {identifier}" for identifier in identifiers
+        )
+
+        def _candidate(keep_chars: int) -> str:
+            head_chars = keep_chars // 2
+            tail_chars = keep_chars - head_chars
+            omitted = max(0, len(span_text) - keep_chars)
+            return (
+                span_text[:head_chars]
+                + f"\n\n…[bounded summary input omitted {omitted} chars]…\n\n"
+                + (span_text[-tail_chars:] if tail_chars else "")
+                + identifier_block
+            )
+
+        low, high = 0, len(span_text)
+        best: list[LLMMessage] | None = None
+        while low <= high:
+            mid = (low + high) // 2
+            candidate_messages = _messages(_candidate(mid))
+            candidate_budget = measure_dispatch(
+                model=model,
+                messages=candidate_messages,
+                tools=None,
+                max_output_tokens=model.compact_summary_max_tokens,
+            )
+            if candidate_budget.fits:
+                best = candidate_messages
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best is None:
+            raise ValueError("summary_prompt_cannot_fit_safely")
+        messages = best
 
     api_key = get_model_api_key(model)
     client = create_llm_client(
@@ -560,20 +589,6 @@ async def _summarize_via_llm(
         api_key=api_key,
         model=model.model,
     )
-
-    user_payload = []
-    if prior_summary:
-        user_payload.append(
-            "<prior-summary epoch_n_minus_1>\n"
-            + prior_summary
-            + "\n</prior-summary>\n"
-        )
-    user_payload.append("<chat-segment>\n" + span_text + "\n</chat-segment>")
-
-    messages = [
-        LLMMessage(role="system", content=SUMMARY_SYSTEM_PROMPT),
-        LLMMessage(role="user", content="\n\n".join(user_payload)),
-    ]
 
     response = await client.complete(
         messages,
@@ -593,6 +608,9 @@ async def maybe_compact(
     model: LLMModel,
     last_prompt_tokens: int | None = None,
     pre_flight_estimate: int | None = None,
+    current_anchor_id: uuid.UUID | None = None,
+    force_required: bool = False,
+    keep_recent_turns_override: int | None = None,
 ) -> CompactionResult:
     """Main entry point.
 
@@ -612,6 +630,15 @@ async def maybe_compact(
         last_prompt_tokens=last_prompt_tokens,
         pre_flight_estimate=pre_flight_estimate,
     )
+    if force_required and not fire:
+        context_window = int(getattr(model, "context_window", 0) or 0)
+        ratio = (
+            (pre_flight_estimate or last_prompt_tokens or 0) / context_window
+            if context_window > 0
+            else 0.0
+        )
+        fire = True
+        reason = "provider_hard_limit"
     if not fire:
         return CompactionResult(triggered=False, skipped_reason=reason)
 
@@ -652,6 +679,8 @@ async def maybe_compact(
                 trigger_prompt_tokens=last_prompt_tokens or pre_flight_estimate or 0,
                 trigger_ratio=ratio,
                 trigger_reason=reason,
+                current_anchor_id=current_anchor_id,
+                keep_recent_turns_override=keep_recent_turns_override,
             )
             if (
                 waited_for_concurrent
@@ -691,6 +720,7 @@ async def maybe_precompact_prompt(
     conversation_id: str,
     model: LLMModel,
     prompt_messages: list[dict],
+    current_anchor_id: uuid.UUID | None = None,
 ) -> CompactionResult:
     """Pre-flight compaction guard for the channel / web entry points.
 
@@ -714,6 +744,7 @@ async def maybe_precompact_prompt(
         conversation_id=conversation_id,
         model=model,
         pre_flight_estimate=estimate,
+        current_anchor_id=current_anchor_id,
     )
 
 
@@ -726,25 +757,52 @@ async def _do_compact(
     trigger_prompt_tokens: int,
     trigger_ratio: float,
     trigger_reason: str,
+    current_anchor_id: uuid.UUID | None = None,
+    keep_recent_turns_override: int | None = None,
 ) -> CompactionResult:
     async with async_session() as db:
+        # Serialize compactions for this session across backend processes.
+        # PostgreSQL releases this transaction-scoped lock automatically.
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:session_id, 0))"),
+            {"session_id": session_id},
+        )
+
         # 1. Load all currently-active messages (compacted_into IS NULL)
         rows = await _load_active_rows(db, agent_id=agent_id, conversation_id=conversation_id)
+
+        if current_anchor_id is not None and (
+            not rows
+            or str(rows[-1].id) != str(current_anchor_id)
+            or rows[-1].role != "user"
+        ):
+            return CompactionResult(
+                triggered=False,
+                skipped_reason="current_anchor_is_not_latest_user",
+            )
 
         # 2. Pull prior epoch's summary (if any) — chained accumulation
         prior_summary, prior_epoch, prior_marker_id = await _load_active_marker(
             db, session_id=session_id
         )
 
-        # 3. Pick the span
-        span = select_compaction_span(rows, keep_recent_turns=model.keep_recent_turns)
-        if span is None:
+        # 3. Pick complete historical turns strictly before the protected
+        # current/recent suffix.
+        turn_partition = partition_turns(
+            rows,
+            current_anchor_id=str(current_anchor_id) if current_anchor_id else None,
+            keep_recent_turns=max(
+                int(getattr(model, "keep_recent_turns", 0) or 0),
+                int(keep_recent_turns_override or 0),
+            ),
+        )
+        span_rows = turn_partition.compactable_rows
+        if not span_rows:
             return CompactionResult(
                 triggered=False,
                 skipped_reason="span_too_small_to_be_worth_compacting",
             )
-        from_idx, to_idx = span
-        span_rows = rows[from_idx:to_idx + 1]
+        expected_span_ids = tuple(str(row.id) for row in span_rows)
 
         # 3.5 Futility floor — BEFORE the expensive summary LLM call.
         # If the span's token mass can't meaningfully dent the prompt,
@@ -805,6 +863,39 @@ async def _do_compact(
             max_tokens=model.compact_summary_max_tokens,
         )
 
+        # The summary model call can take seconds. Re-read under the advisory
+        # lock and reject stale work if another turn changed the boundary.
+        fresh_rows = await _load_active_rows(
+            db,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+        if current_anchor_id is not None and (
+            not fresh_rows
+            or str(fresh_rows[-1].id) != str(current_anchor_id)
+            or fresh_rows[-1].role != "user"
+        ):
+            return CompactionResult(
+                triggered=False,
+                skipped_reason="conversation_changed_during_compaction",
+            )
+        fresh_span_ids = tuple(
+            str(row.id)
+            for row in partition_turns(
+                fresh_rows,
+                current_anchor_id=str(current_anchor_id) if current_anchor_id else None,
+                keep_recent_turns=max(
+                    int(getattr(model, "keep_recent_turns", 0) or 0),
+                    int(keep_recent_turns_override or 0),
+                ),
+            ).compactable_rows
+        )
+        if fresh_span_ids != expected_span_ids:
+            return CompactionResult(
+                triggered=False,
+                skipped_reason="compactable_span_changed_during_compaction",
+            )
+
         # 7. Persist (always — failed validations get rows too, for audit)
         new_epoch = (prior_epoch or 0) + 1
         summary_tokens = (summary_usage or {}).get("completion_tokens") or len(summary) // 3
@@ -842,11 +933,19 @@ async def _do_compact(
             # validation rows live in chat_compactions for audit but
             # don't take effect on live conversations.
             if passed and not _is_dryrun():
-                await db.execute(
+                update_result = await db.execute(
                     update(ChatMessage)
-                    .where(ChatMessage.id.in_([r.id for r in span_rows]))
+                    .where(
+                        ChatMessage.id.in_([r.id for r in span_rows]),
+                        ChatMessage.compacted_into.is_(None),
+                    )
                     .values(compacted_into=compaction.id)
                 )
+                if update_result.rowcount != len(span_rows):
+                    raise RuntimeError(
+                        "compaction row count changed concurrently: "
+                        f"expected={len(span_rows)} updated={update_result.rowcount}"
+                    )
                 if prior_marker_id is not None:
                     await db.execute(
                         update(ChatCompaction)
@@ -944,7 +1043,14 @@ async def _load_active_rows(
         )
         .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
     )
-    return list(result.scalars().all())
+    return [
+        row
+        for row in result.scalars().all()
+        if not (
+            isinstance(getattr(row, "message_meta", None), dict)
+            and row.message_meta.get("consumed_by_onmessage")
+        )
+    ]
 
 
 async def _load_compaction_state(
@@ -955,17 +1061,15 @@ async def _load_compaction_state(
 ) -> tuple[int, uuid.UUID | None]:
     """Return the minimal persisted state needed to detect concurrent work."""
     async with async_session() as db:
-        active_count = (
-            await db.execute(
-                select(func.count(ChatMessage.id)).where(
-                    ChatMessage.agent_id == agent_id,
-                    ChatMessage.conversation_id == conversation_id,
-                    ChatMessage.compacted_into.is_(None),
-                )
+        active_count = len(
+            await _load_active_rows(
+                db,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
             )
-        ).scalar_one()
+        )
         _, _, marker_id = await _load_active_marker(db, session_id=session_id)
-    return int(active_count or 0), marker_id
+    return active_count, marker_id
 
 
 async def _load_active_marker(
