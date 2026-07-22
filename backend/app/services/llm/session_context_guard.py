@@ -15,7 +15,13 @@ SESSION_CONTEXT_TERMINATED_MESSAGE = (
     "上下文过长，请新开会话。"
 )
 
-IM_SESSION_CONTEXT_TERMINATED_MESSAGE = "上下文过长，请发送 /new 指令重置上下文。"
+IM_SESSION_CONTEXT_TERMINATED_MESSAGE = (
+    "当前对话内容较多，已超过可处理的上下文范围，本次任务暂时无法继续。\n\n"
+    "请在当前聊天中单独发送一条消息：\n"
+    "/new\n\n"
+    "请只发送 /new，不要在同一条消息中添加其他文字或附件。"
+    "系统重置成功后，请重新发送刚才的需求；如有附件，请一并重新发送。"
+)
 
 CONTEXT_PREFLIGHT_CHECK_FAILED_MESSAGE = (
     "当前请求在发送模型前的上下文检查失败，平台未发起模型调用。"

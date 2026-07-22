@@ -112,6 +112,8 @@ async def test_handle_channel_command_scopes_lookup_by_source_channel():
     )
 
     assert result["action"] == "new_session"
+    assert "下一条消息将开启新对话" in result["message"]
+    assert "重新发送刚才的需求" in result["message"]
     # Exactly one SELECT for the old-session lookup.
     assert len(db.executed) == 1
     q = db.executed[0]

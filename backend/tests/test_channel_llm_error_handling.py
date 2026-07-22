@@ -162,7 +162,9 @@ async def test_context_limit_uses_short_im_reset_message(monkeypatch):
         user_id=agent.id,
     )
 
-    assert reply == "上下文过长，请发送 /new 指令重置上下文。"
+    assert "单独发送一条消息" in reply
+    assert "/new" in reply
+    assert "不要在同一条消息中添加其他文字或附件" in reply
 
 
 async def test_required_preflight_compaction_failure_terminates_without_llm(monkeypatch):

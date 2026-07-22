@@ -8,7 +8,6 @@ so the LLM can see images from previous turns.
 import base64
 import re
 from pathlib import Path
-from typing import Optional
 
 from loguru import logger
 from app.config import get_settings
@@ -92,11 +91,17 @@ def rehydrate_image_messages(
             b64 = base64.b64encode(img_bytes).decode("ascii")
             ext = file_path.suffix.lower().lstrip('.')
             mime = f"image/{'jpeg' if ext == 'jpg' else ext}"
-            marker = f"[image_data:data:{mime};base64,{b64}]"
+            data_url = f"data:{mime};base64,{b64}"
 
-            # Append image_data marker to existing content
+            # Build the same structured multimodal shape the LLM clients
+            # ultimately consume.  Keeping base64 inside an opaque text marker
+            # made the pre-flight estimator count transport bytes as language
+            # tokens and could falsely terminate otherwise healthy sessions.
             old_content = result[idx]["content"]
-            result[idx] = {**result[idx], "content": f"{old_content}\n{marker}"}
+            parts = [{"type": "image_url", "image_url": {"url": data_url}}]
+            if old_content:
+                parts.append({"type": "text", "text": old_content})
+            result[idx] = {**result[idx], "content": parts}
             rehydrated += 1
             logger.debug(f"[ImageContext] Re-hydrated: {filename}")
 

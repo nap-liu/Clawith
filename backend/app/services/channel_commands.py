@@ -163,7 +163,10 @@ async def handle_channel_command(
         # instead of being locked to a hard-coded placeholder.
         return {
             "action": "new_session",
-            "message": "已开启新对话，之前的上下文已清除。",
+            "message": (
+                "当前对话已重置。你的下一条消息将开启新对话。"
+                "请重新发送刚才的需求；如有附件，请一并重新发送。"
+            ),
         }
 
     return {"action": "unknown", "message": f"未知命令: {cmd}"}

@@ -18,9 +18,10 @@ from types import SimpleNamespace
 import pytest
 
 from app.services.llm.compactor import (
-    PRE_FLIGHT_TRIGGER_RATIO,
     UUID_RECALL_THRESHOLD,
+    append_missing_identifiers,
     estimate_prompt_tokens,
+    extract_preserved_identifiers,
     prefilter_message_content,
     select_compaction_span,
     should_compact,
@@ -302,6 +303,50 @@ class TestValidateSummary:
         assert passed is True
         assert recall == 1.0
 
+    def test_missing_commands_and_ids_are_appended_before_validation(self):
+        opaque_id = "5baa7373-b5c5-9eb4-8d10-d81aef980b1c"
+        original = (
+            "Use /new if recovery is needed. "
+            f"Dataset {opaque_id}. "
+            "Read workspace/report.md and https://example.test/report/42"
+        )
+        summary = """\
+## Summary of earlier conversation
+
+### Key facts
+- The report workflow and recovery procedure were discussed.
+
+### Files / paths / IDs referenced
+- workspace/report.md
+- https://example.test/report/42
+"""
+
+        repaired, missing = append_missing_identifiers(
+            summary=summary,
+            original_text=original,
+        )
+        passed, reason, recall = validate_summary(
+            summary=repaired,
+            original_text=original,
+            max_tokens=2000,
+        )
+
+        assert missing == ["/new", opaque_id]
+        assert "### Preserved identifiers" in repaired
+        assert passed is True
+        assert reason is None
+        assert recall == 1.0
+
+    def test_slash_commands_are_classified_without_path_artifacts(self):
+        identifiers = extract_preserved_identifiers(
+            r"Send /new, then read workspace/report.md; ignore /\nartifact."
+        )
+
+        assert "/new" in identifiers
+        assert "workspace/report.md" in identifiers
+        assert "/" not in identifiers
+        assert not any(identifier.startswith("/\\") for identifier in identifiers)
+
 
 # ─── estimate_prompt_tokens ─────────────────────────────────────────
 
@@ -331,6 +376,16 @@ class TestEstimatePromptTokens:
         ]
         # 1024 placeholder chars per image, estimated at three ASCII chars/token.
         assert estimate_prompt_tokens(msgs) == 342
+
+    def test_legacy_base64_image_markers_get_fixed_cost(self):
+        small = "[image_data:data:image/jpeg;base64," + "A" * 40 + "]"
+        large = "[image_data:data:image/jpeg;base64," + "A" * 400_000 + "]"
+
+        small_estimate = estimate_prompt_tokens([{"role": "user", "content": small}])
+        large_estimate = estimate_prompt_tokens([{"role": "user", "content": large}])
+
+        assert small_estimate == 342
+        assert large_estimate == small_estimate
 
     def test_tool_call_arguments_counted(self):
         msgs = [

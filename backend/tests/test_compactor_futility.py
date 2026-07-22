@@ -165,3 +165,43 @@ async def test_large_span_still_compacts(monkeypatch):
 
     assert result.triggered is True
     assert result.epoch == 2
+
+
+@pytest.mark.asyncio
+async def test_compaction_applies_after_mechanically_preserving_missing_identifiers(monkeypatch):
+    db = _FakeDB()
+    opaque_id = "5baa7373-b5c5-9eb4-8d10-d81aef980b1c"
+    rows = _rows_with_span(4000)
+    rows[0].content = f"Use /new, dataset {opaque_id}. " + rows[0].content
+    summary = (
+        "## Summary of earlier conversation\n\n"
+        "### Key facts\n"
+        "- The earlier conversation discussed a dataset and recovery procedure.\n"
+        "- The user expects the agent to continue from a compact summary.\n\n"
+        "### Open items\n"
+        "- Continue the pending work after compaction is complete.\n"
+    )
+    monkeypatch.setattr(compactor, "async_session", _fake_session_factory(db))
+    monkeypatch.setattr(compactor, "_load_active_rows", AsyncMock(return_value=rows))
+    monkeypatch.setattr(compactor, "_load_active_marker", AsyncMock(return_value=(None, None, None)))
+    monkeypatch.setattr(
+        compactor,
+        "_summarize_via_llm",
+        AsyncMock(return_value=(summary, {"completion_tokens": 100})),
+    )
+
+    result = await _do_compact(
+        agent_id=uuid.uuid4(),
+        session_id="s4",
+        conversation_id="s4",
+        model=_FakeModel(),
+        trigger_prompt_tokens=100_000,
+        trigger_ratio=3.1,
+        trigger_reason="pre_flight",
+    )
+
+    assert result.triggered is True
+    assert db.committed is True
+    assert db.added[0].summary_validation_passed is True
+    assert "/new" in db.added[0].summary_text
+    assert opaque_id in db.added[0].summary_text

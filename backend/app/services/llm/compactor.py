@@ -51,6 +51,7 @@ from app.database import async_session
 from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction
 from app.models.llm import LLMModel
+from app.services.image_context import IMAGE_DATA_PATTERN
 
 
 # ─── Configuration constants ─────────────────────────────────────────
@@ -84,6 +85,11 @@ MIN_SUMMARY_CHARS = 200
 # compaction cannot touch — running the summary LLM would block the
 # turn for tens of seconds every round while never lowering the ratio.
 MIN_COMPACTABLE_SPAN_TOKENS = 2000
+
+# Vision payloads are transported as base64, but the encoded bytes are not
+# language tokens.  Use one provider-neutral conservative placeholder for both
+# legacy string markers and structured multimodal image blocks.
+VISION_IMAGE_ESTIMATE_CHARS = 1024
 
 # Summary LLM gets this prompt verbatim. Wording is deliberate — the
 # "preserve verbatim" + "drop pleasantries" structure is what keeps
@@ -177,30 +183,39 @@ def estimate_prompt_tokens(api_messages: list[dict]) -> int:
     (via ``last_prompt_tokens`` argument).
     """
     chunks: list[str] = []
+
+    def _append_text(value: str) -> None:
+        image_count = len(IMAGE_DATA_PATTERN.findall(value))
+        if image_count:
+            chunks.append(IMAGE_DATA_PATTERN.sub("", value))
+            chunks.extend("x" * VISION_IMAGE_ESTIMATE_CHARS for _ in range(image_count))
+        else:
+            chunks.append(value)
+
     for msg in api_messages:
         c = msg.get("content")
         if isinstance(c, str):
-            chunks.append(c)
+            _append_text(c)
         elif isinstance(c, list):
             for block in c:
                 if isinstance(block, dict):
                     t = block.get("text")
                     if isinstance(t, str):
-                        chunks.append(t)
+                        _append_text(t)
                     elif "image_url" in block or block.get("type") == "image":
                         # Count placeholder cost; vision tokens are
                         # provider-specific and hard to estimate.
-                        chunks.append("x" * 1024)
+                        chunks.append("x" * VISION_IMAGE_ESTIMATE_CHARS)
         for tc in msg.get("tool_calls", []) or []:
             args = tc.get("function", {}).get("arguments", "")
             if isinstance(args, str):
-                chunks.append(args)
+                _append_text(args)
             elif isinstance(args, dict):
                 import json as _j
-                chunks.append(_j.dumps(args, ensure_ascii=False))
+                _append_text(_j.dumps(args, ensure_ascii=False))
         reasoning = msg.get("reasoning_content")
         if isinstance(reasoning, str):
-            chunks.append(reasoning)
+            _append_text(reasoning)
 
     combined = "".join(chunks)
     cjk_chars = sum(
@@ -420,7 +435,46 @@ _UUID_LIKE_RE = re.compile(r"\b[a-f0-9]{32}\b|\b[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A
 _PATH_RE = re.compile(
     r"(?:^|\s)((?:/|\./|\.\./|[A-Za-z]:\\|workspace/|memory/|skills/)[^\s'\"<>]*?)(?=[\s,;:!?]|$)"
 )
+_URL_RE = re.compile(r"\bhttps?://[^\s'\"<>]*?(?=[\s,;!?]|$)", re.IGNORECASE)
+_SLASH_COMMAND_RE = re.compile(
+    r"(?<!\S)/(?:new|reset|help|stop|thinking|think)(?:\s+(?:on|off|status))?(?=[\s,;:!?]|$)",
+    re.IGNORECASE,
+)
+_KNOWN_SLASH_COMMANDS = {"/new", "/reset", "/help", "/stop", "/thinking", "/think"}
 _HEADING_RE = re.compile(r"^#{2,3}\s", re.MULTILINE)
+
+
+def extract_preserved_identifiers(text: str) -> set[str]:
+    """Extract identifiers that must survive a conversation compaction."""
+    source = text or ""
+    identifiers = set(_UUID_LIKE_RE.findall(source))
+    identifiers.update(_URL_RE.findall(source))
+    identifiers.update(match.group(0) for match in _SLASH_COMMAND_RE.finditer(source))
+
+    for match in _PATH_RE.finditer(source):
+        candidate = match.group(1)
+        normalized = candidate.lower()
+        # Slash commands have their own semantic class.  Also discard regex
+        # artifacts such as a bare slash or JSON's escaped-newline prefix.
+        if normalized in _KNOWN_SLASH_COMMANDS or candidate == "/" or candidate.startswith("/\\"):
+            continue
+        identifiers.add(candidate)
+    return identifiers
+
+
+def append_missing_identifiers(*, summary: str, original_text: str) -> tuple[str, list[str]]:
+    """Mechanically preserve exact identifiers the summary model omitted."""
+    rendered = (summary or "").strip()
+    missing = sorted(
+        identifier
+        for identifier in extract_preserved_identifiers(original_text)
+        if identifier not in rendered
+    )
+    if not missing:
+        return rendered, []
+
+    appendix = "\n".join(["### Preserved identifiers", *(f"- {identifier}" for identifier in missing)])
+    return f"{rendered}\n\n{appendix}".strip(), missing
 
 
 def validate_summary(
@@ -449,9 +503,7 @@ def validate_summary(
 
     # UUID + path recall: how much of what was in the original made it
     # into the summary, as a proxy for "didn't lose critical IDs".
-    original_ids = set(_UUID_LIKE_RE.findall(original_text or "")) | {
-        m.group(1) for m in _PATH_RE.finditer(original_text or "")
-    }
+    original_ids = extract_preserved_identifiers(original_text)
     if not original_ids:
         # Span had no IDs to recall — this gate is vacuously satisfied.
         return True, None, 1.0
@@ -731,6 +783,19 @@ async def _do_compact(
             return CompactionResult(
                 triggered=False,
                 skipped_reason=f"summary_llm_error:{type(exc).__name__}",
+            )
+
+        # 5.5 Deterministically preserve exact identifiers before validation.
+        # A structurally sound summary must not brick a session because the
+        # model omitted one opaque UUID, URL, path, or slash command.
+        summary, appended_identifiers = append_missing_identifiers(
+            summary=summary,
+            original_text=span_text,
+        )
+        if appended_identifiers:
+            logger.info(
+                f"[compactor] appended {len(appended_identifiers)} missing identifiers "
+                f"for session={session_id}"
             )
 
         # 6. Validate

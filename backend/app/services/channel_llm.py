@@ -24,7 +24,10 @@ from app.core.permissions import is_agent_expired
 # LLM-layer error sentinels surfaced verbatim to the IM user, followed by a
 # recovery hint that guides them to reset the session with /new.
 _LLM_ERROR_PREFIXES = ("[LLM Error]", "[LLM call error]", "[Error]")
-_IM_LLM_RECOVERY_HINT = "\n\n———\n如果反复出现此问题，请发送 /new 开启新对话后重试。"
+_IM_LLM_RECOVERY_HINT = (
+    "\n\n———\n如果反复出现此问题，请在当前聊天中单独发送一条消息：/new。"
+    "请不要在同一条消息中添加其他文字或附件；重置成功后再重新发送需求和附件。"
+)
 
 
 def _apply_recovery_hint(reply: str, hint: str | None) -> str:
