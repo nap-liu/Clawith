@@ -13,8 +13,14 @@ from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.auth_provider import OAuth2AuthProvider
 from app.services.auth_registry import auth_provider_registry
+from app.services.auth_code_exchange import validate_platform_login_channel
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_neutral_miniprogram_channel_is_supported_for_platform_login():
+    assert validate_platform_login_channel("miniprogram") == "miniprogram"
+    assert validate_platform_login_channel("wechat_miniprogram") == "wechat_miniprogram"
 
 
 @pytest.fixture(autouse=True)

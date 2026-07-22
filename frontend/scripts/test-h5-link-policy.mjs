@@ -1,42 +1,21 @@
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import vm from 'node:vm';
-
-const require = createRequire(import.meta.url);
-const ts = require('typescript');
+import { loadTypeScriptModule } from './load-typescript-module.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const sourcePath = resolve(__dirname, '../src/utils/h5LinkPolicy.ts');
-const source = readFileSync(sourcePath, 'utf8');
-const compiled = ts.transpileModule(source, {
-    compilerOptions: {
-        module: ts.ModuleKind.CommonJS,
-        target: ts.ScriptTarget.ES2020,
-        esModuleInterop: true,
-    },
-}).outputText;
-
-const module = { exports: {} };
-vm.runInNewContext(compiled, {
-    module,
-    exports: module.exports,
-    require,
-    console,
-    URL,
-}, { filename: sourcePath });
 
 const {
     resolveExternalHttpLink,
     resolveH5LinkAction,
-} = module.exports;
+} = loadTypeScriptModule(sourcePath, { URL });
 
 function assertLinkAction(actual, expected) {
     assert.equal(actual.type, expected.type);
     assert.equal(actual.url, expected.url);
     assert.equal(actual.reason, expected.reason);
+    assert.equal(actual.route, expected.route);
 }
 
 const current = 'https://ai.example.test/h5/agents/a1/chat?channel=wechat_miniprogram';
@@ -53,6 +32,35 @@ assert.equal(
 assert.equal(resolveExternalHttpLink('mailto:help@example.com', current), null);
 assert.equal(resolveExternalHttpLink('javascript:alert(1)', current), null);
 assert.equal(resolveExternalHttpLink('https://[invalid', current), null);
+
+assertLinkAction(
+    resolveH5LinkAction('miniprogram://navigate-to/pages/order/detail?id=123', {
+        currentHref: current,
+        runtime: 'wechat-miniapp-webview',
+    }),
+    { type: 'wechat-miniapp-navigate', route: '/pages/order/detail?id=123' },
+);
+assertLinkAction(
+    resolveH5LinkAction('miniprogram://navigate-to/pages/order/detail?id=123', {
+        currentHref: current,
+        runtime: 'dingtalk-miniapp-webview',
+    }),
+    { type: 'dingtalk-miniapp-navigate', route: '/pages/order/detail?id=123' },
+);
+assertLinkAction(
+    resolveH5LinkAction('miniprogram://navigate-to/pages/order/detail?id=123', {
+        currentHref: current,
+        runtime: 'standard',
+    }),
+    { type: 'miniprogram-unavailable' },
+);
+assertLinkAction(
+    resolveH5LinkAction('miniprogram://navigate-to/pages/%2e%2e/admin', {
+        currentHref: current,
+        runtime: 'wechat-miniapp-webview',
+    }),
+    { type: 'invalid-miniprogram-uri' },
+);
 
 assertLinkAction(
     resolveH5LinkAction('https://docs.example.com/path?q=中文#part', {

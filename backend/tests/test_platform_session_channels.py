@@ -58,18 +58,18 @@ async def test_primary_platform_sessions_are_scoped_by_source_channel():
             db,
             agent_id,
             user_id,
-            source_channel="wechat_miniprogram",
+            source_channel="miniprogram",
         )
         second_h5_session = await ensure_primary_platform_session(
             db,
             agent_id,
             user_id,
-            source_channel="wechat_miniprogram",
+            source_channel="miniprogram",
         )
 
     assert web_session.id != h5_session.id
     assert web_session.source_channel == "web"
-    assert h5_session.source_channel == "wechat_miniprogram"
+    assert h5_session.source_channel == "miniprogram"
     assert second_h5_session.id == h5_session.id
 
 
@@ -81,23 +81,56 @@ async def test_create_session_accepts_h5_source_channel():
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         resp = await client.post(
             f"/api/agents/{agent_id}/sessions",
-            json={"source_channel": "wechat_miniprogram"},
+            json={"source_channel": "miniprogram"},
             headers={"Authorization": f"Bearer {token}"},
         )
 
     assert resp.status_code == 201, resp.text
     body = resp.json()
-    assert body["source_channel"] == "wechat_miniprogram"
+    assert body["source_channel"] == "miniprogram"
     assert body["is_primary"] is True
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         sessions_resp = await client.get(
-            f"/api/agents/{agent_id}/sessions?scope=mine&source_channel=wechat_miniprogram",
+            f"/api/agents/{agent_id}/sessions?scope=mine&source_channel=miniprogram",
             headers={"Authorization": f"Bearer {token}"},
         )
 
     assert sessions_resp.status_code == 200, sessions_resp.text
     assert [row["id"] for row in sessions_resp.json()] == [body["id"]]
+
+
+async def test_miniprogram_channel_exposes_neutral_runtime_context():
+    handler = WebSocketChatHandler(
+        websocket=None,
+        agent_id=uuid.uuid4(),
+        token="unused",
+        session_id=None,
+        lang="zh",
+        channel="miniprogram",
+    )
+
+    context = handler._channel_context()
+
+    assert context["source_channel"] == "miniprogram"
+    assert context["display_name"] == "小程序"
+    assert context["client_surface"] == "mini-program web-view"
+
+
+async def test_legacy_wechat_miniprogram_channel_keeps_neutral_runtime_context():
+    handler = WebSocketChatHandler(
+        websocket=None,
+        agent_id=uuid.uuid4(),
+        token="unused",
+        session_id=None,
+        lang="zh",
+        channel="wechat_miniprogram",
+    )
+
+    context = handler._channel_context()
+
+    assert context["source_channel"] == "wechat_miniprogram"
+    assert context["display_name"] == "小程序"
 
 
 async def test_primary_session_is_not_lost_after_first_page_of_active_history():
@@ -162,7 +195,7 @@ async def test_websocket_default_session_uses_channel_when_no_session_id():
             db,
             agent_id,
             user_id,
-            source_channel="wechat_miniprogram",
+            source_channel="miniprogram",
         )
         older_h5_session.created_at = now
         older_h5_session.last_message_at = now + timedelta(hours=2)
@@ -170,7 +203,7 @@ async def test_websocket_default_session_uses_channel_when_no_session_id():
             id=uuid.uuid4(),
             agent_id=agent_id,
             user_id=user_id,
-            source_channel="wechat_miniprogram",
+            source_channel="miniprogram",
             title="Newest H5 session",
             is_primary=False,
             created_at=now + timedelta(minutes=1),
@@ -185,7 +218,7 @@ async def test_websocket_default_session_uses_channel_when_no_session_id():
         token="unused",
         session_id=None,
         lang="zh",
-        channel="wechat_miniprogram",
+        channel="miniprogram",
     )
 
     async with async_session() as db:
@@ -196,7 +229,7 @@ async def test_websocket_default_session_uses_channel_when_no_session_id():
 
     assert conv_id != str(web_session.id)
     assert conv_id == str(latest_h5_session.id)
-    assert h5_session.source_channel == "wechat_miniprogram"
+    assert h5_session.source_channel == "miniprogram"
 
     async with async_session() as db:
         repaired = (
@@ -205,7 +238,7 @@ async def test_websocket_default_session_uses_channel_when_no_session_id():
                 .where(
                     ChatSession.agent_id == agent_id,
                     ChatSession.user_id == user_id,
-                    ChatSession.source_channel == "wechat_miniprogram",
+                    ChatSession.source_channel == "miniprogram",
                 )
                 .order_by(ChatSession.created_at)
             )

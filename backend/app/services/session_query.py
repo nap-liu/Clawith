@@ -43,6 +43,7 @@ from app.models.user import User
 HUMAN_CHANNELS = frozenset(
     {
         "web",
+        "miniprogram",
         "wechat_miniprogram",
         "feishu",
         "dingtalk",

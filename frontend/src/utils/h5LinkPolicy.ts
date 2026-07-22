@@ -7,6 +7,7 @@
  * how a browser link behaves.
  */
 import type { H5ContainerRuntime } from './h5ContainerRuntime';
+import { isMiniProgramUri, parseMiniProgramUri } from './miniProgramUri';
 
 /**
  * Return an absolute cross-origin HTTP(S) URL, or null when the link should
@@ -30,6 +31,10 @@ export function resolveExternalHttpLink(
 }
 
 export type H5LinkAction =
+    | { type: 'dingtalk-miniapp-navigate'; route: string }
+    | { type: 'wechat-miniapp-navigate'; route: string }
+    | { type: 'miniprogram-unavailable' }
+    | { type: 'invalid-miniprogram-uri' }
     | { type: 'dingtalk-open'; url: string }
     | { type: 'wechat-miniapp-open'; url: string }
     | {
@@ -55,6 +60,18 @@ export function resolveH5LinkAction(
     href: string,
     options: ResolveH5LinkActionOptions = {},
 ): H5LinkAction {
+    const miniProgramUri = parseMiniProgramUri(href);
+    if (miniProgramUri) {
+        if (options.runtime === 'dingtalk-miniapp-webview') {
+            return { type: 'dingtalk-miniapp-navigate', route: miniProgramUri.route };
+        }
+        if (options.runtime === 'wechat-miniapp-webview') {
+            return { type: 'wechat-miniapp-navigate', route: miniProgramUri.route };
+        }
+        return { type: 'miniprogram-unavailable' };
+    }
+    if (isMiniProgramUri(href)) return { type: 'invalid-miniprogram-uri' };
+
     const currentHref = options.currentHref
         ?? (typeof window !== 'undefined' ? window.location.href : '');
     let current: URL;

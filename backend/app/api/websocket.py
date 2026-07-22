@@ -494,11 +494,11 @@ class WebSocketChatHandler:
         return conv_id
 
     def _channel_context(self) -> dict:
-        if self.source_channel == "wechat_miniprogram":
+        if self.source_channel in {"miniprogram", "wechat_miniprogram"}:
             return {
-                "source_channel": "wechat_miniprogram",
-                "display_name": "微信小程序",
-                "client_surface": "h5 web-view",
+                "source_channel": self.source_channel,
+                "display_name": "小程序",
+                "client_surface": "mini-program web-view",
             }
         return {
             "source_channel": self.source_channel,

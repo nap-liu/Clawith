@@ -218,6 +218,7 @@ function normalizeH5SessionSummary(row: any): H5SessionSummary | null {
 function h5SessionChannelLabel(channel: string) {
     const labels: Record<string, string> = {
         web: 'Web',
+        miniprogram: '小程序',
         wechat_miniprogram: '微信小程序',
         feishu: '飞书',
         dingtalk: '钉钉',
@@ -331,7 +332,7 @@ export default function H5AgentChat() {
     const searchString = searchParams.toString();
     const channel = useMemo(() => {
         const params = new URLSearchParams(searchString);
-        return params.get('channel') || 'wechat_miniprogram';
+        return params.get('channel') || 'miniprogram';
     }, [searchString]);
     const provider = useMemo(() => new URLSearchParams(searchString).get('provider') || '', [searchString]);
     const code = useMemo(() => new URLSearchParams(searchString).get('code') || '', [searchString]);
@@ -339,7 +340,7 @@ export default function H5AgentChat() {
     const themeMode = useMemo(() => parseH5Theme(new URLSearchParams(searchString).get('theme')), [searchString]);
     const initialSessionId = useMemo(() => parseChatSessionId(new URLSearchParams(searchString).get('session_id')), [searchString]);
     const [resolvedTheme, setResolvedTheme] = useState(() => resolveThemeMode(themeMode));
-    const [containerRuntime, setContainerRuntime] = useState<H5ContainerRuntime>('standard');
+    const [containerRuntime, setContainerRuntime] = useState<H5ContainerRuntime | 'detecting'>('detecting');
 
     const token = useAuthStore((s) => s.token);
     const setAuth = useAuthStore((s) => s.setAuth);
@@ -384,6 +385,18 @@ export default function H5AgentChat() {
     const speechInputSnapshotRef = useRef({ value: '', selectionStart: 0, selectionEnd: 0 });
     const speechSelectionCapturedRef = useRef(false);
     const inputSelectionRef = useRef({ start: 0, end: 0, hasPosition: false });
+    const containerRuntimeDetectionRef = useRef<Promise<H5ContainerRuntime> | null>(null);
+
+    const ensureContainerRuntime = useCallback(() => {
+        if (!containerRuntimeDetectionRef.current) {
+            containerRuntimeDetectionRef.current = detectH5ContainerRuntime()
+                .catch((error) => {
+                    console.warn('H5 container runtime detection failed', error);
+                    return 'standard' as H5ContainerRuntime;
+                });
+        }
+        return containerRuntimeDetectionRef.current;
+    }, []);
 
     const speechTextAtCursor = useCallback((text: string) => {
         const snapshot = speechInputSnapshotRef.current;
@@ -450,18 +463,14 @@ export default function H5AgentChat() {
 
     useEffect(() => {
         let cancelled = false;
-        void detectH5ContainerRuntime()
+        void ensureContainerRuntime()
             .then((runtime) => {
                 if (!cancelled) setContainerRuntime(runtime);
-            })
-            .catch((error) => {
-                console.warn('H5 container runtime detection failed', error);
-                if (!cancelled) setContainerRuntime('standard');
             });
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [ensureContainerRuntime]);
 
     useLayoutEffect(() => installThemeController({
         mode: themeMode,
@@ -1161,8 +1170,38 @@ export default function H5AgentChat() {
         await copyLinkWithFeedback(url);
     }, [copyLinkWithFeedback]);
 
-    const handleMarkdownLinkClick = useCallback((href: string): boolean => {
-        const action = resolveH5LinkAction(href, { runtime: containerRuntime });
+    const handleLinkForRuntime = useCallback((href: string, runtime: H5ContainerRuntime): boolean => {
+        const action = resolveH5LinkAction(href, { runtime });
+        if (action.type === 'dingtalk-miniapp-navigate') {
+            void import('../../utils/dingtalkLink')
+                .then(({ navigateDingTalkMiniProgramPage }) => (
+                    navigateDingTalkMiniProgramPage(action.route)
+                ))
+                .catch((error) => {
+                    console.warn('DingTalk mini-program page navigation failed', error);
+                    toast.error('小程序页面跳转失败');
+                });
+            return true;
+        }
+        if (action.type === 'wechat-miniapp-navigate') {
+            void import('../../utils/wechatMiniProgramLink')
+                .then(({ navigateWechatMiniProgramPage }) => (
+                    navigateWechatMiniProgramPage(action.route)
+                ))
+                .catch((error) => {
+                    console.warn('WeChat mini-program page navigation failed', error);
+                    toast.error('小程序页面跳转失败');
+                });
+            return true;
+        }
+        if (action.type === 'miniprogram-unavailable') {
+            toast.warning('当前环境不支持跳转小程序');
+            return true;
+        }
+        if (action.type === 'invalid-miniprogram-uri') {
+            toast.error('无效的小程序页面地址');
+            return true;
+        }
         if (action.type === 'native') return false;
 
         if (action.type === 'dingtalk-open') {
@@ -1183,7 +1222,19 @@ export default function H5AgentChat() {
             .then(({ openWechatMiniProgramWebview }) => openWechatMiniProgramWebview(action.url))
             .catch((error) => handlePlatformLinkFailure('WeChat', action.url, error));
         return true;
-    }, [containerRuntime, copyLinkWithFeedback, handlePlatformLinkFailure]);
+    }, [copyLinkWithFeedback, handlePlatformLinkFailure, toast]);
+
+    const handleMarkdownLinkClick = useCallback((href: string): boolean => {
+        if (containerRuntime !== 'detecting') {
+            return handleLinkForRuntime(href, containerRuntime);
+        }
+
+        void ensureContainerRuntime().then((runtime) => {
+            setContainerRuntime(runtime);
+            handleLinkForRuntime(href, runtime);
+        });
+        return true;
+    }, [containerRuntime, ensureContainerRuntime, handleLinkForRuntime]);
 
     const renderConversationEntry = useCallback((entry: (typeof conversationEntries)[number]) => {
         if (entry.type === 'analysis_group') {

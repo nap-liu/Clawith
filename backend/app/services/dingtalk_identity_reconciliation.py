@@ -501,7 +501,7 @@ class DingTalkLegacyIdentityReconciler:
                 "SELECT EXISTS("
                 "SELECT 1 FROM chat_sessions "
                 "WHERE user_id = :user_id "
-                "AND source_channel IN ('web', 'wechat_miniprogram')"
+                "AND source_channel IN ('web', 'miniprogram', 'wechat_miniprogram')"
                 ")"
             ),
             {"user_id": source.id},

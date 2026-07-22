@@ -7,6 +7,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const {
     buildWechatMiniProgramWebviewRoute,
     isWechatMiniProgramWebViewRuntime,
+    navigateWechatMiniProgramPage,
     openWechatMiniProgramWebview,
 } = loadTypeScriptModule(
     resolve(__dirname, '../src/utils/wechatMiniProgramLink.ts'),
@@ -123,6 +124,30 @@ await openWechatMiniProgramWebview('https://docs.example.com/a?name=中文#part'
 assert.deepEqual(navigateCalls, [
     '/subPackages/webview/index?url=https%3A%2F%2Fdocs.example.com%2Fa%3Fname%3D%25E4%25B8%25AD%25E6%2596%2587%23part',
 ]);
+
+const directPageCalls = [];
+await navigateWechatMiniProgramPage('/pages/order/detail?id=123', {
+    targetWindow: {
+        __wxjs_environment: 'miniprogram',
+        wx: {
+            miniProgram: {
+                navigateTo(options) {
+                    directPageCalls.push(options.url);
+                    options.success?.();
+                },
+            },
+        },
+    },
+    duplicateWindowMs: 0,
+});
+assert.deepEqual(directPageCalls, ['/pages/order/detail?id=123']);
+await assert.rejects(
+    navigateWechatMiniProgramPage('https://evil.example/page', {
+        targetWindow: miniProgramWindow,
+        duplicateWindowMs: 0,
+    }),
+    /internal page route/,
+);
 
 await assert.rejects(
     openWechatMiniProgramWebview('https://direct.example.com/path', {

@@ -36,6 +36,11 @@ type OpenDingTalkMiniProgramLinkOptions = DetectDingTalkMiniProgramOptions & {
     now?: () => number;
 };
 
+type NavigateDingTalkMiniProgramPageOptions = Omit<
+    OpenDingTalkMiniProgramLinkOptions,
+    'currentHref' | 'route'
+>;
+
 export const DEFAULT_DINGTALK_WEBVIEW_SDK_URL = 'https://appx/web-view.min.js';
 export const DEFAULT_DINGTALK_WEBVIEW_ROUTE = '/subPackages/webview/index';
 
@@ -218,6 +223,22 @@ export async function openDingTalkMiniProgramWebview(
         throw new Error('DingTalk mini-program WebView only allows same-origin URLs');
     }
 
+    const route = buildDingTalkMiniProgramWebviewRoute(
+        parsedUrl.href,
+        options.route,
+    );
+    await navigateDingTalkMiniProgramPage(route, options);
+}
+
+/** Navigate directly to an internal page exposed by the host mini-program. */
+export async function navigateDingTalkMiniProgramPage(
+    route: string,
+    options: NavigateDingTalkMiniProgramPageOptions = {},
+): Promise<void> {
+    if (!route.startsWith('/') || route.startsWith('//') || route.includes('#')) {
+        throw new Error('DingTalk mini-program navigation requires an internal page route');
+    }
+
     const targetWindow = options.targetWindow ?? defaultTargetWindow();
     const isMiniProgram = await isDingTalkMiniProgramWebViewRuntime({
         targetWindow,
@@ -237,18 +258,13 @@ export async function openDingTalkMiniProgramWebview(
     const startedAt = now();
     if (
         duplicateWindowMs > 0
-        && lastOpenUrl === parsedUrl.href
+        && lastOpenUrl === route
         && startedAt - lastOpenStartedAt < duplicateWindowMs
     ) {
         return;
     }
-    lastOpenUrl = parsedUrl.href;
+    lastOpenUrl = route;
     lastOpenStartedAt = startedAt;
-
-    const route = buildDingTalkMiniProgramWebviewRoute(
-        parsedUrl.href,
-        options.route,
-    );
     await new Promise<void>((resolve, reject) => {
         let settled = false;
         const finish = (callback: () => void) => {

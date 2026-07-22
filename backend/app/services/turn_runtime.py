@@ -137,7 +137,7 @@ async def deliver_message_to_runtime(
     if not (message or "").strip():
         return True
     channel = runtime.source_channel
-    if channel in {"web", "wechat_miniprogram", "mcp"}:
+    if channel in {"web", "miniprogram", "wechat_miniprogram", "mcp"}:
         return await _deliver_web(agent_id, runtime, message)
     if channel == "dingtalk":
         return await _deliver_dingtalk(agent_id, runtime, message)

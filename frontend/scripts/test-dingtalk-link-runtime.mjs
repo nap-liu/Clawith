@@ -8,6 +8,7 @@ const {
     buildDingTalkMiniProgramWebviewRoute,
     isDingTalkMiniProgramWebViewCandidate,
     isDingTalkMiniProgramWebViewRuntime,
+    navigateDingTalkMiniProgramPage,
     openDingTalkMiniProgramWebview,
 } = loadTypeScriptModule(
     resolve(__dirname, '../src/utils/dingtalkLink.ts'),
@@ -130,6 +131,30 @@ await openDingTalkMiniProgramWebview('https://docs.example.com/a?name=中文#par
 assert.deepEqual(navigateCalls, [
     '/subPackages/webview/index?url=https%3A%2F%2Fdocs.example.com%2Fa%3Fname%3D%25E4%25B8%25AD%25E6%2596%2587%23part',
 ]);
+
+const directPageCalls = [];
+await navigateDingTalkMiniProgramPage('/pages/order/detail?id=123', {
+    targetWindow: {
+        dd: {
+            navigateTo(options) {
+                directPageCalls.push(options.url);
+                options.success?.();
+            },
+        },
+    },
+    userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
+    duplicateWindowMs: 0,
+    navigateTimeoutMs: 50,
+});
+assert.deepEqual(directPageCalls, ['/pages/order/detail?id=123']);
+await assert.rejects(
+    navigateDingTalkMiniProgramPage('//evil.example/page', {
+        targetWindow: loadedWindow,
+        userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
+        duplicateWindowMs: 0,
+    }),
+    /internal page route/,
+);
 
 await assert.rejects(
     openDingTalkMiniProgramWebview('https://direct.example.com/path', {

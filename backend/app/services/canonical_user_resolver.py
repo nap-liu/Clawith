@@ -520,12 +520,12 @@ class CanonicalUserResolver:
                 """
                 UPDATE chat_sessions s SET is_primary = false
                 WHERE s.user_id = :source AND s.is_primary = true
-                  AND s.source_channel IN ('web', 'wechat_miniprogram')
+                  AND s.source_channel IN ('web', 'miniprogram', 'wechat_miniprogram')
                   AND EXISTS (
                     SELECT 1 FROM chat_sessions t
                     WHERE t.user_id = :target AND t.agent_id = s.agent_id
                       AND t.is_primary = true
-                      AND t.source_channel IN ('web', 'wechat_miniprogram')
+                      AND t.source_channel IN ('web', 'miniprogram', 'wechat_miniprogram')
                   )
                 """
             ),

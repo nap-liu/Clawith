@@ -36,6 +36,11 @@ type OpenWeChatMiniProgramLinkOptions = {
     now?: () => number;
 };
 
+type NavigateWeChatMiniProgramPageOptions = Omit<
+    OpenWeChatMiniProgramLinkOptions,
+    'currentHref' | 'route'
+>;
+
 const DEFAULT_JSSDK_URL = 'https://res.wx.qq.com/open/js/jweixin-1.3.2.js';
 const DEFAULT_BRIDGE_WAIT_TIMEOUT_MS = 800;
 const DEFAULT_ENV_TIMEOUT_MS = 800;
@@ -252,6 +257,22 @@ export async function openWechatMiniProgramWebview(
         throw new Error('WeChat mini-program WebView only allows same-origin URLs');
     }
 
+    const route = buildWechatMiniProgramWebviewRoute(
+        parsedUrl.href,
+        options.route,
+    );
+    await navigateWechatMiniProgramPage(route, options);
+}
+
+/** Navigate directly to an internal page exposed by the host mini-program. */
+export async function navigateWechatMiniProgramPage(
+    route: string,
+    options: NavigateWeChatMiniProgramPageOptions = {},
+): Promise<void> {
+    if (!route.startsWith('/') || route.startsWith('//') || route.includes('#')) {
+        throw new Error('WeChat mini-program navigation requires an internal page route');
+    }
+
     const targetWindow = options.targetWindow ?? defaultTargetWindow();
     const miniProgram = targetWindow?.wx?.miniProgram;
     if (
@@ -266,18 +287,13 @@ export async function openWechatMiniProgramWebview(
     const startedAt = now();
     if (
         duplicateWindowMs > 0
-        && lastOpenUrl === parsedUrl.href
+        && lastOpenUrl === route
         && startedAt - lastOpenStartedAt < duplicateWindowMs
     ) {
         return;
     }
-    lastOpenUrl = parsedUrl.href;
+    lastOpenUrl = route;
     lastOpenStartedAt = startedAt;
-
-    const route = buildWechatMiniProgramWebviewRoute(
-        parsedUrl.href,
-        options.route,
-    );
     await new Promise<void>((resolve, reject) => {
         let settled = false;
         const finish = (callback: () => void) => {

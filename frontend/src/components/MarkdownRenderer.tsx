@@ -5,7 +5,9 @@
  */
 import React, { useCallback, useMemo, useState } from 'react';
 import ChatImageLightbox from './ChatImageLightbox';
+import { useToast } from './Toast/ToastProvider';
 import { buildPreviewImage, type ChatPreviewImage } from '../utils/chatAttachments';
+import { parseMiniProgramUri } from '../utils/miniProgramUri';
 
 function escapeHtml(str: string): string {
     return str
@@ -19,7 +21,10 @@ function escapeAttribute(str: string): string {
     return escapeHtml(str).replace(/'/g, '&#39;');
 }
 
-function prepareUrl(url: string, kind: 'link' | 'image' = 'link'): string | null {
+function prepareUrl(
+    url: string,
+    kind: 'link' | 'image' = 'link',
+): string | null {
     let finalUrl = url.trim().replace(/^<|>$/g, '');
     const lower = finalUrl.toLowerCase();
     const isAllowed =
@@ -27,6 +32,7 @@ function prepareUrl(url: string, kind: 'link' | 'image' = 'link'): string | null
         lower.startsWith('https://') ||
         lower.startsWith('mailto:') ||
         finalUrl.startsWith('/') ||
+        (kind === 'link' && parseMiniProgramUri(finalUrl) !== null) ||
         (kind === 'image' && lower.startsWith('data:image/'));
 
     if (!isAllowed) return null;
@@ -43,6 +49,9 @@ function prepareUrl(url: string, kind: 'link' | 'image' = 'link'): string | null
 function renderLink(url: string, label: string): string {
     const finalUrl = prepareUrl(url);
     if (!finalUrl) return label;
+    if (parseMiniProgramUri(finalUrl)) {
+        return `<a href="${escapeAttribute(finalUrl)}" style="color:var(--accent-primary);text-decoration:underline;text-underline-offset:2px;word-break:break-all">${label}</a>`;
+    }
     return `<a href="${escapeAttribute(finalUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent-primary);text-decoration:underline;text-underline-offset:2px;word-break:break-all">${label}</a>`;
 }
 
@@ -264,6 +273,7 @@ interface MarkdownRendererProps {
 
 export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, style, className, imagePreviewMode = 'desktop', onLinkClick }: MarkdownRendererProps) {
     const html = useMemo(() => markdownToHtml(content), [content]);
+    const toast = useToast();
     const [preview, setPreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
 
     const handleContainerClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
@@ -299,11 +309,19 @@ export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, 
         }
 
         const link = target.closest<HTMLAnchorElement>('a[href]');
-        if (link && onLinkClick?.(link.href)) {
+        const rawHref = link?.getAttribute('href');
+        if (link && rawHref && parseMiniProgramUri(rawHref)) {
+            const handled = onLinkClick?.(rawHref) === true;
+            if (!handled) toast.warning('当前环境不支持跳转小程序');
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }
+        if (link && rawHref && onLinkClick?.(rawHref)) {
             event.preventDefault();
             event.stopPropagation();
         }
-    }, [onLinkClick]);
+    }, [onLinkClick, toast]);
 
     return (
         <>

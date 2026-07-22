@@ -14,7 +14,7 @@ from app.models.identity import IdentityProvider
 from app.services.auth_provider import BaseAuthProvider, PROVIDER_CLASSES
 
 
-PLATFORM_LOGIN_CHANNELS = {"web", "wechat_miniprogram"}
+PLATFORM_LOGIN_CHANNELS = {"web", "miniprogram", "wechat_miniprogram"}
 
 
 def validate_platform_login_channel(channel: str) -> str:
