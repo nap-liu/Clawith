@@ -2456,8 +2456,8 @@
     "title": "OKR"
   },
   "pat": {
-    "sectionTitle": "API 接入 / Personal Access Token",
-    "sectionDesc": "使用长期令牌让 MCP 客户端(Claude Code、Codex 等)鉴权后与智能体对话。",
+    "sectionTitle": "MCP 接入与访问令牌",
+    "sectionDesc": "使用长期访问令牌，将 Claude Code、Codex 等 MCP 客户端连接到数字员工平台，并与您有权限的数字员工交互。",
     "newToken": "新建令牌",
     "name": "令牌名称",
     "namePlaceholder": "例如 my-claude-code",
@@ -2473,7 +2473,7 @@
     "colLastUsed": "最后使用",
     "colExpires": "过期时间",
     "never": "永不",
-    "noTokens": "暂无令牌。创建一个来连接 MCP 客户端。",
+    "noTokens": "暂无访问令牌。新建令牌后即可将 MCP 客户端连接到数字员工平台。",
     "onceWarning": "请立即保存此令牌 — 关闭后将不再显示。",
     "copyToken": "复制令牌",
     "copied": "已复制！",
@@ -2482,9 +2482,9 @@
     "close": "关闭",
     "copyFailed": "复制失败,请手动复制",
     "actionFailed": "操作失败",
-    "configTitle": "MCP 客户端配置",
-    "configDesc": "使用以下片段连接 MCP 客户端。将 {{TOKEN}} 替换为刚刚复制的令牌。",
-    "configDescStatic": "使用以下片段连接。将 <your-token> 替换为创建时复制的明文令牌。",
+    "configTitle": "连接数字员工平台",
+    "configDesc": "访问令牌已自动填入。选择并复制以下任一配置，即可将 MCP 客户端连接到数字员工平台。",
+    "configDescStatic": "选择并复制以下任一配置，将 MCP 客户端连接到数字员工平台；使用时请将 <your-token> 替换为创建令牌时复制的明文内容。",
     "claudeCode": "Claude Code",
     "codex": "Codex (~/.codex/config.toml)",
     "stdioFallback": "stdio 客户端 (mcp-remote)",
@@ -2493,7 +2493,7 @@
     "scope": "权限范围",
     "scopeRead": "只读",
     "scopeWrite": "可写",
-    "scopeHint": "只读：查看与对话。可写：另可创建和配置 agent。",
+    "scopeHint": "只读：查看数字员工并与其对话。可写：还可创建和配置数字员工。",
     "colScope": "范围"
   }
 }

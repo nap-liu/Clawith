@@ -69,22 +69,24 @@ function CopyButton({ text, label }: { text: string; label: string }) {
 
 /* ── config snippets ───────────────────────────────────── */
 
+const MCP_SERVER_ALIAS = 'digital-workforce';
+
 function ConfigSnippets({ token }: { token: string | null }) {
     const { t } = useTranslation();
     const host = window.location.origin;
     const mcpUrl = `${host}/mcp/`;
     const tok = token ?? '<your-token>';
 
-    const claudeSnippet = `claude mcp add --transport http clawith ${mcpUrl} --header "Authorization: Bearer ${tok}"`;
-    const codexSnippet = `[mcp_servers.clawith]
+    const claudeSnippet = `claude mcp add --transport http ${MCP_SERVER_ALIAS} ${mcpUrl} --header "Authorization: Bearer ${tok}"`;
+    const codexSnippet = `[mcp_servers.${MCP_SERVER_ALIAS}]
 transport = "http"
 url = "${mcpUrl}"
 
-[mcp_servers.clawith.headers]
+[mcp_servers.${MCP_SERVER_ALIAS}.headers]
 Authorization = "Bearer ${tok}"`;
     const stdioSnippet = `npx mcp-remote ${mcpUrl} --header "Authorization: Bearer ${tok}"`;
 
-    const desc = token ? t('pat.configDesc', { TOKEN: tok }) : t('pat.configDescStatic');
+    const desc = token ? t('pat.configDesc') : t('pat.configDescStatic');
 
     return (
         <div style={{ marginTop: '16px' }}>

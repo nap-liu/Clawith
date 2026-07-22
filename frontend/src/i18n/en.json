@@ -2373,8 +2373,8 @@
     "title": "OKR"
   },
   "pat": {
-    "sectionTitle": "API Access / Personal Access Tokens",
-    "sectionDesc": "Use long-lived tokens to authenticate MCP clients (Claude Code, Codex, etc.) with your agents.",
+    "sectionTitle": "MCP Access / Personal Access Tokens",
+    "sectionDesc": "Use long-lived access tokens to connect MCP clients (Claude Code, Codex, etc.) to the Digital Workforce platform and interact with digital employees you can access.",
     "newToken": "New Token",
     "name": "Token Name",
     "namePlaceholder": "e.g. my-claude-code",
@@ -2390,7 +2390,7 @@
     "colLastUsed": "Last Used",
     "colExpires": "Expires",
     "never": "Never",
-    "noTokens": "No tokens yet. Create one to connect MCP clients.",
+    "noTokens": "No access tokens yet. Create one to connect an MCP client to the Digital Workforce platform.",
     "onceWarning": "Save this token now — it will not be shown again.",
     "copyToken": "Copy Token",
     "copied": "Copied!",
@@ -2399,9 +2399,9 @@
     "close": "Close",
     "copyFailed": "Copy failed — please copy manually",
     "actionFailed": "Operation failed",
-    "configTitle": "MCP Client Configuration",
-    "configDesc": "Use one of the snippets below to connect your MCP client. Replace {{TOKEN}} with the token you just copied.",
-    "configDescStatic": "Use one of the snippets below to connect. Replace <your-token> with the plaintext token copied at creation time.",
+    "configTitle": "Connect to the Digital Workforce Platform",
+    "configDesc": "Your access token is already included. Copy any configuration below to connect your MCP client to the Digital Workforce platform.",
+    "configDescStatic": "Copy any configuration below to connect your MCP client to the Digital Workforce platform. Replace <your-token> with the plaintext token copied when it was created.",
     "claudeCode": "Claude Code",
     "codex": "Codex (~/.codex/config.toml)",
     "stdioFallback": "stdio clients (mcp-remote)",
@@ -2410,7 +2410,7 @@
     "scope": "Scope",
     "scopeRead": "Read",
     "scopeWrite": "Write",
-    "scopeHint": "Read: list/read/chat with agents. Write: also create and configure agents.",
+    "scopeHint": "Read: view and chat with digital employees. Write: also create and configure digital employees.",
     "colScope": "Scope"
   }
 }
