@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 from loguru import logger
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -40,19 +41,23 @@ from app.models.dingtalk_provisioning import (
 )
 from app.models.identity import IdentityProvider
 from app.models.org import OrgMember
+from app.models.tenant import Tenant
 from app.services.channel_session import find_or_create_channel_session
+from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
 
 
 StreamStarter = Callable[[uuid.UUID, str, str], Awaitable[None]]
 StreamStopper = Callable[[uuid.UUID], Awaitable[None]]
 WelcomeSender = Callable[[str, str, str, str], Awaitable[dict[str, Any]]]
 DINGTALK_BINDING_WELCOME_FALLBACK_NAME = "你的数字员工"
+DINGTALK_PROVISIONING_OPERATION_INITIAL = "initial_setup"
+DINGTALK_PROVISIONING_OPERATION_FORCE = "force_reconfigure"
 
-# The first send happens immediately after registration succeeds.  DingTalk's
-# automatically granted robot permission is eventually consistent, so retry
-# the completion message for a bounded period without delaying channel setup.
-# Including the initial attempt, this allows nine sends over about seven
-# minutes.  State is persisted on the provisioning row and survives restarts.
+# The first send is picked up immediately after the credential transaction
+# commits. DingTalk's automatically granted robot permission is eventually
+# consistent, so retry the completion message for a bounded period without
+# delaying channel setup. Including the initial attempt, this allows nine sends
+# over about seven minutes. State persists on the provisioning row.
 DINGTALK_WELCOME_RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 30, 60, 120, 180)
 
 
@@ -91,6 +96,35 @@ def _extract_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _as_string(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _configured_dingtalk_fingerprint(config: ChannelConfig | None) -> str | None:
+    if (
+        config is None
+        or not config.is_configured
+        or not _as_string(config.app_id)
+        or not _as_string(config.app_secret)
+    ):
+        return None
+    return dingtalk_credential_fingerprint(config.app_id, config.app_secret)
+
+
+def _session_operation(session: DingTalkChannelProvisioningSession) -> str:
+    operation = _as_string((session.registration_result or {}).get("operation"))
+    return operation or DINGTALK_PROVISIONING_OPERATION_INITIAL
+
+
+def _session_baseline_fingerprint(session: DingTalkChannelProvisioningSession) -> str:
+    return _as_string((session.registration_result or {}).get("baseline_fp"))
+
+
+def _merge_registration_result(
+    session: DingTalkChannelProvisioningSession,
+    **values: Any,
+) -> None:
+    result = dict(session.registration_result or {})
+    result.update(values)
+    session.registration_result = result
 
 
 def _bounded_polling_window(
@@ -201,7 +235,8 @@ async def start_dingtalk_channel_provisioning(
     *,
     agent: Agent,
     requested_by_user_id: uuid.UUID | None,
-    restart_existing: bool,
+    force_reconfigure: bool = False,
+    restart_existing: bool | None = None,
     registration_client: DingTalkRegistrationClient | None = None,
     stream_starter: StreamStarter | None = None,
     stream_stopper: StreamStopper | None = None,
@@ -213,9 +248,36 @@ async def start_dingtalk_channel_provisioning(
     client = registration_client or _default_registration_client()
     base = _as_utc(now or _now())
 
-    # Serialize starts per Agent. This prevents two concurrent requests from
-    # both observing no active flow and creating competing authorization links.
+    # Serialize starts per Agent and lock the current channel row when present.
+    # ``restart_existing`` remains accepted for compatibility, but a still-valid
+    # flow is never replaced implicitly. Callers must cancel it explicitly.
     await db.execute(select(Agent.id).where(Agent.id == agent.id).with_for_update())
+    config_result = await db.execute(
+        select(ChannelConfig)
+        .where(
+            ChannelConfig.agent_id == agent.id,
+            ChannelConfig.channel_type == "dingtalk",
+        )
+        .with_for_update()
+    )
+    config = config_result.scalar_one_or_none()
+    current_fingerprint = _configured_dingtalk_fingerprint(config)
+    if current_fingerprint and not force_reconfigure:
+        return {
+            "status": "already_configured",
+            "flow_action": "already_configured",
+            "authorization_url": None,
+            "message": (
+                "当前数字员工的钉钉通道已经配置完成，无需重复配置。"
+                "只有用户明确要求强制重配时才应重新授权；重新授权会创建新的钉钉机器人应用。"
+            ),
+        }
+
+    operation = (
+        DINGTALK_PROVISIONING_OPERATION_FORCE
+        if current_fingerprint
+        else DINGTALK_PROVISIONING_OPERATION_INITIAL
+    )
     active_result = await db.execute(
         select(DingTalkChannelProvisioningSession)
         .where(
@@ -239,7 +301,19 @@ async def start_dingtalk_channel_provisioning(
             error="已由更新的钉钉授权流程替换",
         )
 
-    if active and not restart_existing and _as_utc(active.expires_at) > base:
+    reusable = (
+        active is not None
+        and _as_utc(active.expires_at) > base
+        and _session_operation(active) == operation
+        and (
+            operation == DINGTALK_PROVISIONING_OPERATION_INITIAL
+            or (
+                bool(_session_baseline_fingerprint(active))
+                and _session_baseline_fingerprint(active) == current_fingerprint
+            )
+        )
+    )
+    if reusable:
         response = _session_response(
             active,
             message="当前钉钉授权流程仍有效，请继续使用原授权链接完成配置。",
@@ -248,10 +322,11 @@ async def start_dingtalk_channel_provisioning(
         return response
 
     had_existing = active is not None
-    if active:
-        # Before replacing (or rolling an expired flow), reconcile once. This
-        # closes the propagation race where DingTalk has just switched to
-        # SUCCESS but the background poller has not consumed it yet.
+    if active is not None:
+        # Close the boundary where DingTalk has already completed the old flow
+        # but the connector has not consumed SUCCESS yet. Returning the
+        # configured result avoids handing the user a second authorization link
+        # and therefore avoids creating a duplicate robot application.
         await poll_dingtalk_provisioning_session(
             db,
             active,
@@ -262,12 +337,15 @@ async def start_dingtalk_channel_provisioning(
             now=base,
         )
         if active.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED:
-            response = _session_response(active, message="原钉钉授权已成功，通道配置已经完成。")
+            response = _session_response(
+                active,
+                message="原钉钉授权已经成功，数字员工通道配置已完成。",
+            )
             response["flow_action"] = "configured_existing"
             return response
 
-    # Do not invalidate a usable existing link until DingTalk has successfully
-    # issued the replacement. A transient begin failure therefore remains safe.
+    # Do not cancel the previous flow until DingTalk has successfully issued
+    # the replacement. A transient begin failure therefore remains recoverable.
     begin = await client.begin()
     window = _bounded_polling_window(
         expires_in=begin.get("expires_in"),
@@ -275,6 +353,12 @@ async def start_dingtalk_channel_provisioning(
         now=base,
     )
 
+    if active:
+        _stop_session(
+            active,
+            status=DINGTALK_PROVISIONING_STATUS_CANCELLED,
+            error="当前配置或配置操作已变化，请使用新的钉钉授权流程",
+        )
     for previous in active_sessions:
         if previous.status in DINGTALK_PROVISIONING_ACTIVE_STATUSES:
             _stop_session(
@@ -297,6 +381,14 @@ async def start_dingtalk_channel_provisioning(
         next_poll_at=window.next_poll_at,
         poll_interval_seconds=window.poll_interval_seconds,
         max_poll_attempts=window.max_poll_attempts,
+        registration_result={
+            "operation": operation,
+            **(
+                {"baseline_fp": current_fingerprint}
+                if operation == DINGTALK_PROVISIONING_OPERATION_FORCE
+                else {}
+            ),
+        },
     )
     db.add(session)
     await db.flush()
@@ -337,18 +429,6 @@ def get_dingtalk_provisioning_status_response(session: DingTalkChannelProvisioni
         DINGTALK_PROVISIONING_STATUS_CANCELLED: "该钉钉数字员工通道配置流程已取消。",
     }
     return _session_response(session, message=message_by_status.get(session.status))
-
-
-async def _default_stream_starter(agent_id: uuid.UUID, app_key: str, app_secret: str) -> None:
-    from app.services.dingtalk_stream import dingtalk_stream_manager
-
-    await dingtalk_stream_manager.start_client(agent_id, app_key, app_secret)
-
-
-async def _default_stream_stopper(agent_id: uuid.UUID) -> None:
-    from app.services.dingtalk_stream import dingtalk_stream_manager
-
-    await dingtalk_stream_manager.stop_client(agent_id)
 
 
 async def _default_welcome_sender(app_id: str, app_secret: str, user_id: str, message: str) -> dict[str, Any]:
@@ -742,28 +822,64 @@ async def poll_dingtalk_provisioning_session(
             _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_FAILED, error="钉钉授权成功但未返回完整凭据")
             return session.status
 
-        _, replaced_agent_ids = await _configure_dingtalk_channel(
-            db,
-            session,
-            client_id=client_id,
-            client_secret=client_secret,
+        await db.execute(select(Agent.id).where(Agent.id == session.agent_id).with_for_update())
+        config_result = await db.execute(
+            select(ChannelConfig)
+            .where(
+                ChannelConfig.agent_id == session.agent_id,
+                ChannelConfig.channel_type == "dingtalk",
+            )
+            .with_for_update()
         )
-        session.registration_result = {"client_id": client_id}
-        welcome_result = await _send_dingtalk_binding_welcome_message(
-            db,
+        current_config = config_result.scalar_one_or_none()
+        current_fingerprint = _configured_dingtalk_fingerprint(current_config)
+        operation = _session_operation(session)
+        if operation == DINGTALK_PROVISIONING_OPERATION_FORCE:
+            baseline_fingerprint = _session_baseline_fingerprint(session)
+            if not baseline_fingerprint or baseline_fingerprint != current_fingerprint:
+                _merge_registration_result(session, completion_reason="configuration_changed")
+                _stop_session(
+                    session,
+                    status=DINGTALK_PROVISIONING_STATUS_CANCELLED,
+                    error="钉钉通道配置已在授权期间发生变化，本次强制重配未覆盖当前配置",
+                )
+                return session.status
+        elif current_fingerprint:
+            _merge_registration_result(session, completion_reason="already_configured")
+            _stop_session(
+                session,
+                status=DINGTALK_PROVISIONING_STATUS_CANCELLED,
+                error="钉钉通道已由其他操作配置完成，本次授权未覆盖当前配置",
+            )
+            return session.status
+
+        try:
+            async with db.begin_nested():
+                await _configure_dingtalk_channel(
+                    db,
+                    session,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                )
+        except IntegrityError:
+            _merge_registration_result(session, completion_reason="configuration_conflict")
+            _stop_session(
+                session,
+                status=DINGTALK_PROVISIONING_STATUS_CANCELLED,
+                error="钉钉通道配置已被其他操作更新，本次授权未覆盖当前配置",
+            )
+            return session.status
+
+        _merge_registration_result(session, client_id=client_id)
+        session.welcome_status = DINGTALK_WELCOME_STATUS_PENDING
+        session.welcome_attempt_count = 0
+        session.welcome_next_retry_at = base
+        session.welcome_last_error = None
+        session.welcome_sent_at = None
+        _stop_session(
             session,
-            client_id=client_id,
-            client_secret=client_secret,
-            welcome_sender=welcome_sender,
-            now=base,
+            status=DINGTALK_PROVISIONING_STATUS_CONFIGURED,
         )
-        _record_welcome_attempt(session, welcome_result, now=base)
-        _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_CONFIGURED)
-        stopper = stream_stopper or _default_stream_stopper
-        for replaced_agent_id in replaced_agent_ids:
-            await stopper(replaced_agent_id)
-        starter = stream_starter or _default_stream_starter
-        await starter(session.agent_id, client_id, client_secret)
         return session.status
 
     _stop_session(
@@ -785,11 +901,15 @@ async def retry_due_dingtalk_welcome_messages(
     base = _as_utc(now or _now())
     stmt = (
         select(DingTalkChannelProvisioningSession)
+        .join(Agent, Agent.id == DingTalkChannelProvisioningSession.agent_id)
+        .join(Tenant, Tenant.id == Agent.tenant_id)
         .where(
             DingTalkChannelProvisioningSession.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED,
             DingTalkChannelProvisioningSession.welcome_status == DINGTALK_WELCOME_STATUS_PENDING,
             DingTalkChannelProvisioningSession.welcome_next_retry_at.is_not(None),
             DingTalkChannelProvisioningSession.welcome_next_retry_at <= base,
+            Agent.is_deleted.is_(False),
+            Tenant.is_active.is_(True),
         )
         .order_by(DingTalkChannelProvisioningSession.welcome_next_retry_at.asc())
         .with_for_update(skip_locked=True)
@@ -869,10 +989,14 @@ async def poll_due_dingtalk_provisioning_sessions(
     base = _as_utc(now or _now())
     stmt = (
         select(DingTalkChannelProvisioningSession)
+        .join(Agent, Agent.id == DingTalkChannelProvisioningSession.agent_id)
+        .join(Tenant, Tenant.id == Agent.tenant_id)
         .where(
             DingTalkChannelProvisioningSession.status.in_(DINGTALK_PROVISIONING_ACTIVE_STATUSES),
             DingTalkChannelProvisioningSession.next_poll_at.is_not(None),
             DingTalkChannelProvisioningSession.next_poll_at <= base,
+            Agent.is_deleted.is_(False),
+            Tenant.is_active.is_(True),
         )
         .order_by(DingTalkChannelProvisioningSession.next_poll_at.asc())
         .with_for_update(skip_locked=True)
@@ -881,8 +1005,37 @@ async def poll_due_dingtalk_provisioning_sessions(
         stmt = stmt.limit(limit)
 
     result = await db.execute(stmt)
-    sessions = result.scalars().all()
-    for session in sessions:
+    due_sessions = result.scalars().all()
+    processed_agents: set[uuid.UUID] = set()
+    polled_count = 0
+    for due_session in due_sessions:
+        if due_session.agent_id in processed_agents:
+            continue
+        processed_agents.add(due_session.agent_id)
+        active_result = await db.execute(
+            select(DingTalkChannelProvisioningSession)
+            .where(
+                DingTalkChannelProvisioningSession.agent_id == due_session.agent_id,
+                DingTalkChannelProvisioningSession.status.in_(DINGTALK_PROVISIONING_ACTIVE_STATUSES),
+            )
+            .order_by(
+                DingTalkChannelProvisioningSession.created_at.desc(),
+                DingTalkChannelProvisioningSession.id.desc(),
+            )
+            .with_for_update()
+        )
+        active_sessions = list(active_result.scalars())
+        if not active_sessions:
+            continue
+        session = active_sessions[0]
+        for stale in active_sessions[1:]:
+            _stop_session(
+                stale,
+                status=DINGTALK_PROVISIONING_STATUS_CANCELLED,
+                error="已由更新的钉钉授权流程替换",
+            )
+        if session.next_poll_at is None or _as_utc(session.next_poll_at) > base:
+            continue
         await poll_dingtalk_provisioning_session(
             db,
             session,
@@ -891,8 +1044,9 @@ async def poll_due_dingtalk_provisioning_sessions(
             welcome_sender=welcome_sender,
             now=base,
         )
+        polled_count += 1
     await db.flush()
-    return len(sessions)
+    return polled_count
 
 
 class DingTalkProvisioningPoller:
@@ -911,15 +1065,17 @@ class DingTalkProvisioningPoller:
                         db,
                         limit=settings.DINGTALK_PROVISIONING_POLL_BATCH_SIZE,
                     )
+                    await db.commit()
+                async with async_session() as db:
                     welcome_count = await retry_due_dingtalk_welcome_messages(
                         db,
                         limit=settings.DINGTALK_PROVISIONING_POLL_BATCH_SIZE,
                     )
                     await db.commit()
-                    if count:
-                        logger.info(f"[DingTalk Provisioning] Polled {count} session(s)")
-                    if welcome_count:
-                        logger.info(f"[DingTalk Provisioning] Retried {welcome_count} welcome message(s)")
+                if count:
+                    logger.info(f"[DingTalk Provisioning] Polled {count} session(s)")
+                if welcome_count:
+                    logger.info(f"[DingTalk Provisioning] Retried {welcome_count} welcome message(s)")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

@@ -822,22 +822,23 @@ AGENT_TOOLS = [
         "function": {
             "name": "start_dingtalk_channel_provisioning",
             "description": (
-                "为当前数字员工发起钉钉机器人通道自动配置。仅在用户明确要求配置钉钉机器人、"
-                "钉钉消息通道或授权钉钉应用时调用。工具会返回一个钉钉授权链接；用户打开链接完成授权后，"
-                "平台会自动轮询授权结果并配置好钉钉通道。不要把它用于发送普通消息。"
+                "为当前数字员工配置钉钉机器人通道。已配置时默认直接告知用户通道已经可用，"
+                "无需再次授权。只有用户明确要求强制重配时才设置 force_reconfigure=true；"
+                "强制重配会创建新的钉钉机器人应用，原应用需要用户在钉钉后台自行清理。"
+                "未配置或明确强制重配时，工具返回授权链接，用户授权后平台自动完成配置。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "restart_existing": {
+                    "force_reconfigure": {
                         "type": "boolean",
                         "description": (
-                            "必填。false 表示复用仍有效的授权链接；true 表示先同步旧流程状态，"
-                            "尚未成功时再替换为新的授权链接。"
+                            "默认 false。仅当用户明确要求强制覆盖当前钉钉通道时设为 true；"
+                            "普通配置请求保持 false。"
                         ),
+                        "default": False,
                     },
                 },
-                "required": ["restart_existing"],
             },
         },
     },
@@ -7241,9 +7242,9 @@ async def _start_dingtalk_channel_provisioning_tool(
     if not user_id:
         return "❌ 需要登录用户上下文才能为数字员工配置钉钉通道。请在用户会话中重新发起。"
 
-    restart_existing = (args or {}).get("restart_existing")
-    if not isinstance(restart_existing, bool):
-        return "❌ 缺少必填布尔参数 restart_existing，请明确选择复用现有流程或重新生成授权链接。"
+    force_reconfigure = (args or {}).get("force_reconfigure", False)
+    if not isinstance(force_reconfigure, bool):
+        return "❌ force_reconfigure 必须是布尔值。普通配置请求请保持 false。"
 
     from app.core.permissions import user_can_manage_agent_id
     from app.models.agent import Agent as AgentModel
@@ -7261,11 +7262,17 @@ async def _start_dingtalk_channel_provisioning_tool(
             db,
             agent=agent,
             requested_by_user_id=user_id,
-            restart_existing=restart_existing,
+            force_reconfigure=force_reconfigure,
         )
         await db.commit()
 
     flow_action = response.get("flow_action")
+    if flow_action == "already_configured":
+        return (
+            "当前数字员工的钉钉通道已经配置完成，可以直接使用，无需重复配置。\n"
+            "只有在用户明确要求强制重配时才重新授权；强制重配会创建新的钉钉机器人应用，"
+            "原应用需要用户在钉钉后台自行清理。"
+        )
     if flow_action == "configured_existing":
         return (
             "原钉钉授权已经成功，数字员工通道配置已完成。\n"
@@ -7276,12 +7283,18 @@ async def _start_dingtalk_channel_provisioning_tool(
         "replaced": "已同步并替换原授权流程，请只使用下面的新链接。",
         "created": "已创建钉钉数字员工机器人授权流程。",
     }.get(flow_action, "钉钉数字员工机器人授权流程已就绪。")
+    force_warning = (
+        "\n这是强制重配流程，会创建新的钉钉机器人应用；切换完成后请在钉钉后台清理原应用。"
+        if force_reconfigure
+        else ""
+    )
     return (
         f"{action_message}\n"
         f"授权链接: {response['authorization_url']}\n"
         f"配置编号: {response['provisioning_id']}\n"
         f"有效期至: {response['expires_at']}\n"
         "用户完成授权后，平台会自动配置钉钉通道，并在钉钉中发送配置完成通知，无需手动回复确认。"
+        f"{force_warning}"
     )
 
 

@@ -713,6 +713,7 @@ async def delete_company(
     from app.models.audit import AuditLog, ApprovalRequest, ChatMessage
     from app.models.channel_config import ChannelConfig
     from app.models.chat_session import ChatSession
+    from app.models.dingtalk_provisioning import DingTalkChannelProvisioningSession
     from app.models.gateway_message import GatewayMessage
     from app.models.llm import LLMModel
     from app.models.notification import Notification
@@ -742,6 +743,11 @@ async def delete_company(
         await db.execute(sa_delete(AgentTrigger).where(AgentTrigger.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(AgentSchedule).where(AgentSchedule.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(AgentActivityLog).where(AgentActivityLog.agent_id.in_(agent_ids)))
+        await db.execute(
+            sa_delete(DingTalkChannelProvisioningSession).where(
+                DingTalkChannelProvisioningSession.agent_id.in_(agent_ids)
+            )
+        )
         await db.execute(sa_delete(ChannelConfig).where(ChannelConfig.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(AgentTool).where(AgentTool.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(Notification).where(Notification.agent_id.in_(agent_ids)))

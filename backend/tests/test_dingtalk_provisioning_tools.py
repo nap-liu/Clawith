@@ -43,8 +43,11 @@ def test_dingtalk_provisioning_tools_are_seeded_for_digital_employee_copy():
         assert tool["parameters_schema"]["type"] == "object"
 
     start_schema = _seed_tool("start_dingtalk_channel_provisioning")["parameters_schema"]
-    assert start_schema["required"] == ["restart_existing"]
-    assert start_schema["properties"]["restart_existing"]["type"] == "boolean"
+    assert not start_schema.get("required")
+    force = start_schema["properties"]["force_reconfigure"]
+    assert force["type"] == "boolean"
+    assert force["default"] is False
+    assert "强制" in force["description"]
 
 
 def test_dingtalk_provisioning_tools_exist_in_fallback_definitions():
@@ -56,7 +59,8 @@ def test_dingtalk_provisioning_tools_exist_in_fallback_definitions():
         assert function["parameters"]["type"] == "object"
 
     start_parameters = _fallback_tool("start_dingtalk_channel_provisioning")["parameters"]
-    assert start_parameters["required"] == ["restart_existing"]
+    assert not start_parameters.get("required")
+    assert start_parameters["properties"]["force_reconfigure"]["default"] is False
 
 
 @pytest.mark.asyncio
@@ -119,17 +123,21 @@ async def test_start_dingtalk_provisioning_tool_requires_user_context():
 
 
 @pytest.mark.asyncio
-async def test_start_dingtalk_provisioning_tool_requires_explicit_restart_choice():
+async def test_start_dingtalk_provisioning_tool_rejects_non_boolean_force_flag():
     from app.services import agent_tools
 
-    result = await agent_tools._start_dingtalk_channel_provisioning_tool(uuid.uuid4(), uuid.uuid4(), {})
+    result = await agent_tools._start_dingtalk_channel_provisioning_tool(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        {"force_reconfigure": "yes"},
+    )
 
-    assert "restart_existing" in result
-    assert "必填" in result
+    assert "force_reconfigure" in result
+    assert "布尔值" in result
 
 
 @pytest.mark.asyncio
-async def test_start_dingtalk_provisioning_tool_passes_restart_choice_to_service(monkeypatch):
+async def test_start_dingtalk_provisioning_tool_defaults_to_safe_reuse(monkeypatch):
     from app.core import permissions
     from app.services import agent_tools, dingtalk_provisioning
 
@@ -158,8 +166,8 @@ async def test_start_dingtalk_provisioning_tool_passes_restart_choice_to_service
     async def fake_can_manage(db, uid, target_agent):
         return True
 
-    async def fake_start(db, *, agent, requested_by_user_id, restart_existing):
-        captured.append(restart_existing)
+    async def fake_start(db, *, agent, requested_by_user_id, force_reconfigure):
+        captured.append(force_reconfigure)
         return {
             "flow_action": "reused",
             "authorization_url": "https://auth.example/existing",
@@ -174,9 +182,59 @@ async def test_start_dingtalk_provisioning_tool_passes_restart_choice_to_service
     result = await agent_tools._start_dingtalk_channel_provisioning_tool(
         agent_id,
         user_id,
-        {"restart_existing": False},
+        {},
     )
 
     assert captured == [False]
     assert "复用原钉钉授权链接" in result
     assert "https://auth.example/existing" in result
+
+
+@pytest.mark.asyncio
+async def test_start_dingtalk_provisioning_tool_guides_configured_channel_without_new_link(monkeypatch):
+    from app.core import permissions
+    from app.services import agent_tools, dingtalk_provisioning
+
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id)
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return agent
+
+    class FakeSession:
+        async def execute(self, statement):
+            return FakeResult()
+
+        async def commit(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+    async def fake_can_manage(db, uid, target_agent):
+        return True
+
+    async def fake_start(db, *, agent, requested_by_user_id, force_reconfigure):
+        assert force_reconfigure is False
+        return {
+            "status": "already_configured",
+            "flow_action": "already_configured",
+            "authorization_url": None,
+            "message": "当前数字员工的钉钉通道已经配置完成，无需重复配置。",
+        }
+
+    monkeypatch.setattr(agent_tools, "async_session", lambda: FakeSession())
+    monkeypatch.setattr(permissions, "user_can_manage_agent_id", fake_can_manage)
+    monkeypatch.setattr(dingtalk_provisioning, "start_dingtalk_channel_provisioning", fake_start)
+
+    result = await agent_tools._start_dingtalk_channel_provisioning_tool(agent_id, user_id, {})
+
+    assert "已经配置完成" in result
+    assert "无需重复配置" in result
+    assert "明确要求强制重配" in result
+    assert "http" not in result

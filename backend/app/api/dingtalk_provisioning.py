@@ -78,13 +78,18 @@ async def start_dingtalk_channel_provisioning_route(
     """Start DingTalk robot authorization for a digital employee."""
     agent, _ = await check_agent_access(db, current_user, agent_id)
     _require_manage_access(current_user, agent)
-    restart_existing = (data or {}).get("restart_existing", False)
-    if not isinstance(restart_existing, bool):
+    payload = data or {}
+    force_reconfigure = payload.get("force_reconfigure", False)
+    if not isinstance(force_reconfigure, bool):
+        raise HTTPException(status_code=422, detail="force_reconfigure must be a boolean")
+    restart_existing = payload.get("restart_existing")
+    if restart_existing is not None and not isinstance(restart_existing, bool):
         raise HTTPException(status_code=422, detail="restart_existing must be a boolean")
     response = await start_dingtalk_channel_provisioning(
         db,
         agent=agent,
         requested_by_user_id=current_user.id,
+        force_reconfigure=force_reconfigure,
         restart_existing=restart_existing,
     )
     return _sanitize_response(response)

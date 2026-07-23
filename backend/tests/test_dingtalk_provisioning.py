@@ -28,7 +28,9 @@ from app.models.org import OrgMember
 from app.models.participant import Participant
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
+from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
 from app.services.dingtalk_provisioning import (
+    DINGTALK_PROVISIONING_OPERATION_FORCE,
     DINGTALK_WELCOME_RETRY_DELAYS_SECONDS,
     _bounded_polling_window,
     poll_dingtalk_provisioning_session,
@@ -124,10 +126,10 @@ def test_bounded_polling_window_caps_dingtalk_values():
 
 
 @pytest.mark.asyncio
-async def test_start_provisioning_persists_session_and_cancels_previous_pending(db_session):
+async def test_start_provisioning_reuses_valid_flow_even_with_legacy_restart_flag(db_session):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
-    old = DingTalkChannelProvisioningSession(
+    existing = DingTalkChannelProvisioningSession(
         agent_id=agent.id,
         tenant_id=agent.tenant_id,
         requested_by_user_id=user.id,
@@ -139,7 +141,7 @@ async def test_start_provisioning_persists_session_and_cancels_previous_pending(
         poll_interval_seconds=5,
         max_poll_attempts=10,
     )
-    db_session.add(old)
+    db_session.add(existing)
     await db_session.flush()
     fake_client = FakeRegistrationClient()
 
@@ -152,20 +154,11 @@ async def test_start_provisioning_persists_session_and_cancels_previous_pending(
         now=now,
     )
 
-    assert fake_client.begin_calls == 1
-    assert old.status == DINGTALK_PROVISIONING_STATUS_CANCELLED
-    assert result["status"] == DINGTALK_PROVISIONING_STATUS_WAITING
-    assert result["authorization_url"] == "https://oapi.dingtalk.com/device/complete"
-    assert result["expires_at"] == (now + timedelta(seconds=1800)).isoformat()
-    assert "数字员工" in result["message"]
-    assert "Agent" not in result["message"]
-    assert "client_secret" not in str(result)
-
-    stored = await db_session.get(DingTalkChannelProvisioningSession, uuid.UUID(result["provisioning_id"]))
-    assert stored is not None
-    assert stored.device_code == "device-code-1"
-    assert stored.poll_interval_seconds == 2
-    assert stored.max_poll_attempts == 900
+    assert fake_client.begin_calls == 0
+    assert existing.status == DINGTALK_PROVISIONING_STATUS_WAITING
+    assert result["flow_action"] == "reused"
+    assert result["provisioning_id"] == str(existing.id)
+    assert result["authorization_url"] == existing.authorization_url
 
 
 @pytest.mark.asyncio
@@ -206,59 +199,70 @@ async def test_start_provisioning_reuses_unexpired_flow_when_restart_is_false(db
 
 
 @pytest.mark.asyncio
-async def test_restart_reconciles_success_before_creating_replacement(db_session):
+async def test_start_reports_configured_channel_and_only_force_creates_new_flow(db_session):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
-    existing = DingTalkChannelProvisioningSession(
+    config = ChannelConfig(
         agent_id=agent.id,
-        tenant_id=agent.tenant_id,
-        requested_by_user_id=user.id,
-        status=DINGTALK_PROVISIONING_STATUS_POLLING,
-        device_code="existing-device",
-        authorization_url="https://auth.example/existing",
-        expires_at=now + timedelta(minutes=20),
-        next_poll_at=now + timedelta(seconds=2),
-        poll_interval_seconds=2,
-        max_poll_attempts=900,
+        channel_type="dingtalk",
+        app_id="configured-app-key",
+        app_secret="configured-app-secret",
+        is_configured=True,
+        extra_config={"connection_mode": "websocket"},
     )
-    db_session.add(existing)
+    db_session.add(config)
     await db_session.flush()
-    fake_client = FakeRegistrationClient(
-        poll_responses=[
-            {
-                "status": "SUCCESS",
-                "client_id": "ding-client-id",
-                "client_secret": "ding-client-secret",
-            }
-        ]
-    )
-    stream_starts = []
-
-    async def fake_stream_starter(agent_id, app_key, app_secret):
-        stream_starts.append((agent_id, app_key, app_secret))
+    fake_client = FakeRegistrationClient()
 
     result = await start_dingtalk_channel_provisioning(
         db_session,
         agent=agent,
         requested_by_user_id=user.id,
-        restart_existing=True,
         registration_client=fake_client,
-        stream_starter=fake_stream_starter,
         now=now,
     )
 
-    assert result["flow_action"] == "configured_existing"
-    assert result["provisioning_id"] == str(existing.id)
-    assert existing.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
-    assert fake_client.poll_calls == ["existing-device"]
+    assert result["status"] == "already_configured"
+    assert result["flow_action"] == "already_configured"
+    assert result["authorization_url"] is None
+    assert "无需重复配置" in result["message"]
+    assert "强制重配" in result["message"]
     assert fake_client.begin_calls == 0
-    assert stream_starts == [(agent.id, "ding-client-id", "ding-client-secret")]
 
+    forced = await start_dingtalk_channel_provisioning(
+        db_session,
+        agent=agent,
+        requested_by_user_id=user.id,
+        force_reconfigure=True,
+        registration_client=fake_client,
+        now=now,
+    )
+
+    assert forced["flow_action"] == "created"
+    assert forced["authorization_url"] == "https://oapi.dingtalk.com/device/complete"
+    assert fake_client.begin_calls == 1
+    stored = await db_session.get(
+        DingTalkChannelProvisioningSession,
+        uuid.UUID(forced["provisioning_id"]),
+    )
+    assert stored.registration_result["operation"] == DINGTALK_PROVISIONING_OPERATION_FORCE
+    assert stored.registration_result["baseline_fp"] == dingtalk_credential_fingerprint(
+        "configured-app-key",
+        "configured-app-secret",
+    )
+    assert "configured-app-secret" not in str(stored.registration_result)
 
 @pytest.mark.asyncio
-async def test_restart_begin_failure_keeps_existing_flow_active(db_session):
+async def test_force_begin_failure_keeps_existing_force_flow_active(db_session):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    config = ChannelConfig(
+        agent_id=agent.id,
+        channel_type="dingtalk",
+        app_id="configured-app-key",
+        app_secret="configured-app-secret",
+        is_configured=True,
+    )
     existing = DingTalkChannelProvisioningSession(
         agent_id=agent.id,
         tenant_id=agent.tenant_id,
@@ -270,8 +274,12 @@ async def test_restart_begin_failure_keeps_existing_flow_active(db_session):
         next_poll_at=now + timedelta(seconds=2),
         poll_interval_seconds=2,
         max_poll_attempts=900,
+        registration_result={
+            "operation": DINGTALK_PROVISIONING_OPERATION_FORCE,
+            "baseline_fp": "stale-baseline",
+        },
     )
-    db_session.add(existing)
+    db_session.add_all([config, existing])
     await db_session.flush()
 
     class BeginFailureClient(FakeRegistrationClient):
@@ -279,14 +287,14 @@ async def test_restart_begin_failure_keeps_existing_flow_active(db_session):
             self.begin_calls += 1
             raise RuntimeError("temporary begin failure")
 
-    fake_client = BeginFailureClient(poll_responses=[{"status": "WAITING"}])
+    fake_client = BeginFailureClient()
 
     with pytest.raises(RuntimeError, match="temporary begin failure"):
         await start_dingtalk_channel_provisioning(
             db_session,
             agent=agent,
             requested_by_user_id=user.id,
-            restart_existing=True,
+            force_reconfigure=True,
             registration_client=fake_client,
             now=now,
         )
@@ -295,6 +303,58 @@ async def test_restart_begin_failure_keeps_existing_flow_active(db_session):
     assert fake_client.begin_calls == 1
     assert existing.status == DINGTALK_PROVISIONING_STATUS_POLLING
     assert existing.next_poll_at == now + timedelta(seconds=2)
+
+
+@pytest.mark.asyncio
+async def test_non_reusable_flow_polls_final_success_before_issuing_new_link(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    existing = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="just-authorized",
+        authorization_url="https://auth.example/old",
+        expires_at=now - timedelta(seconds=1),
+        next_poll_at=now - timedelta(seconds=2),
+        poll_interval_seconds=2,
+        max_poll_attempts=900,
+    )
+    db_session.add(existing)
+    await db_session.flush()
+    fake_client = FakeRegistrationClient(
+        poll_responses=[
+            {
+                "status": "SUCCESS",
+                "client_id": "existing-success-key",
+                "client_secret": "existing-success-secret",
+            }
+        ]
+    )
+
+    result = await start_dingtalk_channel_provisioning(
+        db_session,
+        agent=agent,
+        requested_by_user_id=user.id,
+        registration_client=fake_client,
+        now=now,
+    )
+
+    assert result["flow_action"] == "configured_existing"
+    assert result["provisioning_id"] == str(existing.id)
+    assert fake_client.poll_calls == ["just-authorized"]
+    assert fake_client.begin_calls == 0
+    config = (
+        await db_session.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "dingtalk",
+            )
+        )
+    ).scalar_one()
+    assert config.app_id == "existing-success-key"
+    assert config.app_secret == "existing-success-secret"
 
 
 @pytest.mark.asyncio
@@ -540,7 +600,7 @@ async def test_full_30_minute_poll_window_consumes_success_on_attempt_900(db_ses
 
 
 @pytest.mark.asyncio
-async def test_poll_success_configures_dingtalk_channel_and_starts_stream(db_session):
+async def test_poll_success_configures_channel_and_defers_stream_to_reconciler(db_session):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
     session = DingTalkChannelProvisioningSession(
@@ -596,7 +656,119 @@ async def test_poll_success_configures_dingtalk_channel_and_starts_stream(db_ses
     assert config.extra_config["connection_mode"] == "websocket"
     assert config.extra_config["agent_id"] == "ding-client-id"
     assert config.extra_config["provisioning_session_id"] == str(session.id)
-    assert stream_starts == [(agent.id, "ding-client-id", "ding-client-secret")]
+    assert session.welcome_status == DINGTALK_WELCOME_STATUS_PENDING
+    assert session.welcome_attempt_count == 0
+    assert session.welcome_next_retry_at == now
+    assert stream_starts == []
+
+
+@pytest.mark.asyncio
+async def test_force_poll_success_overwrites_only_matching_baseline(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    old_key = "old-app-key"
+    old_secret = "old-app-secret"
+    config = ChannelConfig(
+        agent_id=agent.id,
+        channel_type="dingtalk",
+        app_id=old_key,
+        app_secret=old_secret,
+        is_configured=True,
+        is_connected=True,
+        extra_config={"connection_mode": "websocket"},
+    )
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="force-success",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(minutes=5),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=10,
+        registration_result={
+            "operation": DINGTALK_PROVISIONING_OPERATION_FORCE,
+            "baseline_fp": dingtalk_credential_fingerprint(old_key, old_secret),
+        },
+    )
+    db_session.add_all([config, session])
+    await db_session.flush()
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=FakeRegistrationClient(
+            poll_responses=[
+                {
+                    "status": "SUCCESS",
+                    "client_id": "new-app-key",
+                    "client_secret": "new-app-secret",
+                }
+            ]
+        ),
+        now=now,
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    assert config.app_id == "new-app-key"
+    assert config.app_secret == "new-app-secret"
+    assert config.is_configured is True
+
+
+@pytest.mark.asyncio
+async def test_force_poll_does_not_overwrite_configuration_changed_during_authorization(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+    config = ChannelConfig(
+        agent_id=agent.id,
+        channel_type="dingtalk",
+        app_id="current-app-key",
+        app_secret="manually-updated-secret",
+        is_configured=True,
+    )
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="force-stale",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(minutes=5),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=10,
+        registration_result={
+            "operation": DINGTALK_PROVISIONING_OPERATION_FORCE,
+            "baseline_fp": dingtalk_credential_fingerprint(
+                "current-app-key",
+                "original-secret",
+            ),
+        },
+    )
+    db_session.add_all([config, session])
+    await db_session.flush()
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=FakeRegistrationClient(
+            poll_responses=[
+                {
+                    "status": "SUCCESS",
+                    "client_id": "new-app-key",
+                    "client_secret": "new-app-secret",
+                }
+            ]
+        ),
+        now=now,
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_CANCELLED
+    assert session.registration_result["completion_reason"] == "configuration_changed"
+    assert config.app_id == "current-app-key"
+    assert config.app_secret == "manually-updated-secret"
 
 
 @pytest.mark.asyncio
@@ -667,7 +839,7 @@ async def test_poll_success_replaces_existing_dingtalk_robot_binding_on_other_di
     assert old_config.app_secret is None
     assert old_config.extra_config["replaced_by_agent_id"] == str(new_agent.id)
     assert old_config.extra_config["replaced_by_provisioning_session_id"] == str(session.id)
-    assert stream_stops == [old_agent.id]
+    assert stream_stops == []
 
     new_config = (
         await db_session.execute(
@@ -680,7 +852,7 @@ async def test_poll_success_replaces_existing_dingtalk_robot_binding_on_other_di
     assert new_config.app_id == "ding-client-id"
     assert new_config.app_secret == "new-secret"
     assert new_config.is_configured is True
-    assert stream_starts == [(new_agent.id, "ding-client-id", "new-secret")]
+    assert stream_starts == []
 
 
 @pytest.mark.asyncio
@@ -745,6 +917,20 @@ async def test_poll_success_sends_welcome_message_to_bound_dingtalk_user(db_sess
     )
 
     assert session.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    assert session.welcome_status == DINGTALK_WELCOME_STATUS_PENDING
+    assert session.welcome_attempt_count == 0
+    assert sent_messages == []
+
+    # Provisioning credentials commit before any external welcome-message side
+    # effect. The connector's post-commit retry loop performs the send.
+    await db_session.commit()
+    count = await retry_due_dingtalk_welcome_messages(
+        db_session,
+        welcome_sender=fake_welcome_sender,
+        now=now,
+    )
+
+    assert count == 1
     assert session.welcome_status == DINGTALK_WELCOME_STATUS_SENT
     assert session.welcome_attempt_count == 1
     assert session.welcome_next_retry_at is None
@@ -860,6 +1046,19 @@ async def test_poll_success_retries_welcome_after_permission_propagates(db_sessi
     )
 
     assert provisioning.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    assert provisioning.welcome_status == DINGTALK_WELCOME_STATUS_PENDING
+    assert provisioning.welcome_attempt_count == 0
+    assert provisioning.welcome_next_retry_at == now
+    assert provisioning.last_error is None
+    assert send_attempts == []
+
+    await db_session.commit()
+    count = await retry_due_dingtalk_welcome_messages(
+        db_session,
+        welcome_sender=permission_race_sender,
+        now=now,
+    )
+    assert count == 1
     assert provisioning.welcome_status == DINGTALK_WELCOME_STATUS_PENDING
     assert provisioning.welcome_attempt_count == 1
     assert provisioning.welcome_next_retry_at == now + timedelta(seconds=2)
@@ -1062,7 +1261,25 @@ async def test_poll_terminal_expired_status_stops_session(db_session):
 
 @pytest.mark.asyncio
 async def test_poll_due_sessions_resumes_only_unexpired_due_sessions(db_session):
-    _, user, agent = await _seed_digital_employee(db_session)
+    tenant, user, agent = await _seed_digital_employee(db_session)
+    future_agent = Agent(
+        id=uuid.uuid4(),
+        tenant_id=tenant.id,
+        creator_id=user.id,
+        name="未来授权数字员工",
+        agent_type="native",
+        status="running",
+    )
+    expired_agent = Agent(
+        id=uuid.uuid4(),
+        tenant_id=tenant.id,
+        creator_id=user.id,
+        name="过期授权数字员工",
+        agent_type="native",
+        status="running",
+    )
+    db_session.add_all([future_agent, expired_agent])
+    await db_session.flush()
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
     due = DingTalkChannelProvisioningSession(
         agent_id=agent.id,
@@ -1077,7 +1294,7 @@ async def test_poll_due_sessions_resumes_only_unexpired_due_sessions(db_session)
         max_poll_attempts=10,
     )
     future = DingTalkChannelProvisioningSession(
-        agent_id=agent.id,
+        agent_id=future_agent.id,
         tenant_id=agent.tenant_id,
         requested_by_user_id=user.id,
         status=DINGTALK_PROVISIONING_STATUS_WAITING,
@@ -1089,7 +1306,7 @@ async def test_poll_due_sessions_resumes_only_unexpired_due_sessions(db_session)
         max_poll_attempts=10,
     )
     expired = DingTalkChannelProvisioningSession(
-        agent_id=agent.id,
+        agent_id=expired_agent.id,
         tenant_id=agent.tenant_id,
         requested_by_user_id=user.id,
         status=DINGTALK_PROVISIONING_STATUS_WAITING,

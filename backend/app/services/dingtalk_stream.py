@@ -10,16 +10,22 @@ import json
 import threading
 import uuid
 from concurrent.futures import CancelledError as FutureCancelledError
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
+from urllib.parse import quote_plus
 
 import httpx
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, update
 
+from app.config import get_settings
 from app.database import async_session
+from app.models.agent import Agent
 from app.models.channel_config import ChannelConfig
+from app.models.tenant import Tenant
 from app.services.channel_dispatch import ChannelReactions, run_channel_message
+from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
 from app.services.dingtalk_token import dingtalk_token_manager
 from app.services.storage import store_agent_upload
 
@@ -453,13 +459,54 @@ def _fire_and_forget(loop, coro):
     future.add_done_callback(_on_done)
 
 
+def _connector_role_enabled() -> bool:
+    roles = {
+        role.strip().lower()
+        for role in (get_settings().PROCESS_ROLE or "all").split(",")
+        if role.strip()
+    }
+    return not roles or "all" in roles or "connector" in roles
+
+
+@dataclass
+class _StreamRuntime:
+    generation: int
+    fingerprint: str
+    app_key: str
+    thread: threading.Thread
+    stop_event: threading.Event
+    loop: asyncio.AbstractEventLoop | None = None
+    async_stop_event: asyncio.Event | None = None
+    # None means the process has not published its first observed state yet.
+    # This ensures a stale persisted is_connected=true is cleared on startup
+    # even when the first connection attempt fails.
+    ready: bool | None = None
+    persisted_ready: bool | None = None
+
+
 class DingTalkStreamManager:
     """Manages DingTalk Stream clients for all agents."""
 
     def __init__(self):
-        self._threads: Dict[uuid.UUID, threading.Thread] = {}
-        self._stop_events: Dict[uuid.UUID, threading.Event] = {}
+        self._runtimes: dict[uuid.UUID, _StreamRuntime] = {}
+        self._locks: dict[uuid.UUID, asyncio.Lock] = {}
+        self._state_locks: dict[uuid.UUID, asyncio.Lock] = {}
+        self._generation: dict[uuid.UUID, int] = {}
         self._main_loop: asyncio.AbstractEventLoop | None = None
+
+    def _lock_for(self, agent_id: uuid.UUID) -> asyncio.Lock:
+        lock = self._locks.get(agent_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[agent_id] = lock
+        return lock
+
+    def _state_lock_for(self, agent_id: uuid.UUID) -> asyncio.Lock:
+        lock = self._state_locks.get(agent_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._state_locks[agent_id] = lock
+        return lock
 
     async def start_client(
         self,
@@ -467,35 +514,76 @@ class DingTalkStreamManager:
         app_key: str,
         app_secret: str,
         stop_existing: bool = True,
+        verify_persisted: bool = True,
     ):
         """Start a DingTalk Stream client for a specific agent."""
+        if not _connector_role_enabled():
+            logger.debug(
+                f"[DingTalk Stream] Ignore start for {agent_id}: PROCESS_ROLE has no connector ownership"
+            )
+            return
         if not app_key or not app_secret:
             logger.warning(f"[DingTalk Stream] Missing credentials for {agent_id}, skipping")
             return
+        if verify_persisted:
+            try:
+                desired = await self._load_persisted_desired_credentials(agent_id)
+            except Exception:
+                logger.exception(
+                    f"[DingTalk Stream] Cannot verify committed credentials for {agent_id}; "
+                    "deferring to reconciler"
+                )
+                return
+            if desired is None or dingtalk_credential_fingerprint(*desired) != (
+                dingtalk_credential_fingerprint(app_key, app_secret)
+            ):
+                logger.debug(
+                    f"[DingTalk Stream] Deferring start for {agent_id} until credentials commit"
+                )
+                return
 
-        logger.info(f"[DingTalk Stream] Starting client for agent {agent_id} (AppKey: {app_key[:8]}...)")
-
-        # Capture the main event loop so threads can dispatch coroutines back
         if self._main_loop is None:
             self._main_loop = asyncio.get_running_loop()
+        fingerprint = dingtalk_credential_fingerprint(app_key, app_secret)
+        async with self._lock_for(agent_id):
+            runtime = self._runtimes.get(agent_id)
+            if (
+                runtime is not None
+                and runtime.fingerprint == fingerprint
+                and runtime.thread.is_alive()
+            ):
+                return
+            if runtime is not None and (stop_existing or runtime.fingerprint != fingerprint):
+                stopped = await self._stop_runtime_locked(agent_id, runtime)
+                if not stopped:
+                    logger.error(
+                        f"[DingTalk Stream] Refusing to start a second client for {agent_id}: "
+                        "the previous runner did not exit"
+                    )
+                    return
 
-        # Stop existing client if any
-        if stop_existing:
-            await self.stop_client(agent_id)
-
-        stop_event = threading.Event()
-        self._stop_events[agent_id] = stop_event
-
-        # Run Stream client in a separate thread (SDK uses its own event loop)
-        thread = threading.Thread(
-            target=self._run_client_thread,
-            args=(agent_id, app_key, app_secret, stop_event),
-            name=f"dingtalk-stream-{str(agent_id)[:8]}",
-            daemon=True,
-        )
-        self._threads[agent_id] = thread
-        thread.start()
-        logger.info(f"[DingTalk Stream] Client thread started for agent {agent_id}")
+            generation = self._generation.get(agent_id, 0) + 1
+            self._generation[agent_id] = generation
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=self._run_client_thread,
+                args=(agent_id, app_key, app_secret, stop_event, generation, fingerprint),
+                name=f"dingtalk-stream-{str(agent_id)[:8]}",
+                daemon=True,
+            )
+            runtime = _StreamRuntime(
+                generation=generation,
+                fingerprint=fingerprint,
+                app_key=app_key,
+                thread=thread,
+                stop_event=stop_event,
+            )
+            self._runtimes[agent_id] = runtime
+            thread.start()
+            logger.info(
+                f"[DingTalk Stream] Client runner started for agent {agent_id} "
+                f"(AppKey: {app_key[:8]}..., generation={generation})"
+            )
 
     def _run_client_thread(
         self,
@@ -503,15 +591,26 @@ class DingTalkStreamManager:
         app_key: str,
         app_secret: str,
         stop_event: threading.Event,
+        generation: int,
+        fingerprint: str,
     ):
         """Run the DingTalk Stream client with auto-reconnect."""
-        import dingtalk_stream  # ImportError here exits immediately (no retry)
-
-        MAX_RETRIES = 5
-        RETRY_DELAYS = [2, 5, 15, 30, 60]  # exponential backoff, seconds
-
         main_loop = self._main_loop
-        retries = 0
+        try:
+            import dingtalk_stream
+        except ImportError:
+            logger.warning(
+                "[DingTalk Stream] dingtalk-stream package not installed. "
+                "Install with: pip install dingtalk-stream"
+            )
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_runner_exit(agent_id, generation, fingerprint),
+                    main_loop,
+                )
+            return
+
+        RETRY_DELAYS = [2, 5, 15, 30, 60]  # exponential backoff, seconds
 
         class ClawithChatbotHandler(dingtalk_stream.ChatbotHandler):
             """Custom handler that dispatches messages to the Clawith LLM pipeline."""
@@ -744,75 +843,318 @@ class DingTalkStreamManager:
                     logger.error(f"[DingTalk Stream] card callback error: {e}")
                     return dingtalk_stream.AckMessage.STATUS_SYSTEM_EXCEPTION, str(e)
 
-        while not stop_event.is_set() and retries <= MAX_RETRIES:
+        try:
+            credential = dingtalk_stream.Credential(client_id=app_key, client_secret=app_secret)
+            client = dingtalk_stream.DingTalkStreamClient(credential=credential)
+            client.register_callback_handler(
+                dingtalk_stream.chatbot.ChatbotMessage.TOPIC,
+                ClawithChatbotHandler(),
+            )
+            client.register_callback_handler(
+                dingtalk_stream.Card_Callback_Router_Topic,
+                ClawithCardCallbackHandler(),
+            )
+            logger.info(
+                f"[DingTalk Stream] registered callback topics for agent {agent_id}: "
+                f"{list(client.callback_handler_map.keys())}"
+            )
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            async_stop_event = asyncio.Event()
+            runtime = self._runtimes.get(agent_id)
+            if runtime is not None and runtime.generation == generation:
+                runtime.loop = loop
+                runtime.async_stop_event = async_stop_event
+            if stop_event.is_set():
+                async_stop_event.set()
+            loop.run_until_complete(
+                self._run_managed_client(
+                    agent_id=agent_id,
+                    generation=generation,
+                    client=client,
+                    async_stop_event=async_stop_event,
+                    retry_delays=RETRY_DELAYS,
+                )
+            )
+        except Exception as exc:
+            logger.exception(f"[DingTalk Stream] Client runner failed for {agent_id}: {exc}")
+        finally:
             try:
-                credential = dingtalk_stream.Credential(client_id=app_key, client_secret=app_secret)
-                client = dingtalk_stream.DingTalkStreamClient(credential=credential)
-                client.register_callback_handler(
-                    dingtalk_stream.chatbot.ChatbotMessage.TOPIC,
-                    ClawithChatbotHandler(),
+                pending = asyncio.all_tasks(loop) if "loop" in locals() and not loop.is_closed() else set()
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                if "loop" in locals() and not loop.is_closed():
+                    loop.close()
+            except Exception:
+                logger.exception(f"[DingTalk Stream] Failed to close runner loop for {agent_id}")
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_runner_exit(agent_id, generation, fingerprint),
+                    main_loop,
                 )
-                client.register_callback_handler(
-                    dingtalk_stream.Card_Callback_Router_Topic,
-                    ClawithCardCallbackHandler(),
-                )
-                logger.info(
-                    f"[DingTalk Stream] registered callback topics for agent {agent_id}: "
-                    f"{list(client.callback_handler_map.keys())}"
-                )
+            logger.info(
+                f"[DingTalk Stream] Client runner exited for agent {agent_id} "
+                f"(generation={generation})"
+            )
 
-                logger.info(
-                    f"[DingTalk Stream] Connecting for agent {agent_id}... "
-                    f"(attempt {retries + 1}/{MAX_RETRIES + 1})"
-                )
-                retries = 0  # reset on successful connection
-                # start_forever() blocks until disconnected
-                client.start_forever()
+    async def _open_connection(
+        self,
+        client,
+        http_client: httpx.AsyncClient,
+    ) -> dict:
+        """Open the DingTalk gateway with a bounded, cancellable HTTP call."""
+        topics = []
+        if getattr(client, "_is_event_required", False):
+            topics.append({"type": "EVENT", "topic": "*"})
+        topics.extend(
+            {"type": "CALLBACK", "topic": topic}
+            for topic in client.callback_handler_map
+        )
+        response = await http_client.post(
+            client.OPEN_CONNECTION_API,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "DingTalkStream/managed Clawith",
+            },
+            json={
+                "clientId": client.credential.client_id,
+                "clientSecret": client.credential.client_secret,
+                "subscriptions": topics,
+                "ua": "dingtalk-sdk-python/clawith-managed",
+                "localIp": client.get_host_ip(),
+            },
+        )
+        response.raise_for_status()
+        return response.json()
 
-                # start_forever returned — connection dropped
-                if stop_event.is_set():
-                    break  # intentional stop, no retry
+    async def _open_connection_or_stop(
+        self,
+        client,
+        http_client: httpx.AsyncClient,
+        async_stop_event: asyncio.Event,
+    ) -> dict | None:
+        open_task = asyncio.create_task(self._open_connection(client, http_client))
+        stop_task = asyncio.create_task(async_stop_event.wait())
+        done, pending = await asyncio.wait(
+            {open_task, stop_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_task in done and stop_task.result():
+            open_task.cancel()
+            await asyncio.gather(open_task, return_exceptions=True)
+            return None
+        stop_task.cancel()
+        await asyncio.gather(stop_task, return_exceptions=True)
+        return open_task.result()
 
-                logger.warning(
-                    f"[DingTalk Stream] Connection lost for agent {agent_id}, will retry..."
-                )
+    async def _run_managed_client(
+        self,
+        *,
+        agent_id: uuid.UUID,
+        generation: int,
+        client,
+        async_stop_event: asyncio.Event,
+        retry_delays: list[int],
+    ) -> None:
+        """Run the SDK protocol with an explicit, stoppable reconnect loop."""
+        import websockets
 
-            except ImportError:
-                logger.warning(
-                    "[DingTalk Stream] dingtalk-stream package not installed. "
-                    "Install with: pip install dingtalk-stream"
-                )
-                break  # no point retrying without the package
-            except Exception as e:
-                retries += 1
-                logger.error(
-                    f"[DingTalk Stream] Connection error for {agent_id} "
-                    f"(attempt {retries}/{MAX_RETRIES + 1}): {e}"
-                )
-
-                if retries > MAX_RETRIES:
-                    logger.error(
-                        f"[DingTalk Stream] Agent {agent_id} exhausted all retries, giving up"
+        client.pre_start()
+        retry_count = 0
+        failure_notified = False
+        async with httpx.AsyncClient(timeout=15) as gateway_http:
+            while not async_stop_event.is_set():
+                websocket = None
+                keepalive_task = None
+                try:
+                    connection = await self._open_connection_or_stop(
+                        client,
+                        gateway_http,
+                        async_stop_event,
                     )
-                    # Notify creator about permanent failure
-                    if main_loop and main_loop.is_running():
-                        asyncio.run_coroutine_threadsafe(
-                            self._notify_connection_failed(agent_id, str(e)),
-                            main_loop,
+                    if connection is None and async_stop_event.is_set():
+                        break
+                    if not connection:
+                        raise RuntimeError("DingTalk open connection returned no endpoint")
+                    uri = f'{connection["endpoint"]}?ticket={quote_plus(connection["ticket"])}'
+                    logger.info(
+                        f"[DingTalk Stream] Connecting for agent {agent_id} "
+                        f"(generation={generation}, retry={retry_count})"
+                    )
+                    async with websockets.connect(uri) as websocket:
+                        client.websocket = websocket
+                        retry_count = 0
+                        failure_notified = False
+                        await self._publish_connection_state(agent_id, generation, ready=True)
+                        keepalive_task = asyncio.create_task(client.keepalive(websocket))
+                        while not async_stop_event.is_set():
+                            receive_task = asyncio.create_task(websocket.recv())
+                            stop_task = asyncio.create_task(async_stop_event.wait())
+                            done, pending = await asyncio.wait(
+                                {receive_task, stop_task},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            for task in pending:
+                                task.cancel()
+                            if pending:
+                                await asyncio.gather(*pending, return_exceptions=True)
+                            if stop_task in done and stop_task.result():
+                                if not receive_task.done():
+                                    receive_task.cancel()
+                                await websocket.close()
+                                break
+                            raw_message = receive_task.result()
+                            json_message = json.loads(raw_message)
+                            asyncio.create_task(client.background_task(json_message))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if not async_stop_event.is_set():
+                        retry_count += 1
+                        logger.warning(
+                            f"[DingTalk Stream] Connection error for {agent_id} "
+                            f"(generation={generation}, retry={retry_count}): {exc}"
                         )
+                        if retry_count >= 6 and not failure_notified:
+                            failure_notified = True
+                            main_loop = self._main_loop
+                            if main_loop and main_loop.is_running():
+                                asyncio.run_coroutine_threadsafe(
+                                    self._notify_connection_failed(agent_id, str(exc)),
+                                    main_loop,
+                                )
+                finally:
+                    if keepalive_task is not None:
+                        keepalive_task.cancel()
+                        await asyncio.gather(keepalive_task, return_exceptions=True)
+                    client.websocket = None
+                    await self._publish_connection_state(agent_id, generation, ready=False)
+
+                if async_stop_event.is_set():
                     break
+                delay = retry_delays[min(max(retry_count - 1, 0), len(retry_delays) - 1)]
+                try:
+                    await asyncio.wait_for(async_stop_event.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
 
-                delay = RETRY_DELAYS[min(retries - 1, len(RETRY_DELAYS) - 1)]
-                logger.info(
-                    f"[DingTalk Stream] Retrying in {delay}s for agent {agent_id}..."
+    async def _publish_connection_state(
+        self,
+        agent_id: uuid.UUID,
+        generation: int,
+        *,
+        ready: bool,
+    ) -> None:
+        main_loop = self._main_loop
+        if main_loop is None or not main_loop.is_running():
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._set_connection_state(agent_id, generation, ready=ready),
+            main_loop,
+        )
+
+        def _log_failure(done):
+            try:
+                done.result()
+            except FutureCancelledError:
+                return
+            except Exception:
+                logger.exception(
+                    f"[DingTalk Stream] Connection-state task failed for {agent_id}"
                 )
-                # Use stop_event.wait so we exit immediately if stopped
-                if stop_event.wait(timeout=delay):
-                    break  # stop was requested during wait
 
-        self._threads.pop(agent_id, None)
-        self._stop_events.pop(agent_id, None)
-        logger.info(f"[DingTalk Stream] Client stopped for agent {agent_id}")
+        future.add_done_callback(_log_failure)
+
+    async def _set_connection_state(
+        self,
+        agent_id: uuid.UUID,
+        generation: int,
+        *,
+        ready: bool,
+    ) -> None:
+        async with self._state_lock_for(agent_id):
+            runtime = self._runtimes.get(agent_id)
+            if runtime is None or runtime.generation != generation:
+                return
+            runtime.ready = ready
+            if runtime.persisted_ready != ready:
+                if await self._set_persisted_connected(agent_id, ready):
+                    current = self._runtimes.get(agent_id)
+                    if current is runtime and current.generation == generation:
+                        current.persisted_ready = ready
+            logger.info(
+                f"[DingTalk Stream] Agent {agent_id} connection ready={ready} "
+                f"(generation={generation})"
+            )
+
+    async def _handle_runner_exit(
+        self,
+        agent_id: uuid.UUID,
+        generation: int,
+        fingerprint: str,
+    ) -> None:
+        async with self._lock_for(agent_id):
+            runtime = self._runtimes.get(agent_id)
+            if (
+                runtime is None
+                or runtime.generation != generation
+                or runtime.fingerprint != fingerprint
+            ):
+                return
+            self._runtimes.pop(agent_id, None)
+            async with self._state_lock_for(agent_id):
+                await self._set_persisted_connected(agent_id, False)
+
+    async def _set_persisted_connected(self, agent_id: uuid.UUID, connected: bool) -> bool:
+        async def _write() -> None:
+            async with async_session() as db:
+                await db.execute(
+                    update(ChannelConfig)
+                    .where(
+                        ChannelConfig.agent_id == agent_id,
+                        ChannelConfig.channel_type == "dingtalk",
+                    )
+                    .values(is_connected=connected)
+                )
+                await db.commit()
+
+        try:
+            await asyncio.wait_for(_write(), timeout=5)
+            return True
+        except Exception:
+            logger.exception(
+                f"[DingTalk Stream] Failed to persist connection state for {agent_id}; "
+                "the live connection state remains authoritative"
+            )
+            return False
+
+    async def _load_persisted_desired_credentials(
+        self,
+        agent_id: uuid.UUID,
+    ) -> tuple[str, str] | None:
+        async with async_session() as db:
+            result = await db.execute(
+                select(ChannelConfig)
+                .join(Agent, Agent.id == ChannelConfig.agent_id)
+                .join(Tenant, Tenant.id == Agent.tenant_id)
+                .where(
+                    ChannelConfig.agent_id == agent_id,
+                    ChannelConfig.channel_type == "dingtalk",
+                    ChannelConfig.is_configured.is_(True),
+                    Agent.is_deleted.is_(False),
+                    Tenant.is_active.is_(True),
+                )
+            )
+            config = result.scalar_one_or_none()
+        if not config or not config.app_id or not config.app_secret:
+            return None
+        extra = config.extra_config if isinstance(config.extra_config, dict) else {}
+        if extra.get("connection_mode", "websocket") != "websocket":
+            return None
+        return config.app_id, config.app_secret
 
     async def _notify_connection_failed(self, agent_id: uuid.UUID, error_msg: str):
         """Send notification to agent creator when DingTalk connection permanently fails."""
@@ -840,48 +1182,118 @@ class DingTalkStreamManager:
         except Exception as e:
             logger.error(f"[DingTalk Stream] Failed to send connection failure notification: {e}")
 
-    async def stop_client(self, agent_id: uuid.UUID):
+    async def stop_client(
+        self,
+        agent_id: uuid.UUID,
+        verify_persisted: bool = True,
+    ):
         """Stop a running Stream client for an agent."""
-        stop_event = self._stop_events.pop(agent_id, None)
-        if stop_event:
-            stop_event.set()
-        thread = self._threads.pop(agent_id, None)
-        if thread and thread.is_alive():
-            logger.info(f"[DingTalk Stream] Stopping client for agent {agent_id}, waiting for thread...")
-            thread.join(timeout=5)
-            if thread.is_alive():
-                logger.warning(f"[DingTalk Stream] Thread for {agent_id} did not exit within 5s")
+        if not _connector_role_enabled():
+            logger.debug(
+                f"[DingTalk Stream] Ignore stop for {agent_id}: PROCESS_ROLE has no connector ownership"
+            )
+            return
+        if verify_persisted:
+            try:
+                desired = await self._load_persisted_desired_credentials(agent_id)
+            except Exception:
+                logger.exception(
+                    f"[DingTalk Stream] Cannot verify committed deletion for {agent_id}; "
+                    "deferring to reconciler"
+                )
+                return
+            if desired:
+                logger.debug(
+                    f"[DingTalk Stream] Deferring stop for {agent_id} until deletion commits"
+                )
+                return
+        async with self._lock_for(agent_id):
+            runtime = self._runtimes.get(agent_id)
+            if runtime is None:
+                return
+            await self._stop_runtime_locked(agent_id, runtime)
+
+    async def _stop_runtime_locked(
+        self,
+        agent_id: uuid.UUID,
+        runtime: _StreamRuntime,
+    ) -> bool:
+        runtime.stop_event.set()
+        if runtime.loop is not None and runtime.async_stop_event is not None and runtime.loop.is_running():
+            runtime.loop.call_soon_threadsafe(runtime.async_stop_event.set)
+        if runtime.thread.is_alive():
+            logger.info(
+                f"[DingTalk Stream] Stopping client for agent {agent_id} "
+                f"(generation={runtime.generation})"
+            )
+            await asyncio.to_thread(runtime.thread.join, 10)
+        if runtime.thread.is_alive():
+            logger.error(
+                f"[DingTalk Stream] Client runner for {agent_id} did not exit within 10s "
+                f"(generation={runtime.generation})"
+            )
+            return False
+        current = self._runtimes.get(agent_id)
+        if current is runtime:
+            self._runtimes.pop(agent_id, None)
+            async with self._state_lock_for(agent_id):
+                await self._set_persisted_connected(agent_id, False)
+        return True
 
     async def start_all(self):
-        """Start Stream clients for all configured DingTalk agents."""
-        logger.info("[DingTalk Stream] Initializing all active DingTalk channels...")
+        """Continuously reconcile persisted desired state into live clients."""
+        if not _connector_role_enabled():
+            logger.info("[DingTalk Stream] Reconciler skipped: PROCESS_ROLE has no connector ownership")
+            return
+        logger.info("[DingTalk Stream] Reconciler started")
+        while True:
+            try:
+                await self.reconcile_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[DingTalk Stream] Reconcile iteration failed")
+            await asyncio.sleep(2)
+
+    async def reconcile_once(self) -> None:
         async with async_session() as db:
             result = await db.execute(
-                select(ChannelConfig).where(
+                select(ChannelConfig)
+                .join(Agent, Agent.id == ChannelConfig.agent_id)
+                .join(Tenant, Tenant.id == Agent.tenant_id)
+                .where(
                     ChannelConfig.is_configured.is_(True),
                     ChannelConfig.channel_type == "dingtalk",
+                    Agent.is_deleted.is_(False),
+                    Tenant.is_active.is_(True),
                 )
             )
             configs = result.scalars().all()
 
-        logger.info(f"[DingTalk Stream] Found {len(configs)} configured DingTalk channel(s)")
-
+        desired: dict[uuid.UUID, tuple[str, str]] = {}
         for config in configs:
-            if config.app_id and config.app_secret:
-                await self.start_client(
-                    config.agent_id, config.app_id, config.app_secret,
-                    stop_existing=False,
-                )
-            else:
-                logger.warning(
-                    f"[DingTalk Stream] Skipping agent {config.agent_id}: missing credentials"
-                )
+            extra = config.extra_config if isinstance(config.extra_config, dict) else {}
+            connection_mode = extra.get("connection_mode", "websocket")
+            if connection_mode == "websocket" and config.app_id and config.app_secret:
+                desired[config.agent_id] = (config.app_id, config.app_secret)
+
+        for agent_id in list(self._runtimes):
+            if agent_id not in desired:
+                await self.stop_client(agent_id, verify_persisted=False)
+        for agent_id, (app_key, app_secret) in desired.items():
+            await self.start_client(
+                agent_id,
+                app_key,
+                app_secret,
+                stop_existing=False,
+                verify_persisted=False,
+            )
 
     def status(self) -> dict:
         """Return status of all active Stream clients."""
         return {
-            str(aid): self._threads[aid].is_alive()
-            for aid in self._threads
+            str(agent_id): bool(runtime.ready)
+            for agent_id, runtime in self._runtimes.items()
         }
 
 

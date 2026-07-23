@@ -974,7 +974,10 @@ async def delete_tenant(
         f"DELETE FROM agent_triggers WHERE agent_id IN ({agent_sub})"
     ), {"tid": tid})
 
-    # 8. Channel configs, permissions, credentials
+    # 8. DingTalk provisioning, channel configs, permissions, credentials
+    await db.execute(text(
+        f"DELETE FROM dingtalk_channel_provisioning_sessions WHERE agent_id IN ({agent_sub})"
+    ), {"tid": tid})
     await db.execute(text(
         f"DELETE FROM channel_configs WHERE agent_id IN ({agent_sub})"
     ), {"tid": tid})

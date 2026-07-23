@@ -772,22 +772,27 @@ BUILTIN_TOOLS = [
     {
         "name": "start_dingtalk_channel_provisioning",
         "display_name": "配置钉钉数字员工",
-        "description": "为当前数字员工发起钉钉机器人通道自动配置。仅在用户明确要求配置钉钉机器人、钉钉消息通道或授权钉钉应用时调用。工具会返回一个钉钉授权链接；用户打开链接完成授权后，平台会自动轮询授权结果并配置好钉钉通道。不要把它用于发送普通消息。",
+        "description": (
+            "为当前数字员工配置钉钉机器人通道。已配置时默认直接告知用户通道已经可用，"
+            "无需再次授权。只有用户明确要求强制重配时才设置 force_reconfigure=true；"
+            "强制重配会创建新的钉钉机器人应用，原应用需要用户在钉钉后台自行清理。"
+            "未配置或明确强制重配时，工具返回授权链接，用户授权后平台自动完成配置。"
+        ),
         "category": "communication",
         "icon": "link",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "restart_existing": {
+                "force_reconfigure": {
                     "type": "boolean",
                     "description": (
-                        "必填。false 表示复用仍有效的授权链接；true 表示先同步旧流程状态，"
-                        "尚未成功时再替换为新的授权链接。"
+                        "默认 false。仅当用户明确要求强制覆盖当前钉钉通道时设为 true；"
+                        "普通配置请求保持 false。"
                     ),
+                    "default": False,
                 },
             },
-            "required": ["restart_existing"],
         },
         "config": {},
         "config_schema": {},

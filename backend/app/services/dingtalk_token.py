@@ -5,17 +5,18 @@ All DingTalk token acquisition should go through this manager.
 Tokens are stored in Redis (preferred) with in-memory fallback.
 """
 
-import time
 import asyncio
 from typing import Dict, Optional
 from loguru import logger
 import httpx
 
+from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
+
 
 class DingTalkTokenManager:
     """Global DingTalk access_token cache backed by Redis + memory fallback.
 
-    - Cache by app_key
+    - Cache by the complete credential pair
     - Token valid for 7200s, refresh 300s early (TTL=6900)
     - Concurrency-safe with asyncio.Lock
     """
@@ -28,14 +29,15 @@ class DingTalkTokenManager:
             self._locks[app_key] = asyncio.Lock()
         return self._locks[app_key]
 
-    def _cache_key(self, app_key: str) -> str:
-        return f"clawith:token:dingtalk_corp:{app_key}"
+    def _cache_key(self, app_key: str, app_secret: str) -> str:
+        fingerprint = dingtalk_credential_fingerprint(app_key, app_secret)
+        return f"clawith:token:dingtalk_corp:{app_key}:{fingerprint}"
 
     async def get_token(self, app_key: str, app_secret: str) -> Optional[str]:
         """Get access_token, return cached if valid, refresh if expired."""
         from app.core.token_cache import get_cached_token, set_cached_token
 
-        key = self._cache_key(app_key)
+        key = self._cache_key(app_key, app_secret)
 
         # Fast path: check cache without lock
         cached = await get_cached_token(key)

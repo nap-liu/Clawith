@@ -72,6 +72,7 @@ class TaskCleanupDB(RecordingDB):
                 "DELETE FROM tasks WHERE agent_id = :aid",
                 "DELETE FROM published_pages WHERE agent_id = :aid",
                 "DELETE FROM notifications WHERE agent_id = :aid",
+                "DELETE FROM dingtalk_channel_provisioning_sessions WHERE agent_id = :aid",
             ]
         )
         self.task_rows_remaining = 1
@@ -166,6 +167,9 @@ async def test_delete_agent_cleans_remaining_foreign_key_rows(monkeypatch):
     assert db.executed_sql.index("DELETE FROM task_logs WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = :aid)") < (
         db.executed_sql.index("DELETE FROM tasks WHERE agent_id = :aid")
     )
+    assert db.executed_sql.index(
+        "DELETE FROM dingtalk_channel_provisioning_sessions WHERE agent_id = :aid"
+    ) < db.executed_sql.index("DELETE FROM channel_configs WHERE agent_id = :aid")
 
 
 @pytest.mark.asyncio

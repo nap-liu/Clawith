@@ -1171,6 +1171,7 @@ async def delete_agent(
         "chat_sessions",
         "agent_schedules",
         "agent_triggers",
+        "dingtalk_channel_provisioning_sessions",
         "channel_configs",
         "agent_permissions",
         "agent_tools",
