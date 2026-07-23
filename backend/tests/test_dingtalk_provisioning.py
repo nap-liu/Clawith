@@ -15,6 +15,7 @@ from app.models.dingtalk_provisioning import (
     DINGTALK_PROVISIONING_STATUS_CANCELLED,
     DINGTALK_PROVISIONING_STATUS_CONFIGURED,
     DINGTALK_PROVISIONING_STATUS_EXPIRED,
+    DINGTALK_PROVISIONING_STATUS_FAILED,
     DINGTALK_PROVISIONING_STATUS_POLLING,
     DINGTALK_PROVISIONING_STATUS_WAITING,
     DINGTALK_WELCOME_STATUS_FAILED,
@@ -32,6 +33,7 @@ from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
 from app.services.dingtalk_provisioning import (
     DINGTALK_PROVISIONING_OPERATION_FORCE,
     DINGTALK_WELCOME_RETRY_DELAYS_SECONDS,
+    DingTalkRegistrationClient,
     _bounded_polling_window,
     poll_dingtalk_provisioning_session,
     poll_due_dingtalk_provisioning_sessions,
@@ -123,6 +125,26 @@ def test_bounded_polling_window_caps_dingtalk_values():
     assert window.poll_interval_seconds == 2
     assert window.next_poll_at == now + timedelta(seconds=2)
     assert window.max_poll_attempts == 900
+
+
+@pytest.mark.asyncio
+async def test_registration_poll_preserves_numeric_dingtalk_agent_id(monkeypatch):
+    client = DingTalkRegistrationClient()
+
+    async def fake_post(_path, _payload):
+        return {
+            "status": "SUCCESS",
+            "client_id": "ding-client-id",
+            "client_secret": "ding-client-secret",
+            "agent_id": "4806241691",
+            "errmsg": "ok",
+        }
+
+    monkeypatch.setattr(client, "_post", fake_post)
+
+    result = await client.poll("device-code")
+
+    assert result["agent_id"] == "4806241691"
 
 
 @pytest.mark.asyncio
@@ -402,6 +424,277 @@ async def test_poll_waiting_continues_past_observability_attempt_count_until_dea
     assert fake_client.poll_calls == ["device-wait", "device-wait"]
     assert session.last_error is None
     assert session.next_poll_at == now + timedelta(seconds=6)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registration_status", ["APPROVING", "PUBLISHING"])
+async def test_poll_dingtalk_application_build_states_keep_session_active(
+    db_session,
+    registration_status,
+):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 23, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code=f"device-{registration_status.lower()}",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(minutes=5),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=150,
+    )
+    db_session.add(session)
+    await db_session.flush()
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=FakeRegistrationClient(
+            poll_responses=[
+                {
+                    "status": registration_status,
+                    "client_id": "pending-client-id",
+                    "client_secret": "pending-client-secret",
+                    "message": "ok",
+                }
+            ]
+        ),
+        now=now,
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_POLLING
+    assert session.next_poll_at == now + timedelta(seconds=2)
+    assert session.last_error is None
+    assert session.registration_result["last_poll_status"] == registration_status
+    config = (
+        await db_session.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "dingtalk",
+            )
+        )
+    ).scalar_one_or_none()
+    assert config is None
+    assert "pending-client-secret" not in str(session.registration_result)
+
+
+@pytest.mark.asyncio
+async def test_retry_after_approving_reuses_flow_without_creating_duplicate_app(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 23, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_WAITING,
+        device_code="device-approving-reuse",
+        authorization_url="https://auth.example/original",
+        expires_at=now + timedelta(minutes=30),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=900,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    approving_client = FakeRegistrationClient(
+        poll_responses=[{"status": "APPROVING", "message": "ok"}]
+    )
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=approving_client,
+        now=now,
+    )
+
+    retry_client = FakeRegistrationClient()
+    result = await start_dingtalk_channel_provisioning(
+        db_session,
+        agent=agent,
+        requested_by_user_id=user.id,
+        force_reconfigure=True,
+        registration_client=retry_client,
+        now=now + timedelta(seconds=1),
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_POLLING
+    assert result["flow_action"] == "reused"
+    assert result["provisioning_id"] == str(session.id)
+    assert result["authorization_url"] == "https://auth.example/original"
+    assert retry_client.begin_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_poll_approving_publishing_then_success_configures_same_dingtalk_flow(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 23, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="device-publishing-success",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(minutes=5),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=150,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    fake_client = FakeRegistrationClient(
+        poll_responses=[
+            {"status": "APPROVING", "message": "ok"},
+            {"status": "PUBLISHING", "message": "ok"},
+            {
+                "status": "SUCCESS",
+                "client_id": "published-client-id",
+                "client_secret": "published-client-secret",
+                "agent_id": "4806241691",
+                "message": "ok",
+            },
+        ]
+    )
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=fake_client,
+        now=now,
+    )
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=fake_client,
+        now=now + timedelta(seconds=2),
+    )
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=fake_client,
+        now=now + timedelta(seconds=4),
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    assert fake_client.poll_calls == [
+        "device-publishing-success",
+        "device-publishing-success",
+        "device-publishing-success",
+    ]
+    config = (
+        await db_session.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "dingtalk",
+            )
+        )
+    ).scalar_one()
+    assert config.app_id == "published-client-id"
+    assert config.app_secret == "published-client-secret"
+    assert config.extra_config["agent_id"] == "4806241691"
+    assert session.registration_result["agent_id"] == "4806241691"
+
+
+@pytest.mark.asyncio
+async def test_unknown_nonterminal_dingtalk_status_keeps_session_active(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 23, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="device-unknown-status",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(minutes=5),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=150,
+    )
+    db_session.add(session)
+    await db_session.flush()
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=FakeRegistrationClient(
+            poll_responses=[{"status": "UNKNOWN_STAGE", "message": "ok"}]
+        ),
+        now=now,
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_POLLING
+    assert session.next_poll_at == now + timedelta(seconds=2)
+    assert session.last_error is None
+    assert session.registration_result["last_poll_status"] == "UNKNOWN_STAGE"
+
+
+@pytest.mark.asyncio
+async def test_unknown_dingtalk_status_expires_at_authorization_deadline(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 23, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="device-unknown-deadline",
+        authorization_url="https://auth.example",
+        expires_at=now,
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=150,
+    )
+    db_session.add(session)
+    await db_session.flush()
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=FakeRegistrationClient(
+            poll_responses=[{"status": "FUTURE_PENDING_STAGE", "message": "ok"}]
+        ),
+        now=now,
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_EXPIRED
+    assert session.next_poll_at is None
+    assert "FUTURE_PENDING_STAGE" in session.last_error
+
+
+@pytest.mark.asyncio
+async def test_explicit_dingtalk_fail_is_terminal_and_does_not_report_ok_as_error(db_session):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 23, 10, 0, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="device-explicit-fail",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(minutes=5),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=150,
+    )
+    db_session.add(session)
+    await db_session.flush()
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=FakeRegistrationClient(
+            poll_responses=[{"status": "FAIL", "message": "ok"}]
+        ),
+        now=now,
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_FAILED
+    assert session.last_error == "钉钉授权失败: FAIL"
 
 
 @pytest.mark.asyncio

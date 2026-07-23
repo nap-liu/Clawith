@@ -41,7 +41,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access, is_agent_creator
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
@@ -204,9 +204,9 @@ async def configure_dingtalk_channel(
     db: AsyncSession = Depends(get_db),
 ):
     """Configure DingTalk bot for an agent. Fields: app_key, app_secret, agent_id (optional)."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can configure channel")
+    _, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(status_code=403, detail="Manage access is required to configure channel")
 
     app_key = data.get("app_key", "").strip()
     app_secret = data.get("app_secret", "").strip()
@@ -251,7 +251,7 @@ async def configure_dingtalk_channel(
         app_id=app_key,
         app_secret=app_secret,
         is_configured=True,
-        extra_config={"connection_mode": conn_mode},
+        extra_config={"connection_mode": conn_mode, "agent_id": dingtalk_agent_id},
     )
     db.add(config)
     await db.commit()
@@ -290,9 +290,9 @@ async def delete_dingtalk_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can remove channel")
+    _, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(status_code=403, detail="Manage access is required to remove channel")
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,

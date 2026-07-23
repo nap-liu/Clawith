@@ -52,6 +52,13 @@ WelcomeSender = Callable[[str, str, str, str], Awaitable[dict[str, Any]]]
 DINGTALK_BINDING_WELCOME_FALLBACK_NAME = "你的数字员工"
 DINGTALK_PROVISIONING_OPERATION_INITIAL = "initial_setup"
 DINGTALK_PROVISIONING_OPERATION_FORCE = "force_reconfigure"
+DINGTALK_REGISTRATION_TERMINAL_STATUSES = frozenset(
+    {
+        "SUCCESS",
+        "FAIL",
+        "EXPIRED",
+    }
+)
 
 # The first send is picked up immediately after the credential transaction
 # commits. DingTalk's automatically granted robot permission is eventually
@@ -219,6 +226,7 @@ class DingTalkRegistrationClient:
             "status": status or "FAIL",
             "client_id": _as_string(data.get("client_id")) or _as_string(data.get("clientId")),
             "client_secret": _as_string(data.get("client_secret")) or _as_string(data.get("clientSecret")),
+            "agent_id": _as_string(data.get("agent_id")) or _as_string(data.get("agentId")),
             "message": _as_string(data.get("fail_reason"))
             or _as_string(data.get("failReason"))
             or _as_string(data.get("errmsg"))
@@ -680,6 +688,7 @@ async def _configure_dingtalk_channel(
     *,
     client_id: str,
     client_secret: str,
+    dingtalk_agent_id: str,
 ) -> tuple[ChannelConfig, list[uuid.UUID]]:
     replaced_agent_ids: list[uuid.UUID] = []
     conflicts = await db.execute(
@@ -718,7 +727,7 @@ async def _configure_dingtalk_channel(
     existing = result.scalar_one_or_none()
     extra = {
         "connection_mode": "websocket",
-        "agent_id": client_id,
+        "agent_id": dingtalk_agent_id or client_id,
         "provisioning_session_id": str(session.id),
         "provisioning_source": session.registration_source,
         "provisioned_at": _now().isoformat(),
@@ -796,10 +805,20 @@ async def poll_dingtalk_provisioning_session(
             )
         return session.status
 
-    status = _as_string(poll_result.get("status")).upper()
-    if status == "WAITING":
+    status = _as_string(poll_result.get("status")).upper() or "FAIL"
+    if status not in DINGTALK_REGISTRATION_TERMINAL_STATUSES:
+        _merge_registration_result(session, last_poll_status=status)
         if deadline_reached:
-            _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_EXPIRED, error="钉钉授权链接已过期")
+            error = (
+                "钉钉授权链接已过期"
+                if status == "WAITING"
+                else f"钉钉应用仍处于 {status} 状态，配置等待时间已结束"
+            )
+            _stop_session(
+                session,
+                status=DINGTALK_PROVISIONING_STATUS_EXPIRED,
+                error=error,
+            )
         else:
             session.status = DINGTALK_PROVISIONING_STATUS_POLLING
             session.next_poll_at = min(
@@ -809,15 +828,17 @@ async def poll_dingtalk_provisioning_session(
             session.last_error = None
         return session.status
     if status == "EXPIRED":
+        error = _as_string(poll_result.get("message"))
         _stop_session(
             session,
             status=DINGTALK_PROVISIONING_STATUS_EXPIRED,
-            error=poll_result.get("message") or "钉钉授权链接已过期",
+            error=error if error.lower() != "ok" else "钉钉授权链接已过期",
         )
         return session.status
     if status == "SUCCESS":
         client_id = _as_string(poll_result.get("client_id"))
         client_secret = _as_string(poll_result.get("client_secret"))
+        dingtalk_agent_id = _as_string(poll_result.get("agent_id"))
         if not client_id or not client_secret:
             _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_FAILED, error="钉钉授权成功但未返回完整凭据")
             return session.status
@@ -860,6 +881,7 @@ async def poll_dingtalk_provisioning_session(
                     session,
                     client_id=client_id,
                     client_secret=client_secret,
+                    dingtalk_agent_id=dingtalk_agent_id,
                 )
         except IntegrityError:
             _merge_registration_result(session, completion_reason="configuration_conflict")
@@ -870,7 +892,10 @@ async def poll_dingtalk_provisioning_session(
             )
             return session.status
 
-        _merge_registration_result(session, client_id=client_id)
+        registration_values = {"client_id": client_id}
+        if dingtalk_agent_id:
+            registration_values["agent_id"] = dingtalk_agent_id
+        _merge_registration_result(session, **registration_values)
         session.welcome_status = DINGTALK_WELCOME_STATUS_PENDING
         session.welcome_attempt_count = 0
         session.welcome_next_retry_at = base
@@ -882,10 +907,13 @@ async def poll_dingtalk_provisioning_session(
         )
         return session.status
 
+    error = _as_string(poll_result.get("message"))
+    if not error or error.lower() == "ok":
+        error = f"钉钉授权失败: {status or 'UNKNOWN'}"
     _stop_session(
         session,
         status=DINGTALK_PROVISIONING_STATUS_FAILED,
-        error=poll_result.get("message") or f"钉钉授权失败: {status or 'UNKNOWN'}",
+        error=error,
     )
     return session.status
 
