@@ -80,6 +80,10 @@ import {
     IconAlertTriangle,
 } from '@tabler/icons-react';
 import { useDropZone } from '../../hooks/useDropZone';
+import {
+    useOnboardingKickoff,
+    type OnboardingKickoffRequest,
+} from '../../hooks/useOnboardingKickoff';
 import ApprovalsTab from './tabs/ApprovalsTab';
 import { AGENT_DETAIL_TABS } from './agentDetailTabs';
 import MindTab from './tabs/MindTab';
@@ -2001,10 +2005,8 @@ export default function AgentDetailPage() {
         setOverrideModelId(newModelId);
     }, []);
 
-    // Track onboarding kickoff per (agent, session) so the agent only greets
-    // once per session. The agent opens the conversation itself — no visible
-    // user message — by sending a tagged trigger the backend filters out.
-    const onboardingKickoffRef = useRef<Set<string>>(new Set());
+    const onboardingRequestsRef = useRef<Record<string, OnboardingKickoffRequest>>({});
+    const [onboardingKickoffRequest, setOnboardingKickoffRequest] = useState<OnboardingKickoffRequest | null>(null);
     const [livePanelVisible, setLivePanelVisible] = useState(false);
     const [sidePanelTab, setSidePanelTab] = useState<SidePanelTab>('workspace');
     const awarePanelVisible = activeTab === 'chat' && livePanelVisible && sidePanelTab === 'aware';
@@ -2323,10 +2325,12 @@ export default function AgentDetailPage() {
         // 状态(权限/scope 异步加载完成等)触发的重新同步，都会让输入框反复闪回 "Connecting…"。
         // OPEN→已连接；无 ws / 已关闭→未连接；CONNECTING→保持当前显示，交给 onopen/onclose
         // 事件驱动收敛。
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN && (ws as any)._serverConnected === true) {
             setWsConnected(true);
+            setOnboardingKickoffRequest(onboardingRequestsRef.current[key] || null);
         } else if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
             setWsConnected(false);
+            setOnboardingKickoffRequest(null);
         }
     };
 
@@ -2949,6 +2953,8 @@ export default function AgentDetailPage() {
         setIsStopping(false);
         setWsConnected(false);
         wsRef.current = null;
+        onboardingRequestsRef.current = {};
+        setOnboardingKickoffRequest(null);
         setWorkspaceLockedPath(null);
         setWorkspaceActivePath(null);
         setWorkspaceActivities([]);
@@ -2987,6 +2993,8 @@ export default function AgentDetailPage() {
         });
         wsMapRef.current = {};
         wsRef.current = null;
+        onboardingRequestsRef.current = {};
+        setOnboardingKickoffRequest(null);
     }, [currentUser?.id, token]);
 
     useEffect(() => {
@@ -3116,13 +3124,6 @@ export default function AgentDetailPage() {
             }, 3000);
             if (currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId) {
                 wsRef.current = ws;
-                setWsConnected(true);
-            }
-            if (pendingChatSendRef.current?.runtimeKey === key) {
-                const pending = pendingChatSendRef.current;
-                pendingChatSendRef.current = null;
-                setChatInfoMsg(null);
-                dispatchChatMessage(ws, key, pending);
             }
         };
         ws.onclose = (e) => {
@@ -3132,6 +3133,9 @@ export default function AgentDetailPage() {
             }
             const wasCurrent = wsMapRef.current[key] === ws;
             if (wasCurrent) delete wsMapRef.current[key];
+            if (onboardingRequestsRef.current[key]?.socket === ws) {
+                delete onboardingRequestsRef.current[key];
+            }
             setSessionUiState(key, { isWaiting: false, isStreaming: false, isStopping: false });
             // 陈旧连接(已被新连接替换或显式关闭)的 onclose 不应扰动当前 UI 状态，也不应触发重连——
             // 否则活跃连接会被误判为断开，引发无谓的 2s 重连循环。
@@ -3143,6 +3147,7 @@ export default function AgentDetailPage() {
                 setIsWaiting(false);
                 setIsStreaming(false);
                 setIsStopping(false);
+                setOnboardingKickoffRequest(null);
             }
             if (e.code === 4003 || e.code === 4002) {
                 reconnectDisabledRef.current[key] = true;
@@ -3161,15 +3166,54 @@ export default function AgentDetailPage() {
         };
         ws.onmessage = (e) => {
             const d = JSON.parse(e.data);
-            // Onboarding lock fired (or trigger was rejected because the pair
-            // was already onboarded). Either way, invalidate the cached agent
-            // record so the kickoff effect stops thinking a new session needs
-            // onboarding. Fire early and unconditionally — the event is cheap.
+            const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
+            if (d.type === 'connected' && d.session_id) {
+                (ws as any)._serverConnected = true;
+                const request: OnboardingKickoffRequest = {
+                    sessionId: String(d.session_id),
+                    required: d.onboarding_required === true,
+                    socket: ws,
+                };
+                onboardingRequestsRef.current[key] = request;
+                if (isActiveRuntime) {
+                    wsRef.current = ws;
+                    setWsConnected(true);
+                    setWsSessionId(String(d.session_id));
+                    setOnboardingKickoffRequest(request);
+                    if (request.required) {
+                        setSessionUiState(key, { isWaiting: true, isStreaming: false });
+                        setIsWaiting(true);
+                        setIsStreaming(false);
+                    }
+                }
+                if (!request.required && pendingChatSendRef.current?.runtimeKey === key) {
+                    const pending = pendingChatSendRef.current;
+                    pendingChatSendRef.current = null;
+                    setChatInfoMsg(null);
+                    dispatchChatMessage(ws, key, pending);
+                }
+                return;
+            }
+            // The server committed the phase transition before publishing the
+            // first welcome output. Refresh the cached agent record immediately.
             if (d.type === 'onboarded') {
+                delete onboardingRequestsRef.current[key];
+                if (isActiveRuntime) setOnboardingKickoffRequest(null);
                 queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
                 return;
             }
-            const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
+            if (d.type === 'onboarding_skipped') {
+                delete onboardingRequestsRef.current[key];
+                setSessionUiState(key, { isWaiting: false, isStreaming: false, isStopping: false });
+                if (isActiveRuntime) {
+                    setOnboardingKickoffRequest(null);
+                    setIsWaiting(false);
+                    setIsStreaming(false);
+                    setIsStopping(false);
+                }
+                queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
+                return;
+            }
             if (['thinking', 'chunk', 'workspace_draft', 'tool_call', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
                 const nextStreaming = ['thinking', 'chunk', 'workspace_draft', 'tool_call'].includes(d.type);
                 const endStreaming = ['done', 'error', 'quota_exceeded'].includes(d.type);
@@ -3221,12 +3265,6 @@ export default function AgentDetailPage() {
                     setIsStreaming(false);
                     setIsStopping(false);
                 }
-            }
-
-            // Capture session_id from the 'connected' message for Take Control
-            if (d.type === 'connected' && d.session_id) {
-                if (isActiveRuntime) setWsSessionId(d.session_id);
-                return;
             }
 
             if (d.type === 'thinking') {
@@ -4589,27 +4627,18 @@ export default function AgentDetailPage() {
     const enabledModelCount = enabledLlmModels.length;
     const effectiveModelReady = !!effectiveChatModelId && enabledLlmModels.some((m: any) => m.id === effectiveChatModelId);
 
-    // Onboarding kickoff: wait until a usable model is available before
-    // sending the invisible trigger. Otherwise the empty session would be
-    // marked as already kicked off while the user is still configuring models.
-    useEffect(() => {
-        if (!wsConnected || !id || !activeSession?.id) return;
-        if (!agent || agent.onboarded_for_me !== false) return;
-        if (llmModelsLoading || !effectiveModelReady || !effectiveChatModelId) return;
-        if (chatMessages.length > 0) return;
-        const runtimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
-        if (onboardingKickoffRef.current.has(runtimeKey)) return;
-        const socket = wsMapRef.current[runtimeKey];
-        if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        onboardingKickoffRef.current.add(runtimeKey);
+    const handleOnboardingStart = useCallback(() => {
         setIsWaiting(true);
         setIsStreaming(false);
-        socket.send(JSON.stringify({
-            content: '',
-            kind: 'onboarding_trigger',
-            model_id: effectiveChatModelId,
-        }));
-    }, [wsConnected, id, activeSession?.id, agent?.onboarded_for_me, llmModelsLoading, effectiveModelReady, effectiveChatModelId, chatMessages.length]);
+    }, []);
+
+    useOnboardingKickoff({
+        request: onboardingKickoffRequest,
+        activeSessionId: activeSession?.id,
+        effectiveModelId: effectiveChatModelId,
+        enabled: wsConnected && !llmModelsLoading && effectiveModelReady,
+        onStart: handleOnboardingStart,
+    });
 
     const { data: permData } = useQuery({
         queryKey: ['agent-permissions', id],

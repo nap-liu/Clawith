@@ -34,7 +34,16 @@ from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot
 from app.services.auth_code_exchange import validate_platform_login_channel
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.llm import call_llm_with_failover
-from app.services.onboarding import is_onboarded, mark_onboarding_phase, resolve_onboarding_prompt
+from app.services.onboarding import (
+    PHASE_PENDING,
+    OnboardingClaim,
+    claim_normal_first_turn,
+    claim_onboarding_greeting,
+    mark_onboarding_phase,
+    release_onboarding_claim,
+    resolve_onboarding_eligibility,
+    resolve_onboarding_prompt,
+)
 from app.services.quota_guard import (
     AgentExpired,
     QuotaExceeded,
@@ -51,6 +60,12 @@ router = APIRouter(tags=["websocket"])
 
 MAX_LIVE_CODE_STREAM_CHARS = 120_000
 LIVE_CODE_TRUNCATED_NOTICE = "\n\n[... live output truncated; execution continues ...]\n"
+LLM_FAILURE_PREFIXES = (
+    "[LLM Error]",
+    "[LLM call error]",
+    "[Error]",
+    "[LLM returned empty content]",
+)
 
 
 class ConnectionManager:
@@ -267,6 +282,7 @@ class WebSocketChatHandler:
         self.history_messages: list[ChatMessage] = []
         self.conversation: list[dict] = []
         self.current_user_text: str = ""
+        self.onboarding_required: bool = False
         # Set true when the browser drops mid-turn: the turn still runs to
         # completion + persists, then we tear the handler down cleanly.
         self.client_disconnected: bool = False
@@ -362,6 +378,13 @@ class WebSocketChatHandler:
 
                 # Load history messages
                 await self._load_history(db)
+                onboarding_eligibility = await resolve_onboarding_eligibility(
+                    db,
+                    self.agent_id,
+                    user_id,
+                    uuid.UUID(self.conv_id),
+                )
+                self.onboarding_required = onboarding_eligibility.required
 
         except Exception as e:
             logger.exception(f"[WS] Setup error: {e}")
@@ -403,6 +426,7 @@ class WebSocketChatHandler:
                 "session_id": self.conv_id,
                 "read_only": self.read_only,
                 "source_channel": self.source_channel,
+                "onboarding_required": self.onboarding_required,
             }
         )
 
@@ -539,7 +563,7 @@ class WebSocketChatHandler:
     async def message_loop(self):
         """Core message processing loop."""
         # Send welcome message on new session (no history)
-        if self.welcome_message and not self.history_messages:
+        if self.welcome_message and not self.history_messages and not self.onboarding_required:
             await self.websocket.send_json({"type": "done", "role": "assistant", "content": self.welcome_message})
 
         while True:
@@ -569,17 +593,30 @@ class WebSocketChatHandler:
                 )
                 continue
 
-            if is_onboarding_trigger:
-                if await self._handle_onboarding_trigger_guard():
-                    continue
-                content = "Please begin the onboarding."
-
-            self.current_user_text = content
             effective_llm_model = await self._resolve_effective_model(override_model_id)
 
             # Quota Checks
             if not await self._check_quotas():
                 continue
+
+            onboarding_claim: OnboardingClaim | None = None
+            if is_onboarding_trigger:
+                if effective_llm_model is None:
+                    await self.websocket.send_json(
+                        {
+                            "type": "onboarding_skipped",
+                            "reason": "model_unavailable",
+                        }
+                    )
+                    continue
+                onboarding_claim = await self._claim_onboarding_trigger()
+                if onboarding_claim is None:
+                    continue
+                content = "Please begin the onboarding."
+            else:
+                await self._wait_for_normal_turn_onboarding()
+
+            self.current_user_text = content
 
             # Add user message to in-memory context
             self.conversation.append({"role": "user", "content": content})
@@ -618,7 +655,13 @@ class WebSocketChatHandler:
             # Invoke LLM and stream response
             self.client_disconnected = False
             if effective_llm_model:
-                assistant_response, thinking_content, _queued_messages = await self._run_llm_and_stream(
+                (
+                    assistant_response,
+                    thinking_content,
+                    _queued_messages,
+                    turn_outcome,
+                    produced_output,
+                ) = await self._run_llm_and_stream(
                     effective_llm_model,
                     is_onboarding_trigger,
                     turn_anchor_id=turn_anchor_id,
@@ -630,6 +673,44 @@ class WebSocketChatHandler:
                 )
                 thinking_content = []
                 _queued_messages = []
+                turn_outcome = "failed"
+                produced_output = False
+
+            if onboarding_claim and onboarding_claim.claimed_at:
+                # Successful greeting streams advance pending atomically on the
+                # first chunk. Errors/aborts with no output leave it pending; in
+                # that case release only this exact claim so reconnect can retry.
+                async with async_session() as _release_db:
+                    await release_onboarding_claim(
+                        _release_db,
+                        self.agent_id,
+                        self.user.id,
+                        onboarding_claim.claimed_at,
+                    )
+
+            if (
+                is_onboarding_trigger
+                and not produced_output
+                and turn_outcome in {"failed", "aborted"}
+            ):
+                # A synthetic greeting that never produced user-visible output
+                # must leave the pristine session pristine. Persisting an error
+                # or abort marker would make history-based eligibility reject a
+                # safe reconnect retry.
+                if self.conversation and self.conversation[-1].get("role") == "user":
+                    self.conversation.pop()
+                await self._safe_send(
+                    {
+                        "type": "onboarding_skipped",
+                        "reason": (
+                            "generation_aborted"
+                            if turn_outcome == "aborted"
+                            else "generation_failed"
+                        ),
+                        "agent_id": str(self.agent_id),
+                    }
+                )
+                continue
 
             # request_confirmation suspends the turn inside the unified LLM caller
             # and persists the intro/card rows there. Keep the turn anchor suspended:
@@ -666,19 +747,44 @@ class WebSocketChatHandler:
                 await manager.disconnect(str(self.agent_id), self.websocket)
                 break
 
-    async def _handle_onboarding_trigger_guard(self) -> bool:
-        """Returns True if the onboarding trigger was ignored (already onboarded)."""
+    async def _claim_onboarding_trigger(self) -> OnboardingClaim | None:
+        """Revalidate and atomically claim this session's greeting turn."""
         async with async_session() as _gdb:
-            if await is_onboarded(_gdb, self.agent_id, self.user.id):
-                logger.info("[WS] Onboarding trigger ignored — pair already onboarded")
-                await self.websocket.send_json(
-                    {
-                        "type": "onboarded",
-                        "agent_id": str(self.agent_id),
-                    }
+            claim = await claim_onboarding_greeting(
+                _gdb,
+                self.agent_id,
+                self.user.id,
+                uuid.UUID(self.conv_id),
+            )
+        if claim.acquired:
+            return claim
+        logger.info(f"[WS] Onboarding trigger skipped: {claim.reason}")
+        await self.websocket.send_json(
+            {
+                "type": "onboarding_skipped",
+                "reason": claim.reason,
+                "agent_id": str(self.agent_id),
+            }
+        )
+        return None
+
+    async def _wait_for_normal_turn_onboarding(self) -> None:
+        """Atomically let a real message win, or wait for a claimed greeting."""
+
+        while True:
+            async with async_session() as _normal_db:
+                phase = await claim_normal_first_turn(
+                    _normal_db,
+                    self.agent_id,
+                    self.user.id,
                 )
-                return True
-        return False
+            if phase != PHASE_PENDING:
+                return
+            # ``claim_normal_first_turn`` atomically takes over once the
+            # persisted pending claim reaches its TTL. Keep a bounded polling
+            # interval even at that boundary so a clock/precision mismatch
+            # cannot turn this wait into a busy loop.
+            await asyncio.sleep(0.2)
 
     async def _resolve_effective_model(self, override_model_id: str | None) -> LLMModel | None:
         """Reloads model config and resolves effective model (taking overrides into account)."""
@@ -759,12 +865,6 @@ class WebSocketChatHandler:
 
         if is_onboarding_trigger:
             logger.info("[WS] Onboarding trigger — skipping user-message persistence")
-            async with async_session() as _sdb:
-                _sr = await _sdb.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(self.conv_id)))
-                _s = _sr.scalar_one_or_none()
-                if _s and _s.title.startswith("Session "):
-                    _s.title = "Onboarding"
-                    await _sdb.commit()
             return None, False
         else:
             from app.services.chat_history import ingest_incoming_chat_message
@@ -830,53 +930,66 @@ class WebSocketChatHandler:
         is_onboarding_trigger: bool,
         *,
         turn_anchor_id: uuid.UUID | None = None,
-    ) -> tuple[str, list[str], list[dict]]:
+    ) -> tuple[str, list[str], list[dict], str, bool]:
         """Calls the LLM and streams response chunks to WebSocket."""
         start_gen = perf_counter()
+        partial_chunks: list[str] = []
+        thinking_content: list[str] = []
         try:
             logger.info(f"[WS] Calling LLM {effective_llm_model.model} (streaming)...")
 
             # Accumulate partial content for abort handling
-            partial_chunks: list[str] = []
-
             # Set inside _call_with_failover when an onboarding prompt was injected
             needs_onboarding_mark = False
             onboarding_target_phase = "completed"
+            onboarding_expected_phase: str | None = None
             onboarding_mark_done = False
 
-            async def maybe_mark_onboarding_progress():
+            async def maybe_mark_onboarding_progress() -> bool:
                 nonlocal onboarding_mark_done
-                if needs_onboarding_mark and not onboarding_mark_done:
-                    onboarding_mark_done = True
-                    try:
-                        async with async_session() as _ob_db:
-                            await mark_onboarding_phase(
-                                _ob_db,
-                                self.agent_id,
-                                self.user.id,
-                                onboarding_target_phase,
-                            )
-                        # Tell the frontend to refresh its cached agent record
-                        await self._safe_send(
-                            {
-                                "type": "onboarded",
-                                "agent_id": str(self.agent_id),
-                            }
+                if not needs_onboarding_mark or onboarding_mark_done:
+                    return True
+                try:
+                    async with async_session() as _ob_db:
+                        advanced = await mark_onboarding_phase(
+                            _ob_db,
+                            self.agent_id,
+                            self.user.id,
+                            onboarding_target_phase,
+                            expected_phase=onboarding_expected_phase,
                         )
-                    except Exception as _ob_err:
-                        logger.warning(f"[WS] mark_onboarded failed (non-fatal): {_ob_err}")
+                    if not advanced:
+                        logger.info(
+                            "[WS] Onboarding phase changed before this turn "
+                            "could publish its first output"
+                        )
+                        return False
+                    onboarding_mark_done = True
+                    # Tell the frontend to refresh its cached agent record
+                    await self._safe_send(
+                        {
+                            "type": "onboarded",
+                            "agent_id": str(self.agent_id),
+                        }
+                    )
+                    return True
+                except Exception as _ob_err:
+                    logger.warning(f"[WS] mark_onboarded failed: {_ob_err}")
+                    return False
 
             async def stream_to_ws(text: str):
                 """Send each chunk to client in real-time."""
+                if not await maybe_mark_onboarding_progress():
+                    raise RuntimeError("Onboarding claim lost before first output")
                 partial_chunks.append(text)
                 await self._safe_send({"type": "chunk", "content": text})
-                await maybe_mark_onboarding_progress()
 
             async def tool_call_to_ws(data: dict):
                 """Send tool call info to client and persist completed ones."""
                 public_data = {k: v for k, v in data.items() if not k.startswith("_")}
                 if public_data.get("status") in {"running", "done"}:
-                    await maybe_mark_onboarding_progress()
+                    if not await maybe_mark_onboarding_progress():
+                        raise RuntimeError("Onboarding claim lost before tool output")
                 if public_data.get("status") == "done":
                     # Inject Live Preview & Workspace Activities
                     await self._inject_live_preview_and_workspace_metadata(public_data)
@@ -896,8 +1009,6 @@ class WebSocketChatHandler:
                     await self._save_tool_call_to_db(public_data, turn_anchor_id=turn_anchor_id)
 
             # Track thinking content for storage
-            thinking_content = []
-
             async def thinking_to_ws(text: str):
                 """Send thinking chunks to client for collapsible display."""
                 thinking_content.append(text)
@@ -948,7 +1059,7 @@ class WebSocketChatHandler:
 
             # Run call_llm_with_failover as a cancellable task
             async def _call_with_failover():
-                nonlocal needs_onboarding_mark, onboarding_target_phase
+                nonlocal needs_onboarding_mark, onboarding_expected_phase, onboarding_target_phase
 
                 async def _on_failover(reason: str):
                     await self._safe_send({"type": "info", "content": f"Primary model error, {reason}"})
@@ -971,6 +1082,8 @@ class WebSocketChatHandler:
                             self.user.id,
                             user_name=self.user_display_name,
                             user_locale=self.lang,
+                            is_onboarding_trigger=is_onboarding_trigger,
+                            complete_after_greeting=self.source_channel != "web",
                         )
                     if _onb:
                         ephemeral_overlays = [{"role": "system", "content": _onb.prompt}]
@@ -978,6 +1091,7 @@ class WebSocketChatHandler:
                         if _onb.lock_on_first_chunk:
                             needs_onboarding_mark = True
                             onboarding_target_phase = _onb.target_phase
+                            onboarding_expected_phase = _onb.expected_phase
                         if _onb.is_greeting_turn:
                             skip_tools_for_greeting = True
                 except Exception as _onb_err:
@@ -1114,25 +1228,42 @@ class WebSocketChatHandler:
                 logger.info(f"[WS] LLM response: {str(assistant_response)[:80]}")
 
             # Raise error on prefix for failover matching
-            _llm_error_prefixes = ("[LLM Error]", "[LLM call error]", "[Error]")
             if (
                 not aborted
                 and assistant_response
-                and any(assistant_response.startswith(p) for p in _llm_error_prefixes)
+                and any(assistant_response.startswith(p) for p in LLM_FAILURE_PREFIXES)
             ):
                 raise RuntimeError(assistant_response)
+
+            # Streaming providers normally advance onboarding on the first
+            # chunk. Some compatible APIs return one complete response without
+            # invoking the chunk callback, so close that gap at successful
+            # completion before the pending claim is released.
+            if not aborted and is_onboarding_trigger and assistant_response:
+                if not await maybe_mark_onboarding_progress():
+                    raise RuntimeError("Onboarding claim lost before completion")
 
             # Post-success actions (last_active_at, quota usage increments, activity logs)
             await self._update_activity_and_quota(assistant_response)
 
-            return assistant_response, thinking_content, queued_messages
+            produced_output = bool(partial_chunks) or (not aborted and bool(assistant_response))
+            return assistant_response, thinking_content, queued_messages, _turn_outcome, produced_output
 
         except WebSocketDisconnect:
             raise
         except Exception as e:
             gen_duration = perf_counter() - start_gen
             logger.exception(f"[WS] LLM error after {gen_duration:.3f}s: {e}")
-            return f"[LLM call error] {str(e)[:200]}", [], []
+            if is_onboarding_trigger and partial_chunks:
+                partial_response = "".join(partial_chunks).strip()
+                return (
+                    partial_response + "\n\n*[Welcome generation interrupted]*",
+                    thinking_content,
+                    [],
+                    "failed",
+                    True,
+                )
+            return f"[LLM call error] {str(e)[:200]}", [], [], "failed", False
 
     async def _inject_live_preview_and_workspace_metadata(self, data: dict):
         """Injects live previews and workspace panel activity tracking into tool results."""

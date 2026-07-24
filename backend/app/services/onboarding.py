@@ -12,6 +12,7 @@ ritual rather than a single welcome line:
 ``agent_user_onboardings.phase`` is intentionally small:
 
   - no row: the greeting has not fired yet;
+  - pending: one backend instance has atomically claimed the greeting;
   - greeted: the greeting fired, and the next real user reply should continue
     configuration;
   - completed: normal chat forever after.
@@ -24,14 +25,17 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import String, cast, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent, AgentTemplate, AgentUserOnboarding
 from app.models.audit import ChatMessage
+from app.models.chat_session import ChatSession
+from app.services.auth_code_exchange import PLATFORM_LOGIN_CHANNELS
 
 if TYPE_CHECKING:  # pragma: no cover
     pass
@@ -58,13 +62,34 @@ class OnboardingInjection:
     lock_on_first_chunk: bool
     target_phase: str = "completed"
     is_greeting_turn: bool = False
+    expected_phase: str | None = None
 
 
+@dataclass(frozen=True)
+class OnboardingEligibility:
+    """Whether one concrete platform session may host the first greeting."""
+
+    required: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class OnboardingClaim:
+    """Result of atomically claiming the per-user/agent greeting turn."""
+
+    acquired: bool
+    reason: str
+    claimed_at: datetime | None = None
+
+
+PHASE_PENDING = "pending"
 PHASE_GREETED = "greeted"
 PHASE_CUSTOM_STYLE = "custom_style"
 PHASE_CUSTOM_BOUNDARIES = "custom_boundaries"
 PHASE_TEMPLATE_FOCUS = "template_focus"
 PHASE_COMPLETED = "completed"
+ONBOARDING_PENDING_TTL = timedelta(minutes=2)
+_FIRST_PARTY_CHANNELS = tuple(sorted(PLATFORM_LOGIN_CHANNELS))
 
 
 _CUSTOM_GREETING_PROMPT = """\
@@ -235,6 +260,8 @@ async def resolve_onboarding_prompt(
     *,
     user_name: str = "there",
     user_locale: str = "en",
+    is_onboarding_trigger: bool = False,
+    complete_after_greeting: bool = False,
 ) -> OnboardingInjection | None:
     """Decide what system prompt to inject for this (user, agent) turn.
 
@@ -252,6 +279,16 @@ async def resolve_onboarding_prompt(
     existing_phase = getattr(existing, "phase", PHASE_COMPLETED) if existing else None
     if existing_phase == PHASE_COMPLETED:
         return None
+    # A real user message must never be reinterpreted as the hidden greeting
+    # turn. The normal-message path atomically records ``completed`` when it
+    # wins the first-turn race, but this guard keeps the prompt resolver safe
+    # even if a future caller forgets that arbitration step.
+    if existing_phase is None and not is_onboarding_trigger:
+        return None
+    # ``pending`` is the atomic claim held by the synthetic trigger. A normal
+    # user turn waits for that claim to resolve before reaching this function.
+    if existing_phase == PHASE_PENDING and not is_onboarding_trigger:
+        return None
 
     # Count real user messages this person has sent to this agent. Onboarding
     # triggers are not persisted, so only authentic typed turns are counted.
@@ -265,14 +302,15 @@ async def resolve_onboarding_prompt(
     user_turns = int(user_turn_count.scalar_one() or 0)
 
     # Is anyone at least greeted by this agent yet? If not, this user is the
-    # founder. We intentionally count all rows, including "greeted", because
-    # a greeting already establishes that this agent has met its first human.
+    # founder. The current user's transient pending claim did not exist in the
+    # old pre-claim flow, so discount exactly that row from this decision.
     peer_count = await db.execute(
         select(func.count()).select_from(AgentUserOnboarding).where(
             AgentUserOnboarding.agent_id == agent.id,
         )
     )
-    is_founder = peer_count.scalar_one() == 0
+    current_claim_rows = 1 if existing_phase == PHASE_PENDING else 0
+    is_founder = peer_count.scalar_one() == current_claim_rows
 
     template_prompt: str | None = None
     capability_bullets: list[str] | None = None
@@ -307,7 +345,7 @@ async def resolve_onboarding_prompt(
         prompt = _TEMPLATE_FINALIZE_PROMPT.format(user_name=user_name)
         target_phase = PHASE_COMPLETED
         is_greeting_turn = False
-    else:
+    elif existing_phase in {None, PHASE_PENDING} and is_onboarding_trigger:
         # First contact. Template agents get a confirmation/tuning greeting.
         # Custom agents get the OpenClaw-inspired "define who I am" ritual.
         if is_template_agent:
@@ -323,8 +361,10 @@ async def resolve_onboarding_prompt(
             )
         else:
             prompt = _CUSTOM_GREETING_PROMPT.format(name=agent.name, user_name=user_name)
-        target_phase = PHASE_GREETED
+        target_phase = PHASE_COMPLETED if complete_after_greeting else PHASE_GREETED
         is_greeting_turn = True
+    else:
+        return None
 
     # Prepend a locale directive so the greeting turn lands in the user's
     # interface language (Chinese vs English). Without this, the agent would
@@ -340,7 +380,244 @@ async def resolve_onboarding_prompt(
         lock_on_first_chunk=True,
         target_phase=target_phase,
         is_greeting_turn=is_greeting_turn,
+        expected_phase=existing_phase,
     )
+
+
+def _pending_is_stale(row: AgentUserOnboarding, now: datetime) -> bool:
+    started_at = row.onboarded_at
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    return started_at <= now - ONBOARDING_PENDING_TTL
+
+
+async def resolve_onboarding_eligibility(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: uuid.UUID,
+    *,
+    now: datetime | None = None,
+) -> OnboardingEligibility:
+    """Return the authoritative first-session greeting decision.
+
+    Onboarding is global to a user/agent pair, matching the existing primary
+    key on ``agent_user_onboardings``. The eligible session is therefore the
+    earliest first-party P2P session across Web and H5 surfaces.
+    """
+
+    current = now or datetime.now(timezone.utc)
+    session = await db.get(ChatSession, session_id)
+    if session is None or session.agent_id != agent_id:
+        return OnboardingEligibility(False, "session_not_found")
+    if session.user_id != user_id:
+        return OnboardingEligibility(False, "not_session_owner")
+    if session.is_group or session.peer_agent_id is not None:
+        return OnboardingEligibility(False, "not_p2p_session")
+    if session.source_channel not in _FIRST_PARTY_CHANNELS:
+        return OnboardingEligibility(False, "unsupported_channel")
+
+    onboarding_result = await db.execute(
+        select(AgentUserOnboarding).where(
+            AgentUserOnboarding.agent_id == agent_id,
+            AgentUserOnboarding.user_id == user_id,
+        )
+    )
+    onboarding = onboarding_result.scalar_one_or_none()
+    if onboarding is not None:
+        if onboarding.phase != PHASE_PENDING:
+            return OnboardingEligibility(False, "already_started")
+        if not _pending_is_stale(onboarding, current):
+            return OnboardingEligibility(False, "in_progress")
+
+    # Any persisted platform history means this is no longer a pristine first
+    # conversation. This also self-protects legacy pairs whose onboarding row
+    # is missing: opening an old or empty history record can never inject a
+    # greeting into their audit trail.
+    message_result = await db.execute(
+        select(ChatMessage.id)
+        .join(
+            ChatSession,
+            ChatMessage.conversation_id == cast(ChatSession.id, String),
+        )
+        .where(
+            ChatSession.agent_id == agent_id,
+            ChatSession.user_id == user_id,
+            ChatSession.is_group.is_(False),
+            ChatSession.source_channel.in_(_FIRST_PARTY_CHANNELS),
+        )
+        .limit(1)
+    )
+    if message_result.scalar_one_or_none() is not None:
+        return OnboardingEligibility(False, "existing_history")
+
+    first_result = await db.execute(
+        select(ChatSession.id)
+        .where(
+            ChatSession.agent_id == agent_id,
+            ChatSession.user_id == user_id,
+            ChatSession.is_group.is_(False),
+            ChatSession.source_channel.in_(_FIRST_PARTY_CHANNELS),
+        )
+        .order_by(ChatSession.created_at.asc().nulls_last(), ChatSession.id.asc())
+        .limit(1)
+    )
+    first_session_id = first_result.scalar_one_or_none()
+    if first_session_id != session_id:
+        return OnboardingEligibility(False, "not_first_session")
+    return OnboardingEligibility(True, "required")
+
+
+async def claim_onboarding_greeting(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: uuid.UUID,
+    *,
+    now: datetime | None = None,
+) -> OnboardingClaim:
+    """Atomically claim the greeting turn using the existing pair primary key."""
+
+    current = now or datetime.now(timezone.utc)
+    eligibility = await resolve_onboarding_eligibility(
+        db,
+        agent_id,
+        user_id,
+        session_id,
+        now=current,
+    )
+    if not eligibility.required:
+        return OnboardingClaim(False, eligibility.reason)
+
+    insert_stmt = (
+        pg_insert(AgentUserOnboarding)
+        .values(
+            agent_id=agent_id,
+            user_id=user_id,
+            phase=PHASE_PENDING,
+            onboarded_at=current,
+        )
+        .on_conflict_do_nothing(index_elements=["agent_id", "user_id"])
+        .returning(AgentUserOnboarding.agent_id)
+    )
+    inserted = (await db.execute(insert_stmt)).scalar_one_or_none()
+    if inserted is not None:
+        await db.commit()
+        return OnboardingClaim(True, "claimed", current)
+
+    # A crashed worker may leave a pending claim behind. Reclaim it with a
+    # compare-and-swap on its timestamp; a live claim can never be stolen.
+    reclaim_stmt = (
+        update(AgentUserOnboarding)
+        .where(
+            AgentUserOnboarding.agent_id == agent_id,
+            AgentUserOnboarding.user_id == user_id,
+            AgentUserOnboarding.phase == PHASE_PENDING,
+            AgentUserOnboarding.onboarded_at <= current - ONBOARDING_PENDING_TTL,
+        )
+        .values(onboarded_at=current)
+        .returning(AgentUserOnboarding.agent_id)
+    )
+    reclaimed = (await db.execute(reclaim_stmt)).scalar_one_or_none()
+    await db.commit()
+    if reclaimed is not None:
+        return OnboardingClaim(True, "reclaimed", current)
+    return OnboardingClaim(False, "in_progress")
+
+
+async def release_onboarding_claim(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    claimed_at: datetime,
+) -> bool:
+    """Release only the exact still-pending claim owned by this turn."""
+
+    result = await db.execute(
+        delete(AgentUserOnboarding).where(
+            AgentUserOnboarding.agent_id == agent_id,
+            AgentUserOnboarding.user_id == user_id,
+            AgentUserOnboarding.phase == PHASE_PENDING,
+            AgentUserOnboarding.onboarded_at == claimed_at,
+        )
+    )
+    await db.commit()
+    return bool(result.rowcount)
+
+
+async def claim_normal_first_turn(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Let a real user message win safely when no greeting has started.
+
+    Returns the resulting/current phase. A fresh real message inserts
+    ``completed`` so the prompt resolver cannot replace the user's question
+    with a greeting. A stale pending greeting is also completed atomically.
+    """
+
+    current = now or datetime.now(timezone.utc)
+    existing = await db.get(AgentUserOnboarding, (agent_id, user_id))
+    if existing is not None:
+        if existing.phase != PHASE_PENDING:
+            return existing.phase
+        if not _pending_is_stale(existing, current):
+            return PHASE_PENDING
+
+        stale_takeover = (
+            update(AgentUserOnboarding)
+            .where(
+                AgentUserOnboarding.agent_id == agent_id,
+                AgentUserOnboarding.user_id == user_id,
+                AgentUserOnboarding.phase == PHASE_PENDING,
+                AgentUserOnboarding.onboarded_at == existing.onboarded_at,
+            )
+            .values(phase=PHASE_COMPLETED, onboarded_at=current)
+            .returning(AgentUserOnboarding.phase)
+        )
+        takeover_phase = (await db.execute(stale_takeover)).scalar_one_or_none()
+        await db.commit()
+        if takeover_phase is not None:
+            return PHASE_COMPLETED
+
+        # A concurrent owner advanced or reclaimed the row after our read.
+        phase_result = await db.execute(
+            select(AgentUserOnboarding.phase).where(
+                AgentUserOnboarding.agent_id == agent_id,
+                AgentUserOnboarding.user_id == user_id,
+            )
+        )
+        phase = phase_result.scalar_one_or_none()
+        return phase or PHASE_COMPLETED
+
+    insert_stmt = (
+        pg_insert(AgentUserOnboarding)
+        .values(
+            agent_id=agent_id,
+            user_id=user_id,
+            phase=PHASE_COMPLETED,
+            onboarded_at=current,
+        )
+        .on_conflict_do_nothing(index_elements=["agent_id", "user_id"])
+        .returning(AgentUserOnboarding.phase)
+    )
+    inserted_phase = (await db.execute(insert_stmt)).scalar_one_or_none()
+    if inserted_phase is not None:
+        await db.commit()
+        return PHASE_COMPLETED
+
+    # A greeting claim won between the initial read and our insert.
+    phase_result = await db.execute(
+        select(AgentUserOnboarding.phase).where(
+            AgentUserOnboarding.agent_id == agent_id,
+            AgentUserOnboarding.user_id == user_id,
+        )
+    )
+    phase = phase_result.scalar_one_or_none()
+    return phase or PHASE_COMPLETED
 
 
 async def mark_onboarding_phase(
@@ -348,12 +625,15 @@ async def mark_onboarding_phase(
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
     phase: str = PHASE_COMPLETED,
-) -> None:
+    *,
+    expected_phase: str | None = None,
+) -> bool:
     """Insert or update the onboarding phase for a user/agent pair.
 
     Called as soon as the LLM begins streaming the relevant onboarding turn.
     """
     if phase not in {
+        PHASE_PENDING,
         PHASE_GREETED,
         PHASE_CUSTOM_STYLE,
         PHASE_CUSTOM_BOUNDARIES,
@@ -361,16 +641,34 @@ async def mark_onboarding_phase(
         PHASE_COMPLETED,
     }:
         phase = PHASE_COMPLETED
-    stmt = pg_insert(AgentUserOnboarding).values(
-        agent_id=agent_id,
-        user_id=user_id,
-        phase=phase,
-    ).on_conflict_do_update(
-        index_elements=["agent_id", "user_id"],
-        set_={"phase": phase},
+    if expected_phase is not None:
+        result = await db.execute(
+            update(AgentUserOnboarding)
+            .where(
+                AgentUserOnboarding.agent_id == agent_id,
+                AgentUserOnboarding.user_id == user_id,
+                AgentUserOnboarding.phase == expected_phase,
+            )
+            .values(phase=phase)
+        )
+        await db.commit()
+        return bool(result.rowcount)
+
+    stmt = (
+        pg_insert(AgentUserOnboarding)
+        .values(
+            agent_id=agent_id,
+            user_id=user_id,
+            phase=phase,
+        )
+        .on_conflict_do_update(
+            index_elements=["agent_id", "user_id"],
+            set_={"phase": phase},
+        )
     )
-    await db.execute(stmt)
+    result = await db.execute(stmt)
     await db.commit()
+    return bool(result.rowcount)
 
 
 async def mark_onboarded(

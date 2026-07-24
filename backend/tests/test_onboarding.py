@@ -6,6 +6,7 @@ import pytest
 from app.services.onboarding import (
     PHASE_CUSTOM_STYLE,
     PHASE_GREETED,
+    PHASE_PENDING,
     PHASE_TEMPLATE_FOCUS,
     resolve_onboarding_prompt,
 )
@@ -57,10 +58,31 @@ async def test_first_contact_is_the_only_tool_free_greeting_turn():
         uuid.uuid4(),
         user_name="Ray",
         user_locale="zh",
+        is_onboarding_trigger=True,
     )
 
     assert injection is not None
     assert injection.is_greeting_turn is True
+
+
+@pytest.mark.asyncio
+async def test_real_first_message_is_never_replaced_by_greeting():
+    db = RecordingDB(
+        [
+            DummyResult(scalar_value=None),  # onboarding row
+        ]
+    )
+
+    injection = await resolve_onboarding_prompt(
+        db,
+        _make_agent(),
+        uuid.uuid4(),
+        user_name="Ray",
+        user_locale="zh",
+        is_onboarding_trigger=False,
+    )
+
+    assert injection is None
 
 
 @pytest.mark.asyncio
@@ -136,3 +158,29 @@ async def test_custom_boundary_follow_up_keeps_tools_enabled():
 
     assert injection is not None
     assert injection.is_greeting_turn is False
+
+
+@pytest.mark.asyncio
+async def test_h5_claimed_greeting_completes_on_first_response():
+    db = RecordingDB(
+        [
+            DummyResult(scalar_value=SimpleNamespace(phase=PHASE_PENDING)),
+            DummyResult(scalar_value=0),  # user turns
+            DummyResult(scalar_value=1),  # current pending claim only
+        ]
+    )
+
+    injection = await resolve_onboarding_prompt(
+        db,
+        _make_agent(),
+        uuid.uuid4(),
+        user_name="Ray",
+        user_locale="zh",
+        is_onboarding_trigger=True,
+        complete_after_greeting=True,
+    )
+
+    assert injection is not None
+    assert injection.is_greeting_turn is True
+    assert injection.target_phase == "completed"
+    assert injection.expected_phase == PHASE_PENDING

@@ -61,6 +61,10 @@ import {
 import { resolveH5LinkAction } from '../../utils/h5LinkPolicy';
 import { installThemeController, resolveThemeMode } from '../../utils/themeMode';
 import { insertSpeechTranscript, useSpeechInput } from '../../hooks/useSpeechInput';
+import {
+    useOnboardingKickoff,
+    type OnboardingKickoffRequest,
+} from '../../hooks/useOnboardingKickoff';
 import './H5AgentChat.css';
 
 type AuthStatus = 'checking' | 'exchanging' | 'ready' | 'error';
@@ -359,6 +363,7 @@ export default function H5AgentChat() {
     const [llmModels, setLlmModels] = useState<ChatModelOption[]>([]);
     const [tenantDefaultModelId, setTenantDefaultModelId] = useState<string | null>(null);
     const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
+    const [onboardingKickoffRequest, setOnboardingKickoffRequest] = useState<OnboardingKickoffRequest | null>(null);
     const [isWaiting, setIsWaiting] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
     const [isStopping, setIsStopping] = useState(false);
@@ -698,17 +703,40 @@ export default function H5AgentChat() {
         }, delay);
     }, [agentId, token]);
 
-    const handleSocketMessage = useCallback((data: any) => {
+    const handleSocketMessage = useCallback((data: any, socket: WebSocket) => {
         if (data.type === 'connected' && data.session_id) {
             const nextSessionId = String(data.session_id);
             sessionIdRef.current = nextSessionId;
             setSessionId(nextSessionId);
+            setConnectionStatus('connected');
+            if (data.onboarding_required === true) {
+                setIsWaiting(true);
+                setIsStreaming(false);
+            }
+            setOnboardingKickoffRequest({
+                sessionId: nextSessionId,
+                required: data.onboarding_required === true,
+                socket,
+            });
             window.history.replaceState({}, '', writeChatSessionIdToHref(window.location.href, nextSessionId));
             if (skipNextConnectedHistoryRef.current === nextSessionId) {
                 skipNextConnectedHistoryRef.current = null;
             } else {
                 loadHistory(nextSessionId);
             }
+            return;
+        }
+
+        if (data.type === 'onboarded') {
+            setOnboardingKickoffRequest(null);
+            return;
+        }
+
+        if (data.type === 'onboarding_skipped') {
+            setOnboardingKickoffRequest(null);
+            setIsWaiting(false);
+            setIsStreaming(false);
+            setIsStopping(false);
             return;
         }
 
@@ -789,12 +817,11 @@ export default function H5AgentChat() {
 
         ws.onopen = () => {
             reconnectAttemptRef.current = 0;
-            setConnectionStatus('connected');
         };
 
         ws.onmessage = (event) => {
             try {
-                handleSocketMessage(JSON.parse(event.data));
+                handleSocketMessage(JSON.parse(event.data), ws);
             } catch {
                 // Ignore malformed server frames.
             }
@@ -811,6 +838,7 @@ export default function H5AgentChat() {
             setIsWaiting(false);
             setIsStreaming(false);
             setIsStopping(false);
+            setOnboardingKickoffRequest(null);
             scheduleReconnect();
         };
     }, [agentId, channel, handleSocketMessage, scheduleReconnect, token]);
@@ -1045,6 +1073,19 @@ export default function H5AgentChat() {
         () => modelSupportsVision(llmModels, effectiveModelId),
         [effectiveModelId, llmModels],
     );
+
+    const handleOnboardingStart = useCallback(() => {
+        setIsWaiting(true);
+        setIsStreaming(false);
+    }, []);
+
+    useOnboardingKickoff({
+        request: onboardingKickoffRequest,
+        activeSessionId: sessionId,
+        effectiveModelId,
+        enabled: connectionStatus === 'connected',
+        onStart: handleOnboardingStart,
+    });
 
     const sendMessage = useCallback(async () => {
         const content = input.trim();

@@ -231,10 +231,10 @@ class AgentTemplate(Base):
 class AgentUserOnboarding(Base):
     """Tracks the per-(agent, user) onboarding ritual.
 
-    Row presence means the greeting has fired, so the frontend should not
-    auto-trigger another empty-session greeting. The ``phase`` column lets the
-    backend continue with a second, real user reply that calibrates the agent
-    and writes durable working notes before marking onboarding complete.
+    A ``pending`` row is the backend's short-lived atomic greeting claim.
+    Later phases mean the greeting has fired, so clients must not auto-trigger
+    another one. The ``phase`` column also lets Web continue with real user
+    replies that calibrate the agent before marking onboarding complete.
     """
 
     __tablename__ = "agent_user_onboardings"
