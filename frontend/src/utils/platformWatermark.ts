@@ -19,8 +19,9 @@ type PlatformWatermarkInstallOptions = {
 
 const WATERMARK_ATTRIBUTE = 'data-platform-watermark';
 const MAX_NAME_CHARACTERS = 24;
-const MAX_DEVICE_PIXEL_RATIO = 2;
+const MAX_DEVICE_PIXEL_RATIO = 3;
 const MOBILE_VIEWPORT_MAX_WIDTH = 600;
+const WATERMARK_ROTATION_DEGREES = -22;
 const WATERMARK_FONT_FAMILY = [
     '-apple-system',
     'BlinkMacSystemFont',
@@ -97,34 +98,66 @@ export function calculatePlatformWatermarkTileLayout(
     };
 }
 
-export function createPlatformWatermarkTile(
+function escapePlatformWatermarkXml(value: string) {
+    return value.replace(/[&<>"']/g, (character) => {
+        switch (character) {
+            case '&':
+                return '&amp;';
+            case '<':
+                return '&lt;';
+            case '>':
+                return '&gt;';
+            case '"':
+                return '&quot;';
+            case '\'':
+                return '&apos;';
+            default:
+                return character;
+        }
+    });
+}
+
+export function createPlatformWatermarkSvgDataUrl(
     text: string,
     theme: PlatformWatermarkTheme,
-    targetDocument: Document = document,
-    targetWindow: Window = window,
+    layout: Pick<ReturnType<typeof calculatePlatformWatermarkTileLayout>, 'fontSize' | 'width' | 'height'>,
+) {
+    const escapedText = escapePlatformWatermarkXml(text);
+    const escapedFontFamily = escapePlatformWatermarkXml(WATERMARK_FONT_FAMILY);
+    const fill = theme === 'dark' ? 'rgb(255,255,255)' : 'rgb(0,0,0)';
+    const fillOpacity = theme === 'dark' ? '0.10' : '0.09';
+    const centerX = layout.width / 2;
+    const centerY = layout.height / 2;
+    const svg = [
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${layout.width}" height="${layout.height}"`,
+        ` viewBox="0 0 ${layout.width} ${layout.height}" preserveAspectRatio="xMidYMid meet">`,
+        `<text x="${centerX}" y="${centerY}"`,
+        ` transform="rotate(${WATERMARK_ROTATION_DEGREES} ${centerX} ${centerY})"`,
+        ` font-family="${escapedFontFamily}" font-size="${layout.fontSize}" font-weight="500"`,
+        ` fill="${fill}" fill-opacity="${fillOpacity}" text-anchor="middle" dominant-baseline="middle"`,
+        ` text-rendering="geometricPrecision">${escapedText}</text></svg>`,
+    ].join('');
+
+    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+function createPlatformWatermarkCanvasTile(
+    text: string,
+    theme: PlatformWatermarkTheme,
+    layout: ReturnType<typeof calculatePlatformWatermarkTileLayout>,
+    targetDocument: Document,
 ): PlatformWatermarkTile {
     const canvas = targetDocument.createElement('canvas');
-    const context = canvas.getContext('2d');
-    if (!context) throw new Error('Canvas 2D is unavailable');
-
-    const isNarrow = targetWindow.innerWidth > 0 && targetWindow.innerWidth <= MOBILE_VIEWPORT_MAX_WIDTH;
-    const fontSize = isNarrow ? 13 : 14;
-    context.font = `500 ${fontSize}px ${WATERMARK_FONT_FAMILY}`;
-    const measuredTextWidth = context.measureText(text).width;
-    const layout = calculatePlatformWatermarkTileLayout(
-        measuredTextWidth,
-        targetWindow.innerWidth,
-        targetWindow.devicePixelRatio,
-    );
-
     canvas.width = Math.ceil(layout.width * layout.devicePixelRatio);
     canvas.height = Math.ceil(layout.height * layout.devicePixelRatio);
     const drawingContext = canvas.getContext('2d');
     if (!drawingContext) throw new Error('Canvas 2D is unavailable');
 
-    drawingContext.scale(layout.devicePixelRatio, layout.devicePixelRatio);
+    const scaleX = canvas.width / layout.width;
+    const scaleY = canvas.height / layout.height;
+    drawingContext.setTransform(scaleX, 0, 0, scaleY, 0, 0);
     drawingContext.translate(layout.width / 2, layout.height / 2);
-    drawingContext.rotate(-22 * Math.PI / 180);
+    drawingContext.rotate(WATERMARK_ROTATION_DEGREES * Math.PI / 180);
     drawingContext.font = `500 ${layout.fontSize}px ${WATERMARK_FONT_FAMILY}`;
     drawingContext.fillStyle = theme === 'dark'
         ? 'rgba(255,255,255,0.10)'
@@ -138,6 +171,37 @@ export function createPlatformWatermarkTile(
         width: layout.width,
         height: layout.height,
     };
+}
+
+export function createPlatformWatermarkTile(
+    text: string,
+    theme: PlatformWatermarkTheme,
+    targetDocument: Document = document,
+    targetWindow: Window = window,
+): PlatformWatermarkTile {
+    const measurementCanvas = targetDocument.createElement('canvas');
+    const measurementContext = measurementCanvas.getContext('2d');
+    if (!measurementContext) throw new Error('Canvas 2D is unavailable');
+
+    const isNarrow = targetWindow.innerWidth > 0 && targetWindow.innerWidth <= MOBILE_VIEWPORT_MAX_WIDTH;
+    const fontSize = isNarrow ? 13 : 14;
+    measurementContext.font = `500 ${fontSize}px ${WATERMARK_FONT_FAMILY}`;
+    const measuredTextWidth = measurementContext.measureText(text).width;
+    const layout = calculatePlatformWatermarkTileLayout(
+        measuredTextWidth,
+        targetWindow.innerWidth,
+        targetWindow.devicePixelRatio,
+    );
+
+    try {
+        return {
+            dataUrl: createPlatformWatermarkSvgDataUrl(text, theme, layout),
+            width: layout.width,
+            height: layout.height,
+        };
+    } catch {
+        return createPlatformWatermarkCanvasTile(text, theme, layout, targetDocument);
+    }
 }
 
 function setImportantStyle(element: HTMLElement, property: string, value: string) {
