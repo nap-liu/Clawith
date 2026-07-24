@@ -1,11 +1,13 @@
 """Application configuration."""
 
+from datetime import datetime, timezone
 from functools import lru_cache
 import os
 from pathlib import Path
 import socket
 import uuid
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 from app.services.sandbox.config import SandboxConfig, SandboxType
@@ -118,6 +120,9 @@ class Settings(BaseSettings):
 
     # Process role
     PROCESS_ROLE: str = "all"
+    # Ignore cron occurrences before this rollout boundary. The value must be
+    # timezone-aware ISO 8601 when set.
+    CRON_OCCURRENCE_NOT_BEFORE: datetime | None = None
 
     # Docker (for Agent containers)
     DOCKER_NETWORK: str = "clawith_network"
@@ -169,6 +174,28 @@ class Settings(BaseSettings):
     SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING: bool = _default_allow_unsafe_bwrap_fallback()
     SANDBOX_DEFAULT_TIMEOUT: int = 30
     SANDBOX_MAX_TIMEOUT: int = 60
+
+    @field_validator("CRON_OCCURRENCE_NOT_BEFORE", mode="before")
+    @classmethod
+    def validate_cron_occurrence_not_before(cls, value):
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError(
+                    "CRON_OCCURRENCE_NOT_BEFORE must be an ISO 8601 timestamp"
+                ) from exc
+        if not isinstance(value, datetime):
+            raise ValueError(
+                "CRON_OCCURRENCE_NOT_BEFORE must be an ISO 8601 timestamp"
+            )
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(
+                "CRON_OCCURRENCE_NOT_BEFORE must include a timezone"
+            )
+        return value.astimezone(timezone.utc)
 
     model_config = {
         "env_file": [".env", "../.env"],

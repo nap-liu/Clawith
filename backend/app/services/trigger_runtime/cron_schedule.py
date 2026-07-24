@@ -7,11 +7,12 @@ durable ordering, model context, and execution idempotency.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
 
+from app.config import get_settings
 from app.models.trigger import AgentTrigger
 from app.services.timezone_utils import get_agent_timezone
 
@@ -38,9 +39,20 @@ def compute_next_cron_occurrence(
     expr: str,
     base: datetime,
     timezone_name: str,
+    not_before: datetime | None = None,
 ) -> CronOccurrence:
     """Return the next occurrence after ``base`` in the requested timezone."""
     resolved_name, tz = _resolve_zoneinfo(timezone_name)
+    if not_before is not None:
+        if not_before.tzinfo is None:
+            raise ValueError("cron occurrence boundary must be timezone-aware")
+        boundary_base = not_before.astimezone(timezone.utc) - timedelta(microseconds=1)
+        if base.tzinfo is None:
+            comparable_base = base.replace(tzinfo=tz).astimezone(timezone.utc)
+        else:
+            comparable_base = base.astimezone(timezone.utc)
+        if boundary_base > comparable_base:
+            base = boundary_base
     local_base = base.astimezone(tz) if base.tzinfo else base.replace(tzinfo=tz)
     local_scheduled_for = croniter(expr, local_base).get_next(datetime)
     if local_scheduled_for.tzinfo is None:
@@ -64,10 +76,12 @@ async def compute_next_trigger_cron_occurrence(
     timezone_name = cfg.get("timezone")
     if not timezone_name:
         timezone_name = await get_agent_timezone(trigger.agent_id)
+    not_before = get_settings().CRON_OCCURRENCE_NOT_BEFORE
     return compute_next_cron_occurrence(
         expr=str(cfg.get("expr") or "* * * * *"),
         base=trigger.last_fired_at or trigger.created_at,
         timezone_name=str(timezone_name or "UTC"),
+        not_before=not_before,
     )
 
 

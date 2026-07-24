@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
+from app.config import Settings
 from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.tenant import Tenant
@@ -131,6 +134,35 @@ async def test_explicit_trigger_timezone_wins_without_agent_lookup():
     assert occurrence.scheduled_for == datetime(2026, 7, 22, 9, 0, tzinfo=timezone.utc)
 
 
+async def test_trigger_occurrence_applies_configured_rollout_boundary():
+    trigger = _cron_trigger(
+        last_fired_at=datetime(2026, 7, 22, 10, 0, 12, tzinfo=timezone.utc),
+    )
+    with patch(
+        "app.services.trigger_runtime.cron_schedule.get_settings",
+        return_value=SimpleNamespace(
+            CRON_OCCURRENCE_NOT_BEFORE=datetime(
+                2026,
+                7,
+                24,
+                3,
+                0,
+                tzinfo=timezone.utc,
+            )
+        ),
+    ):
+        occurrence = await compute_next_trigger_cron_occurrence(trigger)
+
+    assert occurrence.scheduled_for == datetime(
+        2026,
+        7,
+        24,
+        10,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+
 def test_invalid_timezone_falls_back_to_utc():
     occurrence = compute_next_cron_occurrence(
         expr="0 18 * * *",
@@ -141,6 +173,104 @@ def test_invalid_timezone_falls_back_to_utc():
     assert occurrence.timezone_name == "UTC"
     assert occurrence.scheduled_for == datetime(2026, 7, 22, 18, 0, tzinfo=timezone.utc)
     assert occurrence.local_scheduled_for.utcoffset() == timedelta(0)
+
+
+def test_rollout_boundary_skips_historical_occurrences_without_mutating_trigger():
+    trigger = _cron_trigger(
+        last_fired_at=datetime(2026, 7, 22, 10, 0, 12, tzinfo=timezone.utc),
+    )
+    original_last_fired_at = trigger.last_fired_at
+
+    occurrence = compute_next_cron_occurrence(
+        expr="0 18 * * *",
+        base=trigger.last_fired_at,
+        timezone_name="Asia/Shanghai",
+        not_before=datetime(2026, 7, 24, 3, 0, tzinfo=timezone.utc),
+    )
+
+    assert occurrence.scheduled_for == datetime(
+        2026,
+        7,
+        24,
+        10,
+        0,
+        tzinfo=timezone.utc,
+    )
+    assert trigger.last_fired_at == original_last_fired_at
+
+
+def test_rollout_boundary_includes_occurrence_exactly_at_boundary():
+    occurrence = compute_next_cron_occurrence(
+        expr="0 18 * * *",
+        base=datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc),
+        timezone_name="Asia/Shanghai",
+        not_before=datetime(2026, 7, 24, 10, 0, tzinfo=timezone.utc),
+    )
+
+    assert occurrence.scheduled_for == datetime(
+        2026,
+        7,
+        24,
+        10,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+
+def test_newer_last_fired_base_wins_over_rollout_boundary():
+    occurrence = compute_next_cron_occurrence(
+        expr="0 18 * * *",
+        base=datetime(2026, 7, 25, 10, 0, 12, tzinfo=timezone.utc),
+        timezone_name="Asia/Shanghai",
+        not_before=datetime(2026, 7, 24, 3, 0, tzinfo=timezone.utc),
+    )
+
+    assert occurrence.scheduled_for == datetime(
+        2026,
+        7,
+        26,
+        10,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+
+def test_rollout_boundary_must_be_timezone_aware():
+    with pytest.raises(ValueError, match="boundary must be timezone-aware"):
+        compute_next_cron_occurrence(
+            expr="0 18 * * *",
+            base=datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc),
+            timezone_name="Asia/Shanghai",
+            not_before=datetime(2026, 7, 24, 3, 0),
+        )
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("", None),
+        ("2026-07-24T03:00:00Z", datetime(2026, 7, 24, 3, 0, tzinfo=timezone.utc)),
+        (
+            "2026-07-24T11:00:00+08:00",
+            datetime(2026, 7, 24, 3, 0, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_settings_normalizes_cron_rollout_boundary(raw_value, expected):
+    settings = Settings(
+        _env_file=None,
+        CRON_OCCURRENCE_NOT_BEFORE=raw_value,
+    )
+
+    assert settings.CRON_OCCURRENCE_NOT_BEFORE == expected
+
+
+def test_settings_rejects_naive_cron_rollout_boundary():
+    with pytest.raises(ValidationError, match="must include a timezone"):
+        Settings(
+            _env_file=None,
+            CRON_OCCURRENCE_NOT_BEFORE="2026-07-24T03:00:00",
+        )
 
 
 def test_dst_occurrence_is_aware_and_stable():
