@@ -1191,6 +1191,15 @@ export default function H5AgentChat() {
             </div>
         </article>
     ), []);
+    const preventProtectedContentAction = useCallback((event: React.SyntheticEvent) => {
+        event.preventDefault();
+    }, []);
+    const preventProtectedImageDrag = useCallback((event: React.DragEvent<HTMLElement>) => {
+        const target = event.target;
+        if (target instanceof Element && target.closest('img')) {
+            event.preventDefault();
+        }
+    }, []);
 
     const copyLinkWithFeedback = useCallback(async (url: string) => {
         await copyH5LinkWithFeedback(url, {
@@ -1340,7 +1349,13 @@ export default function H5AgentChat() {
                                     onClick={() => setImagePreview({ images: previewImages, index })}
                                     aria-label="预览图片"
                                 >
-                                    <img className="h5-chat__bubble-image" src={image.src} alt={image.alt || image.filename || 'image'} loading="lazy" />
+                                    <img
+                                        className="h5-chat__bubble-image"
+                                        src={image.src}
+                                        alt={image.alt || image.filename || 'image'}
+                                        loading="lazy"
+                                        draggable={false}
+                                    />
                                 </button>
                             ))}
                         </div>
@@ -1363,6 +1378,8 @@ export default function H5AgentChat() {
                             className="h5-chat__markdown"
                             content={displayContent}
                             imagePreviewMode="mobile"
+                            allowImageDownload={false}
+                            protectImages
                             onLinkClick={handleMarkdownLinkClick}
                         />
                     ) : msg.streaming ? (
@@ -1544,6 +1561,10 @@ export default function H5AgentChat() {
                     ref={messagesScrollerRef}
                     className={`h5-chat__messages${virtualizeMessages ? ' h5-chat__messages--virtual' : ''}`}
                     aria-live="polite"
+                    onCopyCapture={preventProtectedContentAction}
+                    onCutCapture={preventProtectedContentAction}
+                    onContextMenuCapture={preventProtectedContentAction}
+                    onDragStartCapture={preventProtectedImageDrag}
                 >
                     {virtualizeMessages ? (
                         <div
@@ -1745,6 +1766,8 @@ export default function H5AgentChat() {
                 images={imagePreview?.images || []}
                 index={imagePreview?.index || 0}
                 mode="mobile"
+                allowDownload={false}
+                protectImages
                 onClose={() => setImagePreview(null)}
                 onIndexChange={(index) => setImagePreview((prev) => prev ? { ...prev, index } : prev)}
             />

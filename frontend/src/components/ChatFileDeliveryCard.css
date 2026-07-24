@@ -107,3 +107,10 @@
     min-height: 60px;
     box-shadow: none;
 }
+
+.chat-file-delivery--h5 .chat-file-delivery__thumb--image img {
+    -webkit-touch-callout: none;
+    -webkit-user-drag: none;
+    -webkit-user-select: none;
+    user-select: none;
+}

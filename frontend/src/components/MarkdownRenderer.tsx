@@ -75,7 +75,12 @@ function triggerImageDownload(url: string, alt: string) {
     document.body.removeChild(link);
 }
 
-function renderInline(text: string): string {
+type MarkdownImagePolicy = {
+    allowDownload: boolean;
+    protectImages: boolean;
+};
+
+function renderInline(text: string, imagePolicy: MarkdownImagePolicy): string {
     const tokens: string[] = [];
     const stash = (html: string) => {
         // Token must NOT contain `__` (the line-115 substitution would turn it
@@ -95,12 +100,20 @@ function renderInline(text: string): string {
             if (!finalUrl) return escapeHtml(match);
             const safeUrl = escapeAttribute(finalUrl);
             const safeAlt = escapeAttribute(alt);
+            const protectedImageAttributes = imagePolicy.protectImages
+                ? ' draggable="false"'
+                : '';
+            const downloadButton = imagePolicy.allowDownload
+                ? (
+                    `<button type="button" class="markdown-image-download-btn" data-markdown-image-download="${safeUrl}" data-markdown-image-alt="${safeAlt}" aria-label="Download image" title="Download image">` +
+                    `↓` +
+                    `</button>`
+                )
+                : '';
             return stash(
                 `<span class="markdown-image-wrap" data-markdown-image-wrap="1">` +
-                `<img src="${safeUrl}" alt="${safeAlt}" class="markdown-inline-image" data-markdown-image-src="${safeUrl}" data-markdown-image-alt="${safeAlt}" />` +
-                `<button type="button" class="markdown-image-download-btn" data-markdown-image-download="${safeUrl}" data-markdown-image-alt="${safeAlt}" aria-label="Download image" title="Download image">` +
-                `↓` +
-                `</button>` +
+                `<img src="${safeUrl}" alt="${safeAlt}" class="markdown-inline-image" data-markdown-image-src="${safeUrl}" data-markdown-image-alt="${safeAlt}"${protectedImageAttributes} />` +
+                downloadButton +
                 `</span>`
             );
         })
@@ -126,7 +139,7 @@ function renderInline(text: string): string {
     return working;
 }
 
-function markdownToHtml(md: string): string {
+function markdownToHtml(md: string, imagePolicy: MarkdownImagePolicy): string {
     const lines = md.split('\n');
     let html = '';
     let inCodeBlock = false;
@@ -182,7 +195,7 @@ function markdownToHtml(md: string): string {
             const level = hMatch[1].length;
             const sizes = ['1.6em', '1.4em', '1.2em', '1.1em', '1em', '0.9em'];
             const margins = ['20px 0 8px', '16px 0 6px', '14px 0 5px', '12px 0 4px', '10px 0 4px', '8px 0 4px'];
-            html += `<h${level} style="margin:${margins[level - 1]};font-size:${sizes[level - 1]};font-weight:600;line-height:1.3">${renderInline(hMatch[2])}</h${level}>`;
+            html += `<h${level} style="margin:${margins[level - 1]};font-size:${sizes[level - 1]};font-weight:600;line-height:1.3">${renderInline(hMatch[2], imagePolicy)}</h${level}>`;
             continue;
         }
 
@@ -200,7 +213,7 @@ function markdownToHtml(md: string): string {
                 html += '<blockquote style="border-left:3px solid var(--accent-primary);margin:8px 0;padding:4px 12px;color:var(--text-secondary);background:var(--bg-secondary);border-radius:0 4px 4px 0">';
                 inBlockquote = true;
             }
-            html += `<div>${renderInline(line.slice(2))}</div>`;
+            html += `<div>${renderInline(line.slice(2), imagePolicy)}</div>`;
             continue;
         } else if (inBlockquote) {
             flushBlockquote();
@@ -220,10 +233,10 @@ function markdownToHtml(md: string): string {
                 inTable = true;
                 tableHeader = false;
                 // This is the header row
-                html += '<tr>' + cols.map(c => `<th style="border:1px solid rgba(128,128,128,0.4);padding:6px 10px;background:var(--bg-secondary);text-align:left;font-weight:600">${renderInline(c)}</th>`).join('') + '</tr>';
+                html += '<tr>' + cols.map(c => `<th style="border:1px solid rgba(128,128,128,0.4);padding:6px 10px;background:var(--bg-secondary);text-align:left;font-weight:600">${renderInline(c, imagePolicy)}</th>`).join('') + '</tr>';
                 html += '</thead><tbody>';
             } else {
-                html += '<tr>' + cols.map(c => `<td style="border:1px solid rgba(128,128,128,0.4);padding:6px 10px">${renderInline(c)}</td>`).join('') + '</tr>';
+                html += '<tr>' + cols.map(c => `<td style="border:1px solid rgba(128,128,128,0.4);padding:6px 10px">${renderInline(c, imagePolicy)}</td>`).join('') + '</tr>';
             }
             continue;
         } else if (inTable) {
@@ -235,7 +248,7 @@ function markdownToHtml(md: string): string {
         if (ulMatch) {
             flushBlockquote(); flushTable();
             if (inList !== 'ul') { if (inList) flushList(); html += '<ul style="margin:6px 0;padding-left:24px">'; inList = 'ul'; }
-            html += `<li style="margin:2px 0">${renderInline(ulMatch[2])}</li>`;
+            html += `<li style="margin:2px 0">${renderInline(ulMatch[2], imagePolicy)}</li>`;
             continue;
         }
 
@@ -244,13 +257,13 @@ function markdownToHtml(md: string): string {
         if (olMatch) {
             flushBlockquote(); flushTable();
             if (inList !== 'ol') { if (inList) flushList(); html += '<ol style="margin:6px 0;padding-left:24px">'; inList = 'ol'; }
-            html += `<li style="margin:2px 0">${renderInline(olMatch[2])}</li>`;
+            html += `<li style="margin:2px 0">${renderInline(olMatch[2], imagePolicy)}</li>`;
             continue;
         }
 
         // Regular paragraph
         flushList(); flushBlockquote(); flushTable();
-        html += `<p style="margin:4px 0;line-height:1.7">${renderInline(line)}</p>`;
+        html += `<p style="margin:4px 0;line-height:1.7">${renderInline(line, imagePolicy)}</p>`;
     }
 
     // Close any open structures
@@ -267,12 +280,25 @@ interface MarkdownRendererProps {
     style?: React.CSSProperties;
     className?: string;
     imagePreviewMode?: 'desktop' | 'mobile';
+    allowImageDownload?: boolean;
+    protectImages?: boolean;
     /** Return true when the caller handled the link and native navigation should be prevented. */
     onLinkClick?: (href: string) => boolean;
 }
 
-export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, style, className, imagePreviewMode = 'desktop', onLinkClick }: MarkdownRendererProps) {
-    const html = useMemo(() => markdownToHtml(content), [content]);
+export const MarkdownRenderer = React.memo(function MarkdownRenderer({
+    content,
+    style,
+    className,
+    imagePreviewMode = 'desktop',
+    allowImageDownload = true,
+    protectImages = false,
+    onLinkClick,
+}: MarkdownRendererProps) {
+    const html = useMemo(() => markdownToHtml(content, {
+        allowDownload: allowImageDownload,
+        protectImages,
+    }), [allowImageDownload, content, protectImages]);
     const toast = useToast();
     const [preview, setPreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
 
@@ -336,6 +362,8 @@ export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, 
                 images={preview?.images || []}
                 index={preview?.index || 0}
                 mode={imagePreviewMode}
+                allowDownload={allowImageDownload}
+                protectImages={protectImages}
                 onClose={() => setPreview(null)}
                 onIndexChange={(index) => setPreview(prev => prev ? { ...prev, index } : prev)}
             />

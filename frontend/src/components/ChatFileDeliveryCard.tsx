@@ -26,6 +26,7 @@ export default function ChatFileDeliveryCard({
     const downloadUrl = agentId ? fileApi.downloadUrl(agentId, delivery.path) : '';
     const previewUrl = agentId ? fileApi.downloadUrl(agentId, delivery.path, { inline: true }) : '';
     const isImage = isImageDelivery(delivery);
+    const protectImage = mode === 'h5' && isImage;
     const details = [
         delivery.size !== undefined ? formatFileSize(delivery.size) : '',
         delivery.mimeType || '',
@@ -54,7 +55,12 @@ export default function ChatFileDeliveryCard({
                         onClick={openPreview}
                         aria-label="预览图片"
                     >
-                        <img src={previewUrl} alt={delivery.filename} loading="lazy" />
+                        <img
+                            src={previewUrl}
+                            alt={delivery.filename}
+                            loading="lazy"
+                            draggable={!protectImage}
+                        />
                     </button>
                 ) : (
                     <div className="chat-file-delivery__thumb" aria-hidden="true">
@@ -65,7 +71,7 @@ export default function ChatFileDeliveryCard({
                     <div className="chat-file-delivery__name" title={delivery.filename}>{delivery.filename}</div>
                     {details ? <div className="chat-file-delivery__details">{details}</div> : null}
                 </div>
-                {downloadUrl ? (
+                {downloadUrl && !protectImage ? (
                     <a
                         className="chat-file-delivery__download"
                         href={downloadUrl}

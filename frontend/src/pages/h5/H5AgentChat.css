@@ -401,7 +401,16 @@ body.h5-chat-active #root {
     gap: 10px;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
+    -webkit-user-select: none;
+    user-select: none;
     scroll-padding-bottom: calc(18px + var(--h5-safe-area-bottom));
+}
+
+.h5-chat__messages img {
+    -webkit-touch-callout: none;
+    -webkit-user-drag: none;
+    -webkit-user-select: none;
+    user-select: none;
 }
 
 .h5-chat__flow-row,

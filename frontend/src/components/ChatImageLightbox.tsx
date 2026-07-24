@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo } from 'react';
 import Lightbox from 'yet-another-react-lightbox';
 import Zoom from 'yet-another-react-lightbox/plugins/zoom';
 import Fullscreen from 'yet-another-react-lightbox/plugins/fullscreen';
@@ -14,6 +14,8 @@ type Props = {
     images: ChatPreviewImage[];
     index: number;
     mode: 'desktop' | 'mobile';
+    allowDownload?: boolean;
+    protectImages?: boolean;
     onClose: () => void;
     onIndexChange?: (index: number) => void;
 };
@@ -23,20 +25,56 @@ export default function ChatImageLightbox({
     images,
     index,
     mode,
+    allowDownload,
+    protectImages = false,
     onClose,
     onIndexChange,
 }: Props) {
+    const isMobile = mode === 'mobile';
+    const downloadEnabled = allowDownload ?? !isMobile;
     const slides = useMemo(() => images.map((image) => ({
         src: image.src,
         alt: image.alt || image.filename || 'image',
-        download: {
-            url: image.downloadUrl || image.src,
-            filename: image.filename || image.alt || 'image',
-        },
-    })), [images]);
+        ...(downloadEnabled ? {
+            download: {
+                url: image.downloadUrl || image.src,
+                filename: image.filename || image.alt || 'image',
+            },
+        } : {}),
+    })), [downloadEnabled, images]);
 
-    const isMobile = mode === 'mobile';
-    const toolbarButtons = (isMobile ? ['close'] : ['zoom', 'fullscreen', 'download', 'close']) as any;
+    useEffect(() => {
+        if (!open || !protectImages) return undefined;
+
+        const preventProtectedImageAction = (event: Event) => {
+            const target = event.target;
+            if (
+                target instanceof Element
+                && target.closest('.chat-image-lightbox--protected img')
+            ) {
+                event.preventDefault();
+            }
+        };
+
+        document.addEventListener('contextmenu', preventProtectedImageAction, true);
+        document.addEventListener('dragstart', preventProtectedImageAction, true);
+        return () => {
+            document.removeEventListener('contextmenu', preventProtectedImageAction, true);
+            document.removeEventListener('dragstart', preventProtectedImageAction, true);
+        };
+    }, [open, protectImages]);
+
+    const toolbarButtons = (
+        isMobile
+            ? [...(downloadEnabled ? ['download'] : []), 'close']
+            : ['zoom', 'fullscreen', ...(downloadEnabled ? ['download'] : []), 'close']
+    ) as any;
+    const plugins = [
+        Zoom,
+        ...(!isMobile ? [Fullscreen] : []),
+        ...(downloadEnabled ? [Download] : []),
+        Counter,
+    ];
 
     return (
         <Lightbox
@@ -44,8 +82,8 @@ export default function ChatImageLightbox({
             close={onClose}
             slides={slides}
             index={Math.min(Math.max(index, 0), Math.max(0, slides.length - 1))}
-            plugins={isMobile ? [Zoom, Counter] : [Zoom, Fullscreen, Download, Counter]}
-            className={`chat-image-lightbox chat-image-lightbox--${mode}`}
+            plugins={plugins}
+            className={`chat-image-lightbox chat-image-lightbox--${mode}${protectImages ? ' chat-image-lightbox--protected' : ''}`}
             toolbar={{
                 buttons: toolbarButtons,
             }}
