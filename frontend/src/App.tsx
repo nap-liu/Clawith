@@ -4,6 +4,7 @@ import { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef } from 're
 import { useTranslation } from 'react-i18next';
 import { authApi } from './services/api';
 import { applyDocumentTheme, readSavedTheme } from './utils/themeMode';
+import PlatformWatermark from './components/PlatformWatermark';
 
 const Login = lazy(() => import('./pages/Login'));
 const ForgotPassword = lazy(() => import('./pages/ForgotPassword'));
@@ -281,6 +282,7 @@ export default function App() {
 
     return (
         <>
+            <PlatformWatermark />
             {!isH5Route && <NotificationBar />}
             <Suspense fallback={<div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--text-tertiary)' }}>加载中...</div>}>
             <Routes>

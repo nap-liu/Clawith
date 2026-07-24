@@ -5,6 +5,7 @@ export interface User {
     username: string;
     email: string;
     display_name: string;
+    primary_mobile?: string | null;
     avatar_url?: string;
     role: 'platform_admin' | 'org_admin' | 'agent_admin' | 'member';
     is_platform_admin?: boolean;
