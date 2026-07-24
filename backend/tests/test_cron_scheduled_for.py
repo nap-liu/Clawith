@@ -1,0 +1,342 @@
+"""Regression coverage for timezone-aware cron execution identity."""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
+
+from app.database import async_session, engine
+from app.models.agent import Agent
+from app.models.tenant import Tenant
+from app.models.trigger import AgentTrigger
+from app.models.trigger_execution import TriggerExecution
+from app.models.user import Identity, User
+from app.services.trigger_runtime.cron_schedule import (
+    compute_next_cron_occurrence,
+    compute_next_trigger_cron_occurrence,
+    format_cron_timing_context,
+)
+from app.services.trigger_runtime.dispatch import enqueue_due_trigger
+from app.services.trigger_runtime.executions import build_execution_runtime_trigger
+from app.services.trigger_runtime.keys import build_scheduled_execution_key
+from app.services.trigger_runtime.queue import enqueue_trigger_execution
+
+
+@pytest.fixture(autouse=True)
+async def _dispose_engine():
+    await engine.dispose()
+    yield
+    await engine.dispose()
+
+
+def _cron_trigger(
+    *,
+    trigger_id: uuid.UUID | None = None,
+    agent_id: uuid.UUID | None = None,
+    config: dict | None = None,
+    created_at: datetime | None = None,
+    last_fired_at: datetime | None = None,
+) -> AgentTrigger:
+    return AgentTrigger(
+        id=trigger_id or uuid.uuid4(),
+        agent_id=agent_id or uuid.uuid4(),
+        name=f"cron-{uuid.uuid4().hex[:8]}",
+        type="cron",
+        config=config or {"expr": "0 18 * * *", "timezone": "Asia/Shanghai"},
+        reason="scheduled work",
+        is_enabled=True,
+        fire_count=0,
+        cooldown_seconds=60,
+        created_at=created_at or datetime(2026, 7, 22, 1, 39, 44, tzinfo=timezone.utc),
+        last_fired_at=last_fired_at,
+    )
+
+
+def test_consecutive_shanghai_occurrences_have_distinct_canonical_keys():
+    trigger = _cron_trigger()
+    first = compute_next_cron_occurrence(
+        expr="0 18 * * *",
+        base=trigger.created_at,
+        timezone_name="Asia/Shanghai",
+    )
+    first_key = build_scheduled_execution_key(
+        trigger,
+        first.scheduled_for,
+        scheduled_for=first.scheduled_for,
+    )
+
+    trigger.last_fired_at = datetime(2026, 7, 22, 10, 0, 12, tzinfo=timezone.utc)
+    second = compute_next_cron_occurrence(
+        expr="0 18 * * *",
+        base=trigger.last_fired_at,
+        timezone_name="Asia/Shanghai",
+    )
+    second_key = build_scheduled_execution_key(
+        trigger,
+        second.scheduled_for,
+        scheduled_for=second.scheduled_for,
+    )
+
+    assert first.scheduled_for == datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+    assert second.scheduled_for == datetime(2026, 7, 23, 10, 0, tzinfo=timezone.utc)
+    assert first_key.endswith("2026-07-22T10:00:00+00:00")
+    assert second_key.endswith("2026-07-23T10:00:00+00:00")
+    assert first_key != second_key
+
+
+def test_same_occurrence_has_stable_key_and_cron_requires_it():
+    trigger = _cron_trigger()
+    scheduled_for = datetime(2026, 7, 23, 10, 0, tzinfo=timezone.utc)
+
+    first = build_scheduled_execution_key(
+        trigger,
+        scheduled_for,
+        scheduled_for=scheduled_for,
+    )
+    second = build_scheduled_execution_key(
+        trigger,
+        scheduled_for + timedelta(seconds=15),
+        scheduled_for=scheduled_for,
+    )
+
+    assert first == second
+    with pytest.raises(ValueError, match="require scheduled_for"):
+        build_scheduled_execution_key(trigger, scheduled_for)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        build_scheduled_execution_key(
+            trigger,
+            scheduled_for,
+            scheduled_for=scheduled_for.replace(tzinfo=None),
+        )
+
+
+async def test_explicit_trigger_timezone_wins_without_agent_lookup():
+    trigger = _cron_trigger(
+        config={"expr": "0 18 * * *", "timezone": "Asia/Tokyo"},
+    )
+    with patch(
+        "app.services.trigger_runtime.cron_schedule.get_agent_timezone",
+        new_callable=AsyncMock,
+    ) as timezone_lookup:
+        occurrence = await compute_next_trigger_cron_occurrence(trigger)
+
+    timezone_lookup.assert_not_awaited()
+    assert occurrence.timezone_name == "Asia/Tokyo"
+    assert occurrence.scheduled_for == datetime(2026, 7, 22, 9, 0, tzinfo=timezone.utc)
+
+
+def test_invalid_timezone_falls_back_to_utc():
+    occurrence = compute_next_cron_occurrence(
+        expr="0 18 * * *",
+        base=datetime(2026, 7, 22, 1, 39, tzinfo=timezone.utc),
+        timezone_name="Invalid/Timezone",
+    )
+
+    assert occurrence.timezone_name == "UTC"
+    assert occurrence.scheduled_for == datetime(2026, 7, 22, 18, 0, tzinfo=timezone.utc)
+    assert occurrence.local_scheduled_for.utcoffset() == timedelta(0)
+
+
+def test_dst_occurrence_is_aware_and_stable():
+    occurrence = compute_next_cron_occurrence(
+        expr="30 2 * * *",
+        base=datetime(2026, 3, 7, 8, 0, tzinfo=timezone.utc),
+        timezone_name="America/New_York",
+    )
+
+    assert occurrence.scheduled_for.tzinfo is timezone.utc
+    assert occurrence.local_scheduled_for.tzinfo is not None
+    repeated = compute_next_cron_occurrence(
+        expr="30 2 * * *",
+        base=datetime(2026, 3, 7, 8, 0, tzinfo=timezone.utc),
+        timezone_name="America/New_York",
+    )
+    assert repeated == occurrence
+
+
+def test_timing_context_is_automatic_and_business_neutral():
+    context = format_cron_timing_context(
+        {
+            "_scheduled_for": "2026-07-23T10:00:00+00:00",
+            "_scheduled_timezone": "Asia/Shanghai",
+        },
+        datetime(2026, 7, 23, 10, 15, tzinfo=timezone.utc),
+    )
+
+    assert "2026-07-23T18:00:00+08:00" in context
+    assert "Current execution time" in context
+    assert "Delay seconds: 900" in context
+    assert "anchor relative calendar terms" in context
+    assert "scheduled occurrence" in context
+    assert "current execution time for live state" in context
+    assert "Explicit time ranges in the task take precedence" in context
+    assert "complaint" not in context.lower()
+    assert "24 hours" not in context.lower()
+
+
+async def test_non_workday_uses_scheduled_date_for_delayed_run():
+    from app.services.trigger_daemon import _evaluate_trigger
+
+    trigger = _cron_trigger(
+        last_fired_at=datetime(2026, 7, 22, 10, 0, 12, tzinfo=timezone.utc),
+    )
+    occurrence = await compute_next_trigger_cron_occurrence(trigger)
+    delayed_now = datetime(2026, 7, 24, 1, 0, tzinfo=timezone.utc)
+
+    with (
+        patch(
+            "app.services.trigger_daemon._should_skip_non_workday",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as should_skip,
+        patch(
+            "app.services.trigger_daemon._mark_trigger_skipped",
+            new_callable=AsyncMock,
+        ) as mark_skipped,
+    ):
+        assert not await _evaluate_trigger(
+            trigger,
+            delayed_now,
+            cron_occurrence=occurrence,
+        )
+
+    scheduled_local = should_skip.await_args.args[1]
+    assert scheduled_local.isoformat() == "2026-07-23T18:00:00+08:00"
+    mark_skipped.assert_awaited_once_with(trigger.id, delayed_now)
+
+
+async def _seed_persisted_cron() -> tuple[AgentTrigger, dict[str, uuid.UUID]]:
+    suffix = uuid.uuid4().hex[:10]
+    async with async_session() as db:
+        tenant = Tenant(
+            name=f"Cron Tenant {suffix}",
+            slug=f"cron-{suffix}",
+            timezone="Asia/Shanghai",
+        )
+        db.add(tenant)
+        await db.flush()
+        identity = Identity(
+            username=f"cron_{suffix}",
+            email=f"cron_{suffix}@example.com",
+            password_hash="x",
+        )
+        db.add(identity)
+        await db.flush()
+        user = User(
+            identity_id=identity.id,
+            display_name=f"Cron User {suffix}",
+            role="member",
+            is_active=True,
+            tenant_id=tenant.id,
+        )
+        db.add(user)
+        await db.flush()
+        agent = Agent(
+            name=f"Cron Agent {suffix}",
+            creator_id=user.id,
+            tenant_id=tenant.id,
+            agent_type="native",
+            status="idle",
+        )
+        db.add(agent)
+        await db.flush()
+        trigger = _cron_trigger(
+            agent_id=agent.id,
+            config={"expr": "0 18 * * *"},
+            created_at=datetime(2026, 7, 22, 1, 39, 44, tzinfo=timezone.utc),
+        )
+        db.add(trigger)
+        await db.commit()
+        await db.refresh(trigger)
+        db.expunge(trigger)
+        return trigger, {
+            "tenant": tenant.id,
+            "identity": identity.id,
+            "user": user.id,
+            "agent": agent.id,
+        }
+
+
+async def _cleanup_seeded_cron(ids: dict[str, uuid.UUID]) -> None:
+    async with async_session() as db:
+        await db.execute(delete(Agent).where(Agent.id == ids["agent"]))
+        await db.execute(delete(User).where(User.id == ids["user"]))
+        await db.execute(delete(Identity).where(Identity.id == ids["identity"]))
+        await db.execute(delete(Tenant).where(Tenant.id == ids["tenant"]))
+        await db.commit()
+
+
+async def test_concurrent_enqueue_uses_schedule_for_record_key_and_context():
+    trigger, ids = await _seed_persisted_cron()
+    occurrence = await compute_next_trigger_cron_occurrence(trigger)
+    scheduled_for = occurrence.scheduled_for
+    observed_at = scheduled_for + timedelta(hours=15)
+    try:
+        assert occurrence.timezone_name == "Asia/Shanghai"
+        assert scheduled_for == datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc)
+        await asyncio.gather(
+            enqueue_due_trigger(
+                trigger,
+                observed_at,
+                scheduled_for=scheduled_for,
+                scheduled_timezone=occurrence.timezone_name,
+            ),
+            enqueue_due_trigger(
+                trigger,
+                observed_at + timedelta(seconds=15),
+                scheduled_for=scheduled_for,
+                scheduled_timezone=occurrence.timezone_name,
+            ),
+        )
+
+        async with async_session() as db:
+            executions = list(
+                (
+                    await db.execute(
+                        select(TriggerExecution).where(
+                            TriggerExecution.trigger_id == trigger.id
+                        )
+                    )
+                ).scalars()
+            )
+
+        assert len(executions) == 1
+        execution = executions[0]
+        assert execution.scheduled_at == scheduled_for
+        assert execution.idempotency_key.endswith("2026-07-22T10:00:00+00:00")
+        assert execution.payload["_scheduled_for"] == "2026-07-22T10:00:00+00:00"
+        assert execution.payload["_scheduled_timezone"] == "Asia/Shanghai"
+        runtime_trigger = build_execution_runtime_trigger(trigger, execution)
+        assert runtime_trigger.config["_scheduled_for"] == "2026-07-22T10:00:00+00:00"
+        assert "Schedule timing" in format_cron_timing_context(
+            runtime_trigger.config,
+            observed_at,
+        )
+    finally:
+        await _cleanup_seeded_cron(ids)
+
+
+async def test_unrelated_integrity_error_is_not_treated_as_deduplication():
+    trigger, ids = await _seed_persisted_cron()
+    invalid_agent_trigger = _cron_trigger(
+        trigger_id=trigger.id,
+        agent_id=uuid.uuid4(),
+    )
+    try:
+        async with async_session() as db:
+            with pytest.raises(IntegrityError):
+                await enqueue_trigger_execution(
+                    db,
+                    trigger=invalid_agent_trigger,
+                    source="cron",
+                    idempotency_key=f"bad-fk-{uuid.uuid4()}",
+                    scheduled_at=datetime.now(timezone.utc),
+                )
+    finally:
+        await _cleanup_seeded_cron(ids)

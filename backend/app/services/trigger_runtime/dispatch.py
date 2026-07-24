@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
@@ -50,13 +50,21 @@ def runtime_execution_payload(trigger: AgentTrigger) -> dict:
         "_set_trigger_context",
         "_trigger_context",
         "_a2a_session_id",
+        "_scheduled_for",
+        "_scheduled_timezone",
     ):
         if key in cfg and cfg.get(key) is not None:
             payload[key] = cfg.get(key)
     return payload
 
 
-async def enqueue_due_trigger(trigger: AgentTrigger, now: datetime) -> None:
+async def enqueue_due_trigger(
+    trigger: AgentTrigger,
+    now: datetime,
+    *,
+    scheduled_for: datetime | None = None,
+    scheduled_timezone: str | None = None,
+) -> None:
     async with async_session() as db:
         cfg = trigger.config or {}
         webhook_mode = (
@@ -138,12 +146,34 @@ async def enqueue_due_trigger(trigger: AgentTrigger, now: datetime) -> None:
                 await db.rollback()
             return
 
+        payload_obj = runtime_execution_payload(trigger)
+        execution_scheduled_at = None
+        if trigger.type == "cron":
+            if scheduled_for is None:
+                raise ValueError("cron enqueue requires scheduled_for")
+            if scheduled_for.tzinfo is None:
+                raise ValueError("scheduled_for must be timezone-aware")
+            if not scheduled_timezone:
+                raise ValueError("cron enqueue requires scheduled_timezone")
+            scheduled_for = scheduled_for.astimezone(timezone.utc).replace(microsecond=0)
+            execution_scheduled_at = scheduled_for
+            payload_obj = {
+                **payload_obj,
+                "_scheduled_for": scheduled_for.isoformat(),
+                "_scheduled_timezone": scheduled_timezone,
+            }
+
         await enqueue_trigger_execution(
             db,
             trigger=trigger,
             source=trigger.type,
-            idempotency_key=build_scheduled_execution_key(trigger, now),
-            payload_obj=runtime_execution_payload(trigger),
+            idempotency_key=build_scheduled_execution_key(
+                trigger,
+                now,
+                scheduled_for=scheduled_for,
+            ),
+            payload_obj=payload_obj,
+            scheduled_at=execution_scheduled_at,
         )
 
 

@@ -12,6 +12,7 @@ from sqlalchemy import select
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
+from app.services.trigger_runtime.cron_schedule import format_cron_timing_context
 from app.services.trigger_runtime import (
     mark_trigger_executions_completed,
     mark_trigger_executions_failed,
@@ -122,6 +123,7 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
 
             context_parts = []
             trigger_names = []
+            context_executed_at = datetime.now(timezone.utc)
             for t in triggers:
                 part = f"触发器：{t.name} ({t.type})\n原因：{t.reason}"
                 if t.name == "daily_okr_collection":
@@ -145,6 +147,8 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                 if t.focus_ref:
                     part += f"\n关联 Focus：{t.focus_ref}"
                 cfg = t.config or {}
+                if t.type == "cron":
+                    part += format_cron_timing_context(cfg, context_executed_at)
                 if t.type == "on_message" and cfg.get("_matched_message"):
                     part += f"\n收到来自 {cfg.get('_matched_from', '?')} 的消息：\n\"{cfg['_matched_message'][:500]}\""
                 if t.type == "on_message" and cfg.get("okr_member_id") and cfg.get("okr_report_date"):

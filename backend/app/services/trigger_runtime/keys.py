@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timedelta, timezone
 
-from croniter import croniter
-
 from app.models.trigger import AgentTrigger
 
 
-def build_scheduled_execution_key(trigger: AgentTrigger, now: datetime) -> str:
+def build_scheduled_execution_key(
+    trigger: AgentTrigger,
+    now: datetime,
+    *,
+    scheduled_for: datetime | None = None,
+) -> str:
     """Build a deterministic idempotency key for non-webhook trigger runs."""
     cfg = trigger.config or {}
     trigger_type = trigger.type
@@ -25,13 +28,12 @@ def build_scheduled_execution_key(trigger: AgentTrigger, now: datetime) -> str:
         return f"interval:{trigger.id}:{due_at.astimezone(timezone.utc).isoformat()}"
 
     if trigger_type == "cron":
-        expr = cfg.get("expr", "* * * * *")
-        base = trigger.last_fired_at or trigger.created_at
-        cron = croniter(expr, base)
-        due_at = cron.get_next(datetime)
-        if due_at.tzinfo is None:
-            due_at = due_at.replace(tzinfo=timezone.utc)
-        return f"cron:{trigger.id}:{due_at.astimezone(timezone.utc).isoformat()}"
+        if scheduled_for is None:
+            raise ValueError("cron execution keys require scheduled_for")
+        if scheduled_for.tzinfo is None:
+            raise ValueError("scheduled_for must be timezone-aware")
+        canonical = scheduled_for.astimezone(timezone.utc).replace(microsecond=0)
+        return f"cron:{trigger.id}:{canonical.isoformat()}"
 
     if trigger_type == "on_message":
         matched_message_id = str(cfg.get("_matched_message_id") or "").strip()

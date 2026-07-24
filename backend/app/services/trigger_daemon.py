@@ -12,7 +12,6 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
-from croniter import croniter
 from loguru import logger
 from sqlalchemy import select
 
@@ -35,6 +34,11 @@ from app.services.trigger_runtime import (
     enqueue_due_trigger,
 )
 from app.services.trigger_runtime.executions import renew_trigger_execution_leases
+from app.services.trigger_runtime.cron_schedule import (
+    CronOccurrence,
+    compute_next_trigger_cron_occurrence,
+    format_cron_timing_context,
+)
 
 TICK_INTERVAL = 15  # seconds
 DEDUP_WINDOW = 30   # seconds — same agent won't be invoked twice within this window
@@ -80,8 +84,19 @@ async def _mark_trigger_fired(trigger_id: uuid.UUID, now: datetime) -> None:
     await mark_trigger_fired_runtime(trigger_id, now)
 
 
-async def _handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> bool:
-    return await handle_okr_report_trigger_runtime(trigger, now)
+async def _handle_okr_report_trigger(
+    trigger: AgentTrigger,
+    now: datetime,
+    *,
+    scheduled_for: datetime | None = None,
+    local_scheduled_for: datetime | None = None,
+) -> bool:
+    return await handle_okr_report_trigger_runtime(
+        trigger,
+        now,
+        scheduled_for=scheduled_for,
+        local_scheduled_for=local_scheduled_for,
+    )
 
 
 async def _handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) -> bool:
@@ -116,49 +131,34 @@ def _is_private_url(url: str) -> bool:
         return True  # Block on any parsing error
 
 
-async def _evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
+async def _evaluate_trigger(
+    trigger: AgentTrigger,
+    now: datetime,
+    *,
+    cron_occurrence: CronOccurrence | None = None,
+) -> bool:
     """Return True if this trigger should fire right now."""
-    if not trigger.is_enabled:
-        return False
-    if trigger.expires_at and now >= trigger.expires_at:
-        # Auto-disable expired triggers
-        return False
-    if trigger.max_fires is not None and trigger.fire_count >= trigger.max_fires:
+    if not _is_trigger_eligible(trigger, now):
         return False
 
     cfg = trigger.config or {}
     t = trigger.type
     webhook_mode = cfg.get("webhook_mode", "legacy") if t == "webhook" else None
 
-    # Cooldown check — queue/merge webhook 绕过(串行锁保证不并发); 其余 type 行为不变
-    if trigger.last_fired_at and webhook_mode not in ("queue", "merge"):
-        cooldown = timedelta(seconds=trigger.cooldown_seconds)
-        if (now - trigger.last_fired_at) < cooldown:
-            return False
-
     if t == "cron":
         expr = cfg.get("expr", "* * * * *")
-        base = trigger.last_fired_at or trigger.created_at
         try:
-            # Resolve timezone: trigger config → agent → tenant → UTC
-            tz_name = cfg.get("timezone")
-            if not tz_name:
-                from app.services.timezone_utils import get_agent_timezone
-                tz_name = await get_agent_timezone(trigger.agent_id)
-            from zoneinfo import ZoneInfo
-            try:
-                tz = ZoneInfo(tz_name)
-            except (KeyError, Exception):
-                tz = ZoneInfo("UTC")
-            # Evaluate cron in agent's timezone
-            local_now = now.astimezone(tz)
-            local_base = base.astimezone(tz) if base.tzinfo else base.replace(tzinfo=tz)
-            cron = croniter(expr, local_base)
-            next_run = cron.get_next(datetime)
-            if local_now >= next_run:
-                if await _should_skip_non_workday(trigger, local_now):
+            occurrence = cron_occurrence or await compute_next_trigger_cron_occurrence(trigger)
+            if now >= occurrence.scheduled_for:
+                if await _should_skip_non_workday(
+                    trigger,
+                    occurrence.local_scheduled_for,
+                ):
                     await _mark_trigger_skipped(trigger.id, now)
-                    logger.info(f"[Trigger] Skipped {trigger.name} on non-workday {local_now.date()}")
+                    logger.info(
+                        f"[Trigger] Skipped {trigger.name} on non-workday "
+                        f"{occurrence.local_scheduled_for.date()}"
+                    )
                     return False
                 return True
             return False
@@ -211,6 +211,31 @@ async def _evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
         return len(cfg.get("_webhook_queue") or []) > 0
 
     return False
+
+
+def _is_trigger_eligible(trigger: AgentTrigger, now: datetime) -> bool:
+    """Check common trigger guards without I/O."""
+    if not trigger.is_enabled:
+        return False
+    if trigger.expires_at and now >= trigger.expires_at:
+        # Auto-disable expired triggers
+        return False
+    if trigger.max_fires is not None and trigger.fire_count >= trigger.max_fires:
+        return False
+
+    cfg = trigger.config or {}
+    webhook_mode = (
+        cfg.get("webhook_mode", "legacy")
+        if trigger.type == "webhook"
+        else None
+    )
+
+    # Cooldown check — queue/merge webhook 绕过(串行锁保证不并发); 其余 type 行为不变
+    if trigger.last_fired_at and webhook_mode not in ("queue", "merge"):
+        cooldown = timedelta(seconds=trigger.cooldown_seconds)
+        if (now - trigger.last_fired_at) < cooldown:
+            return False
+    return True
 
 
 async def _poll_check(trigger: AgentTrigger) -> bool:
@@ -1013,6 +1038,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             # autonomous wakeups behave consistently across UI locales.
             context_parts = []
             trigger_names = []
+            context_executed_at = datetime.now(timezone.utc)
             for t in triggers:
                 part = f"Trigger: {t.name} ({t.type})\nReason: {t.reason}"
                 if t.name == "daily_okr_collection":
@@ -1043,6 +1069,8 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                     part += f"\nRelated Focus: {t.focus_ref}"
                 # Include matched message for on_message triggers
                 cfg = t.config or {}
+                if t.type == "cron":
+                    part += format_cron_timing_context(cfg, context_executed_at)
                 if t.type == "on_message" and cfg.get("_matched_message"):
                     part += f"\nMatched message from {cfg.get('_matched_from', '?')}:\n\"{cfg['_matched_message'][:500]}\""
                 if t.type == "on_message" and cfg.get("okr_member_id") and cfg.get("okr_report_date"):
@@ -1476,8 +1504,30 @@ async def _tick():
             continue
 
         try:
-            if await _evaluate_trigger(trigger, now):
-                handled = await _handle_okr_report_trigger(trigger, now)
+            if not _is_trigger_eligible(trigger, now):
+                continue
+            cron_occurrence = None
+            if trigger.type == "cron":
+                cron_occurrence = await compute_next_trigger_cron_occurrence(trigger)
+            if await _evaluate_trigger(
+                trigger,
+                now,
+                cron_occurrence=cron_occurrence,
+            ):
+                handled = await _handle_okr_report_trigger(
+                    trigger,
+                    now,
+                    scheduled_for=(
+                        cron_occurrence.scheduled_for
+                        if cron_occurrence is not None
+                        else None
+                    ),
+                    local_scheduled_for=(
+                        cron_occurrence.local_scheduled_for
+                        if cron_occurrence is not None
+                        else None
+                    ),
+                )
                 if not handled:
                     handled = await _handle_okr_collection_trigger(trigger, now)
                 if not handled:
@@ -1503,7 +1553,20 @@ async def _tick():
                             continue
                         recent.append(now)
                         _on_msg_fire_log[trigger.agent_id] = recent
-                    await enqueue_due_trigger(trigger, now)
+                    await enqueue_due_trigger(
+                        trigger,
+                        now,
+                        scheduled_for=(
+                            cron_occurrence.scheduled_for
+                            if cron_occurrence is not None
+                            else None
+                        ),
+                        scheduled_timezone=(
+                            cron_occurrence.timezone_name
+                            if cron_occurrence is not None
+                            else None
+                        ),
+                    )
         except Exception as e:
             logger.warning(f"Error evaluating trigger {trigger.name}: {e}")
 

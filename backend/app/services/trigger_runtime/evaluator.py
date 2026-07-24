@@ -8,13 +8,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
-from croniter import croniter
 from loguru import logger
 from sqlalchemy import and_, func, or_, select
 
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
+from app.services.trigger_runtime.cron_schedule import (
+    compute_next_trigger_cron_occurrence,
+)
 
 MIN_POLL_INTERVAL_MINUTES = 5
 
@@ -570,7 +572,13 @@ async def mark_trigger_fired(trigger_id: uuid.UUID, now: datetime) -> None:
         logger.warning(f"Failed to mark fired trigger {trigger_id}: {e}")
 
 
-async def handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> bool:
+async def handle_okr_report_trigger(
+    trigger: AgentTrigger,
+    now: datetime,
+    *,
+    scheduled_for: datetime | None = None,
+    local_scheduled_for: datetime | None = None,
+) -> bool:
     if trigger.name not in {"daily_okr_report", "weekly_okr_report", "monthly_okr_report"}:
         return False
 
@@ -594,12 +602,17 @@ async def handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> boo
         if not settings or not settings.enabled:
             return True
 
-    tz_name = await get_agent_timezone(trigger.agent_id)
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
-    local_today = now.astimezone(tz).date()
+    if local_scheduled_for is not None:
+        if local_scheduled_for.tzinfo is None:
+            raise ValueError("local_scheduled_for must be timezone-aware")
+        local_today = local_scheduled_for.date()
+    else:
+        tz_name = await get_agent_timezone(trigger.agent_id)
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        local_today = (scheduled_for or now).astimezone(tz).date()
 
     if trigger.name == "daily_okr_report":
         await generate_company_daily_report(tenant_id, local_today - timedelta(days=1))
@@ -686,25 +699,18 @@ async def evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
 
     if t == "cron":
         expr = cfg.get("expr", "* * * * *")
-        base = trigger.last_fired_at or trigger.created_at
         try:
-            tz_name = cfg.get("timezone")
-            if not tz_name:
-                from app.services.timezone_utils import get_agent_timezone
-                tz_name = await get_agent_timezone(trigger.agent_id)
-            from zoneinfo import ZoneInfo
-            try:
-                tz = ZoneInfo(tz_name)
-            except (KeyError, Exception):
-                tz = ZoneInfo("UTC")
-            local_now = now.astimezone(tz)
-            local_base = base.astimezone(tz) if base.tzinfo else base.replace(tzinfo=tz)
-            cron = croniter(expr, local_base)
-            next_run = cron.get_next(datetime)
-            if local_now >= next_run:
-                if await should_skip_non_workday(trigger, local_now):
+            occurrence = await compute_next_trigger_cron_occurrence(trigger)
+            if now >= occurrence.scheduled_for:
+                if await should_skip_non_workday(
+                    trigger,
+                    occurrence.local_scheduled_for,
+                ):
                     await mark_trigger_skipped(trigger.id, now)
-                    logger.info(f"[Trigger] Skipped {trigger.name} on non-workday {local_now.date()}")
+                    logger.info(
+                        f"[Trigger] Skipped {trigger.name} on non-workday "
+                        f"{occurrence.local_scheduled_for.date()}"
+                    )
                     return False
                 return True
             return False
