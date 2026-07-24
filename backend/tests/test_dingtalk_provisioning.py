@@ -328,7 +328,11 @@ async def test_force_begin_failure_keeps_existing_force_flow_active(db_session):
 
 
 @pytest.mark.asyncio
-async def test_non_reusable_flow_polls_final_success_before_issuing_new_link(db_session):
+@pytest.mark.parametrize("registration_status", ["SUCCESS", "APPROVING"])
+async def test_non_reusable_flow_polls_final_ready_credentials_before_issuing_new_link(
+    db_session,
+    registration_status,
+):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
     existing = DingTalkChannelProvisioningSession(
@@ -348,7 +352,7 @@ async def test_non_reusable_flow_polls_final_success_before_issuing_new_link(db_
     fake_client = FakeRegistrationClient(
         poll_responses=[
             {
-                "status": "SUCCESS",
+                "status": registration_status,
                 "client_id": "existing-success-key",
                 "client_secret": "existing-success-secret",
             }
@@ -427,13 +431,12 @@ async def test_poll_waiting_continues_past_observability_attempt_count_until_dea
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("registration_status", ["APPROVING", "PUBLISHING"])
-async def test_poll_dingtalk_application_build_states_keep_session_active(
+async def test_poll_dingtalk_publishing_with_credentials_keeps_session_active(
     db_session,
-    registration_status,
 ):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 23, 10, 0, tzinfo=UTC)
+    registration_status = "PUBLISHING"
     session = DingTalkChannelProvisioningSession(
         agent_id=agent.id,
         tenant_id=agent.tenant_id,
@@ -479,6 +482,131 @@ async def test_poll_dingtalk_application_build_states_keep_session_active(
     ).scalar_one_or_none()
     assert config is None
     assert "pending-client-secret" not in str(session.registration_result)
+
+
+@pytest.mark.asyncio
+async def test_poll_dingtalk_approving_with_complete_credentials_configures_channel(
+    db_session,
+):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 24, 3, 42, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="device-approving-ready",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(minutes=30),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=900,
+    )
+    db_session.add(session)
+    await db_session.flush()
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=FakeRegistrationClient(
+            poll_responses=[
+                {
+                    "status": "APPROVING",
+                    "client_id": "approving-client-id",
+                    "client_secret": "approving-client-secret",
+                    "agent_id": "4806241691",
+                    "message": "ok",
+                }
+            ]
+        ),
+        now=now,
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_CONFIGURED
+    assert session.next_poll_at is None
+    assert session.last_error is None
+    assert session.registration_result == {
+        "client_id": "approving-client-id",
+        "agent_id": "4806241691",
+        "last_poll_status": "APPROVING",
+        "completion_reason": "credentials_ready_while_approving",
+    }
+    assert "approving-client-secret" not in str(session.registration_result)
+    config = (
+        await db_session.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "dingtalk",
+            )
+        )
+    ).scalar_one()
+    assert config.app_id == "approving-client-id"
+    assert config.app_secret == "approving-client-secret"
+    assert config.is_configured is True
+    assert config.is_connected is False
+    assert config.extra_config["connection_mode"] == "websocket"
+    assert config.extra_config["agent_id"] == "4806241691"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "poll_response",
+    [
+        {"status": "APPROVING", "message": "ok"},
+        {
+            "status": "APPROVING",
+            "client_id": "partial-client-id",
+            "message": "ok",
+        },
+        {
+            "status": "APPROVING",
+            "client_secret": "partial-client-secret",
+            "message": "ok",
+        },
+    ],
+)
+async def test_poll_dingtalk_approving_without_complete_credentials_keeps_session_active(
+    db_session,
+    poll_response,
+):
+    _, user, agent = await _seed_digital_employee(db_session)
+    now = datetime(2026, 7, 24, 3, 42, tzinfo=UTC)
+    session = DingTalkChannelProvisioningSession(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        requested_by_user_id=user.id,
+        status=DINGTALK_PROVISIONING_STATUS_POLLING,
+        device_code="device-approving-incomplete",
+        authorization_url="https://auth.example",
+        expires_at=now + timedelta(minutes=30),
+        next_poll_at=now,
+        poll_interval_seconds=2,
+        max_poll_attempts=900,
+    )
+    db_session.add(session)
+    await db_session.flush()
+
+    await poll_dingtalk_provisioning_session(
+        db_session,
+        session,
+        registration_client=FakeRegistrationClient(poll_responses=[poll_response]),
+        now=now,
+    )
+
+    assert session.status == DINGTALK_PROVISIONING_STATUS_POLLING
+    assert session.next_poll_at == now + timedelta(seconds=2)
+    assert session.last_error is None
+    assert session.registration_result["last_poll_status"] == "APPROVING"
+    config = (
+        await db_session.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "dingtalk",
+            )
+        )
+    ).scalar_one_or_none()
+    assert config is None
+    assert "partial-client-secret" not in str(session.registration_result)
 
 
 @pytest.mark.asyncio
@@ -749,7 +877,11 @@ async def test_poll_transport_errors_retry_past_legacy_attempt_cap_until_deadlin
 
 
 @pytest.mark.asyncio
-async def test_poll_success_is_consumed_at_deadline_after_legacy_attempt_cap(db_session):
+@pytest.mark.parametrize("registration_status", ["SUCCESS", "APPROVING"])
+async def test_poll_ready_credentials_are_consumed_at_deadline_after_legacy_attempt_cap(
+    db_session,
+    registration_status,
+):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
     session = DingTalkChannelProvisioningSession(
@@ -771,7 +903,7 @@ async def test_poll_success_is_consumed_at_deadline_after_legacy_attempt_cap(db_
     fake_client = FakeRegistrationClient(
         poll_responses=[
             {
-                "status": "SUCCESS",
+                "status": registration_status,
                 "client_id": "late-client-id",
                 "client_secret": "late-client-secret",
             }
@@ -804,7 +936,17 @@ async def test_poll_success_is_consumed_at_deadline_after_legacy_attempt_cap(db_
 
 
 @pytest.mark.asyncio
-async def test_final_deadline_poll_waiting_expires_instead_of_rescheduling(db_session):
+@pytest.mark.parametrize(
+    "poll_response",
+    [
+        {"status": "WAITING"},
+        {"status": "APPROVING", "client_id": "partial-client-id"},
+    ],
+)
+async def test_final_deadline_poll_nonready_response_expires_instead_of_rescheduling(
+    db_session,
+    poll_response,
+):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
     session = DingTalkChannelProvisioningSession(
@@ -822,7 +964,7 @@ async def test_final_deadline_poll_waiting_expires_instead_of_rescheduling(db_se
     )
     db_session.add(session)
     await db_session.flush()
-    fake_client = FakeRegistrationClient(poll_responses=[{"status": "WAITING"}])
+    fake_client = FakeRegistrationClient(poll_responses=[poll_response])
 
     await poll_dingtalk_provisioning_session(
         db_session,
@@ -956,7 +1098,11 @@ async def test_poll_success_configures_channel_and_defers_stream_to_reconciler(d
 
 
 @pytest.mark.asyncio
-async def test_force_poll_success_overwrites_only_matching_baseline(db_session):
+@pytest.mark.parametrize("registration_status", ["SUCCESS", "APPROVING"])
+async def test_force_poll_ready_credentials_overwrite_only_matching_baseline(
+    db_session,
+    registration_status,
+):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
     old_key = "old-app-key"
@@ -995,7 +1141,7 @@ async def test_force_poll_success_overwrites_only_matching_baseline(db_session):
         registration_client=FakeRegistrationClient(
             poll_responses=[
                 {
-                    "status": "SUCCESS",
+                    "status": registration_status,
                     "client_id": "new-app-key",
                     "client_secret": "new-app-secret",
                 }
@@ -1011,7 +1157,11 @@ async def test_force_poll_success_overwrites_only_matching_baseline(db_session):
 
 
 @pytest.mark.asyncio
-async def test_force_poll_does_not_overwrite_configuration_changed_during_authorization(db_session):
+@pytest.mark.parametrize("registration_status", ["SUCCESS", "APPROVING"])
+async def test_force_poll_ready_credentials_do_not_overwrite_configuration_changed_during_authorization(
+    db_session,
+    registration_status,
+):
     _, user, agent = await _seed_digital_employee(db_session)
     now = datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
     config = ChannelConfig(
@@ -1049,7 +1199,7 @@ async def test_force_poll_does_not_overwrite_configuration_changed_during_author
         registration_client=FakeRegistrationClient(
             poll_responses=[
                 {
-                    "status": "SUCCESS",
+                    "status": registration_status,
                     "client_id": "new-app-key",
                     "client_secret": "new-app-secret",
                 }

@@ -806,7 +806,19 @@ async def poll_dingtalk_provisioning_session(
         return session.status
 
     status = _as_string(poll_result.get("status")).upper() or "FAIL"
-    if status not in DINGTALK_REGISTRATION_TERMINAL_STATUSES:
+    client_id = _as_string(poll_result.get("client_id"))
+    client_secret = _as_string(poll_result.get("client_secret"))
+    dingtalk_agent_id = _as_string(poll_result.get("agent_id"))
+    # DingTalk can return usable application credentials while its registration
+    # status still reads APPROVING. The credential pair is the readiness signal;
+    # incomplete APPROVING responses remain in the normal polling path.
+    credentials_ready_while_approving = (
+        status == "APPROVING" and bool(client_id) and bool(client_secret)
+    )
+    if (
+        status not in DINGTALK_REGISTRATION_TERMINAL_STATUSES
+        and not credentials_ready_while_approving
+    ):
         _merge_registration_result(session, last_poll_status=status)
         if deadline_reached:
             error = (
@@ -835,10 +847,7 @@ async def poll_dingtalk_provisioning_session(
             error=error if error.lower() != "ok" else "钉钉授权链接已过期",
         )
         return session.status
-    if status == "SUCCESS":
-        client_id = _as_string(poll_result.get("client_id"))
-        client_secret = _as_string(poll_result.get("client_secret"))
-        dingtalk_agent_id = _as_string(poll_result.get("agent_id"))
+    if status == "SUCCESS" or credentials_ready_while_approving:
         if not client_id or not client_secret:
             _stop_session(session, status=DINGTALK_PROVISIONING_STATUS_FAILED, error="钉钉授权成功但未返回完整凭据")
             return session.status
@@ -893,6 +902,13 @@ async def poll_dingtalk_provisioning_session(
             return session.status
 
         registration_values = {"client_id": client_id}
+        if credentials_ready_while_approving:
+            registration_values.update(
+                {
+                    "last_poll_status": status,
+                    "completion_reason": "credentials_ready_while_approving",
+                }
+            )
         if dingtalk_agent_id:
             registration_values["agent_id"] = dingtalk_agent_id
         _merge_registration_result(session, **registration_values)
