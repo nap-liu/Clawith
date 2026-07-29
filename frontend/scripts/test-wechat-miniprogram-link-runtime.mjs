@@ -189,6 +189,51 @@ await assert.rejects(
     /route failure/,
 );
 
+await assert.rejects(
+    openWechatMiniProgramWebview('https://timeout.example.com/path', {
+        currentHref: 'https://timeout.example.com/h5/agents/a1/chat',
+        targetWindow: {
+            __wxjs_environment: 'miniprogram',
+            wx: {
+                miniProgram: {
+                    navigateTo() {},
+                },
+            },
+        },
+        duplicateWindowMs: 0,
+        navigateTimeoutMs: 5,
+    }),
+    /Timed out navigating WeChat/,
+);
+
+const hiddenDocumentListeners = new Map();
+const hiddenDocument = {
+    visibilityState: 'visible',
+    addEventListener(type, listener) {
+        hiddenDocumentListeners.set(type, listener);
+    },
+    removeEventListener(type) {
+        hiddenDocumentListeners.delete(type);
+    },
+};
+const hiddenNavigation = openWechatMiniProgramWebview('https://hidden.example.com/path', {
+    currentHref: 'https://hidden.example.com/h5/agents/a1/chat',
+    targetWindow: {
+        __wxjs_environment: 'miniprogram',
+        wx: {
+            miniProgram: {
+                navigateTo() {},
+            },
+        },
+    },
+    targetDocument: hiddenDocument,
+    duplicateWindowMs: 0,
+    navigateTimeoutMs: 20,
+});
+hiddenDocument.visibilityState = 'hidden';
+hiddenDocumentListeners.get('visibilitychange')?.();
+await hiddenNavigation;
+
 let duplicateCalls = 0;
 const duplicateOptions = {
     currentHref: 'https://duplicate.example.com/h5/chat',

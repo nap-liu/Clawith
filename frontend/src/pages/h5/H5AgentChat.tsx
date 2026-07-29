@@ -59,6 +59,7 @@ import {
     type H5ContainerRuntime,
 } from '../../utils/h5ContainerRuntime';
 import { resolveH5LinkAction } from '../../utils/h5LinkPolicy';
+import { installH5PageLifecycle } from '../../utils/h5PageLifecycle';
 import { installThemeController, resolveThemeMode } from '../../utils/themeMode';
 import { insertSpeechTranscript, useSpeechInput } from '../../hooks/useSpeechInput';
 import {
@@ -363,6 +364,7 @@ export default function H5AgentChat() {
     const [llmModels, setLlmModels] = useState<ChatModelOption[]>([]);
     const [tenantDefaultModelId, setTenantDefaultModelId] = useState<string | null>(null);
     const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
+    const [pageResumeRevision, setPageResumeRevision] = useState(0);
     const [onboardingKickoffRequest, setOnboardingKickoffRequest] = useState<OnboardingKickoffRequest | null>(null);
     const [isWaiting, setIsWaiting] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
@@ -378,8 +380,13 @@ export default function H5AgentChat() {
     const wsRef = useRef<WebSocket | null>(null);
     const sessionIdRef = useRef<string | null>(initialSessionId);
     const reconnectTimerRef = useRef<number | null>(null);
+    const resumeReconnectTimerRef = useRef<number | null>(null);
+    const nativeNavigationFallbackTimerRef = useRef<number | null>(null);
+    const socketConnectTimerRef = useRef<number | null>(null);
     const reconnectAttemptRef = useRef(0);
-    const manualCloseRef = useRef(false);
+    const pageSuspendedRef = useRef(
+        typeof document !== 'undefined' && document.visibilityState === 'hidden',
+    );
     const unmountedRef = useRef(false);
     const messagesEndRef = useRef<HTMLDivElement | null>(null);
     const messagesScrollerRef = useRef<HTMLElement | null>(null);
@@ -461,6 +468,21 @@ export default function H5AgentChat() {
         };
     };
 
+    const clearSocketConnectTimer = useCallback(() => {
+        if (socketConnectTimerRef.current === null) return;
+        window.clearTimeout(socketConnectTimerRef.current);
+        socketConnectTimerRef.current = null;
+    }, []);
+
+    const closeCurrentSocket = useCallback(() => {
+        clearSocketConnectTimer();
+        const socket = wsRef.current;
+        wsRef.current = null;
+        if (socket && socket.readyState < WebSocket.CLOSING) {
+            socket.close();
+        }
+    }, [clearSocketConnectTimer]);
+
     useEffect(() => {
         document.body.classList.add('h5-chat-active');
         return () => document.body.classList.remove('h5-chat-active');
@@ -501,12 +523,15 @@ export default function H5AgentChat() {
         return () => {
             unmountedRef.current = true;
             if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
+            if (resumeReconnectTimerRef.current) window.clearTimeout(resumeReconnectTimerRef.current);
+            if (nativeNavigationFallbackTimerRef.current) {
+                window.clearTimeout(nativeNavigationFallbackTimerRef.current);
+            }
             uploadAbortRef.current.forEach((abort) => abort());
             uploadAbortRef.current.clear();
-            manualCloseRef.current = true;
-            wsRef.current?.close();
+            closeCurrentSocket();
         };
-    }, []);
+    }, [closeCurrentSocket]);
 
     useEffect(() => {
         if (!initialSessionId || sessionIdRef.current) return;
@@ -692,7 +717,13 @@ export default function H5AgentChat() {
     }, [agentId]);
 
     const scheduleReconnect = useCallback(() => {
-        if (manualCloseRef.current || unmountedRef.current || !token || !agentId) return;
+        if (
+            pageSuspendedRef.current
+            || unmountedRef.current
+            || !token
+            || !agentId
+            || document.visibilityState === 'hidden'
+        ) return;
         if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
         const attempt = reconnectAttemptRef.current;
         reconnectAttemptRef.current = attempt + 1;
@@ -705,6 +736,7 @@ export default function H5AgentChat() {
 
     const handleSocketMessage = useCallback((data: any, socket: WebSocket) => {
         if (data.type === 'connected' && data.session_id) {
+            clearSocketConnectTimer();
             const nextSessionId = String(data.session_id);
             sessionIdRef.current = nextSessionId;
             setSessionId(nextSessionId);
@@ -791,17 +823,22 @@ export default function H5AgentChat() {
                 created_at: new Date().toISOString(),
             }]);
         }
-    }, [loadHistory]);
+    }, [clearSocketConnectTimer, loadHistory]);
 
     const openSocket = useCallback((requestedSessionId?: string | null) => {
-        if (!agentId || !token) return;
+        if (
+            !agentId
+            || !token
+            || unmountedRef.current
+            || pageSuspendedRef.current
+            || document.visibilityState === 'hidden'
+        ) return;
 
-        if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
-            manualCloseRef.current = true;
-            wsRef.current.close();
-            manualCloseRef.current = false;
+        if (reconnectTimerRef.current) {
+            window.clearTimeout(reconnectTimerRef.current);
+            reconnectTimerRef.current = null;
         }
-
+        closeCurrentSocket();
         setConnectionStatus('connecting');
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const params = new URLSearchParams({
@@ -812,8 +849,23 @@ export default function H5AgentChat() {
         const effectiveSessionId = requestedSessionId || sessionIdRef.current;
         if (effectiveSessionId) params.set('session_id', effectiveSessionId);
 
-        const ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat/${agentId}?${params.toString()}`);
+        let ws: WebSocket;
+        try {
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat/${agentId}?${params.toString()}`);
+        } catch {
+            setConnectionStatus('disconnected');
+            scheduleReconnect();
+            return;
+        }
         wsRef.current = ws;
+        socketConnectTimerRef.current = window.setTimeout(() => {
+            if (wsRef.current !== ws) return;
+            wsRef.current = null;
+            socketConnectTimerRef.current = null;
+            if (ws.readyState < WebSocket.CLOSING) ws.close();
+            setConnectionStatus('disconnected');
+            scheduleReconnect();
+        }, 10000);
 
         ws.onopen = () => {
             reconnectAttemptRef.current = 0;
@@ -833,6 +885,7 @@ export default function H5AgentChat() {
 
         ws.onclose = () => {
             if (wsRef.current !== ws) return;
+            clearSocketConnectTimer();
             wsRef.current = null;
             setConnectionStatus('disconnected');
             setIsWaiting(false);
@@ -841,7 +894,15 @@ export default function H5AgentChat() {
             setOnboardingKickoffRequest(null);
             scheduleReconnect();
         };
-    }, [agentId, channel, handleSocketMessage, scheduleReconnect, token]);
+    }, [
+        agentId,
+        channel,
+        clearSocketConnectTimer,
+        closeCurrentSocket,
+        handleSocketMessage,
+        scheduleReconnect,
+        token,
+    ]);
 
     const openSocketRef = useRef(openSocket);
     useEffect(() => {
@@ -850,13 +911,92 @@ export default function H5AgentChat() {
 
     useEffect(() => {
         if (authStatus !== 'ready' || !agent || !token) return;
+        pageSuspendedRef.current = document.visibilityState === 'hidden';
         openSocket(initialSessionId);
-        return () => {
-            manualCloseRef.current = true;
-            wsRef.current?.close();
-            manualCloseRef.current = false;
-        };
-    }, [agent, authStatus, initialSessionId, openSocket, token]);
+        return closeCurrentSocket;
+    }, [agent, authStatus, closeCurrentSocket, initialSessionId, openSocket, token]);
+
+    useLayoutEffect(() => installH5PageLifecycle({
+        onSuspend: () => {
+            pageSuspendedRef.current = true;
+            if (reconnectTimerRef.current) {
+                window.clearTimeout(reconnectTimerRef.current);
+                reconnectTimerRef.current = null;
+            }
+            if (resumeReconnectTimerRef.current) {
+                window.clearTimeout(resumeReconnectTimerRef.current);
+                resumeReconnectTimerRef.current = null;
+            }
+            if (nativeNavigationFallbackTimerRef.current) {
+                window.clearTimeout(nativeNavigationFallbackTimerRef.current);
+                nativeNavigationFallbackTimerRef.current = null;
+            }
+            closeCurrentSocket();
+            setConnectionStatus('disconnected');
+            setIsWaiting(false);
+            setIsStreaming(false);
+            setIsStopping(false);
+            setOnboardingKickoffRequest(null);
+        },
+        onResume: () => {
+            pageSuspendedRef.current = false;
+            setPageResumeRevision((revision) => revision + 1);
+            if (nativeNavigationFallbackTimerRef.current) {
+                window.clearTimeout(nativeNavigationFallbackTimerRef.current);
+                nativeNavigationFallbackTimerRef.current = null;
+            }
+            if (authStatus !== 'ready' || !agent || !token || unmountedRef.current) return;
+            if (reconnectTimerRef.current) {
+                window.clearTimeout(reconnectTimerRef.current);
+                reconnectTimerRef.current = null;
+            }
+            if (resumeReconnectTimerRef.current) {
+                window.clearTimeout(resumeReconnectTimerRef.current);
+            }
+            resumeReconnectTimerRef.current = window.setTimeout(() => {
+                resumeReconnectTimerRef.current = null;
+                openSocketRef.current(sessionIdRef.current);
+            }, 50);
+        },
+    }), [agent, authStatus, closeCurrentSocket, token]);
+
+    const recoverFromNativeNavigation = useCallback(() => {
+        if (nativeNavigationFallbackTimerRef.current) {
+            window.clearTimeout(nativeNavigationFallbackTimerRef.current);
+            nativeNavigationFallbackTimerRef.current = null;
+        }
+        if (
+            document.visibilityState === 'hidden'
+            || authStatus !== 'ready'
+            || !agent
+            || !token
+            || unmountedRef.current
+        ) return;
+        pageSuspendedRef.current = false;
+        openSocketRef.current(sessionIdRef.current);
+    }, [agent, authStatus, token]);
+
+    const prepareForNativeNavigation = useCallback(() => {
+        if (reconnectTimerRef.current) {
+            window.clearTimeout(reconnectTimerRef.current);
+            reconnectTimerRef.current = null;
+        }
+        closeCurrentSocket();
+        setConnectionStatus('disconnected');
+        setIsWaiting(false);
+        setIsStreaming(false);
+        setIsStopping(false);
+        setOnboardingKickoffRequest(null);
+        if (nativeNavigationFallbackTimerRef.current) {
+            window.clearTimeout(nativeNavigationFallbackTimerRef.current);
+        }
+        // Some WebViews do not emit pagehide when native navigation fails. If the
+        // H5 page is still visible, restore its connection instead of stranding it.
+        nativeNavigationFallbackTimerRef.current = window.setTimeout(() => {
+            nativeNavigationFallbackTimerRef.current = null;
+            recoverFromNativeNavigation();
+        }, 2000);
+    }, [closeCurrentSocket, recoverFromNativeNavigation]);
 
     const clearUploadDrafts = useCallback((abortUploads = false) => {
         if (abortUploads) {
@@ -900,15 +1040,13 @@ export default function H5AgentChat() {
         setMessages([]);
         window.history.replaceState({}, '', writeChatSessionIdToHref(window.location.href, nextSessionId));
 
-        manualCloseRef.current = true;
-        wsRef.current?.close();
+        closeCurrentSocket();
         if (await loadHistory(nextSessionId)) skipNextConnectedHistoryRef.current = nextSessionId;
         window.setTimeout(() => {
-            manualCloseRef.current = false;
             openSocket(nextSessionId);
             setIsSwitchingSession(false);
         }, 0);
-    }, [clearUploadDrafts, isStopping, isStreaming, isWaiting, loadHistory, openSocket]);
+    }, [clearUploadDrafts, closeCurrentSocket, isStopping, isStreaming, isWaiting, loadHistory, openSocket]);
 
     const startNewSession = useCallback(async () => {
         if (!agentId || isStartingNew) return;
@@ -940,10 +1078,8 @@ export default function H5AgentChat() {
                         )),
                 ]);
             }
-            manualCloseRef.current = true;
-            wsRef.current?.close();
+            closeCurrentSocket();
             window.setTimeout(() => {
-                manualCloseRef.current = false;
                 openSocket(nextSessionId);
             }, 0);
         } catch (error: any) {
@@ -956,7 +1092,7 @@ export default function H5AgentChat() {
         } finally {
             setIsStartingNew(false);
         }
-    }, [agentId, channel, clearUploadDrafts, isStartingNew, openSocket]);
+    }, [agentId, channel, clearUploadDrafts, closeCurrentSocket, isStartingNew, openSocket]);
 
     const stopGeneration = useCallback(() => {
         const ws = wsRef.current;
@@ -1169,6 +1305,15 @@ export default function H5AgentChat() {
     }, []);
 
     useEffect(() => {
+        if (pageResumeRevision === 0) return;
+        const frame = window.requestAnimationFrame(() => {
+            rowVirtualizer.measure();
+            window.dispatchEvent(new Event('resize'));
+        });
+        return () => window.cancelAnimationFrame(frame);
+    }, [pageResumeRevision, rowVirtualizer]);
+
+    useEffect(() => {
         const total = conversationEntries.length + (isWaiting ? 1 : 0);
         const scrollToBottom = () => {
             if (virtualizeMessages && total > 0) {
@@ -1214,31 +1359,36 @@ export default function H5AgentChat() {
         url: string,
         error: unknown,
     ) => {
+        recoverFromNativeNavigation();
         console.warn(`${platform} mini-program link open failed`, error);
         if (openExternalLinkWithBrowserDefault(url)) return;
 
         await copyLinkWithFeedback(url);
-    }, [copyLinkWithFeedback]);
+    }, [copyLinkWithFeedback, recoverFromNativeNavigation]);
 
     const handleLinkForRuntime = useCallback((href: string, runtime: H5ContainerRuntime): boolean => {
         const action = resolveH5LinkAction(href, { runtime });
         if (action.type === 'dingtalk-miniapp-navigate') {
+            prepareForNativeNavigation();
             void import('../../utils/dingtalkLink')
                 .then(({ navigateDingTalkMiniProgramPage }) => (
                     navigateDingTalkMiniProgramPage(action.route)
                 ))
                 .catch((error) => {
+                    recoverFromNativeNavigation();
                     console.warn('DingTalk mini-program page navigation failed', error);
                     toast.error('小程序页面跳转失败');
                 });
             return true;
         }
         if (action.type === 'wechat-miniapp-navigate') {
+            prepareForNativeNavigation();
             void import('../../utils/wechatMiniProgramLink')
                 .then(({ navigateWechatMiniProgramPage }) => (
                     navigateWechatMiniProgramPage(action.route)
                 ))
                 .catch((error) => {
+                    recoverFromNativeNavigation();
                     console.warn('WeChat mini-program page navigation failed', error);
                     toast.error('小程序页面跳转失败');
                 });
@@ -1255,6 +1405,7 @@ export default function H5AgentChat() {
         if (action.type === 'native') return false;
 
         if (action.type === 'dingtalk-open') {
+            prepareForNativeNavigation();
             void import('../../utils/dingtalkLink')
                 .then(({ openDingTalkMiniProgramWebview }) => (
                     openDingTalkMiniProgramWebview(action.url)
@@ -1268,11 +1419,18 @@ export default function H5AgentChat() {
             return true;
         }
 
+        prepareForNativeNavigation();
         void import('../../utils/wechatMiniProgramLink')
             .then(({ openWechatMiniProgramWebview }) => openWechatMiniProgramWebview(action.url))
             .catch((error) => handlePlatformLinkFailure('WeChat', action.url, error));
         return true;
-    }, [copyLinkWithFeedback, handlePlatformLinkFailure, toast]);
+    }, [
+        copyLinkWithFeedback,
+        handlePlatformLinkFailure,
+        prepareForNativeNavigation,
+        recoverFromNativeNavigation,
+        toast,
+    ]);
 
     const handleMarkdownLinkClick = useCallback((href: string): boolean => {
         if (containerRuntime !== 'detecting') {

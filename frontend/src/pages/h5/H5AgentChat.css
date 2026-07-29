@@ -1,10 +1,12 @@
 body.h5-chat-active {
     overflow: hidden;
     background: var(--bg-primary);
+    height: var(--h5-viewport-height, 100dvh);
+    min-height: var(--h5-viewport-height, 100dvh);
 }
 
 body.h5-chat-active #root {
-    min-height: 100dvh;
+    min-height: var(--h5-viewport-height, 100dvh);
 }
 
 .h5-chat {
@@ -26,8 +28,8 @@ body.h5-chat-active #root {
     --h5-composer-padding-right: max(10px, calc(10px + var(--h5-safe-area-right)));
     --h5-composer-safe-bottom: max(9px, calc(9px + var(--h5-safe-area-bottom)));
     position: relative;
-    height: 100dvh;
-    min-height: 100dvh;
+    height: var(--h5-viewport-height, 100dvh);
+    min-height: var(--h5-viewport-height, 100dvh);
     display: flex;
     flex-direction: column;
     overflow: hidden;

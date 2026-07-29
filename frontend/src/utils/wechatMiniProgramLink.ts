@@ -30,9 +30,11 @@ type DetectWeChatMiniProgramOptions = {
 
 type OpenWeChatMiniProgramLinkOptions = {
     targetWindow?: WeChatHostWindow;
+    targetDocument?: Document;
     currentHref?: string;
     route?: string;
     duplicateWindowMs?: number;
+    navigateTimeoutMs?: number;
     now?: () => number;
 };
 
@@ -45,6 +47,7 @@ const DEFAULT_JSSDK_URL = 'https://res.wx.qq.com/open/js/jweixin-1.3.2.js';
 const DEFAULT_BRIDGE_WAIT_TIMEOUT_MS = 800;
 const DEFAULT_ENV_TIMEOUT_MS = 800;
 const DEFAULT_DUPLICATE_WINDOW_MS = 500;
+const DEFAULT_NAVIGATE_TIMEOUT_MS = 1500;
 export const DEFAULT_WECHAT_WEBVIEW_ROUTE = '/subPackages/webview/index';
 
 let jssdkLoadPromise: Promise<void> | null = null;
@@ -296,11 +299,22 @@ export async function navigateWechatMiniProgramPage(
     lastOpenStartedAt = startedAt;
     await new Promise<void>((resolve, reject) => {
         let settled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const targetDocument = options.targetDocument ?? defaultTargetDocument();
+        const onVisibilityChange = () => {
+            if (targetDocument?.visibilityState === 'hidden') finish(resolve);
+        };
         const finish = (callback: () => void) => {
             if (settled) return;
             settled = true;
+            if (timer !== null) clearTimeout(timer);
+            targetDocument?.removeEventListener('visibilitychange', onVisibilityChange);
             callback();
         };
+        targetDocument?.addEventListener('visibilitychange', onVisibilityChange);
+        timer = setTimeout(() => finish(() => reject(new Error(
+            'Timed out navigating WeChat mini-program WebView',
+        ))), Math.max(0, options.navigateTimeoutMs ?? DEFAULT_NAVIGATE_TIMEOUT_MS));
 
         try {
             const result = miniProgram.navigateTo?.({
