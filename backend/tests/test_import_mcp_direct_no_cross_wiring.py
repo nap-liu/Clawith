@@ -101,3 +101,37 @@ async def test_cjk_named_servers_do_not_cross_wire():
     assert rs_a == srv_a.id, f"agent A routes to {rs_a}, expected its own server {srv_a.id}"
     assert rs_b == srv_b.id, f"agent B routes to {rs_b}, expected its own server {srv_b.id}"
     assert rs_a != rs_b, "CROSS-WIRING: both agents route to the SAME MCP server (= same key)"
+
+
+async def test_same_url_installs_get_agent_private_catalogs():
+    from app.services.resource_discovery import import_mcp_direct
+
+    s = uuid.uuid4().hex[:6]
+    agent_a = await _mk_agent(f"samea{s}")
+    agent_b = await _mk_agent(f"sameb{s}")
+    shared_url = f"https://mcp-gw.example/server/shared{s}"
+
+    with patch("app.services.mcp_client.MCPClient", _FakeMCPClient):
+        await import_mcp_direct(
+            mcp_url=shared_url,
+            agent_id=agent_a,
+            server_name="RAGFlow Admin",
+            api_key=f"KEYA{s}",
+        )
+        await import_mcp_direct(
+            mcp_url=shared_url,
+            agent_id=agent_b,
+            server_name="RAGFlow Admin",
+            api_key=f"KEYB{s}",
+        )
+
+    async with async_session() as db:
+        servers = (
+            await db.execute(
+                select(MCPServer).where(MCPServer.base_url_template == shared_url)
+            )
+        ).scalars().all()
+
+    assert len(servers) == 2
+    assert len({server.name for server in servers}) == 2
+    assert await _routed_server_id(agent_a) != await _routed_server_id(agent_b)

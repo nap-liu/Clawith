@@ -471,7 +471,7 @@ async def test_agent_refresh_endpoint_rejects_enterprise_server_before_discovery
     mcp_client.assert_not_called()
 
 
-async def test_agent_tool_refresh_rejects_server_shared_with_another_agent():
+async def test_agent_tool_refresh_splits_historical_self_installed_server():
     user, agent, server = await _make_agent()
     async with async_session() as db:
         other_agent = Agent(
@@ -515,13 +515,45 @@ async def test_agent_tool_refresh_rejects_server_shared_with_another_agent():
 
     from app.services.agent_mcp_lifecycle import refresh_mcp_server
 
-    with patch("app.services.mcp_refresh_service.MCPClient") as mcp_client:
+    class FakeClient:
+        server_instructions = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def list_tools(self):
+            return [
+                {
+                    "name": "shared",
+                    "description": "refreshed",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ]
+
+    with patch("app.services.mcp_refresh_service.MCPClient", FakeClient):
         result = json.loads(await refresh_mcp_server(agent.id, server.id))
 
-    assert result["ok"] is False
-    assert result["error"] == "agent_refresh_not_isolated"
-    assert "inherited or shared MCP servers" in result["detail"]
-    mcp_client.assert_not_called()
+    assert result["ok"] is True
+    assert result["mcp_server_id"] != str(server.id)
+
+    async with async_session() as db:
+        current_server_ids = (
+            await db.execute(
+                select(Tool.mcp_server_id)
+                .join(AgentTool, AgentTool.tool_id == Tool.id)
+                .where(AgentTool.agent_id == agent.id)
+            )
+        ).scalars().all()
+        other_server_ids = (
+            await db.execute(
+                select(Tool.mcp_server_id)
+                .join(AgentTool, AgentTool.tool_id == Tool.id)
+                .where(AgentTool.agent_id == other_agent.id)
+            )
+        ).scalars().all()
+
+    assert set(current_server_ids) == {uuid.UUID(result["mcp_server_id"])}
+    assert set(other_server_ids) == {server.id}
 
 
 async def test_agent_tool_refresh_reuses_agent_scope_service():

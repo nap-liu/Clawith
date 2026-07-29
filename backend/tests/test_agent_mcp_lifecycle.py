@@ -4,9 +4,11 @@ import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 from sqlalchemy import select
 
+from app.core.security import create_access_token
 from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.mcp_server import MCPServer
@@ -175,7 +177,7 @@ async def test_uninstall_only_detaches_current_agent_and_preserves_shared_server
         assert [row.agent_id for row in assignments] == [agent_b]
 
 
-async def test_uninstall_deletes_only_unreferenced_tool_not_server():
+async def test_uninstall_deletes_unreferenced_private_group():
     tenant_id, (agent_id,) = await _make_agents(1)
     async with async_session() as db:
         server, tool = await _make_server_tool(db, tenant_id, "orphan")
@@ -194,11 +196,13 @@ async def test_uninstall_deletes_only_unreferenced_tool_not_server():
     result = json.loads(await uninstall_mcp_server(agent_id, server_id))
     assert result["ok"] is True
     assert result["deleted_orphan_tools"] == 1
+    assert result["server_deleted"] is True
+    assert result["shared_server_preserved"] is False
 
     async with async_session() as db:
         assert (
             await db.execute(select(MCPServer).where(MCPServer.id == server_id))
-        ).scalar_one_or_none() is not None
+        ).scalar_one_or_none() is None
         assert (
             await db.execute(select(Tool).where(Tool.id == tool_id))
         ).scalar_one_or_none() is None
@@ -218,6 +222,65 @@ async def test_uninstall_rejects_binding_not_installed_by_current_agent():
         "error": "not_installed_or_not_removable",
         "mcp_server_id": str(server_id),
     }
+
+
+async def test_admin_endpoint_uninstalls_complete_mcp_group():
+    tenant_id, (agent_id,) = await _make_agents(1)
+    async with async_session() as db:
+        agent = (
+            await db.execute(select(Agent).where(Agent.id == agent_id))
+        ).scalar_one()
+        user = (
+            await db.execute(select(User).where(User.id == agent.creator_id))
+        ).scalar_one()
+        server, first_tool = await _make_server_tool(db, tenant_id, "group")
+        second_tool = Tool(
+            name=f"mcp_{server.name}_second",
+            display_name="Group: second",
+            type="mcp",
+            category="mcp",
+            mcp_server_id=server.id,
+            mcp_server_name=server.name,
+            mcp_tool_name="second",
+            source="agent",
+        )
+        db.add(second_tool)
+        await db.flush()
+        db.add_all(
+            [
+                AgentTool(
+                    agent_id=agent_id,
+                    tool_id=tool.id,
+                    enabled=True,
+                    source="user_installed",
+                    installed_by_agent_id=agent_id,
+                )
+                for tool in (first_tool, second_tool)
+            ]
+        )
+        await db.commit()
+        server_id = server.id
+        token = create_access_token(str(user.id), user.role)
+
+    from app.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+    ) as client:
+        response = await client.delete(
+            f"/api/tools/agents/{agent_id}/mcp-servers/{server_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["removed_bindings"] == 2
+    assert response.json()["server_deleted"] is True
+    async with async_session() as db:
+        assert (
+            await db.execute(select(MCPServer).where(MCPServer.id == server_id))
+        ).scalar_one_or_none() is None
 
 
 async def test_observable_result_masks_only_credentials_and_keeps_diagnostics():

@@ -1,5 +1,6 @@
 """Tool management API — CRUD for tools and per-agent assignments."""
 
+import json
 import uuid
 from loguru import logger
 
@@ -688,6 +689,31 @@ async def delete_agent_tool(
     return {"ok": True}
 
 
+@router.delete("/agents/{agent_id}/mcp-servers/{server_id}")
+async def uninstall_agent_mcp_server_group(
+    agent_id: uuid.UUID,
+    server_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove one complete self-installed MCP group from an Agent."""
+    from app.core.permissions import check_agent_access
+    from app.services.agent_mcp_lifecycle import uninstall_mcp_server
+
+    _agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(status_code=403, detail="Manage access required")
+    # Release the request-scoped read transaction before the lifecycle service
+    # opens its serialized write transaction for this Agent.
+    await db.rollback()
+
+    result = json.loads(await uninstall_mcp_server(agent_id, server_id))
+    if not result.get("ok"):
+        status_code = 404 if result.get("error") == "mcp_server_not_found" else 409
+        raise HTTPException(status_code=status_code, detail=result)
+    return result
+
+
 # ─── Per-Agent Tool Config ───────────────────────────────────
 
 class AgentToolConfigUpdate(BaseModel):
@@ -872,6 +898,12 @@ async def get_agent_tools_with_config(
             "global_config": masked_global,
             "agent_config": raw_agent,
             "source": t.source,
+            "agent_tool_source": at.source if at else None,
+            "installed_by_agent_id": (
+                str(at.installed_by_agent_id)
+                if at and at.installed_by_agent_id
+                else None
+            ),
         })
     return result
 

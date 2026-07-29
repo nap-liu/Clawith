@@ -10,6 +10,7 @@ import {
     IconSearch,
     IconSettings,
     IconTerminal2,
+    IconTrash,
     IconTools,
 } from '@tabler/icons-react';
 
@@ -50,6 +51,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
     const [configSaving, setConfigSaving] = useState(false);
     const [toolTab, setToolTab] = useState<'company' | 'installed'>('company');
     const [deletingToolId, setDeletingToolId] = useState<string | null>(null);
+    const [deletingMcpServerId, setDeletingMcpServerId] = useState<string | null>(null);
     const [configCategory, setConfigCategory] = useState<string | null>(null);
     const [focusedField, setFocusedField] = useState<string | null>(null);
     const [showAdvancedToolConfig, setShowAdvancedToolConfig] = useState(false);
@@ -238,13 +240,24 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
     // EXCEPT system tools that expose user config (e.g. request_confirmation's per-agent
     // DingTalk card template), which must stay configurable here.
     const isHiddenSystemTool = (t: any) => t.category === 'system' && !(t.config_schema?.fields?.length > 0);
-    const companyTools = tools.filter(t => (t.source === 'builtin' || t.source === 'admin') && !isHiddenSystemTool(t));
-    const agentInstalledTools = tools.filter(t => t.source === 'agent' && !isHiddenSystemTool(t));
+    const isSelfInstalledTool = (tool: any) => (
+        tool.agent_tool_source === 'user_installed'
+        && tool.installed_by_agent_id === agentId
+    );
+    const companyTools = tools.filter(t => (
+        !isSelfInstalledTool(t)
+        && (t.source === 'builtin' || t.source === 'admin')
+        && !isHiddenSystemTool(t)
+    ));
+    const agentInstalledTools = tools.filter(t => (
+        isSelfInstalledTool(t)
+        && !isHiddenSystemTool(t)
+    ));
 
     const mcpGroupKey = (tool: any) => {
         const serverName = String(tool.mcp_server_name || '').trim();
         return tool.type === 'mcp' && serverName
-            ? `mcp:${serverName.toLowerCase()}`
+            ? `mcp:${tool.mcp_server_id || serverName.toLowerCase()}`
             : (tool.category || 'general');
     };
 
@@ -354,6 +367,76 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         } catch (err: any) {
             console.error('Bulk update failed', err);
             loadTools();
+        }
+    };
+
+    const uninstallMcpGroup = async (serverId: string, label: string, toolCount: number) => {
+        const ok = await dialog.confirm(
+            t('agent.tools.confirmRemoveMcpGroup', {
+                name: label,
+                count: toolCount,
+                defaultValue: `Remove all ${toolCount} tools from MCP server "${label}"?`,
+            }),
+            {
+                title: t('agent.tools.deleteMcpGroupTitle', 'Delete MCP tool group'),
+                danger: true,
+                confirmLabel: t('common.delete', 'Delete'),
+            },
+        );
+        if (!ok) return;
+
+        setDeletingMcpServerId(serverId);
+        try {
+            const token = localStorage.getItem('token');
+            const res = await fetch(`/api/tools/agents/${agentId}/mcp-servers/${serverId}`, {
+                method: 'DELETE',
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                throw new Error(body?.detail?.error || body?.detail || `HTTP ${res.status}`);
+            }
+            await loadTools();
+            toast.success(t('agent.tools.mcpGroupRemoved', 'MCP group removed'));
+        } catch (e: any) {
+            toast.error(t('agent.tools.deleteFailed', 'Delete failed'), { details: String(e?.message || e) });
+        } finally {
+            setDeletingMcpServerId(null);
+        }
+    };
+
+    const deleteCompanyMcpGroup = async (serverId: string, label: string, toolCount: number) => {
+        const ok = await dialog.confirm(
+            t('agent.tools.confirmDeleteCompanyMcpGroup', {
+                name: label,
+                count: toolCount,
+                defaultValue: `Delete all ${toolCount} company tools from MCP server "${label}"? This affects every agent using this group and cannot be undone.`,
+            }),
+            {
+                title: t('agent.tools.deleteCompanyMcpGroupTitle', 'Delete company MCP tool group'),
+                danger: true,
+                confirmLabel: t('common.delete', 'Delete'),
+            },
+        );
+        if (!ok) return;
+
+        setDeletingMcpServerId(serverId);
+        try {
+            const token = localStorage.getItem('token');
+            const res = await fetch(`/api/admin/mcp-servers/${serverId}`, {
+                method: 'DELETE',
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (!res.ok) {
+                const body = await res.json().catch(() => null);
+                throw new Error(body?.detail?.error || body?.detail || `HTTP ${res.status}`);
+            }
+            await loadTools();
+            toast.success(t('agent.tools.companyMcpGroupDeleted', 'Company MCP tool group deleted'));
+        } catch (e: any) {
+            toast.error(t('agent.tools.deleteFailed', 'Delete failed'), { details: String(e?.message || e) });
+        } finally {
+            setDeletingMcpServerId(null);
         }
     };
 
@@ -478,6 +561,27 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                 const mixed = enabledCount > 0 && enabledCount < allCatTools.length;
                 const expanded = expandedCategories.has(category) || !!toolSearch.trim();
                 const visibleCount = (catTools as any[]).length;
+                const mcpServerId = allCatTools[0]?.mcp_server_id as string | undefined;
+                const removableMcpGroup = (
+                    toolTab === 'installed'
+                    && category.startsWith('mcp:')
+                    && !!mcpServerId
+                    && allCatTools.every((tool: any) => (
+                        tool.agent_tool_source === 'user_installed'
+                        && tool.installed_by_agent_id === agentId
+                    ))
+                );
+                const deletableCompanyMcpGroup = (
+                    toolTab === 'company'
+                    && currentUser?.role === 'platform_admin'
+                    && category.startsWith('mcp:')
+                    && !!mcpServerId
+                    && allCatTools.every((tool: any) => (
+                        tool.type === 'mcp'
+                        && tool.source === 'admin'
+                        && tool.mcp_server_id === mcpServerId
+                    ))
+                );
                 return (
                     <div key={category} style={{
                         border: '1px solid var(--border-subtle)',
@@ -548,6 +652,22 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                 </div>
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }} onClick={(e) => e.stopPropagation()}>
+                                {canManage && (removableMcpGroup || deletableCompanyMcpGroup) && (
+                                    <button
+                                        type="button"
+                                        onClick={() => void (
+                                            deletableCompanyMcpGroup
+                                                ? deleteCompanyMcpGroup(mcpServerId!, label, allCatTools.length)
+                                                : uninstallMcpGroup(mcpServerId!, label, allCatTools.length)
+                                        )}
+                                        disabled={deletingMcpServerId === mcpServerId}
+                                        style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '4px 8px', fontSize: '11px', cursor: 'pointer', color: 'var(--danger-color, #dc2626)', display: 'inline-flex', alignItems: 'center', gap: '4px', opacity: deletingMcpServerId === mcpServerId ? 0.5 : 1 }}
+                                        title={t('common.delete', 'Delete')}
+                                    >
+                                        <IconTrash size={12} stroke={1.8} />
+                                        {deletingMcpServerId === mcpServerId ? '...' : t('common.delete', 'Delete')}
+                                    </button>
+                                )}
                                 {CATEGORY_CONFIG_SCHEMAS[meta.configCategory] && canManage && (
                                     <button
                                         type="button"

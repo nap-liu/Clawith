@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
@@ -21,6 +22,7 @@ from app.models.mcp_server import MCPServer
 from app.models.tool import AgentTool, Tool
 from app.services.mcp_client import MCPClient
 from app.services.mcp_server_service import (
+    agent_private_server_name,
     build_placeholder_context_for_call,
     compose_runtime_config,
     lookup_overrides,
@@ -176,6 +178,183 @@ async def _assert_agent_refresh_is_isolated(
         )
 
 
+async def ensure_agent_mcp_server_isolated(
+    db,
+    server: MCPServer,
+    agent_id: uuid.UUID,
+) -> MCPServer:
+    """Split a historical same-URL catalog shared by self-installing Agents.
+
+    Older HTTP imports reused one MCPServer/Tool catalog for every Agent in a
+    tenant. If all consumers are genuine self-installs, move only the current
+    Agent's bindings to a private clone before refresh. Enterprise/inherited
+    sharing is intentionally left untouched so the normal guard rejects it.
+    """
+    if server.created_by_user_id is not None:
+        return server
+
+    pairs = (
+        await db.execute(
+            select(AgentTool, Tool)
+            .join(Tool, Tool.id == AgentTool.tool_id)
+            .where(Tool.mcp_server_id == server.id)
+            .order_by(AgentTool.created_at)
+        )
+    ).all()
+    current_pairs = [
+        (assignment, tool)
+        for assignment, tool in pairs
+        if assignment.agent_id == agent_id
+    ]
+    if not current_pairs or not all(
+        assignment.source == "user_installed"
+        and assignment.installed_by_agent_id == agent_id
+        for assignment, _tool in current_pairs
+    ):
+        return server
+
+    other_pairs = [
+        (assignment, tool)
+        for assignment, tool in pairs
+        if assignment.agent_id != agent_id
+    ]
+    if not other_pairs:
+        return server
+    if not all(
+        assignment.source == "user_installed"
+        and assignment.installed_by_agent_id == assignment.agent_id
+        for assignment, _tool in other_pairs
+    ):
+        return server
+
+    tenant_override, agent_override = await lookup_overrides(
+        db,
+        server.id,
+        server.tenant_id,
+        agent_id,
+    )
+    resolved = compose_runtime_config(server, tenant_override, agent_override)
+    assignment_config = dict(current_pairs[0][0].config or {})
+    private_url = str(
+        assignment_config.get("mcp_url")
+        or resolved.url_template
+        or server.base_url_template
+        or ""
+    )
+    private_name = agent_private_server_name(
+        server.display_name,
+        private_url,
+        agent_id,
+    )
+    tenant_clause = (
+        MCPServer.tenant_id == server.tenant_id
+        if server.tenant_id is not None
+        else MCPServer.tenant_id.is_(None)
+    )
+    private_server = (
+        await db.execute(
+            select(MCPServer).where(
+                MCPServer.base_url_template == private_url,
+                MCPServer.name.endswith(private_name[private_name.rfind("-a"):]),
+                tenant_clause,
+            )
+        )
+    ).scalar_one_or_none()
+    if private_server is None:
+        private_server = MCPServer(
+            tenant_id=server.tenant_id,
+            name=private_name,
+            display_name=server.display_name,
+            base_url_template=private_url,
+            headers_template=deepcopy(
+                assignment_config.get("headers")
+                if isinstance(assignment_config.get("headers"), dict)
+                else resolved.headers_template or {}
+            ),
+            credential_template=(
+                assignment_config.get("api_key")
+                or resolved.credential_template
+            ),
+            system_prompt_block="\n\n".join(resolved.prompt_blocks) or None,
+            instructions=server.instructions,
+            instructions_captured_at=server.instructions_captured_at,
+            placeholder_allowlist=deepcopy(server.placeholder_allowlist),
+            transport=resolved.transport,
+            command_template=(
+                assignment_config.get("command")
+                or resolved.command_template
+            ),
+            args_template=deepcopy(
+                assignment_config.get("args")
+                or resolved.args_template
+            ),
+            env_template=deepcopy(
+                assignment_config.get("env")
+                or resolved.env_template
+            ),
+        )
+        db.add(private_server)
+        await db.flush()
+
+    for assignment, old_tool in current_pairs:
+        remote_name = old_tool.mcp_tool_name
+        private_tool = (
+            await db.execute(
+                select(Tool).where(
+                    Tool.mcp_server_id == private_server.id,
+                    Tool.mcp_tool_name == remote_name,
+                )
+            )
+        ).scalar_one_or_none()
+        if private_tool is None:
+            name_seed = remote_name or old_tool.name
+            private_tool = Tool(
+                name=_tool_name(private_server, name_seed),
+                display_name=old_tool.display_name,
+                description=old_tool.description,
+                type="mcp",
+                category=old_tool.category,
+                icon=old_tool.icon,
+                parameters_schema=deepcopy(old_tool.parameters_schema or {}),
+                config=deepcopy(old_tool.config or {}),
+                config_schema=deepcopy(old_tool.config_schema or {}),
+                mcp_server_url=private_url or None,
+                mcp_server_name=private_server.name,
+                mcp_tool_name=remote_name,
+                system_prompt_block=old_tool.system_prompt_block,
+                mcp_server_instructions=old_tool.mcp_server_instructions,
+                enabled=old_tool.enabled,
+                is_default=False,
+                source="agent",
+                mcp_server_id=private_server.id,
+                tenant_id=server.tenant_id,
+            )
+            db.add(private_tool)
+            await db.flush()
+
+        existing_assignment = (
+            await db.execute(
+                select(AgentTool).where(
+                    AgentTool.agent_id == agent_id,
+                    AgentTool.tool_id == private_tool.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_assignment is None:
+            assignment.tool_id = private_tool.id
+        else:
+            existing_assignment.enabled = assignment.enabled
+            existing_assignment.config = deepcopy(assignment.config or {})
+            existing_assignment.source = assignment.source
+            existing_assignment.installed_by_agent_id = (
+                assignment.installed_by_agent_id
+            )
+            await db.delete(assignment)
+
+    await db.flush()
+    return private_server
+
+
 async def refresh_mcp_server_tools(
     db,
     server_id: uuid.UUID,
@@ -209,6 +388,7 @@ async def refresh_mcp_server_tools(
         ):
             raise PermissionError("Agent and MCP server belong to different tenants")
         tenant_id = agent.tenant_id
+        server = await ensure_agent_mcp_server_isolated(db, server, agent_id)
         await _assert_agent_refresh_is_isolated(db, server, agent_id)
 
     tenant_override, agent_override = await lookup_overrides(

@@ -224,6 +224,18 @@ def _slugify_server_name(name: str, url_seed: str | None = None) -> str:
     return "mcp_server"
 
 
+def agent_private_server_name(
+    server_name: str,
+    server_url: str,
+    agent_id: uuid.UUID,
+) -> str:
+    """Return the stable registry name for one Agent-owned MCP installation."""
+    base = _slugify_server_name(server_name, url_seed=server_url)[:72]
+    agent8 = str(agent_id).replace("-", "")[:8]
+    url8 = hashlib.sha1(server_url.encode("utf-8")).hexdigest()[:8]
+    return f"{base}-a{agent8}-{url8}"[:100]
+
+
 async def persist_stdio_discovered_tools(
     db,
     srv,
@@ -296,23 +308,40 @@ async def upsert_mcp_server_from_tools(
     headers_template: dict | None = None,
     api_key: str | None = None,
     created_by_user_id: uuid.UUID | None = None,
+    owner_agent_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
-    """Find or create an mcp_servers row for (tenant_id, server_url).
+    """Find or create an MCP server row.
 
     Behavior:
+    - Agent-owned import: key by a stable Agent + URL registry name.
+    - Shared/admin import: retain the historical (tenant_id, server_url) key.
     - Existing row: update only fields that are not None (None = "don't touch")
     - New row: create with provided fields; defaults system_prompt_block=None,
       headers_template={}, credential_template=None
     - Returns the row's id.
     - On name collision (uniq violation), suffixes -2/-3 etc. (matches P0a migration).
     """
-    existing = (await db.execute(
-        select(MCPServer).where(
-            MCPServer.base_url_template == server_url,
-            (MCPServer.tenant_id == tenant_id) if tenant_id is not None
-            else MCPServer.tenant_id.is_(None),
-        )
-    )).scalar_one_or_none()
+    tenant_clause = (
+        MCPServer.tenant_id == tenant_id
+        if tenant_id is not None
+        else MCPServer.tenant_id.is_(None)
+    )
+    private_name = (
+        agent_private_server_name(server_name, server_url, owner_agent_id)
+        if owner_agent_id is not None
+        else None
+    )
+    lookup = select(MCPServer).where(
+        MCPServer.base_url_template == server_url,
+        tenant_clause,
+    )
+    if private_name is not None:
+        # The display name may change between imports; ownership identity does
+        # not. Match the stable Agent + URL suffix before using the current
+        # display-derived name for a newly created row.
+        private_suffix = private_name[private_name.rfind("-a"):]
+        lookup = lookup.where(MCPServer.name.endswith(private_suffix))
+    existing = (await db.execute(lookup)).scalar_one_or_none()
 
     if existing is not None:
         if system_prompt_block is not None:
@@ -326,7 +355,7 @@ async def upsert_mcp_server_from_tools(
 
     # Create new — derive unique name (seed the fallback from the URL so
     # ASCII-free names don't all collapse to the same base; see docstring).
-    base = _slugify_server_name(server_name, url_seed=server_url)
+    base = private_name or _slugify_server_name(server_name, url_seed=server_url)
     name = base
     suffix = 2
     while True:

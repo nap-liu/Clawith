@@ -6,6 +6,8 @@ from sqlalchemy import select
 from app.database import async_session, engine
 from app.models.user import User, Identity
 from app.models.mcp_server import MCPServer
+from app.models.agent import Agent
+from app.models.tool import AgentTool, Tool
 from app.core.security import create_access_token
 
 pytestmark = pytest.mark.asyncio
@@ -176,6 +178,52 @@ async def test_delete_cascades_to_overrides(client):
             select(MCPServerOverride).where(MCPServerOverride.mcp_server_id == srv_id)
         )).scalars().all()
         assert n == [], "overrides should be cascade-deleted with server"
+
+async def test_delete_removes_server_tools_and_agent_assignments(client):
+    """Deleting a company MCP group removes its tools and every assignment."""
+    admin, admin_token = await _make_user("platform_admin")
+    suffix = uuid.uuid4().hex[:6]
+    async with async_session() as db:
+        srv = MCPServer(
+            name=f"group_{suffix}",
+            display_name="Company group",
+            base_url_template="https://company.example/mcp",
+            headers_template={},
+            created_by_user_id=admin.id,
+        )
+        db.add(srv)
+        await db.flush()
+        tool = Tool(
+            name=f"company_mcp_{suffix}",
+            display_name="Company MCP tool",
+            type="mcp",
+            category="custom",
+            parameters_schema={},
+            source="admin",
+            mcp_server_id=srv.id,
+            mcp_server_name=srv.name,
+            mcp_tool_name="run",
+        )
+        agent = Agent(name=f"A_{suffix}", creator_id=admin.id)
+        db.add_all([tool, agent])
+        await db.flush()
+        assignment = AgentTool(agent_id=agent.id, tool_id=tool.id, enabled=True)
+        db.add(assignment)
+        await db.commit()
+        server_id = srv.id
+        tool_id = tool.id
+        assignment_id = assignment.id
+
+    response = await client.delete(
+        f"/api/admin/mcp-servers/{server_id}",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert response.status_code == 204
+
+    async with async_session() as db:
+        assert await db.get(MCPServer, server_id) is None
+        assert await db.get(Tool, tool_id) is None
+        assert await db.get(AgentTool, assignment_id) is None
 
 
 # ---------------------------------------------------------------------------

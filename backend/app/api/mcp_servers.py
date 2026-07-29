@@ -15,13 +15,14 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user, require_role
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.mcp_server import MCPServer, MCPServerOverride
+from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.schemas.mcp_server import (
     DryRunRequest,
@@ -184,12 +185,22 @@ async def delete_mcp_server(
     if srv is None:
         raise HTTPException(status_code=404, detail="MCP server not found")
     name = srv.name
+    tool_ids = list(
+        (
+            await db.execute(
+                select(Tool.id).where(Tool.mcp_server_id == server_id)
+            )
+        ).scalars()
+    )
+    if tool_ids:
+        await db.execute(delete(AgentTool).where(AgentTool.tool_id.in_(tool_ids)))
+        await db.execute(delete(Tool).where(Tool.id.in_(tool_ids)))
     await db.delete(srv)
     await db.commit()
 
     await write_audit_log(
         action="MCP_SERVER_DELETE",
-        details={"server_id": str(server_id), "name": name},
+        details={"server_id": str(server_id), "name": name, "deleted_tools": len(tool_ids)},
         user_id=current_user.id,
     )
 

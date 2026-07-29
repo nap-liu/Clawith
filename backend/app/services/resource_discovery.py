@@ -782,12 +782,11 @@ async def import_mcp_direct(
         _agent_row = (await db.execute(select(_Agent).where(_Agent.id == agent_id))).scalar_one_or_none()
         _tenant_id = _agent_row.tenant_id if _agent_row else None
 
-        # Find-or-create the mcp_servers row FIRST (keyed on tenant + URL). Every
+        # Find-or-create an Agent-private mcp_servers row FIRST. Every
         # tool we import is then named after — and bound to — THIS server. The
-        # server name is unique per (tenant, url), so per-server tool names are
+        # server name is stable per (Agent, URL), so per-server tool names are
         # unique too: this is what stops the global Tool.name dedup from merging
-        # two different servers' identically-named tools onto one row (the
-        # cross-wiring bug where one agent's call routed to another's key).
+        # different Agent installations onto one mutable catalog.
         srv_id = await upsert_mcp_server_from_tools(
             db,
             tenant_id=_tenant_id,
@@ -795,6 +794,7 @@ async def import_mcp_direct(
             server_name=display_name,
             headers_template=isinstance(headers, dict) and headers or None,
             api_key=api_key,
+            owner_agent_id=agent_id,
         )
         srv = (await db.execute(select(MCPServer).where(MCPServer.id == srv_id))).scalar_one()
 

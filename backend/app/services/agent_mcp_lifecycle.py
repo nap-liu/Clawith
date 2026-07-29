@@ -16,7 +16,10 @@ from app.database import async_session
 from app.models.agent import Agent
 from app.models.mcp_server import MCPServer
 from app.models.tool import AgentTool, Tool
-from app.services.mcp_refresh_service import refresh_mcp_server_tools
+from app.services.mcp_refresh_service import (
+    ensure_agent_mcp_server_isolated,
+    refresh_mcp_server_tools,
+)
 
 
 def _normalized_configs(
@@ -144,9 +147,14 @@ async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
             )
 
         try:
+            server = await ensure_agent_mcp_server_isolated(
+                db,
+                server,
+                agent_id,
+            )
             result = await refresh_mcp_server_tools(
                 db,
-                server_id,
+                server.id,
                 agent_id=agent_id,
                 assign_to_agent=True,
             )
@@ -157,7 +165,7 @@ async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
                 {
                     "ok": False,
                     "error": "agent_refresh_not_isolated",
-                    "mcp_server_id": str(server_id),
+                    "mcp_server_id": str(server.id),
                     "detail": str(exc),
                 },
                 ensure_ascii=False,
@@ -168,7 +176,7 @@ async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
                 {
                     "ok": False,
                     "error": "refresh_failed",
-                    "mcp_server_id": str(server_id),
+                    "mcp_server_id": str(server.id),
                     "detail": str(exc)[:500],
                 },
                 ensure_ascii=False,
@@ -177,7 +185,7 @@ async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
         return json.dumps(
             {
                 "ok": True,
-                "mcp_server_id": str(server_id),
+                "mcp_server_id": str(server.id),
                 **result.to_dict(),
                 "effective": "next_turn",
             },
@@ -246,9 +254,51 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
                 tool = (
                     await db.execute(select(Tool).where(Tool.id == tool_id))
                 ).scalar_one_or_none()
-                if tool is not None and tool.type == "mcp":
+                if (
+                    tool is not None
+                    and tool.type == "mcp"
+                    and tool.source == "agent"
+                    and server.created_by_user_id is None
+                ):
                     await db.delete(tool)
                     deleted_orphan_tools += 1
+
+        await db.flush()
+        remaining_server_assignments = (
+            await db.execute(
+                select(AgentTool.id)
+                .join(Tool, Tool.id == AgentTool.tool_id)
+                .where(Tool.mcp_server_id == server_id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if (
+            remaining_server_assignments is None
+            and server.created_by_user_id is None
+        ):
+            stale_agent_tools = (
+                await db.execute(
+                    select(Tool).where(
+                        Tool.mcp_server_id == server_id,
+                        Tool.source == "agent",
+                    )
+                )
+            ).scalars().all()
+            for tool in stale_agent_tools:
+                await db.delete(tool)
+                deleted_orphan_tools += 1
+            await db.flush()
+
+        remaining_server_tools = (
+            await db.execute(
+                select(Tool.id)
+                .where(Tool.mcp_server_id == server_id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        server_deleted = remaining_server_tools is None
+        if server_deleted:
+            await db.delete(server)
 
         await db.commit()
         return json.dumps(
@@ -259,7 +309,8 @@ async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str
                 "removed_bindings": len(assignment_ids),
                 "deleted_orphan_tools": deleted_orphan_tools,
                 "removed_tool_names": tool_names,
-                "shared_server_preserved": True,
+                "server_deleted": server_deleted,
+                "shared_server_preserved": not server_deleted,
                 "other_agents_affected": 0,
                 "effective": "immediate",
             },
