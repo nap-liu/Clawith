@@ -14,8 +14,8 @@ from sqlalchemy import delete, select
 
 from app.database import async_session
 from app.models.agent import Agent
-from app.models.tool import AgentTool, Tool
 from app.models.mcp_server import MCPServer
+from app.models.tool import AgentTool, Tool
 from app.services.mcp_refresh_service import refresh_mcp_server_tools
 
 
@@ -117,7 +117,7 @@ async def list_installed_mcp_servers(agent_id: uuid.UUID) -> str:
 
 
 async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
-    """Refresh one MCP server with the current Agent's effective configuration."""
+    """Refresh one MCP server installed exclusively by the current Agent."""
     async with async_session() as db:
         agent = (
             await db.execute(
@@ -143,27 +143,6 @@ async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
                 ensure_ascii=False,
             )
 
-        assignment = (
-            await db.execute(
-                select(AgentTool.id)
-                .join(Tool, Tool.id == AgentTool.tool_id)
-                .where(
-                    AgentTool.agent_id == agent_id,
-                    Tool.mcp_server_id == server_id,
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if assignment is None:
-            return json.dumps(
-                {
-                    "ok": False,
-                    "error": "not_installed_or_not_assigned",
-                    "mcp_server_id": str(server_id),
-                },
-                ensure_ascii=False,
-            )
-
         try:
             result = await refresh_mcp_server_tools(
                 db,
@@ -172,6 +151,17 @@ async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
                 assign_to_agent=True,
             )
             await db.commit()
+        except PermissionError as exc:
+            await db.rollback()
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "agent_refresh_not_isolated",
+                    "mcp_server_id": str(server_id),
+                    "detail": str(exc),
+                },
+                ensure_ascii=False,
+            )
         except Exception as exc:
             await db.rollback()
             return json.dumps(

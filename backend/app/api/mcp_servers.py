@@ -22,7 +22,6 @@ from app.core.security import get_current_user, require_role
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.mcp_server import MCPServer, MCPServerOverride
-from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.schemas.mcp_server import (
     DryRunRequest,
@@ -359,7 +358,7 @@ async def refresh_mcp_server_tool_catalog(
     db: AsyncSession = Depends(get_db),
     agent_id: uuid.UUID | None = None,
 ) -> MCPToolRefreshResultOut:
-    """Refresh one server globally or with one Agent's effective configuration."""
+    """Refresh globally, or refresh an Agent's exclusively self-installed server."""
     server = (
         await db.execute(select(MCPServer).where(MCPServer.id == server_id))
     ).scalar_one_or_none()
@@ -370,22 +369,6 @@ async def refresh_mcp_server_tool_catalog(
         await _assert_can_edit_server(current_user, server)
     else:
         await _require_agent_override_access(current_user, agent_id, db)
-        assignment = (
-            await db.execute(
-                select(AgentTool.id)
-                .join(Tool, Tool.id == AgentTool.tool_id)
-                .where(
-                    AgentTool.agent_id == agent_id,
-                    Tool.mcp_server_id == server_id,
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if assignment is None:
-            raise HTTPException(
-                status_code=403,
-                detail="MCP server is not assigned to this agent",
-            )
 
     try:
         result = await refresh_mcp_server_tools(

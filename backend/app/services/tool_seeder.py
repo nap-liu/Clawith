@@ -1964,10 +1964,11 @@ BUILTIN_TOOLS = [
         "name": "refresh_mcp_server",
         "display_name": "Refresh MCP Server",
         "description": (
-            "Refresh one MCP server's tool catalog using your effective Agent configuration. "
-            "Use the exact mcp_server_id returned by list_installed_mcp_servers. Existing tool "
-            "enablement and configuration are preserved; newly discovered tools become available "
-            "on your next turn."
+            "Refresh one MCP server installed exclusively by you, using your Agent configuration. "
+            "Use the exact mcp_server_id returned by list_installed_mcp_servers. Inherited enterprise "
+            "or shared MCP servers cannot be refreshed here and must use the administrator global "
+            "refresh. Existing tool enablement and configuration are preserved; newly discovered "
+            "tools become available on your next turn."
         ),
         "category": "discovery",
         "icon": "🔄",

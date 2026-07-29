@@ -143,6 +143,39 @@ async def _assignment_template(
     )
 
 
+async def _assert_agent_refresh_is_isolated(
+    db,
+    server: MCPServer,
+    agent_id: uuid.UUID,
+) -> None:
+    """Allow Agent-scoped refresh only for an exclusively self-installed server."""
+    if server.created_by_user_id is not None:
+        raise PermissionError(
+            "Inherited enterprise MCP servers cannot be refreshed by an Agent; "
+            "use the administrator global refresh instead"
+        )
+
+    assignments = (
+        await db.execute(
+            select(AgentTool)
+            .join(Tool, Tool.id == AgentTool.tool_id)
+            .where(Tool.mcp_server_id == server.id)
+        )
+    ).scalars().all()
+    exclusively_self_installed = bool(assignments) and all(
+        assignment.agent_id == agent_id
+        and assignment.source == "user_installed"
+        and assignment.installed_by_agent_id == agent_id
+        for assignment in assignments
+    )
+    if not exclusively_self_installed:
+        raise PermissionError(
+            "Only an MCP server installed exclusively by the current Agent can "
+            "be refreshed here; inherited or shared MCP servers must use the "
+            "administrator global refresh"
+        )
+
+
 async def refresh_mcp_server_tools(
     db,
     server_id: uuid.UUID,
@@ -176,6 +209,7 @@ async def refresh_mcp_server_tools(
         ):
             raise PermissionError("Agent and MCP server belong to different tenants")
         tenant_id = agent.tenant_id
+        await _assert_agent_refresh_is_isolated(db, server, agent_id)
 
     tenant_override, agent_override = await lookup_overrides(
         db,

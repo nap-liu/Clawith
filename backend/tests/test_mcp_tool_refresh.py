@@ -178,7 +178,13 @@ async def test_agent_refresh_uses_override_and_preserves_existing_assignment(mon
 
 
 async def test_global_refresh_creates_tools_without_agent_assignments(monkeypatch):
-    _user, _agent, server = await _make_agent()
+    user, _agent, server = await _make_agent()
+    async with async_session() as db:
+        server_row = (
+            await db.execute(select(MCPServer).where(MCPServer.id == server.id))
+        ).scalar_one()
+        server_row.created_by_user_id = user.id
+        await db.commit()
 
     class FakeClient:
         server_instructions = None
@@ -243,7 +249,15 @@ async def test_stdio_refresh_uses_sandbox_hub_and_cleans_up(monkeypatch):
         )
         db.add(seed_tool)
         await db.flush()
-        db.add(AgentTool(agent_id=agent.id, tool_id=seed_tool.id, enabled=True))
+        db.add(
+            AgentTool(
+                agent_id=agent.id,
+                tool_id=seed_tool.id,
+                enabled=True,
+                source="user_installed",
+                installed_by_agent_id=agent.id,
+            )
+        )
         await db.commit()
 
     class Settings:
@@ -415,6 +429,101 @@ async def test_agent_refresh_endpoint_uses_agent_scope_and_assigns_new_tools(cli
     }
 
 
+async def test_agent_refresh_endpoint_rejects_enterprise_server_before_discovery(client):
+    user, agent, server = await _make_agent()
+    async with async_session() as db:
+        server_row = (
+            await db.execute(select(MCPServer).where(MCPServer.id == server.id))
+        ).scalar_one()
+        server_row.created_by_user_id = user.id
+        tool = Tool(
+            name=f"mcp_{server.name}_enterprise",
+            display_name="Enterprise",
+            type="mcp",
+            category="mcp",
+            mcp_server_id=server.id,
+            mcp_server_name=server.name,
+            mcp_tool_name="enterprise",
+            source="admin",
+            tenant_id=server.tenant_id,
+        )
+        db.add(tool)
+        await db.flush()
+        db.add(
+            AgentTool(
+                agent_id=agent.id,
+                tool_id=tool.id,
+                enabled=True,
+                source="system",
+            )
+        )
+        await db.commit()
+
+    token = create_access_token(str(user.id), user.role)
+    with patch("app.services.mcp_refresh_service.MCPClient") as mcp_client:
+        response = await client.post(
+            f"/api/admin/mcp-servers/{server.id}/refresh-tools?agent_id={agent.id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 403
+    assert "administrator global refresh" in response.json()["detail"]
+    mcp_client.assert_not_called()
+
+
+async def test_agent_tool_refresh_rejects_server_shared_with_another_agent():
+    user, agent, server = await _make_agent()
+    async with async_session() as db:
+        other_agent = Agent(
+            name=f"Other_{uuid.uuid4().hex[:8]}",
+            creator_id=user.id,
+            tenant_id=agent.tenant_id,
+        )
+        db.add(other_agent)
+        tool = Tool(
+            name=f"mcp_{server.name}_shared",
+            display_name="Shared",
+            type="mcp",
+            category="mcp",
+            mcp_server_id=server.id,
+            mcp_server_name=server.name,
+            mcp_tool_name="shared",
+            source="agent",
+            tenant_id=server.tenant_id,
+        )
+        db.add(tool)
+        await db.flush()
+        db.add_all(
+            [
+                AgentTool(
+                    agent_id=agent.id,
+                    tool_id=tool.id,
+                    enabled=True,
+                    source="user_installed",
+                    installed_by_agent_id=agent.id,
+                ),
+                AgentTool(
+                    agent_id=other_agent.id,
+                    tool_id=tool.id,
+                    enabled=True,
+                    source="user_installed",
+                    installed_by_agent_id=other_agent.id,
+                ),
+            ]
+        )
+        await db.commit()
+
+    from app.services.agent_mcp_lifecycle import refresh_mcp_server
+
+    with patch("app.services.mcp_refresh_service.MCPClient") as mcp_client:
+        result = json.loads(await refresh_mcp_server(agent.id, server.id))
+
+    assert result["ok"] is False
+    assert result["error"] == "agent_refresh_not_isolated"
+    assert "inherited or shared MCP servers" in result["detail"]
+    mcp_client.assert_not_called()
+
+
 async def test_agent_tool_refresh_reuses_agent_scope_service():
     _user, agent, server = await _make_agent()
     async with async_session() as db:
@@ -431,11 +540,19 @@ async def test_agent_tool_refresh_reuses_agent_scope_service():
         )
         db.add(tool)
         await db.flush()
-        db.add(AgentTool(agent_id=agent.id, tool_id=tool.id, enabled=True))
+        db.add(
+            AgentTool(
+                agent_id=agent.id,
+                tool_id=tool.id,
+                enabled=True,
+                source="user_installed",
+                installed_by_agent_id=agent.id,
+            )
+        )
         await db.commit()
 
-    from app.services.mcp_refresh_service import MCPToolRefreshResult
     from app.services.agent_mcp_lifecycle import refresh_mcp_server
+    from app.services.mcp_refresh_service import MCPToolRefreshResult
 
     refreshed = MCPToolRefreshResult(discovered=2, created=1, updated=1, assigned=1)
     with patch(
