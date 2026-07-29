@@ -50,6 +50,15 @@ export interface TestConnectionResult {
   error: string | null;
 }
 
+export interface MCPToolRefreshResult {
+  success: boolean;
+  discovered: number;
+  created: number;
+  updated: number;
+  assigned: number;
+  effective: 'next_turn';
+}
+
 export interface MCPServerOverride {
   id: string;
   mcp_server_id: string;

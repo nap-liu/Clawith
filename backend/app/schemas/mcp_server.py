@@ -142,6 +142,17 @@ class TestConnectionResult(BaseModel):
     error: str | None = None
 
 
+class MCPToolRefreshResultOut(BaseModel):
+    """Response for POST /refresh-tools."""
+
+    success: bool
+    discovered: int
+    created: int
+    updated: int
+    assigned: int
+    effective: Literal["next_turn"] = "next_turn"
+
+
 class MCPServerOverridePut(BaseModel):
     """Request body for PUT /overrides/{scope}/{scope_id}.
 

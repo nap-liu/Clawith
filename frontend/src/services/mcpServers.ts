@@ -4,6 +4,7 @@ import type {
   MCPServerCreatePayload,
   MCPServerUpdatePayload,
   TestConnectionResult,
+  MCPToolRefreshResult,
   MCPServerOverride,
   MCPServerOverridePutPayload,
   OverridesGrouped,
@@ -30,6 +31,13 @@ export const mcpServersApi = {
     fetchJson<TestConnectionResult>(`/admin/mcp-servers/${id}/test-connection`, {
       method: 'POST',
     }),
+  refreshTools: (id: string, agentId?: string) => {
+    const qs = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : '';
+    return fetchJson<MCPToolRefreshResult>(
+      `/admin/mcp-servers/${id}/refresh-tools${qs}`,
+      { method: 'POST' },
+    );
+  },
 };
 
 export const mcpOverridesApi = {

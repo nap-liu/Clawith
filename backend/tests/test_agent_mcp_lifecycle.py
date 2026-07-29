@@ -361,6 +361,7 @@ def test_builtin_and_runtime_tool_contracts_are_exact_and_default():
         for item in AGENT_TOOLS
         if item.get("function", {}).get("name") in {
             "list_installed_mcp_servers",
+            "refresh_mcp_server",
             "uninstall_mcp_server",
         }
     }
@@ -369,7 +370,11 @@ def test_builtin_and_runtime_tool_contracts_are_exact_and_default():
         for item in BUILTIN_TOOLS
         if item.get("name") in runtime
     }
-    assert set(runtime) == {"list_installed_mcp_servers", "uninstall_mcp_server"}
+    assert set(runtime) == {
+        "list_installed_mcp_servers",
+        "refresh_mcp_server",
+        "uninstall_mcp_server",
+    }
     assert set(seeded) == set(runtime)
 
     list_schema = runtime["list_installed_mcp_servers"]["parameters"]
@@ -377,6 +382,9 @@ def test_builtin_and_runtime_tool_contracts_are_exact_and_default():
     uninstall_schema = runtime["uninstall_mcp_server"]["parameters"]
     assert uninstall_schema["required"] == ["mcp_server_id"]
     assert set(uninstall_schema["properties"]) == {"mcp_server_id"}
+    refresh_schema = runtime["refresh_mcp_server"]["parameters"]
+    assert refresh_schema["required"] == ["mcp_server_id"]
+    assert set(refresh_schema["properties"]) == {"mcp_server_id"}
     for name in runtime:
         assert seeded[name]["parameters_schema"] == runtime[name]["parameters"]
         assert seeded[name]["is_default"] is True

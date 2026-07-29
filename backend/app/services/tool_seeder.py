@@ -23,6 +23,7 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "jina_read",
     "update_objective",
     "list_installed_mcp_servers",
+    "refresh_mcp_server",
     "uninstall_mcp_server",
     # request_confirmation is OPT-IN (is_default=False); it was briefly seeded is_default=True,
     # so sync the correction to the DB on deploy (otherwise existing rows keep is_default=True).
@@ -1956,6 +1957,31 @@ BUILTIN_TOOLS = [
         "icon": "📋",
         "is_default": True,
         "parameters_schema": {"type": "object", "properties": {}, "required": []},
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
+        "name": "refresh_mcp_server",
+        "display_name": "Refresh MCP Server",
+        "description": (
+            "Refresh one MCP server's tool catalog using your effective Agent configuration. "
+            "Use the exact mcp_server_id returned by list_installed_mcp_servers. Existing tool "
+            "enablement and configuration are preserved; newly discovered tools become available "
+            "on your next turn."
+        ),
+        "category": "discovery",
+        "icon": "🔄",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "mcp_server_id": {
+                    "type": "string",
+                    "description": "Exact MCP server UUID. Names and fuzzy identifiers are not accepted.",
+                }
+            },
+            "required": ["mcp_server_id"],
+        },
         "config": {},
         "config_schema": {"fields": []},
     },

@@ -1,0 +1,456 @@
+"""Manual MCP tool refresh for global and Agent-scoped configurations."""
+
+import json
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+from sqlalchemy import select
+
+from app.core.security import create_access_token
+from app.database import async_session, engine
+from app.models.agent import Agent
+from app.models.mcp_server import MCPServer, MCPServerOverride
+from app.models.tenant import Tenant
+from app.models.tool import AgentTool, Tool
+from app.models.user import Identity, User
+
+pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture(autouse=True)
+async def _isolate():
+    await engine.dispose()
+    yield
+    await engine.dispose()
+
+
+async def _make_agent() -> tuple[User, Agent, MCPServer]:
+    suffix = uuid.uuid4().hex[:8]
+    async with async_session() as db:
+        tenant = Tenant(name=f"T_{suffix}", slug=f"t-{suffix}")
+        db.add(tenant)
+        await db.flush()
+        identity = Identity(
+            username=f"u_{suffix}",
+            email=f"u-{suffix}@x.local",
+            password_hash="x",
+        )
+        db.add(identity)
+        await db.flush()
+        user = User(
+            identity_id=identity.id,
+            display_name="Refresh Owner",
+            role="member",
+            is_active=True,
+            tenant_id=tenant.id,
+        )
+        db.add(user)
+        await db.flush()
+        agent = Agent(name=f"A_{suffix}", creator_id=user.id, tenant_id=tenant.id)
+        db.add(agent)
+        await db.flush()
+        server = MCPServer(
+            tenant_id=tenant.id,
+            name=f"refresh-{suffix}",
+            display_name="Refresh",
+            base_url_template="https://global.example/mcp",
+            headers_template={},
+        )
+        db.add(server)
+        await db.commit()
+        return user, agent, server
+
+
+async def test_agent_refresh_uses_override_and_preserves_existing_assignment(monkeypatch):
+    user, agent, server = await _make_agent()
+    async with async_session() as db:
+        db.add(
+            MCPServerOverride(
+                mcp_server_id=server.id,
+                scope_type="agent",
+                scope_id=agent.id,
+                url_template="https://agent.example/mcp",
+                headers_template={"X-Agent": "yes"},
+            )
+        )
+        existing = Tool(
+            name=f"mcp_{server.name}_run",
+            display_name="Run",
+            description="old",
+            type="mcp",
+            category="mcp",
+            parameters_schema={},
+            mcp_server_id=server.id,
+            mcp_server_name=server.name,
+            mcp_tool_name="run",
+            tenant_id=server.tenant_id,
+            source="agent",
+        )
+        db.add(existing)
+        await db.flush()
+        db.add(
+            AgentTool(
+                agent_id=agent.id,
+                tool_id=existing.id,
+                enabled=False,
+                source="user_installed",
+                installed_by_agent_id=agent.id,
+                config={"command": "existing-config"},
+            )
+        )
+        await db.commit()
+
+    captured: dict = {}
+
+    class FakeClient:
+        server_instructions = "Use refreshed tools."
+        server_info = {"name": "fake"}
+
+        def __init__(self, server_url, api_key=None, headers=None):
+            captured.update(url=server_url, api_key=api_key, headers=headers)
+
+        async def list_tools(self):
+            return [
+                {
+                    "name": "run",
+                    "description": "new description",
+                    "inputSchema": {"type": "object", "properties": {"value": {"type": "string"}}},
+                },
+                {
+                    "name": "new_tool",
+                    "description": "new tool",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+            ]
+
+    import app.services.mcp_refresh_service as refresh_service
+
+    monkeypatch.setattr(refresh_service, "MCPClient", FakeClient)
+    async with async_session() as db:
+        result = await refresh_service.refresh_mcp_server_tools(
+            db,
+            server.id,
+            agent_id=agent.id,
+            user_id=user.id,
+            assign_to_agent=True,
+        )
+        await db.commit()
+
+    assert captured == {
+        "url": "https://agent.example/mcp",
+        "api_key": None,
+        "headers": {"X-Agent": "yes"},
+    }
+    assert result.discovered == 2
+    assert result.created == 1
+    assert result.updated == 1
+    assert result.assigned == 1
+
+    async with async_session() as db:
+        tools = (
+            await db.execute(
+                select(Tool)
+                .where(Tool.mcp_server_id == server.id)
+                .order_by(Tool.mcp_tool_name)
+            )
+        ).scalars().all()
+        assert [tool.mcp_tool_name for tool in tools] == ["new_tool", "run"]
+        run = next(tool for tool in tools if tool.mcp_tool_name == "run")
+        new_tool = next(tool for tool in tools if tool.mcp_tool_name == "new_tool")
+        assert run.description == "new description"
+        assignments = (
+            await db.execute(
+                select(AgentTool).where(
+                    AgentTool.agent_id == agent.id,
+                    AgentTool.tool_id.in_([run.id, new_tool.id]),
+                )
+            )
+        ).scalars().all()
+        by_tool = {assignment.tool_id: assignment for assignment in assignments}
+        assert by_tool[run.id].enabled is False
+        assert by_tool[run.id].config == {"command": "existing-config"}
+        assert by_tool[new_tool.id].enabled is True
+        assert by_tool[new_tool.id].source == "user_installed"
+        assert by_tool[new_tool.id].installed_by_agent_id == agent.id
+        assert by_tool[new_tool.id].config == {"command": "existing-config"}
+
+
+async def test_global_refresh_creates_tools_without_agent_assignments(monkeypatch):
+    _user, _agent, server = await _make_agent()
+
+    class FakeClient:
+        server_instructions = None
+        server_info = {"name": "fake"}
+
+        def __init__(self, server_url, api_key=None, headers=None):
+            assert server_url == "https://global.example/mcp"
+
+        async def list_tools(self):
+            return [
+                {
+                    "name": "global_tool",
+                    "description": "global",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }
+            ]
+
+    import app.services.mcp_refresh_service as refresh_service
+
+    monkeypatch.setattr(refresh_service, "MCPClient", FakeClient)
+    async with async_session() as db:
+        result = await refresh_service.refresh_mcp_server_tools(db, server.id)
+        await db.commit()
+
+    assert result.created == 1
+    assert result.assigned == 0
+    async with async_session() as db:
+        tool = (
+            await db.execute(
+                select(Tool).where(
+                    Tool.mcp_server_id == server.id,
+                    Tool.mcp_tool_name == "global_tool",
+                )
+            )
+        ).scalar_one()
+        assert (
+            await db.execute(select(AgentTool).where(AgentTool.tool_id == tool.id))
+        ).scalar_one_or_none() is None
+
+
+async def test_stdio_refresh_uses_sandbox_hub_and_cleans_up(monkeypatch):
+    user, agent, server = await _make_agent()
+    async with async_session() as db:
+        row = (
+            await db.execute(select(MCPServer).where(MCPServer.id == server.id))
+        ).scalar_one()
+        row.transport = "stdio"
+        row.base_url_template = ""
+        row.command_template = "npx"
+        row.args_template = ["-y", "pkg"]
+        row.env_template = {"TOKEN": "value"}
+        seed_tool = Tool(
+            name=f"mcp_{row.name}_seed",
+            display_name="Seed",
+            type="mcp",
+            category="mcp",
+            mcp_server_id=row.id,
+            mcp_server_name=row.name,
+            mcp_tool_name="seed",
+            source="agent",
+            tenant_id=row.tenant_id,
+        )
+        db.add(seed_tool)
+        await db.flush()
+        db.add(AgentTool(agent_id=agent.id, tool_id=seed_tool.id, enabled=True))
+        await db.commit()
+
+    class Settings:
+        SANDBOX_API_URL = "http://sandbox:8080"
+        SANDBOX_API_KEY = "key"
+
+    import app.services.mcp_refresh_service as refresh_service
+
+    host = MagicMock()
+    host.ensure_registered = AsyncMock(return_value="entry__refresh")
+    host.deregister = AsyncMock()
+    hub = MagicMock()
+    hub.list_tools = AsyncMock(
+        return_value=[
+            {"name": "seed", "description": "updated", "inputSchema": {}},
+            {"name": "next", "description": "next", "inputSchema": {}},
+        ]
+    )
+    monkeypatch.setattr(refresh_service, "get_settings", lambda: Settings())
+    monkeypatch.setattr(refresh_service, "SandboxMcpHost", lambda *_: host)
+    monkeypatch.setattr(refresh_service, "SandboxMcpHubClient", lambda *_: hub)
+    monkeypatch.setattr(refresh_service, "_agent_workspace_root", lambda _agent_id: MagicMock(
+        resolve=lambda: "/data/agents/test",
+        mkdir=lambda **_kwargs: None,
+    ))
+
+    async with async_session() as db:
+        result = await refresh_service.refresh_mcp_server_tools(
+            db,
+            server.id,
+            agent_id=agent.id,
+            user_id=user.id,
+            assign_to_agent=True,
+        )
+        await db.commit()
+
+    assert result.discovered == 2
+    host.ensure_registered.assert_awaited_once()
+    hub.list_tools.assert_awaited_once_with("entry__refresh")
+    host.deregister.assert_awaited_once_with("entry__refresh")
+
+
+@pytest.fixture
+async def client():
+    from app.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
+async def test_refresh_endpoint_returns_counts(client):
+    suffix = uuid.uuid4().hex[:8]
+    async with async_session() as db:
+        identity = Identity(
+            username=f"admin_{suffix}",
+            email=f"admin-{suffix}@x.local",
+            password_hash="x",
+            is_platform_admin=True,
+        )
+        db.add(identity)
+        await db.flush()
+        admin = User(
+            identity_id=identity.id,
+            display_name="Admin",
+            role="platform_admin",
+            is_active=True,
+        )
+        db.add(admin)
+        server = MCPServer(
+            name=f"api-refresh-{suffix}",
+            display_name="API Refresh",
+            base_url_template="https://api.example/mcp",
+            headers_template={},
+        )
+        db.add(server)
+        await db.commit()
+        token = create_access_token(str(admin.id), "platform_admin")
+
+    class FakeClient:
+        server_instructions = None
+        server_info = {}
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def list_tools(self):
+            return [{"name": "one", "description": "one", "inputSchema": {}}]
+
+    with patch("app.services.mcp_refresh_service.MCPClient", FakeClient):
+        response = await client.post(
+            f"/api/admin/mcp-servers/{server.id}/refresh-tools",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "discovered": 1,
+        "created": 1,
+        "updated": 0,
+        "assigned": 0,
+        "effective": "next_turn",
+    }
+
+
+async def test_agent_refresh_endpoint_uses_agent_scope_and_assigns_new_tools(client):
+    user, agent, server = await _make_agent()
+    async with async_session() as db:
+        seed = Tool(
+            name=f"mcp_{server.name}_seed",
+            display_name="Seed",
+            type="mcp",
+            category="mcp",
+            mcp_server_id=server.id,
+            mcp_server_name=server.name,
+            mcp_tool_name="seed",
+            source="agent",
+            tenant_id=server.tenant_id,
+        )
+        db.add(seed)
+        await db.flush()
+        db.add(
+            AgentTool(
+                agent_id=agent.id,
+                tool_id=seed.id,
+                enabled=True,
+                source="user_installed",
+                installed_by_agent_id=agent.id,
+            )
+        )
+        db.add(
+            MCPServerOverride(
+                mcp_server_id=server.id,
+                scope_type="agent",
+                scope_id=agent.id,
+                url_template="https://agent-api.example/mcp",
+            )
+        )
+        await db.commit()
+    token = create_access_token(str(user.id), user.role)
+    requested_urls: list[str] = []
+
+    class FakeClient:
+        server_instructions = None
+        server_info = {}
+
+        def __init__(self, server_url, **_kwargs):
+            requested_urls.append(server_url)
+
+        async def list_tools(self):
+            return [{"name": "next", "description": "next", "inputSchema": {}}]
+
+    with patch("app.services.mcp_refresh_service.MCPClient", FakeClient):
+        response = await client.post(
+            f"/api/admin/mcp-servers/{server.id}/refresh-tools?agent_id={agent.id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 200
+    assert requested_urls == ["https://agent-api.example/mcp"]
+    assert response.json() == {
+        "success": True,
+        "discovered": 1,
+        "created": 1,
+        "updated": 0,
+        "assigned": 1,
+        "effective": "next_turn",
+    }
+
+
+async def test_agent_tool_refresh_reuses_agent_scope_service():
+    _user, agent, server = await _make_agent()
+    async with async_session() as db:
+        tool = Tool(
+            name=f"mcp_{server.name}_seed",
+            display_name="Seed",
+            type="mcp",
+            category="mcp",
+            mcp_server_id=server.id,
+            mcp_server_name=server.name,
+            mcp_tool_name="seed",
+            source="agent",
+            tenant_id=server.tenant_id,
+        )
+        db.add(tool)
+        await db.flush()
+        db.add(AgentTool(agent_id=agent.id, tool_id=tool.id, enabled=True))
+        await db.commit()
+
+    from app.services.mcp_refresh_service import MCPToolRefreshResult
+    from app.services.agent_mcp_lifecycle import refresh_mcp_server
+
+    refreshed = MCPToolRefreshResult(discovered=2, created=1, updated=1, assigned=1)
+    with patch(
+        "app.services.agent_mcp_lifecycle.refresh_mcp_server_tools",
+        AsyncMock(return_value=refreshed),
+    ) as refresh:
+        result = json.loads(await refresh_mcp_server(agent.id, server.id))
+
+    assert result == {
+        "ok": True,
+        "mcp_server_id": str(server.id),
+        "discovered": 2,
+        "created": 1,
+        "updated": 1,
+        "assigned": 1,
+        "effective": "next_turn",
+    }
+    refresh.assert_awaited_once()

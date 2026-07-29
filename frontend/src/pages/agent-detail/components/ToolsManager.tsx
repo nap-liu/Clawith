@@ -1056,7 +1056,10 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                     role={effectiveEditorRole(currentUser)}
                     titleSuffix={mcpEditor.toolDisplayName}
                     onClose={() => setMcpEditor(null)}
-                    onSaved={() => tmQueryClient.invalidateQueries({ queryKey: ['agent-tools', agentId] })}
+                    onSaved={() => {
+                        loadTools();
+                        tmQueryClient.invalidateQueries({ queryKey: ['agent-tools', agentId] });
+                    }}
                 />
             )}
         </>

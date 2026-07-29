@@ -16,6 +16,7 @@ from app.database import async_session
 from app.models.agent import Agent
 from app.models.tool import AgentTool, Tool
 from app.models.mcp_server import MCPServer
+from app.services.mcp_refresh_service import refresh_mcp_server_tools
 
 
 def _normalized_configs(
@@ -113,6 +114,85 @@ async def list_installed_mcp_servers(agent_id: uuid.UUID) -> str:
                 "Re-import the same MCP configuration to attach an exact server ID."
             )
         return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+
+async def refresh_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:
+    """Refresh one MCP server with the current Agent's effective configuration."""
+    async with async_session() as db:
+        agent = (
+            await db.execute(
+                select(Agent).where(Agent.id == agent_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if agent is None:
+            return json.dumps(
+                {"ok": False, "error": "agent_not_found"},
+                ensure_ascii=False,
+            )
+
+        server = (
+            await db.execute(select(MCPServer).where(MCPServer.id == server_id))
+        ).scalar_one_or_none()
+        if server is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "mcp_server_not_found",
+                    "mcp_server_id": str(server_id),
+                },
+                ensure_ascii=False,
+            )
+
+        assignment = (
+            await db.execute(
+                select(AgentTool.id)
+                .join(Tool, Tool.id == AgentTool.tool_id)
+                .where(
+                    AgentTool.agent_id == agent_id,
+                    Tool.mcp_server_id == server_id,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if assignment is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "not_installed_or_not_assigned",
+                    "mcp_server_id": str(server_id),
+                },
+                ensure_ascii=False,
+            )
+
+        try:
+            result = await refresh_mcp_server_tools(
+                db,
+                server_id,
+                agent_id=agent_id,
+                assign_to_agent=True,
+            )
+            await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "refresh_failed",
+                    "mcp_server_id": str(server_id),
+                    "detail": str(exc)[:500],
+                },
+                ensure_ascii=False,
+            )
+
+        return json.dumps(
+            {
+                "ok": True,
+                "mcp_server_id": str(server_id),
+                **result.to_dict(),
+                "effective": "next_turn",
+            },
+            ensure_ascii=False,
+        )
 
 
 async def uninstall_mcp_server(agent_id: uuid.UUID, server_id: uuid.UUID) -> str:

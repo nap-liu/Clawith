@@ -1,19 +1,26 @@
 import React, { useState } from 'react';
 import { IconCheck, IconAlertTriangle } from '@tabler/icons-react';
 import { mcpServersApi, mcpOverridesApi } from '../../services/mcpServers';
-import type { MCPServer, TestConnectionResult, DryRunResponse } from '../../types/mcpServer';
+import type {
+  MCPServer,
+  TestConnectionResult,
+  MCPToolRefreshResult,
+  DryRunResponse,
+} from '../../types/mcpServer';
 
 interface Props {
   server: MCPServer;
   agentId?: string;
+  onRefreshed?: () => void;
 }
 
 type Result =
   | { kind: 'connection'; body: TestConnectionResult; ok: boolean }
+  | { kind: 'refresh'; body: MCPToolRefreshResult; ok: boolean }
   | { kind: 'dry-run'; body: DryRunResponse; ok: boolean };
 
-export default function TestTab({ server, agentId }: Props) {
-  const [running, setRunning] = useState<'connection' | 'dry-run' | null>(null);
+export default function TestTab({ server, agentId, onRefreshed }: Props) {
+  const [running, setRunning] = useState<'connection' | 'refresh' | 'dry-run' | null>(null);
   const [result, setResult] = useState<Result | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
@@ -24,6 +31,21 @@ export default function TestTab({ server, agentId }: Props) {
     try {
       const body = await mcpServersApi.testConnection(server.id);
       setResult({ kind: 'connection', body, ok: !!body?.success });
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    } finally {
+      setRunning(null);
+    }
+  };
+
+  const refreshTools = async () => {
+    setRunning('refresh');
+    setErr(null);
+    setResult(null);
+    try {
+      const body = await mcpServersApi.refreshTools(server.id, agentId);
+      setResult({ kind: 'refresh', body, ok: !!body?.success });
+      if (body?.success) onRefreshed?.();
     } catch (e: any) {
       setErr(e?.message ?? String(e));
     } finally {
@@ -63,6 +85,18 @@ export default function TestTab({ server, agentId }: Props) {
           }}
         >
           {running === 'connection' ? '测试中…' : 'Test Connection'}
+        </button>
+        <button
+          onClick={refreshTools}
+          disabled={running !== null}
+          style={{
+            padding: '6px 14px', fontSize: 12,
+            border: '1px solid var(--border-subtle)', borderRadius: 6,
+            background: 'var(--bg-secondary)', color: 'var(--text-primary)',
+            cursor: running ? 'not-allowed' : 'pointer',
+          }}
+        >
+          {running === 'refresh' ? '刷新中…' : '刷新工具'}
         </button>
         <button
           onClick={dryRun}

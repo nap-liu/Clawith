@@ -22,12 +22,14 @@ from app.core.security import get_current_user, require_role
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.mcp_server import MCPServer, MCPServerOverride
+from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.schemas.mcp_server import (
     DryRunRequest,
     DryRunResponse,
     MCPServerCreate,
     MCPServerOut,
+    MCPToolRefreshResultOut,
     MCPServerUpdate,
     MCPServerOverridePut,
     MCPServerOverrideOut,
@@ -46,6 +48,7 @@ from app.services.placeholder_engine import (
 )
 from app.services.audit_logger import write_audit_log
 from app.services.mcp_client import MCPClient
+from app.services.mcp_refresh_service import refresh_mcp_server_tools
 from app.services.sandbox_mcp_host import SandboxMcpHost
 from app.services.sandbox_mcp_hub_client import SandboxMcpHubClient
 
@@ -347,6 +350,85 @@ async def _require_agent_override_access(
     ):
         return
     raise HTTPException(status_code=403, detail="not authorized for this agent override")
+
+
+@router.post("/{server_id}/refresh-tools", response_model=MCPToolRefreshResultOut)
+async def refresh_mcp_server_tool_catalog(
+    server_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    agent_id: uuid.UUID | None = None,
+) -> MCPToolRefreshResultOut:
+    """Refresh one server globally or with one Agent's effective configuration."""
+    server = (
+        await db.execute(select(MCPServer).where(MCPServer.id == server_id))
+    ).scalar_one_or_none()
+    if server is None:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+
+    if agent_id is None:
+        await _assert_can_edit_server(current_user, server)
+    else:
+        await _require_agent_override_access(current_user, agent_id, db)
+        assignment = (
+            await db.execute(
+                select(AgentTool.id)
+                .join(Tool, Tool.id == AgentTool.tool_id)
+                .where(
+                    AgentTool.agent_id == agent_id,
+                    Tool.mcp_server_id == server_id,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if assignment is None:
+            raise HTTPException(
+                status_code=403,
+                detail="MCP server is not assigned to this agent",
+            )
+
+    try:
+        result = await refresh_mcp_server_tools(
+            db,
+            server_id,
+            agent_id=agent_id,
+            user_id=current_user.id,
+            assign_to_agent=agent_id is not None,
+        )
+        await db.commit()
+    except (LookupError, PermissionError) as exc:
+        await db.rollback()
+        status_code = 404 if isinstance(exc, LookupError) else 403
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except Exception as exc:
+        await db.rollback()
+        await write_audit_log(
+            action="MCP_SERVER_REFRESH_TOOLS",
+            details={
+                "server_id": str(server_id),
+                "agent_id": str(agent_id) if agent_id else None,
+                "ok": False,
+                "error": str(exc)[:200],
+            },
+            user_id=current_user.id,
+        )
+        raise HTTPException(status_code=502, detail=f"MCP tool refresh failed: {exc}") from exc
+
+    await write_audit_log(
+        action="MCP_SERVER_REFRESH_TOOLS",
+        details={
+            "server_id": str(server_id),
+            "agent_id": str(agent_id) if agent_id else None,
+            "ok": True,
+            **result.to_dict(),
+        },
+        user_id=current_user.id,
+    )
+    return MCPToolRefreshResultOut(
+        success=True,
+        **result.to_dict(),
+        effective="next_turn",
+    )
 
 
 async def _upsert_override(

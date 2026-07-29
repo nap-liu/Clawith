@@ -119,7 +119,7 @@ export default function MCPServerEditor(props: MCPServerEditorProps) {
               {activeTab === 'basic' && <BasicTab server={server} role={role} agentId={agentId} onSaved={handleSaved} />}
               {activeTab === 'advanced' && <AdvancedTab server={server} role={role} agentId={agentId} onSaved={handleSaved} />}
               {activeTab === 'override' && agentId && <OverrideTab server={server} agentId={agentId} role={role} onSaved={handleSaved} />}
-              {activeTab === 'test' && <TestTab server={server} agentId={agentId} />}
+              {activeTab === 'test' && <TestTab server={server} agentId={agentId} onRefreshed={handleSaved} />}
             </>
           )}
         </div>

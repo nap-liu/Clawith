@@ -1786,6 +1786,23 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "refresh_mcp_server",
+            "description": "Refresh one MCP server's tool catalog using your effective Agent configuration. Use the exact mcp_server_id returned by list_installed_mcp_servers. Existing tool enablement and configuration are preserved; newly discovered tools become available on your next turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mcp_server_id": {
+                        "type": "string",
+                        "description": "Exact MCP server UUID. Names and fuzzy identifiers are not accepted.",
+                    }
+                },
+                "required": ["mcp_server_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "uninstall_mcp_server",
             "description": "Uninstall one MCP server from yourself using the exact mcp_server_id returned by list_installed_mcp_servers or import_mcp_server. This only removes your self-installed binding; enterprise/shared MCP definitions and other agents are never affected. The removal is effective immediately.",
             "parameters": {
@@ -3643,6 +3660,14 @@ async def execute_tool(
         elif tool_name == "list_installed_mcp_servers":
             from app.services.agent_mcp_lifecycle import list_installed_mcp_servers
             result = await list_installed_mcp_servers(agent_id)
+        elif tool_name == "refresh_mcp_server":
+            from app.services.agent_mcp_lifecycle import refresh_mcp_server
+            try:
+                _server_id = uuid.UUID(str(arguments.get("mcp_server_id") or ""))
+            except (ValueError, TypeError):
+                result = "❌ mcp_server_id must be an exact UUID from list_installed_mcp_servers."
+            else:
+                result = await refresh_mcp_server(agent_id, _server_id)
         elif tool_name == "uninstall_mcp_server":
             from app.services.agent_mcp_lifecycle import uninstall_mcp_server
             try:
