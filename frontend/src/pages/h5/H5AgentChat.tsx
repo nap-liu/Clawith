@@ -60,6 +60,12 @@ import {
 } from '../../utils/h5ContainerRuntime';
 import { resolveH5LinkAction } from '../../utils/h5LinkPolicy';
 import { installH5PageLifecycle } from '../../utils/h5PageLifecycle';
+import {
+    H5_LOGIN_MESSAGES,
+    formatH5LoginError,
+    isRememberedH5AuthCode,
+    rememberH5AuthCode,
+} from '../../utils/h5AuthSession';
 import { installThemeController, resolveThemeMode } from '../../utils/themeMode';
 import { insertSpeechTranscript, useSpeechInput } from '../../hooks/useSpeechInput';
 import {
@@ -550,16 +556,46 @@ export default function H5AgentChat() {
         if (code) {
             if (!provider) {
                 setAuthStatus('error');
-                setAuthError('缺少 OAuth provider 参数');
+                setAuthError(H5_LOGIN_MESSAGES.incomplete);
                 return;
             }
 
             const lockKey = `${provider}:${code}`;
             if (consumedExchangeCodes.has(lockKey)) {
                 setAuthStatus(existingToken ? 'ready' : 'error');
-                if (!existingToken) setAuthError('登录凭证已失效');
+                setAuthError(existingToken ? '' : H5_LOGIN_MESSAGES.expired);
                 return;
             }
+
+            if (isRememberedH5AuthCode(code)) {
+                if (!existingToken) {
+                    setAuthStatus('error');
+                    setAuthError(H5_LOGIN_MESSAGES.expired);
+                    return;
+                }
+
+                setAuthStatus('checking');
+                setAuthError('');
+                let active = true;
+                authApi.validateSession()
+                    .then((user) => {
+                        if (!active) return;
+                        setAuth(user, existingToken);
+                        setAuthStatus('ready');
+                        window.history.replaceState({}, '', cleanedOAuthAddress(window.location.href));
+                    })
+                    .catch((error: any) => {
+                        if (!active) return;
+                        if (error?.status === 401) {
+                            useAuthStore.getState().logout();
+                        }
+                        setAuthStatus('error');
+                        setAuthError(formatH5LoginError(error));
+                    });
+
+                return () => { active = false; };
+            }
+
             setAuthStatus('exchanging');
             setAuthError('');
 
@@ -574,14 +610,15 @@ export default function H5AgentChat() {
                 context: { agent_id: agentId },
             }).then((res) => {
                 if (!active) return;
-                setAuth(res.user, res.access_token);
+                rememberH5AuthCode(code);
                 consumedExchangeCodes.add(lockKey);
+                setAuth(res.user, res.access_token);
                 setAuthStatus('ready');
                 window.history.replaceState({}, '', cleanedOAuthAddress(window.location.href));
             }).catch((error: any) => {
                 if (!active) return;
                 setAuthStatus('error');
-                setAuthError(error?.message || '登录失败');
+                setAuthError(formatH5LoginError(error));
             });
 
             return () => { active = false; };
@@ -592,7 +629,7 @@ export default function H5AgentChat() {
             setAuthError('');
         } else {
             setAuthStatus('error');
-            setAuthError('缺少登录凭证');
+            setAuthError(H5_LOGIN_MESSAGES.expired);
         }
     }, [agentId, channel, code, oauthState, provider, setAuth, token]);
 

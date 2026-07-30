@@ -4,7 +4,15 @@ import type { Agent, TokenResponse, User, Task, ChatMessage } from '../types';
 
 const API_BASE = '/api';
 
-async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
+type RequestBehavior = {
+    redirectOnUnauthorized?: boolean;
+};
+
+async function request<T>(
+    url: string,
+    options: RequestInit = {},
+    behavior: RequestBehavior = {},
+): Promise<T> {
     const token = localStorage.getItem('token');
     const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -22,7 +30,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
             || url.startsWith('/auth/resend-verification')
             || url.startsWith('/auth/forgot-password')
             || url.startsWith('/auth/reset-password');
-        if (res.status === 401 && !isAuthEndpoint) {
+        if (res.status === 401 && !isAuthEndpoint && behavior.redirectOnUnauthorized !== false) {
             localStorage.removeItem('token');
             localStorage.removeItem('user');
             window.location.href = '/login';
@@ -175,6 +183,9 @@ export const authApi = {
         request<{ hint: string }>(`/auth/email-hint?username=${encodeURIComponent(username)}`),
 
     me: () => request<User>('/auth/me'),
+
+    validateSession: () =>
+        request<User>('/auth/me', {}, { redirectOnUnauthorized: false }),
 
     updateMe: (data: Partial<User>) =>
         request<User>('/auth/me', { method: 'PATCH', body: JSON.stringify(data) }),

@@ -1,0 +1,72 @@
+import assert from 'node:assert/strict';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { loadTypeScriptModule } from './load-typescript-module.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const {
+    H5_LOGIN_MESSAGES,
+    formatH5LoginError,
+    isRememberedH5AuthCode,
+    readLastH5AuthCode,
+    rememberH5AuthCode,
+} = loadTypeScriptModule(resolve(__dirname, '../src/utils/h5AuthSession.ts'));
+
+function createStorage() {
+    const values = new Map();
+    return {
+        getItem(key) {
+            return values.get(key) ?? null;
+        },
+        setItem(key, value) {
+            values.set(key, String(value));
+        },
+    };
+}
+
+const storage = createStorage();
+assert.equal(readLastH5AuthCode(storage), '');
+assert.equal(isRememberedH5AuthCode('once-code', storage), false);
+assert.equal(rememberH5AuthCode('once-code', storage), true);
+assert.equal(readLastH5AuthCode(storage), 'once-code');
+assert.equal(isRememberedH5AuthCode('once-code', storage), true);
+assert.equal(isRememberedH5AuthCode('new-code', storage), false);
+
+const blockedStorage = {
+    getItem() {
+        throw new Error('blocked');
+    },
+    setItem() {
+        throw new Error('blocked');
+    },
+};
+assert.equal(readLastH5AuthCode(blockedStorage), '');
+assert.equal(rememberH5AuthCode('once-code', blockedStorage), false);
+
+assert.equal(
+    formatH5LoginError(Object.assign(new Error('Invalid or expired token'), { status: 401 })),
+    '登录已失效，请返回重新进入',
+);
+assert.equal(
+    formatH5LoginError(Object.assign(new Error('OAuth provider rejected the authorization code'), { status: 400 })),
+    '登录链接已失效，请返回重新进入',
+);
+assert.equal(
+    formatH5LoginError(Object.assign(new Error('backend unavailable'), { status: 503 })),
+    '登录服务暂时不可用，请返回重新进入',
+);
+assert.equal(
+    formatH5LoginError(new TypeError('Failed to fetch')),
+    '登录服务暂时不可用，请返回重新进入',
+);
+assert.equal(
+    formatH5LoginError(new Error('unexpected English provider error')),
+    '登录失败，请返回重新进入',
+);
+
+for (const message of Object.values(H5_LOGIN_MESSAGES)) {
+    assert.match(message, /请返回重新进入$/);
+    assert.doesNotMatch(message, /小程序|重新打开|稍后重试/);
+}
+
+console.log('h5 auth session tests passed');
