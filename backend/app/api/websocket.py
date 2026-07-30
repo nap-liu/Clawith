@@ -4,13 +4,13 @@ import asyncio
 import json
 import re
 import uuid
-from datetime import datetime, timezone as tz
+from datetime import datetime, timedelta, timezone as tz
 from time import perf_counter
 
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging_config import set_trace_id
@@ -23,7 +23,7 @@ from app.core.permissions import (
 )
 from app.core.security import decode_access_token
 from app.database import async_session
-from app.models.agent import Agent
+from app.models.agent import Agent, AgentUserOnboarding
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.llm import LLMModel
@@ -32,14 +32,19 @@ from app.models.user import User
 from app.services.activity_logger import log_activity
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
 from app.services.auth_code_exchange import validate_platform_login_channel
+from app.services.chat_history import persist_initial_assistant_message_if_pristine
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.llm import call_llm_with_failover
 from app.services.onboarding import (
+    PHASE_COMPLETED,
+    PHASE_GREETED,
     PHASE_PENDING,
     OnboardingClaim,
+    claim_fixed_welcome_slot,
     claim_normal_first_turn,
     claim_onboarding_greeting,
     mark_onboarding_phase,
+    onboarding_claim_is_current,
     release_onboarding_claim,
     resolve_onboarding_eligibility,
     resolve_onboarding_prompt,
@@ -60,6 +65,7 @@ router = APIRouter(tags=["websocket"])
 
 MAX_LIVE_CODE_STREAM_CHARS = 120_000
 LIVE_CODE_TRUNCATED_NOTICE = "\n\n[... live output truncated; execution continues ...]\n"
+ONBOARDING_LEASE_REFRESH_SECONDS = 30.0
 LLM_FAILURE_PREFIXES = (
     "[LLM Error]",
     "[LLM call error]",
@@ -238,9 +244,10 @@ async def websocket_chat(
     session_id: str = Query(None),
     lang: str = Query("en"),
     channel: str = Query("web"),
+    scene: str | None = Query(None),
 ):
     """WebSocket endpoint for real-time chat with an agent."""
-    handler = WebSocketChatHandler(websocket, agent_id, token, session_id, lang, channel)
+    handler = WebSocketChatHandler(websocket, agent_id, token, session_id, lang, channel, scene)
     await handler.run()
 
 
@@ -255,6 +262,7 @@ class WebSocketChatHandler:
         session_id: str | None = None,
         lang: str = "en",
         channel: str = "web",
+        scene: str | None = None,
     ):
         self.websocket = websocket
         self.agent_id = agent_id
@@ -262,6 +270,9 @@ class WebSocketChatHandler:
         self.session_id_param = session_id
         self.lang = lang
         self.source_channel = validate_platform_login_channel(channel)
+        self.scene_key = scene
+        self.scene_manifest: dict | None = None
+        self.pending_initial_assistant: dict | None = None
 
         # State fields initialized during setup
         self.user: User | None = None
@@ -364,6 +375,7 @@ class WebSocketChatHandler:
                 self.welcome_message = self.agent.welcome_message or ""
                 self.ctx_size = self.agent.context_window_size or 100
                 self.user_display_name = (self.user.display_name or "").strip() or "there"
+                await self._load_scene_manifest(db)
                 logger.info(
                     f"[WS] Agent: {self.agent_name}, type: {self.agent_type}, model_id: {self.agent.primary_model_id}, ctx: {self.ctx_size}"
                 )
@@ -378,13 +390,19 @@ class WebSocketChatHandler:
 
                 # Load history messages
                 await self._load_history(db)
+                await self._prepare_initial_greeting(db, user_id)
                 onboarding_eligibility = await resolve_onboarding_eligibility(
                     db,
                     self.agent_id,
                     user_id,
                     uuid.UUID(self.conv_id),
                 )
-                self.onboarding_required = onboarding_eligibility.required
+                # A published scene welcome is already the authored first reply.
+                # Prefer it over the generated onboarding greeting so opening the
+                # scene does not spend tokens or create an extra model turn.
+                self.onboarding_required = self._resolve_onboarding_required(
+                    onboarding_eligibility.required
+                )
 
         except Exception as e:
             logger.exception(f"[WS] Setup error: {e}")
@@ -517,18 +535,115 @@ class WebSocketChatHandler:
             logger.info(f"[WS] Selected primary session {conv_id}")
         return conv_id
 
+    async def _load_scene_manifest(self, db: AsyncSession | None = None) -> None:
+        """Load the current scene revision without binding it to the session."""
+        self.scene_manifest = None
+        if not self.scene_key:
+            return
+        try:
+            from app.schemas.scene import validate_scene_key
+            from app.services.scene_service import (
+                get_scene,
+                scene_tool_enabled,
+                serialize_published_scene,
+            )
+
+            self.scene_key = validate_scene_key(self.scene_key)
+
+            async def _load(active_db: AsyncSession):
+                if not await scene_tool_enabled(active_db, self.agent_id):
+                    return None
+                found = await get_scene(active_db, self.agent_id, self.scene_key, enabled_only=True)
+                if not found:
+                    return None
+                scene, revision = found
+                return serialize_published_scene(scene, revision) if revision else None
+
+            if db is not None:
+                self.scene_manifest = await _load(db)
+            else:
+                async with async_session() as active_db:
+                    self.scene_manifest = await _load(active_db)
+        except (TypeError, ValueError):
+            logger.warning(f"[WS] Ignoring invalid scene key: {self.scene_key!r}")
+            self.scene_key = None
+        except Exception as exc:
+            logger.warning(f"[WS] Scene load failed (non-fatal): {exc}")
+
+    def _has_configured_scene_welcome(self) -> bool:
+        """Whether the published scene provides a fixed, user-visible greeting."""
+        if not self.scene_manifest:
+            return False
+        return bool(str(self.scene_manifest.get("welcome_message") or "").strip())
+
+    def _resolve_onboarding_required(self, onboarding_required: bool) -> bool:
+        """Make fixed scene greetings and generated onboarding strictly exclusive."""
+        return bool(onboarding_required and not self._has_configured_scene_welcome())
+
+    async def _prepare_initial_greeting(
+        self,
+        db: AsyncSession,
+        user_id: uuid.UUID,
+    ) -> None:
+        self.pending_initial_assistant = None
+        if self.history_messages or not self._has_configured_scene_welcome():
+            return
+        if not await claim_fixed_welcome_slot(db, self.agent_id, user_id):
+            logger.info(
+                "[WS] Fixed scene welcome skipped because onboarding already "
+                "published visible output"
+            )
+            return
+        self.pending_initial_assistant = {
+            "content": str(self.scene_manifest["welcome_message"]),
+            "message_meta": {
+                **self._scene_message_meta(),
+                "scene_welcome": True,
+            },
+        }
+        # The authored greeting owns the shared first-contact slot. The message
+        # itself is still written only with the first real user message through
+        # the standard ChatMessage persistence path.
+
+    def _scene_message_meta(self) -> dict:
+        if not self.scene_manifest:
+            return {}
+        return {
+            "scene_key": self.scene_manifest.get("scene_key"),
+            "scene_revision": self.scene_manifest.get("revision"),
+        }
+
     def _channel_context(self) -> dict:
         if self.source_channel in {"miniprogram", "wechat_miniprogram"}:
-            return {
+            context = {
                 "source_channel": self.source_channel,
                 "display_name": "小程序",
                 "client_surface": "mini-program web-view",
             }
-        return {
-            "source_channel": self.source_channel,
-            "display_name": "Web",
-            "client_surface": "desktop web",
-        }
+        else:
+            context = {
+                "source_channel": self.source_channel,
+                "display_name": "Web",
+                "client_surface": "desktop web",
+            }
+        if self.scene_manifest:
+            context.update(
+                {
+                    "scene_key": self.scene_manifest.get("scene_key"),
+                    "scene_revision": self.scene_manifest.get("revision"),
+                    "scene_system_prompts": [
+                        item
+                        for item in self.scene_manifest.get("system_prompts", [])
+                        if item.get("enabled", True)
+                    ],
+                    "scene_quick_actions": list(
+                        item
+                        for item in self.scene_manifest.get("quick_actions", [])
+                        if item.get("enabled", True)
+                    ),
+                }
+            )
+        return context
 
     async def _load_history(self, db: AsyncSession):
         """Loads and prepares history messages for the conversation via the shared
@@ -563,8 +678,13 @@ class WebSocketChatHandler:
     async def message_loop(self):
         """Core message processing loop."""
         # Send welcome message on new session (no history)
-        if self.welcome_message and not self.history_messages and not self.onboarding_required:
-            await self.websocket.send_json({"type": "done", "role": "assistant", "content": self.welcome_message})
+        initial_content = (
+            str(self.pending_initial_assistant["content"])
+            if self.pending_initial_assistant
+            else self.welcome_message
+        )
+        if initial_content and not self.history_messages and not self.onboarding_required:
+            await self.websocket.send_json({"type": "done", "role": "assistant", "content": initial_content})
 
         while True:
             data = await self.websocket.receive_json()
@@ -593,6 +713,10 @@ class WebSocketChatHandler:
                 )
                 continue
 
+            # Scene changes apply to the next turn. The session itself remains
+            # unchanged; the exact scene revision used is recorded on messages.
+            await self._load_scene_manifest()
+
             effective_llm_model = await self._resolve_effective_model(override_model_id)
 
             # Quota Checks
@@ -618,11 +742,14 @@ class WebSocketChatHandler:
 
             self.current_user_text = content
 
-            # Add user message to in-memory context
-            self.conversation.append({"role": "user", "content": content})
-
-            # Save user message to DB
-            turn_anchor_id, consumed_by_onmessage = await self._save_user_message(
+            # Persist the first fixed greeting, if any, in the same transaction
+            # as the first real user message. Opening a session alone never
+            # writes the greeting to history.
+            (
+                turn_anchor_id,
+                consumed_by_onmessage,
+                persisted_initial_assistant,
+            ) = await self._save_user_message(
                 content,
                 display_content,
                 file_name,
@@ -630,15 +757,25 @@ class WebSocketChatHandler:
                 client_message_id=(data.get("message_id") or data.get("client_message_id")),
             )
 
+            if persisted_initial_assistant is not None:
+                self.conversation.append(
+                    {
+                        "role": "assistant",
+                        "content": persisted_initial_assistant.content,
+                    }
+                )
+
             if consumed_by_onmessage:
                 # The durable inbound event belongs to one or more exact
                 # on_message subscriptions.  Their origin sessions will run
                 # the corresponding event turns; do not also answer it in this
                 # remote session.
-                if self.conversation and self.conversation[-1].get("role") == "user":
-                    self.conversation.pop()
                 await self._safe_send({"type": "done", "role": "assistant", "content": ""})
                 continue
+
+            # Add the real user message after any assistant-first greeting so
+            # the in-memory context matches durable history ordering.
+            self.conversation.append({"role": "user", "content": content})
 
             # OpenClaw routing check
             if self.agent_type == "openclaw":
@@ -664,6 +801,7 @@ class WebSocketChatHandler:
                 ) = await self._run_llm_and_stream(
                     effective_llm_model,
                     is_onboarding_trigger,
+                    onboarding_claim=onboarding_claim,
                     turn_anchor_id=turn_anchor_id,
                 )
             else:
@@ -730,7 +868,16 @@ class WebSocketChatHandler:
             self.conversation.append({"role": "assistant", "content": assistant_response})
 
             # Save assistant reply
-            await self._save_assistant_reply(assistant_response, thinking_content, turn_anchor_id=turn_anchor_id)
+            await self._save_assistant_reply(
+                assistant_response,
+                thinking_content,
+                turn_anchor_id=turn_anchor_id,
+                complete_onboarding=(
+                    is_onboarding_trigger
+                    and produced_output
+                    and self.source_channel != "web"
+                ),
+            )
 
             # Final 'done' packet — best-effort broadcast; a client that dropped
             # mid-turn gets the reply via history replay on reconnect instead.
@@ -853,7 +1000,7 @@ class WebSocketChatHandler:
         file_name: str,
         is_onboarding_trigger: bool,
         client_message_id: str | None = None,
-    ) -> tuple[uuid.UUID | None, bool]:
+    ) -> tuple[uuid.UUID | None, bool, ChatMessage | None]:
         """Saves user message to the database and updates session title/time."""
         has_image_marker = "[image_data:" in content
         if has_image_marker:
@@ -865,15 +1012,39 @@ class WebSocketChatHandler:
 
         if is_onboarding_trigger:
             logger.info("[WS] Onboarding trigger — skipping user-message persistence")
-            return None, False
+            return None, False, None
         else:
             from app.services.chat_history import ingest_incoming_chat_message
 
             async with async_session() as db:
-                _sess_r = await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(self.conv_id)))
+                _sess_r = await db.execute(
+                    select(ChatSession)
+                    .where(ChatSession.id == uuid.UUID(self.conv_id))
+                    .with_for_update()
+                )
                 _sess = _sess_r.scalar_one_or_none()
                 if _sess is None:
                     raise RuntimeError("chat session no longer exists")
+                initial_assistant = None
+                first_user_created_at = None
+                if self.pending_initial_assistant is not None:
+                    initial_assistant = await persist_initial_assistant_message_if_pristine(
+                        db,
+                        session=_sess,
+                        agent_id=self.agent_id,
+                        user_id=self.user.id,
+                        content=str(self.pending_initial_assistant["content"]),
+                        message_meta=dict(
+                            self.pending_initial_assistant.get("message_meta") or {}
+                        ),
+                    )
+                    if initial_assistant is not None:
+                        initial_created_at = (
+                            initial_assistant.created_at or datetime.now(tz.utc)
+                        )
+                        first_user_created_at = initial_created_at + timedelta(
+                            microseconds=1
+                        )
                 ingested = await ingest_incoming_chat_message(
                     db,
                     session=_sess,
@@ -884,6 +1055,8 @@ class WebSocketChatHandler:
                     provider_event_id=str(client_message_id or "") or None,
                     channel_config_id=_sess.id,
                     actor_ref=str(self.user.id),
+                    message_meta=self._scene_message_meta(),
+                    created_at=first_user_created_at,
                 )
                 # Update session
                 _now = datetime.now(tz.utc)
@@ -899,7 +1072,11 @@ class WebSocketChatHandler:
                         _sess.title = clean_title[:40] if clean_title else content[:40]
                 await db.commit()
             logger.info("[WS] User message saved")
-            return ingested.message.id, ingested.consumed_by_onmessage
+            return (
+                ingested.message.id,
+                ingested.consumed_by_onmessage,
+                initial_assistant,
+            )
 
     async def _route_openclaw(self, content: str):
         """Enqueues message for OpenClaw edge node poll."""
@@ -929,24 +1106,50 @@ class WebSocketChatHandler:
         effective_llm_model: LLMModel,
         is_onboarding_trigger: bool,
         *,
+        onboarding_claim: OnboardingClaim | None = None,
         turn_anchor_id: uuid.UUID | None = None,
     ) -> tuple[str, list[str], list[dict], str, bool]:
         """Calls the LLM and streams response chunks to WebSocket."""
         start_gen = perf_counter()
         partial_chunks: list[str] = []
         thinking_content: list[str] = []
+        onboarding_lease_task: asyncio.Task | None = None
+        onboarding_lease_lost = False
+
+        async def stop_onboarding_lease() -> None:
+            nonlocal onboarding_lease_task
+            if onboarding_lease_task is None:
+                return
+            lease_task = onboarding_lease_task
+            onboarding_lease_task = None
+            lease_task.cancel()
+            try:
+                await lease_task
+            except asyncio.CancelledError:
+                pass
+
         try:
             logger.info(f"[WS] Calling LLM {effective_llm_model.model} (streaming)...")
 
             # Accumulate partial content for abort handling
             # Set inside _call_with_failover when an onboarding prompt was injected
-            needs_onboarding_mark = False
+            onboarding_claimed_at = (
+                onboarding_claim.claimed_at if onboarding_claim else None
+            )
+            needs_onboarding_mark = bool(
+                is_onboarding_trigger and onboarding_claimed_at is not None
+            )
             onboarding_target_phase = "completed"
-            onboarding_expected_phase: str | None = None
+            onboarding_expected_phase: str | None = (
+                PHASE_PENDING if needs_onboarding_mark else None
+            )
             onboarding_mark_done = False
+            onboarding_visible_output_started = False
+            onboarding_lease_refreshed_at = 0.0
 
             async def maybe_mark_onboarding_progress() -> bool:
-                nonlocal onboarding_mark_done
+                nonlocal onboarding_mark_done, onboarding_lease_refreshed_at
+                nonlocal onboarding_lease_task
                 if not needs_onboarding_mark or onboarding_mark_done:
                     return True
                 try:
@@ -957,6 +1160,7 @@ class WebSocketChatHandler:
                             self.user.id,
                             onboarding_target_phase,
                             expected_phase=onboarding_expected_phase,
+                            expected_onboarded_at=onboarding_claimed_at,
                         )
                     if not advanced:
                         logger.info(
@@ -965,6 +1169,11 @@ class WebSocketChatHandler:
                         )
                         return False
                     onboarding_mark_done = True
+                    onboarding_lease_refreshed_at = perf_counter()
+                    if onboarding_target_phase == PHASE_GREETED:
+                        onboarding_lease_task = asyncio.create_task(
+                            maintain_onboarding_lease()
+                        )
                     # Tell the frontend to refresh its cached agent record
                     await self._safe_send(
                         {
@@ -977,9 +1186,67 @@ class WebSocketChatHandler:
                     logger.warning(f"[WS] mark_onboarded failed: {_ob_err}")
                     return False
 
+            async def maybe_refresh_onboarding_lease(*, force: bool = False) -> bool:
+                """Keep an unpublished greeting reserved during a long stream."""
+                nonlocal onboarding_lease_refreshed_at, onboarding_lease_lost
+                if onboarding_lease_lost:
+                    return False
+                if (
+                    not onboarding_mark_done
+                    or onboarding_target_phase != PHASE_GREETED
+                    or (
+                        not force
+                        and perf_counter() - onboarding_lease_refreshed_at
+                        < ONBOARDING_LEASE_REFRESH_SECONDS
+                    )
+                ):
+                    return True
+                try:
+                    async with async_session() as _lease_db:
+                        refreshed = await mark_onboarding_phase(
+                            _lease_db,
+                            self.agent_id,
+                            self.user.id,
+                            PHASE_GREETED,
+                            expected_phase=PHASE_GREETED,
+                        )
+                    if not refreshed:
+                        logger.info(
+                            "[WS] Onboarding greeting lease changed before "
+                            "assistant persistence"
+                        )
+                        onboarding_lease_lost = True
+                        return False
+                    onboarding_lease_refreshed_at = perf_counter()
+                    return True
+                except Exception as _lease_err:
+                    logger.warning(
+                        f"[WS] Onboarding greeting lease refresh failed: {_lease_err}"
+                    )
+                    onboarding_lease_lost = True
+                    return False
+
+            async def maintain_onboarding_lease() -> None:
+                """Renew independently even while the model stream is silent."""
+                while True:
+                    await asyncio.sleep(ONBOARDING_LEASE_REFRESH_SECONDS)
+                    if not await maybe_refresh_onboarding_lease(force=True):
+                        return
+
+            async def reserve_visible_output() -> bool:
+                """Reserve first-contact ownership before any visible callback."""
+                nonlocal onboarding_visible_output_started
+                if not await maybe_mark_onboarding_progress():
+                    return False
+                if not await maybe_refresh_onboarding_lease():
+                    return False
+                if is_onboarding_trigger:
+                    onboarding_visible_output_started = True
+                return True
+
             async def stream_to_ws(text: str):
                 """Send each chunk to client in real-time."""
-                if not await maybe_mark_onboarding_progress():
+                if not await reserve_visible_output():
                     raise RuntimeError("Onboarding claim lost before first output")
                 partial_chunks.append(text)
                 await self._safe_send({"type": "chunk", "content": text})
@@ -987,9 +1254,8 @@ class WebSocketChatHandler:
             async def tool_call_to_ws(data: dict):
                 """Send tool call info to client and persist completed ones."""
                 public_data = {k: v for k, v in data.items() if not k.startswith("_")}
-                if public_data.get("status") in {"running", "done"}:
-                    if not await maybe_mark_onboarding_progress():
-                        raise RuntimeError("Onboarding claim lost before tool output")
+                if not await reserve_visible_output():
+                    raise RuntimeError("Onboarding claim lost before tool output")
                 if public_data.get("status") == "done":
                     # Inject Live Preview & Workspace Activities
                     await self._inject_live_preview_and_workspace_metadata(public_data)
@@ -1011,6 +1277,8 @@ class WebSocketChatHandler:
             # Track thinking content for storage
             async def thinking_to_ws(text: str):
                 """Send thinking chunks to client for collapsible display."""
+                if not await reserve_visible_output():
+                    raise RuntimeError("Onboarding claim lost before thinking output")
                 thinking_content.append(text)
                 await self._safe_send({"type": "thinking", "content": text})
 
@@ -1045,6 +1313,8 @@ class WebSocketChatHandler:
                 draft_id = str(data.get("id") or f"draft-{data.get('index', 0)}")
                 if _workspace_draft_cache.get(draft_id) == raw_args:
                     return
+                if not await reserve_visible_output():
+                    raise RuntimeError("Onboarding claim lost before tool draft output")
                 _workspace_draft_cache[draft_id] = raw_args
 
                 await self._safe_send(
@@ -1061,7 +1331,30 @@ class WebSocketChatHandler:
             async def _call_with_failover():
                 nonlocal needs_onboarding_mark, onboarding_expected_phase, onboarding_target_phase
 
+                # A synthetic greeting owns one exact pending claim. Another
+                # connection may legitimately complete that first-contact slot
+                # before this model call begins (for example by selecting a
+                # fixed welcome message). Abort before spending a turn in that
+                # case; a later race is still stopped by the exact-token CAS
+                # before the first output is published.
+                if is_onboarding_trigger and onboarding_claimed_at is not None:
+                    async with async_session() as _claim_db:
+                        claim_is_current = await onboarding_claim_is_current(
+                            _claim_db,
+                            self.agent_id,
+                            self.user.id,
+                            onboarding_claimed_at,
+                        )
+                    if not claim_is_current:
+                        raise RuntimeError(
+                            "Onboarding claim lost before model invocation"
+                        )
+
                 async def _on_failover(reason: str):
+                    if not await reserve_visible_output():
+                        raise RuntimeError(
+                            "Onboarding claim lost before failover output"
+                        )
                     await self._safe_send({"type": "info", "content": f"Primary model error, {reason}"})
 
                 # History loading is turn-aware, so do not re-apply a row/message
@@ -1096,6 +1389,14 @@ class WebSocketChatHandler:
                             skip_tools_for_greeting = True
                 except Exception as _onb_err:
                     logger.warning(f"[WS] Onboarding prompt resolve failed (non-fatal): {_onb_err}")
+                    if is_onboarding_trigger:
+                        raise RuntimeError(
+                            "Onboarding prompt could not be resolved"
+                        ) from _onb_err
+                if is_onboarding_trigger and _onb is None:
+                    raise RuntimeError(
+                        "Onboarding claim changed before prompt resolution"
+                    )
 
                 context_recovery = None
                 if turn_anchor_id is not None and persisted_view:
@@ -1154,6 +1455,10 @@ class WebSocketChatHandler:
                 async def code_output_to_ws(text: str, label: str = "stdout"):
                     """Stream execute_code output chunks to the frontend live panel in real-time."""
                     nonlocal live_code_chars_sent, live_code_truncated_sent
+                    if not await reserve_visible_output():
+                        raise RuntimeError(
+                            "Onboarding claim lost before code output"
+                        )
                     try:
                         remaining = MAX_LIVE_CODE_STREAM_CHARS - live_code_chars_sent
                         if remaining <= 0:
@@ -1240,13 +1545,24 @@ class WebSocketChatHandler:
             # invoking the chunk callback, so close that gap at successful
             # completion before the pending claim is released.
             if not aborted and is_onboarding_trigger and assistant_response:
-                if not await maybe_mark_onboarding_progress():
+                if not await reserve_visible_output():
                     raise RuntimeError("Onboarding claim lost before completion")
 
             # Post-success actions (last_active_at, quota usage increments, activity logs)
             await self._update_activity_and_quota(assistant_response)
+            await maybe_refresh_onboarding_lease(force=True)
+            await stop_onboarding_lease()
 
-            produced_output = bool(partial_chunks) or (not aborted and bool(assistant_response))
+            # This must be the final lease check: no await is allowed between
+            # it and the return. The renewer has already been stopped above.
+            if is_onboarding_trigger and onboarding_lease_lost:
+                return "", thinking_content, queued_messages, "aborted", False
+
+            produced_output = (
+                bool(partial_chunks)
+                or (not aborted and bool(assistant_response))
+                or onboarding_visible_output_started
+            )
             return assistant_response, thinking_content, queued_messages, _turn_outcome, produced_output
 
         except WebSocketDisconnect:
@@ -1254,16 +1570,30 @@ class WebSocketChatHandler:
         except Exception as e:
             gen_duration = perf_counter() - start_gen
             logger.exception(f"[WS] LLM error after {gen_duration:.3f}s: {e}")
-            if is_onboarding_trigger and partial_chunks:
+            await stop_onboarding_lease()
+            if is_onboarding_trigger and onboarding_lease_lost:
+                return "", thinking_content, [], "aborted", False
+            if is_onboarding_trigger and (
+                partial_chunks or onboarding_visible_output_started
+            ):
                 partial_response = "".join(partial_chunks).strip()
+                if not partial_response:
+                    partial_response = "*[Welcome generation interrupted]*"
                 return (
-                    partial_response + "\n\n*[Welcome generation interrupted]*",
+                    (
+                        partial_response
+                        if partial_response.endswith("*[Welcome generation interrupted]*")
+                        else partial_response
+                        + "\n\n*[Welcome generation interrupted]*"
+                    ),
                     thinking_content,
                     [],
                     "failed",
                     True,
                 )
             return f"[LLM call error] {str(e)[:200]}", [], [], "failed", False
+        finally:
+            await stop_onboarding_lease()
 
     async def _inject_live_preview_and_workspace_metadata(self, data: dict):
         """Injects live previews and workspace panel activity tracking into tool results."""
@@ -1403,6 +1733,7 @@ class WebSocketChatHandler:
         thinking_content: list[str],
         *,
         turn_anchor_id: uuid.UUID | None = None,
+        complete_onboarding: bool = False,
     ):
         """Saves assistant reply to DB."""
         async with async_session() as db:
@@ -1417,12 +1748,27 @@ class WebSocketChatHandler:
                     {
                         "turn_anchor_id": str(turn_anchor_id),
                         "turn_status": "completed",
+                        **self._scene_message_meta(),
                     }
                     if turn_anchor_id is not None
-                    else {}
+                    else self._scene_message_meta()
                 ),
             )
             db.add(assistant_msg)
+            if complete_onboarding:
+                completed = await db.execute(
+                    update(AgentUserOnboarding)
+                    .where(
+                        AgentUserOnboarding.agent_id == self.agent_id,
+                        AgentUserOnboarding.user_id == self.user.id,
+                        AgentUserOnboarding.phase == PHASE_GREETED,
+                    )
+                    .values(phase=PHASE_COMPLETED)
+                )
+                if not completed.rowcount:
+                    raise RuntimeError(
+                        "Onboarding state changed before assistant persistence"
+                    )
             await maybe_mark_session_read_for_active_viewer(
                 db,
                 agent_id=self.agent_id,

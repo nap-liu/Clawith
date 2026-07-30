@@ -7,11 +7,13 @@ import {
     IconChevronDown,
     IconHistory,
     IconLoader2,
+    IconMenu2,
     IconMicrophone,
     IconPaperclip,
     IconPlayerStopFilled,
     IconPlus,
     IconRefresh,
+    IconSearch,
     IconSend,
     IconX,
 } from '@tabler/icons-react';
@@ -21,7 +23,17 @@ import ConfirmationCard from '../../components/ConfirmationCard';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
 import { useToast } from '../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../stores';
-import { agentApi, authApi, chatSessionApi, enterpriseApi, tenantApi, uploadFileWithProgress } from '../../services/api';
+import {
+    agentApi,
+    authApi,
+    chatSessionApi,
+    enterpriseApi,
+    sceneApi,
+    tenantApi,
+    uploadFileWithProgress,
+    type Scene,
+    type SceneQuickAction,
+} from '../../services/api';
 import type { Agent, TokenResponse } from '../../types';
 import {
     buildChatAttachmentPayload,
@@ -37,6 +49,10 @@ import {
     type ChatPreviewImage,
     type ChatModelOption,
 } from '../../utils/chatAttachments';
+import {
+    enabledSceneQuickActions,
+    findEnabledSceneQuickAction,
+} from '../../utils/sceneQuickActions';
 import {
     applyAssistantStreamMessage,
     buildH5ConversationEntries,
@@ -89,6 +105,7 @@ type H5SessionSummary = {
 };
 
 const VIRTUALIZE_ENTRY_THRESHOLD = 40;
+const QUICK_ACTIONS_MENU_CLOSE_MS = 180;
 
 const OAUTH_TRANSIENT_PARAMS = [
     'code',
@@ -230,7 +247,7 @@ function h5SessionChannelLabel(channel: string) {
     const labels: Record<string, string> = {
         web: 'Web',
         miniprogram: '小程序',
-        wechat_miniprogram: '微信小程序',
+        wechat_miniprogram: '小程序',
         feishu: '飞书',
         dingtalk: '钉钉',
         wecom: '企业微信',
@@ -350,6 +367,7 @@ export default function H5AgentChat() {
     const oauthState = useMemo(() => new URLSearchParams(searchString).get('state'), [searchString]);
     const themeMode = useMemo(() => parseH5Theme(new URLSearchParams(searchString).get('theme')), [searchString]);
     const initialSessionId = useMemo(() => parseChatSessionId(new URLSearchParams(searchString).get('session_id')), [searchString]);
+    const sceneKey = useMemo(() => new URLSearchParams(searchString).get('scene') || 'default', [searchString]);
     const [resolvedTheme, setResolvedTheme] = useState(() => resolveThemeMode(themeMode));
     const [containerRuntime, setContainerRuntime] = useState<H5ContainerRuntime | 'detecting'>('detecting');
 
@@ -360,6 +378,11 @@ export default function H5AgentChat() {
     const [authError, setAuthError] = useState('');
     const [agent, setAgent] = useState<Agent | null>(null);
     const [agentError, setAgentError] = useState('');
+    const [sceneManifest, setSceneManifest] = useState<Scene | null>(null);
+    const [quickActionsOverflow, setQuickActionsOverflow] = useState(false);
+    const [quickActionsMenuOpen, setQuickActionsMenuOpen] = useState(false);
+    const [quickActionsMenuClosing, setQuickActionsMenuClosing] = useState(false);
+    const [quickActionSearch, setQuickActionSearch] = useState('');
     const [messages, setMessages] = useState<H5ChatMessage[]>([]);
     const [input, setInput] = useState('');
     const [sessionId, setSessionId] = useState<string | null>(initialSessionId);
@@ -384,6 +407,9 @@ export default function H5AgentChat() {
     const [imagePreview, setImagePreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
 
     const wsRef = useRef<WebSocket | null>(null);
+    const sceneManifestRef = useRef<Scene | null>(null);
+    const sceneManifestRequestRef = useRef(0);
+    const quickActionActivationRef = useRef(false);
     const sessionIdRef = useRef<string | null>(initialSessionId);
     const reconnectTimerRef = useRef<number | null>(null);
     const resumeReconnectTimerRef = useRef<number | null>(null);
@@ -396,6 +422,10 @@ export default function H5AgentChat() {
     const unmountedRef = useRef(false);
     const messagesEndRef = useRef<HTMLDivElement | null>(null);
     const messagesScrollerRef = useRef<HTMLElement | null>(null);
+    const quickActionsRef = useRef<HTMLDivElement | null>(null);
+    const quickActionsMenuCloseTimerRef = useRef<number | null>(null);
+    const messageDispatchLockedRef = useRef(false);
+    const messageRuntimeBlockedRef = useRef(false);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const uploadAbortRef = useRef<Map<string, () => void>>(new Map());
@@ -404,6 +434,31 @@ export default function H5AgentChat() {
     const speechSelectionCapturedRef = useRef(false);
     const inputSelectionRef = useRef({ start: 0, end: 0, hasPosition: false });
     const containerRuntimeDetectionRef = useRef<Promise<H5ContainerRuntime> | null>(null);
+
+    const openQuickActionsMenu = useCallback(() => {
+        if (quickActionsMenuCloseTimerRef.current !== null) {
+            window.clearTimeout(quickActionsMenuCloseTimerRef.current);
+            quickActionsMenuCloseTimerRef.current = null;
+        }
+        setQuickActionsMenuClosing(false);
+        setQuickActionsMenuOpen(true);
+    }, []);
+
+    const closeQuickActionsMenu = useCallback(() => {
+        if (!quickActionsMenuOpen || quickActionsMenuClosing) return;
+        setQuickActionsMenuClosing(true);
+        quickActionsMenuCloseTimerRef.current = window.setTimeout(() => {
+            setQuickActionsMenuOpen(false);
+            setQuickActionsMenuClosing(false);
+            quickActionsMenuCloseTimerRef.current = null;
+        }, QUICK_ACTIONS_MENU_CLOSE_MS);
+    }, [quickActionsMenuClosing, quickActionsMenuOpen]);
+
+    useEffect(() => () => {
+        if (quickActionsMenuCloseTimerRef.current !== null) {
+            window.clearTimeout(quickActionsMenuCloseTimerRef.current);
+        }
+    }, []);
 
     const ensureContainerRuntime = useCallback(() => {
         if (!containerRuntimeDetectionRef.current) {
@@ -647,6 +702,94 @@ export default function H5AgentChat() {
         return () => { cancelled = true; };
     }, [agentId, authStatus, token]);
 
+    const refreshSceneManifest = useCallback(async () => {
+        if (authStatus !== 'ready' || !agentId || !token) return null;
+        const requestId = ++sceneManifestRequestRef.current;
+        try {
+            const loaded = await sceneApi.manifest(agentId, sceneKey);
+            const manifest = loaded.enabled ? loaded : null;
+            if (requestId === sceneManifestRequestRef.current) {
+                sceneManifestRef.current = manifest;
+                setSceneManifest(manifest);
+            }
+            return requestId === sceneManifestRequestRef.current
+                ? manifest
+                : sceneManifestRef.current;
+        } catch {
+            if (requestId === sceneManifestRequestRef.current) {
+                sceneManifestRef.current = null;
+                setSceneManifest(null);
+            }
+            return null;
+        }
+    }, [agentId, authStatus, sceneKey, token]);
+
+    useEffect(() => {
+        void refreshSceneManifest();
+        return () => {
+            sceneManifestRequestRef.current += 1;
+        };
+    }, [refreshSceneManifest]);
+
+    useEffect(() => {
+        if (pageResumeRevision === 0) return;
+        void refreshSceneManifest();
+    }, [pageResumeRevision, refreshSceneManifest]);
+
+    const activeQuickActions = useMemo(
+        () => enabledSceneQuickActions(sceneManifest?.quick_actions),
+        [sceneManifest?.quick_actions],
+    );
+
+    useLayoutEffect(() => {
+        const element = quickActionsRef.current;
+        if (!element || activeQuickActions.length === 0) {
+            setQuickActionsOverflow(false);
+            return;
+        }
+        const measure = () => {
+            const reservedMenuSpace = Number.parseFloat(
+                window.getComputedStyle(element).paddingRight,
+            ) || 0;
+            setQuickActionsOverflow(
+                element.scrollWidth - reservedMenuSpace > element.clientWidth + 1,
+            );
+        };
+        const frame = window.requestAnimationFrame(measure);
+        const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+        observer?.observe(element);
+        window.addEventListener('resize', measure);
+        return () => {
+            window.cancelAnimationFrame(frame);
+            observer?.disconnect();
+            window.removeEventListener('resize', measure);
+        };
+    }, [activeQuickActions]);
+
+    useEffect(() => {
+        if (quickActionsMenuCloseTimerRef.current !== null) {
+            window.clearTimeout(quickActionsMenuCloseTimerRef.current);
+            quickActionsMenuCloseTimerRef.current = null;
+        }
+        setQuickActionsMenuOpen(false);
+        setQuickActionsMenuClosing(false);
+        setQuickActionSearch('');
+    }, [sceneManifest?.scene_key, sceneManifest?.revision]);
+
+    useEffect(() => {
+        if (!quickActionsMenuOpen) return;
+        const closeOnEscape = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') closeQuickActionsMenu();
+        };
+        const previousOverflow = document.body.style.overflow;
+        document.body.style.overflow = 'hidden';
+        window.addEventListener('keydown', closeOnEscape);
+        return () => {
+            document.body.style.overflow = previousOverflow;
+            window.removeEventListener('keydown', closeOnEscape);
+        };
+    }, [closeQuickActionsMenu, quickActionsMenuOpen]);
+
     useEffect(() => {
         if (authStatus !== 'ready' || !token) return;
         let cancelled = false;
@@ -778,6 +921,7 @@ export default function H5AgentChat() {
             sessionIdRef.current = nextSessionId;
             setSessionId(nextSessionId);
             setConnectionStatus('connected');
+            void refreshSceneManifest();
             if (data.onboarding_required === true) {
                 setIsWaiting(true);
                 setIsStreaming(false);
@@ -860,7 +1004,7 @@ export default function H5AgentChat() {
                 created_at: new Date().toISOString(),
             }]);
         }
-    }, [clearSocketConnectTimer, loadHistory]);
+    }, [clearSocketConnectTimer, loadHistory, refreshSceneManifest]);
 
     const openSocket = useCallback((requestedSessionId?: string | null) => {
         if (
@@ -882,6 +1026,7 @@ export default function H5AgentChat() {
             token,
             lang: navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en',
             channel,
+            scene: sceneKey,
         });
         const effectiveSessionId = requestedSessionId || sessionIdRef.current;
         if (effectiveSessionId) params.set('session_id', effectiveSessionId);
@@ -938,6 +1083,7 @@ export default function H5AgentChat() {
         closeCurrentSocket,
         handleSocketMessage,
         scheduleReconnect,
+        sceneKey,
         token,
     ]);
 
@@ -1260,13 +1406,26 @@ export default function H5AgentChat() {
         onStart: handleOnboardingStart,
     });
 
-    const sendMessage = useCallback(async () => {
-        const content = input.trim();
-        if ((!content && attachedFiles.length === 0) || isWaiting || isStreaming || isStopping || isStartingNew || isSwitchingSession || uploadDrafts.length > 0 || speech.isActive) return;
+    const dispatchMessage = useCallback(async (
+        rawContent: string,
+        files: ChatAttachedFile[],
+        consumeComposer: boolean,
+    ) => {
+        const content = rawContent.trim();
+        if (
+            (!content && files.length === 0)
+            || messageDispatchLockedRef.current
+            || messageRuntimeBlockedRef.current
+        ) return;
+        messageDispatchLockedRef.current = true;
 
-        if (attachedFiles.length === 0 && (content === '/new' || content === '/reset')) {
-            setInput('');
-            await startNewSession();
+        if (files.length === 0 && (content === '/new' || content === '/reset')) {
+            if (consumeComposer) setInput('');
+            try {
+                await startNewSession();
+            } finally {
+                messageDispatchLockedRef.current = false;
+            }
             return;
         }
 
@@ -1279,16 +1438,18 @@ export default function H5AgentChat() {
                 created_at: new Date().toISOString(),
             }]);
             openSocket(sessionIdRef.current);
+            messageDispatchLockedRef.current = false;
             return;
         }
 
         const payload = buildChatAttachmentPayload({
             input: content,
-            attachments: attachedFiles,
-            supportsVision: effectiveModelSupportsVision || attachedFiles.some((file) => !!file.imageUrl),
+            attachments: files,
+            supportsVision: effectiveModelSupportsVision || files.some((file) => !!file.imageUrl),
         });
+        const messageId = makeId();
         setMessages((prev) => [...prev, {
-            id: makeId(),
+            id: messageId,
             role: 'user',
             content: stripAttachmentDisplayPrefix(payload.userMsg),
             fileName: payload.fileName,
@@ -1296,17 +1457,25 @@ export default function H5AgentChat() {
             previewImages: payload.previewImages,
             created_at: new Date().toISOString(),
         }]);
-        setInput('');
-        setAttachedFiles([]);
+        if (consumeComposer) {
+            setInput('');
+            setAttachedFiles([]);
+        }
         setIsWaiting(true);
         setIsStreaming(false);
         ws.send(JSON.stringify({
+            message_id: messageId,
             content: payload.contentForLLM,
             display_content: payload.userMsg,
             file_name: payload.fileName,
             model_id: effectiveModelId,
         }));
-    }, [attachedFiles, effectiveModelId, effectiveModelSupportsVision, input, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
+    }, [effectiveModelId, effectiveModelSupportsVision, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
+
+    const sendMessage = useCallback(
+        () => dispatchMessage(input, attachedFiles, true),
+        [attachedFiles, dispatchMessage, input],
+    );
 
     const handleInputKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
         if (event.key === 'Enter' && !event.shiftKey) {
@@ -1476,7 +1645,9 @@ export default function H5AgentChat() {
 
         void ensureContainerRuntime().then((runtime) => {
             setContainerRuntime(runtime);
-            handleLinkForRuntime(href, runtime);
+            if (!handleLinkForRuntime(href, runtime)) {
+                window.location.assign(href);
+            }
         });
         return true;
     }, [containerRuntime, ensureContainerRuntime, handleLinkForRuntime]);
@@ -1594,6 +1765,18 @@ export default function H5AgentChat() {
     const showBlockingError = authStatus === 'error' || !!agentError;
     const isBusy = authStatus === 'checking' || authStatus === 'exchanging' || (authStatus === 'ready' && !agent && !agentError);
     const generationActive = isWaiting || isStreaming || isStopping;
+    messageRuntimeBlockedRef.current = generationActive
+        || showBlockingError
+        || isBusy
+        || speech.isActive
+        || isStartingNew
+        || isSwitchingSession
+        || uploadDrafts.length > 0;
+    useEffect(() => {
+        if (!generationActive && !isStartingNew && !isSwitchingSession) {
+            messageDispatchLockedRef.current = false;
+        }
+    }, [generationActive, isStartingNew, isSwitchingSession]);
     const sendDisabled = (!input.trim() && attachedFiles.length === 0)
         || showBlockingError
         || isBusy
@@ -1611,6 +1794,58 @@ export default function H5AgentChat() {
         || uploadDrafts.length > 0
         || attachedFiles.length >= 10;
     const agentAvatarUrl = resolveAgentAvatarUrl(agent?.avatar_url, token);
+    const quickMessageDisabled = generationActive
+        || showBlockingError
+        || isBusy
+        || isStartingNew
+        || isSwitchingSession;
+    const filteredQuickActions = useMemo(() => {
+        const query = quickActionSearch.trim().toLocaleLowerCase();
+        const actions = activeQuickActions;
+        if (!query) return actions;
+        return actions.filter((action) => (
+            `${action.label} ${action.message || ''} ${action.uri || ''}`
+                .toLocaleLowerCase()
+                .includes(query)
+        ));
+    }, [activeQuickActions, quickActionSearch]);
+    const activateQuickAction = async (snapshot: SceneQuickAction) => {
+        if (
+            quickActionActivationRef.current
+            || (snapshot.type === 'send_message'
+                && (messageRuntimeBlockedRef.current || messageDispatchLockedRef.current))
+        ) return;
+
+        quickActionActivationRef.current = true;
+        try {
+            const latestManifest = await refreshSceneManifest();
+            const action = findEnabledSceneQuickAction(
+                latestManifest?.quick_actions,
+                snapshot.id,
+            );
+            if (!action) {
+                toast.info('功能配置已更新，请重新选择');
+                return;
+            }
+            if (action.type === 'open_uri' && action.uri) {
+                closeQuickActionsMenu();
+                if (!handleMarkdownLinkClick(action.uri)) {
+                    window.location.assign(action.uri);
+                }
+                return;
+            }
+            if (
+                action.type !== 'send_message'
+                || !action.message
+                || messageRuntimeBlockedRef.current
+                || messageDispatchLockedRef.current
+            ) return;
+            closeQuickActionsMenu();
+            await dispatchMessage(action.message, [], false);
+        } finally {
+            quickActionActivationRef.current = false;
+        }
+    };
 
     return (
         <main
@@ -1799,6 +2034,66 @@ export default function H5AgentChat() {
                 </section>
             )}
 
+            {quickActionsMenuOpen ? (
+                <div
+                    className={`h5-chat__quick-menu-backdrop${quickActionsMenuClosing ? ' is-closing' : ''}`}
+                    role="presentation"
+                    onClick={closeQuickActionsMenu}
+                >
+                    <section
+                        className="h5-chat__quick-menu-sheet"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label="选择功能"
+                        onClick={(event) => event.stopPropagation()}
+                    >
+                        <div className="h5-chat__quick-menu-handle" />
+                        <header className="h5-chat__quick-menu-header">
+                            <div>
+                                <strong>功能</strong>
+                                <span>{activeQuickActions.length} 项</span>
+                            </div>
+                            <button
+                                type="button"
+                                className="h5-chat__quick-menu-close"
+                                onClick={closeQuickActionsMenu}
+                                aria-label="关闭"
+                            >
+                                <IconX size={20} />
+                            </button>
+                        </header>
+                        <label className="h5-chat__quick-menu-search">
+                            <IconSearch size={17} />
+                            <input
+                                type="search"
+                                value={quickActionSearch}
+                                onChange={(event) => setQuickActionSearch(event.target.value)}
+                                placeholder="搜索功能"
+                                aria-label="搜索功能"
+                                autoFocus
+                            />
+                        </label>
+                        <div className="h5-chat__quick-menu-list">
+                            {filteredQuickActions.map((action) => (
+                                <button
+                                    key={action.id}
+                                    type="button"
+                                    className="h5-chat__quick-menu-item"
+                                    disabled={action.type === 'send_message' && quickMessageDisabled}
+                                    title={action.type === 'send_message' && quickMessageDisabled ? '当前回复完成后可用' : undefined}
+                                    onClick={() => void activateQuickAction(action)}
+                                >
+                                    <span>{action.label}</span>
+                                </button>
+                            ))}
+                            {filteredQuickActions.length === 0 ? (
+                                <div className="h5-chat__quick-menu-empty">没有匹配的功能</div>
+                            ) : null}
+                        </div>
+                    </section>
+                </div>
+            ) : null}
+
             <form
                 className="h5-chat__composer"
                 onSubmit={(event) => {
@@ -1814,6 +2109,35 @@ export default function H5AgentChat() {
                     onChange={handleFileInputChange}
                 />
                 {uploadError ? <div className="h5-chat__upload-error">{uploadError}</div> : null}
+                {activeQuickActions.length ? (
+                    <div className={`h5-chat__quick-actions-shell ${quickActionsOverflow ? 'has-menu' : ''}`}>
+                        <div ref={quickActionsRef} className="h5-chat__quick-actions" aria-label="功能">
+                            {activeQuickActions.map((action) => (
+                                <button
+                                    key={action.id}
+                                    type="button"
+                                    className="h5-chat__quick-action"
+                                    disabled={action.type === 'send_message' && quickMessageDisabled}
+                                    title={action.type === 'send_message' && quickMessageDisabled ? '当前回复完成后可用' : undefined}
+                                    onClick={() => void activateQuickAction(action)}
+                                >
+                                    {action.label}
+                                </button>
+                            ))}
+                        </div>
+                        {quickActionsOverflow ? (
+                            <button
+                                type="button"
+                                className="h5-chat__quick-actions-menu-button"
+                                onClick={openQuickActionsMenu}
+                                aria-label="查看全部功能"
+                                title="查看全部功能"
+                            >
+                                <IconMenu2 size={18} />
+                            </button>
+                        ) : null}
+                    </div>
+                ) : null}
                 {(uploadDrafts.length > 0 || attachedFiles.length > 0) ? (
                     <div className="h5-chat__attachments">
                         {uploadDrafts.map((draft) => (

@@ -166,6 +166,64 @@ async def test_channel_context_is_dynamic_not_static():
     assert "## Current Channel" not in static_p
 
 
+async def test_scene_quick_actions_follow_scene_prompts_in_dynamic_context():
+    agent_id = await _seed_basic_agent()
+    static_p, dynamic_p = await build_agent_context(
+        agent_id,
+        "Test Agent",
+        "role",
+        current_user_name="Alice",
+        is_group=False,
+        channel_context={
+            "scene_key": "warranty",
+            "scene_revision": 3,
+            "scene_system_prompts": [
+                {
+                    "id": "tone",
+                    "name": "Response style",
+                    "content": "Keep answers concise.",
+                    "enabled": True,
+                }
+            ],
+            "scene_quick_actions": [
+                {
+                    "id": "action_repair_id",
+                    "label": "我要报修",
+                    "type": "send_message",
+                    "enabled": True,
+                    "message": "我要申请设备保修",
+                },
+                {
+                    "id": "action_orders_id",
+                    "label": "查看工单",
+                    "type": "open_uri",
+                    "enabled": True,
+                    "uri": "/orders",
+                },
+                {
+                    "id": "disabled",
+                    "label": "暂停入口",
+                    "type": "send_message",
+                    "enabled": False,
+                    "message": "不应进入上下文",
+                },
+            ],
+        },
+    )
+
+    prompt_position = dynamic_p.index("### Response style")
+    actions_position = dynamic_p.index("### Available Quick Actions")
+    assert prompt_position < actions_position
+    assert "| Title | Type | Content |" in dynamic_p
+    assert "| 我要报修 | send_message | 我要申请设备保修 |" in dynamic_p
+    assert "| 查看工单 | open_uri | /orders |" in dynamic_p
+    assert "action_repair_id" not in dynamic_p
+    assert "action_orders_id" not in dynamic_p
+    assert "暂停入口" not in dynamic_p
+    assert "不应进入上下文" not in dynamic_p
+    assert "Available Quick Actions" not in static_p
+
+
 async def test_build_agent_context_does_not_inject_focus_block():
     """Focus is no longer injected into the dynamic context.
 

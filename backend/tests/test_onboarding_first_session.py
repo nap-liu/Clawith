@@ -16,9 +16,14 @@ from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.onboarding import (
     PHASE_COMPLETED,
+    PHASE_GREETED,
     PHASE_PENDING,
+    claim_fixed_welcome_slot,
     claim_normal_first_turn,
     claim_onboarding_greeting,
+    mark_onboarded,
+    mark_onboarding_phase,
+    onboarding_claim_is_current,
     release_onboarding_claim,
     resolve_onboarding_eligibility,
 )
@@ -104,9 +109,8 @@ async def first_session_pair():
         )
         await db.execute(
             delete(ChatMessage).where(
-                ChatMessage.conversation_id.in_(
-                    [str(first_session_id), str(second_session_id)]
-                )
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.user_id == user_id,
             )
         )
         await db.execute(
@@ -236,6 +240,205 @@ async def test_real_message_wins_before_trigger(first_session_pair):
     assert greeting_claim.acquired is False
     assert greeting_claim.reason == "already_started"
     assert stored_phase == PHASE_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_completed_first_contact_invalidates_an_existing_greeting_claim(
+    first_session_pair,
+):
+    async with first_session_pair["session_factory"]() as db:
+        claim = await claim_onboarding_greeting(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+            first_session_pair["first_session_id"],
+        )
+    assert claim.acquired is True
+    assert claim.claimed_at is not None
+
+    async with first_session_pair["session_factory"]() as db:
+        assert await onboarding_claim_is_current(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+            claim.claimed_at,
+        )
+
+    # A fixed welcome on another connection wins the same first-contact slot.
+    async with first_session_pair["session_factory"]() as db:
+        await mark_onboarded(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+        )
+
+    async with first_session_pair["session_factory"]() as db:
+        assert not await onboarding_claim_is_current(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+            claim.claimed_at,
+        )
+        assert not await release_onboarding_claim(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+            claim.claimed_at,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fixed_welcome_can_take_over_only_before_onboarding_output(
+    first_session_pair,
+):
+    async with first_session_pair["session_factory"]() as db:
+        claim = await claim_onboarding_greeting(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+            first_session_pair["first_session_id"],
+        )
+    assert claim.acquired is True
+    assert claim.claimed_at is not None
+
+    async with first_session_pair["session_factory"]() as db:
+        assert await claim_fixed_welcome_slot(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+        )
+        assert not await onboarding_claim_is_current(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+            claim.claimed_at,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fixed_welcome_loses_after_onboarding_publishes_output(
+    first_session_pair,
+):
+    async with first_session_pair["session_factory"]() as db:
+        claim = await claim_onboarding_greeting(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+            first_session_pair["first_session_id"],
+        )
+    assert claim.claimed_at is not None
+
+    async with first_session_pair["session_factory"]() as db:
+        assert await mark_onboarding_phase(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+            PHASE_GREETED,
+            expected_phase=PHASE_PENDING,
+            expected_onboarded_at=claim.claimed_at,
+        )
+        greeted = await db.get(
+            AgentUserOnboarding,
+            (
+                first_session_pair["agent_id"],
+                first_session_pair["user_id"],
+            ),
+        )
+        assert greeted is not None
+        assert greeted.onboarded_at > claim.claimed_at
+
+    async with first_session_pair["session_factory"]() as db:
+        assert not await claim_fixed_welcome_slot(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_message_waits_until_visible_greeting_is_durable(
+    first_session_pair,
+):
+    visible_at = datetime.now(timezone.utc)
+    async with first_session_pair["session_factory"]() as db:
+        db.add(
+            AgentUserOnboarding(
+                agent_id=first_session_pair["agent_id"],
+                user_id=first_session_pair["user_id"],
+                phase=PHASE_GREETED,
+                onboarded_at=visible_at,
+            )
+        )
+        db.add(
+            ChatMessage(
+                agent_id=first_session_pair["agent_id"],
+                user_id=first_session_pair["user_id"],
+                role="assistant",
+                content="older unrelated reply",
+                conversation_id=str(first_session_pair["first_session_id"]),
+                created_at=visible_at - timedelta(minutes=1),
+            )
+        )
+        await db.commit()
+
+    async with first_session_pair["session_factory"]() as db:
+        assert (
+            await claim_normal_first_turn(
+                db,
+                first_session_pair["agent_id"],
+                first_session_pair["user_id"],
+            )
+            == PHASE_PENDING
+        )
+
+    async with first_session_pair["session_factory"]() as db:
+        db.add(
+            ChatMessage(
+                agent_id=first_session_pair["agent_id"],
+                user_id=first_session_pair["user_id"],
+                role="assistant",
+                content="durable greeting",
+                conversation_id=str(first_session_pair["first_session_id"]),
+                created_at=visible_at + timedelta(seconds=1),
+            )
+        )
+        await db.commit()
+
+    async with first_session_pair["session_factory"]() as db:
+        assert (
+            await claim_normal_first_turn(
+                db,
+                first_session_pair["agent_id"],
+                first_session_pair["user_id"],
+            )
+            == PHASE_GREETED
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_message_recovers_stale_greeted_without_message(
+    first_session_pair,
+):
+    stale_started_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    async with first_session_pair["session_factory"]() as db:
+        db.add(
+            AgentUserOnboarding(
+                agent_id=first_session_pair["agent_id"],
+                user_id=first_session_pair["user_id"],
+                phase=PHASE_GREETED,
+                onboarded_at=stale_started_at,
+            )
+        )
+        await db.commit()
+
+    async with first_session_pair["session_factory"]() as db:
+        phase = await claim_normal_first_turn(
+            db,
+            first_session_pair["agent_id"],
+            first_session_pair["user_id"],
+        )
+
+    assert phase == PHASE_COMPLETED
 
 
 @pytest.mark.asyncio

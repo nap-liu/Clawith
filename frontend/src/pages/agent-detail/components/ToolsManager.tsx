@@ -16,6 +16,7 @@ import {
 
 import { useDialog } from '../../../components/Dialog/DialogProvider';
 import { useToast } from '../../../components/Toast/ToastProvider';
+import ToggleSwitch from '../../../components/ToggleSwitch';
 import { useAuthStore } from '../../../stores';
 import MCPServerEditor from '../../../components/MCPServerEditor';
 import { effectiveEditorRole } from '../../../components/MCPServerEditor/role';
@@ -99,15 +100,21 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
     useEffect(() => { loadTools(); }, [agentId]);
 
     const toggleTool = async (toolId: string, enabled: boolean) => {
+        const previous = tools;
         setTools(prev => prev.map(t => t.id === toolId ? { ...t, enabled } : t));
         try {
             const token = localStorage.getItem('token');
-            await fetch(`/api/tools/agents/${agentId}`, {
+            const response = await fetch(`/api/tools/agents/${agentId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
                 body: JSON.stringify([{ tool_id: toolId, enabled }]),
             });
-        } catch (e) { console.error(e); }
+            if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || `HTTP ${response.status}`);
+            await tmQueryClient.invalidateQueries({ queryKey: ['agent', agentId] });
+        } catch (e: any) {
+            setTools(previous);
+            toast.error(t('agent.tools.updateFailed', 'Tool update failed'), { details: String(e?.message || e) });
+        }
     };
 
     // Sensitive field keys that should not be pre-filled from masked global config.
@@ -324,26 +331,6 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         }
     };
 
-    const switchTrack = (enabled: boolean, mixed = false) => ({
-        position: 'absolute' as const,
-        inset: 0,
-        background: enabled ? 'var(--accent-primary)' : mixed ? 'var(--border-default)' : 'var(--bg-tertiary)',
-        borderRadius: '11px',
-        transition: 'background 0.2s',
-    });
-
-    const switchKnob = (enabled: boolean) => ({
-        position: 'absolute' as const,
-        left: enabled ? '20px' : '2px',
-        top: '2px',
-        width: '18px',
-        height: '18px',
-        background: '#fff',
-        borderRadius: '50%',
-        transition: 'left 0.2s',
-        boxShadow: '0 1px 3px rgba(0,0,0,0.12)',
-    });
-
     const toggleCategoryExpanded = (category: string) => {
         setExpandedCategories(prev => {
             const next = new Set(prev);
@@ -523,17 +510,11 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                         >{deletingToolId === tool.id ? '...' : '✕'}</button>
                     )}
                     {canManage ? (
-                        <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }}>
-                            <input
-                                type="checkbox"
-                                checked={tool.enabled}
-                                onChange={e => toggleTool(tool.id, e.target.checked)}
-                                style={{ opacity: 0, width: 0, height: 0 }}
-                            />
-                            <span style={switchTrack(tool.enabled)}>
-                                <span style={switchKnob(tool.enabled)} />
-                            </span>
-                        </label>
+                        <ToggleSwitch
+                            checked={tool.enabled}
+                            onChange={(checked) => void toggleTool(tool.id, checked)}
+                            ariaLabel={`${tool.display_name || tool.name} ${tool.enabled ? t('common.enabled', 'On') : t('common.disabled', 'Off')}`}
+                        />
                     ) : (
                         <span style={{ fontSize: '11px', color: tool.enabled ? 'var(--accent-primary)' : 'var(--text-tertiary)', fontWeight: 500 }}>
                             {tool.enabled ? t('common.enabled', 'On') : t('common.disabled', 'Off')}
@@ -677,15 +658,13 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                     ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
                                 )}
                                 {canManage && (
-                                    <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }} title={t('agent.tools.enableDisableAll', 'Enable/Disable all {{category}} tools', { category: label })}>
-                                        <input type="checkbox"
-                                            checked={allEnabled}
-                                            onChange={(e) => void bulkToggleCategory(allCatTools, e.target.checked)}
-                                            style={{ opacity: 0, width: 0, height: 0 }} />
-                                        <span style={switchTrack(allEnabled, mixed)}>
-                                            <span style={switchKnob(allEnabled)} />
-                                        </span>
-                                    </label>
+                                    <ToggleSwitch
+                                        checked={allEnabled}
+                                        mixed={mixed}
+                                        onChange={(checked) => void bulkToggleCategory(allCatTools, checked)}
+                                        ariaLabel={t('agent.tools.enableDisableAll', 'Enable/Disable all {{category}} tools', { category: label })}
+                                        title={t('agent.tools.enableDisableAll', 'Enable/Disable all {{category}} tools', { category: label })}
+                                    />
                                 )}
                             </div>
                         </div>

@@ -340,6 +340,9 @@ async def get_agent(
     out_model = await _agent_to_out(db, agent, current_user.id)
     out = out_model.model_dump()
     out["access_level"] = access_level
+    from app.services.scene_service import scene_tool_enabled
+
+    out["scene_config_enabled"] = await scene_tool_enabled(db, agent_id)
 
     # Resolve creator username (one extra query, only on detail page).
     # IMPORTANT: User.username is an association_proxy to User.identity.username.

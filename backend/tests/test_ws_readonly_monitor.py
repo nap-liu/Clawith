@@ -59,7 +59,9 @@ def _db_returning(session_obj):
 
 def _handler() -> WebSocketChatHandler:
     # Bypass __init__ — we set only the fields the code under test touches.
-    return WebSocketChatHandler.__new__(WebSocketChatHandler)
+    handler = WebSocketChatHandler.__new__(WebSocketChatHandler)
+    handler.pending_initial_assistant = None
+    return handler
 
 
 # ── 1. permission gate ────────────────────────────────────────────────────────

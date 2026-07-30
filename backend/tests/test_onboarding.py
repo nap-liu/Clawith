@@ -161,7 +161,7 @@ async def test_custom_boundary_follow_up_keeps_tools_enabled():
 
 
 @pytest.mark.asyncio
-async def test_h5_claimed_greeting_completes_on_first_response():
+async def test_h5_claimed_greeting_reserves_output_before_durable_completion():
     db = RecordingDB(
         [
             DummyResult(scalar_value=SimpleNamespace(phase=PHASE_PENDING)),
@@ -182,5 +182,5 @@ async def test_h5_claimed_greeting_completes_on_first_response():
 
     assert injection is not None
     assert injection.is_greeting_turn is True
-    assert injection.target_phase == "completed"
+    assert injection.target_phase == PHASE_GREETED
     assert injection.expected_phase == PHASE_PENDING

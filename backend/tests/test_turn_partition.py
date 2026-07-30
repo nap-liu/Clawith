@@ -89,6 +89,19 @@ def test_tool_heavy_turn_is_never_split():
     assert partition.protected_rows == [row for turn in turns[1:] for row in turn]
 
 
+def test_initial_assistant_message_is_normalized_as_closed_history():
+    greeting = _row("assistant", 0)
+    turns = [_closed_turn(index + 1) for index in range(9)]
+    rows = [greeting, *(row for turn in turns for row in turn)]
+
+    partition = partition_turns(rows, keep_recent_turns=8)
+
+    assert partition.compactable_rows == [greeting, *turns[0]]
+    assert partition.protected_rows == [row for turn in turns[1:] for row in turn]
+    assert partition.compactable[0].closed is True
+    assert partition.compactable[0].unknown is False
+
+
 def test_incomplete_turn_and_every_later_turn_are_protected():
     completed = [_closed_turn(index) for index in range(10)]
     interrupted_user = _row("user", 1001)

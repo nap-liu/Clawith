@@ -28,6 +28,8 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     # request_confirmation is OPT-IN (is_default=False); it was briefly seeded is_default=True,
     # so sync the correction to the DB on deploy (otherwise existing rows keep is_default=True).
     "request_confirmation",
+    # Scene management is opt-in and must remain opt-in on existing databases.
+    "manage_scene",
     # AgentBay tools should NOT be is_default=True. Older seeder versions may
     # have set them to True; include them here so the seeder corrects the DB.
     "agentbay_browser_navigate",
@@ -98,6 +100,235 @@ def _global_builtin_config(tool_data: dict) -> dict:
 # Builtin tool definitions — these map to the hardcoded AGENT_TOOLS
 BUILTIN_TOOLS = [
     REQUEST_CONFIRMATION_TOOL_SEED,
+    {
+        "name": "manage_scene",
+        "display_name": "场景配置",
+        "description": (
+            "Manage versioned scene configurations. This tool may only execute inside a "
+            "direct conversation whose current human user has administrator permission. "
+            "Use scenes to maintain a welcome message, ordered system prompt blocks, and "
+            "unlimited quick actions for URI navigation or sending a preset message. "
+            "Scene configuration is independent of the consuming channel. "
+            "SAVE RULES: save is a field-level incremental update by default. Omitted "
+            "fields preserve the current draft, or the published configuration when no "
+            "draft exists. Passing an explicit empty string or empty array clears that "
+            "field. Set force_overwrite=true to reset every omitted optional configuration "
+            "field to its empty default and reset omitted enabled to true. The name may be "
+            "omitted when updating an existing scene, but is required when creating one. "
+            "When an array field is provided, it replaces that entire ordered array. "
+            "Every save requires expected_revision: pass the revision returned by get, "
+            "or 0 when the scene has never been published. Use get before updating when "
+            "the current revision or contents are unknown, then publish separately after save."
+        ),
+        "category": "general",
+        "icon": "🎬",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["list", "get", "save", "publish", "delete", "rollback"],
+                    "description": (
+                        "Operation to perform: list returns scenes; get returns the current "
+                        "draft configuration when present (otherwise the published configuration) "
+                        "together with the current published revision; save creates or "
+                        "incrementally updates a draft unless force_overwrite=true; publish "
+                        "makes the saved draft active; delete removes a scene; rollback "
+                        "copies a historical revision into a new published revision."
+                    ),
+                },
+                "scene_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+                    "description": (
+                        "Required scene key for get, save, publish, delete, and rollback. "
+                        "It starts with a lowercase letter and contains only lowercase "
+                        "letters, digits, underscores, or hyphens; for example warranty."
+                    ),
+                },
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100,
+                    "description": (
+                        "Human-readable scene name. Required when creating a scene; "
+                        "omit during an incremental update to preserve the current name."
+                    ),
+                },
+                "enabled": {
+                    "type": "boolean",
+                    "description": (
+                        "Whether the scene is active. When omitted from an incremental save, "
+                        "the current value is preserved."
+                    ),
+                },
+                "expected_revision": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Required for save, publish, and rollback. This is the current published "
+                        "revision returned by get and is used for optimistic concurrency. "
+                        "Use 0 when saving or publishing a scene that has never been published."
+                    ),
+                },
+                "welcome_message": {
+                    "type": "string",
+                    "maxLength": 12000,
+                    "description": (
+                        "Optional initial welcome message. Omit to preserve the current value "
+                        "during an incremental save; use an empty string to clear it."
+                    ),
+                },
+                "system_prompts": {
+                    "type": "array",
+                    "description": (
+                        "Optional ordered prompt blocks. Omit to preserve the current list "
+                        "during an incremental save; use an empty array to clear it."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "id": {"type": "string", "minLength": 1, "maxLength": 120},
+                            "name": {"type": "string", "minLength": 1, "maxLength": 80},
+                            "content": {"type": "string", "minLength": 1, "maxLength": 12000},
+                            "enabled": {
+                                "type": "boolean",
+                                "default": True,
+                                "description": (
+                                    "Whether this prompt block is active. "
+                                    "Omitting it enables the supplied block."
+                                ),
+                            },
+                        },
+                        "required": ["id", "name", "content"],
+                    },
+                },
+                "quick_actions": {
+                    "type": "array",
+                    "description": (
+                        "Optional ordered quick actions. Omit to preserve the current list "
+                        "during an incremental save; use an empty array to clear it. "
+                        "When supplied, the whole list replaces the previous list. Each supplied "
+                        "item whose enabled field is omitted becomes enabled, including an item "
+                        "with the same id as a previously disabled item. No item count limit is imposed."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "id": {"type": "string", "minLength": 1, "maxLength": 120},
+                            "label": {"type": "string", "minLength": 1, "maxLength": 80},
+                            "type": {"type": "string", "enum": ["open_uri", "send_message"]},
+                            "enabled": {
+                                "type": "boolean",
+                                "default": True,
+                                "description": (
+                                    "Whether this quick action is available. "
+                                    "Omit when creating an enabled action; set false to "
+                                    "temporarily hide it without deleting its configuration."
+                                ),
+                            },
+                            "uri": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 2048,
+                                "description": "Required for open_uri; supports relative, http(s), and miniprogram://navigate-to/.",
+                            },
+                            "message": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 12000,
+                                "description": "Required for send_message; sent exactly as a normal user message.",
+                            },
+                        },
+                        "required": ["id", "label", "type"],
+                        "anyOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["open_uri"]}
+                                },
+                                "required": ["type", "uri"],
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["send_message"]}
+                                },
+                                "required": ["type", "message"],
+                            },
+                        ],
+                    },
+                },
+                "force_overwrite": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Only applies to save. Defaults to false for incremental updates. "
+                        "When true, omitted optional configuration fields are reset to their "
+                        "empty defaults instead of preserving current values, and omitted "
+                        "enabled resets to true. For an existing scene, an omitted name is "
+                        "still preserved; creating a scene always requires name."
+                    ),
+                },
+                "target_revision": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Historical revision to copy when rolling back.",
+                },
+            },
+            "additionalProperties": False,
+            "required": ["operation"],
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string", "enum": ["list"]}
+                    },
+                    "required": ["operation"],
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string", "enum": ["get", "delete"]}
+                    },
+                    "required": ["operation", "scene_key"],
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string", "enum": ["save"]}
+                    },
+                    "required": ["operation", "scene_key", "expected_revision"],
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string", "enum": ["publish"]}
+                    },
+                    "required": ["operation", "scene_key", "expected_revision"],
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string", "enum": ["rollback"]}
+                    },
+                    "required": [
+                        "operation",
+                        "scene_key",
+                        "expected_revision",
+                        "target_revision",
+                    ],
+                },
+            ],
+        },
+        "config": {},
+        "config_schema": {},
+    },
     {
         "name": "list_files",
         "display_name": "List Files",

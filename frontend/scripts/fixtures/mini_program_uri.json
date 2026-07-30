@@ -1,0 +1,32 @@
+{
+  "valid": [
+    {
+      "value": "miniprogram://navigate-to/pages/order/detail?id=123&from=h5",
+      "action": "navigate-to",
+      "route": "/pages/order/detail?id=123&from=h5"
+    },
+    {
+      "value": "MINIPROGRAM://NAVIGATE-TO/pages/%E8%AE%A2%E5%8D%95?id=%E4%B8%AD%E6%96%87",
+      "action": "navigate-to",
+      "route": "/pages/%E8%AE%A2%E5%8D%95?id=%E4%B8%AD%E6%96%87"
+    }
+  ],
+  "invalid": [
+    "https://navigate-to/pages/order",
+    "miniprogram:navigate-to/pages/order",
+    "miniprogram://navigate-to",
+    "miniprogram://navigate-to/",
+    "miniprogram://unknown/pages/order",
+    "miniprogram://user@navigate-to/pages/order",
+    "miniprogram://navigate-to:80/pages/order",
+    "miniprogram://navigate-to/pages/order#detail",
+    "miniprogram://navigate-to/pages//order",
+    "miniprogram://navigate-to/pages/../admin",
+    "miniprogram://navigate-to/pages/%2e%2e/admin",
+    "miniprogram://navigate-to/pages/%2Fadmin",
+    "miniprogram://navigate-to/pages/%5cadmin",
+    "miniprogram://navigate-to/pages/%00admin",
+    "miniprogram://navigate-to/pages/order?name=中文",
+    "miniprogram://navigate-to/pages/order?bad=%xy"
+  ]
+}

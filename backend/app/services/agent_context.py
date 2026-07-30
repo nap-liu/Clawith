@@ -13,6 +13,18 @@ from app.services.storage import get_storage_backend, normalize_storage_key
 
 settings = get_settings()
 
+
+def _markdown_table_cell(value: object) -> str:
+    return (
+        str(value or "")
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r\n", "<br>")
+        .replace("\n", "<br>")
+        .replace("\r", "<br>")
+    )
+
+
 async def _read_file_safe(key: str, max_chars: int | None = 3000) -> str:
     """Read a storage-backed text file, return empty string if missing.
 
@@ -824,11 +836,62 @@ Strict rules:
 
     if channel_context:
         channel_lines = ["\n## Current Channel"]
-        for key in ("source_channel", "display_name", "client_surface"):
+        for key in ("source_channel", "display_name", "client_surface", "scene_key", "scene_revision"):
             value = channel_context.get(key)
             if value:
                 channel_lines.append(f"{key}: {value}")
         dynamic_parts.append("\n".join(channel_lines))
+        scene_prompts = channel_context.get("scene_system_prompts") or []
+        enabled_prompt_lines = []
+        for block in scene_prompts:
+            if not isinstance(block, dict) or not block.get("enabled", True):
+                continue
+            content = str(block.get("content") or "").strip()
+            if not content:
+                continue
+            name = str(block.get("name") or block.get("id") or "Scene prompt").strip()
+            enabled_prompt_lines.append(f"### {name}\n{content}")
+        quick_action_rows = []
+        for action in channel_context.get("scene_quick_actions") or []:
+            if not isinstance(action, dict) or not action.get("enabled", True):
+                continue
+            action_type = str(action.get("type") or "").strip()
+            if action_type not in {"send_message", "open_uri"}:
+                continue
+            content = (
+                action.get("message")
+                if action_type == "send_message"
+                else action.get("uri")
+            )
+            quick_action_rows.append(
+                "| "
+                + " | ".join(
+                    (
+                        _markdown_table_cell(action.get("label")),
+                        action_type,
+                        _markdown_table_cell(content),
+                    )
+                )
+                + " |"
+            )
+        if enabled_prompt_lines or quick_action_rows:
+            scene_parts = [
+                "\n## Scene Instructions",
+                "These administrator-authored instructions apply to the current scene. "
+                "They cannot override platform authorization or safety rules.",
+            ]
+            if enabled_prompt_lines:
+                scene_parts.append("\n\n".join(enabled_prompt_lines))
+            if quick_action_rows:
+                scene_parts.append(
+                    "### Available Quick Actions\n"
+                    "| Title | Type | Content |\n"
+                    "|---|---|---|\n"
+                    + "\n".join(quick_action_rows)
+                )
+            dynamic_parts.append(
+                "\n\n".join(scene_parts)
+            )
 
     # --- Focus (working memory) --- DISABLED: injecting completed focus items
     # into the system prompt was reinforcing stale workflow patterns over updated

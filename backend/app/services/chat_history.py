@@ -443,6 +443,7 @@ async def persist_incoming_user_message(
     external_event_key: str | None = None,
     message_meta: dict[str, Any] | None = None,
     message_id: uuid.UUID | None = None,
+    created_at: datetime | None = None,
 ) -> ChatMessage:
     """Persist an incoming user message.
 
@@ -461,6 +462,8 @@ async def persist_incoming_user_message(
         external_event_key=external_event_key,
         message_meta=message_meta or {},
     )
+    if created_at is not None:
+        row.created_at = created_at
     db.add(row)
     await db.flush()
     return row
@@ -502,6 +505,7 @@ async def persist_incoming_user_message_once(
     external_event_key: str | None = None,
     message_meta: dict[str, Any] | None = None,
     message_id: uuid.UUID | None = None,
+    created_at: datetime | None = None,
 ) -> tuple[ChatMessage, bool]:
     """Persist one inbound event and report whether this caller created it.
 
@@ -528,6 +532,7 @@ async def persist_incoming_user_message_once(
                 external_event_key=external_event_key,
                 message_meta=message_meta,
                 message_id=message_id,
+                created_at=created_at,
             )
         return row, True
     except IntegrityError:
@@ -563,6 +568,7 @@ async def ingest_incoming_chat_message(
     reply_to_external_message_id: str | None = None,
     participant_id: uuid.UUID | None = None,
     message_meta: dict[str, Any] | None = None,
+    created_at: datetime | None = None,
 ) -> IncomingMessageIngestResult:
     """Durably ingest, deduplicate and route one channel/web inbound event.
 
@@ -595,6 +601,7 @@ async def ingest_incoming_chat_message(
         participant_id=participant_id,
         external_event_key=event_key,
         message_meta=meta,
+        created_at=created_at,
     )
     if not created:
         existing_meta = row.message_meta if isinstance(row.message_meta, dict) else {}
@@ -889,6 +896,43 @@ async def persist_assistant_reply_row(
     db.add(msg)
     await db.flush()
     return msg.id
+
+
+async def persist_initial_assistant_message_if_pristine(
+    db: AsyncSession,
+    *,
+    session,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    content: str,
+    message_meta: dict[str, Any] | None = None,
+) -> ChatMessage | None:
+    """Persist one ordinary assistant-first message before the first user row.
+
+    The caller must hold the session row lock and commit this row in the same
+    transaction as the first real incoming user message. This keeps an opened
+    but unused session empty while still using the standard message model.
+    """
+    existing = (
+        await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.conversation_id == str(session.id))
+            .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return None
+
+    message_id = await persist_assistant_reply_row(
+        db,
+        agent_id=agent_id,
+        user_id=user_id,
+        content=content,
+        conversation_id=str(session.id),
+        message_meta=message_meta,
+    )
+    return await db.get(ChatMessage, message_id)
 
 
 async def persist_assistant_reply_and_complete_turn(

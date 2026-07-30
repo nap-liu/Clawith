@@ -85,9 +85,11 @@ import {
     type OnboardingKickoffRequest,
 } from '../../hooks/useOnboardingKickoff';
 import ApprovalsTab from './tabs/ApprovalsTab';
-import { AGENT_DETAIL_TABS } from './agentDetailTabs';
+import { AGENT_DETAIL_TABS, type AgentDetailTab } from './agentDetailTabs';
 import MindTab from './tabs/MindTab';
 import SettingsTab from './tabs/SettingsTab';
+import SceneConfigTab from './tabs/SceneConfigTab';
+import { useUnsavedChangesGuard } from '../../hooks/useUnsavedChangesGuard';
 import SkillsTab from './tabs/SkillsTab';
 import ToolsTab from './tabs/ToolsTab';
 import { useAgentDetailRoute } from './hooks/useAgentDetailRoute';
@@ -1966,18 +1968,34 @@ export default function AgentDetailPage() {
         return true;
     }, [navigate]);
     const queryClient = useQueryClient();
+    const [sceneConfigDirty, setSceneConfigDirty] = useState(false);
     const {
         activeTab,
         isChatRoute,
         isSettingsRoute,
-        setActiveTab,
+        setActiveTab: setActiveTabRoute,
     } = useAgentDetailRoute({ agentId: id });
+    useUnsavedChangesGuard(
+        activeTab === 'scenes' && sceneConfigDirty,
+        '当前有未保存的编辑内容，继续操作将丢失这些修改。是否继续？',
+    );
+    const setActiveTab = setActiveTabRoute;
 
     const { data: agent, isLoading } = useQuery({
         queryKey: ['agent', id],
         queryFn: () => agentApi.get(id!),
         enabled: !!id,
     });
+
+    useEffect(() => {
+        if (
+            agent
+            && activeTab === 'scenes'
+            && (agent.access_level !== 'manage' || !agent.scene_config_enabled)
+        ) {
+            setActiveTab('tools');
+        }
+    }, [activeTab, agent, setActiveTab]);
 
     // Tenant default model — used to render the "默认" tag and as a visual
     // fallback when an agent has no explicit primary model.
@@ -5443,6 +5461,7 @@ export default function AgentDetailPage() {
                 {activeTab !== 'chat' && <div className="tabs">
                     {AGENT_DETAIL_TABS.filter(tab => {
                         if (['aware', 'workspace', 'chat'].includes(tab)) return false;
+                        if (tab === 'scenes' && (!canManage || !agent?.scene_config_enabled)) return false;
                         // 'use' access keeps the existing tab bar unchanged; settings remains available via its own entry.
                         if ((agent as any)?.access_level === 'use') {
                             if (tab === 'settings' || tab === 'approvals') return false;
@@ -6276,6 +6295,13 @@ export default function AgentDetailPage() {
                 {/* ── Tools Tab ── */}
                 {
                     activeTab === 'tools' && id && <ToolsTab agentId={id} agentName={agent?.name || 'Agent'} canManage={canManage} />
+                }
+
+                {/* ── Scene Configuration Tab ── */}
+                {
+                    activeTab === 'scenes' && id && canManage && agent?.scene_config_enabled && (
+                        <SceneConfigTab agentId={id} onDirtyChange={setSceneConfigDirty} />
+                    )
                 }
 
                 {/* ── Skills Tab ── */}

@@ -9,7 +9,7 @@
     "prebuild": "npm run test:h5-theme && npm run test:h5-link && npm run test:h5-lifecycle && npm run test:h5-auth && npm run test:h5-content-protection && npm run test:platform-watermark && npm run test:vconsole",
     "build": "tsc && vite build",
     "test:h5-theme": "node scripts/test-h5-url-params.mjs && node scripts/test-h5-theme-tokens.mjs && node scripts/test-h5-theme-runtime.mjs",
-    "test:h5-link": "node scripts/test-miniprogram-uri.mjs && node scripts/test-h5-link-policy.mjs && node scripts/test-h5-link-feedback.mjs && node scripts/test-h5-container-runtime.mjs && node scripts/test-dingtalk-link-runtime.mjs && node scripts/test-wechat-miniprogram-link-runtime.mjs",
+    "test:h5-link": "node scripts/test-miniprogram-uri.mjs && node scripts/test-scene-quick-actions.mjs && node scripts/test-h5-link-policy.mjs && node scripts/test-h5-link-feedback.mjs && node scripts/test-h5-container-runtime.mjs && node scripts/test-dingtalk-link-runtime.mjs && node scripts/test-wechat-miniprogram-link-runtime.mjs",
     "test:h5-lifecycle": "node scripts/test-h5-page-lifecycle.mjs",
     "test:h5-auth": "node scripts/test-h5-auth-session.mjs",
     "test:h5-content-protection": "node scripts/test-h5-content-protection.mjs",
@@ -19,6 +19,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@radix-ui/react-select": "^2.3.7",
+    "@radix-ui/react-switch": "^1.3.7",
     "@tabler/icons-react": "^3.40.0",
     "@tanstack/react-query": "^5.0.0",
     "@tanstack/react-virtual": "^3.14.5",

@@ -3,6 +3,7 @@ export const AGENT_DETAIL_TABS = [
     'aware',
     'mind',
     'tools',
+    'scenes',
     'skills',
     'relationships',
     'workspace',

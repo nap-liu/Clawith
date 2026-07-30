@@ -49,6 +49,8 @@ export interface Agent {
     openclaw_last_seen?: string;
     access_mode?: 'company' | 'private' | 'custom';
     company_access_level?: 'use' | 'manage';
+    access_level?: 'use' | 'manage';
+    scene_config_enabled?: boolean;
     unread_count?: number;
     // True when the viewing user has already been onboarded to this agent.
     // Defaults to true on list endpoints that don't compute per-viewer state.

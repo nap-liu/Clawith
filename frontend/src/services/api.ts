@@ -87,6 +87,69 @@ async function request<T>(
 /** Legacy/Internal generic fetcher */
 export const fetchJson = request;
 
+export type SceneSystemPrompt = {
+    id: string;
+    name: string;
+    content: string;
+    enabled: boolean;
+};
+
+export type SceneQuickAction = {
+    id: string;
+    label: string;
+    type: 'open_uri' | 'send_message';
+    enabled: boolean;
+    uri?: string | null;
+    message?: string | null;
+};
+
+export type Scene = {
+    id?: string;
+    scene_key: string;
+    name: string;
+    enabled: boolean;
+    revision: number;
+    has_unpublished_changes: boolean;
+    welcome_message: string;
+    system_prompts: SceneSystemPrompt[];
+    quick_actions: SceneQuickAction[];
+    updated_at?: string | null;
+    revisions?: Array<{
+        revision: number;
+        created_at: string | null;
+        created_by_user_id?: string | null;
+        created_by_agent_id?: string | null;
+    }>;
+};
+
+export const sceneApi = {
+    list: (agentId: string) =>
+        request<Scene[]>(`/agents/${agentId}/scenes`),
+    get: (agentId: string, sceneKey: string) =>
+        request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}`),
+    revision: (agentId: string, sceneKey: string, revision: number) =>
+        request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}/revisions/${revision}`),
+    manifest: (agentId: string, sceneKey: string) =>
+        request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}/manifest`),
+    save: (agentId: string, sceneKey: string, data: Omit<Scene, 'id' | 'scene_key' | 'revision' | 'has_unpublished_changes' | 'updated_at' | 'revisions'> & { expected_revision: number }) =>
+        request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}`, {
+            method: 'PUT',
+            body: JSON.stringify(data),
+        }),
+    publish: (agentId: string, sceneKey: string, expectedRevision: number) =>
+        request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}/publish`, {
+            method: 'POST',
+            body: JSON.stringify({ expected_revision: expectedRevision }),
+        }),
+    delete: (agentId: string, sceneKey: string) =>
+        request<{ ok: boolean }>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}`, { method: 'DELETE' }),
+    rollback: (agentId: string, sceneKey: string, targetRevision: number, expectedRevision: number) =>
+        request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}/rollback`, {
+            method: 'POST',
+            body: JSON.stringify({ target_revision: targetRevision, expected_revision: expectedRevision }),
+        }),
+};
+
 export const speechApi = {
     createTicket: () => request<{ ticket: string; expires_in: number }>("/speech/ticket", { method: "POST" }),
 };

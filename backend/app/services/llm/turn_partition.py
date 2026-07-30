@@ -55,7 +55,7 @@ def _tool_status(row: Any) -> str:
 
 @dataclass(frozen=True)
 class ConversationTurn:
-    """One persisted user turn and every row up to the next user row."""
+    """One normalized history group, usually a user row through its reply."""
 
     rows: tuple[Any, ...]
     user_row: Any | None
@@ -85,8 +85,17 @@ class TurnPartition:
 
 def _turn_closed(rows: tuple[Any, ...], user_row: Any | None) -> tuple[bool, bool]:
     """Return ``(closed, unknown)`` using explicit metadata then legacy rules."""
-    if user_row is None or not rows:
+    if not rows:
         return False, True
+
+    if user_row is None:
+        # A conversation may legitimately begin with one persisted assistant
+        # greeting. It is an ordinary, complete history item even though no
+        # model turn ran to produce it. Keep this rule channel- and feature-
+        # neutral so downstream history/compaction never needs to understand
+        # the business source of the message.
+        is_initial_assistant = len(rows) == 1 and _role(rows[0]) == "assistant"
+        return is_initial_assistant, not is_initial_assistant
 
     last = rows[-1]
     if _role(last) != "assistant":

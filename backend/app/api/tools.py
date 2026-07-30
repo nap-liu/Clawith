@@ -549,7 +549,11 @@ async def update_agent_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """Update tool assignments for an agent."""
-    agent_obj = await _load_agent_for_tool_scope(db, agent_id)
+    from app.core.permissions import check_agent_access
+
+    agent_obj, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(status_code=403, detail="Agent manage permission required")
     assignments = await _load_agent_tool_assignments(db, agent_id)
     for u in updates:
         tool_id = uuid.UUID(u.tool_id)

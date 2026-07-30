@@ -3871,6 +3871,16 @@ async def execute_tool(
             result = await _generate_monthly_okr_report(agent_id)
         elif tool_name == "upsert_member_daily_report":
             result = await _upsert_member_daily_report(agent_id, arguments)
+        # ── Scene management (strict current-manager session gate) ──
+        elif tool_name == "manage_scene":
+            from app.services.scene_service import execute_scene_management_tool
+
+            result = await execute_scene_management_tool(
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                arguments=arguments,
+            )
         # ── Vercel & Neon Deploy Tools ──
         elif tool_name == "vercel_deploy":
             result = await _vercel_deploy(agent_id, ws, arguments)

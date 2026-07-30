@@ -207,6 +207,7 @@ async def lifespan(fastapi_app: FastAPI):
             import app.models.onboarding     # noqa
             import app.models.mcp_server     # noqa  # FK target of tools.mcp_server_id; fresh-DB create_all needs it registered
             import app.models.chat_compaction  # noqa  # FK target of chat_messages.compacted_into
+            import app.models.scene          # noqa
 
             import app.models.identity       # noqa
             async with engine.begin() as conn:
@@ -458,6 +459,7 @@ from app.api.wechat import router as wechat_router
 from app.api.teams import router as teams_router
 from app.api.triggers import router as triggers_router
 from app.api.focus import router as focus_router
+from app.api.scenes import router as scenes_router
 
 from app.api.atlassian import router as atlassian_router
 
@@ -522,6 +524,7 @@ app.include_router(atlassian_router, prefix=settings.API_PREFIX)
 
 app.include_router(triggers_router)
 app.include_router(focus_router, prefix=settings.API_PREFIX)
+app.include_router(scenes_router, prefix=settings.API_PREFIX)
 app.include_router(chat_sessions_router)
 app.include_router(plaza_router)
 app.include_router(notification_router, prefix=settings.API_PREFIX)

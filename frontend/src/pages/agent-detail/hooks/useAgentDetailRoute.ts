@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 import { type AgentDetailTab, isAgentDetailSettingsTab } from '../agentDetailTabs';
@@ -21,21 +21,26 @@ export function useAgentDetailRoute({ agentId }: { agentId?: string }) {
         setActiveTabRaw((currentTab) => currentTab === nextTab ? currentTab : nextTab);
     }, [hashTab, isSettingsRoute]);
 
-    const setActiveTab = (tab: AgentDetailTab) => {
+    const setActiveTab = useCallback((tab: AgentDetailTab) => {
         if (tab === 'chat') {
-            setActiveTabRaw('chat');
             if (agentId) navigate(`/agents/${agentId}/chat`);
             return;
         }
 
         const nextTab = isAgentDetailSettingsTab(tab) ? tab : 'status';
-        setActiveTabRaw(nextTab);
         if (agentId && !isSettingsRoute) {
             navigate(`/agents/${agentId}/settings#${nextTab}`);
             return;
         }
-        window.history.replaceState(null, '', `#${nextTab}`);
-    };
+        navigate(
+            {
+                pathname: location.pathname,
+                search: location.search,
+                hash: `#${nextTab}`,
+            },
+            { replace: true },
+        );
+    }, [agentId, isSettingsRoute, location.pathname, location.search, navigate]);
 
     return {
         activeTab,

@@ -361,7 +361,10 @@ async def resolve_onboarding_prompt(
             )
         else:
             prompt = _CUSTOM_GREETING_PROMPT.format(name=agent.name, user_name=user_name)
-        target_phase = PHASE_COMPLETED if complete_after_greeting else PHASE_GREETED
+        # Every channel first publishes the visible greeting as ``greeted``.
+        # Non-interactive channels advance to ``completed`` only after the
+        # assistant reply is durably persisted.
+        target_phase = PHASE_GREETED
         is_greeting_turn = True
     else:
         return None
@@ -545,6 +548,101 @@ async def release_onboarding_claim(
     return bool(result.rowcount)
 
 
+async def onboarding_claim_is_current(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    claimed_at: datetime,
+) -> bool:
+    """Return whether one synthetic greeting still owns its exact pending claim."""
+
+    result = await db.execute(
+        select(AgentUserOnboarding.agent_id).where(
+            AgentUserOnboarding.agent_id == agent_id,
+            AgentUserOnboarding.user_id == user_id,
+            AgentUserOnboarding.phase == PHASE_PENDING,
+            AgentUserOnboarding.onboarded_at == claimed_at,
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def claim_fixed_welcome_slot(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> bool:
+    """Atomically let a fixed welcome own first contact before model output."""
+
+    current = datetime.now(timezone.utc)
+    inserted = (
+        await db.execute(
+            pg_insert(AgentUserOnboarding)
+            .values(
+                agent_id=agent_id,
+                user_id=user_id,
+                phase=PHASE_COMPLETED,
+                onboarded_at=current,
+            )
+            .on_conflict_do_nothing(index_elements=["agent_id", "user_id"])
+            .returning(AgentUserOnboarding.phase)
+        )
+    ).scalar_one_or_none()
+    if inserted is not None:
+        await db.commit()
+        return True
+
+    takeover = (
+        await db.execute(
+            update(AgentUserOnboarding)
+            .where(
+                AgentUserOnboarding.agent_id == agent_id,
+                AgentUserOnboarding.user_id == user_id,
+                AgentUserOnboarding.phase == PHASE_PENDING,
+            )
+            .values(phase=PHASE_COMPLETED, onboarded_at=current)
+            .returning(AgentUserOnboarding.phase)
+        )
+    ).scalar_one_or_none()
+    if takeover is not None:
+        await db.commit()
+        return True
+
+    phase = await db.scalar(
+        select(AgentUserOnboarding.phase).where(
+            AgentUserOnboarding.agent_id == agent_id,
+            AgentUserOnboarding.user_id == user_id,
+        )
+    )
+    await db.rollback()
+    if phase != PHASE_COMPLETED:
+        return False
+
+    # Once a real user turn exists, first-contact arbitration is over and a
+    # new pristine scene session may show its configured welcome. A generated
+    # greeting without a real user turn remains the winning welcome.
+    real_user_message = await db.scalar(
+        select(ChatMessage.id)
+        .where(
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.user_id == user_id,
+            ChatMessage.role == "user",
+        )
+        .limit(1)
+    )
+    if real_user_message is not None:
+        return True
+    any_message = await db.scalar(
+        select(ChatMessage.id)
+        .where(
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.user_id == user_id,
+        )
+        .limit(1)
+    )
+    return any_message is None
+
+
 async def claim_normal_first_turn(
     db: AsyncSession,
     agent_id: uuid.UUID,
@@ -556,15 +654,41 @@ async def claim_normal_first_turn(
 
     Returns the resulting/current phase. A fresh real message inserts
     ``completed`` so the prompt resolver cannot replace the user's question
-    with a greeting. A stale pending greeting is also completed atomically.
+    with a greeting. ``pending`` means the caller must wait while a greeting
+    owns first contact but has not yet written its standard assistant message.
+    A stale greeting claim is completed atomically so a crashed worker cannot
+    block normal chat forever.
     """
 
     current = now or datetime.now(timezone.utc)
     existing = await db.get(AgentUserOnboarding, (agent_id, user_id))
     if existing is not None:
-        if existing.phase != PHASE_PENDING:
+        if existing.phase == PHASE_GREETED:
+            durable_greeting = await db.scalar(
+                select(ChatMessage.id)
+                .join(
+                    ChatSession,
+                    ChatMessage.conversation_id == cast(ChatSession.id, String),
+                )
+                .where(
+                    ChatMessage.agent_id == agent_id,
+                    ChatMessage.user_id == user_id,
+                    ChatMessage.role == "assistant",
+                    ChatMessage.created_at >= existing.onboarded_at,
+                    ChatSession.agent_id == agent_id,
+                    ChatSession.user_id == user_id,
+                    ChatSession.is_group.is_(False),
+                    ChatSession.source_channel.in_(_FIRST_PARTY_CHANNELS),
+                )
+                .limit(1)
+            )
+            if durable_greeting is not None:
+                return PHASE_GREETED
+            if not _pending_is_stale(existing, current):
+                return PHASE_PENDING
+        elif existing.phase != PHASE_PENDING:
             return existing.phase
-        if not _pending_is_stale(existing, current):
+        elif not _pending_is_stale(existing, current):
             return PHASE_PENDING
 
         stale_takeover = (
@@ -572,7 +696,7 @@ async def claim_normal_first_turn(
             .where(
                 AgentUserOnboarding.agent_id == agent_id,
                 AgentUserOnboarding.user_id == user_id,
-                AgentUserOnboarding.phase == PHASE_PENDING,
+                AgentUserOnboarding.phase == existing.phase,
                 AgentUserOnboarding.onboarded_at == existing.onboarded_at,
             )
             .values(phase=PHASE_COMPLETED, onboarded_at=current)
@@ -627,6 +751,7 @@ async def mark_onboarding_phase(
     phase: str = PHASE_COMPLETED,
     *,
     expected_phase: str | None = None,
+    expected_onboarded_at: datetime | None = None,
 ) -> bool:
     """Insert or update the onboarding phase for a user/agent pair.
 
@@ -642,28 +767,41 @@ async def mark_onboarding_phase(
     }:
         phase = PHASE_COMPLETED
     if expected_phase is not None:
+        phase_values = {
+            "phase": phase,
+            "onboarded_at": datetime.now(timezone.utc),
+        }
+        conditions = [
+            AgentUserOnboarding.agent_id == agent_id,
+            AgentUserOnboarding.user_id == user_id,
+            AgentUserOnboarding.phase == expected_phase,
+        ]
+        if expected_onboarded_at is not None:
+            conditions.append(
+                AgentUserOnboarding.onboarded_at == expected_onboarded_at
+            )
         result = await db.execute(
             update(AgentUserOnboarding)
-            .where(
-                AgentUserOnboarding.agent_id == agent_id,
-                AgentUserOnboarding.user_id == user_id,
-                AgentUserOnboarding.phase == expected_phase,
-            )
-            .values(phase=phase)
+            .where(*conditions)
+            .values(**phase_values)
         )
         await db.commit()
         return bool(result.rowcount)
 
+    phase_values = {
+        "phase": phase,
+        "onboarded_at": datetime.now(timezone.utc),
+    }
     stmt = (
         pg_insert(AgentUserOnboarding)
         .values(
             agent_id=agent_id,
             user_id=user_id,
-            phase=phase,
+            **phase_values,
         )
         .on_conflict_do_update(
             index_elements=["agent_id", "user_id"],
-            set_={"phase": phase},
+            set_=phase_values,
         )
     )
     result = await db.execute(stmt)
