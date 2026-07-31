@@ -7,6 +7,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const {
     enabledSceneQuickActions,
     findEnabledSceneQuickAction,
+    isSceneQuickActionUnavailable,
 } = loadTypeScriptModule(
     resolve(__dirname, '../src/utils/sceneQuickActions.ts'),
 );
@@ -23,5 +24,26 @@ assert.deepEqual(
 );
 assert.equal(findEnabledSceneQuickAction(actions, 'enabled')?.label, 'Enabled');
 assert.equal(findEnabledSceneQuickAction(actions, 'disabled'), undefined);
+assert.equal(
+    isSceneQuickActionUnavailable(
+        { id: 'send', type: 'send_message' },
+        { confirmationPending: false, sendMessageUnavailable: true },
+    ),
+    true,
+);
+assert.equal(
+    isSceneQuickActionUnavailable(
+        { id: 'link', type: 'open_uri' },
+        { confirmationPending: false, sendMessageUnavailable: true },
+    ),
+    false,
+);
+assert.equal(
+    isSceneQuickActionUnavailable(
+        { id: 'link', type: 'open_uri' },
+        { confirmationPending: true, sendMessageUnavailable: false },
+    ),
+    true,
+);
 
 console.log('scene quick action tests passed');

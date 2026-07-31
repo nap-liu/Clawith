@@ -1,11 +1,12 @@
 import json
 import uuid
-from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
 from app.api.websocket import WebSocketChatHandler
+from app.core.security import create_access_token
 from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.agent import AgentUserOnboarding
@@ -20,6 +21,7 @@ from app.services.agent_tools import get_agent_tools_for_llm
 from app.services.chat_history import build_llm_messages_from_rows
 from app.services.onboarding import (
     PHASE_COMPLETED,
+    claim_fixed_welcome_slot,
     resolve_onboarding_eligibility,
 )
 from app.services.scene_service import (
@@ -278,7 +280,7 @@ async def test_fixed_scene_welcome_is_persisted_with_first_real_user_message():
 
     handler = WebSocketChatHandler.__new__(WebSocketChatHandler)
     handler.agent_id = agent_id
-    handler.user = SimpleNamespace(id=user_id)
+    handler.user_id = user_id
     handler.conv_id = str(session_id)
     handler.scene_manifest = {
         "scene_key": "warranty",
@@ -310,13 +312,15 @@ async def test_fixed_scene_welcome_is_persisted_with_first_real_user_message():
         )
     assert before == []
 
-    first_user_id, consumed, greeting = await handler._save_user_message(
+    first_user_id, consumed, greeting, pending_confirmation, ignored_confirmation = await handler._save_user_message(
         "我要报修",
         "",
         "",
         False,
         client_message_id=uuid.uuid4().hex,
     )
+    assert pending_confirmation is None
+    assert ignored_confirmation is False
 
     async with async_session() as db:
         rows = list(
@@ -348,6 +352,86 @@ async def test_fixed_scene_welcome_is_persisted_with_first_real_user_message():
         {"role": "assistant", "content": "欢迎使用报修服务"},
         {"role": "user", "content": "我要报修"},
     ]
+
+
+async def test_fixed_scene_welcome_claim_does_not_control_caller_transaction(
+    monkeypatch,
+):
+    user_id, agent_id = await _seed_actor_and_agent()
+
+    async with async_session() as db:
+        assert await claim_fixed_welcome_slot(db, agent_id, user_id) is True
+        await db.commit()
+
+    async with async_session() as db:
+        user = await db.get(User, user_id)
+        commit = AsyncMock(
+            side_effect=AssertionError(
+                "claim_fixed_welcome_slot must not commit its caller's session"
+            )
+        )
+        rollback = AsyncMock(
+            side_effect=AssertionError(
+                "claim_fixed_welcome_slot must not roll back its caller's session"
+            )
+        )
+        monkeypatch.setattr(db, "commit", commit)
+        monkeypatch.setattr(db, "rollback", rollback)
+
+        assert await claim_fixed_welcome_slot(db, agent_id, user_id) is True
+        assert user.id == user_id
+        commit.assert_not_awaited()
+        rollback.assert_not_awaited()
+
+
+async def test_websocket_setup_rolls_back_complete_initialization_on_failure(
+    monkeypatch,
+):
+    class SetupSocket:
+        def __init__(self):
+            self.sent = []
+            self.closed_code = None
+
+        async def accept(self):
+            return None
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+        async def close(self, code=1000):
+            self.closed_code = code
+
+    user_id, agent_id = await _seed_actor_and_agent()
+    websocket = SetupSocket()
+    handler = WebSocketChatHandler(
+        websocket=websocket,
+        agent_id=agent_id,
+        token=create_access_token(str(user_id), "member"),
+        channel="web",
+    )
+    monkeypatch.setattr(
+        handler,
+        "_prepare_initial_greeting",
+        AsyncMock(side_effect=RuntimeError("initialization failed")),
+    )
+
+    assert await handler.setup() is False
+    assert websocket.closed_code == 4002
+
+    async with async_session() as db:
+        sessions = list(
+            (
+                await db.execute(
+                    select(ChatSession).where(
+                        ChatSession.agent_id == agent_id,
+                        ChatSession.user_id == user_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert sessions == []
 
 
 async def test_scene_greeting_completes_shared_onboarding_arbitration():
@@ -382,6 +466,7 @@ async def test_scene_greeting_completes_shared_onboarding_arbitration():
         }
         handler.pending_initial_assistant = None
         await handler._prepare_initial_greeting(db, user_id)
+        await db.commit()
 
     async with async_session() as db:
         state = await db.get(

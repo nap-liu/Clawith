@@ -31,7 +31,7 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from sqlalchemy import select
@@ -42,6 +42,9 @@ from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction
 from app.models.user import User
 from app.services.sender_attribution import wrap_with_sender
+
+if TYPE_CHECKING:
+    from app.services.confirmation_service import PendingConfirmation
 
 
 @dataclass
@@ -299,6 +302,28 @@ def _trim_incomplete_user_turn_tail_rows(rows: list[Any]) -> list[Any]:
         if isinstance(row, _SyntheticSummaryMessage):
             continue
         if getattr(row, "role", None) == "user":
+            # A confirmation tool call is the one normalized tool lifecycle that
+            # deliberately ends the current model run before a final assistant reply:
+            # pending waits for a click, and done is replayed when that click resumes
+            # the same turn. Ordinary completed tool rows without a final assistant
+            # are still an interrupted /stop tail and must be discarded.
+            next_user_idx = next(
+                (
+                    later_idx
+                    for later_idx in range(idx + 1, len(rows))
+                    if getattr(rows[later_idx], "role", None) == "user"
+                ),
+                len(rows),
+            )
+            if any(
+                (
+                    getattr(rows[later_idx], "role", None) == "assistant"
+                    or _is_confirmation_tool_call_row(rows[later_idx])
+                )
+                for later_idx in range(idx + 1, next_user_idx)
+                if not isinstance(rows[later_idx], _SyntheticSummaryMessage)
+            ):
+                continue
             if idx < len(rows):
                 logger.info(
                     "[chat_history] dropped incomplete stopped-turn tail "
@@ -335,6 +360,17 @@ def _parse_tool_call_payload(content: str) -> dict[str, Any] | None:
     }
 
 
+def _is_confirmation_tool_call_row(row: Any) -> bool:
+    if getattr(row, "role", None) != "tool_call":
+        return False
+    payload = _parse_tool_call_payload(getattr(row, "content", ""))
+    return bool(
+        payload
+        and payload.get("name") == "request_confirmation"
+        and payload.get("status") in {"pending", "done"}
+    )
+
+
 def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
     """Expand one persisted ``tool_call`` row into an OpenAI ``assistant``
     (carrying ``tool_calls``) + ``tool`` (result) message pair.
@@ -352,17 +388,8 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
     args = payload["args"] if payload["args"] is not None else {}
     status = payload["status"] or "done"
     result = payload["result"] or ""
-    if status != "done":
-        if status == "pending" and name == "request_confirmation":
-            result = "(用户尚未响应该确认卡,视为未决;在收到明确点击前不要执行该操作)"
-        else:
-            return []
-    # A suspended request_confirmation tool_call (awaiting the user's click) carries no
-    # result yet. Every tool_call still needs a paired tool result or strict providers
-    # reject the orphan — emit a placeholder that also tells the model it's unresolved,
-    # rather than an empty string the model can't interpret.
-    if status == "pending" and not result:
-        result = "(用户尚未响应该确认卡,视为未决;在收到明确点击前不要执行该操作)"
+    if status not in {"done", "pending"}:
+        return []
     tc_id = str(payload.get("call_id") or f"call_{msg.id}")
 
     asst: dict[str, Any] = {
@@ -384,6 +411,13 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
 
     # Lazy import: vision_inject pulls in optional deps; only needed here.
     from app.services.vision_inject import sanitize_history_tool_result
+
+    if status == "pending":
+        # A confirmation suspends the turn with an intentionally unpaired tool call.
+        # No provider request is allowed while it remains pending; the real tool result
+        # is created only by a button click or by an explicitly non-blocking card being
+        # ignored through a later user message.
+        return [asst]
 
     tool_msg = {
         "role": "tool",
@@ -552,6 +586,48 @@ class IncomingMessageIngestResult:
     created: bool
     consumed_by_onmessage: bool
     execution_ids: tuple[uuid.UUID, ...] = ()
+    blocked_by_confirmation: bool = False
+    pending_confirmation: PendingConfirmation | None = None
+    ignored_confirmation: PendingConfirmation | None = None
+    ignored_confirmation_result: str | None = None
+
+
+async def finish_blocked_confirmation_ingest(
+    db: AsyncSession,
+    result: IncomingMessageIngestResult,
+) -> bool:
+    """Finish an IM ingress rejected by the pending-confirmation hard gate.
+
+    The caller's legitimate setup work (identity/session creation) is committed,
+    while no inbound message exists to broadcast or execute.  After releasing the
+    session lock, create a fresh transport instance for the same durable card on
+    supported IM channels.
+    """
+    if not result.blocked_by_confirmation or result.pending_confirmation is None:
+        return False
+    await db.commit()
+    from app.services.confirmation_service import redeliver_pending_confirmation
+
+    await redeliver_pending_confirmation(result.pending_confirmation)
+    return True
+
+
+async def finish_ignored_confirmation_ingest(
+    result: IncomingMessageIngestResult,
+) -> bool:
+    """Publish a committed non-blocking confirmation's negative tool result."""
+    if (
+        result.ignored_confirmation is None
+        or not result.ignored_confirmation_result
+    ):
+        return False
+    from app.services.confirmation_service import publish_ignored_confirmation
+
+    await publish_ignored_confirmation(
+        result.ignored_confirmation,
+        result.ignored_confirmation_result,
+    )
+    return True
 
 
 async def ingest_incoming_chat_message(
@@ -583,6 +659,92 @@ async def ingest_incoming_chat_message(
         provider_event_id=provider_event_id,
         channel_config_id=channel_config_id,
     )
+
+    # Provider retries are deduplicated before the pending-confirmation gate.  If
+    # the original event was accepted before the card appeared, retrying that same
+    # event must not be mistaken for a new attempt and must never re-run its turn.
+    if event_key:
+        existing = (
+            await db.execute(
+                select(ChatMessage).where(ChatMessage.external_event_key == event_key)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            existing_meta = (
+                existing.message_meta if isinstance(existing.message_meta, dict) else {}
+            )
+            execution_ids: list[uuid.UUID] = []
+            for raw_id in existing_meta.get("onmessage_execution_ids") or []:
+                try:
+                    execution_ids.append(uuid.UUID(str(raw_id)))
+                except (TypeError, ValueError):
+                    continue
+            return IncomingMessageIngestResult(
+                message=existing,
+                created=False,
+                consumed_by_onmessage=True,
+                execution_ids=tuple(execution_ids),
+            )
+
+    # Use the normal ChatSession row as the cross-process ordering boundary.  The
+    # confirmation writer takes the same lock, so a message can never slip between
+    # "agent requested confirmation" and "pending row became visible".
+    from app.models.chat_session import ChatSession
+
+    locked_session = (
+        await db.execute(
+            select(ChatSession).where(ChatSession.id == session.id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if locked_session is None:
+        raise RuntimeError("chat session no longer exists")
+
+    from app.services.confirmation_service import find_pending_confirmation
+
+    # Confirmation cards are currently a product contract for Web/H5 and
+    # DingTalk only. Do not silently impose an unclickable hard gate on other IM
+    # transports until they implement the same card lifecycle.
+    confirmation_gated = source_channel in {
+        "web",
+        "miniprogram",
+        "wechat_miniprogram",
+        "dingtalk",
+    }
+    pending = (
+        await find_pending_confirmation(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+        )
+        if confirmation_gated
+        else None
+    )
+    ignored_confirmation = None
+    ignored_confirmation_result = None
+    if pending is not None and pending.force_confirmation:
+        pending_row = await db.get(ChatMessage, pending.row_id)
+        if pending_row is None:
+            raise RuntimeError("pending confirmation message no longer exists")
+        return IncomingMessageIngestResult(
+            message=pending_row,
+            created=False,
+            consumed_by_onmessage=True,
+            blocked_by_confirmation=True,
+            pending_confirmation=pending,
+        )
+    if pending is not None:
+        from app.services.confirmation_service import (
+            ignore_pending_confirmation_for_new_input,
+        )
+
+        ignored_confirmation_result = await ignore_pending_confirmation_for_new_input(
+            db,
+            pending,
+        )
+        if ignored_confirmation_result is None:
+            raise RuntimeError("non-blocking pending confirmation could not be closed")
+        ignored_confirmation = pending
+
     meta = {
         **(message_meta or {}),
         "direction": "inbound",
@@ -628,6 +790,8 @@ async def ingest_incoming_chat_message(
         created=True,
         consumed_by_onmessage=matched.consumed,
         execution_ids=matched.execution_ids,
+        ignored_confirmation=ignored_confirmation,
+        ignored_confirmation_result=ignored_confirmation_result,
     )
 
 

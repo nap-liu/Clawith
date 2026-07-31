@@ -51,11 +51,8 @@ def test_expand_web_schema_produces_assistant_and_tool_pair():
     assert "file contents" in tool["content"]
 
 
-def test_expand_pending_confirmation_emits_placeholder_result():
-    """A request_confirmation tool_call still awaiting the user (status='pending',
-    empty result) must replay as assistant(tool_call) + tool(placeholder) — every
-    tool_call needs a paired result for strict providers, and the placeholder tells
-    the model the user hasn't responded yet rather than feeding it an empty string."""
+def test_expand_pending_confirmation_keeps_unpaired_tool_call():
+    """A pending card suspends the turn before a tool result exists."""
     mid = uuid.uuid4()
     row = _row(
         json.dumps(
@@ -71,14 +68,9 @@ def test_expand_pending_confirmation_emits_placeholder_result():
 
     out = expand_tool_call_row(row)
 
-    assert len(out) == 2
-    asst, tool = out
+    assert len(out) == 1
+    asst = out[0]
     assert asst["tool_calls"][0]["function"]["name"] == "request_confirmation"
-    assert tool["role"] == "tool"
-    assert tool["tool_call_id"] == f"call_{mid}"
-    # Not an empty string — a concrete "still pending" marker.
-    assert tool["content"].strip() != ""
-    assert "未响应" in tool["content"] or "未决" in tool["content"]
 
 
 def test_expand_legacy_feishu_schema_is_tolerated():

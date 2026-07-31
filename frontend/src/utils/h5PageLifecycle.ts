@@ -8,13 +8,19 @@ type H5PageLifecycleOptions = {
 };
 
 const VIEWPORT_HEIGHT_PROPERTY = '--h5-viewport-height';
+const VIEWPORT_OFFSET_TOP_PROPERTY = '--h5-viewport-offset-top';
 
-function readViewportHeight(targetWindow: Window): number {
-    const visualHeight = targetWindow.visualViewport?.height;
+function readViewportMetrics(targetWindow: Window) {
+    const visualViewport = targetWindow.visualViewport;
+    const visualHeight = visualViewport?.height;
     const height = visualHeight && visualHeight > 0
         ? visualHeight
         : targetWindow.innerHeight;
-    return Number.isFinite(height) && height > 0 ? Math.round(height) : 0;
+    const offsetTop = visualViewport?.offsetTop ?? 0;
+    return {
+        height: Number.isFinite(height) && height > 0 ? Math.round(height) : 0,
+        offsetTop: Number.isFinite(offsetTop) && offsetTop > 0 ? Math.round(offsetTop) : 0,
+    };
 }
 
 /**
@@ -32,12 +38,16 @@ export function installH5PageLifecycle(options: H5PageLifecycleOptions = {}) {
 
     let suspended = targetDocument.visibilityState === 'hidden';
 
-    const updateViewportHeight = () => {
-        const height = readViewportHeight(targetWindow);
+    const updateViewport = () => {
+        const { height, offsetTop } = readViewportMetrics(targetWindow);
         if (height > 0) {
             targetDocument.documentElement.style.setProperty(
                 VIEWPORT_HEIGHT_PROPERTY,
                 `${height}px`,
+            );
+            targetDocument.documentElement.style.setProperty(
+                VIEWPORT_OFFSET_TOP_PROPERTY,
+                `${offsetTop}px`,
             );
         }
     };
@@ -50,7 +60,7 @@ export function installH5PageLifecycle(options: H5PageLifecycleOptions = {}) {
         if (targetDocument.visibilityState === 'hidden') return;
         const shouldNotify = suspended || force;
         suspended = false;
-        updateViewportHeight();
+        updateViewport();
         if (shouldNotify) options.onResume?.(reason);
     };
     const onVisibilityChange = () => {
@@ -66,23 +76,26 @@ export function installH5PageLifecycle(options: H5PageLifecycleOptions = {}) {
     };
     const onOnline = () => resume('online', true);
 
-    updateViewportHeight();
+    updateViewport();
     targetDocument.addEventListener('visibilitychange', onVisibilityChange);
     targetWindow.addEventListener('pagehide', onPageHide);
     targetWindow.addEventListener('pageshow', onPageShow);
     targetWindow.addEventListener('online', onOnline);
-    targetWindow.addEventListener('resize', updateViewportHeight);
-    targetWindow.addEventListener('orientationchange', updateViewportHeight);
-    targetWindow.visualViewport?.addEventListener('resize', updateViewportHeight);
+    targetWindow.addEventListener('resize', updateViewport);
+    targetWindow.addEventListener('orientationchange', updateViewport);
+    targetWindow.visualViewport?.addEventListener('resize', updateViewport);
+    targetWindow.visualViewport?.addEventListener('scroll', updateViewport);
 
     return () => {
         targetDocument.removeEventListener('visibilitychange', onVisibilityChange);
         targetWindow.removeEventListener('pagehide', onPageHide);
         targetWindow.removeEventListener('pageshow', onPageShow);
         targetWindow.removeEventListener('online', onOnline);
-        targetWindow.removeEventListener('resize', updateViewportHeight);
-        targetWindow.removeEventListener('orientationchange', updateViewportHeight);
-        targetWindow.visualViewport?.removeEventListener('resize', updateViewportHeight);
+        targetWindow.removeEventListener('resize', updateViewport);
+        targetWindow.removeEventListener('orientationchange', updateViewport);
+        targetWindow.visualViewport?.removeEventListener('resize', updateViewport);
+        targetWindow.visualViewport?.removeEventListener('scroll', updateViewport);
         targetDocument.documentElement.style.removeProperty(VIEWPORT_HEIGHT_PROPERTY);
+        targetDocument.documentElement.style.removeProperty(VIEWPORT_OFFSET_TOP_PROPERTY);
     };
 }

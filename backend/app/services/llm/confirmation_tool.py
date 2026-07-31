@@ -13,6 +13,9 @@ REQUEST_CONFIRMATION_TOOL_DEFINITION: dict[str, Any] = {
             "用本工具向用户出示一张确认卡片征求许可。调用即把控制权交给用户并结束当前回合。"
             "用户点击卡片按钮后,你会在后续回合被告知他点了哪个按钮(按钮文字),"
             "然后由你自己决定后续——同意就自己去执行该操作,拒绝就据此继续对话。"
+            "force_confirmation=true 时用户只能点击卡片才能继续;"
+            "force_confirmation=false 时用户也可以直接发送新消息来忽略本次确认,"
+            "平台会明确告知你本次操作没有获得确认。"
             "平台只忠实地把用户的点击带回给你,不会替你执行任何操作。卡片有效期 24 小时,过期作废。"
         ),
         "parameters": {
@@ -67,6 +70,14 @@ REQUEST_CONFIRMATION_TOOL_DEFINITION: dict[str, Any] = {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
                     "description": "风险等级,仅影响卡片配色,默认 medium",
+                },
+                "force_confirmation": {
+                    "type": "boolean",
+                    "description": (
+                        "是否强制用户点击卡片后才能继续。默认 true。"
+                        "true:卡片未处理前拒绝普通输入;"
+                        "false:用户发送新消息时视为忽略本次确认,平台会返回明确的未确认结果。"
+                    ),
                 },
             },
             "required": ["title", "summary"],
@@ -135,6 +146,7 @@ class ConfirmationCall:
     error: str | None = None
     call_id: str = ""
     buttons: list | None = None  # agent-defined [{text, value, color}], None → default 确认/取消
+    force_confirmation: bool = True
 
 
 def _parse_args(tc: dict) -> dict | None:
@@ -192,7 +204,29 @@ def find_request_confirmation_call(tool_calls: list[dict] | None) -> Confirmatio
                 for b in raw_buttons
                 if isinstance(b, dict) and (b.get("text") or b.get("value"))
             ] or None
+        force_confirmation = args.get("force_confirmation")
+        if force_confirmation is None:
+            force_confirmation = True
+        if not isinstance(force_confirmation, bool):
+            return ConfirmationCall(
+                False,
+                title,
+                summary,
+                action,
+                risk if risk in ("low", "medium", "high") else "medium",
+                "force_confirmation 必须是 boolean",
+                cid,
+                buttons,
+            )
         return ConfirmationCall(
-            True, title, summary, action, risk if risk in ("low", "medium", "high") else "medium", None, cid, buttons
+            True,
+            title,
+            summary,
+            action,
+            risk if risk in ("low", "medium", "high") else "medium",
+            None,
+            cid,
+            buttons,
+            force_confirmation,
         )
     return None

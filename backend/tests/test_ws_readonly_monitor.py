@@ -104,12 +104,16 @@ async def test_resolve_admits_privileged_viewer_as_read_only():
     h = _handler()
     h.session_id_param = str(session_id)
     h.agent_id = agent.id
-    h.agent = agent
-    h.user = SimpleNamespace(id=viewer_id, role="org_admin")
+    viewer = SimpleNamespace(id=viewer_id, role="org_admin")
     h.read_only = False
     h.websocket = _FakeWS()
 
-    conv = await h._resolve_chat_session(_db_returning(other_session), viewer_id)
+    conv = await h._resolve_chat_session(
+        _db_returning(other_session),
+        viewer_id,
+        viewer=viewer,
+        agent=agent,
+    )
 
     assert conv == str(session_id), "a privileged viewer is admitted to the session"
     assert h.read_only is True, "and the connection is marked read-only"
@@ -126,12 +130,16 @@ async def test_resolve_rejects_unprivileged_viewer():
     h = _handler()
     h.session_id_param = str(session_id)
     h.agent_id = agent.id
-    h.agent = agent
-    h.user = SimpleNamespace(id=viewer_id, role="member")
+    viewer = SimpleNamespace(id=viewer_id, role="member")
     h.read_only = False
     h.websocket = _FakeWS()
 
-    conv = await h._resolve_chat_session(_db_returning(other_session), viewer_id)
+    conv = await h._resolve_chat_session(
+        _db_returning(other_session),
+        viewer_id,
+        viewer=viewer,
+        agent=agent,
+    )
 
     assert conv is None, "an unprivileged viewer is rejected"
     assert h.read_only is False
@@ -147,12 +155,16 @@ async def test_resolve_owner_is_writable_not_read_only():
     h = _handler()
     h.session_id_param = str(session_id)
     h.agent_id = agent.id
-    h.agent = agent
-    h.user = SimpleNamespace(id=owner_id, role="member")
+    viewer = SimpleNamespace(id=owner_id, role="member")
     h.read_only = False
     h.websocket = _FakeWS()
 
-    conv = await h._resolve_chat_session(_db_returning(own_session), owner_id)
+    conv = await h._resolve_chat_session(
+        _db_returning(own_session),
+        owner_id,
+        viewer=viewer,
+        agent=agent,
+    )
 
     assert conv == str(session_id)
     assert h.read_only is False, "the owner keeps full read/write access"

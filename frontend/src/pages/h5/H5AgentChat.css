@@ -1,4 +1,9 @@
 body.h5-chat-active {
+    position: fixed;
+    top: var(--h5-viewport-offset-top, 0px);
+    right: 0;
+    left: 0;
+    width: 100%;
     overflow: hidden;
     background: var(--bg-primary);
     height: var(--h5-viewport-height, 100dvh);
@@ -1088,7 +1093,8 @@ body.h5-chat-active #root {
     color: var(--text-primary);
     background: transparent;
     font: inherit;
-    font-size: 14px;
+    /* iOS zooms the viewport when a focused form control is smaller than 16px. */
+    font-size: 16px;
 }
 
 .h5-chat__quick-menu-search:focus-within,

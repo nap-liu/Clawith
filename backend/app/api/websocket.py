@@ -34,6 +34,8 @@ from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot
 from app.services.auth_code_exchange import validate_platform_login_channel
 from app.services.chat_history import persist_initial_assistant_message_if_pristine
 from app.services.chat_session_service import ensure_primary_platform_session
+from app.services.confirmation_service import PendingConfirmation
+from app.services.llm.runtime_model import RuntimeLLMModel
 from app.services.llm import call_llm_with_failover
 from app.services.onboarding import (
     PHASE_COMPLETED,
@@ -275,16 +277,15 @@ class WebSocketChatHandler:
         self.pending_initial_assistant: dict | None = None
 
         # State fields initialized during setup
-        self.user: User | None = None
-        self.agent: Agent | None = None
+        self.user_id: uuid.UUID | None = None
         self.agent_name: str = ""
         self.agent_type: str = ""
         self.role_description: str = ""
         self.welcome_message: str = ""
         self.ctx_size: int = 100
         self.user_display_name: str = ""
-        self.llm_model: LLMModel | None = None
-        self.fallback_llm_model: LLMModel | None = None
+        self.llm_model: RuntimeLLMModel | None = None
+        self.fallback_llm_model: RuntimeLLMModel | None = None
         self.conv_id: str | None = None
         # Read-only monitor: viewer is watching a session they do NOT own but are
         # allowed to see (admins / agent creator). They subscribe to live
@@ -326,7 +327,7 @@ class WebSocketChatHandler:
             await self.message_loop()
 
         except WebSocketDisconnect:
-            logger.info(f"[WS] Client disconnected: {getattr(self.user, 'id', 'unknown')}")
+            logger.info(f"[WS] Client disconnected: {self.user_id or 'unknown'}")
             await manager.disconnect(str(self.agent_id), self.websocket)
         except Exception as e:
             logger.exception(f"[WS] Unexpected error: {e}")
@@ -341,6 +342,7 @@ class WebSocketChatHandler:
         try:
             payload = decode_access_token(self.token)
             user_id = uuid.UUID(payload["sub"])
+            self.user_id = user_id
         except Exception:
             await self.websocket.send_json({"type": "error", "content": "Authentication failed"})
             await self.websocket.close(code=4001)
@@ -349,17 +351,17 @@ class WebSocketChatHandler:
         try:
             async with async_session() as db:
                 result = await db.execute(select(User).where(User.id == user_id))
-                self.user = result.scalar_one_or_none()
-                if not self.user:
+                user = result.scalar_one_or_none()
+                if not user:
                     logger.error("[WS] User not found")
                     await self.websocket.send_json({"type": "error", "content": "User not found"})
                     await self.websocket.close(code=4001)
                     return False
 
                 logger.info(f"[WS] Checking agent access for {self.agent_id}")
-                self.agent, _ = await check_agent_access(db, self.user, self.agent_id)
-                require_current_agent_tenant(self.user, self.agent)
-                if is_agent_expired(self.agent):
+                agent, _ = await check_agent_access(db, user, self.agent_id)
+                require_current_agent_tenant(user, agent)
+                if is_agent_expired(agent):
                     await self.websocket.send_json(
                         {
                             "type": "error",
@@ -369,22 +371,27 @@ class WebSocketChatHandler:
                     await self.websocket.close(code=4003)
                     return False
 
-                self.agent_name = self.agent.name
-                self.agent_type = self.agent.agent_type or ""
-                self.role_description = self.agent.role_description or ""
-                self.welcome_message = self.agent.welcome_message or ""
-                self.ctx_size = self.agent.context_window_size or 100
-                self.user_display_name = (self.user.display_name or "").strip() or "there"
+                self.agent_name = agent.name
+                self.agent_type = agent.agent_type or ""
+                self.role_description = agent.role_description or ""
+                self.welcome_message = agent.welcome_message or ""
+                self.ctx_size = agent.context_window_size or 100
+                self.user_display_name = (user.display_name or "").strip() or "there"
                 await self._load_scene_manifest(db)
                 logger.info(
-                    f"[WS] Agent: {self.agent_name}, type: {self.agent_type}, model_id: {self.agent.primary_model_id}, ctx: {self.ctx_size}"
+                    f"[WS] Agent: {self.agent_name}, type: {self.agent_type}, model_id: {agent.primary_model_id}, ctx: {self.ctx_size}"
                 )
 
                 # Load models
-                await self._load_models(db)
+                await self._load_models(db, agent)
 
                 # Resolve or create chat session
-                self.conv_id = await self._resolve_chat_session(db, user_id)
+                self.conv_id = await self._resolve_chat_session(
+                    db,
+                    user_id,
+                    viewer=user,
+                    agent=agent,
+                )
                 if not self.conv_id:
                     return False
 
@@ -403,6 +410,9 @@ class WebSocketChatHandler:
                 self.onboarding_required = self._resolve_onboarding_required(
                     onboarding_eligibility.required
                 )
+                # setup owns the complete initialization transaction. Helpers
+                # may flush/query but must never commit or roll it back.
+                await db.commit()
 
         except Exception as e:
             logger.exception(f"[WS] Setup error: {e}")
@@ -453,24 +463,26 @@ class WebSocketChatHandler:
 
         return True
 
-    async def _load_models(self, db: AsyncSession):
+    async def _load_models(self, db: AsyncSession, agent: Agent):
         """Loads primary and fallback models for the agent."""
-        if self.agent.primary_model_id:
-            model_result = await db.execute(select(LLMModel).where(LLMModel.id == self.agent.primary_model_id))
-            self.llm_model = model_result.scalar_one_or_none()
-            if self.llm_model and not self.llm_model.enabled:
-                logger.info(f"[WS] Primary model {self.llm_model.model} is disabled, skipping")
+        if agent.primary_model_id:
+            model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
+            model = model_result.scalar_one_or_none()
+            if model and not model.enabled:
+                logger.info(f"[WS] Primary model {model.model} is disabled, skipping")
                 self.llm_model = None
             else:
+                self.llm_model = RuntimeLLMModel.from_orm(model) if model else None
                 logger.info(f"[WS] Primary model loaded: {self.llm_model.model if self.llm_model else 'None'}")
 
-        if self.agent.fallback_model_id:
-            fb_result = await db.execute(select(LLMModel).where(LLMModel.id == self.agent.fallback_model_id))
-            self.fallback_llm_model = fb_result.scalar_one_or_none()
-            if self.fallback_llm_model and not self.fallback_llm_model.enabled:
-                logger.info(f"[WS] Fallback model {self.fallback_llm_model.model} is disabled, skipping")
+        if agent.fallback_model_id:
+            fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
+            fallback_model = fb_result.scalar_one_or_none()
+            if fallback_model and not fallback_model.enabled:
+                logger.info(f"[WS] Fallback model {fallback_model.model} is disabled, skipping")
                 self.fallback_llm_model = None
-            elif self.fallback_llm_model:
+            elif fallback_model:
+                self.fallback_llm_model = RuntimeLLMModel.from_orm(fallback_model)
                 logger.info(f"[WS] Fallback model loaded: {self.fallback_llm_model.model}")
 
         if not self.llm_model and self.fallback_llm_model:
@@ -478,7 +490,14 @@ class WebSocketChatHandler:
             self.fallback_llm_model = None
             logger.info(f"[WS] Primary model unavailable, using fallback: {self.llm_model.model}")
 
-    async def _resolve_chat_session(self, db: AsyncSession, user_id: uuid.UUID) -> str | None:
+    async def _resolve_chat_session(
+        self,
+        db: AsyncSession,
+        user_id: uuid.UUID,
+        *,
+        viewer: User,
+        agent: Agent,
+    ) -> str | None:
         """Resolves existing session or creates a new one."""
         conv_id = self.session_id_param
         if conv_id:
@@ -498,10 +517,10 @@ class WebSocketChatHandler:
                 if not _existing:
                     conv_id = None
                 else:
-                    if hasattr(self.agent, "tenant_id"):
+                    if hasattr(agent, "tenant_id"):
                         try:
                             await require_tenant_safe_chat_session(
-                                db, _existing, self.agent.tenant_id
+                                db, _existing, agent.tenant_id
                             )
                         except HTTPException:
                             await self.websocket.send_json(
@@ -516,7 +535,7 @@ class WebSocketChatHandler:
                     # session/message APIs: admins + the agent creator) — so any
                     # session visible in the web UI also updates live. They only
                     # subscribe to broadcasts; sending is blocked in message_loop.
-                    if can_view_all_agent_chat_sessions(self.user, self.agent):
+                    if can_view_all_agent_chat_sessions(viewer, agent):
                         self.read_only = True
                     else:
                         await self.websocket.send_json({"type": "error", "content": "Not authorized for this session"})
@@ -529,8 +548,6 @@ class WebSocketChatHandler:
                 user_id,
                 source_channel=self.source_channel,
             )
-            await db.commit()
-            await db.refresh(_latest)
             conv_id = str(_latest.id)
             logger.info(f"[WS] Selected primary session {conv_id}")
         return conv_id
@@ -684,7 +701,14 @@ class WebSocketChatHandler:
             else self.welcome_message
         )
         if initial_content and not self.history_messages and not self.onboarding_required:
-            await self.websocket.send_json({"type": "done", "role": "assistant", "content": initial_content})
+            await self.websocket.send_json(
+                {
+                    "type": "done",
+                    "role": "assistant",
+                    "content": initial_content,
+                    "message_id": f"initial-assistant:{self.conv_id}",
+                }
+            )
 
         while True:
             data = await self.websocket.receive_json()
@@ -749,6 +773,8 @@ class WebSocketChatHandler:
                 turn_anchor_id,
                 consumed_by_onmessage,
                 persisted_initial_assistant,
+                pending_confirmation,
+                ignored_confirmation,
             ) = await self._save_user_message(
                 content,
                 display_content,
@@ -756,6 +782,44 @@ class WebSocketChatHandler:
                 is_onboarding_trigger,
                 client_message_id=(data.get("message_id") or data.get("client_message_id")),
             )
+
+            if pending_confirmation is not None:
+                await self._safe_send(
+                    {
+                        "type": "confirmation_required",
+                        "content": "请先完成待确认操作。",
+                        "message_id": data.get("message_id")
+                        or data.get("client_message_id"),
+                        "name": "request_confirmation",
+                        "call_id": str(pending_confirmation.row_id),
+                        "args": pending_confirmation.args,
+                        "status": "running",
+                    }
+                )
+                continue
+
+            if ignored_confirmation:
+                # The pending tool call was closed with a real negative result in the
+                # same transaction as this new user row. Reload the persisted prefix
+                # before the new anchor so the next single turn sees:
+                # assistant(tool_call) -> tool(not confirmed) -> user(new input).
+                from app.services.chat_history import load_history_prefix_before_anchor
+
+                async with async_session() as _history_db:
+                    refreshed_prefix = await load_history_prefix_before_anchor(
+                        _history_db,
+                        agent_id=self.agent_id,
+                        conversation_id=self.conv_id,
+                        turn_anchor_id=turn_anchor_id,
+                        ctx_size=self.ctx_size,
+                        rehydrate_images_max=3,
+                        include_thinking=True,
+                    )
+                if refreshed_prefix is None:
+                    raise RuntimeError(
+                        "confirmation ignore committed but history prefix could not be rebuilt"
+                    )
+                self.conversation = refreshed_prefix
 
             if persisted_initial_assistant is not None:
                 self.conversation.append(
@@ -822,7 +886,7 @@ class WebSocketChatHandler:
                     await release_onboarding_claim(
                         _release_db,
                         self.agent_id,
-                        self.user.id,
+                        self.user_id,
                         onboarding_claim.claimed_at,
                     )
 
@@ -889,7 +953,7 @@ class WebSocketChatHandler:
             if self.client_disconnected:
                 logger.info(
                     f"[WS] Detached turn complete after disconnect; closing handler for "
-                    f"{getattr(self.user, 'id', 'unknown')}"
+                    f"{self.user_id or 'unknown'}"
                 )
                 await manager.disconnect(str(self.agent_id), self.websocket)
                 break
@@ -900,7 +964,7 @@ class WebSocketChatHandler:
             claim = await claim_onboarding_greeting(
                 _gdb,
                 self.agent_id,
-                self.user.id,
+                self.user_id,
                 uuid.UUID(self.conv_id),
             )
         if claim.acquired:
@@ -923,7 +987,7 @@ class WebSocketChatHandler:
                 phase = await claim_normal_first_turn(
                     _normal_db,
                     self.agent_id,
-                    self.user.id,
+                    self.user_id,
                 )
             if phase != PHASE_PENDING:
                 return
@@ -942,14 +1006,22 @@ class WebSocketChatHandler:
                 if _agent_cur.primary_model_id:
                     _m_r = await _mdb.execute(select(LLMModel).where(LLMModel.id == _agent_cur.primary_model_id))
                     _m = _m_r.scalar_one_or_none()
-                    self.llm_model = _m if (_m and _m.enabled) else None
+                    self.llm_model = (
+                        RuntimeLLMModel.from_orm(_m)
+                        if (_m and _m.enabled)
+                        else None
+                    )
                 else:
                     self.llm_model = None
 
                 if _agent_cur.fallback_model_id:
                     _fb_r = await _mdb.execute(select(LLMModel).where(LLMModel.id == _agent_cur.fallback_model_id))
                     _fb = _fb_r.scalar_one_or_none()
-                    self.fallback_llm_model = _fb if (_fb and _fb.enabled) else None
+                    self.fallback_llm_model = (
+                        RuntimeLLMModel.from_orm(_fb)
+                        if (_fb and _fb.enabled)
+                        else None
+                    )
                 else:
                     self.fallback_llm_model = None
 
@@ -970,7 +1042,7 @@ class WebSocketChatHandler:
                         and _ovr.tenant_id
                         and (not self.llm_model or _ovr.tenant_id == self.llm_model.tenant_id)
                     ):
-                        effective_llm_model = _ovr
+                        effective_llm_model = RuntimeLLMModel.from_orm(_ovr)
                     else:
                         logger.warning(
                             f"[WS] model override {override_model_id} rejected (missing/disabled/tenant mismatch)"
@@ -983,7 +1055,7 @@ class WebSocketChatHandler:
     async def _check_quotas(self) -> bool:
         """Checks conversation and agent LLM quotas. Sends message and returns False if exceeded."""
         try:
-            await check_conversation_quota(self.user.id)
+            await check_conversation_quota(self.user_id)
             await check_agent_expired(self.agent_id)
             return True
         except QuotaExceeded as qe:
@@ -1000,7 +1072,13 @@ class WebSocketChatHandler:
         file_name: str,
         is_onboarding_trigger: bool,
         client_message_id: str | None = None,
-    ) -> tuple[uuid.UUID | None, bool, ChatMessage | None]:
+    ) -> tuple[
+        uuid.UUID | None,
+        bool,
+        ChatMessage | None,
+        PendingConfirmation | None,
+        bool,
+    ]:
         """Saves user message to the database and updates session title/time."""
         has_image_marker = "[image_data:" in content
         if has_image_marker:
@@ -1012,7 +1090,7 @@ class WebSocketChatHandler:
 
         if is_onboarding_trigger:
             logger.info("[WS] Onboarding trigger — skipping user-message persistence")
-            return None, False, None
+            return None, False, None, None, False
         else:
             from app.services.chat_history import ingest_incoming_chat_message
 
@@ -1032,7 +1110,7 @@ class WebSocketChatHandler:
                         db,
                         session=_sess,
                         agent_id=self.agent_id,
-                        user_id=self.user.id,
+                        user_id=self.user_id,
                         content=str(self.pending_initial_assistant["content"]),
                         message_meta=dict(
                             self.pending_initial_assistant.get("message_meta") or {}
@@ -1049,15 +1127,24 @@ class WebSocketChatHandler:
                     db,
                     session=_sess,
                     agent_id=self.agent_id,
-                    user_id=self.user.id,
+                    user_id=self.user_id,
                     content=saved_content,
                     source_channel=_sess.source_channel,
                     provider_event_id=str(client_message_id or "") or None,
                     channel_config_id=_sess.id,
-                    actor_ref=str(self.user.id),
+                    actor_ref=str(self.user_id),
                     message_meta=self._scene_message_meta(),
                     created_at=first_user_created_at,
                 )
+                if ingested.blocked_by_confirmation:
+                    # No user row, session timestamp/title change, trigger or turn.  Commit
+                    # only releases the session lock acquired by canonical ingestion.
+                    await db.commit()
+                    logger.info(
+                        "[WS] Message blocked by pending confirmation %s",
+                        ingested.message.id,
+                    )
+                    return None, True, None, ingested.pending_confirmation, False
                 # Update session
                 _now = datetime.now(tz.utc)
                 if _sess:
@@ -1071,11 +1158,19 @@ class WebSocketChatHandler:
                             clean_title = f"📎 {file_name}"
                         _sess.title = clean_title[:40] if clean_title else content[:40]
                 await db.commit()
+            if ingested.ignored_confirmation is not None:
+                from app.services.chat_history import (
+                    finish_ignored_confirmation_ingest,
+                )
+
+                await finish_ignored_confirmation_ingest(ingested)
             logger.info("[WS] User message saved")
             return (
                 ingested.message.id,
                 ingested.consumed_by_onmessage,
                 initial_assistant,
+                None,
+                ingested.ignored_confirmation is not None,
             )
 
     async def _route_openclaw(self, content: str):
@@ -1085,7 +1180,7 @@ class WebSocketChatHandler:
         async with async_session() as db:
             gw_msg = GwMsg(
                 agent_id=self.agent_id,
-                sender_user_id=self.user.id,
+                sender_user_id=self.user_id,
                 conversation_id=self.conv_id,
                 content=content,
                 status="pending",
@@ -1103,7 +1198,7 @@ class WebSocketChatHandler:
 
     async def _run_llm_and_stream(
         self,
-        effective_llm_model: LLMModel,
+        effective_llm_model: RuntimeLLMModel,
         is_onboarding_trigger: bool,
         *,
         onboarding_claim: OnboardingClaim | None = None,
@@ -1157,7 +1252,7 @@ class WebSocketChatHandler:
                         advanced = await mark_onboarding_phase(
                             _ob_db,
                             self.agent_id,
-                            self.user.id,
+                            self.user_id,
                             onboarding_target_phase,
                             expected_phase=onboarding_expected_phase,
                             expected_onboarded_at=onboarding_claimed_at,
@@ -1206,7 +1301,7 @@ class WebSocketChatHandler:
                         refreshed = await mark_onboarding_phase(
                             _lease_db,
                             self.agent_id,
-                            self.user.id,
+                            self.user_id,
                             PHASE_GREETED,
                             expected_phase=PHASE_GREETED,
                         )
@@ -1342,7 +1437,7 @@ class WebSocketChatHandler:
                         claim_is_current = await onboarding_claim_is_current(
                             _claim_db,
                             self.agent_id,
-                            self.user.id,
+                            self.user_id,
                             onboarding_claimed_at,
                         )
                     if not claim_is_current:
@@ -1369,10 +1464,16 @@ class WebSocketChatHandler:
                 skip_tools_for_greeting = False
                 try:
                     async with async_session() as _ob_db:
+                        _agent_result = await _ob_db.execute(
+                            select(Agent).where(Agent.id == self.agent_id)
+                        )
+                        _agent = _agent_result.scalar_one_or_none()
+                        if _agent is None:
+                            raise RuntimeError("Agent no longer exists")
                         _onb = await resolve_onboarding_prompt(
                             _ob_db,
-                            self.agent,
-                            self.user.id,
+                            _agent,
+                            self.user_id,
                             user_name=self.user_display_name,
                             user_locale=self.lang,
                             is_onboarding_trigger=is_onboarding_trigger,
@@ -1494,7 +1595,7 @@ class WebSocketChatHandler:
                     agent_name=self.agent_name,
                     role_description=self.role_description,
                     agent_id=self.agent_id,
-                    user_id=self.user.id,
+                    user_id=self.user_id,
                     session_id=self.conv_id,
                     on_chunk=stream_to_ws,
                     on_tool_call=tool_call_to_ws,
@@ -1657,7 +1758,7 @@ class WebSocketChatHandler:
         await persist_tool_call(
             async_session,
             agent_id=self.agent_id,
-            user_id=self.user.id,
+            user_id=self.user_id,
             conversation_id=self.conv_id,
             evt=data,
             turn_anchor_id=turn_anchor_id,
@@ -1668,7 +1769,7 @@ class WebSocketChatHandler:
                     _tc_db,
                     agent_id=self.agent_id,
                     session_id=self.conv_id,
-                    user_id=self.user.id,
+                    user_id=self.user_id,
                 )
                 await _tc_db.commit()
         except Exception as _tc_err:
@@ -1687,7 +1788,7 @@ class WebSocketChatHandler:
             logger.warning(f"[WS] Failed to update last_active_at: {e}")
 
         try:
-            await increment_conversation_usage(self.user.id)
+            await increment_conversation_usage(self.user_id)
             await increment_agent_llm_usage(self.agent_id)
         except Exception:
             pass
@@ -1712,7 +1813,7 @@ class WebSocketChatHandler:
                 task = Task(
                     agent_id=self.agent_id,
                     title=task_title,
-                    created_by=self.user.id,
+                    created_by=self.user_id,
                     status="pending",
                     priority="medium",
                 )
@@ -1739,7 +1840,7 @@ class WebSocketChatHandler:
         async with async_session() as db:
             assistant_msg = ChatMessage(
                 agent_id=self.agent_id,
-                user_id=self.user.id,
+                user_id=self.user_id,
                 role="assistant",
                 content=assistant_response,
                 conversation_id=self.conv_id,
@@ -1760,7 +1861,7 @@ class WebSocketChatHandler:
                     update(AgentUserOnboarding)
                     .where(
                         AgentUserOnboarding.agent_id == self.agent_id,
-                        AgentUserOnboarding.user_id == self.user.id,
+                        AgentUserOnboarding.user_id == self.user_id,
                         AgentUserOnboarding.phase == PHASE_GREETED,
                     )
                     .values(phase=PHASE_COMPLETED)
@@ -1773,7 +1874,7 @@ class WebSocketChatHandler:
                 db,
                 agent_id=self.agent_id,
                 session_id=self.conv_id,
-                user_id=self.user.id,
+                user_id=self.user_id,
             )
             await db.commit()
         logger.info("[WS] Assistant message saved")

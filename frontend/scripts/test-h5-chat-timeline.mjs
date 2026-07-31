@@ -45,6 +45,7 @@ const {
     applyAssistantStreamMessage,
     buildH5ConversationEntries,
     getH5ScrollAnchor,
+    hasPendingConfirmation,
     isConfirmationToolCall,
     mapHistoryMessage,
     mergeHistoryMessages,
@@ -168,6 +169,26 @@ const {
 }
 
 {
+    const messageId = 'initial-assistant:session-1';
+    let messages = applyAssistantStreamMessage([], {
+        type: 'done',
+        content: '欢迎使用报修服务',
+        messageId,
+        now: '2026-07-31T00:00:00.000Z',
+    });
+    messages = applyAssistantStreamMessage(messages, {
+        type: 'done',
+        content: '欢迎使用报修服务',
+        messageId,
+        now: '2026-07-31T00:00:01.000Z',
+    });
+
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].id, messageId);
+    assert.equal(messages[0].content, '欢迎使用报修服务');
+}
+
+{
     const beforeEntries = buildH5ConversationEntries([
         { id: 'u1', role: 'user', content: 'hi' },
         { id: 'a1', role: 'assistant', content: '正在生成', streaming: true },
@@ -203,9 +224,33 @@ const {
     }, () => 'done-local', '2026-07-08T00:00:01.000Z');
 
     assert.equal(isConfirmationToolCall(pending), true);
+    assert.equal(hasPendingConfirmation([pending]), true);
+    const persistedPending = mapHistoryMessage({
+        role: 'tool_call',
+        toolName: 'request_confirmation',
+        toolCallId: 'confirm-history',
+        toolArgs: {
+            title: '历史确认',
+            summary: '刷新后仍需确认',
+            force_confirmation: true,
+        },
+        toolStatus: 'pending',
+    }, () => 'history-pending');
+    assert.equal(persistedPending.toolStatus, 'running');
+    assert.equal(hasPendingConfirmation([persistedPending]), true);
+    const optionalPending = {
+        ...pending,
+        toolCallId: 'confirm-optional',
+        toolArgs: {
+            ...pending.toolArgs,
+            force_confirmation: false,
+        },
+    };
+    assert.equal(hasPendingConfirmation([optionalPending]), false);
     const merged = upsertToolCallMessage([pending], done);
     assert.equal(merged.length, 1);
     assert.equal(merged[0].toolStatus, 'done');
+    assert.equal(hasPendingConfirmation(merged), false);
 
     const entries = buildH5ConversationEntries(merged);
     assert.equal(JSON.stringify(entries.map((entry) => entry.type)), JSON.stringify(['message']));

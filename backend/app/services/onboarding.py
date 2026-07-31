@@ -572,7 +572,11 @@ async def claim_fixed_welcome_slot(
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
 ) -> bool:
-    """Atomically let a fixed welcome own first contact before model output."""
+    """Atomically let a fixed welcome own first contact before model output.
+
+    The caller owns the transaction. This function never commits or rolls back
+    the supplied session.
+    """
 
     current = datetime.now(timezone.utc)
     inserted = (
@@ -589,7 +593,6 @@ async def claim_fixed_welcome_slot(
         )
     ).scalar_one_or_none()
     if inserted is not None:
-        await db.commit()
         return True
 
     takeover = (
@@ -605,7 +608,6 @@ async def claim_fixed_welcome_slot(
         )
     ).scalar_one_or_none()
     if takeover is not None:
-        await db.commit()
         return True
 
     phase = await db.scalar(
@@ -614,7 +616,6 @@ async def claim_fixed_welcome_slot(
             AgentUserOnboarding.user_id == user_id,
         )
     )
-    await db.rollback()
     if phase != PHASE_COMPLETED:
         return False
 

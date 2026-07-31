@@ -1486,6 +1486,7 @@ async def call_llm(
                     action=conf_call.action,
                     risk_level=conf_call.risk_level,
                     buttons=conf_call.buttons,
+                    force_confirmation=conf_call.force_confirmation,
                     turn_anchor_id=turn_anchor_id,
                 )
                 if agent_id and _unsaved_usage.total_tokens > 0:
@@ -2129,6 +2130,7 @@ async def call_agent_llm_with_tools(
                             action=conf_call.action,
                             risk_level=conf_call.risk_level,
                             buttons=conf_call.buttons,
+                            force_confirmation=conf_call.force_confirmation,
                             turn_anchor_id=None,
                         )
                         if agent_id and _unsaved_usage.total_tokens > 0:

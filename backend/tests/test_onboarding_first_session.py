@@ -307,6 +307,7 @@ async def test_fixed_welcome_can_take_over_only_before_onboarding_output(
             first_session_pair["agent_id"],
             first_session_pair["user_id"],
         )
+        await db.commit()
         assert not await onboarding_claim_is_current(
             db,
             first_session_pair["agent_id"],

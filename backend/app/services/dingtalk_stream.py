@@ -668,6 +668,10 @@ class DingTalkStreamManager:
                                             _wh=session_webhook, _nick=sender_nick,
                                             _mid=message_id, _sid=sender_id,
                                             _title=conversation_title, _reactions=reactions):
+                                from app.api.dingtalk import _check_message_dedup
+
+                                if await _check_message_dedup(_mid):
+                                    return ""
                                 await process_dingtalk_message(
                                     agent_id=agent_id,
                                     sender_staff_id=_ssid,
@@ -707,6 +711,10 @@ class DingTalkStreamManager:
                                                   _nick=sender_nick, _mid=message_id,
                                                   _sid=sender_id, _title=conversation_title,
                                                   _reactions=reactions):
+                                from app.api.dingtalk import _check_message_dedup
+
+                                if await _check_message_dedup(_mid):
+                                    return ""
                                 await self._handle_media_and_dispatch(
                                     msg_data=_md,
                                     app_key=_ak,
@@ -762,6 +770,28 @@ class DingTalkStreamManager:
             ):
                 """Download media, then dispatch to process_dingtalk_message."""
                 from app.api.dingtalk import process_dingtalk_message
+                from app.services.confirmation_service import (
+                    find_dingtalk_pending_confirmation,
+                    redeliver_pending_confirmation,
+                )
+
+                external_conv_id = (
+                    f"dingtalk_group_{conversation_id}"
+                    if conversation_type == "2"
+                    else f"dingtalk_p2p_{sender_staff_id}"
+                )
+                pending = await find_dingtalk_pending_confirmation(
+                    agent_id=agent_id,
+                    external_conv_id=external_conv_id,
+                )
+                if pending is not None and pending.force_confirmation:
+                    await redeliver_pending_confirmation(pending)
+                    logger.info(
+                        "[DingTalk Stream] Discarded media before download because "
+                        "confirmation %s is required",
+                        pending.row_id,
+                    )
+                    return
 
                 user_text, image_base64_list, saved_file_paths = await _process_media_message(
                     msg_data=msg_data,

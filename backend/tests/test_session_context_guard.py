@@ -10,6 +10,8 @@ from sqlalchemy import delete, select
 from app.database import async_session, engine
 from app.models.agent import Agent
 from app.models.chat_session import ChatSession
+from app.models.tenant import Tenant
+from app.models.user import Identity, User
 from app.services.llm.session_context_guard import (
     CONTEXT_REQUEST_TOO_LARGE_MESSAGE,
     SESSION_CONTEXT_TERMINATED_MESSAGE,
@@ -30,13 +32,41 @@ async def _fresh_pool():
 
 async def test_termination_is_persisted_and_blocks_later_turns():
     async with async_session() as db:
-        agent_id, user_id = (
-            await db.execute(select(Agent.id, Agent.creator_id).limit(1))
-        ).one()
+        suffix = uuid.uuid4().hex
+        tenant = Tenant(
+            name=f"Context guard {suffix}",
+            slug=f"context-guard-{suffix}",
+        )
+        db.add(tenant)
+        await db.flush()
+        identity = Identity(
+            username=f"context_guard_{suffix}",
+            email=f"context-guard-{suffix}@test.local",
+            password_hash="x",
+        )
+        db.add(identity)
+        await db.flush()
+        user = User(
+            identity_id=identity.id,
+            display_name="Context Guard Tester",
+            role="member",
+            is_active=True,
+            tenant_id=tenant.id,
+        )
+        db.add(user)
+        await db.flush()
+        agent = Agent(
+            name=f"Context Guard Agent {suffix}",
+            creator_id=user.id,
+            tenant_id=tenant.id,
+            status="idle",
+        )
+        db.add(agent)
+        await db.flush()
         session = ChatSession(
             id=uuid.uuid4(),
-            agent_id=agent_id,
-            user_id=user_id,
+            agent_id=agent.id,
+            user_id=user.id,
             title="context guard test",
             source_channel="web",
         )

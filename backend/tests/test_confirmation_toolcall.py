@@ -9,6 +9,7 @@ loop. These tests pin:
 - (resolve + reenter tests are added as the resolve path is built)
 """
 
+import asyncio
 import datetime
 import json
 import uuid
@@ -20,6 +21,7 @@ from sqlalchemy import select, update
 from app.database import async_session, engine
 from app.models.audit import ChatMessage
 from app.models.agent import Agent  # noqa: F401 — FK target registered in metadata
+from app.models.chat_session import ChatSession
 from app.models.user import User, Identity  # noqa: F401
 from app.models.tenant import Tenant  # noqa: F401
 from app.models.participant import Participant  # noqa: F401 — ChatMessage.participant_id FK
@@ -124,6 +126,408 @@ async def _make_pending(agent_id, user_id, *, conv=None, args=None) -> tuple[str
     return conv, row_id
 
 
+async def _make_session(
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    *,
+    source_channel: str = "web",
+) -> ChatSession:
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            title="confirmation gate",
+            source_channel=source_channel,
+            external_conv_id=f"{source_channel}_p2p_{uuid.uuid4().hex}",
+        )
+        db.add(session)
+        await db.commit()
+        await db.refresh(session)
+        db.expunge(session)
+        return session
+
+
+async def test_pending_confirmation_blocks_canonical_message_ingest():
+    """No text/file event is persisted or routed while the normalized message
+    stream contains an unresolved request_confirmation tool call."""
+    from app.services.chat_history import ingest_incoming_chat_message
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="dingtalk")
+    _conv, row_id = await _make_pending(
+        agent_id,
+        user_id,
+        conv=str(session.id),
+        args={"title": "确认", "summary": "继续操作"},
+    )
+
+    async with async_session() as db:
+        live_session = await db.get(ChatSession, session.id)
+        result = await ingest_incoming_chat_message(
+            db,
+            session=live_session,
+            agent_id=agent_id,
+            user_id=user_id,
+            content="不要点了，直接继续",
+            source_channel="dingtalk",
+            provider_event_id="blocked-event-1",
+            channel_config_id="bot-1",
+            actor_ref="staff-1",
+        )
+        await db.commit()
+
+    assert result.created is False
+    assert result.consumed_by_onmessage is True
+    assert result.blocked_by_confirmation is True
+    assert result.message.id == row_id
+    assert result.pending_confirmation.row_id == row_id
+    async with async_session() as db:
+        blocked_rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.agent_id == agent_id,
+                    ChatMessage.conversation_id == str(session.id),
+                    ChatMessage.role == "user",
+                    ChatMessage.content == "不要点了，直接继续",
+                )
+            )
+        ).scalars().all()
+    assert blocked_rows == []
+
+
+async def test_confirmation_gate_is_limited_to_supported_product_channels():
+    """Other IM transports keep their existing input behavior until they
+    implement the same clickable confirmation-card lifecycle."""
+    from app.services.chat_history import ingest_incoming_chat_message
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="feishu")
+    await _make_pending(agent_id, user_id, conv=str(session.id))
+
+    async with async_session() as db:
+        live_session = await db.get(ChatSession, session.id)
+        result = await ingest_incoming_chat_message(
+            db,
+            session=live_session,
+            agent_id=agent_id,
+            user_id=user_id,
+            content="飞书沿用原有输入链路",
+            source_channel="feishu",
+            provider_event_id=f"feishu-{uuid.uuid4()}",
+            channel_config_id=session.id,
+            actor_ref=str(user_id),
+        )
+        await db.commit()
+
+    assert result.created is True
+    assert result.blocked_by_confirmation is False
+    assert result.ignored_confirmation is None
+
+
+@pytest.mark.parametrize(
+    "source_channel",
+    ["web", "miniprogram", "wechat_miniprogram"],
+)
+async def test_first_party_h5_channels_share_the_confirmation_hard_gate(
+    source_channel: str,
+):
+    from app.services.chat_history import ingest_incoming_chat_message
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(
+        agent_id,
+        user_id,
+        source_channel=source_channel,
+    )
+    _conversation_id, row_id = await _make_pending(
+        agent_id,
+        user_id,
+        conv=str(session.id),
+    )
+
+    async with async_session() as db:
+        live_session = await db.get(ChatSession, session.id)
+        result = await ingest_incoming_chat_message(
+            db,
+            session=live_session,
+            agent_id=agent_id,
+            user_id=user_id,
+            content="必须先处理确认卡",
+            source_channel=source_channel,
+            provider_event_id=f"{source_channel}-{uuid.uuid4()}",
+            channel_config_id=session.id,
+            actor_ref=str(user_id),
+        )
+        await db.commit()
+
+    assert result.created is False
+    assert result.blocked_by_confirmation is True
+    assert result.pending_confirmation is not None
+    assert result.pending_confirmation.row_id == row_id
+
+
+async def test_non_blocking_confirmation_is_closed_before_new_user_message():
+    """A new message ignores a non-blocking card with a real negative tool result."""
+    from app.services.chat_history import ingest_incoming_chat_message
+    from app.services.confirmation_service import IGNORED_CONFIRMATION_RESULT
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    _conv, row_id = await _make_pending(
+        agent_id,
+        user_id,
+        conv=str(session.id),
+        args={
+            "title": "是否继续",
+            "summary": "可以忽略",
+            "force_confirmation": False,
+        },
+    )
+
+    async with async_session() as db:
+        live_session = await db.get(ChatSession, session.id)
+        result = await ingest_incoming_chat_message(
+            db,
+            session=live_session,
+            agent_id=agent_id,
+            user_id=user_id,
+            content="先处理另一件事",
+            source_channel="web",
+            provider_event_id="ignore-confirmation-1",
+            channel_config_id=session.id,
+            actor_ref=str(user_id),
+        )
+        await db.commit()
+
+    assert result.created is True
+    assert result.blocked_by_confirmation is False
+    assert result.ignored_confirmation is not None
+    assert result.ignored_confirmation.row_id == row_id
+    assert result.ignored_confirmation_result == IGNORED_CONFIRMATION_RESULT
+    payload = await _row_payload(row_id)
+    assert payload["status"] == "done"
+    assert payload["result"] == IGNORED_CONFIRMATION_RESULT
+
+
+async def test_latest_tool_call_is_the_normalized_confirmation_state():
+    """A later tool call means the standard message tail is no longer suspended."""
+    from app.services.chat_history import ingest_incoming_chat_message
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    await _make_pending(agent_id, user_id, conv=str(session.id))
+    async with async_session() as db:
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="tool_call",
+                content=json.dumps(
+                    {
+                        "name": "read_file",
+                        "args": {"path": "a.txt"},
+                        "status": "done",
+                        "result": "ok",
+                    }
+                ),
+                conversation_id=str(session.id),
+                created_at=datetime.datetime.now(datetime.UTC)
+                + datetime.timedelta(seconds=1),
+            )
+        )
+        await db.commit()
+
+    async with async_session() as db:
+        live_session = await db.get(ChatSession, session.id)
+        result = await ingest_incoming_chat_message(
+            db,
+            session=live_session,
+            agent_id=agent_id,
+            user_id=user_id,
+            content="正常继续",
+            source_channel="web",
+            provider_event_id="last-tool-wins",
+            channel_config_id=session.id,
+            actor_ref=str(user_id),
+        )
+        await db.commit()
+
+    assert result.created is True
+    assert result.blocked_by_confirmation is False
+
+
+async def test_provider_retry_is_deduplicated_before_confirmation_gate():
+    """A retry of an event accepted before suspension is not a new blocked message."""
+    from app.services.chat_history import ingest_incoming_chat_message
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="dingtalk")
+    async with async_session() as db:
+        live_session = await db.get(ChatSession, session.id)
+        first = await ingest_incoming_chat_message(
+            db,
+            session=live_session,
+            agent_id=agent_id,
+            user_id=user_id,
+            content="执行操作",
+            source_channel="dingtalk",
+            provider_event_id="original-event-1",
+            channel_config_id="bot-1",
+            actor_ref="staff-1",
+        )
+        await db.commit()
+
+    await _make_pending(agent_id, user_id, conv=str(session.id))
+
+    async with async_session() as db:
+        live_session = await db.get(ChatSession, session.id)
+        retry = await ingest_incoming_chat_message(
+            db,
+            session=live_session,
+            agent_id=agent_id,
+            user_id=user_id,
+            content="执行操作",
+            source_channel="dingtalk",
+            provider_event_id="original-event-1",
+            channel_config_id="bot-1",
+            actor_ref="staff-1",
+        )
+        await db.commit()
+
+    assert first.created is True
+    assert retry.created is False
+    assert retry.consumed_by_onmessage is True
+    assert retry.blocked_by_confirmation is False
+    assert retry.message.id == first.message.id
+
+
+async def test_finish_blocked_ingest_redelivers_same_confirmation(monkeypatch):
+    """IM recovery re-delivers the original card handle instead of creating a row."""
+    from app.services import confirmation_service as cs
+    from app.services.chat_history import (
+        finish_blocked_confirmation_ingest,
+        ingest_incoming_chat_message,
+    )
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="dingtalk")
+    _conv, row_id = await _make_pending(agent_id, user_id, conv=str(session.id))
+    redeliver = AsyncMock(return_value=True)
+    monkeypatch.setattr(cs, "redeliver_pending_confirmation", redeliver)
+
+    async with async_session() as db:
+        live_session = await db.get(ChatSession, session.id)
+        result = await ingest_incoming_chat_message(
+            db,
+            session=live_session,
+            agent_id=agent_id,
+            user_id=user_id,
+            content="[file:test.pdf]",
+            source_channel="dingtalk",
+            provider_event_id="blocked-file-1",
+            channel_config_id="bot-1",
+            actor_ref="staff-1",
+        )
+        handled = await finish_blocked_confirmation_ingest(db, result)
+
+    assert handled is True
+    redeliver.assert_awaited_once()
+    assert redeliver.await_args.args[0].row_id == row_id
+
+
+async def test_dingtalk_forced_redelivery_creates_fresh_card_instance(monkeypatch):
+    """A rejected DingTalk input creates a new visible card instance, not a repeated
+    deliver call for the original outTrackId."""
+    from app.models.channel_config import ChannelConfig
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="dingtalk")
+    _conv, row_id = await _make_pending(
+        agent_id,
+        user_id,
+        conv=str(session.id),
+        args={
+            "title": "确认",
+            "summary": "必须点击",
+            "force_confirmation": True,
+        },
+    )
+    async with async_session() as db:
+        app_id = f"ding-{uuid.uuid4().hex}"
+        db.add(
+            ChannelConfig(
+                agent_id=agent_id,
+                channel_type="dingtalk",
+                app_id=app_id,
+                app_secret="ding-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+        pending = await cs.find_pending_confirmation(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+        )
+    assert pending is not None
+
+    sent_ids: list[str] = []
+
+    async def fake_send_confirmation_card(**kwargs):
+        sent_ids.append(kwargs["out_track_id"])
+        return kwargs["out_track_id"]
+
+    monkeypatch.setattr(
+        cs,
+        "_resolve_session_channel",
+        AsyncMock(
+            return_value=("dingtalk", session.external_conv_id, False)
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.agent_tools._get_tool_config",
+        AsyncMock(return_value={"card_template_id": "template-1"}),
+    )
+    monkeypatch.setattr(
+        "app.services.dingtalk_card.send_confirmation_card",
+        fake_send_confirmation_card,
+    )
+    monkeypatch.setattr(cs, "_mark_card_expired", AsyncMock())
+
+    assert await cs.redeliver_pending_confirmation(pending) is True
+    assert len(sent_ids) == 1
+    assert sent_ids[0] != str(row_id)
+    assert sent_ids[0].startswith(f"{row_id.hex}.")
+    async with async_session() as db:
+        row = await db.get(ChatMessage, row_id)
+    assert row.message_meta["confirmation_delivery_id"] == sent_ids[0]
+
+
+async def test_channel_command_keeps_priority_over_pending_confirmation():
+    """Control-plane commands are not dialogue and must never be blocked by a card."""
+    from app.services.channel_commands import handle_channel_command
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="dingtalk")
+    await _make_pending(agent_id, user_id, conv=str(session.id))
+
+    async with async_session() as db:
+        result = await handle_channel_command(
+            db=db,
+            command="/reset",
+            agent_id=agent_id,
+            user_id=user_id,
+            external_conv_id=session.external_conv_id,
+            source_channel="dingtalk",
+        )
+        await db.commit()
+        updated = await db.get(ChatSession, session.id)
+
+    assert result["action"] == "new_session"
+    assert "__archived_" in updated.external_conv_id
+
+
 async def _make_turn_anchor(agent_id, user_id, conv: str) -> uuid.UUID:
     from app.services.chat_history import persist_incoming_user_message
 
@@ -178,14 +582,15 @@ async def test_confirmation_pending_tool_call_is_the_suspended_state():
     from app.services import confirmation_service as cs
 
     agent_id, user_id = await _make_agent()
-    conv = str(uuid.uuid4())
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    conv = str(session.id)
     anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
 
     with patch.object(cs, "_broadcast", new=AsyncMock()):
         row_id = await cs.suspend_for_confirmation(
             agent_id=agent_id,
             conversation_id=conv,
-            chat_session_id=None,
+            chat_session_id=session.id,
             source_channel="web",
             user_id=user_id,
             intro_text=None,
@@ -225,19 +630,287 @@ async def test_confirmation_pending_tool_call_is_the_suspended_state():
     assert reenter.await_args.kwargs["turn_anchor_id"] == anchor_id
 
 
+async def test_session_lock_reuses_existing_pending_confirmation():
+    """A second suspension attempt in the same real session cannot create another card."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    with patch.object(cs, "_broadcast", new=AsyncMock()):
+        first = await cs.suspend_for_confirmation(
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+            chat_session_id=session.id,
+            source_channel="web",
+            user_id=user_id,
+            intro_text=None,
+            title="第一次确认",
+            summary="只能存在一张",
+            action=None,
+            risk_level="medium",
+        )
+        second = await cs.suspend_for_confirmation(
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+            chat_session_id=session.id,
+            source_channel="web",
+            user_id=user_id,
+            intro_text=None,
+            title="第二次确认",
+            summary="不能覆盖第一张",
+            action=None,
+            risk_level="medium",
+        )
+
+    assert second == first
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(session.id),
+                    ChatMessage.role == "tool_call",
+                )
+            )
+        ).scalars().all()
+    assert [row.id for row in rows] == [first]
+
+
+async def test_pending_lookup_reads_latest_tool_call_without_casting_history():
+    """Escaped NULs in older tool results cannot break the normalized tail lookup."""
+    from app.services import confirmation_service as cs
+    from app.services.chat_history import persist_pending_confirmation_row
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    now = datetime.datetime.now(datetime.UTC)
+
+    async with async_session() as db:
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="tool_call",
+                content=(
+                    '{"name":"read_file","args":{},"status":"done",'
+                    '"result":"historic\\\\u0000payload"}'
+                ),
+                conversation_id=str(session.id),
+                created_at=now - datetime.timedelta(seconds=1),
+            )
+        )
+        pending_id = await persist_pending_confirmation_row(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=str(session.id),
+            name="request_confirmation",
+            args={
+                "title": "确认",
+                "summary": "读取最新工具消息",
+                "force_confirmation": True,
+            },
+            created_at=now,
+        )
+        await db.commit()
+
+    async with async_session() as db:
+        pending = await cs.find_pending_confirmation(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+        )
+
+    assert pending is not None
+    assert pending.row_id == pending_id
+
+
+async def test_pending_lookup_does_not_reopen_an_older_confirmation():
+    """A later completed tool call closes the normalized tail's pending state."""
+    from app.services import confirmation_service as cs
+    from app.services.chat_history import persist_pending_confirmation_row
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    now = datetime.datetime.now(datetime.UTC)
+
+    async with async_session() as db:
+        await persist_pending_confirmation_row(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=str(session.id),
+            name="request_confirmation",
+            args={"title": "旧确认", "summary": "不应重新生效"},
+            created_at=now,
+        )
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="tool_call",
+                content=json.dumps(
+                    {
+                        "name": "request_confirmation",
+                        "args": {"title": "旧确认"},
+                        "status": "done",
+                        "result": "用户已处理",
+                    },
+                    ensure_ascii=False,
+                ),
+                conversation_id=str(session.id),
+                created_at=now + datetime.timedelta(microseconds=1),
+            )
+        )
+        await db.commit()
+
+    async with async_session() as db:
+        pending = await cs.find_pending_confirmation(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+        )
+
+    assert pending is None
+
+
+async def test_concurrent_suspensions_create_exactly_one_pending_confirmation():
+    """Independent turns racing across database sessions converge on one durable card."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="web")
+
+    async def suspend(title: str) -> uuid.UUID:
+        return await cs.suspend_for_confirmation(
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+            chat_session_id=session.id,
+            source_channel="web",
+            user_id=user_id,
+            intro_text=None,
+            title=title,
+            summary="并发请求只能保留一张",
+            action=None,
+            risk_level="medium",
+        )
+
+    with patch.object(cs, "_broadcast", new=AsyncMock()):
+        first, second = await asyncio.gather(
+            suspend("并发确认 A"),
+            suspend("并发确认 B"),
+        )
+
+    assert first == second
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(session.id),
+                    ChatMessage.role == "tool_call",
+                )
+            )
+        ).scalars().all()
+    pending_rows = [
+        row
+        for row in rows
+        if json.loads(row.content).get("status") == "pending"
+    ]
+    assert [row.id for row in pending_rows] == [first]
+
+
+async def test_suspend_confirmation_rejects_non_session_conversation():
+    """Confirmation state must belong to the normalized ChatSession message stream."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    conversation_id = f"legacy-{uuid.uuid4()}"
+
+    with (
+        patch.object(
+            cs,
+            "_resolve_session_channel",
+            new=AsyncMock(return_value=("web", None, False)),
+        ),
+        patch.object(cs, "_broadcast", new=AsyncMock()),
+        pytest.raises(
+            RuntimeError,
+            match="confirmation requires a normalized chat session",
+        ),
+    ):
+        await cs.suspend_for_confirmation(
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            chat_session_id=None,
+            source_channel="web",
+            user_id=user_id,
+            intro_text=None,
+            title="无效确认",
+            summary="不应创建独立确认状态",
+            action=None,
+            risk_level="medium",
+        )
+
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.agent_id == agent_id,
+                    ChatMessage.conversation_id == conversation_id,
+                    ChatMessage.role == "tool_call",
+                )
+            )
+        ).scalars().all()
+    assert rows == []
+
+
+async def test_confirmation_result_without_intro_replays_as_standard_tool_pair():
+    """An assistant may call the card tool without preceding prose; after resolution,
+    the original user anchor and real tool result must still reach continuation."""
+    from app.services.chat_history import load_history_for_llm
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    conv = str(session.id)
+    await _make_turn_anchor(agent_id, user_id, conv)
+    _conv, row_id = await _make_pending(agent_id, user_id, conv=conv)
+    async with async_session() as db:
+        row = await db.get(ChatMessage, row_id)
+        payload = json.loads(row.content)
+        payload["status"] = "done"
+        payload["result"] = "用户点了「确认」(value=confirm)、在有效期内。"
+        row.content = json.dumps(payload, ensure_ascii=False)
+        await db.commit()
+
+    async with async_session() as db:
+        history = await load_history_for_llm(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv,
+            ctx_size=100,
+        )
+
+    assert [message["role"] for message in history] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert history[-1]["content"].startswith("用户点了")
+
+
 async def test_suspend_confirmation_persists_intro_before_pending_card():
     """Intro and pending card are persisted in order as ordinary append-only messages."""
     from app.services import confirmation_service as cs
 
     agent_id, user_id = await _make_agent()
-    conv = str(uuid.uuid4())
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    conv = str(session.id)
     anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
 
     with patch.object(cs, "_broadcast", new=AsyncMock()):
         row_id = await cs.suspend_for_confirmation(
             agent_id=agent_id,
             conversation_id=conv,
-            chat_session_id=None,
+            chat_session_id=session.id,
             source_channel="web",
             user_id=user_id,
             intro_text="需要你确认",
@@ -385,7 +1058,8 @@ async def test_call_llm_confirmation_tool_suspends_turn_anchor(monkeypatch):
         supports_vision = False
 
     agent_id, user_id = await _make_agent()
-    conv = str(uuid.uuid4())
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    conv = str(session.id)
     anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
 
     monkeypatch.setattr("app.services.llm.caller.create_llm_client", lambda **_kwargs: FakeClient())
@@ -515,12 +1189,19 @@ async def test_dingtalk_stale_click_only_disables_card_no_reresolve_no_message()
         patch.object(cs, "_deliver_reply_to_channel", new=AsyncMock()) as reply,
         patch.object(cs, "resolve_confirmation", new=AsyncMock()) as resolve,
     ):
-        await cs.resolve_confirmation_via_dingtalk(str(row_id), "staff-x", "confirm", "确认")
+        delivery_id = f"{row_id.hex}.retrycard"
+        await cs.resolve_confirmation_via_dingtalk(
+            delivery_id,
+            "staff-x",
+            "confirm",
+            "确认",
+        )
 
     resolve.assert_not_awaited()  # no re-resolve of an already-resolved card
     reply.assert_not_awaited()    # no message delivery, no agent wake-up
     push.assert_awaited()         # only the card buttons get disabled → 已过期
     assert push.await_args.kwargs.get("buttons_disabled") is True
+    assert push.await_args.args[1] == delivery_id
     fields = push.await_args.args[2]
     assert fields["buttons"] == [{"text": "已过期", "value": "expired", "color": "gray"}]
 
@@ -531,11 +1212,12 @@ async def test_suspend_persists_intro_before_toolcall_and_broadcasts_web():
     from app.services import confirmation_service as cs
 
     agent_id, user_id = await _make_agent()
-    conv = str(uuid.uuid4())
+    session = await _make_session(agent_id, user_id, source_channel="web")
+    conv = str(session.id)
 
     with patch.object(cs, "_broadcast", new=AsyncMock()) as broadcast:
         row_id = await cs.suspend_for_confirmation(
-            agent_id=agent_id, conversation_id=conv, chat_session_id=None,
+            agent_id=agent_id, conversation_id=conv, chat_session_id=session.id,
             source_channel="web", user_id=user_id, intro_text="我需要你确认删库操作:",
             title="删库确认", summary="清理历史订单", action=None, risk_level="high",
             buttons=[{"text": "确认", "value": "confirm", "color": "red"}],

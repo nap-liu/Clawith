@@ -27,6 +27,7 @@ interface Props {
     resolved: boolean;
     result?: string;
     t: (k: string, opts?: any) => string;
+    onResolved?: (result: string) => void;
 }
 
 const DEFAULT_BUTTONS: CardButton[] = [
@@ -55,7 +56,15 @@ const BTN_CLASS: Record<string, string> = {
     gray: 'btn btn-ghost',
 };
 
-const ConfirmationCard: React.FC<Props> = ({ agentId, callId, args, resolved, result, t }) => {
+const ConfirmationCard: React.FC<Props> = ({
+    agentId,
+    callId,
+    args,
+    resolved,
+    result,
+    t,
+    onResolved,
+}) => {
     const [busy, setBusy] = useState(false);
     const [localResolved, setLocalResolved] = useState(false);
     const [localResult, setLocalResult] = useState<string | undefined>(undefined);
@@ -74,8 +83,14 @@ const ConfirmationCard: React.FC<Props> = ({ agentId, callId, args, resolved, re
         try {
             const r = await agentApi.resolveConfirmation(agentId, callId, value, label);
             // result is null when the card was already resolved elsewhere (stale click) → 已过期.
-            setLocalResult(r && r.result ? `已收到:你点了「${label}」` : '卡片已过期');
+            const resolvedResult = r && r.result
+                ? String(r.result)
+                : '卡片已过期';
+            setLocalResult(r && r.result ? `已收到:你点了「${label}」` : resolvedResult);
             setLocalResolved(true);
+            // The REST response is authoritative for this client. WebSocket broadcast
+            // remains cross-client synchronization and may legitimately be lost.
+            onResolved?.(resolvedResult);
         } finally {
             setBusy(false);
         }

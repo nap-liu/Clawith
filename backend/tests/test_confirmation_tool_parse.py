@@ -22,6 +22,27 @@ def test_valid_with_action():
     assert call.title == "创建采购单"
     assert call.action["tool"] == "sql_execute"
     assert call.risk_level == "medium"
+    assert call.force_confirmation is True
+
+
+def test_non_blocking_confirmation_is_explicit():
+    call = find_request_confirmation_call([_tc("request_confirmation", {
+        "title": "是否继续",
+        "summary": "可以忽略",
+        "force_confirmation": False,
+    })])
+    assert call is not None and call.valid is True
+    assert call.force_confirmation is False
+
+
+def test_force_confirmation_must_be_boolean():
+    call = find_request_confirmation_call([_tc("request_confirmation", {
+        "title": "是否继续",
+        "summary": "必须明确",
+        "force_confirmation": "false",
+    })])
+    assert call is not None and call.valid is False
+    assert "boolean" in call.error
 
 
 def test_invalid_missing_title():

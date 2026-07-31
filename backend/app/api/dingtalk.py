@@ -723,7 +723,10 @@ async def process_dingtalk_message(
         platform_user_id = platform_user.id
 
         # Check for channel commands (/new, /reset)
-        from app.services.channel_commands import is_channel_command, handle_channel_command
+        from app.services.channel_commands import (
+            handle_channel_command,
+            is_channel_command,
+        )
         if is_channel_command(user_text):
             cmd_result = await handle_channel_command(
                 db=db, command=user_text, agent_id=agent_id,
@@ -788,7 +791,12 @@ async def process_dingtalk_message(
             saved_content = f"{_file_prefixes}\n{_clean_text}".strip() if _clean_text else _file_prefixes
         else:
             saved_content = _clean_text or user_text
-        from app.services.chat_history import ingest_incoming_chat_message
+        from app.services.chat_history import (
+            finish_blocked_confirmation_ingest,
+            finish_ignored_confirmation_ingest,
+            ingest_incoming_chat_message,
+            load_history_prefix_before_anchor,
+        )
 
         ingested = await ingest_incoming_chat_message(
             db,
@@ -805,9 +813,38 @@ async def process_dingtalk_message(
                 "sender_nickname": sender_nick or None,
             },
         )
+        if await finish_blocked_confirmation_ingest(db, ingested):
+            if saved_file_paths:
+                from app.services.storage import (
+                    agent_storage_key,
+                    get_storage_backend,
+                )
+
+                storage = get_storage_backend()
+                for workspace_path in saved_file_paths:
+                    await storage.delete(
+                        agent_storage_key(agent_id, workspace_path)
+                    )
+            return
         turn_anchor_id = ingested.message.id
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
+        if ingested.ignored_confirmation is not None:
+            await finish_ignored_confirmation_ingest(ingested)
+            refreshed_prefix = await load_history_prefix_before_anchor(
+                db,
+                agent_id=agent_id,
+                conversation_id=session_conv_id,
+                turn_anchor_id=ingested.message.id,
+                ctx_size=ctx_size,
+                rehydrate_images_max=3,
+                is_group=(conversation_type == "2"),
+            )
+            if refreshed_prefix is None:
+                raise RuntimeError(
+                    "confirmation ignore committed but DingTalk history prefix could not be rebuilt"
+                )
+            history = refreshed_prefix
 
         # Mirror this inbound message to anyone viewing the session on web in real
         # time — the agent reply already streams there; this makes the user's own

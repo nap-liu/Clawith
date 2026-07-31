@@ -82,11 +82,12 @@ async def _seed_session(
     channel: str = "dingtalk",
     external_conv_id: str = "dingtalk_group_open-conversation-1",
     is_group: bool = True,
+    user_id: uuid.UUID | None = None,
 ) -> ChatSession:
     async with async_session() as db:
         session = ChatSession(
             agent_id=agent_id,
-            user_id=None,
+            user_id=user_id,
             title="研发群",
             group_name="研发群",
             source_channel=channel,
@@ -178,6 +179,7 @@ async def test_send_group_session_message_rejects_invalid_target_boundaries(monk
         channel="discord" if kind == "unsupported" else "dingtalk",
         external_conv_id=("dingtalk_group_old__archived_20260717" if kind == "archived" else "dingtalk_group_target"),
         is_group=kind != "p2p",
+        user_id=owner.creator_id if kind == "p2p" else None,
     )
     calls = 0
 
@@ -267,12 +269,13 @@ async def test_failed_transport_does_not_persist_target_receipt(monkeypatch):
 
 async def test_dingtalk_runtime_delivers_to_exact_group_conversation(monkeypatch):
     owner, _ = await _seed_agents()
+    app_id = f"ding-app-{uuid.uuid4().hex}"
     async with async_session() as db:
         db.add(
             ChannelConfig(
                 agent_id=owner.id,
                 channel_type="dingtalk",
-                app_id="ding-app",
+                app_id=app_id,
                 app_secret="ding-secret",
                 is_configured=True,
             )
@@ -301,7 +304,7 @@ async def test_dingtalk_runtime_delivers_to_exact_group_conversation(monkeypatch
 
     assert sent is True
     assert captured == {
-        "app_id": "ding-app",
+        "app_id": app_id,
         "app_secret": "ding-secret",
         "open_conversation_id": "open-conversation-exact",
         "message": "exact target",
@@ -315,7 +318,7 @@ async def test_unconfigured_channel_is_not_used(monkeypatch):
             ChannelConfig(
                 agent_id=owner.id,
                 channel_type="dingtalk",
-                app_id="ding-app",
+                app_id=f"ding-app-{uuid.uuid4().hex}",
                 app_secret="ding-secret",
                 is_configured=False,
             )
@@ -392,7 +395,7 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
             ChannelConfig(
                 agent_id=owner.id,
                 channel_type="dingtalk",
-                app_id="ding-app",
+                app_id=f"ding-app-{uuid.uuid4().hex}",
                 app_secret="ding-secret",
                 is_configured=True,
             )

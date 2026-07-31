@@ -52,11 +52,13 @@ import {
 import {
     enabledSceneQuickActions,
     findEnabledSceneQuickAction,
+    isSceneQuickActionUnavailable,
 } from '../../utils/sceneQuickActions';
 import {
     applyAssistantStreamMessage,
     buildH5ConversationEntries,
     getH5ScrollAnchor,
+    hasPendingConfirmation,
     isConfirmationToolCall,
     mapHistoryMessage,
     mergeHistoryMessages,
@@ -65,6 +67,7 @@ import {
     type H5AnalysisItem,
     type H5ChatMessage,
 } from './chatTimeline';
+import { createClientId } from '../../utils/clientId';
 import { parseH5Theme } from './h5Params';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import { openExternalLinkWithBrowserDefault } from '../../utils/browserLink';
@@ -123,12 +126,7 @@ type CodeExchangePayload = Parameters<typeof authApi.exchangeCode>[0];
 const codeExchangePromises = new Map<string, Promise<TokenResponse>>();
 const consumedExchangeCodes = new Set<string>();
 
-const makeId = () => {
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-        return crypto.randomUUID();
-    }
-    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-};
+const makeId = createClientId;
 
 export function buildCodeExchangeRedirectUri(href: string) {
     const url = new URL(href);
@@ -384,6 +382,10 @@ export default function H5AgentChat() {
     const [quickActionsMenuClosing, setQuickActionsMenuClosing] = useState(false);
     const [quickActionSearch, setQuickActionSearch] = useState('');
     const [messages, setMessages] = useState<H5ChatMessage[]>([]);
+    const confirmationPending = useMemo(
+        () => hasPendingConfirmation(messages),
+        [messages],
+    );
     const [input, setInput] = useState('');
     const [sessionId, setSessionId] = useState<string | null>(initialSessionId);
     const [sessionsPanelOpen, setSessionsPanelOpen] = useState(false);
@@ -791,6 +793,12 @@ export default function H5AgentChat() {
     }, [closeQuickActionsMenu, quickActionsMenuOpen]);
 
     useEffect(() => {
+        if (confirmationPending && quickActionsMenuOpen) {
+            closeQuickActionsMenu();
+        }
+    }, [closeQuickActionsMenu, confirmationPending, quickActionsMenuOpen]);
+
+    useEffect(() => {
         if (authStatus !== 'ready' || !token) return;
         let cancelled = false;
 
@@ -959,6 +967,7 @@ export default function H5AgentChat() {
             setMessages((prev) => applyAssistantStreamMessage(prev, {
                 type: 'thinking',
                 content: data.content || '',
+                messageId: data.message_id ? String(data.message_id) : undefined,
             }, makeId));
             return;
         }
@@ -969,6 +978,7 @@ export default function H5AgentChat() {
             setMessages((prev) => applyAssistantStreamMessage(prev, {
                 type: 'chunk',
                 content: data.content || '',
+                messageId: data.message_id ? String(data.message_id) : undefined,
             }, makeId));
             return;
         }
@@ -981,6 +991,7 @@ export default function H5AgentChat() {
                 type: 'done',
                 content: data.content || '',
                 now: new Date().toISOString(),
+                messageId: data.message_id ? String(data.message_id) : undefined,
             }, makeId));
             return;
         }
@@ -990,6 +1001,18 @@ export default function H5AgentChat() {
             setIsStreaming(true);
             const toolMsg = toolCallMessageFromEvent(data, makeId, new Date().toISOString());
             setMessages((prev) => upsertToolCallMessage(prev, toolMsg));
+            return;
+        }
+
+        if (data.type === 'confirmation_required') {
+            setIsWaiting(false);
+            setIsStreaming(false);
+            setIsStopping(false);
+            const toolMsg = toolCallMessageFromEvent(data, makeId, new Date().toISOString());
+            setMessages((prev) => upsertToolCallMessage(
+                prev.filter((message) => message.id !== String(data.message_id || '')),
+                toolMsg,
+            ));
             return;
         }
 
@@ -1301,7 +1324,7 @@ export default function H5AgentChat() {
     }, []);
 
     const handleH5Files = useCallback(async (files: File[]) => {
-        if (!agentId || !files.length) return;
+        if (confirmationPending || !agentId || !files.length) return;
         setUploadError('');
         const availableSlots = Math.max(0, 10 - attachedFiles.length - uploadDrafts.length);
         const allowedFiles = files.slice(0, availableSlots);
@@ -1357,7 +1380,7 @@ export default function H5AgentChat() {
         };
 
         await Promise.all(allowedFiles.map((file, index) => runOne(file, newDrafts[index])));
-    }, [agentId, attachedFiles.length, uploadDrafts.length]);
+    }, [agentId, attachedFiles.length, confirmationPending, uploadDrafts.length]);
 
     const handleFileInputChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
         const files = Array.from(event.target.files || []);
@@ -1412,14 +1435,12 @@ export default function H5AgentChat() {
         consumeComposer: boolean,
     ) => {
         const content = rawContent.trim();
-        if (
-            (!content && files.length === 0)
-            || messageDispatchLockedRef.current
-            || messageRuntimeBlockedRef.current
-        ) return;
-        messageDispatchLockedRef.current = true;
+        if (!content && files.length === 0) return;
 
+        // Session-control commands are control-plane operations, not dialogue.
+        // They stay available even while a confirmation card is pending.
         if (files.length === 0 && (content === '/new' || content === '/reset')) {
+            messageDispatchLockedRef.current = true;
             if (consumeComposer) setInput('');
             try {
                 await startNewSession();
@@ -1428,6 +1449,13 @@ export default function H5AgentChat() {
             }
             return;
         }
+
+        if (
+            messageDispatchLockedRef.current
+            || messageRuntimeBlockedRef.current
+            || confirmationPending
+        ) return;
+        messageDispatchLockedRef.current = true;
 
         const ws = wsRef.current;
         if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -1470,7 +1498,7 @@ export default function H5AgentChat() {
             file_name: payload.fileName,
             model_id: effectiveModelId,
         }));
-    }, [effectiveModelId, effectiveModelSupportsVision, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
+    }, [confirmationPending, effectiveModelId, effectiveModelSupportsVision, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
 
     const sendMessage = useCallback(
         () => dispatchMessage(input, attachedFiles, true),
@@ -1696,6 +1724,13 @@ export default function H5AgentChat() {
                             resolved={msg.toolStatus === 'done'}
                             result={msg.toolResult}
                             t={h5T}
+                            onResolved={(resolvedResult) => {
+                                setMessages((prev) => upsertToolCallMessage(prev, {
+                                    ...msg,
+                                    toolStatus: 'done',
+                                    toolResult: resolvedResult,
+                                }));
+                            }}
                         />
                     </div>
                 </article>
@@ -1766,6 +1801,7 @@ export default function H5AgentChat() {
     const isBusy = authStatus === 'checking' || authStatus === 'exchanging' || (authStatus === 'ready' && !agent && !agentError);
     const generationActive = isWaiting || isStreaming || isStopping;
     messageRuntimeBlockedRef.current = generationActive
+        || confirmationPending
         || showBlockingError
         || isBusy
         || speech.isActive
@@ -1781,6 +1817,7 @@ export default function H5AgentChat() {
         || showBlockingError
         || isBusy
         || generationActive
+        || confirmationPending
         || speech.isActive
         || isStartingNew
         || isSwitchingSession
@@ -1788,6 +1825,7 @@ export default function H5AgentChat() {
     const uploadDisabled = showBlockingError
         || isBusy
         || generationActive
+        || confirmationPending
         || speech.isActive
         || isStartingNew
         || isSwitchingSession
@@ -1795,10 +1833,17 @@ export default function H5AgentChat() {
         || attachedFiles.length >= 10;
     const agentAvatarUrl = resolveAgentAvatarUrl(agent?.avatar_url, token);
     const quickMessageDisabled = generationActive
+        || confirmationPending
         || showBlockingError
         || isBusy
         || isStartingNew
         || isSwitchingSession;
+    const quickActionUnavailable = (action: SceneQuickAction) => (
+        isSceneQuickActionUnavailable(action, {
+            confirmationPending,
+            sendMessageUnavailable: quickMessageDisabled,
+        })
+    );
     const filteredQuickActions = useMemo(() => {
         const query = quickActionSearch.trim().toLocaleLowerCase();
         const actions = activeQuickActions;
@@ -1812,6 +1857,7 @@ export default function H5AgentChat() {
     const activateQuickAction = async (snapshot: SceneQuickAction) => {
         if (
             quickActionActivationRef.current
+            || confirmationPending
             || (snapshot.type === 'send_message'
                 && (messageRuntimeBlockedRef.current || messageDispatchLockedRef.current))
         ) return;
@@ -2079,8 +2125,8 @@ export default function H5AgentChat() {
                                     key={action.id}
                                     type="button"
                                     className="h5-chat__quick-menu-item"
-                                    disabled={action.type === 'send_message' && quickMessageDisabled}
-                                    title={action.type === 'send_message' && quickMessageDisabled ? '当前回复完成后可用' : undefined}
+                                    disabled={quickActionUnavailable(action)}
+                                    title={quickActionUnavailable(action) ? '当前操作完成后可用' : undefined}
                                     onClick={() => void activateQuickAction(action)}
                                 >
                                     <span>{action.label}</span>
@@ -2117,8 +2163,8 @@ export default function H5AgentChat() {
                                     key={action.id}
                                     type="button"
                                     className="h5-chat__quick-action"
-                                    disabled={action.type === 'send_message' && quickMessageDisabled}
-                                    title={action.type === 'send_message' && quickMessageDisabled ? '当前回复完成后可用' : undefined}
+                                    disabled={quickActionUnavailable(action)}
+                                    title={quickActionUnavailable(action) ? '当前操作完成后可用' : undefined}
                                     onClick={() => void activateQuickAction(action)}
                                 >
                                     {action.label}
@@ -2129,6 +2175,7 @@ export default function H5AgentChat() {
                             <button
                                 type="button"
                                 className="h5-chat__quick-actions-menu-button"
+                                disabled={confirmationPending}
                                 onClick={openQuickActionsMenu}
                                 aria-label="查看全部功能"
                                 title="查看全部功能"
@@ -2228,10 +2275,10 @@ export default function H5AgentChat() {
                             onSelect={handleInputSelect}
                             onKeyDown={handleInputKeyDown}
                             onPaste={handlePaste}
-                            placeholder="输入消息"
+                            placeholder={confirmationPending ? '请先完成上方确认' : '输入消息'}
                             rows={1}
                             onFocus={handleInputSelect}
-                            disabled={showBlockingError || isBusy || isStartingNew || speech.isActive}
+                            disabled={showBlockingError || isBusy || isStartingNew || speech.isActive || confirmationPending}
                         />
                         <button
                             type="button"
@@ -2242,6 +2289,7 @@ export default function H5AgentChat() {
                                 || showBlockingError
                                 || isBusy
                                 || generationActive
+                                || confirmationPending
                                 || isStartingNew
                                 || isSwitchingSession
                                 || speech.status === 'connecting'

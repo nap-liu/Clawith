@@ -222,7 +222,15 @@ async def test_websocket_default_session_uses_channel_when_no_session_id():
     )
 
     async with async_session() as db:
-        conv_id = await handler._resolve_chat_session(db, user_id)
+        user = await db.get(User, user_id)
+        agent = await db.get(Agent, agent_id)
+        conv_id = await handler._resolve_chat_session(
+            db,
+            user_id,
+            viewer=user,
+            agent=agent,
+        )
+        await db.commit()
         h5_session = (
             await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(conv_id)))
         ).scalar_one()

@@ -793,3 +793,63 @@ async def test_load_history_for_llm_drops_cancelled_turn_tail():
             ),
         ),
     ]
+
+
+async def test_load_history_for_llm_keeps_resolved_confirmation_turn_for_resume():
+    """A resolved confirmation is not a cancelled tool tail.
+
+    Clicking the card completes its normalized tool result and immediately resumes
+    the same turn, so the LLM must receive the original user message plus the
+    assistant/tool pair even though no final assistant prose exists yet.
+    """
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    conv_id = f"test_confirmation_resume_{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    await _insert_messages_bypass_fk(
+        [
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "user_id": user_id,
+                "role": "user",
+                "content": "请执行需要确认的操作",
+                "conversation_id": conv_id,
+                "created_at": now - timedelta(seconds=10),
+            },
+            {
+                "id": uuid.uuid4(),
+                "agent_id": agent_id,
+                "user_id": user_id,
+                "role": "tool_call",
+                "content": json.dumps(
+                    {
+                        "name": "request_confirmation",
+                        "args": {"title": "确认操作", "summary": "继续执行"},
+                        "status": "done",
+                        "result": "用户点击了「确认」",
+                    },
+                    ensure_ascii=False,
+                ),
+                "conversation_id": conv_id,
+                "created_at": now,
+            },
+        ]
+    )
+
+    async with async_session() as db:
+        history = await load_history_for_llm(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv_id,
+            ctx_size=50,
+        )
+
+    assert [message["role"] for message in history] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert history[0]["content"] == "请执行需要确认的操作"
+    assert history[1]["tool_calls"][0]["function"]["name"] == "request_confirmation"
+    assert history[2]["content"] == "用户点击了「确认」"

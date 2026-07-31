@@ -5,7 +5,8 @@ tool_call whose execution simply SUSPENDS the turn until the user clicks:
 
 - ``suspend_for_confirmation``: persist the agent's intro text + a PENDING tool_call row
   (``status="pending"``, empty result) and deliver the card to the originating channel.
-  The row id is the confirmation handle (web ``call_id`` / DingTalk ``outTrackId``).
+  The row id is the canonical confirmation handle. Web uses it as ``call_id``;
+  DingTalk delivery instances use it as the stable prefix of ``outTrackId``.
 - ``resolve_confirmation``: the user's click FILLS that row's tool result and flips status
   to ``done``, then RESUMES the loop from the now-complete history — no synthetic user
   message, no separate table/event/role.
@@ -18,9 +19,11 @@ executes nothing — it faithfully relays the clicked button; the agent decides 
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
@@ -32,6 +35,99 @@ CONFIRMATION_EXPIRY_HOURS = 24
 
 class ConfirmationActorMismatch(PermissionError):
     """The resolving user is not the human for whom this card was created."""
+
+
+@dataclass(frozen=True)
+class PendingConfirmation:
+    """The durable suspended ``request_confirmation`` tool call for one session."""
+
+    row_id: uuid.UUID
+    agent_id: uuid.UUID
+    conversation_id: str
+    user_id: uuid.UUID | None
+    args: dict
+    created_at: datetime | None
+    force_confirmation: bool = True
+
+
+async def find_pending_confirmation(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+) -> PendingConfirmation | None:
+    """Return the session's normalized pending confirmation, if any.
+
+    Confirmation remains part of the normalized message stream. The latest active
+    tool call is read through the existing ``ix_chat_messages_active`` session
+    history index and interpreted in Python. This avoids casting historical message
+    text inside PostgreSQL while keeping the ordinary message row as the only truth.
+    """
+    from app.models.audit import ChatMessage
+
+    row = (
+        await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.conversation_id == str(conversation_id),
+                ChatMessage.role == "tool_call",
+                ChatMessage.compacted_into.is_(None),
+            )
+            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row.content or "{}")
+    except (TypeError, ValueError):
+        return None
+    if (
+        isinstance(payload, dict)
+        and payload.get("name") == REQUEST_CONFIRMATION_TOOL_NAME
+        and payload.get("status") == "pending"
+    ):
+        args = payload.get("args")
+        normalized_args = args if isinstance(args, dict) else {}
+        return PendingConfirmation(
+            row_id=row.id,
+            agent_id=row.agent_id,
+            conversation_id=row.conversation_id,
+            user_id=row.user_id,
+            args=normalized_args,
+            created_at=row.created_at,
+            force_confirmation=normalized_args.get("force_confirmation") is not False,
+        )
+    return None
+
+
+async def find_dingtalk_pending_confirmation(
+    *,
+    agent_id: uuid.UUID,
+    external_conv_id: str,
+) -> PendingConfirmation | None:
+    """Read the pending card for an existing DingTalk session, if any."""
+    from app.models.chat_session import ChatSession
+
+    async with async_session() as db:
+        session = (
+            await db.execute(
+                select(ChatSession).where(
+                    ChatSession.agent_id == agent_id,
+                    ChatSession.source_channel == "dingtalk",
+                    ChatSession.external_conv_id == external_conv_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if session is None:
+            return None
+        return await find_pending_confirmation(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+        )
 
 
 def _assert_confirmation_actor(row, pending_meta: dict, resolving_user_id: uuid.UUID) -> None:
@@ -58,7 +154,12 @@ def _action_preview(action: dict | None) -> str:
 
 
 def _build_card_args(
-    title: str, summary: str, action: dict | None, risk_level: str, buttons: list | None
+    title: str,
+    summary: str,
+    action: dict | None,
+    risk_level: str,
+    buttons: list | None,
+    force_confirmation: bool,
 ) -> dict:
     """The tool_call args that ARE the card — what the agent passed to request_confirmation.
     Stored verbatim on the tool_call row; both renderers (web + DingTalk) read these and
@@ -69,6 +170,7 @@ def _build_card_args(
         "action": action,
         "risk_level": risk_level or "medium",
         "buttons": buttons,
+        "force_confirmation": force_confirmation,
     }
 
 
@@ -140,6 +242,7 @@ async def suspend_for_confirmation(
     action: dict | None,
     risk_level: str,
     buttons: list | None = None,
+    force_confirmation: bool = True,
     turn_anchor_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Suspend the turn on a request_confirmation tool_call and return the row id.
@@ -151,7 +254,14 @@ async def suspend_for_confirmation(
     from app.models.audit import ChatMessage
     from app.services.chat_history import persist_pending_confirmation_row
 
-    args = _build_card_args(title, summary, action, risk_level, buttons)
+    args = _build_card_args(
+        title,
+        summary,
+        action,
+        risk_level,
+        buttons,
+        force_confirmation,
+    )
     resolved_channel, ext_conv_id, is_group = await _resolve_session_channel(
         conversation_id, chat_session_id, source_channel
     )
@@ -162,6 +272,43 @@ async def suspend_for_confirmation(
     has_intro = bool(intro_text and intro_text.strip())
     created_at = datetime.now(timezone.utc)
     async with async_session() as db:
+        # The session row is the cross-process serialization boundary shared with
+        # inbound message ingestion and confirmation resolution.  Either the user
+        # message wins first and belongs to this turn, or the pending card wins and
+        # every later message is rejected until the card is clicked.
+        from app.models.chat_session import ChatSession
+
+        try:
+            sid = uuid.UUID(str(conversation_id))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "confirmation requires a normalized chat session"
+            ) from exc
+        locked_session_id = (
+            await db.execute(
+                select(ChatSession.id)
+                .where(
+                    ChatSession.id == sid,
+                    ChatSession.agent_id == agent_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if locked_session_id is None:
+            raise RuntimeError("confirmation chat session no longer exists")
+        existing = await find_pending_confirmation(
+            db,
+            agent_id=agent_id,
+            conversation_id=str(conversation_id),
+        )
+        if existing is not None:
+            logger.warning(
+                "Confirmation %s already pending for conversation %s; "
+                "reusing the existing suspended tool call",
+                existing.row_id,
+                conversation_id,
+            )
+            return existing.row_id
         if has_intro:
             db.add(
                 ChatMessage(
@@ -181,7 +328,11 @@ async def suspend_for_confirmation(
             name=REQUEST_CONFIRMATION_TOOL_NAME,
             args=args,
             turn_anchor_id=turn_anchor_id,
-            created_at=created_at + timedelta(microseconds=1) if has_intro else None,
+            created_at=(
+                created_at + timedelta(microseconds=1)
+                if has_intro
+                else None
+            ),
         )
         await db.commit()
 
@@ -216,6 +367,7 @@ async def resolve_confirmation(
     button_value: str,
     button_label: str | None,
     resolving_user_id: uuid.UUID,
+    clicked_card_instance_id: str | None = None,
 ) -> str | None:
     """Record the clicked button as the tool_call's result, then resume the loop.
 
@@ -258,6 +410,7 @@ async def resolve_confirmation(
             return None  # idempotent — already resolved (or not a confirmation)
 
         pending_meta = row.message_meta if isinstance(row.message_meta, dict) else {}
+        latest_delivery_id = pending_meta.get("confirmation_delivery_id")
         try:
             _assert_confirmation_actor(row, pending_meta, resolving_user_id)
         except ConfirmationActorMismatch:
@@ -309,7 +462,20 @@ async def resolve_confirmation(
     # Keep the origin IM card in sync: a card delivered to DingTalk — resolved here on web OR
     # via its own button — flips to a disabled, resolved state so it can't be clicked again
     # (no stale clicks). Best-effort; web-origin cards are a no-op.
-    await _update_origin_card(agent_id, conversation_id, str(call_id), payload.get("args") or {}, label, button_value)
+    card_instance_ids = [str(call_id)]
+    if latest_delivery_id:
+        card_instance_ids.append(str(latest_delivery_id))
+    if clicked_card_instance_id:
+        card_instance_ids.append(clicked_card_instance_id)
+    for card_instance_id in dict.fromkeys(card_instance_ids):
+        await _update_origin_card(
+            agent_id,
+            conversation_id,
+            card_instance_id,
+            payload.get("args") or {},
+            label,
+            button_value,
+        )
 
     # Resume the agent's loop from the now-complete tool result. Best-effort — its failure
     # must not mask the resolution (the REST caller still gets the committed outcome).
@@ -459,6 +625,172 @@ async def _deliver_channel_card(
         logger.exception("_deliver_channel_card failed for confirmation %s", out_track_id)
 
 
+async def redeliver_pending_confirmation(pending: PendingConfirmation) -> bool:
+    """Create and deliver a fresh transport card for the same pending tool call.
+
+    DingTalk does not guarantee that delivering the same instance twice creates a
+    second visible message. A fresh transport id represents this delivery only and
+    deterministically maps back to the original normalized tool_call row.
+    """
+    try:
+        channel, external_conv_id, is_group = await _resolve_session_channel(
+            pending.conversation_id, None, ""
+        )
+        if channel != "dingtalk" or not external_conv_id:
+            logger.info(
+                "Pending confirmation %s blocked %s input; card redelivery is unavailable",
+                pending.row_id,
+                channel,
+            )
+            return False
+
+        from app.models.audit import ChatMessage
+        from app.models.channel_config import ChannelConfig
+
+        async with async_session() as db:
+            cc = (
+                await db.execute(
+                    select(ChannelConfig).where(
+                        ChannelConfig.agent_id == pending.agent_id,
+                        ChannelConfig.channel_type == "dingtalk",
+                    )
+                )
+            ).scalar_one_or_none()
+        if cc is None or not cc.app_id or not cc.app_secret:
+            return False
+
+        from app.services.agent_tools import _get_tool_config
+        from app.services.dingtalk_card import (
+            build_confirmation_card_data,
+            send_confirmation_card,
+        )
+
+        tool_cfg = await _get_tool_config(
+            pending.agent_id,
+            REQUEST_CONFIRMATION_TOOL_NAME,
+        ) or {}
+        template_id = tool_cfg.get("card_template_id")
+        if not template_id:
+            return False
+        delivery_id = f"{pending.row_id.hex}.{uuid.uuid4().hex[:12]}"
+        card_data = build_confirmation_card_data(
+            title=pending.args.get("title") or "",
+            summary=pending.args.get("summary") or "",
+            action_preview=_action_preview(pending.args.get("action")),
+            risk_level=pending.args.get("risk_level") or "medium",
+            status="pending",
+            buttons=pending.args.get("buttons"),
+        )
+        sent = await send_confirmation_card(
+            app_id=cc.app_id,
+            app_secret=cc.app_secret,
+            card_template_id=template_id,
+            out_track_id=delivery_id,
+            card_data=card_data,
+            external_conv_id=external_conv_id,
+            is_group=is_group,
+        )
+        if not sent:
+            return False
+
+        async with async_session() as db:
+            row = await db.get(ChatMessage, pending.row_id)
+            if row is None:
+                return True
+            meta = dict(row.message_meta or {})
+            previous_delivery_id = str(
+                meta.get("confirmation_delivery_id") or pending.row_id
+            )
+            meta["confirmation_delivery_id"] = delivery_id
+            row.message_meta = meta
+            try:
+                payload = json.loads(row.content or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            still_pending = payload.get("status") == "pending"
+            await db.commit()
+        if not still_pending:
+            await _mark_card_expired(cc, delivery_id, pending.args)
+        elif previous_delivery_id != delivery_id:
+            # Only the newest transport card remains actionable. This keeps delivery
+            # metadata bounded and prevents a trail of visually active stale cards.
+            await _mark_card_expired(cc, previous_delivery_id, pending.args)
+        return True
+    except Exception:
+        logger.exception(
+            "redeliver_pending_confirmation failed for %s", pending.row_id
+        )
+        return False
+
+
+IGNORED_CONFIRMATION_RESULT = (
+    "用户没有点击确认卡，而是继续发送了新的消息。本次操作未获得用户确认，"
+    "不得将其视为同意，也不得执行确认卡中描述的待确认操作。请根据用户随后发送的新消息继续处理。"
+)
+
+
+async def ignore_pending_confirmation_for_new_input(
+    db: AsyncSession,
+    pending: PendingConfirmation,
+) -> str | None:
+    """Close one non-blocking pending card with a real negative tool result.
+
+    The caller holds the ChatSession row lock and owns the transaction.  This only
+    fills the existing normalized tool_call row; it does not start the suspended
+    turn.  The new user message that follows drives the next single turn.
+    """
+    from app.models.audit import ChatMessage
+
+    row = await db.get(ChatMessage, pending.row_id)
+    if row is None or row.role != "tool_call":
+        return None
+    try:
+        payload = json.loads(row.content or "{}")
+    except (TypeError, ValueError):
+        return None
+    args = payload.get("args")
+    if (
+        payload.get("name") != REQUEST_CONFIRMATION_TOOL_NAME
+        or payload.get("status") != "pending"
+        or not isinstance(args, dict)
+        or args.get("force_confirmation") is not False
+    ):
+        return None
+    payload["status"] = "done"
+    payload["result"] = IGNORED_CONFIRMATION_RESULT
+    row.content = json.dumps(payload, ensure_ascii=False, default=str)
+    await db.flush()
+    return IGNORED_CONFIRMATION_RESULT
+
+
+async def publish_ignored_confirmation(
+    pending: PendingConfirmation,
+    result_text: str,
+) -> None:
+    """Publish the committed non-confirmation result to live/card views."""
+    await _broadcast(
+        pending.agent_id,
+        pending.conversation_id,
+        {
+            "type": "tool_call",
+            "name": REQUEST_CONFIRMATION_TOOL_NAME,
+            "call_id": str(pending.row_id),
+            "args": pending.args,
+            "status": "done",
+            "result": result_text,
+        },
+    )
+    await _update_origin_card(
+        pending.agent_id,
+        pending.conversation_id,
+        str(pending.row_id),
+        pending.args,
+        "未确认",
+        "ignored",
+        status_text="未确认",
+    )
+
+
 _DEFAULT_RESOLVE_BUTTONS = [{"text": "取消", "value": "cancel"}, {"text": "确认", "value": "confirm"}]
 
 
@@ -479,7 +811,14 @@ def _mark_selected_buttons(buttons: list | None, selected_value: str) -> list:
 
 
 async def _update_origin_card(
-    agent_id: uuid.UUID, conversation_id: str, out_track_id: str, args: dict, label: str, value: str
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    out_track_id: str,
+    args: dict,
+    label: str,
+    value: str,
+    *,
+    status_text: str = "已处理",
 ) -> None:
     """On resolution, flip the card on its origin IM channel (DingTalk) to a disabled, resolved
     state — with a ✅ marker on the selected button so it's clear what was chosen — so it can't
@@ -500,7 +839,13 @@ async def _update_origin_card(
                 )
             ).scalar_one_or_none()
         fields = {**(args or {}), "buttons": _mark_selected_buttons((args or {}).get("buttons"), value)}
-        await _push_card_state(cc, out_track_id, fields, status_text="已处理", buttons_disabled=True)
+        await _push_card_state(
+            cc,
+            out_track_id,
+            fields,
+            status_text=status_text,
+            buttons_disabled=True,
+        )
     except Exception:
         logger.exception("_update_origin_card failed for %s", out_track_id)
 
@@ -556,9 +901,12 @@ async def _deliver_reply_to_channel(agent_id: uuid.UUID, conversation_id: str, r
 async def resolve_confirmation_via_dingtalk(
     out_track_id: str, staff_id: str, button_value: str, button_label: str
 ) -> None:
-    """Bridge a DingTalk card-button click to resolve_confirmation. The card's outTrackId IS
-    the tool_call row id. Maps the clicker's staff_id → internal user, optimistically flips
-    the card, then resolves (fills the tool result + resumes the loop). Never raises."""
+    """Bridge a DingTalk card-button click to the durable confirmation transition.
+
+    ``outTrackId`` is either the canonical tool-call UUID or a fresh delivery alias
+    whose prefix is that UUID. Maps the clicker to an internal user, updates the
+    transport card, then resolves the stored tool call and resumes the loop.
+    """
     try:
         from app.models.agent import Agent as AgentModel
         from app.models.audit import ChatMessage
@@ -567,7 +915,7 @@ async def resolve_confirmation_via_dingtalk(
         from app.models.org import OrgMember
 
         try:
-            rid = uuid.UUID(str(out_track_id))
+            rid = uuid.UUID(str(out_track_id).split(".", 1)[0])
         except (ValueError, TypeError):
             logger.warning(f"[DingTalkCard] callback outTrackId not a uuid: {out_track_id!r}")
             return
@@ -623,7 +971,7 @@ async def resolve_confirmation_via_dingtalk(
         # disable the card with an 已过期 state and tell the user, so a still-clickable DingTalk
         # card can't drive a duplicate action.
         if card_status != "pending":
-            await _mark_card_expired(cc, str(rid), args)
+            await _mark_card_expired(cc, out_track_id, args)
             return
 
         if user_id is None:
@@ -638,11 +986,12 @@ async def resolve_confirmation_via_dingtalk(
             button_value=button_value,
             button_label=button_label,
             resolving_user_id=user_id,
+            clicked_card_instance_id=out_track_id,
         )
         # Race: another path (web) resolved it between our status read and resolve's lock.
         # resolve returned None (already done) — correct the card to the 已过期 state.
         if result is None:
-            await _mark_card_expired(cc, str(rid), args)
+            await _mark_card_expired(cc, out_track_id, args)
     except Exception:
         logger.exception("[DingTalkCard] resolve_confirmation_via_dingtalk failed")
 

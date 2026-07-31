@@ -25,8 +25,7 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "list_installed_mcp_servers",
     "refresh_mcp_server",
     "uninstall_mcp_server",
-    # request_confirmation is OPT-IN (is_default=False); it was briefly seeded is_default=True,
-    # so sync the correction to the DB on deploy (otherwise existing rows keep is_default=True).
+    # Keep request_confirmation allocated consistently for existing and new agents.
     "request_confirmation",
     # Scene management is opt-in and must remain opt-in on existing databases.
     "manage_scene",

@@ -1,5 +1,6 @@
 import type { ChatPreviewImage } from '../../utils/chatAttachments';
 import { parseFileDeliveryToolResult, type ChatFileDelivery } from '../../utils/chatFileDelivery';
+import { createClientId } from '../../utils/clientId';
 
 export type H5ToolStatus = 'running' | 'done';
 
@@ -34,16 +35,12 @@ export type H5AssistantStreamMessage = {
     type: 'thinking' | 'chunk' | 'done';
     content?: string;
     now?: string;
+    messageId?: string;
 };
 
 const CONFIRMATION_TOOL = 'request_confirmation';
 
-const defaultMakeId = () => {
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-        return crypto.randomUUID();
-    }
-    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-};
+const defaultMakeId = createClientId;
 
 export function parseToolArgs(raw: any): Record<string, any> {
     if (!raw) return {};
@@ -68,7 +65,7 @@ function parseStoredToolPayload(content: any): Record<string, any> {
 }
 
 function normalizeToolStatus(status: any): H5ToolStatus {
-    return status === 'running' ? 'running' : 'done';
+    return status === 'running' || status === 'pending' ? 'running' : 'done';
 }
 
 function normalizeToolResult(result: any): string | undefined {
@@ -111,6 +108,15 @@ export function mapHistoryMessage(raw: any, makeId: () => string = defaultMakeId
     };
 }
 
+export function hasPendingConfirmation(messages: H5ChatMessage[]): boolean {
+    return messages.some((message) => (
+        message.role === 'tool_call'
+        && message.toolName === CONFIRMATION_TOOL
+        && message.toolStatus === 'running'
+        && parseToolArgs(message.toolArgs).force_confirmation !== false
+    ));
+}
+
 export function findStreamingAssistantIndex(messages: H5ChatMessage[]) {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
         const msg = messages[i];
@@ -139,7 +145,12 @@ export function applyAssistantStreamMessage(
     event: H5AssistantStreamMessage,
     makeId: () => string = defaultMakeId,
 ): H5ChatMessage[] {
-    const idx = findStreamingAssistantIndexAfterLastTool(messages);
+    const identifiedIdx = event.messageId
+        ? messages.findIndex((message) => message.id === event.messageId)
+        : -1;
+    const idx = identifiedIdx >= 0
+        ? identifiedIdx
+        : findStreamingAssistantIndexAfterLastTool(messages);
     const content = event.content || '';
     const now = event.now || new Date().toISOString();
 
@@ -149,7 +160,13 @@ export function applyAssistantStreamMessage(
             next[idx] = { ...next[idx], thinking: (next[idx].thinking || '') + content };
             return next;
         }
-        return [...messages, { id: makeId(), role: 'assistant', content: '', thinking: content, streaming: true }];
+        return [...messages, {
+            id: event.messageId || makeId(),
+            role: 'assistant',
+            content: '',
+            thinking: content,
+            streaming: true,
+        }];
     }
 
     if (event.type === 'chunk') {
@@ -158,7 +175,12 @@ export function applyAssistantStreamMessage(
             next[idx] = { ...next[idx], content: next[idx].content + content };
             return next;
         }
-        return [...messages, { id: makeId(), role: 'assistant', content, streaming: true }];
+        return [...messages, {
+            id: event.messageId || makeId(),
+            role: 'assistant',
+            content,
+            streaming: true,
+        }];
     }
 
     if (idx >= 0) {
@@ -173,7 +195,7 @@ export function applyAssistantStreamMessage(
     }
     if (!content) return messages;
     return [...messages, {
-        id: makeId(),
+        id: event.messageId || makeId(),
         role: 'assistant',
         content,
         created_at: now,

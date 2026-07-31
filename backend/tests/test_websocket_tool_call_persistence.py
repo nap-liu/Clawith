@@ -46,7 +46,7 @@ async def test_websocket_tool_call_uses_single_canonical_writer(monkeypatch):
         token="test-token",
         session_id=conversation_id,
     )
-    handler.user = SimpleNamespace(id=user_id)
+    handler.user_id = user_id
     handler.conv_id = conversation_id
 
     evt = {

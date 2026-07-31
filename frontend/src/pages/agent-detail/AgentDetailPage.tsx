@@ -34,6 +34,14 @@ const isConfirmationToolCall = (msg: any): boolean => {
     const name = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })();
     return name === CONFIRMATION_TOOL;
 };
+const isPendingConfirmationToolCall = (msg: any): boolean => {
+    if (!isConfirmationToolCall(msg)) return false;
+    const parsed = (() => { try { return JSON.parse(msg.content || '{}'); } catch { return {}; } })();
+    const status = msg.toolStatus || parsed.status;
+    const args = msg.toolArgs || parsed.args || {};
+    return (status === 'running' || status === 'pending')
+        && args.force_confirmation !== false;
+};
 import { useAuthStore } from '../../stores';
 import { copyToClipboard } from '../../utils/clipboard';
 import { formatFileSize } from '../../utils/formatFileSize';
@@ -48,6 +56,7 @@ import {
     type ChatAttachedFile,
     type ChatPreviewImage,
 } from '../../utils/chatAttachments';
+import { createClientId } from '../../utils/clientId';
 import { parseFileDeliveryToolResult, type ChatFileDelivery } from '../../utils/chatFileDelivery';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import {
@@ -2573,6 +2582,7 @@ export default function AgentDetailPage() {
     };
     interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
+    const confirmationPending = chatMessages.some(isPendingConfirmationToolCall);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
         const parsed = typeof args === 'string'
@@ -2661,6 +2671,7 @@ export default function AgentDetailPage() {
         imageUrl?: string;
         previewImages: ChatPreviewImage[];
         modelId?: string | null;
+        messageId: string;
     };
     const [attachedFiles, setAttachedFiles] = useState<ChatAttachedFile[]>([]);
     const attachedImagePreviews = useMemo(() => buildPreviewImagesFromAttachments(attachedFiles), [attachedFiles]);
@@ -3232,9 +3243,9 @@ export default function AgentDetailPage() {
                 queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
                 return;
             }
-            if (['thinking', 'chunk', 'workspace_draft', 'tool_call', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
+            if (['thinking', 'chunk', 'workspace_draft', 'tool_call', 'confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
                 const nextStreaming = ['thinking', 'chunk', 'workspace_draft', 'tool_call'].includes(d.type);
-                const endStreaming = ['done', 'error', 'quota_exceeded'].includes(d.type);
+                const endStreaming = ['confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type);
                 setSessionUiState(key, {
                     isWaiting: false,
                     isStreaming: endStreaming ? false : nextStreaming,
@@ -3276,16 +3287,28 @@ export default function AgentDetailPage() {
                 return;
             }
 
-            if (['thinking', 'chunk', 'workspace_draft', 'tool_call', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
+            if (['thinking', 'chunk', 'workspace_draft', 'tool_call', 'confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
                 setIsWaiting(false);
                 if (['thinking', 'chunk', 'workspace_draft', 'tool_call'].includes(d.type)) setIsStreaming(true);
-                if (['done', 'error', 'quota_exceeded'].includes(d.type)) {
+                if (['confirmation_required', 'done', 'error', 'quota_exceeded'].includes(d.type)) {
                     setIsStreaming(false);
                     setIsStopping(false);
                 }
             }
 
-            if (d.type === 'thinking') {
+            if (d.type === 'confirmation_required') {
+                setChatMessages((prev) => prev.filter(
+                    (message) => String(message.id || '') !== String(d.message_id || ''),
+                ));
+                upsertToolCallMessage({
+                    role: 'tool_call',
+                    content: '',
+                    toolName: CONFIRMATION_TOOL,
+                    toolCallId: String(d.call_id || ''),
+                    toolArgs: d.args,
+                    toolStatus: 'running',
+                });
+            } else if (d.type === 'thinking') {
                 setChatMessages(prev => {
                     const last = prev[prev.length - 1];
                     if (last && last.role === 'assistant' && (last as any)._streaming) {
@@ -3552,6 +3575,7 @@ export default function AgentDetailPage() {
         setIsStopping(false);
         setSessionUiState(runtimeKey, { isWaiting: true, isStreaming: false, isStopping: false });
         setChatMessages(prev => [...prev, parseChatMsg({
+            id: payload.messageId,
             role: 'user',
             content: payload.userMsg,
             fileName: payload.fileName,
@@ -3560,6 +3584,7 @@ export default function AgentDetailPage() {
             timestamp: new Date().toISOString()
         })]);
         socket.send(JSON.stringify({
+            message_id: payload.messageId,
             content: payload.contentForLLM,
             display_content: payload.userMsg,
             file_name: payload.fileName,
@@ -4183,6 +4208,13 @@ export default function AgentDetailPage() {
                             args={cardArgs}
                             resolved={cardStatus === 'done'}
                             result={cardResult}
+                            onResolved={(resolvedResult) => {
+                                upsertToolCallMessage({
+                                    ...msg,
+                                    toolStatus: 'done',
+                                    toolResult: resolvedResult,
+                                });
+                            }}
                         />
                     </div>
                 );
@@ -4307,7 +4339,7 @@ export default function AgentDetailPage() {
     const sendChatMsg = () => {
         if (!id || !activeSession?.id) return;
         if (showNoModelState) return;
-        if (isWaiting || isStreaming || isStopping) return;
+        if (isWaiting || isStreaming || isStopping || confirmationPending) return;
         const activeRuntimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
         const activeSocket = wsMapRef.current[activeRuntimeKey];
         if (!chatInput.trim() && attachedFiles.length === 0) return;
@@ -4326,6 +4358,7 @@ export default function AgentDetailPage() {
             imageUrl: attachmentPayload.imageUrl,
             previewImages: attachmentPayload.previewImages,
             modelId: effectiveChatModelId,
+            messageId: createClientId(),
         };
 
         setChatInput('');
@@ -4351,6 +4384,10 @@ export default function AgentDetailPage() {
     };
 
     const handleChatFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        if (confirmationPending) {
+            e.target.value = '';
+            return;
+        }
         const files = Array.from(e.target.files || []);
         if (!files.length) return;
         const allowedFiles = files.slice(0, 10 - attachedFiles.length);
@@ -4410,6 +4447,10 @@ export default function AgentDetailPage() {
 
     // Clipboard paste handler — auto-upload pasted images
     const handlePaste = async (e: React.ClipboardEvent) => {
+        if (confirmationPending) {
+            e.preventDefault();
+            return;
+        }
         const items = e.clipboardData?.items;
         if (!items) return;
 
@@ -4483,7 +4524,7 @@ export default function AgentDetailPage() {
 
     // ── Drag-and-drop chat file upload ──
     const handleDroppedChatFiles = useCallback(async (files: File[]) => {
-        if (!wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10) return;
+        if (confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10) return;
         const availableSlots = Math.max(0, 10 - attachedFiles.length);
         const filesToProcess = files.slice(0, availableSlots);
 
@@ -4513,11 +4554,11 @@ export default function AgentDetailPage() {
                 setChatUploadDrafts(prev => prev.filter(d => d.id !== draftId));
             }
         }
-    }, [id, wsConnected, chatUploadDrafts.length, isWaiting, isStreaming, isStopping, attachedFiles.length, isWritableSession, t]);
+    }, [attachedFiles.length, chatUploadDrafts.length, confirmationPending, id, isStopping, isStreaming, isWaiting, t, wsConnected]);
 
     const { isDragging: isChatDragging, dropZoneProps: chatDropProps } = useDropZone({
         onDrop: handleDroppedChatFiles,
-        disabled: !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10 || !activeSession || !isWritableSession(activeSession),
+        disabled: confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10 || !activeSession || !isWritableSession(activeSession),
     });
 
     // Expandable activity log
@@ -6878,7 +6919,7 @@ export default function AgentDetailPage() {
                                                 <textarea
                                                     ref={chatInputRef}
                                                     className="chat-input"
-                                                    disabled={showNoModelState}
+                                                    disabled={showNoModelState || confirmationPending}
                                                     value={chatInput}
                                                     onChange={e => {
                                                         setChatInput(e.target.value);
@@ -6895,7 +6936,11 @@ export default function AgentDetailPage() {
                                                         }
                                                     }}
                                                     onPaste={handlePaste}
-                                                    placeholder={showNoModelState ? t('agent.chat.noModelPlaceholder', 'Configure a company model to start chatting') : (!wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? 'Connecting...' : t('chat.placeholder'))}
+                                                    placeholder={confirmationPending
+                                                        ? '请先完成上方确认'
+                                                        : showNoModelState
+                                                            ? t('agent.chat.noModelPlaceholder', 'Configure a company model to start chatting')
+                                                            : (!wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? 'Connecting...' : t('chat.placeholder'))}
                                                     rows={1}
                                                 />
                                             </div>
@@ -6905,7 +6950,7 @@ export default function AgentDetailPage() {
                                                     type="button"
                                                     className="chat-composer-btn"
                                                     onClick={() => fileInputRef.current?.click()}
-                                                    disabled={showNoModelState || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10}
+                                                    disabled={showNoModelState || confirmationPending || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || isStopping || attachedFiles.length >= 10}
                                                     title={t('agent.workspace.uploadFile')}
                                                 >
                                                     <IconPaperclip size={16} stroke={1.75} />
@@ -6945,7 +6990,7 @@ export default function AgentDetailPage() {
                                                         type="button"
                                                         className="btn btn-primary chat-composer-send"
                                                         onClick={sendChatMsg}
-                                                        disabled={showNoModelState || !wsConnected || (!chatInput.trim() && attachedFiles.length === 0)}
+                                                        disabled={showNoModelState || confirmationPending || !wsConnected || (!chatInput.trim() && attachedFiles.length === 0)}
                                                         title={t('chat.send')}
                                                     >
                                                         <IconSend size={16} stroke={1.75} />
