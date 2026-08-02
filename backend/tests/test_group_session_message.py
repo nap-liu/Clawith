@@ -15,6 +15,7 @@ from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.models.chat_session import ChatSession
 from app.models.mcp_server import MCPServer  # noqa: F401 - register Tool FK target
+from app.models.org import AgentRelationship
 from app.models.tenant import Tenant
 from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
@@ -101,6 +102,31 @@ async def _seed_session(
         return session
 
 
+async def _seed_related_user(agent: Agent, *, display_name: str = "Session Recipient") -> User:
+    suffix = uuid.uuid4().hex[:10]
+    async with async_session() as db:
+        identity = Identity(
+            username=f"session_recipient_{suffix}",
+            email=f"session-recipient-{suffix}@test.local",
+            password_hash="x",
+        )
+        db.add(identity)
+        await db.flush()
+        user = User(
+            identity_id=identity.id,
+            display_name=display_name,
+            role="member",
+            is_active=True,
+            tenant_id=agent.tenant_id,
+        )
+        db.add(user)
+        await db.flush()
+        db.add(AgentRelationship(agent_id=agent.id, user_id=user.id))
+        await db.commit()
+        await db.refresh(user)
+        return user
+
+
 async def test_send_group_session_message_uses_exact_binding_and_persists_receipt(monkeypatch):
     owner, _ = await _seed_agents()
     target = await _seed_session(owner.id)
@@ -160,6 +186,99 @@ async def test_send_group_session_message_uses_exact_binding_and_persists_receip
     assert receipt.message_meta["source_channel"] == "dingtalk"
     assert receipt.message_meta["actor_ref"] == target.external_conv_id
     assert refreshed is not None and refreshed.last_message_at is not None
+
+
+@pytest.mark.parametrize("channel", ["dingtalk", "feishu"])
+async def test_send_session_message_uses_exact_person_route_and_active_relationship(monkeypatch, channel):
+    owner, _ = await _seed_agents()
+    recipient = await _seed_related_user(owner)
+    target = await _seed_session(
+        owner.id,
+        channel=channel,
+        external_conv_id=f"{channel}_p2p_exact-user",
+        is_group=False,
+        user_id=recipient.id,
+    )
+    delivered: list[dict] = []
+
+    async def fake_deliver(**kwargs):
+        delivered.append(kwargs)
+        return True
+
+    async def fake_live_mirror(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
+
+    result = await agent_tools._send_session_message(
+        owner.id,
+        {"session_id": str(target.id), "message": "按原会话投递"},
+        origin_session_id=str(uuid.uuid4()),
+        tool_call_id=f"call-{channel}-person",
+        origin_turn_anchor_id=uuid.uuid4(),
+    )
+
+    assert json.loads(result) == {
+        "status": "sent",
+        "session_id": str(target.id),
+        "channel": channel,
+        "conversation_type": "person",
+        "conversation_name": recipient.display_name,
+    }
+    assert len(delivered) == 1
+    assert delivered[0]["runtime"] == TurnRuntime(
+        session_found=True,
+        source_channel=channel,
+        conversation_id=str(target.id),
+        external_conv_id=target.external_conv_id,
+        is_group=False,
+    )
+
+    async with async_session() as db:
+        receipt = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(target.id),
+                    ChatMessage.content == "按原会话投递",
+                )
+            )
+        ).scalar_one()
+    assert receipt.user_id == recipient.id
+    assert receipt.message_meta["target_is_group"] is False
+
+
+async def test_send_session_message_rejects_person_session_after_relationship_removal(monkeypatch):
+    owner, _ = await _seed_agents()
+    recipient = await _seed_related_user(owner)
+    target = await _seed_session(
+        owner.id,
+        channel="dingtalk",
+        external_conv_id="dingtalk_p2p_removed-user",
+        is_group=False,
+        user_id=recipient.id,
+    )
+    async with async_session() as db:
+        await db.execute(
+            delete(AgentRelationship).where(
+                AgentRelationship.agent_id == owner.id,
+                AgentRelationship.user_id == recipient.id,
+            )
+        )
+        await db.commit()
+
+    async def fail_if_delivered(**_kwargs):
+        raise AssertionError("revoked relationship must block exact-Session delivery")
+
+    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_if_delivered)
+    result = await agent_tools._send_session_message(
+        owner.id,
+        {"session_id": str(target.id), "message": "should not send"},
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "error"
+    assert payload["code"] == "recipient_not_related"
 
 
 @pytest.mark.parametrize(
@@ -311,6 +430,53 @@ async def test_dingtalk_runtime_delivers_to_exact_group_conversation(monkeypatch
     }
 
 
+async def test_feishu_runtime_delivers_to_exact_group_conversation(monkeypatch):
+    owner, _ = await _seed_agents()
+    app_id = f"feishu-app-{uuid.uuid4().hex}"
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="feishu",
+                app_id=app_id,
+                app_secret="feishu-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+    captured = {}
+
+    async def fake_send_message(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"code": 0}
+
+    monkeypatch.setattr("app.services.feishu_service.feishu_service.send_message", fake_send_message)
+    runtime = TurnRuntime(
+        session_found=True,
+        source_channel="feishu",
+        conversation_id=str(uuid.uuid4()),
+        external_conv_id="feishu_group_exact-chat-id",
+        is_group=True,
+    )
+
+    sent = await turn_runtime.deliver_message_to_runtime(
+        agent_id=owner.id,
+        runtime=runtime,
+        message="exact feishu target",
+    )
+
+    assert sent is True
+    assert captured["args"] == (
+        app_id,
+        "feishu-secret",
+        "exact-chat-id",
+        "text",
+        json.dumps({"text": "exact feishu target"}, ensure_ascii=False),
+    )
+    assert captured["kwargs"] == {"receive_id_type": "chat_id"}
+
+
 async def test_unconfigured_channel_is_not_used(monkeypatch):
     owner, _ = await _seed_agents()
     async with async_session() as db:
@@ -429,6 +595,22 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
             "message": {
                 "type": "string",
                 "description": "Text content to send to the bound group.",
+            },
+        },
+        "required": ["session_id", "message"],
+        "additionalProperties": False,
+    }
+    session_tool = next(tool for tool in tools if tool["function"]["name"] == "send_session_message")
+    assert session_tool["function"]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Exact human ChatSession UUID returned by list_sessions/search_sessions.",
+            },
+            "message": {
+                "type": "string",
+                "description": "Text content to send to the bound conversation.",
             },
         },
         "required": ["session_id", "message"],

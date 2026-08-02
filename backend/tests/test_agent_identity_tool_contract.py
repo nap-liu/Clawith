@@ -48,6 +48,21 @@ def _seed_schema(name: str) -> dict:
     raise AssertionError(f"Seeded tool {name!r} is missing")
 
 
+def _agent_description(name: str) -> str:
+    for tool in AGENT_TOOLS:
+        function = tool.get("function") or {}
+        if function.get("name") == name:
+            return function.get("description") or ""
+    raise AssertionError(f"Agent tool {name!r} is missing")
+
+
+def _seed_description(name: str) -> str:
+    for tool in BUILTIN_TOOLS:
+        if tool.get("name") == name:
+            return tool.get("description") or ""
+    raise AssertionError(f"Seeded tool {name!r} is missing")
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -58,6 +73,7 @@ def _seed_schema(name: str) -> dict:
         "send_channel_file",
         "send_platform_message",
         "send_channel_message",
+        "send_session_message",
         "send_group_session_message",
         "search_contacts",
         "add_contact",
@@ -115,11 +131,25 @@ def test_message_tool_schemas_use_only_canonical_recipient_ids(name, canonical_f
         assert LEGACY_EXECUTION_FIELDS.isdisjoint(properties)
 
 
-def test_group_session_message_uses_only_exact_session_address():
-    for schema in (_agent_schema("send_group_session_message"), _seed_schema("send_group_session_message")):
+@pytest.mark.parametrize("name", ["send_session_message", "send_group_session_message"])
+def test_session_message_uses_only_exact_session_address(name):
+    for schema in (_agent_schema(name), _seed_schema(name)):
         assert set(schema["properties"]) == {"session_id", "message"}
         assert schema["required"] == ["session_id", "message"]
         assert schema["additionalProperties"] is False
+
+
+def test_session_message_description_states_its_narrow_delivery_boundary():
+    for description in (
+        _agent_description("send_session_message"),
+        _seed_description("send_session_message"),
+    ):
+        assert "text only" in description
+        assert "already exists" in description
+        assert "never creates a Session" in description
+        assert "selects or changes a channel" in description
+        assert "sends files" in description
+        assert "contacts another digital employee" in description
 
 
 @pytest.mark.parametrize("name", ["add_contact", "remove_contact"])

@@ -244,6 +244,30 @@ async def resolve_platform_user_recipient(
     return ResolvedHumanRecipient(source, user, relationship, member)
 
 
+async def resolve_human_recipient(
+    db: AsyncSession,
+    source_agent_id: uuid.UUID,
+    user_id: object,
+) -> ResolvedHumanRecipient:
+    """Authorize one canonical human without selecting a delivery route.
+
+    Exact-Session delivery already has a durable provider route on
+    ``ChatSession``. It still needs the same tenant, relationship, suppression,
+    and effective-status checks as proactive user-addressed delivery, but it
+    must not re-resolve or silently replace that exact Session route.
+    """
+
+    canonical_id = parse_canonical_id(user_id, "user_id")
+    source = await _load_source_agent(db, source_agent_id)
+    user, relationship = await _active_human_rows(db, source, canonical_id)
+    member = (
+        await db.get(OrgMember, relationship.member_id)
+        if relationship.member_id
+        else None
+    )
+    return ResolvedHumanRecipient(source, user, relationship, member)
+
+
 async def resolve_human_channel_recipient(
     db: AsyncSession,
     source_agent_id: uuid.UUID,

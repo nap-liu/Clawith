@@ -891,13 +891,44 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "send_session_message",
+        "display_name": "Session Message",
+        "description": (
+            "Send text only to one human conversation that already exists in Clawith. "
+            "Provide the exact session_id returned by list_sessions/search_sessions; the existing "
+            "Session's bound platform/IM route is used unchanged. This tool never creates a Session, "
+            "discovers a person, selects or changes a channel, sends files, or contacts another "
+            "digital employee. If no suitable Session exists, use send_channel_message for an external-IM "
+            "person or send_platform_message for a platform user."
+        ),
+        "category": "communication",
+        "icon": "✉️",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Exact human ChatSession UUID returned by list_sessions/search_sessions.",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Text content to send to the bound conversation.",
+                },
+            },
+            "required": ["session_id", "message"],
+            "additionalProperties": False,
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "send_group_session_message",
         "display_name": "Group Session Message",
         "description": (
-            "Send a text message to one existing external-IM group conversation by its exact "
-            "Clawith session_id from list_sessions/search_sessions. The target Session is the only "
-            "routing authority: its bound channel and external conversation ID are resolved internally. "
-            "This tool accepts group Sessions only; use send_channel_message for a person."
+            "Compatibility tool for sending text to an existing external-IM group by exact "
+            "session_id. Prefer send_session_message for new work; this tool remains available "
+            "for existing workflows and accepts group Sessions only."
         ),
         "category": "communication",
         "icon": "📣",
