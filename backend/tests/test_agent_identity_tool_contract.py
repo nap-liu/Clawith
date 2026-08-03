@@ -157,6 +157,17 @@ def test_session_message_description_states_its_narrow_delivery_boundary():
         assert "contacts another digital employee" in description
 
 
+@pytest.mark.parametrize("name", ["send_session_message", "send_group_session_message"])
+def test_session_message_description_requires_tool_for_native_mentions(name):
+    for description in (_agent_description(name), _seed_description(name)):
+        assert "MUST call" in description
+        assert "normal assistant reply is plain text" in description
+    for schema in (_agent_schema(name), _seed_schema(name)):
+        message_description = schema["properties"]["message"]["description"]
+        assert "do not prefix @names" in message_description
+        assert "renders each native @ exactly once" in message_description
+
+
 @pytest.mark.parametrize("name", ["add_contact", "remove_contact"])
 def test_contact_mutation_schema_requires_exactly_one_canonical_id(name):
     for schema in (_agent_schema(name), _seed_schema(name)):

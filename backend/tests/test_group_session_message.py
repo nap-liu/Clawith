@@ -861,7 +861,10 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
             },
             "message": {
                 "type": "string",
-                "description": "Text content to send to the bound group.",
+                "description": (
+                    "Business text to send. When mention_user_ids is present, do not prefix @names "
+                    "or external IDs; the transport renders each native @ exactly once."
+                ),
             },
             "mention_user_ids": {
                 "type": "array",
@@ -887,7 +890,10 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
             },
             "message": {
                 "type": "string",
-                "description": "Text content to send to the bound conversation.",
+                "description": (
+                    "Business text to send. When mention_user_ids is present, do not prefix @names "
+                    "or external IDs; the transport renders each native @ exactly once."
+                ),
             },
             "mention_user_ids": {
                 "type": "array",

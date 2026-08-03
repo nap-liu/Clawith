@@ -780,7 +780,9 @@ AGENT_TOOLS = [
                 "Session's bound platform/IM route is used unchanged. This tool never creates a Session, "
                 "discovers a person, selects or changes a channel, sends files, or contacts another "
                 "digital employee. If no suitable Session exists, use send_channel_message for an external-IM "
-                "person or send_platform_message for a platform user."
+                "person or send_platform_message for a platform user. For a native DingTalk @, you MUST call "
+                "this tool with mention_user_ids even when replying in the current group; writing @name in a "
+                "normal assistant reply is plain text and does not create an @ action."
             ),
             "parameters": {
                 "type": "object",
@@ -791,7 +793,10 @@ AGENT_TOOLS = [
                     },
                     "message": {
                         "type": "string",
-                        "description": "Text content to send to the bound conversation.",
+                        "description": (
+                            "Business text to send. When mention_user_ids is present, do not prefix @names "
+                            "or external IDs; the transport renders each native @ exactly once."
+                        ),
                     },
                     "mention_user_ids": {
                         "type": "array",
@@ -816,7 +821,9 @@ AGENT_TOOLS = [
             "description": (
                 "Compatibility tool for sending text to an existing external-IM group by exact "
                 "session_id. Prefer send_session_message for new work; this tool remains available "
-                "for existing workflows and accepts group Sessions only."
+                "for existing workflows and accepts group Sessions only. For a native DingTalk @, you MUST "
+                "call this tool with mention_user_ids even when replying in the current group; writing @name "
+                "in a normal assistant reply is plain text and does not create an @ action."
             ),
             "parameters": {
                 "type": "object",
@@ -827,7 +834,10 @@ AGENT_TOOLS = [
                     },
                     "message": {
                         "type": "string",
-                        "description": "Text content to send to the bound group.",
+                        "description": (
+                            "Business text to send. When mention_user_ids is present, do not prefix @names "
+                            "or external IDs; the transport renders each native @ exactly once."
+                        ),
                     },
                     "mention_user_ids": {
                         "type": "array",
