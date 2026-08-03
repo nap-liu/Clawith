@@ -7775,8 +7775,8 @@ async def _send_exact_session_message(
                 is_group=target_is_group,
             )
             message_for_delivery = (
-                f"{' '.join(f'@{name}' for name in mentioned_names)}\n{message_text}"
-                if mentioned_names
+                f"{' '.join(f'@{staff_id}' for staff_id in dingtalk_at_user_ids)}\n{message_text}"
+                if dingtalk_at_user_ids
                 else message_text
             )
             delivery_kwargs = {
