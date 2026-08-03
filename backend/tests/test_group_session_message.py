@@ -395,13 +395,15 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
     mentioned_user_id = uuid.uuid4()
     webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=secret"
     async with async_session() as db:
-        stored = await db.get(ChatSession, target.id)
-        cache_group_session_webhook(
-            stored,
+        stored = await cache_group_session_webhook(
+            db,
+            agent_id=owner.id,
+            external_conv_id=target.external_conv_id,
             webhook=webhook,
             expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
         )
         await db.commit()
+        assert stored is not None
         encrypted_config = dict(stored.im_config or {})
     assert webhook not in json.dumps(encrypted_config)
 
@@ -454,6 +456,90 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
         ).scalar_one()
     assert receipt.message_meta["mention_user_ids"] == [str(mentioned_user_id)]
     assert receipt.message_meta["mentioned_users"] == ["张三"]
+
+
+async def test_dingtalk_webhook_merge_preserves_concurrent_scene_and_model_switches():
+    from app.services.dingtalk_group_mentions import (
+        cache_group_session_webhook,
+        load_group_session_webhook,
+    )
+
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    selected_model_id = str(uuid.uuid4())
+    webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=concurrent"
+
+    async with async_session() as stale_db:
+        stale = await stale_db.get(ChatSession, target.id)
+        assert stale is not None and stale.im_config == {}
+        stale.im_config = {"stale_write": "must-not-survive"}
+
+        async with async_session() as command_db:
+            locked = (
+                await command_db.execute(select(ChatSession).where(ChatSession.id == target.id).with_for_update())
+            ).scalar_one()
+            locked.im_config = {
+                "scene_key": "warranty",
+                "model_id": selected_model_id,
+            }
+            await command_db.commit()
+
+        merged = await cache_group_session_webhook(
+            stale_db,
+            agent_id=owner.id,
+            external_conv_id=target.external_conv_id,
+            webhook=webhook,
+            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
+        )
+        assert merged is not None
+        await stale_db.commit()
+
+    async with async_session() as db:
+        refreshed = await db.get(ChatSession, target.id)
+        assert refreshed is not None
+        assert refreshed.im_config["scene_key"] == "warranty"
+        assert refreshed.im_config["model_id"] == selected_model_id
+        assert "stale_write" not in refreshed.im_config
+        assert load_group_session_webhook(refreshed) == webhook
+
+
+async def test_dingtalk_webhook_cache_never_regresses_to_older_callback():
+    from app.services.dingtalk_group_mentions import (
+        cache_group_session_webhook,
+        load_group_session_webhook,
+    )
+
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    newer_webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=newer"
+    older_webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=older"
+
+    async with async_session() as db:
+        await cache_group_session_webhook(
+            db,
+            agent_id=owner.id,
+            external_conv_id=target.external_conv_id,
+            webhook=newer_webhook,
+            expires_at_ms=now_ms + 900_000,
+        )
+        await db.commit()
+
+    async with async_session() as db:
+        await cache_group_session_webhook(
+            db,
+            agent_id=owner.id,
+            external_conv_id=target.external_conv_id,
+            webhook=older_webhook,
+            expires_at_ms=now_ms + 600_000,
+        )
+        await db.commit()
+
+    async with async_session() as db:
+        refreshed = await db.get(ChatSession, target.id)
+        assert refreshed is not None
+        assert load_group_session_webhook(refreshed) == newer_webhook
+        assert refreshed.im_config["dingtalk_session_webhook_expires_at_ms"] == (now_ms + 900_000)
 
 
 async def test_dingtalk_group_mention_requires_recent_group_webhook(monkeypatch):

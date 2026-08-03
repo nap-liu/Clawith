@@ -598,6 +598,131 @@ async def test_model_command_switches_by_saved_label_with_spaces(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reserved_label", ["list", "status", "default"])
+async def test_model_command_selects_reserved_saved_label_with_use(
+    monkeypatch,
+    reserved_label,
+):
+    from app.services import chat_model_selection
+
+    model_id = uuid.uuid4()
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    session = SimpleNamespace(im_config={})
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return session
+
+    async def fake_resolve(*_args, **kwargs):
+        assert kwargs["label"] == reserved_label
+        return chat_model_selection.ModelLabelResolution(
+            chat_model_selection.MODEL_STATUS_OK,
+            SimpleNamespace(id=model_id, label=reserved_label),
+        )
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_label", fake_resolve)
+
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command=f"/model use {reserved_label}",
+        agent_id=agent.id,
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_group_1",
+        source_channel="dingtalk",
+        is_group=True,
+    )
+
+    assert result["action"] == "model_switched"
+    assert session.im_config == {"model_id": str(model_id)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "model", "expected_action"),
+    [
+        ("not_found", None, "model_not_found"),
+        ("disabled", SimpleNamespace(label="停用模型"), "model_disabled"),
+        ("ambiguous", None, "model_ambiguous"),
+    ],
+)
+async def test_model_command_reports_precise_selection_failure(
+    monkeypatch,
+    status,
+    model,
+    expected_action,
+):
+    from app.services import chat_model_selection
+
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return None
+
+    async def fake_resolve(*_args, **_kwargs):
+        return chat_model_selection.ModelLabelResolution(status, model)
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_label", fake_resolve)
+
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/model 测试模型",
+        agent_id=agent.id,
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_p2p_1",
+        source_channel="dingtalk",
+    )
+
+    assert result["action"] == expected_action
+    assert result["message"].startswith("❌")
+
+
+@pytest.mark.asyncio
+async def test_model_status_reports_stale_session_override(monkeypatch):
+    from app.services import chat_model_selection
+
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    session = SimpleNamespace(im_config={"model_id": str(uuid.uuid4())})
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return session
+
+    async def fake_runtime(*_args, **_kwargs):
+        return chat_model_selection.RuntimeModelResolution(
+            SimpleNamespace(label="默认模型"),
+            None,
+            chat_model_selection.MODEL_OVERRIDE_UNAVAILABLE,
+        )
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(chat_model_selection, "resolve_runtime_models", fake_runtime)
+
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/model status",
+        agent_id=agent.id,
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_p2p_1",
+        source_channel="dingtalk",
+    )
+
+    assert result["action"] == "model_status_unavailable"
+    assert result["message"].startswith("⚠️")
+
+
+@pytest.mark.asyncio
 async def test_model_list_shows_saved_labels_without_internal_ids(monkeypatch):
     from app.services import chat_model_selection
 
@@ -632,9 +757,7 @@ async def test_model_default_clears_only_model_preference(monkeypatch):
     from app.services import chat_model_selection
 
     agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
-    session = SimpleNamespace(
-        im_config={"model_id": str(uuid.uuid4()), "scene_key": "warranty"}
-    )
+    session = SimpleNamespace(im_config={"model_id": str(uuid.uuid4()), "scene_key": "warranty"})
 
     async def fake_agent(*_args, **_kwargs):
         return agent

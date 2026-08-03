@@ -94,6 +94,7 @@ def _help_message() -> str:
         "/scene <场景标识>：从下一条消息起激活指定场景\n"
         "/scene status：查看当前场景；/scene off：退出当前场景\n"
         "/model list：查看可用模型；/model <模型名>：切换当前会话模型\n"
+        "/model use <模型名>：切换名称为 list、status、default 的模型\n"
         "/model status：查看当前模型；/model default：恢复默认模型\n"
         "/stop：停止当前这轮正在执行的工作\n"
         "/help：查看帮助"
@@ -151,7 +152,15 @@ async def handle_channel_command(
             return {"action": "model_failed", "message": "❌ 无法读取数字员工的模型配置。"}
 
         normalized_arg = str(arg or "status").strip()
-        control_arg = normalized_arg.casefold()
+        explicit_use = normalized_arg.casefold().startswith("use ")
+        if explicit_use:
+            normalized_arg = normalized_arg[4:].strip()
+            if not normalized_arg:
+                return {
+                    "action": "model_usage",
+                    "message": "❌ 用法：/model use <模型名>。",
+                }
+        control_arg = "" if explicit_use else normalized_arg.casefold()
         if control_arg == "list":
             models = await list_enabled_tenant_models(db, agent.tenant_id)
             if not models:
@@ -159,7 +168,10 @@ async def handle_channel_command(
             labels = "\n".join(f"- {model.label}" for model in models)
             return {
                 "action": "model_list",
-                "message": f"可用模型：\n{labels}\n\n切换方式：/model <模型名>",
+                "message": (
+                    f"可用模型：\n{labels}\n\n切换方式：/model <模型名>"
+                    "；若模型名为 list、status 或 default，请使用 /model use <模型名>。"
+                ),
             }
 
         session = await _load_channel_session(
@@ -169,11 +181,7 @@ async def handle_channel_command(
             source_channel=source_channel,
             for_update=control_arg != "status",
         )
-        current_model_id = (
-            str((session.im_config or {}).get(MODEL_SESSION_CONFIG_KEY) or "")
-            if session
-            else ""
-        )
+        current_model_id = str((session.im_config or {}).get(MODEL_SESSION_CONFIG_KEY) or "") if session else ""
 
         if control_arg == "status":
             resolved = await resolve_runtime_models(
@@ -302,10 +310,7 @@ async def handle_channel_command(
                 manifest = resolved.manifest
                 return {
                     "action": "scene_status",
-                    "message": (
-                        f"当前场景：{manifest['name']}"
-                        f"（{manifest['scene_key']}，v{manifest['revision']}）。"
-                    ),
+                    "message": (f"当前场景：{manifest['name']}（{manifest['scene_key']}，v{manifest['revision']}）。"),
                 }
             return {
                 "action": "scene_status_unavailable",
@@ -422,17 +427,10 @@ async def handle_channel_command(
         if old_session:
             from app.services.scene_service import SCENE_SESSION_CONFIG_KEY
 
-            cleared_scene_key = str(
-                (getattr(old_session, "im_config", None) or {}).get(
-                    SCENE_SESSION_CONFIG_KEY
-                )
-                or ""
-            )
+            cleared_scene_key = str((getattr(old_session, "im_config", None) or {}).get(SCENE_SESSION_CONFIG_KEY) or "")
             # Rename old external_conv_id so find_or_create will make a new one
             now = datetime.now(UTC)
-            old_session.external_conv_id = (
-                f"{external_conv_id}__archived_{now.strftime('%Y%m%d_%H%M%S')}"
-            )
+            old_session.external_conv_id = f"{external_conv_id}__archived_{now.strftime('%Y%m%d_%H%M%S')}"
             await db.flush()
 
         # Defer session creation to the user's next message so its title

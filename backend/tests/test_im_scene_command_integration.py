@@ -17,7 +17,7 @@ from app.models.tool import AgentTool, Tool
 from app.models.user import Identity, User
 from app.services.channel_commands import handle_channel_command
 from app.services.channel_session import find_or_create_channel_session
-from app.services.chat_history import ingest_incoming_chat_message, persist_assistant_reply_row
+from app.services.chat_history import ingest_incoming_chat_message
 from app.services.scene_service import load_turn_scene_context
 
 pytestmark = pytest.mark.asyncio
@@ -178,25 +178,3 @@ async def test_scene_command_persists_session_and_snapshots_exact_turn_revision(
         assert context["scene_key"] == "warranty"
         assert context["scene_revision"] == 1
         assert context["scene_system_prompts"][0]["content"] == "优先核对保修政策。"
-
-        await persist_assistant_reply_row(
-            db,
-            agent_id=agent_id,
-            user_id=user_id,
-            conversation_id=session_id,
-            content="已按售后场景处理。",
-            turn_anchor_id=anchor_id,
-        )
-        await db.commit()
-
-    async with async_session() as db:
-        assistant = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id == session_id,
-                    ChatMessage.role == "assistant",
-                )
-            )
-        ).scalar_one()
-        assert assistant.message_meta["scene_key"] == "warranty"
-        assert assistant.message_meta["scene_revision"] == 1

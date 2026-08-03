@@ -1076,16 +1076,6 @@ async def persist_assistant_reply_row(
         raise ValueError("assistant reply content must be non-empty")
     final_meta = dict(message_meta or {})
     if turn_anchor_id is not None:
-        anchor = await db.get(ChatMessage, turn_anchor_id)
-        if (
-            anchor is not None
-            and anchor.agent_id == agent_id
-            and anchor.conversation_id == conversation_id
-        ):
-            anchor_meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
-            for key in ("scene_key", "scene_revision", "model_id"):
-                if anchor_meta.get(key) is not None:
-                    final_meta.setdefault(key, anchor_meta[key])
         final_meta.update(
             {
                 "turn_anchor_id": str(turn_anchor_id),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -19,7 +20,7 @@ from app.models.user import Identity, User
 from app.services import channel_llm
 from app.services.channel_commands import handle_channel_command
 from app.services.channel_session import find_or_create_channel_session
-from app.services.chat_history import ingest_incoming_chat_message, persist_assistant_reply_row
+from app.services.chat_history import ingest_incoming_chat_message
 
 pytestmark = pytest.mark.asyncio
 _REGISTERED_FK_TARGETS = (_MCPServer, _Participant)
@@ -32,7 +33,7 @@ async def _isolate_engine():
     await engine.dispose()
 
 
-async def _seed_model_runtime() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
+async def _seed_model_runtime() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID]:
     suffix = uuid.uuid4().hex[:10]
     async with async_session() as db:
         tenant = Tenant(
@@ -85,11 +86,11 @@ async def _seed_model_runtime() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.U
         await db.flush()
         db.add(agent)
         await db.commit()
-        return agent.id, user.id, default_model.id, selected_model.id
+        return agent.id, user.id, tenant.id, default_model.id, selected_model.id
 
 
 async def test_model_command_snapshots_selected_saved_model_for_exact_im_turn(monkeypatch):
-    agent_id, user_id, default_model_id, selected_model_id = await _seed_model_runtime()
+    agent_id, user_id, _tenant_id, default_model_id, selected_model_id = await _seed_model_runtime()
     external_conv_id = f"dingtalk_p2p_{uuid.uuid4().hex[:8]}"
 
     async with async_session() as db:
@@ -173,23 +174,131 @@ async def test_model_command_snapshots_selected_saved_model_for_exact_im_turn(mo
         assert captured["primary_model"].id == selected_model_id
         assert captured["primary_model"].id != default_model_id
 
-        await persist_assistant_reply_row(
-            db,
-            agent_id=agent_id,
-            user_id=user_id,
-            conversation_id=session_id,
-            content=reply,
-            turn_anchor_id=anchor_id,
+
+async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():
+    from app.api.websocket import WebSocketChatHandler
+    from app.services.chat_model_selection import (
+        MODEL_OVERRIDE_DISABLED,
+        MODEL_OVERRIDE_INVALID,
+        MODEL_OVERRIDE_OK,
+        MODEL_OVERRIDE_UNAVAILABLE,
+        MODEL_STATUS_AMBIGUOUS,
+        MODEL_STATUS_DISABLED,
+        list_enabled_tenant_models,
+        resolve_runtime_models,
+        resolve_tenant_model_by_label,
+    )
+
+    agent_id, _user_id, tenant_id, default_model_id, selected_model_id = await _seed_model_runtime()
+    async with async_session() as db:
+        other_tenant = Tenant(
+            id=uuid.uuid4(),
+            name=f"Other Model Tenant {uuid.uuid4().hex[:8]}",
+            slug=f"other-model-{uuid.uuid4().hex[:10]}",
+            im_provider="web_only",
         )
+        db.add(other_tenant)
+        await db.flush()
+        disabled = LLMModel(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            provider="openai",
+            model="disabled-internal-model",
+            api_key_encrypted="encrypted-test-key",
+            label="停用模型",
+            enabled=False,
+        )
+        duplicate_one = LLMModel(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            provider="openai",
+            model="duplicate-one",
+            api_key_encrypted="encrypted-test-key",
+            label="重复 模型",
+            enabled=True,
+        )
+        duplicate_two = LLMModel(
+            id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            provider="openai",
+            model="duplicate-two",
+            api_key_encrypted="encrypted-test-key",
+            label="重复  模型",
+            enabled=True,
+        )
+        cross_tenant = LLMModel(
+            id=uuid.uuid4(),
+            tenant_id=other_tenant.id,
+            provider="openai",
+            model="cross-tenant-model",
+            api_key_encrypted="encrypted-test-key",
+            label="跨租户模型",
+            enabled=True,
+        )
+        db.add_all([disabled, duplicate_one, duplicate_two, cross_tenant])
+        agent = await db.get(Agent, agent_id)
+        assert agent is not None
+        agent.primary_model_id = disabled.id
+        agent.fallback_model_id = default_model_id
         await db.commit()
 
     async with async_session() as db:
-        assistant = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id == session_id,
-                    ChatMessage.role == "assistant",
-                )
-            )
-        ).scalar_one()
-        assert assistant.message_meta["model_id"] == str(selected_model_id)
+        agent = await db.get(Agent, agent_id)
+        assert agent is not None
+
+        default_resolution = await resolve_runtime_models(db, agent=agent)
+        assert default_resolution.primary_model.id == default_model_id
+        assert default_resolution.fallback_model is None
+
+        selected_resolution = await resolve_runtime_models(
+            db,
+            agent=agent,
+            override_model_id=selected_model_id,
+        )
+        assert selected_resolution.override_status == MODEL_OVERRIDE_OK
+        assert selected_resolution.primary_model.id == selected_model_id
+
+        disabled_resolution = await resolve_runtime_models(
+            db,
+            agent=agent,
+            override_model_id=disabled.id,
+        )
+        assert disabled_resolution.override_status == MODEL_OVERRIDE_DISABLED
+        assert disabled_resolution.primary_model.id == default_model_id
+
+        cross_resolution = await resolve_runtime_models(
+            db,
+            agent=agent,
+            override_model_id=cross_tenant.id,
+        )
+        assert cross_resolution.override_status == MODEL_OVERRIDE_UNAVAILABLE
+        assert cross_resolution.primary_model.id == default_model_id
+
+        invalid_resolution = await resolve_runtime_models(
+            db,
+            agent=agent,
+            override_model_id="not-a-uuid",
+        )
+        assert invalid_resolution.override_status == MODEL_OVERRIDE_INVALID
+
+        disabled_label = await resolve_tenant_model_by_label(
+            db,
+            tenant_id=tenant_id,
+            label="停用模型",
+        )
+        assert disabled_label.status == MODEL_STATUS_DISABLED
+        duplicate_label = await resolve_tenant_model_by_label(
+            db,
+            tenant_id=tenant_id,
+            label="重复 模型",
+        )
+        assert duplicate_label.status == MODEL_STATUS_AMBIGUOUS
+        listed_ids = {model.id for model in await list_enabled_tenant_models(db, tenant_id)}
+        assert disabled.id not in listed_ids
+        assert cross_tenant.id not in listed_ids
+
+    handler = WebSocketChatHandler(SimpleNamespace(), agent_id, "test-token")
+    selected = await handler._resolve_effective_model(str(selected_model_id))
+    assert selected is not None and selected.id == selected_model_id
+    fallback = await handler._resolve_effective_model(str(disabled.id))
+    assert fallback is not None and fallback.id == default_model_id

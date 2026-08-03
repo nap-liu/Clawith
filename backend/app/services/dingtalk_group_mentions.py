@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import time
+import uuid
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from app.config import get_settings
 from app.core.security import decrypt_data, encrypt_data
@@ -10,34 +15,62 @@ from app.models.chat_session import ChatSession
 
 _WEBHOOK_KEY = "dingtalk_session_webhook_encrypted"
 _WEBHOOK_EXPIRES_AT_KEY = "dingtalk_session_webhook_expires_at_ms"
-_DEFAULT_WEBHOOK_TTL_MS = 60 * 60 * 1000
 _EXPIRY_SAFETY_MS = 30 * 1000
 
 
-def cache_group_session_webhook(
-    session: ChatSession,
+async def cache_group_session_webhook(
+    db: AsyncSession,
     *,
+    agent_id: uuid.UUID,
+    external_conv_id: str,
     webhook: str,
     expires_at_ms: int | str | None,
-) -> None:
-    """Store the latest temporary session webhook encrypted on a group Session."""
+) -> ChatSession | None:
+    """Merge the latest temporary webhook into a freshly locked group Session."""
     value = str(webhook or "").strip()
-    if not value or not session.is_group or session.source_channel != "dingtalk":
-        return
+    if not value:
+        return None
     now_ms = int(time.time() * 1000)
     try:
-        expiry = int(expires_at_ms) if expires_at_ms is not None else 0
+        expiry = int(expires_at_ms)
     except (TypeError, ValueError):
-        expiry = 0
-    if expiry and expiry <= now_ms:
-        return
-    if not expiry:
-        expiry = now_ms + _DEFAULT_WEBHOOK_TTL_MS
+        return None
+    if expiry <= now_ms:
+        return None
+
+    # Lock and refresh only im_config. Suppressing autoflush is essential: a
+    # stale identity-map copy must not be written before the fresh row is read.
+    with db.no_autoflush:
+        session = (
+            await db.execute(
+                select(ChatSession)
+                .options(load_only(ChatSession.im_config))
+                .where(
+                    ChatSession.agent_id == agent_id,
+                    ChatSession.source_channel == "dingtalk",
+                    ChatSession.external_conv_id == external_conv_id,
+                    ChatSession.is_group.is_(True),
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+    if session is None:
+        return None
 
     config = dict(session.im_config or {})
+    try:
+        existing_expiry = int(config.get(_WEBHOOK_EXPIRES_AT_KEY) or 0)
+    except (TypeError, ValueError):
+        existing_expiry = 0
+    if config.get(_WEBHOOK_KEY) and existing_expiry >= expiry:
+        return session
+
     config[_WEBHOOK_KEY] = encrypt_data(value, get_settings().SECRET_KEY)
     config[_WEBHOOK_EXPIRES_AT_KEY] = expiry
     session.im_config = config
+    await db.flush()
+    return session
 
 
 def load_group_session_webhook(session: ChatSession) -> str | None:

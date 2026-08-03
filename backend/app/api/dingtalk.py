@@ -737,26 +737,17 @@ async def process_dingtalk_message(
                 group_name=conversation_title or None,
             )
             if conversation_type == "2":
-                from app.models.chat_session import ChatSession
                 from app.services.dingtalk_group_mentions import (
                     cache_group_session_webhook,
                 )
 
-                command_session = (
-                    await db.execute(
-                        _select(ChatSession).where(
-                            ChatSession.agent_id == agent_id,
-                            ChatSession.source_channel == "dingtalk",
-                            ChatSession.external_conv_id == conv_id,
-                        )
-                    )
-                ).scalar_one_or_none()
-                if command_session is not None:
-                    cache_group_session_webhook(
-                        command_session,
-                        webhook=session_webhook,
-                        expires_at_ms=session_webhook_expires_at_ms,
-                    )
+                await cache_group_session_webhook(
+                    db,
+                    agent_id=agent_id,
+                    external_conv_id=conv_id,
+                    webhook=session_webhook,
+                    expires_at_ms=session_webhook_expires_at_ms,
+                )
             await db.commit()
             import httpx as _httpx_cmd
             try:
@@ -797,11 +788,15 @@ async def process_dingtalk_message(
                 cache_group_session_webhook,
             )
 
-            cache_group_session_webhook(
-                sess,
+            locked_session = await cache_group_session_webhook(
+                db,
+                agent_id=agent_id,
+                external_conv_id=conv_id,
                 webhook=session_webhook,
                 expires_at_ms=session_webhook_expires_at_ms,
             )
+            if locked_session is not None:
+                sess = locked_session
         session_conv_id = str(sess.id)
 
         # Load history (with vision rehydration so multi-turn LLM keeps prior images visible)
