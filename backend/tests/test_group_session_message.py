@@ -441,7 +441,7 @@ async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypat
     payload = json.loads(result)
     assert payload["status"] == "sent"
     assert payload["mentioned_users"] == ["张三"]
-    assert delivered[0]["message"] == "@张三\n请确认今晚发布窗口"
+    assert delivered[0]["message"] == "请确认今晚发布窗口"
     assert delivered[0]["dingtalk_at_user_ids"] == ["staff-zhangsan"]
     assert delivered[0]["dingtalk_session_webhook"] == webhook
 
@@ -640,7 +640,7 @@ async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monke
             external_conv_id="dingtalk_group_open-conversation-exact",
             is_group=True,
         ),
-        message="@张三\n请确认",
+        message="请确认",
         dingtalk_at_user_ids=["staff-zhangsan"],
         dingtalk_session_webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
     )
@@ -648,7 +648,7 @@ async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monke
     assert sent is True
     assert captured == {
         "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?secret",
-        "message": "@张三\n请确认",
+        "message": "请确认",
         "at_user_ids": ["staff-zhangsan"],
     }
 
@@ -684,7 +684,7 @@ async def test_dingtalk_group_mention_payload_contains_native_at_metadata(monkey
 
     result = await turn_runtime._send_dingtalk_group_mention(
         session_webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
-        message="@张三\n请确认",
+        message="请确认",
         at_user_ids=["staff-zhangsan"],
     )
 
@@ -692,7 +692,7 @@ async def test_dingtalk_group_mention_payload_contains_native_at_metadata(monkey
     assert captured["url"].endswith("sendBySession?secret")
     assert captured["json"] == {
         "msgtype": "text",
-        "text": {"content": "@张三\n请确认"},
+        "text": {"content": "请确认"},
         "at": {"atUserIds": ["staff-zhangsan"], "isAtAll": False},
     }
 

@@ -7774,11 +7774,12 @@ async def _send_exact_session_message(
                 external_conv_id=external_conv_id or None,
                 is_group=target_is_group,
             )
-            message_for_delivery = (
+            message_for_history = (
                 f"{' '.join(f'@{name}' for name in mentioned_names)}\n{message_text}"
                 if mentioned_names
                 else message_text
             )
+            message_for_delivery = message_text if dingtalk_at_user_ids else message_for_history
             delivery_kwargs = {
                 "agent_id": agent_id,
                 "runtime": runtime,
@@ -7805,7 +7806,7 @@ async def _send_exact_session_message(
                 agent_id=agent_id,
                 user_id=target_user_id,
                 session=session,
-                content=message_for_delivery,
+                content=message_for_history,
                 source_channel=target_channel,
                 actor_ref=external_conv_id or str(target_user_id or ""),
                 target_name=target_name,
@@ -7832,7 +7833,7 @@ async def _send_exact_session_message(
                     {
                         "type": "done",
                         "role": "assistant",
-                        "content": message_for_delivery,
+                        "content": message_for_history,
                         "session_id": str(target_session_id),
                     },
                 )
