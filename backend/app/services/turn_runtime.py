@@ -293,8 +293,8 @@ async def _send_dingtalk_group_mention(
 ) -> dict:
     """Reply to one DingTalk group with native @ metadata."""
     payload = {
-        "msgtype": "markdown",
-        "markdown": {"title": "Notification", "text": message},
+        "msgtype": "text",
+        "text": {"content": message},
         "at": {"atUserIds": at_user_ids, "isAtAll": False},
     }
     try:
