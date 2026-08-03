@@ -774,6 +774,20 @@ async def ingest_incoming_chat_message(
             )
             if resolved_scene.status == SCENE_STATUS_OK:
                 meta.update(scene_message_meta(resolved_scene.manifest))
+    if not meta.get("model_id"):
+        from app.services.chat_model_selection import MODEL_SESSION_CONFIG_KEY
+
+        active_model_id = str(
+            (locked_session.im_config or {}).get(MODEL_SESSION_CONFIG_KEY) or ""
+        )
+        try:
+            if active_model_id:
+                meta["model_id"] = str(uuid.UUID(active_model_id))
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid session model override session={}",
+                locked_session.id,
+            )
     if reply_to_external_message_id:
         meta["reply_to_external_message_id"] = str(reply_to_external_message_id)
 
@@ -1069,7 +1083,7 @@ async def persist_assistant_reply_row(
             and anchor.conversation_id == conversation_id
         ):
             anchor_meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
-            for key in ("scene_key", "scene_revision"):
+            for key in ("scene_key", "scene_revision", "model_id"):
                 if anchor_meta.get(key) is not None:
                     final_meta.setdefault(key, anchor_meta[key])
         final_meta.update(

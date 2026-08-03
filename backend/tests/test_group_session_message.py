@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import delete, select
@@ -386,6 +387,96 @@ async def test_failed_transport_does_not_persist_target_receipt(monkeypatch):
     assert receipts == []
 
 
+async def test_dingtalk_group_session_message_mentions_canonical_users(monkeypatch):
+    from app.services.dingtalk_group_mentions import cache_group_session_webhook
+
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+    mentioned_user_id = uuid.uuid4()
+    webhook = "https://oapi.dingtalk.com/robot/sendBySession?session=secret"
+    async with async_session() as db:
+        stored = await db.get(ChatSession, target.id)
+        cache_group_session_webhook(
+            stored,
+            webhook=webhook,
+            expires_at_ms=int(datetime.now(timezone.utc).timestamp() * 1000) + 600_000,
+        )
+        await db.commit()
+        encrypted_config = dict(stored.im_config or {})
+    assert webhook not in json.dumps(encrypted_config)
+
+    delivered: list[dict] = []
+
+    async def fake_resolve(_db, agent_id, user_id, *, channel):
+        assert agent_id == owner.id
+        assert user_id == str(mentioned_user_id)
+        assert channel == "dingtalk"
+        return SimpleNamespace(
+            user=SimpleNamespace(display_name="张三"),
+            member=SimpleNamespace(external_id="staff-zhangsan", name="张三"),
+        )
+
+    async def fake_deliver(**kwargs):
+        delivered.append(kwargs)
+        return True
+
+    async def fake_live_mirror(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(agent_tools, "resolve_human_channel_recipient", fake_resolve)
+    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_deliver)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
+
+    result = await agent_tools._send_group_session_message(
+        owner.id,
+        {
+            "session_id": str(target.id),
+            "message": "请确认今晚发布窗口",
+            "mention_user_ids": [str(mentioned_user_id)],
+        },
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "sent"
+    assert payload["mentioned_users"] == ["张三"]
+    assert delivered[0]["message"] == "@张三\n请确认今晚发布窗口"
+    assert delivered[0]["dingtalk_at_user_ids"] == ["staff-zhangsan"]
+    assert delivered[0]["dingtalk_session_webhook"] == webhook
+
+    async with async_session() as db:
+        receipt = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(target.id),
+                    ChatMessage.content == "@张三\n请确认今晚发布窗口",
+                )
+            )
+        ).scalar_one()
+    assert receipt.message_meta["mention_user_ids"] == [str(mentioned_user_id)]
+    assert receipt.message_meta["mentioned_users"] == ["张三"]
+
+
+async def test_dingtalk_group_mention_requires_recent_group_webhook(monkeypatch):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(owner.id)
+
+    async def fail_if_called(**_kwargs):
+        raise AssertionError("delivery must not run without a temporary group webhook")
+
+    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_if_called)
+    result = await agent_tools._send_group_session_message(
+        owner.id,
+        {
+            "session_id": str(target.id),
+            "message": "请确认",
+            "mention_user_ids": [str(uuid.uuid4())],
+        },
+    )
+
+    assert result.startswith("❌")
+    assert "先在群内 @数字员工" in result
+
+
 async def test_dingtalk_runtime_delivers_to_exact_group_conversation(monkeypatch):
     owner, _ = await _seed_agents()
     app_id = f"ding-app-{uuid.uuid4().hex}"
@@ -427,6 +518,96 @@ async def test_dingtalk_runtime_delivers_to_exact_group_conversation(monkeypatch
         "app_secret": "ding-secret",
         "open_conversation_id": "open-conversation-exact",
         "message": "exact target",
+    }
+
+
+async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monkeypatch):
+    owner, _ = await _seed_agents()
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-app-{uuid.uuid4().hex}",
+                app_secret="ding-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+    captured = {}
+
+    async def fake_mention(**kwargs):
+        captured.update(kwargs)
+        return {"errcode": 0}
+
+    async def fail_proactive(**_kwargs):
+        raise AssertionError("native mention must use the temporary session webhook")
+
+    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_mention", fake_mention)
+    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fail_proactive)
+    sent = await turn_runtime.deliver_message_to_runtime(
+        agent_id=owner.id,
+        runtime=TurnRuntime(
+            session_found=True,
+            source_channel="dingtalk",
+            conversation_id=str(uuid.uuid4()),
+            external_conv_id="dingtalk_group_open-conversation-exact",
+            is_group=True,
+        ),
+        message="@张三\n请确认",
+        dingtalk_at_user_ids=["staff-zhangsan"],
+        dingtalk_session_webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
+    )
+
+    assert sent is True
+    assert captured == {
+        "session_webhook": "https://oapi.dingtalk.com/robot/sendBySession?secret",
+        "message": "@张三\n请确认",
+        "at_user_ids": ["staff-zhangsan"],
+    }
+
+
+async def test_dingtalk_group_mention_payload_contains_native_at_metadata(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+        @staticmethod
+        def json():
+            return {"errcode": 0}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, *, json):
+            captured["url"] = url
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        turn_runtime.httpx,
+        "AsyncClient",
+        lambda **_kwargs: FakeClient(),
+    )
+
+    result = await turn_runtime._send_dingtalk_group_mention(
+        session_webhook="https://oapi.dingtalk.com/robot/sendBySession?secret",
+        message="@张三\n请确认",
+        at_user_ids=["staff-zhangsan"],
+    )
+
+    assert result == {"errcode": 0}
+    assert captured["url"].endswith("sendBySession?secret")
+    assert captured["json"] == {
+        "msgtype": "markdown",
+        "markdown": {"title": "Notification", "text": "@张三\n请确认"},
+        "at": {"atUserIds": ["staff-zhangsan"], "isAtAll": False},
     }
 
 
@@ -596,6 +777,16 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
                 "type": "string",
                 "description": "Text content to send to the bound group.",
             },
+            "mention_user_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 20,
+                "description": (
+                    "Optional canonical platform user_ids to @ in a DingTalk group. "
+                    "Each person must have an active DingTalk route; DingTalk only renders "
+                    "the @ for people who are members of the target group."
+                ),
+            },
         },
         "required": ["session_id", "message"],
         "additionalProperties": False,
@@ -611,6 +802,16 @@ async def test_seeded_tool_is_visible_with_the_exact_runtime_schema():
             "message": {
                 "type": "string",
                 "description": "Text content to send to the bound conversation.",
+            },
+            "mention_user_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 20,
+                "description": (
+                    "Optional canonical platform user_ids to @ in a DingTalk group. "
+                    "Each person must have an active DingTalk route; DingTalk only renders "
+                    "the @ for people who are members of the target group."
+                ),
             },
         },
         "required": ["session_id", "message"],

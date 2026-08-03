@@ -134,9 +134,14 @@ def test_message_tool_schemas_use_only_canonical_recipient_ids(name, canonical_f
 @pytest.mark.parametrize("name", ["send_session_message", "send_group_session_message"])
 def test_session_message_uses_only_exact_session_address(name):
     for schema in (_agent_schema(name), _seed_schema(name)):
-        assert set(schema["properties"]) == {"session_id", "message"}
+        assert set(schema["properties"]) == {
+            "session_id",
+            "message",
+            "mention_user_ids",
+        }
         assert schema["required"] == ["session_id", "message"]
         assert schema["additionalProperties"] is False
+        assert schema["properties"]["mention_user_ids"]["maxItems"] == 20
 
 
 def test_session_message_description_states_its_narrow_delivery_boundary():

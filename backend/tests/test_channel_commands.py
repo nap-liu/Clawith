@@ -199,6 +199,9 @@ async def test_is_channel_command_recognises_slash_commands():
     assert channel_commands.is_channel_command("/scene off") is True
     assert channel_commands.is_channel_command("/scene") is True
     assert channel_commands.is_channel_command("/scene too many args") is True
+    assert channel_commands.is_channel_command("/model") is True
+    assert channel_commands.is_channel_command("/model list") is True
+    assert channel_commands.is_channel_command("/model 企业 GPT 旗舰版") is True
     assert channel_commands.is_channel_command("  /NEW  ") is True
     assert channel_commands.is_channel_command("/RESET") is True
     # Non-commands
@@ -228,6 +231,7 @@ async def test_help_command_lists_available_im_commands():
     assert "/thinking off" in result["message"]
     assert "/thinking status" in result["message"]
     assert "/scene" in result["message"]
+    assert "/model" in result["message"]
     assert "/stop" in result["message"]
     assert "/help" in result["message"]
 
@@ -546,3 +550,117 @@ async def test_first_scene_command_creates_control_session(monkeypatch):
     assert created_kwargs["is_group"] is True
     assert created_kwargs["allow_unresolved_user"] is True
     assert created_session.im_config == {"scene_key": "default"}
+
+
+@pytest.mark.asyncio
+async def test_model_command_switches_by_saved_label_with_spaces(monkeypatch):
+    from app.services import chat_model_selection
+
+    model_id = uuid.uuid4()
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    session = SimpleNamespace(im_config={"scene_key": "warranty"})
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return session
+
+    async def fake_resolve(*_args, **kwargs):
+        assert kwargs["label"] == "企业 GPT 旗舰版"
+        return chat_model_selection.ModelLabelResolution(
+            chat_model_selection.MODEL_STATUS_OK,
+            SimpleNamespace(id=model_id, label="企业 GPT 旗舰版"),
+        )
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_label", fake_resolve)
+    db = FakeDB()
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/model 企业 GPT 旗舰版",
+        agent_id=agent.id,
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_group_1",
+        source_channel="dingtalk",
+        is_group=True,
+    )
+
+    assert result["action"] == "model_switched"
+    assert "企业 GPT 旗舰版" in result["message"]
+    assert str(model_id) not in result["message"]
+    assert session.im_config == {
+        "scene_key": "warranty",
+        "model_id": str(model_id),
+    }
+
+
+@pytest.mark.asyncio
+async def test_model_list_shows_saved_labels_without_internal_ids(monkeypatch):
+    from app.services import chat_model_selection
+
+    model_id = uuid.uuid4()
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_list(*_args, **_kwargs):
+        return [SimpleNamespace(id=model_id, label="研发推理模型")]
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(chat_model_selection, "list_enabled_tenant_models", fake_list)
+
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/model list",
+        agent_id=agent.id,
+        user_id=None,
+        external_conv_id="feishu_p2p_1",
+        source_channel="feishu",
+    )
+
+    assert result["action"] == "model_list"
+    assert "研发推理模型" in result["message"]
+    assert str(model_id) not in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_model_default_clears_only_model_preference(monkeypatch):
+    from app.services import chat_model_selection
+
+    agent = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    session = SimpleNamespace(
+        im_config={"model_id": str(uuid.uuid4()), "scene_key": "warranty"}
+    )
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return session
+
+    async def fake_runtime(*_args, **_kwargs):
+        return chat_model_selection.RuntimeModelResolution(
+            SimpleNamespace(label="默认生产模型"),
+            None,
+        )
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(chat_model_selection, "resolve_runtime_models", fake_runtime)
+
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/model default",
+        agent_id=agent.id,
+        user_id=None,
+        external_conv_id="wecom_p2p_1",
+        source_channel="wecom",
+    )
+
+    assert result["action"] == "model_default"
+    assert "默认生产模型" in result["message"]
+    assert session.im_config == {"scene_key": "warranty"}

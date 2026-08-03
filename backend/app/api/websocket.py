@@ -26,7 +26,6 @@ from app.database import async_session
 from app.models.agent import Agent, AgentUserOnboarding
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
-from app.models.llm import LLMModel
 from app.models.task import Task
 from app.models.user import User
 from app.services.activity_logger import log_activity
@@ -465,30 +464,16 @@ class WebSocketChatHandler:
 
     async def _load_models(self, db: AsyncSession, agent: Agent):
         """Loads primary and fallback models for the agent."""
-        if agent.primary_model_id:
-            model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-            model = model_result.scalar_one_or_none()
-            if model and not model.enabled:
-                logger.info(f"[WS] Primary model {model.model} is disabled, skipping")
-                self.llm_model = None
-            else:
-                self.llm_model = RuntimeLLMModel.from_orm(model) if model else None
-                logger.info(f"[WS] Primary model loaded: {self.llm_model.model if self.llm_model else 'None'}")
+        from app.services.chat_model_selection import resolve_runtime_models
 
-        if agent.fallback_model_id:
-            fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
-            fallback_model = fb_result.scalar_one_or_none()
-            if fallback_model and not fallback_model.enabled:
-                logger.info(f"[WS] Fallback model {fallback_model.model} is disabled, skipping")
-                self.fallback_llm_model = None
-            elif fallback_model:
-                self.fallback_llm_model = RuntimeLLMModel.from_orm(fallback_model)
-                logger.info(f"[WS] Fallback model loaded: {self.fallback_llm_model.model}")
-
-        if not self.llm_model and self.fallback_llm_model:
-            self.llm_model = self.fallback_llm_model
-            self.fallback_llm_model = None
-            logger.info(f"[WS] Primary model unavailable, using fallback: {self.llm_model.model}")
+        resolved = await resolve_runtime_models(db, agent=agent)
+        self.llm_model = resolved.primary_model
+        self.fallback_llm_model = resolved.fallback_model
+        logger.info(
+            f"[WS] Models loaded: primary="
+            f"{self.llm_model.model if self.llm_model else 'None'}, fallback="
+            f"{self.fallback_llm_model.model if self.fallback_llm_model else 'None'}"
+        )
 
     async def _resolve_chat_session(
         self,
@@ -760,6 +745,11 @@ class WebSocketChatHandler:
                 file_name,
                 is_onboarding_trigger,
                 client_message_id=(data.get("message_id") or data.get("client_message_id")),
+                model_id=(
+                    str(effective_llm_model.id)
+                    if effective_llm_model is not None
+                    else None
+                ),
             )
 
             if pending_confirmation is not None:
@@ -976,60 +966,38 @@ class WebSocketChatHandler:
             # cannot turn this wait into a busy loop.
             await asyncio.sleep(0.2)
 
-    async def _resolve_effective_model(self, override_model_id: str | None) -> LLMModel | None:
+    async def _resolve_effective_model(
+        self,
+        override_model_id: str | None,
+    ) -> RuntimeLLMModel | None:
         """Reloads model config and resolves effective model (taking overrides into account)."""
+        from app.services.chat_model_selection import (
+            MODEL_OVERRIDE_NONE,
+            MODEL_OVERRIDE_OK,
+            resolve_runtime_models,
+        )
+
         async with async_session() as _mdb:
             _agent_r = await _mdb.execute(select(Agent).where(Agent.id == self.agent_id))
             _agent_cur = _agent_r.scalar_one_or_none()
-            if _agent_cur:
-                if _agent_cur.primary_model_id:
-                    _m_r = await _mdb.execute(select(LLMModel).where(LLMModel.id == _agent_cur.primary_model_id))
-                    _m = _m_r.scalar_one_or_none()
-                    self.llm_model = (
-                        RuntimeLLMModel.from_orm(_m)
-                        if (_m and _m.enabled)
-                        else None
-                    )
-                else:
-                    self.llm_model = None
+            if _agent_cur is None:
+                self.llm_model = None
+                self.fallback_llm_model = None
+                return None
+            resolved = await resolve_runtime_models(
+                _mdb,
+                agent=_agent_cur,
+                override_model_id=override_model_id,
+            )
 
-                if _agent_cur.fallback_model_id:
-                    _fb_r = await _mdb.execute(select(LLMModel).where(LLMModel.id == _agent_cur.fallback_model_id))
-                    _fb = _fb_r.scalar_one_or_none()
-                    self.fallback_llm_model = (
-                        RuntimeLLMModel.from_orm(_fb)
-                        if (_fb and _fb.enabled)
-                        else None
-                    )
-                else:
-                    self.fallback_llm_model = None
-
-                if not self.llm_model and self.fallback_llm_model:
-                    self.llm_model = self.fallback_llm_model
-                    self.fallback_llm_model = None
-
-        effective_llm_model = self.llm_model
-        if override_model_id:
-            try:
-                _ovr_uuid = uuid.UUID(str(override_model_id))
-                async with async_session() as _mdb:
-                    _mr = await _mdb.execute(select(LLMModel).where(LLMModel.id == _ovr_uuid))
-                    _ovr = _mr.scalar_one_or_none()
-                    if (
-                        _ovr
-                        and _ovr.enabled
-                        and _ovr.tenant_id
-                        and (not self.llm_model or _ovr.tenant_id == self.llm_model.tenant_id)
-                    ):
-                        effective_llm_model = RuntimeLLMModel.from_orm(_ovr)
-                    else:
-                        logger.warning(
-                            f"[WS] model override {override_model_id} rejected (missing/disabled/tenant mismatch)"
-                        )
-            except (ValueError, TypeError):
-                logger.warning(f"[WS] model override {override_model_id!r} is not a valid UUID")
-
-        return effective_llm_model
+        self.llm_model = resolved.primary_model
+        self.fallback_llm_model = resolved.fallback_model
+        if resolved.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}:
+            logger.warning(
+                f"[WS] model override {override_model_id!r} rejected "
+                f"({resolved.override_status})"
+            )
+        return resolved.primary_model
 
     async def _check_quotas(self) -> bool:
         """Checks conversation and agent LLM quotas. Sends message and returns False if exceeded."""
@@ -1051,6 +1019,7 @@ class WebSocketChatHandler:
         file_name: str,
         is_onboarding_trigger: bool,
         client_message_id: str | None = None,
+        model_id: str | None = None,
     ) -> tuple[
         uuid.UUID | None,
         bool,
@@ -1112,7 +1081,10 @@ class WebSocketChatHandler:
                     provider_event_id=str(client_message_id or "") or None,
                     channel_config_id=_sess.id,
                     actor_ref=str(self.user_id),
-                    message_meta=self._scene_message_meta(),
+                    message_meta={
+                        **self._scene_message_meta(),
+                        **({"model_id": model_id} if model_id else {}),
+                    },
                     created_at=first_user_created_at,
                 )
                 if ingested.blocked_by_confirmation:

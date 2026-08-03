@@ -793,6 +793,16 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "Text content to send to the bound conversation.",
                     },
+                    "mention_user_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 20,
+                        "description": (
+                            "Optional canonical platform user_ids to @ in a DingTalk group. "
+                            "Each person must have an active DingTalk route; DingTalk only renders "
+                            "the @ for people who are members of the target group."
+                        ),
+                    },
                 },
                 "required": ["session_id", "message"],
                 "additionalProperties": False,
@@ -818,6 +828,16 @@ AGENT_TOOLS = [
                     "message": {
                         "type": "string",
                         "description": "Text content to send to the bound group.",
+                    },
+                    "mention_user_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 20,
+                        "description": (
+                            "Optional canonical platform user_ids to @ in a DingTalk group. "
+                            "Each person must have an active DingTalk route; DingTalk only renders "
+                            "the @ for people who are members of the target group."
+                        ),
                     },
                 },
                 "required": ["session_id", "message"],
@@ -7578,6 +7598,7 @@ def _session_message_result(
     target_name: str,
     is_group: bool,
     legacy_group_contract: bool,
+    mentioned_users: list[str] | None = None,
 ) -> str:
     if legacy_group_contract:
         payload = {
@@ -7594,6 +7615,8 @@ def _session_message_result(
             "conversation_type": "group" if is_group else "person",
             "conversation_name": target_name,
         }
+    if mentioned_users:
+        payload["mentioned_users"] = mentioned_users
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -7610,11 +7633,24 @@ async def _send_exact_session_message(
     """Authorize and send text through one exact human ChatSession route."""
     raw_session_id = str(args.get("session_id") or "").strip()
     message_text = str(args.get("message") or "").strip()
+    raw_mention_user_ids = args.get("mention_user_ids")
     if not raw_session_id:
         qualifier = "group " if require_group else ""
         return f"❌ Please provide the exact {qualifier}session_id"
     if not message_text:
         return "❌ Please provide message content"
+    if raw_mention_user_ids is None:
+        mention_user_ids: list[str] = []
+    elif not isinstance(raw_mention_user_ids, list):
+        return "❌ mention_user_ids must be an array of canonical platform user_ids"
+    else:
+        mention_user_ids = list(
+            dict.fromkeys(str(value or "").strip() for value in raw_mention_user_ids)
+        )
+        if not all(mention_user_ids):
+            return "❌ mention_user_ids cannot contain empty values"
+        if len(mention_user_ids) > 20:
+            return "❌ mention_user_ids supports at most 20 people"
     try:
         target_session_id = uuid.UUID(raw_session_id)
     except (TypeError, ValueError):
@@ -7629,6 +7665,9 @@ async def _send_exact_session_message(
     target_name = "group" if require_group else "conversation"
     target_channel = ""
     target_is_group = require_group
+    mentioned_names: list[str] = []
+    dingtalk_at_user_ids: list[str] = []
+    dingtalk_session_webhook: str | None = None
 
     try:
         async with async_session() as db:
@@ -7648,6 +7687,7 @@ async def _send_exact_session_message(
                         target_name=str(meta.get("target_name") or target_name),
                         is_group=bool(meta.get("target_is_group", require_group)),
                         legacy_group_contract=legacy_group_contract,
+                        mentioned_users=list(meta.get("mentioned_users") or []),
                     )
 
             conditions = [
@@ -7682,6 +7722,38 @@ async def _send_exact_session_message(
                 label = "Group Session" if target_is_group else "Session"
                 return f"❌ {label} delivery is not supported for channel: {target_channel or 'unknown'}"
 
+            if mention_user_ids:
+                if not target_is_group or target_channel != "dingtalk":
+                    return "❌ @指定人当前仅支持钉钉群 Session。"
+                from app.services.dingtalk_group_mentions import (
+                    load_group_session_webhook,
+                )
+
+                dingtalk_session_webhook = load_group_session_webhook(session)
+                if not dingtalk_session_webhook:
+                    return (
+                        "❌ 当前钉钉群 Session 没有可用的临时回复凭证；"
+                        "请让群成员先在群内 @数字员工发送一条消息后重试。"
+                    )
+                for mention_user_id in mention_user_ids:
+                    try:
+                        route = await resolve_human_channel_recipient(
+                            db,
+                            agent_id,
+                            mention_user_id,
+                            channel="dingtalk",
+                        )
+                    except RecipientResolutionError as exc:
+                        return exc.as_json()
+                    staff_id = str(route.member.external_id or "").strip()
+                    if not staff_id:
+                        return "❌ 指定用户缺少可用的钉钉 userId，无法 @。"
+                    if staff_id not in dingtalk_at_user_ids:
+                        dingtalk_at_user_ids.append(staff_id)
+                        mentioned_names.append(
+                            str(route.user.display_name or route.member.name or "用户")
+                        )
+
             if target_is_group:
                 target_name = str(session.group_name or session.title or "group")
                 target_user_id = None
@@ -7702,12 +7774,27 @@ async def _send_exact_session_message(
                 external_conv_id=external_conv_id or None,
                 is_group=target_is_group,
             )
+            message_for_delivery = (
+                f"{' '.join(f'@{name}' for name in mentioned_names)}\n{message_text}"
+                if mentioned_names
+                else message_text
+            )
+            delivery_kwargs = {
+                "agent_id": agent_id,
+                "runtime": runtime,
+                "message": message_for_delivery,
+                "require_transport": True,
+                "allow_wecom_group_actor_fallback": False,
+            }
+            if dingtalk_at_user_ids:
+                delivery_kwargs.update(
+                    {
+                        "dingtalk_at_user_ids": dingtalk_at_user_ids,
+                        "dingtalk_session_webhook": dingtalk_session_webhook,
+                    }
+                )
             delivered = await deliver_message_to_runtime(
-                agent_id=agent_id,
-                runtime=runtime,
-                message=message_text,
-                require_transport=True,
-                allow_wecom_group_actor_fallback=False,
+                **delivery_kwargs,
             )
             if not delivered:
                 label = "Group message" if target_is_group else "Session message"
@@ -7718,7 +7805,7 @@ async def _send_exact_session_message(
                 agent_id=agent_id,
                 user_id=target_user_id,
                 session=session,
-                content=message_text,
+                content=message_for_delivery,
                 source_channel=target_channel,
                 actor_ref=external_conv_id or str(target_user_id or ""),
                 target_name=target_name,
@@ -7729,6 +7816,9 @@ async def _send_exact_session_message(
             )
             receipt_meta = dict(receipt.message_meta or {})
             receipt_meta["target_is_group"] = target_is_group
+            if mentioned_names:
+                receipt_meta["mention_user_ids"] = mention_user_ids
+                receipt_meta["mentioned_users"] = mentioned_names
             receipt.message_meta = receipt_meta
             await db.commit()
 
@@ -7742,7 +7832,7 @@ async def _send_exact_session_message(
                     {
                         "type": "done",
                         "role": "assistant",
-                        "content": message_text,
+                        "content": message_for_delivery,
                         "session_id": str(target_session_id),
                     },
                 )
@@ -7758,6 +7848,7 @@ async def _send_exact_session_message(
             target_name=target_name,
             is_group=target_is_group,
             legacy_group_contract=legacy_group_contract,
+            mentioned_users=mentioned_names,
         )
     except Exception as exc:
         logger.opt(exception=True).error(

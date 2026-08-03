@@ -55,20 +55,36 @@ def _make_db(agent, model, fallback_model=None):
     return SimpleNamespace(execute=_execute)
 
 
-def _make_agent_and_model(request_timeout=None):
-    model_id = uuid.uuid4()
-    model = SimpleNamespace(
-        id=model_id,
-        model="test-model",
+def _make_model(*, model_name="test-model", request_timeout=None):
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="openai",
+        model=model_name,
+        api_key_encrypted="test-key",
+        base_url=None,
+        label=model_name,
+        max_tokens_per_day=None,
         enabled=True,
         supports_vision=False,
+        temperature=None,
         request_timeout=request_timeout,
+        max_output_tokens=None,
+        context_window=32000,
+        compact_trigger_ratio=0.85,
+        keep_recent_turns=8,
+        compact_summary_max_tokens=2000,
     )
+
+
+def _make_agent_and_model(request_timeout=None):
+    model = _make_model(request_timeout=request_timeout)
     agent = SimpleNamespace(
         id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
         name="测试助手",
         role_description="",
-        primary_model_id=model_id,
+        primary_model_id=model.id,
         fallback_model_id=None,
         context_window_size=100,
     )
@@ -238,14 +254,8 @@ async def test_fresh_channel_turn_recovery_reloads_only_prefix_and_keeps_current
 
     agent, model = _make_agent_and_model()
     model.keep_recent_turns = 8
-    fallback_model = SimpleNamespace(
-        id=uuid.uuid4(),
-        model="fallback-model",
-        enabled=True,
-        supports_vision=False,
-        request_timeout=None,
-        keep_recent_turns=12,
-    )
+    fallback_model = _make_model(model_name="fallback-model")
+    fallback_model.keep_recent_turns = 12
     agent.fallback_model_id = fallback_model.id
     anchor = uuid.uuid4()
     compact = AsyncMock(return_value=CompactionResult(triggered=True, required=True))

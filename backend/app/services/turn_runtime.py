@@ -127,6 +127,8 @@ async def deliver_message_to_runtime(
     origin_actor_ref: str | None = None,
     origin_actor_ref_type: str | None = None,
     allow_wecom_group_actor_fallback: bool = True,
+    dingtalk_at_user_ids: list[str] | None = None,
+    dingtalk_session_webhook: str | None = None,
 ) -> bool:
     """Deliver text through the exact transport bound to a loaded Session runtime.
 
@@ -140,7 +142,13 @@ async def deliver_message_to_runtime(
     if channel in {"web", "miniprogram", "wechat_miniprogram", "mcp"}:
         return await _deliver_web(agent_id, runtime, message)
     if channel == "dingtalk":
-        return await _deliver_dingtalk(agent_id, runtime, message)
+        return await _deliver_dingtalk(
+            agent_id,
+            runtime,
+            message,
+            at_user_ids=dingtalk_at_user_ids,
+            session_webhook=dingtalk_session_webhook,
+        )
 
     delivered: bool | None = None
     if channel == "feishu":
@@ -220,7 +228,14 @@ async def _load_channel_config(agent_id: uuid.UUID, channel_type: str) -> Channe
         ).scalar_one_or_none()
 
 
-async def _deliver_dingtalk(agent_id: uuid.UUID, runtime: TurnRuntime, reply: str) -> bool:
+async def _deliver_dingtalk(
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    reply: str,
+    *,
+    at_user_ids: list[str] | None = None,
+    session_webhook: str | None = None,
+) -> bool:
     if not runtime.external_conv_id:
         logger.warning("[turn_runtime] DingTalk runtime missing external_conv_id: %s", runtime.conversation_id)
         return False
@@ -246,6 +261,17 @@ async def _deliver_dingtalk(agent_id: uuid.UUID, runtime: TurnRuntime, reply: st
             msg_type="markdown",
             robot_code=cfg.app_id,
         )
+    elif at_user_ids:
+        if not session_webhook:
+            logger.warning(
+                "[turn_runtime] DingTalk group mention missing temporary session webhook"
+            )
+            return False
+        result = await _send_dingtalk_group_mention(
+            session_webhook=session_webhook,
+            message=reply,
+            at_user_ids=at_user_ids,
+        )
     else:
         result = await _send_dingtalk_group_markdown(
             app_id=cfg.app_id,
@@ -257,6 +283,40 @@ async def _deliver_dingtalk(agent_id: uuid.UUID, runtime: TurnRuntime, reply: st
     if not ok:
         logger.warning("[turn_runtime] DingTalk recovered reply delivery failed: %s", result)
     return ok
+
+
+async def _send_dingtalk_group_mention(
+    *,
+    session_webhook: str,
+    message: str,
+    at_user_ids: list[str],
+) -> dict:
+    """Reply to one DingTalk group with native @ metadata."""
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {"title": "Notification", "text": message},
+        "at": {"atUserIds": at_user_ids, "isAtAll": False},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(session_webhook, json=payload)
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+    except Exception as exc:
+        # httpx exception strings may contain the signed webhook URL. Keep that
+        # credential out of logs and tool-visible errors.
+        return {
+            "errcode": -1,
+            "errmsg": f"temporary webhook request failed ({type(exc).__name__})",
+        }
+    if response.status_code >= 400 or data.get("errcode"):
+        return {
+            "errcode": data.get("errcode", response.status_code),
+            "errmsg": data.get("errmsg") or response.text[:200],
+        }
+    return {"errcode": 0}
 
 
 async def _deliver_feishu(

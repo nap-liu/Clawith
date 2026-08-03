@@ -126,7 +126,12 @@ async def _call_agent_llm(
     is ignored in this mode.
     """
     from app.models.agent import Agent
-    from app.models.llm import LLMModel
+    from app.services.chat_model_selection import (
+        MODEL_OVERRIDE_NONE,
+        MODEL_OVERRIDE_OK,
+        load_turn_model_id,
+        resolve_runtime_models,
+    )
     from app.services.llm import call_llm_with_failover
     from app.services.llm.session_context_guard import (
         CONTEXT_REQUEST_TOO_LARGE_MESSAGE,
@@ -165,29 +170,27 @@ async def _call_agent_llm(
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
 
-    # Load primary model (skip if disabled by admin)
-    model = None
-    if agent.primary_model_id:
-        model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-        model = model_result.scalar_one_or_none()
-        if model and not model.enabled:
-            logger.info(f"[Channel] Primary model {model.model} is disabled, skipping")
-            model = None
-
-    # Load fallback model (skip if disabled by admin)
-    fallback_model = None
-    if agent.fallback_model_id:
-        fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
-        fallback_model = fb_result.scalar_one_or_none()
-        if fallback_model and not fallback_model.enabled:
-            logger.info(f"[Channel] Fallback model {fallback_model.model} is disabled, skipping")
-            fallback_model = None
-
-    # Config-level fallback: primary missing -> use fallback
-    if not model and fallback_model:
-        model = fallback_model
-        fallback_model = None
-        logger.warning(f"[Channel] Primary model unavailable, using fallback: {model.model}")
+    turn_model_id = await load_turn_model_id(
+        db,
+        agent_id=agent_id,
+        session_id=session_id,
+        turn_anchor_id=turn_anchor_id,
+    )
+    resolved_models = await resolve_runtime_models(
+        db,
+        agent=agent,
+        override_model_id=turn_model_id,
+    )
+    if (
+        turn_model_id
+        and resolved_models.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}
+    ):
+        return (
+            "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，"
+            "或 /model default 恢复默认模型。"
+        )
+    model = resolved_models.primary_model
+    fallback_model = resolved_models.fallback_model
 
     if not model:
         return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"

@@ -373,6 +373,7 @@ async def process_dingtalk_message(
     conversation_id: str,
     conversation_type: str,
     session_webhook: str,
+    session_webhook_expires_at_ms: int | str | None = None,
     image_base64_list: list[str] | None = None,
     saved_file_paths: list[str] | None = None,
     sender_nick: str = "",
@@ -735,13 +736,39 @@ async def process_dingtalk_message(
                 is_group=conversation_type == "2",
                 group_name=conversation_title or None,
             )
+            if conversation_type == "2":
+                from app.models.chat_session import ChatSession
+                from app.services.dingtalk_group_mentions import (
+                    cache_group_session_webhook,
+                )
+
+                command_session = (
+                    await db.execute(
+                        _select(ChatSession).where(
+                            ChatSession.agent_id == agent_id,
+                            ChatSession.source_channel == "dingtalk",
+                            ChatSession.external_conv_id == conv_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if command_session is not None:
+                    cache_group_session_webhook(
+                        command_session,
+                        webhook=session_webhook,
+                        expires_at_ms=session_webhook_expires_at_ms,
+                    )
             await db.commit()
             import httpx as _httpx_cmd
-            async with _httpx_cmd.AsyncClient(timeout=10) as _cl_cmd:
-                await _cl_cmd.post(session_webhook, json={
-                    "msgtype": "text",
-                    "text": {"content": cmd_result["message"]},
-                })
+            try:
+                async with _httpx_cmd.AsyncClient(timeout=10) as _cl_cmd:
+                    await _cl_cmd.post(session_webhook, json={
+                        "msgtype": "text",
+                        "text": {"content": cmd_result["message"]},
+                    })
+            except Exception as exc:
+                logger.error(
+                    f"[DingTalk] Command reply failed: {type(exc).__name__}"
+                )
             return
 
         # Use the real DingTalk group title when the stream event provides one;
@@ -765,6 +792,16 @@ async def process_dingtalk_message(
             is_group=(conversation_type == "2"),
             group_name=_dt_group_name,
         )
+        if conversation_type == "2":
+            from app.services.dingtalk_group_mentions import (
+                cache_group_session_webhook,
+            )
+
+            cache_group_session_webhook(
+                sess,
+                webhook=session_webhook,
+                expires_at_ms=session_webhook_expires_at_ms,
+            )
         session_conv_id = str(sess.id)
 
         # Load history (with vision rehydration so multi-turn LLM keeps prior images visible)
@@ -957,7 +994,9 @@ async def process_dingtalk_message(
                             "text": {"content": "\n\n".join(_fallback_parts)},
                         })
                 except Exception as _fb_err:
-                    logger.error(f"[DingTalk] Fallback file text also failed: {_fb_err}")
+                    logger.error(
+                        f"[DingTalk] Fallback file text also failed: {type(_fb_err).__name__}"
+                    )
 
             _cfs_token = _cfs.set(_dingtalk_file_sender)
 
@@ -981,11 +1020,16 @@ async def process_dingtalk_message(
         async def _send_thinking_text(text: str) -> None:
             if not session_webhook:
                 return
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(session_webhook, json={
-                    "msgtype": "text",
-                    "text": {"content": text},
-                })
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(session_webhook, json={
+                        "msgtype": "text",
+                        "text": {"content": text},
+                    })
+            except Exception as exc:
+                raise RuntimeError(
+                    f"DingTalk thinking delivery failed ({type(exc).__name__})"
+                ) from None
 
         _thinking_sender = BufferedIMThinkingSender(
             enabled=resolve_im_thinking_enabled(agent_obj, sess),
@@ -1064,7 +1108,9 @@ async def process_dingtalk_message(
                         },
                     })
             except Exception as e:
-                logger.error(f"[DingTalk] Failed to reply via webhook: {e}")
+                logger.error(
+                    f"[DingTalk] Failed to reply via webhook: {type(e).__name__}"
+                )
                 # Fallback: try plain text
                 try:
                     async with httpx.AsyncClient(timeout=10) as client:
@@ -1073,7 +1119,9 @@ async def process_dingtalk_message(
                             "text": {"content": reply_text},
                         })
                 except Exception as e2:
-                    logger.error(f"[DingTalk] Fallback text reply also failed: {e2}")
+                    logger.error(
+                        f"[DingTalk] Fallback text reply also failed: {type(e2).__name__}"
+                    )
 
         # Log activity
         from app.services.activity_logger import log_activity

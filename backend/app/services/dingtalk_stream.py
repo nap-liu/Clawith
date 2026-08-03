@@ -637,6 +637,9 @@ class DingTalkStreamManager:
                     conversation_type = incoming.conversation_type or "1"
                     conversation_title = (incoming.conversation_title or "").strip()
                     session_webhook = incoming.session_webhook or ""
+                    session_webhook_expires_at_ms = msg_data.get(
+                        "sessionWebhookExpiredTime"
+                    )
 
                     logger.info(
                         f"[DingTalk Stream] Received {msgtype} message from {sender_staff_id}"
@@ -666,6 +669,7 @@ class DingTalkStreamManager:
                             async def _work(_text=user_text, _ssid=sender_staff_id,
                                             _cid=conversation_id, _ctype=conversation_type,
                                             _wh=session_webhook, _nick=sender_nick,
+                                            _wh_exp=session_webhook_expires_at_ms,
                                             _mid=message_id, _sid=sender_id,
                                             _title=conversation_title, _reactions=reactions):
                                 from app.api.dingtalk import _check_message_dedup
@@ -679,6 +683,7 @@ class DingTalkStreamManager:
                                     conversation_id=_cid,
                                     conversation_type=_ctype,
                                     session_webhook=_wh,
+                                    session_webhook_expires_at_ms=_wh_exp,
                                     sender_nick=_nick,
                                     message_id=_mid,
                                     sender_id=_sid,
@@ -708,6 +713,7 @@ class DingTalkStreamManager:
                             async def _work_media(_md=msg_data, _ak=app_key, _as=app_secret,
                                                   _ssid=sender_staff_id, _cid=conversation_id,
                                                   _ctype=conversation_type, _wh=session_webhook,
+                                                  _wh_exp=session_webhook_expires_at_ms,
                                                   _nick=sender_nick, _mid=message_id,
                                                   _sid=sender_id, _title=conversation_title,
                                                   _reactions=reactions):
@@ -724,6 +730,7 @@ class DingTalkStreamManager:
                                     conversation_id=_cid,
                                     conversation_type=_ctype,
                                     session_webhook=_wh,
+                                    session_webhook_expires_at_ms=_wh_exp,
                                     sender_nick=_nick,
                                     message_id=_mid,
                                     sender_id=_sid,
@@ -747,7 +754,10 @@ class DingTalkStreamManager:
 
                     return dingtalk_stream.AckMessage.STATUS_OK, "ok"
                 except Exception as e:
-                    logger.error(f"[DingTalk Stream] Error in message handler: {e}")
+                    # Network exception text may include a signed sessionWebhook.
+                    logger.error(
+                        f"[DingTalk Stream] Error in message handler: {type(e).__name__}"
+                    )
                     import traceback
                     traceback.print_exc()
                     return dingtalk_stream.AckMessage.STATUS_SYSTEM_EXCEPTION, str(e)
@@ -762,6 +772,7 @@ class DingTalkStreamManager:
                 conversation_id: str,
                 conversation_type: str,
                 session_webhook: str,
+                session_webhook_expires_at_ms: int | str | None = None,
                 sender_nick: str = "",
                 message_id: str = "",
                 sender_id: str = "",
@@ -811,6 +822,7 @@ class DingTalkStreamManager:
                     conversation_id=conversation_id,
                     conversation_type=conversation_type,
                     session_webhook=session_webhook,
+                    session_webhook_expires_at_ms=session_webhook_expires_at_ms,
                     image_base64_list=image_base64_list,
                     saved_file_paths=saved_file_paths,
                     sender_nick=sender_nick,

@@ -915,6 +915,16 @@ BUILTIN_TOOLS = [
                     "type": "string",
                     "description": "Text content to send to the bound conversation.",
                 },
+                "mention_user_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 20,
+                    "description": (
+                        "Optional canonical platform user_ids to @ in a DingTalk group. "
+                        "Each person must have an active DingTalk route; DingTalk only renders "
+                        "the @ for people who are members of the target group."
+                    ),
+                },
             },
             "required": ["session_id", "message"],
             "additionalProperties": False,
@@ -941,6 +951,16 @@ BUILTIN_TOOLS = [
                     "description": "Exact group ChatSession UUID returned by list_sessions/search_sessions.",
                 },
                 "message": {"type": "string", "description": "Text content to send to the bound group."},
+                "mention_user_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 20,
+                    "description": (
+                        "Optional canonical platform user_ids to @ in a DingTalk group. "
+                        "Each person must have an active DingTalk route; DingTalk only renders "
+                        "the @ for people who are members of the target group."
+                    ),
+                },
             },
             "required": ["session_id", "message"],
             "additionalProperties": False,
