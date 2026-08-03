@@ -1098,6 +1098,7 @@ async def call_llm(
     on_tool_call=None,
     on_tool_delta=None,
     on_thinking=None,
+    on_usage=None,
     supports_vision=False,
     max_tool_rounds_override: int | None = None,
     skip_tools: bool = False,
@@ -1203,8 +1204,29 @@ async def call_llm(
         return f"[Error] Failed to create LLM client: {e}"
 
     max_tokens = get_max_tokens(model.provider, model.model, getattr(model, "max_output_tokens", None))
-    _accumulated_usage = TokenUsage()
     _unsaved_usage = TokenUsage()
+
+    async def _track_response_usage(response, usage_messages: list[LLMMessage], round_number: int) -> None:
+        usage = _usage_from_response_or_estimate(response, usage_messages)
+        _unsaved_usage.add(usage)
+        if on_usage is not None:
+            try:
+                await on_usage(usage)
+            except Exception as exc:
+                logger.warning(f"[LLM] usage callback failed (ignored): {exc}")
+
+        raw_usage = getattr(response, "usage", None)
+        ratio = _cache_hit_ratio(raw_usage)
+        if ratio is not None and isinstance(raw_usage, dict):
+            prompt_tokens = raw_usage.get("prompt_tokens")
+            line = (
+                f"[LLM] Round {round_number} cache-hit-ratio={ratio} "
+                f"prompt={prompt_tokens}"
+            )
+            if ratio < float(os.environ.get("CLAWITH_CACHE_HIT_WARN_RATIO", "0.7")):
+                logger.warning(line + " (LOW — prefix cache may be missing the tool-loop tail)")
+            else:
+                logger.info(line)
 
     # Turn-level latency accounting, logged once at every loop exit so slow
     # turns can be attributed (how many rounds, how long) straight from logs.
@@ -1322,6 +1344,7 @@ async def call_llm(
                 on_tool_delta=on_tool_delta,
                 on_thinking=on_thinking,
             )
+            await _track_response_usage(response, dispatch_messages, round_i + 1)
 
             # ── P4: max_output_tokens recovery ────────────────────────────
             # If the response was cut off because we hit the per-call output
@@ -1388,6 +1411,7 @@ async def call_llm(
                     on_chunk=on_chunk,
                     on_thinking=on_thinking,
                 )
+                await _track_response_usage(response, dispatch_messages, round_i + 1)
 
             # Still truncated after exhausting the resume budget — surface
             # a clear error. The failover layer will see a [LLM Error] and
@@ -1397,8 +1421,8 @@ async def call_llm(
                 logger.error(
                     f"[LLM] Output token limit not recoverable after {MAX_OUTPUT_TOKENS_RECOVERY_LIMIT} resume attempts"
                 )
-                if agent_id and _accumulated_usage.total_tokens > 0:
-                    await record_token_usage(agent_id, _accumulated_usage)
+                if agent_id and _unsaved_usage.total_tokens > 0:
+                    await record_token_usage(agent_id, _unsaved_usage)
                 await client.close()
                 _log_turn_timing("output_limit", round_i + 1)
                 return "[LLM Error] Output token limit exceeded after 3 resume attempts"
@@ -1431,24 +1455,6 @@ async def call_llm(
             await client.close()
             _log_turn_timing("call_error", round_i + 1)
             return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
-
-        # Track tokens for this round
-        _usage_this_round = _usage_from_response_or_estimate(response, api_messages)
-        _accumulated_usage.add(_usage_this_round)
-        _unsaved_usage.add(_usage_this_round)
-
-        # Observability: prefix-cache effectiveness for this round. A ratio that
-        # stays low while the tool loop grows means the tail isn't being cached
-        # (re-prefilled every round → "responses get slower as the chat grows").
-        _usage = getattr(response, "usage", None)
-        _ratio = _cache_hit_ratio(_usage)
-        if _ratio is not None and isinstance(_usage, dict):
-            _prompt = _usage.get("prompt_tokens")
-            _line = f"[LLM] Round {round_i + 1} cache-hit-ratio={_ratio} prompt={_prompt}"
-            if _ratio < float(os.environ.get("CLAWITH_CACHE_HIT_WARN_RATIO", "0.7")):
-                logger.warning(_line + " (LOW — prefix cache may be missing the tool-loop tail)")
-            else:
-                logger.info(_line)
 
         # Plain assistant text (no tool calls) ends the turn — it IS the reply.
         if not response.tool_calls:
@@ -1672,6 +1678,7 @@ async def call_llm_with_failover(
     session_id: str = "",
     on_chunk=None,
     on_thinking=None,
+    on_usage=None,
     on_tool_call=None,
     on_tool_delta=None,
     supports_vision=False,
@@ -1779,6 +1786,7 @@ async def call_llm_with_failover(
         on_tool_call=_wrapped_on_tool_call,
         on_tool_delta=_wrapped_on_tool_delta,
         on_thinking=_wrapped_on_thinking,
+        on_usage=on_usage,
         supports_vision=supports_vision,
         skip_tools=skip_tools,
         is_group=is_group,
@@ -1863,6 +1871,7 @@ async def call_llm_with_failover(
         on_tool_call=_fallback_on_tool_call,
         on_tool_delta=_fallback_on_tool_delta,
         on_thinking=_fallback_on_thinking,
+        on_usage=on_usage,
         supports_vision=getattr(fallback_model, "supports_vision", False),
         skip_tools=skip_tools,
         is_group=is_group,

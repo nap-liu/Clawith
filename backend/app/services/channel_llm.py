@@ -325,24 +325,44 @@ async def _call_agent_llm(
     # "Model response timed out (>180s)" errors. Per-request timeouts already live
     # inside call_llm (the httpx client timeout), and the loop is bounded by the
     # agent's ``max_tool_rounds``.
-    reply = await call_llm_with_failover(
-        primary_model=model,
-        fallback_model=fallback_model,
-        messages=messages,
-        agent_name=agent.name,
-        role_description=agent.role_description or "",
-        agent_id=agent_id,
-        user_id=effective_user_id,
-        session_id=session_id,
-        on_chunk=_on_chunk_bridged,
-        on_thinking=_on_thinking_bridged,
-        on_tool_call=_on_tool_call_persisted,
-        supports_vision=getattr(model, "supports_vision", False),
-        is_group=is_group,
-        channel_context=scene_channel_context,
-        turn_anchor_id=turn_anchor_id,
-        context_recovery=context_recovery,
-    )
+    from app.services.session_token_usage import persist_turn_token_usage
+    from app.services.token_tracker import TokenUsage
+
+    turn_usage = TokenUsage()
+
+    async def _collect_usage(usage: TokenUsage) -> None:
+        turn_usage.add(usage)
+
+    try:
+        reply = await call_llm_with_failover(
+            primary_model=model,
+            fallback_model=fallback_model,
+            messages=messages,
+            agent_name=agent.name,
+            role_description=agent.role_description or "",
+            agent_id=agent_id,
+            user_id=effective_user_id,
+            session_id=session_id,
+            on_chunk=_on_chunk_bridged,
+            on_thinking=_on_thinking_bridged,
+            on_usage=_collect_usage,
+            on_tool_call=_on_tool_call_persisted,
+            supports_vision=getattr(model, "supports_vision", False),
+            is_group=is_group,
+            channel_context=scene_channel_context,
+            turn_anchor_id=turn_anchor_id,
+            context_recovery=context_recovery,
+        )
+    finally:
+        try:
+            await persist_turn_token_usage(
+                agent_id=history_agent_id,
+                session_id=session_id,
+                turn_anchor_id=turn_anchor_id,
+                usage=turn_usage,
+            )
+        except Exception as exc:
+            logger.warning(f"[Channel] session token usage persistence failed: {exc}")
     reply = _context_reply(reply)
 
     # Finalize the streamed bubble for any web client watching this session, so

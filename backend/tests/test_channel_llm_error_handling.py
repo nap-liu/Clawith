@@ -164,6 +164,59 @@ async def test_successful_reply_passes_through(monkeypatch):
     assert reply == "你好，我可以帮你做什么？"
 
 
+async def test_channel_turn_persists_accumulated_session_usage(monkeypatch):
+    from app.services import session_token_usage
+    from app.services.token_tracker import TokenUsage
+
+    agent, model = _make_agent_and_model()
+    anchor_id = uuid.uuid4()
+    session_id = str(uuid.uuid4())
+    persist = AsyncMock(return_value=None)
+    monkeypatch.setattr(session_token_usage, "persist_turn_token_usage", persist)
+
+    async def ok_llm(*_args, on_usage=None, **_kwargs):
+        assert on_usage is not None
+        await on_usage(
+            TokenUsage(
+                total_tokens=1000,
+                input_tokens=900,
+                output_tokens=100,
+                cache_read_tokens=600,
+                cache_eligible_input_tokens=900,
+            )
+        )
+        await on_usage(
+            TokenUsage(
+                total_tokens=300,
+                input_tokens=200,
+                output_tokens=100,
+                cache_read_tokens=100,
+                cache_eligible_input_tokens=200,
+            )
+        )
+        return "完成"
+
+    _patch_llm(monkeypatch, ok_llm)
+
+    reply = await channel_llm._call_agent_llm(
+        _make_db(agent, model),
+        agent.id,
+        "执行任务",
+        session_id=session_id,
+        user_id=agent.id,
+        turn_anchor_id=anchor_id,
+    )
+
+    assert reply == "完成"
+    persist.assert_awaited_once()
+    kwargs = persist.await_args.kwargs
+    assert kwargs["session_id"] == session_id
+    assert kwargs["turn_anchor_id"] == anchor_id
+    assert kwargs["usage"].total_tokens == 1300
+    assert kwargs["usage"].cache_read_tokens == 700
+    assert kwargs["usage"].cache_eligible_input_tokens == 1100
+
+
 async def test_scene_context_is_forwarded_to_shared_llm_caller(monkeypatch):
     from app.services import scene_service
 

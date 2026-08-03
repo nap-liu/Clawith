@@ -176,16 +176,13 @@ async def test_model_command_snapshots_selected_saved_model_for_exact_im_turn(mo
         assert captured["primary_model"].id != default_model_id
 
 
-async def test_status_reads_current_session_and_agent_token_counters():
+async def test_status_reads_current_session_token_and_cache_usage():
     agent_id, user_id, _tenant_id, _default_model_id, _selected_model_id = await _seed_model_runtime()
     external_conv_id = f"dingtalk_p2p_{uuid.uuid4().hex[:8]}"
 
     async with async_session() as db:
         agent = await db.get(Agent, agent_id)
         assert agent is not None
-        agent.tokens_used_today = 1234
-        agent.tokens_used_month = 5678
-        agent.tokens_used_total = 9012
         session = await find_or_create_channel_session(
             db=db,
             agent_id=agent_id,
@@ -194,7 +191,7 @@ async def test_status_reads_current_session_and_agent_token_counters():
             source_channel="dingtalk",
             first_message_title="状态测试",
         )
-        await ingest_incoming_chat_message(
+        ingested = await ingest_incoming_chat_message(
             db,
             session=session,
             agent_id=agent_id,
@@ -205,6 +202,24 @@ async def test_status_reads_current_session_and_agent_token_counters():
             actor_ref="staff-1",
         )
         await db.commit()
+        session_id = str(session.id)
+        turn_anchor_id = ingested.message.id
+
+    from app.services.session_token_usage import persist_turn_token_usage
+    from app.services.token_tracker import TokenUsage
+
+    await persist_turn_token_usage(
+        agent_id=agent_id,
+        session_id=session_id,
+        turn_anchor_id=turn_anchor_id,
+        usage=TokenUsage(
+            total_tokens=1200,
+            input_tokens=1000,
+            output_tokens=200,
+            cache_read_tokens=700,
+            cache_eligible_input_tokens=1000,
+        ),
+    )
 
     async with async_session() as db:
         result = await handle_channel_command(
@@ -220,7 +235,8 @@ async def test_status_reads_current_session_and_agent_token_counters():
     assert "运行状态：空闲" in result["message"]
     assert "模型：qwen3-max（默认模型）" in result["message"]
     assert "会话：单聊 · 1 条消息" in result["message"]
-    assert "Token（数字员工）：今日 1,234 / 本月 5,678 / 累计 9,012" in result["message"]
+    assert "Session Token（已记录 1 轮）：输入 1,000 / 输出 200 / 总计 1,200" in result["message"]
+    assert "缓存命中率：70.0%（命中 700 / 可缓存输入 1,000）" in result["message"]
 
 
 async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():

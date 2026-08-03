@@ -240,7 +240,8 @@ async def test_help_command_lists_available_im_commands():
 
 @pytest.mark.asyncio
 async def test_status_reports_current_agent_model_session_and_token_usage(monkeypatch):
-    from app.services import chat_model_selection
+    from app.services import chat_model_selection, session_token_usage
+    from app.services.token_tracker import TokenUsage
 
     agent_id = uuid.uuid4()
     session = SimpleNamespace(
@@ -253,9 +254,6 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
         id=agent_id,
         name="小智",
         status="idle",
-        tokens_used_today=1234,
-        tokens_used_month=5678,
-        tokens_used_total=9012,
     )
 
     async def fake_agent(*_args, **_kwargs):
@@ -277,11 +275,24 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
     async def fake_running(*_args, **_kwargs):
         return True
 
+    async def fake_usage(*_args, **_kwargs):
+        return (
+            TokenUsage(
+                total_tokens=1200,
+                input_tokens=1000,
+                output_tokens=200,
+                cache_read_tokens=700,
+                cache_eligible_input_tokens=1000,
+            ),
+            3,
+        )
+
     monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
     monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
     monkeypatch.setattr(channel_commands, "_count_session_messages", fake_count)
     monkeypatch.setattr(channel_commands, "has_running_turn", fake_running)
     monkeypatch.setattr(chat_model_selection, "resolve_runtime_models", fake_runtime)
+    monkeypatch.setattr(session_token_usage, "load_session_token_usage", fake_usage)
 
     result = await channel_commands.handle_channel_command(
         db=FakeDB(),
@@ -300,7 +311,8 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
     assert "场景：warranty" in result["message"]
     assert "会话：群聊 · 12 条消息" in result["message"]
     assert "通道：dingtalk · 群聊" in result["message"]
-    assert "Token（数字员工）：今日 1,234 / 本月 5,678 / 累计 9,012" in result["message"]
+    assert "Session Token（已记录 3 轮）：输入 1,000 / 输出 200 / 总计 1,200" in result["message"]
+    assert "缓存命中率：70.0%（命中 700 / 可缓存输入 1,000）" in result["message"]
 
 
 @pytest.mark.asyncio

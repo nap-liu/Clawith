@@ -19,6 +19,7 @@ class TokenUsage:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    cache_eligible_input_tokens: int = 0
     estimated_tokens: int = 0
 
     def add(self, other: "TokenUsage") -> None:
@@ -27,6 +28,7 @@ class TokenUsage:
         self.output_tokens += other.output_tokens
         self.cache_read_tokens += other.cache_read_tokens
         self.cache_creation_tokens += other.cache_creation_tokens
+        self.cache_eligible_input_tokens += other.cache_eligible_input_tokens
         self.estimated_tokens += other.estimated_tokens
 
 
@@ -105,6 +107,7 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
             output_tokens=output_tokens,
             cache_read_tokens=cached,
             cache_creation_tokens=cache_creation,
+            cache_eligible_input_tokens=input_tokens,
         )
 
     # Anthropic:
@@ -127,6 +130,7 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
             output_tokens=output_tokens,
             cache_read_tokens=cache_read,
             cache_creation_tokens=cache_creation,
+            cache_eligible_input_tokens=input_tokens + cache_read + cache_creation,
         )
 
     # Gemini usage metadata can be normalized by the client, but keep a direct
@@ -141,6 +145,7 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cached,
+            cache_eligible_input_tokens=input_tokens,
         )
 
     return None

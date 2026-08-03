@@ -21,6 +21,7 @@ import pytest
 
 from app.services.llm.caller import call_llm
 from app.services.llm.client import LLMResponse
+from app.services.token_tracker import TokenUsage
 
 
 class _ScriptedClient:
@@ -99,6 +100,45 @@ async def test_plain_text_ends_turn_after_one_round(monkeypatch):
     assert result == "直接回答"
     assert len(client.stream_calls) == 1, "plain text must stop the loop — no reminder round"
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_plain_text_reports_normalized_usage_to_callback(monkeypatch):
+    client = _ScriptedClient([
+        LLMResponse(
+            content="直接回答",
+            finish_reason="stop",
+            usage={
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "total_tokens": 1200,
+                "prompt_tokens_details": {"cached_tokens": 700},
+            },
+        ),
+    ])
+    _patch_collaborators(monkeypatch, client)
+    captured = TokenUsage()
+
+    async def _on_usage(usage: TokenUsage):
+        captured.add(usage)
+
+    result = await call_llm(
+        model=_FakeModel(),
+        messages=[{"role": "user", "content": "hi"}],
+        agent_name="T",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="s",
+        on_usage=_on_usage,
+    )
+
+    assert result == "直接回答"
+    assert captured.total_tokens == 1200
+    assert captured.input_tokens == 1000
+    assert captured.output_tokens == 200
+    assert captured.cache_read_tokens == 700
+    assert captured.cache_eligible_input_tokens == 1000
 
 
 @pytest.mark.asyncio

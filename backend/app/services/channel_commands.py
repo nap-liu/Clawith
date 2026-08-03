@@ -159,6 +159,8 @@ async def handle_channel_command(
             resolve_runtime_models,
         )
         from app.services.scene_service import SCENE_SESSION_CONFIG_KEY
+        from app.services.session_token_usage import load_session_token_usage
+        from app.services.token_tracker import TokenUsage
 
         agent = await _load_agent(db, agent_id=agent_id)
         if agent is None:
@@ -205,6 +207,8 @@ async def handle_channel_command(
             conversation_type = "群聊" if is_group else "单聊"
             message_count = 0
             context_status = "正常"
+            session_usage = TokenUsage()
+            tracked_turns = 0
         else:
             conversation_type = "群聊" if session.is_group else "单聊"
             message_count = await _count_session_messages(
@@ -214,6 +218,29 @@ async def handle_channel_command(
             )
             session_status = f"{conversation_type} · {message_count:,} 条消息"
             context_status = "已终止，请使用 /new" if session.context_terminated_reason else "正常"
+            session_usage, tracked_turns = await load_session_token_usage(
+                db,
+                agent_id=agent_id,
+                session_id=session.id,
+            )
+
+        cache_denominator = session_usage.cache_eligible_input_tokens
+        if cache_denominator > 0:
+            cache_hit_rate = min(
+                100.0,
+                session_usage.cache_read_tokens / cache_denominator * 100,
+            )
+            cache_status = (
+                f"{cache_hit_rate:.1f}%（命中 {session_usage.cache_read_tokens:,} / "
+                f"可缓存输入 {cache_denominator:,}）"
+            )
+        else:
+            cache_status = "暂无可用统计"
+        estimated_suffix = (
+            f"，其中估算 {session_usage.estimated_tokens:,}"
+            if session_usage.estimated_tokens > 0
+            else ""
+        )
 
         scene_key = str(config.get(SCENE_SESSION_CONFIG_KEY) or "")
         scene_status = scene_key or "未激活"
@@ -227,10 +254,11 @@ async def handle_channel_command(
                 f"会话：{session_status}\n"
                 f"通道：{source_channel} · {conversation_type}\n"
                 f"上下文：{context_status}\n"
-                "Token（数字员工）："
-                f"今日 {int(agent.tokens_used_today or 0):,} / "
-                f"本月 {int(agent.tokens_used_month or 0):,} / "
-                f"累计 {int(agent.tokens_used_total or 0):,}"
+                f"Session Token（已记录 {tracked_turns:,} 轮）："
+                f"输入 {session_usage.input_tokens:,} / "
+                f"输出 {session_usage.output_tokens:,} / "
+                f"总计 {session_usage.total_tokens:,}{estimated_suffix}\n"
+                f"缓存命中率：{cache_status}"
             ),
         }
 
