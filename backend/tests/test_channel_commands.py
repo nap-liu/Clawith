@@ -190,6 +190,7 @@ async def test_is_channel_command_recognises_slash_commands():
     assert channel_commands.is_channel_command("/reset") is True
     assert channel_commands.is_channel_command("/help") is True
     assert channel_commands.is_channel_command("/stop") is True
+    assert channel_commands.is_channel_command("/status") is True
     assert channel_commands.is_channel_command("/thinking on") is True
     assert channel_commands.is_channel_command("/thinking off") is True
     assert channel_commands.is_channel_command("/thinking status") is True
@@ -201,7 +202,7 @@ async def test_is_channel_command_recognises_slash_commands():
     assert channel_commands.is_channel_command("/scene too many args") is True
     assert channel_commands.is_channel_command("/model") is True
     assert channel_commands.is_channel_command("/model list") is True
-    assert channel_commands.is_channel_command("/model 企业 GPT 旗舰版") is True
+    assert channel_commands.is_channel_command("/model qwen3.5-plus") is True
     assert channel_commands.is_channel_command("  /NEW  ") is True
     assert channel_commands.is_channel_command("/RESET") is True
     # Non-commands
@@ -233,7 +234,73 @@ async def test_help_command_lists_available_im_commands():
     assert "/scene" in result["message"]
     assert "/model" in result["message"]
     assert "/stop" in result["message"]
+    assert "/status" in result["message"]
     assert "/help" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_status_reports_current_agent_model_session_and_token_usage(monkeypatch):
+    from app.services import chat_model_selection
+
+    agent_id = uuid.uuid4()
+    session = SimpleNamespace(
+        id=uuid.uuid4(),
+        im_config={"model_id": str(uuid.uuid4()), "scene_key": "warranty"},
+        is_group=True,
+        context_terminated_reason=None,
+    )
+    agent = SimpleNamespace(
+        id=agent_id,
+        name="小智",
+        status="idle",
+        tokens_used_today=1234,
+        tokens_used_month=5678,
+        tokens_used_total=9012,
+    )
+
+    async def fake_agent(*_args, **_kwargs):
+        return agent
+
+    async def fake_session(*_args, **_kwargs):
+        return session
+
+    async def fake_runtime(*_args, **_kwargs):
+        return chat_model_selection.RuntimeModelResolution(
+            SimpleNamespace(model="qwen3.5-plus"),
+            None,
+            chat_model_selection.MODEL_OVERRIDE_OK,
+        )
+
+    async def fake_count(*_args, **_kwargs):
+        return 12
+
+    async def fake_running(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
+    monkeypatch.setattr(channel_commands, "_count_session_messages", fake_count)
+    monkeypatch.setattr(channel_commands, "has_running_turn", fake_running)
+    monkeypatch.setattr(chat_model_selection, "resolve_runtime_models", fake_runtime)
+
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/status",
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_group_1",
+        source_channel="dingtalk",
+        is_group=True,
+    )
+
+    assert result["action"] == "status"
+    assert "数字员工：小智" in result["message"]
+    assert "运行状态：处理中" in result["message"]
+    assert "模型：qwen3.5-plus（会话临时模型）" in result["message"]
+    assert "场景：warranty" in result["message"]
+    assert "会话：群聊 · 12 条消息" in result["message"]
+    assert "通道：dingtalk · 群聊" in result["message"]
+    assert "Token（数字员工）：今日 1,234 / 本月 5,678 / 累计 9,012" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -553,7 +620,7 @@ async def test_first_scene_command_creates_control_session(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_model_command_switches_by_saved_label_with_spaces(monkeypatch):
+async def test_model_command_switches_by_saved_model_name(monkeypatch):
     from app.services import chat_model_selection
 
     model_id = uuid.uuid4()
@@ -567,20 +634,20 @@ async def test_model_command_switches_by_saved_label_with_spaces(monkeypatch):
         return session
 
     async def fake_resolve(*_args, **kwargs):
-        assert kwargs["label"] == "企业 GPT 旗舰版"
-        return chat_model_selection.ModelLabelResolution(
+        assert kwargs["model_name"] == "qwen3.5-plus"
+        return chat_model_selection.ModelNameResolution(
             chat_model_selection.MODEL_STATUS_OK,
-            SimpleNamespace(id=model_id, label="企业 GPT 旗舰版"),
+            SimpleNamespace(id=model_id, model="qwen3.5-plus"),
         )
 
     monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
     monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
-    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_label", fake_resolve)
+    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_name", fake_resolve)
     db = FakeDB()
 
     result = await channel_commands.handle_channel_command(
         db=db,
-        command="/model 企业 GPT 旗舰版",
+        command="/model qwen3.5-plus",
         agent_id=agent.id,
         user_id=uuid.uuid4(),
         external_conv_id="dingtalk_group_1",
@@ -589,7 +656,7 @@ async def test_model_command_switches_by_saved_label_with_spaces(monkeypatch):
     )
 
     assert result["action"] == "model_switched"
-    assert "企业 GPT 旗舰版" in result["message"]
+    assert "qwen3.5-plus" in result["message"]
     assert str(model_id) not in result["message"]
     assert session.im_config == {
         "scene_key": "warranty",
@@ -598,10 +665,10 @@ async def test_model_command_switches_by_saved_label_with_spaces(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reserved_label", ["list", "status", "default"])
-async def test_model_command_selects_reserved_saved_label_with_use(
+@pytest.mark.parametrize("reserved_name", ["list", "status", "default"])
+async def test_model_command_selects_reserved_saved_name_with_use(
     monkeypatch,
-    reserved_label,
+    reserved_name,
 ):
     from app.services import chat_model_selection
 
@@ -616,19 +683,19 @@ async def test_model_command_selects_reserved_saved_label_with_use(
         return session
 
     async def fake_resolve(*_args, **kwargs):
-        assert kwargs["label"] == reserved_label
-        return chat_model_selection.ModelLabelResolution(
+        assert kwargs["model_name"] == reserved_name
+        return chat_model_selection.ModelNameResolution(
             chat_model_selection.MODEL_STATUS_OK,
-            SimpleNamespace(id=model_id, label=reserved_label),
+            SimpleNamespace(id=model_id, model=reserved_name),
         )
 
     monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
     monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
-    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_label", fake_resolve)
+    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_name", fake_resolve)
 
     result = await channel_commands.handle_channel_command(
         db=FakeDB(),
-        command=f"/model use {reserved_label}",
+        command=f"/model use {reserved_name}",
         agent_id=agent.id,
         user_id=uuid.uuid4(),
         external_conv_id="dingtalk_group_1",
@@ -645,7 +712,7 @@ async def test_model_command_selects_reserved_saved_label_with_use(
     ("status", "model", "expected_action"),
     [
         ("not_found", None, "model_not_found"),
-        ("disabled", SimpleNamespace(label="停用模型"), "model_disabled"),
+        ("disabled", SimpleNamespace(model="disabled-model"), "model_disabled"),
         ("ambiguous", None, "model_ambiguous"),
     ],
 )
@@ -666,15 +733,15 @@ async def test_model_command_reports_precise_selection_failure(
         return None
 
     async def fake_resolve(*_args, **_kwargs):
-        return chat_model_selection.ModelLabelResolution(status, model)
+        return chat_model_selection.ModelNameResolution(status, model)
 
     monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
     monkeypatch.setattr(channel_commands, "_load_channel_session", fake_session)
-    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_label", fake_resolve)
+    monkeypatch.setattr(chat_model_selection, "resolve_tenant_model_by_name", fake_resolve)
 
     result = await channel_commands.handle_channel_command(
         db=FakeDB(),
-        command="/model 测试模型",
+        command="/model test-model",
         agent_id=agent.id,
         user_id=uuid.uuid4(),
         external_conv_id="dingtalk_p2p_1",
@@ -700,7 +767,7 @@ async def test_model_status_reports_stale_session_override(monkeypatch):
 
     async def fake_runtime(*_args, **_kwargs):
         return chat_model_selection.RuntimeModelResolution(
-            SimpleNamespace(label="默认模型"),
+            SimpleNamespace(model="qwen3.5-plus"),
             None,
             chat_model_selection.MODEL_OVERRIDE_UNAVAILABLE,
         )
@@ -723,7 +790,7 @@ async def test_model_status_reports_stale_session_override(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_model_list_shows_saved_labels_without_internal_ids(monkeypatch):
+async def test_model_list_shows_saved_model_names_without_labels_or_internal_ids(monkeypatch):
     from app.services import chat_model_selection
 
     model_id = uuid.uuid4()
@@ -733,7 +800,13 @@ async def test_model_list_shows_saved_labels_without_internal_ids(monkeypatch):
         return agent
 
     async def fake_list(*_args, **_kwargs):
-        return [SimpleNamespace(id=model_id, label="研发推理模型")]
+        return [
+            SimpleNamespace(
+                id=model_id,
+                model="qwen3.5-plus",
+                label="企业 GPT 旗舰版",
+            )
+        ]
 
     monkeypatch.setattr(channel_commands, "_load_agent", fake_agent)
     monkeypatch.setattr(chat_model_selection, "list_enabled_tenant_models", fake_list)
@@ -748,7 +821,8 @@ async def test_model_list_shows_saved_labels_without_internal_ids(monkeypatch):
     )
 
     assert result["action"] == "model_list"
-    assert "研发推理模型" in result["message"]
+    assert "qwen3.5-plus" in result["message"]
+    assert "企业 GPT 旗舰版" not in result["message"]
     assert str(model_id) not in result["message"]
 
 
@@ -767,7 +841,7 @@ async def test_model_default_clears_only_model_preference(monkeypatch):
 
     async def fake_runtime(*_args, **_kwargs):
         return chat_model_selection.RuntimeModelResolution(
-            SimpleNamespace(label="默认生产模型"),
+            SimpleNamespace(model="qwen3.5-plus"),
             None,
         )
 
@@ -785,5 +859,5 @@ async def test_model_default_clears_only_model_preference(monkeypatch):
     )
 
     assert result["action"] == "model_default"
-    assert "默认生产模型" in result["message"]
+    assert "qwen3.5-plus" in result["message"]
     assert session.im_config == {"scene_key": "warranty"}

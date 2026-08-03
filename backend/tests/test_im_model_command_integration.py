@@ -58,7 +58,7 @@ async def _seed_model_runtime() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.U
             id=uuid.uuid4(),
             tenant_id=tenant.id,
             provider="openai",
-            model="default-internal-model",
+            model="qwen3-max",
             api_key_encrypted="encrypted-test-key",
             label="默认生产模型",
             enabled=True,
@@ -67,7 +67,7 @@ async def _seed_model_runtime() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID, uuid.U
             id=uuid.uuid4(),
             tenant_id=tenant.id,
             provider="openai",
-            model="selected-internal-model",
+            model="qwen3.5-plus",
             api_key_encrypted="encrypted-test-key",
             label="企业 GPT 旗舰版",
             enabled=True,
@@ -96,7 +96,7 @@ async def test_model_command_snapshots_selected_saved_model_for_exact_im_turn(mo
     async with async_session() as db:
         result = await handle_channel_command(
             db=db,
-            command="/model 企业 GPT 旗舰版",
+            command="/model qwen3.5-plus",
             agent_id=agent_id,
             user_id=user_id,
             external_conv_id=external_conv_id,
@@ -105,7 +105,8 @@ async def test_model_command_snapshots_selected_saved_model_for_exact_im_turn(mo
         await db.commit()
 
     assert result["action"] == "model_switched"
-    assert "企业 GPT 旗舰版" in result["message"]
+    assert "qwen3.5-plus" in result["message"]
+    assert "企业 GPT 旗舰版" not in result["message"]
     assert str(selected_model_id) not in result["message"]
 
     async with async_session() as db:
@@ -175,6 +176,53 @@ async def test_model_command_snapshots_selected_saved_model_for_exact_im_turn(mo
         assert captured["primary_model"].id != default_model_id
 
 
+async def test_status_reads_current_session_and_agent_token_counters():
+    agent_id, user_id, _tenant_id, _default_model_id, _selected_model_id = await _seed_model_runtime()
+    external_conv_id = f"dingtalk_p2p_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        agent = await db.get(Agent, agent_id)
+        assert agent is not None
+        agent.tokens_used_today = 1234
+        agent.tokens_used_month = 5678
+        agent.tokens_used_total = 9012
+        session = await find_or_create_channel_session(
+            db=db,
+            agent_id=agent_id,
+            user_id=user_id,
+            external_conv_id=external_conv_id,
+            source_channel="dingtalk",
+            first_message_title="状态测试",
+        )
+        await ingest_incoming_chat_message(
+            db,
+            session=session,
+            agent_id=agent_id,
+            user_id=user_id,
+            content="状态测试",
+            source_channel="dingtalk",
+            provider_event_id=f"event-{uuid.uuid4()}",
+            actor_ref="staff-1",
+        )
+        await db.commit()
+
+    async with async_session() as db:
+        result = await handle_channel_command(
+            db=db,
+            command="/status",
+            agent_id=agent_id,
+            user_id=user_id,
+            external_conv_id=external_conv_id,
+            source_channel="dingtalk",
+        )
+
+    assert result["action"] == "status"
+    assert "运行状态：空闲" in result["message"]
+    assert "模型：qwen3-max（默认模型）" in result["message"]
+    assert "会话：单聊 · 1 条消息" in result["message"]
+    assert "Token（数字员工）：今日 1,234 / 本月 5,678 / 累计 9,012" in result["message"]
+
+
 async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():
     from app.api.websocket import WebSocketChatHandler
     from app.services.chat_model_selection import (
@@ -186,7 +234,7 @@ async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():
         MODEL_STATUS_DISABLED,
         list_enabled_tenant_models,
         resolve_runtime_models,
-        resolve_tenant_model_by_label,
+        resolve_tenant_model_by_name,
     )
 
     agent_id, _user_id, tenant_id, default_model_id, selected_model_id = await _seed_model_runtime()
@@ -203,7 +251,7 @@ async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():
             id=uuid.uuid4(),
             tenant_id=tenant_id,
             provider="openai",
-            model="disabled-internal-model",
+            model="disabled-model",
             api_key_encrypted="encrypted-test-key",
             label="停用模型",
             enabled=False,
@@ -212,7 +260,7 @@ async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():
             id=uuid.uuid4(),
             tenant_id=tenant_id,
             provider="openai",
-            model="duplicate-one",
+            model="duplicate-model",
             api_key_encrypted="encrypted-test-key",
             label="重复 模型",
             enabled=True,
@@ -221,7 +269,7 @@ async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():
             id=uuid.uuid4(),
             tenant_id=tenant_id,
             provider="openai",
-            model="duplicate-two",
+            model="duplicate-model",
             api_key_encrypted="encrypted-test-key",
             label="重复  模型",
             enabled=True,
@@ -281,18 +329,18 @@ async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():
         )
         assert invalid_resolution.override_status == MODEL_OVERRIDE_INVALID
 
-        disabled_label = await resolve_tenant_model_by_label(
+        disabled_name = await resolve_tenant_model_by_name(
             db,
             tenant_id=tenant_id,
-            label="停用模型",
+            model_name="disabled-model",
         )
-        assert disabled_label.status == MODEL_STATUS_DISABLED
-        duplicate_label = await resolve_tenant_model_by_label(
+        assert disabled_name.status == MODEL_STATUS_DISABLED
+        duplicate_name = await resolve_tenant_model_by_name(
             db,
             tenant_id=tenant_id,
-            label="重复 模型",
+            model_name="duplicate-model",
         )
-        assert duplicate_label.status == MODEL_STATUS_AMBIGUOUS
+        assert duplicate_name.status == MODEL_STATUS_AMBIGUOUS
         listed_ids = {model.id for model in await list_enabled_tenant_models(db, tenant_id)}
         assert disabled.id not in listed_ids
         assert cross_tenant.id not in listed_ids

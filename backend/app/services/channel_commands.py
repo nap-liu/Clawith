@@ -6,13 +6,13 @@ Supports slash commands like /new to reset session context.
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import user_can_manage_agent_id
 from app.models.agent import Agent
 from app.models.chat_session import ChatSession
-from app.services.channel_dispatch import cancel_running_turn
+from app.services.channel_dispatch import cancel_running_turn, has_running_turn
 from app.services.im_thinking_output import (
     THINKING_OFF,
     THINKING_ON,
@@ -23,6 +23,7 @@ COMMANDS = {
     "/reset",
     "/help",
     "/stop",
+    "/status",
     "/thinking",
     "/think",
     "/scene",
@@ -47,7 +48,7 @@ def _parse_command(text: str) -> tuple[str, str | None]:
 def is_channel_command(text: str) -> bool:
     """Check if the message is a recognized channel command."""
     command, arg = _parse_command(text)
-    if command in {"/new", "/reset", "/help", "/stop"}:
+    if command in {"/new", "/reset", "/help", "/stop", "/status"}:
         return arg is None
     if command in {"/thinking", "/think"}:
         return arg in {"on", "off", "status"}
@@ -97,12 +98,30 @@ def _help_message() -> str:
         "/model use <模型名>：切换名称为 list、status、default 的模型\n"
         "/model status：查看当前模型；/model default：恢复默认模型\n"
         "/stop：停止当前这轮正在执行的工作\n"
+        "/status：查看当前数字员工和会话状态\n"
         "/help：查看帮助"
     )
 
 
 def _thinking_status_label(enabled: bool) -> str:
     return "开启" if enabled else "关闭"
+
+
+async def _count_session_messages(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    session_id: uuid.UUID,
+) -> int:
+    from app.models.audit import ChatMessage
+
+    result = await db.execute(
+        select(func.count(ChatMessage.id)).where(
+            ChatMessage.agent_id == agent_id,
+            ChatMessage.conversation_id == str(session_id),
+        )
+    )
+    return int(result.scalar_one() or 0)
 
 
 async def handle_channel_command(
@@ -133,6 +152,88 @@ async def handle_channel_command(
             "message": "已请求停止当前工作。" if cancelled else "当前没有正在执行的工作。",
         }
 
+    if parsed_cmd == "/status":
+        from app.services.chat_model_selection import (
+            MODEL_OVERRIDE_OK,
+            MODEL_SESSION_CONFIG_KEY,
+            resolve_runtime_models,
+        )
+        from app.services.scene_service import SCENE_SESSION_CONFIG_KEY
+
+        agent = await _load_agent(db, agent_id=agent_id)
+        if agent is None:
+            return {"action": "status_failed", "message": "❌ 无法读取数字员工状态。"}
+
+        session = await _load_channel_session(
+            db,
+            agent_id=agent_id,
+            external_conv_id=external_conv_id,
+            source_channel=source_channel,
+        )
+        config = dict((session.im_config if session else None) or {})
+        override_model_id = str(config.get(MODEL_SESSION_CONFIG_KEY) or "")
+        resolved = await resolve_runtime_models(
+            db,
+            agent=agent,
+            override_model_id=override_model_id or None,
+        )
+
+        if resolved.primary_model is None:
+            model_status = "未配置"
+        elif override_model_id and resolved.override_status == MODEL_OVERRIDE_OK:
+            model_status = f"{resolved.primary_model.model}（会话临时模型）"
+        elif override_model_id:
+            model_status = f"{resolved.primary_model.model}（会话模型已失效，已回退默认）"
+        else:
+            model_status = f"{resolved.primary_model.model}（默认模型）"
+
+        turn_running = await has_running_turn(_lock_key(source_channel, external_conv_id))
+        runtime_labels = {
+            "creating": "创建中",
+            "running": "运行中",
+            "idle": "空闲",
+            "stopped": "已停止",
+            "error": "异常",
+        }
+        runtime_status = "处理中" if turn_running else runtime_labels.get(
+            str(agent.status or ""),
+            str(agent.status or "未知"),
+        )
+
+        if session is None:
+            session_status = "尚未建立"
+            conversation_type = "群聊" if is_group else "单聊"
+            message_count = 0
+            context_status = "正常"
+        else:
+            conversation_type = "群聊" if session.is_group else "单聊"
+            message_count = await _count_session_messages(
+                db,
+                agent_id=agent_id,
+                session_id=session.id,
+            )
+            session_status = f"{conversation_type} · {message_count:,} 条消息"
+            context_status = "已终止，请使用 /new" if session.context_terminated_reason else "正常"
+
+        scene_key = str(config.get(SCENE_SESSION_CONFIG_KEY) or "")
+        scene_status = scene_key or "未激活"
+        return {
+            "action": "status",
+            "message": (
+                f"数字员工：{agent.name}\n"
+                f"运行状态：{runtime_status}\n"
+                f"模型：{model_status}\n"
+                f"场景：{scene_status}\n"
+                f"会话：{session_status}\n"
+                f"通道：{source_channel} · {conversation_type}\n"
+                f"上下文：{context_status}\n"
+                "Token（数字员工）："
+                f"今日 {int(agent.tokens_used_today or 0):,} / "
+                f"本月 {int(agent.tokens_used_month or 0):,} / "
+                f"累计 {int(agent.tokens_used_total or 0):,}"
+            ),
+        }
+
     if parsed_cmd == "/model":
         from app.services.channel_session import find_or_create_channel_session
         from app.services.chat_model_selection import (
@@ -144,7 +245,7 @@ async def handle_channel_command(
             MODEL_STATUS_OK,
             list_enabled_tenant_models,
             resolve_runtime_models,
-            resolve_tenant_model_by_label,
+            resolve_tenant_model_by_name,
         )
 
         agent = await _load_agent(db, agent_id=agent_id)
@@ -165,11 +266,11 @@ async def handle_channel_command(
             models = await list_enabled_tenant_models(db, agent.tenant_id)
             if not models:
                 return {"action": "model_list", "message": "当前企业没有已启用的模型。"}
-            labels = "\n".join(f"- {model.label}" for model in models)
+            model_names = "\n".join(f"- {model.model}" for model in models)
             return {
                 "action": "model_list",
                 "message": (
-                    f"可用模型：\n{labels}\n\n切换方式：/model <模型名>"
+                    f"可用模型：\n{model_names}\n\n切换方式：/model <模型名>"
                     "；若模型名为 list、status 或 default，请使用 /model use <模型名>。"
                 ),
             }
@@ -199,7 +300,7 @@ async def handle_channel_command(
             source = "会话临时模型" if current_model_id else "数字员工默认模型"
             return {
                 "action": "model_status",
-                "message": f"当前模型：{resolved.primary_model.label}（{source}）。",
+                "message": f"当前模型：{resolved.primary_model.model}（{source}）。",
             }
 
         if control_arg == "default":
@@ -216,13 +317,13 @@ async def handle_channel_command(
                 }
             return {
                 "action": "model_default",
-                "message": f"✅ 已恢复数字员工默认模型「{resolved.primary_model.label}」，从下一条消息起生效。",
+                "message": f"✅ 已恢复数字员工默认模型「{resolved.primary_model.model}」，从下一条消息起生效。",
             }
 
-        matched = await resolve_tenant_model_by_label(
+        matched = await resolve_tenant_model_by_name(
             db,
             tenant_id=agent.tenant_id,
-            label=normalized_arg,
+            model_name=normalized_arg,
         )
         if matched.status == MODEL_STATUS_NOT_FOUND:
             return {
@@ -232,7 +333,7 @@ async def handle_channel_command(
         if matched.status == MODEL_STATUS_DISABLED:
             return {
                 "action": "model_disabled",
-                "message": f"❌ 模型「{matched.model.label}」当前已停用，无法切换。",
+                "message": f"❌ 模型「{matched.model.model}」当前已停用，无法切换。",
             }
         if matched.status == MODEL_STATUS_AMBIGUOUS:
             return {
@@ -270,7 +371,7 @@ async def handle_channel_command(
         await db.flush()
         return {
             "action": "model_switched",
-            "message": f"✅ 已切换到模型「{matched.model.label}」，从下一条消息起生效。",
+            "message": f"✅ 已切换到模型「{matched.model.model}」，从下一条消息起生效。",
         }
 
     if parsed_cmd == "/scene":

@@ -105,6 +105,15 @@ async def cancel_running_turn(lock_key: str) -> bool:
         return True
 
 
+async def has_running_turn(lock_key: str) -> bool:
+    """Return whether this IM session currently has a running or queued turn."""
+    async with _running_turns_guard:
+        return any(
+            not task.done()
+            for task in _running_turns.get(lock_key, set())
+        )
+
+
 @asynccontextmanager
 async def _distributed_session_lock(lock_key: str):
     """Cross-replica PostgreSQL advisory lock for durable trigger turns."""

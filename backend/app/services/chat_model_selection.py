@@ -28,7 +28,7 @@ MODEL_OVERRIDE_DISABLED = "disabled"
 
 
 @dataclass(frozen=True, slots=True)
-class ModelLabelResolution:
+class ModelNameResolution:
     status: str
     model: LLMModel | None = None
 
@@ -40,8 +40,8 @@ class RuntimeModelResolution:
     override_status: str = MODEL_OVERRIDE_NONE
 
 
-def _normalized_label(value: str) -> str:
-    return " ".join(str(value or "").split()).casefold()
+def _normalized_model_name(value: str) -> str:
+    return str(value or "").strip().casefold()
 
 
 async def list_enabled_tenant_models(
@@ -57,30 +57,34 @@ async def list_enabled_tenant_models(
     )
     return sorted(
         result.scalars().all(),
-        key=lambda model: (_normalized_label(model.label), str(model.id)),
+        key=lambda model: (_normalized_model_name(model.model), str(model.id)),
     )
 
 
-async def resolve_tenant_model_by_label(
+async def resolve_tenant_model_by_name(
     db: AsyncSession,
     *,
     tenant_id: uuid.UUID,
-    label: str,
-) -> ModelLabelResolution:
-    """Resolve an exact saved model label without exposing internal IDs."""
-    normalized = _normalized_label(label)
+    model_name: str,
+) -> ModelNameResolution:
+    """Resolve an exact saved model name without exposing internal IDs."""
+    normalized = _normalized_model_name(model_name)
     if not normalized:
-        return ModelLabelResolution(MODEL_STATUS_NOT_FOUND)
+        return ModelNameResolution(MODEL_STATUS_NOT_FOUND)
 
     result = await db.execute(select(LLMModel).where(LLMModel.tenant_id == tenant_id))
-    matches = [model for model in result.scalars().all() if _normalized_label(model.label) == normalized]
+    matches = [
+        model
+        for model in result.scalars().all()
+        if _normalized_model_name(model.model) == normalized
+    ]
     if not matches:
-        return ModelLabelResolution(MODEL_STATUS_NOT_FOUND)
+        return ModelNameResolution(MODEL_STATUS_NOT_FOUND)
     if len(matches) > 1:
-        return ModelLabelResolution(MODEL_STATUS_AMBIGUOUS)
+        return ModelNameResolution(MODEL_STATUS_AMBIGUOUS)
     if not matches[0].enabled:
-        return ModelLabelResolution(MODEL_STATUS_DISABLED, matches[0])
-    return ModelLabelResolution(MODEL_STATUS_OK, matches[0])
+        return ModelNameResolution(MODEL_STATUS_DISABLED, matches[0])
+    return ModelNameResolution(MODEL_STATUS_OK, matches[0])
 
 
 async def resolve_runtime_models(
