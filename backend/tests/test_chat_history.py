@@ -252,6 +252,49 @@ async def test_completed_turn_is_represented_by_appended_assistant_row():
     assert [saved.content for saved in rows] == ["hi", "hello"]
 
 
+async def test_assistant_reply_inherits_scene_revision_from_turn_anchor():
+    from app.services.chat_history import persist_assistant_reply_row, persist_incoming_user_message
+
+    agent_id = uuid.uuid4()
+    u_alice, _u_bob = await _seed_two_users()
+    conv_id = f"scene_{uuid.uuid4().hex[:8]}"
+
+    async with async_session() as db:
+        await db.execute(text("SET session_replication_role = replica"))
+        anchor = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=u_alice.id,
+            conversation_id=conv_id,
+            content="处理售后",
+            message_meta={"scene_key": "warranty", "scene_revision": 3},
+        )
+        await persist_assistant_reply_row(
+            db,
+            agent_id=agent_id,
+            user_id=u_alice.id,
+            conversation_id=conv_id,
+            content="已处理",
+            turn_anchor_id=anchor.id,
+        )
+        await db.commit()
+        await db.execute(text("SET session_replication_role = DEFAULT"))
+        await db.commit()
+
+    async with async_session() as db:
+        assistant = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == conv_id,
+                    ChatMessage.role == "assistant",
+                )
+            )
+        ).scalar_one()
+
+    assert assistant.message_meta["scene_key"] == "warranty"
+    assert assistant.message_meta["scene_revision"] == 3
+
+
 async def test_recoverable_history_preserves_processing_user_tail_that_normal_loader_trims():
     """Startup recovery needs the interrupted user tail that normal replay trims."""
     from app.services.chat_history import load_recoverable_history_for_turn

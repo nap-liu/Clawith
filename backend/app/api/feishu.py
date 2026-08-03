@@ -560,6 +560,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                         db=_cmd_db, command=user_text, agent_id=agent_id,
                         user_id=None, external_conv_id=conv_id,
                         source_channel="feishu",
+                        is_group=chat_type == "group",
                     )
                     await _cmd_db.commit()
                 _cmd_reply_to = chat_id if chat_type == "group" and chat_id else sender_open_id

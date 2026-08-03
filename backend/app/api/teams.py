@@ -476,8 +476,9 @@ async def teams_event_webhook(
                 return {"ok": True}
             cmd_result = await handle_channel_command(
                 db=db, command=user_text, agent_id=agent_id,
-                user_id=None, external_conv_id=conversation_id,
+                user_id=platform_user_id, external_conv_id=conversation_id,
                 source_channel="microsoft_teams",
+                is_group=_is_group_teams,
             )
             await db.commit()
             use_mi_cmd = config.extra_config.get("use_managed_identity", False)

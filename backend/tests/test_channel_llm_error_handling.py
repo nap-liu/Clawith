@@ -148,6 +148,41 @@ async def test_successful_reply_passes_through(monkeypatch):
     assert reply == "你好，我可以帮你做什么？"
 
 
+async def test_scene_context_is_forwarded_to_shared_llm_caller(monkeypatch):
+    from app.services import scene_service
+
+    agent, model = _make_agent_and_model()
+    captured = {}
+    scene_context = {
+        "source_channel": "dingtalk",
+        "scene_key": "warranty",
+        "scene_revision": 3,
+        "scene_system_prompts": [{"id": "policy", "content": "Use warranty policy."}],
+    }
+
+    async def fake_scene_context(*_args, **_kwargs):
+        return scene_context
+
+    async def fake_llm(*_args, **kwargs):
+        captured.update(kwargs)
+        return "已处理"
+
+    monkeypatch.setattr(scene_service, "load_turn_scene_context", fake_scene_context)
+    _patch_llm(monkeypatch, fake_llm)
+
+    reply = await channel_llm._call_agent_llm(
+        _make_db(agent, model),
+        agent.id,
+        "处理售后",
+        session_id=str(uuid.uuid4()),
+        user_id=agent.id,
+        turn_anchor_id=uuid.uuid4(),
+    )
+
+    assert reply == "已处理"
+    assert captured["channel_context"] == scene_context
+
+
 async def test_context_limit_uses_short_im_reset_message(monkeypatch):
     agent, model = _make_agent_and_model()
 

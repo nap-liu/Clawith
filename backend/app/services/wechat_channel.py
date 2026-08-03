@@ -219,6 +219,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
                 db=_cmd_db, command=user_text, agent_id=agent_id,
                 user_id=None, external_conv_id=conv_id,
                 source_channel="wechat",
+                is_group=False,
             )
             await _cmd_db.commit()
         token = str((config.extra_config or {}).get("bot_token") or "").strip()

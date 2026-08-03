@@ -407,10 +407,11 @@ _PATH_RE = re.compile(
 )
 _URL_RE = re.compile(r"\bhttps?://[^\s'\"<>]*?(?=[\s,;!?]|$)", re.IGNORECASE)
 _SLASH_COMMAND_RE = re.compile(
-    r"(?<!\S)/(?:new|reset|help|stop|thinking|think)(?:\s+(?:on|off|status))?(?=[\s,;:!?]|$)",
+    r"(?<!\S)/(?:new|reset|help|stop|(?:thinking|think)(?:\s+(?:on|off|status))?|"
+    r"scene(?:\s+(?:status|off|[a-z][a-z0-9_-]{0,63}))?)(?=[\s,;:!?]|$)",
     re.IGNORECASE,
 )
-_KNOWN_SLASH_COMMANDS = {"/new", "/reset", "/help", "/stop", "/thinking", "/think"}
+_KNOWN_SLASH_COMMANDS = {"/new", "/reset", "/help", "/stop", "/thinking", "/think", "/scene"}
 _HEADING_RE = re.compile(r"^#{2,3}\s", re.MULTILINE)
 
 

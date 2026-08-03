@@ -298,6 +298,7 @@ async def discord_interaction_webhook(
                         db=_cmd_db, command=user_text, agent_id=agent_id,
                         user_id=None, external_conv_id=conv_id,
                         source_channel="discord",
+                        is_group=_is_group_discord,
                     )
                     await _cmd_db.commit()
                 # Re-read config for bot credentials

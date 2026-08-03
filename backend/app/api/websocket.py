@@ -560,21 +560,19 @@ class WebSocketChatHandler:
         try:
             from app.schemas.scene import validate_scene_key
             from app.services.scene_service import (
-                get_scene,
-                scene_tool_enabled,
-                serialize_published_scene,
+                SCENE_STATUS_OK,
+                resolve_scene_for_activation,
             )
 
             self.scene_key = validate_scene_key(self.scene_key)
 
             async def _load(active_db: AsyncSession):
-                if not await scene_tool_enabled(active_db, self.agent_id):
-                    return None
-                found = await get_scene(active_db, self.agent_id, self.scene_key, enabled_only=True)
-                if not found:
-                    return None
-                scene, revision = found
-                return serialize_published_scene(scene, revision) if revision else None
+                resolved = await resolve_scene_for_activation(
+                    active_db,
+                    self.agent_id,
+                    self.scene_key,
+                )
+                return resolved.manifest if resolved.status == SCENE_STATUS_OK else None
 
             if db is not None:
                 self.scene_manifest = await _load(db)
@@ -623,44 +621,25 @@ class WebSocketChatHandler:
         # the standard ChatMessage persistence path.
 
     def _scene_message_meta(self) -> dict:
-        if not self.scene_manifest:
-            return {}
-        return {
-            "scene_key": self.scene_manifest.get("scene_key"),
-            "scene_revision": self.scene_manifest.get("revision"),
-        }
+        from app.services.scene_service import scene_message_meta
+
+        return scene_message_meta(self.scene_manifest)
 
     def _channel_context(self) -> dict:
+        from app.services.scene_service import build_scene_channel_context
+
         if self.source_channel in {"miniprogram", "wechat_miniprogram"}:
-            context = {
-                "source_channel": self.source_channel,
-                "display_name": "小程序",
-                "client_surface": "mini-program web-view",
-            }
+            display_name = "小程序"
+            client_surface = "mini-program web-view"
         else:
-            context = {
-                "source_channel": self.source_channel,
-                "display_name": "Web",
-                "client_surface": "desktop web",
-            }
-        if self.scene_manifest:
-            context.update(
-                {
-                    "scene_key": self.scene_manifest.get("scene_key"),
-                    "scene_revision": self.scene_manifest.get("revision"),
-                    "scene_system_prompts": [
-                        item
-                        for item in self.scene_manifest.get("system_prompts", [])
-                        if item.get("enabled", True)
-                    ],
-                    "scene_quick_actions": list(
-                        item
-                        for item in self.scene_manifest.get("quick_actions", [])
-                        if item.get("enabled", True)
-                    ),
-                }
-            )
-        return context
+            display_name = "Web"
+            client_surface = "desktop web"
+        return build_scene_channel_context(
+            self.scene_manifest,
+            source_channel=self.source_channel,
+            display_name=display_name,
+            client_surface=client_surface,
+        )
 
     async def _load_history(self, db: AsyncSession):
         """Loads and prepares history messages for the conversation via the shared

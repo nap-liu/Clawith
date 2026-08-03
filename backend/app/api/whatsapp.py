@@ -296,8 +296,9 @@ async def whatsapp_event_webhook(
                             _processed_whatsapp_messages.clear()
                     cmd_result = await handle_channel_command(
                         db=db, command=user_text, agent_id=agent_id,
-                        user_id=None, external_conv_id=conv_id,
+                        user_id=platform_user_id, external_conv_id=conv_id,
                         source_channel="whatsapp",
+                        is_group=False,
                     )
                     await db.commit()
                     try:

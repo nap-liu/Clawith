@@ -3,7 +3,7 @@
 Used by feishu.py, slack.py, discord_bot.py, wecom.py, teams.py — eliminates in-process caches.
 """
 import uuid as _uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -16,12 +16,13 @@ from app.services.session_identity import require_same_tenant_session_user
 async def find_or_create_channel_session(
     db: AsyncSession,
     agent_id: _uuid.UUID,
-    user_id: _uuid.UUID,
+    user_id: _uuid.UUID | None,
     external_conv_id: str,
     source_channel: str,
     first_message_title: str,
     is_group: bool = False,
     group_name: str | None = None,
+    allow_unresolved_user: bool = False,
 ) -> ChatSession:
     """Find an existing ChatSession by channel-scoped conversation id, or create one.
 
@@ -37,7 +38,9 @@ async def find_or_create_channel_session(
                   are excluded from the user's "mine" session list.
         group_name: Display name for group sessions (e.g. IM group/channel name).
     """
-    if not is_group:
+    if user_id is None and not (is_group or allow_unresolved_user):
+        raise ValueError("A resolved user is required for a direct channel session")
+    if not is_group and user_id is not None:
         await require_same_tenant_session_user(db, agent_id, user_id)
     result = await db.execute(
         select(ChatSession).where(
@@ -49,7 +52,7 @@ async def find_or_create_channel_session(
     session = result.scalar_one_or_none()
 
     if session is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         candidate = ChatSession(
             agent_id=agent_id,
             user_id=user_id,
@@ -82,8 +85,18 @@ async def find_or_create_channel_session(
     else:
         # For P2P sessions: re-attribute to the correct user
         # (fixes legacy sessions stored under creator_id)
-        if not session.is_group and session.user_id != user_id:
+        if not session.is_group and user_id is not None and session.user_id != user_id:
             session.user_id = user_id
+
+        # A control command can create a transport session before the first
+        # dialogue message is available.  Let that first real message supply
+        # the user-facing title without creating a duplicate session.
+        if (
+            not is_group
+            and session.title == "New Session"
+            and first_message_title != "New Session"
+        ):
+            session.title = first_message_title[:40]
 
         # Upgrade legacy rows that were created before is_group was passed
         # by the channel entry. Idempotent: when callers correctly mark a

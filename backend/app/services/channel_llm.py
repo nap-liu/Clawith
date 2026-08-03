@@ -147,6 +147,15 @@ async def _call_agent_llm(
     # awakened.  Ordinary channels use the same id for both roles.
     history_agent_id = storage_agent_id or agent_id
 
+    from app.services.scene_service import load_turn_scene_context
+
+    scene_channel_context = await load_turn_scene_context(
+        db,
+        agent_id=agent_id,
+        session_id=session_id,
+        turn_anchor_id=turn_anchor_id,
+    )
+
     # Load agent and model
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = agent_result.scalar_one_or_none()
@@ -327,6 +336,7 @@ async def _call_agent_llm(
         on_tool_call=_on_tool_call_persisted,
         supports_vision=getattr(model, "supports_vision", False),
         is_group=is_group,
+        channel_context=scene_channel_context,
         turn_anchor_id=turn_anchor_id,
         context_recovery=context_recovery,
     )

@@ -170,6 +170,7 @@ class WeComStreamManager:
                                 db=_cmd_db, command=user_text, agent_id=agent_id,
                                 user_id=None, external_conv_id=conv_id,
                                 source_channel="wecom",
+                                is_group=is_group_msg,
                             )
                             await _cmd_db.commit()
                         _stream_id_cmd = generate_req_id("stream")

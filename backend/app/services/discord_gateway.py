@@ -126,6 +126,7 @@ class DiscordGatewayManager:
                         db=_cmd_db, command=user_text, agent_id=agent_id,
                         user_id=None, external_conv_id=conv_id_om,
                         source_channel="discord",
+                        is_group=message.guild is not None,
                     )
                     await _cmd_db.commit()
                 try:

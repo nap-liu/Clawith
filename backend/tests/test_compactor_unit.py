@@ -343,10 +343,12 @@ class TestValidateSummary:
 
     def test_slash_commands_are_classified_without_path_artifacts(self):
         identifiers = extract_preserved_identifiers(
-            r"Send /new, then read workspace/report.md; ignore /\nartifact."
+            r"Send /new, activate /scene sales_demo, then read "
+            r"workspace/report.md; ignore /\nartifact."
         )
 
         assert "/new" in identifiers
+        assert "/scene sales_demo" in identifiers
         assert "workspace/report.md" in identifiers
         assert "/" not in identifiers
         assert not any(identifier.startswith("/\\") for identifier in identifiers)

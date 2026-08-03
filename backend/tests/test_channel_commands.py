@@ -194,6 +194,11 @@ async def test_is_channel_command_recognises_slash_commands():
     assert channel_commands.is_channel_command("/thinking off") is True
     assert channel_commands.is_channel_command("/thinking status") is True
     assert channel_commands.is_channel_command("/think on") is True
+    assert channel_commands.is_channel_command("/scene warranty") is True
+    assert channel_commands.is_channel_command("/scene status") is True
+    assert channel_commands.is_channel_command("/scene off") is True
+    assert channel_commands.is_channel_command("/scene") is True
+    assert channel_commands.is_channel_command("/scene too many args") is True
     assert channel_commands.is_channel_command("  /NEW  ") is True
     assert channel_commands.is_channel_command("/RESET") is True
     # Non-commands
@@ -222,6 +227,7 @@ async def test_help_command_lists_available_im_commands():
     assert "/thinking on" in result["message"]
     assert "/thinking off" in result["message"]
     assert "/thinking status" in result["message"]
+    assert "/scene" in result["message"]
     assert "/stop" in result["message"]
     assert "/help" in result["message"]
 
@@ -372,3 +378,171 @@ async def test_stop_command_reports_when_no_turn_is_running(monkeypatch):
 
     assert result["action"] == "stop_turn"
     assert "没有正在执行" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_scene_command_activates_published_scene_on_existing_session(monkeypatch):
+    from app.services import scene_service
+
+    session = SimpleNamespace(im_config={})
+
+    async def fake_load(*_args, **_kwargs):
+        return session
+
+    async def fake_resolve(*_args, **_kwargs):
+        return scene_service.SceneRuntimeResolution(
+            scene_service.SCENE_STATUS_OK,
+            {
+                "scene_key": "warranty",
+                "name": "售后咨询",
+                "revision": 3,
+                "enabled": True,
+            },
+        )
+
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_load)
+    monkeypatch.setattr(scene_service, "resolve_scene_for_activation", fake_resolve)
+    db = FakeDB()
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/scene warranty",
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        external_conv_id="dingtalk_p2p_staff_1",
+        source_channel="dingtalk",
+    )
+
+    assert result["action"] == "scene_activated"
+    assert "售后咨询" in result["message"]
+    assert "v3" in result["message"]
+    assert "下一条消息起生效" in result["message"]
+    assert session.im_config == {"scene_key": "warranty"}
+    assert db.flushes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "action", "message"),
+    [
+        ("capability_disabled", "scene_capability_disabled", "未启用场景能力"),
+        ("not_found", "scene_not_found", "未找到场景"),
+        ("unpublished", "scene_unpublished", "尚未发布"),
+        ("disabled", "scene_disabled", "已停用"),
+    ],
+)
+async def test_scene_command_reports_precise_activation_failure(
+    monkeypatch,
+    status,
+    action,
+    message,
+):
+    from app.services import scene_service
+
+    async def fake_load(*_args, **_kwargs):
+        return None
+
+    async def fake_resolve(*_args, **_kwargs):
+        return scene_service.SceneRuntimeResolution(status)
+
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_load)
+    monkeypatch.setattr(scene_service, "resolve_scene_for_activation", fake_resolve)
+
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/scene warranty",
+        agent_id=uuid.uuid4(),
+        user_id=None,
+        external_conv_id="feishu_p2p_ou_1",
+        source_channel="feishu",
+    )
+
+    assert result["action"] == action
+    assert message in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_scene_invalid_syntax_never_falls_through_to_dialogue():
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(),
+        command="/scene too many args",
+        agent_id=uuid.uuid4(),
+        user_id=None,
+        external_conv_id="slack_D1",
+        source_channel="slack",
+    )
+
+    assert result["action"] == "scene_invalid"
+    assert "用法" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_scene_off_clears_only_scene_session_preference(monkeypatch):
+    session = SimpleNamespace(im_config={"scene_key": "warranty", "other": "keep"})
+
+    async def fake_load(*_args, **_kwargs):
+        return session
+
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_load)
+    db = FakeDB()
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/scene off",
+        agent_id=uuid.uuid4(),
+        user_id=None,
+        external_conv_id="wecom_p2p_1",
+        source_channel="wecom",
+    )
+
+    assert result["action"] == "scene_off"
+    assert "恢复默认对话模式" in result["message"]
+    assert session.im_config == {"other": "keep"}
+    assert db.flushes == 1
+
+
+@pytest.mark.asyncio
+async def test_first_scene_command_creates_control_session(monkeypatch):
+    from app.services import channel_session, scene_service
+
+    created_session = SimpleNamespace(im_config={})
+    loads = iter([None, created_session])
+    created_kwargs = {}
+
+    async def fake_load(*_args, **_kwargs):
+        return next(loads)
+
+    async def fake_resolve(*_args, **_kwargs):
+        return scene_service.SceneRuntimeResolution(
+            scene_service.SCENE_STATUS_OK,
+            {
+                "scene_key": "default",
+                "name": "默认场景",
+                "revision": 1,
+                "enabled": True,
+            },
+        )
+
+    async def fake_find_or_create(**kwargs):
+        created_kwargs.update(kwargs)
+        return created_session
+
+    monkeypatch.setattr(channel_commands, "_load_channel_session", fake_load)
+    monkeypatch.setattr(scene_service, "resolve_scene_for_activation", fake_resolve)
+    monkeypatch.setattr(channel_session, "find_or_create_channel_session", fake_find_or_create)
+    db = FakeDB()
+
+    result = await channel_commands.handle_channel_command(
+        db=db,
+        command="/scene default",
+        agent_id=uuid.uuid4(),
+        user_id=None,
+        external_conv_id="feishu_group_chat_1",
+        source_channel="feishu",
+        is_group=True,
+    )
+
+    assert result["action"] == "scene_activated"
+    assert created_kwargs["first_message_title"] == "New Session"
+    assert created_kwargs["is_group"] is True
+    assert created_kwargs["allow_unresolved_user"] is True
+    assert created_session.im_config == {"scene_key": "default"}

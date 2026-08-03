@@ -231,6 +231,7 @@ async def slack_event_webhook(
                 db=_cmd_db, command=user_text, agent_id=agent_id,
                 user_id=None, external_conv_id=conv_id,
                 source_channel="slack",
+                is_group=_is_group_slack,
             )
             await _cmd_db.commit()
         _bot_token_cmd = config.app_secret or ""

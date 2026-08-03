@@ -572,6 +572,7 @@ async def _process_wecom_text(
                 db=_cmd_db, command=user_text, agent_id=agent_id,
                 user_id=None, external_conv_id=conv_id,
                 source_channel="wecom",
+                is_group=_is_group,
             )
             await _cmd_db.commit()
         wecom_agent_id_cmd = (config.extra_config or {}).get("wecom_agent_id", "")

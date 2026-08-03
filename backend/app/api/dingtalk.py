@@ -732,6 +732,8 @@ async def process_dingtalk_message(
                 db=db, command=user_text, agent_id=agent_id,
                 user_id=platform_user_id, external_conv_id=conv_id,
                 source_channel="dingtalk",
+                is_group=conversation_type == "2",
+                group_name=conversation_title or None,
             )
             await db.commit()
             import httpx as _httpx_cmd

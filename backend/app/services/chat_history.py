@@ -751,6 +751,29 @@ async def ingest_incoming_chat_message(
         "source_channel": source_channel,
         "actor_ref": str(actor_ref or user_id),
     }
+    # Snapshot the published scene while holding the same session-row lock used
+    # to order inbound events.  A /scene command racing with an older in-flight
+    # turn can therefore affect only messages ingested after the command wins
+    # this lock.  Explicit Web/H5 scene metadata remains authoritative.
+    if not meta.get("scene_key"):
+        from app.services.scene_service import (
+            SCENE_SESSION_CONFIG_KEY,
+            SCENE_STATUS_OK,
+            resolve_scene_for_activation,
+            scene_message_meta,
+        )
+
+        active_scene_key = str(
+            (locked_session.im_config or {}).get(SCENE_SESSION_CONFIG_KEY) or ""
+        )
+        if active_scene_key:
+            resolved_scene = await resolve_scene_for_activation(
+                db,
+                agent_id,
+                active_scene_key,
+            )
+            if resolved_scene.status == SCENE_STATUS_OK:
+                meta.update(scene_message_meta(resolved_scene.manifest))
     if reply_to_external_message_id:
         meta["reply_to_external_message_id"] = str(reply_to_external_message_id)
 
@@ -1039,6 +1062,16 @@ async def persist_assistant_reply_row(
         raise ValueError("assistant reply content must be non-empty")
     final_meta = dict(message_meta or {})
     if turn_anchor_id is not None:
+        anchor = await db.get(ChatMessage, turn_anchor_id)
+        if (
+            anchor is not None
+            and anchor.agent_id == agent_id
+            and anchor.conversation_id == conversation_id
+        ):
+            anchor_meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
+            for key in ("scene_key", "scene_revision"):
+                if anchor_meta.get(key) is not None:
+                    final_meta.setdefault(key, anchor_meta[key])
         final_meta.update(
             {
                 "turn_anchor_id": str(turn_anchor_id),

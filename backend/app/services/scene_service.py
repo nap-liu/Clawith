@@ -2,6 +2,7 @@
 
 import json
 import uuid
+from dataclasses import dataclass
 
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -11,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.permissions import user_can_manage_agent_id
 from app.database import async_session
 from app.models.agent import Agent
-from app.models.audit import AuditLog
+from app.models.audit import AuditLog, ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.scene import AgentScene, AgentSceneRevision
 from app.models.tool import AgentTool, Tool
@@ -26,6 +27,22 @@ from app.schemas.scene import (
 )
 
 SCENE_TOOL_NAME = "manage_scene"
+SCENE_SESSION_CONFIG_KEY = "scene_key"
+
+SCENE_STATUS_OK = "ok"
+SCENE_STATUS_CAPABILITY_DISABLED = "capability_disabled"
+SCENE_STATUS_NOT_FOUND = "not_found"
+SCENE_STATUS_UNPUBLISHED = "unpublished"
+SCENE_STATUS_DISABLED = "disabled"
+SCENE_STATUS_REVISION_NOT_FOUND = "revision_not_found"
+
+
+@dataclass(frozen=True)
+class SceneRuntimeResolution:
+    """Result of resolving a scene for activation or turn execution."""
+
+    status: str
+    manifest: dict | None = None
 
 
 async def scene_tool_enabled(db: AsyncSession, agent_id: uuid.UUID) -> bool:
@@ -194,6 +211,159 @@ async def get_revision(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def resolve_scene_for_activation(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    scene_key: str,
+) -> SceneRuntimeResolution:
+    """Resolve the current published scene and retain a precise failure reason."""
+    if not await scene_tool_enabled(db, agent_id):
+        return SceneRuntimeResolution(SCENE_STATUS_CAPABILITY_DISABLED)
+
+    found = await get_scene(db, agent_id, validate_scene_key(scene_key))
+    if not found:
+        return SceneRuntimeResolution(SCENE_STATUS_NOT_FOUND)
+
+    scene, revision = found
+    if revision is None:
+        return SceneRuntimeResolution(SCENE_STATUS_UNPUBLISHED)
+
+    manifest = serialize_published_scene(scene, revision)
+    if not manifest["enabled"]:
+        return SceneRuntimeResolution(SCENE_STATUS_DISABLED, manifest)
+    return SceneRuntimeResolution(SCENE_STATUS_OK, manifest)
+
+
+async def load_scene_revision_manifest(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    scene_key: str,
+    revision: int,
+) -> SceneRuntimeResolution:
+    """Load the immutable scene revision recorded on a durable turn anchor."""
+    try:
+        key = validate_scene_key(scene_key)
+    except ValueError:
+        return SceneRuntimeResolution(SCENE_STATUS_NOT_FOUND)
+
+    scene = (
+        await db.execute(
+            select(AgentScene).where(
+                AgentScene.agent_id == agent_id,
+                AgentScene.scene_key == key,
+            )
+        )
+    ).scalar_one_or_none()
+    if scene is None:
+        return SceneRuntimeResolution(SCENE_STATUS_NOT_FOUND)
+
+    source = await get_revision(db, scene.id, revision)
+    if source is None:
+        return SceneRuntimeResolution(SCENE_STATUS_REVISION_NOT_FOUND)
+    return SceneRuntimeResolution(
+        SCENE_STATUS_OK,
+        serialize_published_scene(scene, source),
+    )
+
+
+def scene_message_meta(manifest: dict | None) -> dict:
+    """Return the small immutable scene reference stored on chat messages."""
+    if not manifest:
+        return {}
+    return {
+        "scene_key": manifest.get("scene_key"),
+        "scene_revision": manifest.get("revision"),
+    }
+
+
+def build_scene_channel_context(
+    manifest: dict | None,
+    *,
+    source_channel: str,
+    display_name: str,
+    client_surface: str,
+) -> dict:
+    """Build the channel-context contract shared by Web/H5 and IM turns."""
+    context = {
+        "source_channel": source_channel,
+        "display_name": display_name,
+        "client_surface": client_surface,
+    }
+    if manifest:
+        context.update(
+            {
+                "scene_key": manifest.get("scene_key"),
+                "scene_revision": manifest.get("revision"),
+                "scene_system_prompts": [
+                    item for item in manifest.get("system_prompts", []) if item.get("enabled", True)
+                ],
+                "scene_quick_actions": [
+                    item for item in manifest.get("quick_actions", []) if item.get("enabled", True)
+                ],
+            }
+        )
+    return context
+
+
+async def load_turn_scene_context(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    session_id: str,
+    turn_anchor_id: uuid.UUID | None,
+) -> dict | None:
+    """Rehydrate the exact scene revision durably recorded on one turn."""
+    if turn_anchor_id is None:
+        return None
+    get_row = getattr(db, "get", None)
+    if not callable(get_row):
+        return None
+    anchor = await get_row(ChatMessage, turn_anchor_id)
+    if anchor is None or anchor.agent_id != agent_id:
+        return None
+    meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
+    scene_key = str(meta.get("scene_key") or "")
+    try:
+        revision = int(meta.get("scene_revision"))
+    except (TypeError, ValueError):
+        return None
+    if not scene_key or revision < 1:
+        return None
+
+    try:
+        parsed_session_id = uuid.UUID(str(session_id))
+    except (TypeError, ValueError):
+        return None
+
+    session = (
+        await db.execute(
+            select(ChatSession).where(
+                ChatSession.id == parsed_session_id,
+                ChatSession.agent_id == agent_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        return None
+    if anchor.conversation_id != str(session.id):
+        return None
+
+    resolved = await load_scene_revision_manifest(
+        db,
+        agent_id,
+        scene_key,
+        revision,
+    )
+    if resolved.status != SCENE_STATUS_OK or not resolved.manifest:
+        return None
+    return build_scene_channel_context(
+        resolved.manifest,
+        source_channel=session.source_channel,
+        display_name=session.source_channel,
+        client_surface="external IM",
+    )
 
 
 async def save_scene(
