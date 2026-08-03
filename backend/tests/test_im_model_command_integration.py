@@ -235,8 +235,8 @@ async def test_status_reads_current_session_token_and_cache_usage():
     assert "运行状态：空闲" in result["message"]
     assert "模型：qwen3-max（默认模型）" in result["message"]
     assert "会话：单聊 · 1 条消息" in result["message"]
-    assert "Session Token（已记录 1 轮）：输入 1K / 输出 200 / 总计 1.2K" in result["message"]
-    assert "缓存命中率：70.0%（命中 700 / 可缓存输入 1K）" in result["message"]
+    assert "输入 1K / 输出 200 / 总计 1.2K / 缓存命中率 70.0%" in result["message"]
+    assert "已记录" not in result["message"]
 
 
 async def test_shared_model_resolver_and_web_path_enforce_catalog_rules():

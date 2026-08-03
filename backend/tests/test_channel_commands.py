@@ -327,8 +327,8 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
     assert "场景：warranty" in result["message"]
     assert "会话：群聊 · 12 条消息" in result["message"]
     assert "通道：dingtalk · 群聊" in result["message"]
-    assert "Session Token（已记录 3 轮）：输入 1K / 输出 200 / 总计 1.2K" in result["message"]
-    assert "缓存命中率：70.0%（命中 700 / 可缓存输入 1K）" in result["message"]
+    assert "输入 1K / 输出 200 / 总计 1.2K / 缓存命中率 70.0%" in result["message"]
+    assert "已记录" not in result["message"]
 
 
 @pytest.mark.asyncio

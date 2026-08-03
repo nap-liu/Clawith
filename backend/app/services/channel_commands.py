@@ -225,7 +225,6 @@ async def handle_channel_command(
             message_count = 0
             context_status = "正常"
             session_usage = TokenUsage()
-            tracked_turns = 0
         else:
             conversation_type = "群聊" if session.is_group else "单聊"
             message_count = await _count_session_messages(
@@ -235,7 +234,7 @@ async def handle_channel_command(
             )
             session_status = f"{conversation_type} · {message_count:,} 条消息"
             context_status = "已终止，请使用 /new" if session.context_terminated_reason else "正常"
-            session_usage, tracked_turns = await load_session_token_usage(
+            session_usage, _ = await load_session_token_usage(
                 db,
                 agent_id=agent_id,
                 session_id=session.id,
@@ -247,10 +246,7 @@ async def handle_channel_command(
                 100.0,
                 session_usage.cache_read_tokens / cache_denominator * 100,
             )
-            cache_status = (
-                f"{cache_hit_rate:.1f}%（命中 {_format_token_count(session_usage.cache_read_tokens)} / "
-                f"可缓存输入 {_format_token_count(cache_denominator)}）"
-            )
+            cache_status = f"{cache_hit_rate:.1f}%"
         else:
             cache_status = "暂无可用统计"
         estimated_suffix = (
@@ -271,11 +267,10 @@ async def handle_channel_command(
                 f"会话：{session_status}\n"
                 f"通道：{source_channel} · {conversation_type}\n"
                 f"上下文：{context_status}\n"
-                f"Session Token（已记录 {tracked_turns:,} 轮）："
                 f"输入 {_format_token_count(session_usage.input_tokens)} / "
                 f"输出 {_format_token_count(session_usage.output_tokens)} / "
-                f"总计 {_format_token_count(session_usage.total_tokens)}{estimated_suffix}\n"
-                f"缓存命中率：{cache_status}"
+                f"总计 {_format_token_count(session_usage.total_tokens)}{estimated_suffix} / "
+                f"缓存命中率 {cache_status}"
             ),
         }
 
