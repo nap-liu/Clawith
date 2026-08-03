@@ -107,6 +107,23 @@ def _thinking_status_label(enabled: bool) -> str:
     return "开启" if enabled else "关闭"
 
 
+def _format_token_count(value: int) -> str:
+    count = max(0, int(value or 0))
+    for divisor, suffix in (
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ):
+        if count >= divisor:
+            compact = count / divisor
+            precision = 0 if compact >= 100 else 1
+            formatted = f"{compact:.{precision}f}"
+            if "." in formatted:
+                formatted = formatted.rstrip("0").rstrip(".")
+            return formatted + suffix
+    return str(count)
+
+
 async def _count_session_messages(
     db: AsyncSession,
     *,
@@ -231,13 +248,13 @@ async def handle_channel_command(
                 session_usage.cache_read_tokens / cache_denominator * 100,
             )
             cache_status = (
-                f"{cache_hit_rate:.1f}%（命中 {session_usage.cache_read_tokens:,} / "
-                f"可缓存输入 {cache_denominator:,}）"
+                f"{cache_hit_rate:.1f}%（命中 {_format_token_count(session_usage.cache_read_tokens)} / "
+                f"可缓存输入 {_format_token_count(cache_denominator)}）"
             )
         else:
             cache_status = "暂无可用统计"
         estimated_suffix = (
-            f"，其中估算 {session_usage.estimated_tokens:,}"
+            f"，其中估算 {_format_token_count(session_usage.estimated_tokens)}"
             if session_usage.estimated_tokens > 0
             else ""
         )
@@ -255,9 +272,9 @@ async def handle_channel_command(
                 f"通道：{source_channel} · {conversation_type}\n"
                 f"上下文：{context_status}\n"
                 f"Session Token（已记录 {tracked_turns:,} 轮）："
-                f"输入 {session_usage.input_tokens:,} / "
-                f"输出 {session_usage.output_tokens:,} / "
-                f"总计 {session_usage.total_tokens:,}{estimated_suffix}\n"
+                f"输入 {_format_token_count(session_usage.input_tokens)} / "
+                f"输出 {_format_token_count(session_usage.output_tokens)} / "
+                f"总计 {_format_token_count(session_usage.total_tokens)}{estimated_suffix}\n"
                 f"缓存命中率：{cache_status}"
             ),
         }

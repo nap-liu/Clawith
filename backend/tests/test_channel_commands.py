@@ -238,6 +238,22 @@ async def test_help_command_lists_available_im_commands():
     assert "/help" in result["message"]
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0, "0"),
+        (950, "950"),
+        (1200, "1.2K"),
+        (13_579, "13.6K"),
+        (100_000, "100K"),
+        (1_250_000, "1.2M"),
+        (125_000_000, "125M"),
+    ],
+)
+def test_format_token_count_is_human_readable(value, expected):
+    assert channel_commands._format_token_count(value) == expected
+
+
 @pytest.mark.asyncio
 async def test_status_reports_current_agent_model_session_and_token_usage(monkeypatch):
     from app.services import chat_model_selection, session_token_usage
@@ -311,8 +327,8 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
     assert "场景：warranty" in result["message"]
     assert "会话：群聊 · 12 条消息" in result["message"]
     assert "通道：dingtalk · 群聊" in result["message"]
-    assert "Session Token（已记录 3 轮）：输入 1,000 / 输出 200 / 总计 1,200" in result["message"]
-    assert "缓存命中率：70.0%（命中 700 / 可缓存输入 1,000）" in result["message"]
+    assert "Session Token（已记录 3 轮）：输入 1K / 输出 200 / 总计 1.2K" in result["message"]
+    assert "缓存命中率：70.0%（命中 700 / 可缓存输入 1K）" in result["message"]
 
 
 @pytest.mark.asyncio
