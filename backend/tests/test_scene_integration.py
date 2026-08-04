@@ -140,7 +140,18 @@ async def test_scene_draft_publish_lifecycle_keeps_unpublished_changes_off_consu
                         "menu_visible": True,
                         "ai_visible": False,
                         "ai_context": "MENU_ONLY_INTERNAL_CONTEXT",
+                        "uri": "https://internal.example/old-admin",
                         "message": "I need warranty service.",
+                    },
+                    {
+                        "id": "menu_open",
+                        "label": "Menu link",
+                        "type": "open_uri",
+                        "menu_visible": True,
+                        "ai_visible": False,
+                        "ai_context": "MENU_LINK_INTERNAL_CONTEXT",
+                        "uri": "/orders",
+                        "message": "STALE_INTERNAL_MESSAGE",
                     },
                     {
                         "id": "ai_only",
@@ -203,24 +214,37 @@ async def test_scene_draft_publish_lifecycle_keeps_unpublished_changes_off_consu
         )
         assert published_revision is not None
         full_manifest = serialize_published_scene(published_scene, published_revision)
-        assert len(full_manifest["quick_actions"]) == 3
+        assert len(full_manifest["quick_actions"]) == 4
+        assert full_manifest["quick_actions"][0]["uri"] == "https://internal.example/old-admin"
+        assert full_manifest["quick_actions"][1]["message"] == "STALE_INTERNAL_MESSAGE"
         consumer_manifest = serialize_scene_manifest(published_scene, published_revision)
         assert consumer_manifest["enabled"] is True
         assert consumer_manifest["welcome_message"] == "Welcome"
         assert consumer_manifest["system_prompts"] == []
-        assert [item["id"] for item in consumer_manifest["quick_actions"]] == ["menu_only"]
+        assert [item["id"] for item in consumer_manifest["quick_actions"]] == [
+            "menu_only",
+            "menu_open",
+        ]
         assert consumer_manifest["quick_actions"][0] == {
             "id": "menu_only",
             "label": "Menu only",
             "type": "send_message",
-            "uri": None,
             "message": "I need warranty service.",
+            "menu_visible": True,
+        }
+        assert consumer_manifest["quick_actions"][1] == {
+            "id": "menu_open",
+            "label": "Menu link",
+            "type": "open_uri",
+            "uri": "/orders",
             "menu_visible": True,
         }
         serialized_consumer = json.dumps(consumer_manifest)
         assert "ai_visible" not in serialized_consumer
         assert "ai_context" not in serialized_consumer
         assert "INTERNAL_CONTEXT" not in serialized_consumer
+        assert "old-admin" not in serialized_consumer
+        assert "STALE_INTERNAL_MESSAGE" not in serialized_consumer
 
         second_published = await publish_scene(
             db,

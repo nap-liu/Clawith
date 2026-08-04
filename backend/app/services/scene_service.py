@@ -172,12 +172,16 @@ def serialize_scene_manifest(scene: AgentScene, revision: AgentSceneRevision) ->
     for action in published.get("quick_actions", []):
         if not action.get("menu_visible", action.get("enabled", True)):
             continue
-        menu_actions.append(
-            {
-                key: action.get(key)
-                for key in ("id", "label", "type", "uri", "message", "menu_visible")
-            }
-        )
+        action_type = action.get("type")
+        projected = {
+            key: action.get(key)
+            for key in ("id", "label", "type", "menu_visible")
+        }
+        if action_type == "send_message":
+            projected["message"] = action.get("message")
+        elif action_type == "open_uri":
+            projected["uri"] = action.get("uri")
+        menu_actions.append(projected)
     return {
         **published,
         # Prompt blocks and AI-only action metadata are server-side context, not a

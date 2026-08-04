@@ -126,7 +126,15 @@ export type Scene = {
     }>;
 };
 
-export type SceneManifestQuickAction = Omit<SceneQuickAction, 'ai_visible' | 'ai_context'>;
+type SceneManifestQuickActionBase = Pick<
+    SceneQuickAction,
+    'id' | 'label' | 'menu_visible' | 'enabled'
+>;
+
+export type SceneManifestQuickAction = SceneManifestQuickActionBase & (
+    | { type: 'send_message'; message: string; uri?: never }
+    | { type: 'open_uri'; uri: string; message?: never }
+);
 
 export type SceneManifest = Omit<Scene, 'system_prompts' | 'quick_actions'> & {
     system_prompts: [];
