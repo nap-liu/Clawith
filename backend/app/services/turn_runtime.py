@@ -1,8 +1,8 @@
-"""Runtime delivery adapters for restart-resumed turns.
+"""Unified delivery adapters for replies bound to a durable ChatSession.
 
-Startup recovery resumes a turn loop; it should not know channel-specific
-transport details. This module rebuilds the original runtime from the durable
-ChatSession, then delivers the final assistant reply through that runtime.
+Callers rebuild the original runtime from the persisted session and deliver through
+the same channel-specific transport, regardless of whether the reply came from a
+normal turn, a confirmation continuation, or startup recovery.
 """
 
 from __future__ import annotations
@@ -68,6 +68,64 @@ async def load_turn_runtime(
     )
 
 
+async def deliver_reply_to_origin(
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    reply: str,
+    origin_actor_ref: str | None = None,
+    origin_actor_ref_type: str | None = None,
+    require_transport: bool = False,
+    expected_source_channel: str | None = None,
+    expected_external_conv_id: str | None = None,
+    validate_external_conv_id: bool = False,
+) -> bool:
+    """Deliver a reply through the channel runtime persisted on its ChatSession."""
+    if not (reply or "").strip():
+        return True
+    try:
+        runtime = await load_turn_runtime(
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+        if require_transport and not runtime.session_found:
+            logger.warning(
+                "[turn_runtime] origin session disappeared before delivery: {}",
+                conversation_id,
+            )
+            return False
+        if expected_source_channel and runtime.source_channel != expected_source_channel:
+            logger.warning(
+                "[turn_runtime] origin channel changed before delivery: expected={} actual={}",
+                expected_source_channel,
+                runtime.source_channel,
+            )
+            return False
+        if validate_external_conv_id and runtime.external_conv_id != expected_external_conv_id:
+            logger.warning(
+                "[turn_runtime] origin conversation generation changed before delivery: "
+                "expected={} actual={}",
+                expected_external_conv_id,
+                runtime.external_conv_id,
+            )
+            return False
+        return await deliver_message_to_runtime(
+            agent_id=agent_id,
+            runtime=runtime,
+            message=reply,
+            require_transport=require_transport,
+            origin_actor_ref=origin_actor_ref,
+            origin_actor_ref_type=origin_actor_ref_type,
+        )
+    except Exception:
+        logger.opt(exception=True).warning(
+            "[turn_runtime] origin delivery raised for conversation={}; "
+            "DB history remains authoritative",
+            conversation_id,
+        )
+        return False
+
+
 async def deliver_recovered_reply_to_origin(
     *,
     agent_id: uuid.UUID,
@@ -80,41 +138,17 @@ async def deliver_recovered_reply_to_origin(
     expected_external_conv_id: str | None = None,
     validate_external_conv_id: bool = False,
 ) -> bool:
-    """Deliver a recovered final reply through the original channel runtime."""
-    if not (reply or "").strip():
-        return True
-    runtime = await load_turn_runtime(
+    """Backward-compatible recovery entry point for the unified origin delivery."""
+    return await deliver_reply_to_origin(
         agent_id=agent_id,
         conversation_id=conversation_id,
-    )
-    if require_transport and not runtime.session_found:
-        logger.warning(
-            "[turn_runtime] origin session disappeared before delivery: %s",
-            conversation_id,
-        )
-        return False
-    if expected_source_channel and runtime.source_channel != expected_source_channel:
-        logger.warning(
-            "[turn_runtime] origin channel changed before delivery: expected=%s actual=%s",
-            expected_source_channel,
-            runtime.source_channel,
-        )
-        return False
-    if validate_external_conv_id and runtime.external_conv_id != expected_external_conv_id:
-        logger.warning(
-            "[turn_runtime] origin conversation generation changed before delivery: "
-            "expected=%s actual=%s",
-            expected_external_conv_id,
-            runtime.external_conv_id,
-        )
-        return False
-    return await deliver_message_to_runtime(
-        agent_id=agent_id,
-        runtime=runtime,
-        message=reply,
-        require_transport=require_transport,
+        reply=reply,
         origin_actor_ref=origin_actor_ref,
         origin_actor_ref_type=origin_actor_ref_type,
+        require_transport=require_transport,
+        expected_source_channel=expected_source_channel,
+        expected_external_conv_id=expected_external_conv_id,
+        validate_external_conv_id=validate_external_conv_id,
     )
 
 

@@ -19,12 +19,13 @@ import pytest
 from sqlalchemy import select, update
 
 from app.database import async_session, engine
+from app.models.agent import Agent
 from app.models.audit import ChatMessage
-from app.models.agent import Agent  # noqa: F401 — FK target registered in metadata
+from app.models.channel_config import ChannelConfig
 from app.models.chat_session import ChatSession
-from app.models.user import User, Identity  # noqa: F401
-from app.models.tenant import Tenant  # noqa: F401
 from app.models.participant import Participant  # noqa: F401 — ChatMessage.participant_id FK
+from app.models.tenant import Tenant
+from app.models.user import Identity, User
 
 pytestmark = pytest.mark.asyncio
 
@@ -131,14 +132,18 @@ async def _make_session(
     user_id: uuid.UUID,
     *,
     source_channel: str = "web",
+    external_conv_id: str | None = None,
+    is_group: bool = False,
 ) -> ChatSession:
     async with async_session() as db:
         session = ChatSession(
             agent_id=agent_id,
-            user_id=user_id,
+            user_id=None if is_group else user_id,
             title="confirmation gate",
             source_channel=source_channel,
-            external_conv_id=f"{source_channel}_p2p_{uuid.uuid4().hex}",
+            external_conv_id=external_conv_id or f"{source_channel}_p2p_{uuid.uuid4().hex}",
+            is_group=is_group,
+            group_name="confirmation gate" if is_group else None,
         )
         db.add(session)
         await db.commit()
@@ -956,7 +961,7 @@ async def test_reenter_loop_marks_turn_completed_after_final_reply(monkeypatch):
 
     monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_call_agent_llm)
     monkeypatch.setattr("app.services.channel_dispatch.run_channel_message", fake_run_channel_message)
-    monkeypatch.setattr(cs, "_deliver_reply_to_channel", AsyncMock())
+    monkeypatch.setattr(cs, "deliver_reply_to_origin", AsyncMock())
 
     await cs._reenter_loop(agent_id, conv, user_id, turn_anchor_id=anchor_id)
 
@@ -973,6 +978,143 @@ async def test_reenter_loop_marks_turn_completed_after_final_reply(monkeypatch):
             )
         ).scalars().all()
     assert len(replies) == 1
+
+
+async def test_dingtalk_group_confirmation_followup_uses_unified_origin_delivery(monkeypatch):
+    """A DingTalk group card continuation reaches the persisted group target."""
+    from app.services import confirmation_service as cs
+    from app.services import turn_runtime
+
+    agent_id, user_id = await _make_agent()
+    external_conv_id = f"dingtalk_group_open-conversation-{uuid.uuid4().hex}"
+    app_id = f"ding-app-{uuid.uuid4().hex}"
+    session = await _make_session(
+        agent_id,
+        user_id,
+        source_channel="dingtalk",
+        external_conv_id=external_conv_id,
+        is_group=True,
+    )
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=agent_id,
+                channel_type="dingtalk",
+                app_id=app_id,
+                app_secret="ding-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+
+    captured = {}
+
+    async def fake_group_send(**kwargs):
+        captured.update(kwargs)
+        return {"errcode": 0}
+
+    async def fake_call_agent_llm(*_args, **_kwargs):
+        return "卡片处理完成"
+
+    async def fake_run_channel_message(_conversation_id, *, work, **_kwargs):
+        return await work()
+
+    monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fake_group_send)
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_call_agent_llm)
+    monkeypatch.setattr("app.services.channel_dispatch.run_channel_message", fake_run_channel_message)
+
+    await cs._reenter_loop(agent_id, str(session.id), user_id)
+
+    assert captured == {
+        "app_id": app_id,
+        "app_secret": "ding-secret",
+        "open_conversation_id": external_conv_id.removeprefix("dingtalk_group_"),
+        "message": "卡片处理完成",
+    }
+
+
+@pytest.mark.parametrize("source_channel", ["web", "miniprogram", "wechat_miniprogram"])
+async def test_first_party_confirmation_followup_uses_unified_origin_delivery(monkeypatch, source_channel):
+    """Web and both H5 Chat channels receive the resumed final reply live."""
+    from app.api.websocket import manager
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    session = await _make_session(agent_id, user_id, source_channel=source_channel)
+    delivered = []
+
+    async def fake_call_agent_llm(*_args, **_kwargs):
+        return "卡片处理完成"
+
+    async def fake_run_channel_message(_conversation_id, *, work, **_kwargs):
+        return await work()
+
+    async def fake_send_to_session(target_agent_id, conversation_id, payload):
+        delivered.append((target_agent_id, conversation_id, payload))
+
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_call_agent_llm)
+    monkeypatch.setattr("app.services.channel_dispatch.run_channel_message", fake_run_channel_message)
+    monkeypatch.setattr(manager, "send_to_session", fake_send_to_session)
+
+    await cs._reenter_loop(agent_id, str(session.id), user_id)
+
+    assert delivered == [
+        (
+            str(agent_id),
+            str(session.id),
+            {"type": "done", "role": "assistant", "content": "卡片处理完成"},
+        )
+    ]
+
+
+async def test_dingtalk_p2p_confirmation_followup_uses_unified_origin_delivery(monkeypatch):
+    """A DingTalk P2P card continuation still uses the exact stored recipient."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    staff_id = f"staff-{uuid.uuid4().hex}"
+    app_id = f"ding-app-{uuid.uuid4().hex}"
+    session = await _make_session(
+        agent_id,
+        user_id,
+        source_channel="dingtalk",
+        external_conv_id=f"dingtalk_p2p_{staff_id}",
+    )
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=agent_id,
+                channel_type="dingtalk",
+                app_id=app_id,
+                app_secret="ding-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+
+    captured = {}
+
+    async def fake_call_agent_llm(*_args, **_kwargs):
+        return "卡片处理完成"
+
+    async def fake_run_channel_message(_conversation_id, *, work, **_kwargs):
+        return await work()
+
+    async def fake_p2p_send(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"errcode": 0}
+
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fake_call_agent_llm)
+    monkeypatch.setattr("app.services.channel_dispatch.run_channel_message", fake_run_channel_message)
+    monkeypatch.setattr("app.services.dingtalk_service.send_dingtalk_v1_robot_oto_message", fake_p2p_send)
+
+    await cs._reenter_loop(agent_id, str(session.id), user_id)
+
+    assert captured == {
+        "args": (app_id, "ding-secret", [staff_id], "卡片处理完成"),
+        "kwargs": {"msg_type": "markdown", "robot_code": app_id},
+    }
 
 
 async def test_reenter_loop_does_not_complete_turn_when_final_persist_fails(monkeypatch):
@@ -1186,7 +1328,7 @@ async def test_dingtalk_stale_click_only_disables_card_no_reresolve_no_message()
 
     with (
         patch.object(cs, "_push_card_state", new=AsyncMock()) as push,
-        patch.object(cs, "_deliver_reply_to_channel", new=AsyncMock()) as reply,
+        patch.object(cs, "deliver_reply_to_origin", new=AsyncMock()) as reply,
         patch.object(cs, "resolve_confirmation", new=AsyncMock()) as resolve,
     ):
         delivery_id = f"{row_id.hex}.retrycard"
@@ -1241,6 +1383,61 @@ async def test_suspend_persists_intro_before_toolcall_and_broadcasts_web():
     assert payload["call_id"] == str(row_id)
     assert payload["status"] == "running"
     assert payload["args"]["buttons"][0]["value"] == "confirm"
+
+
+async def test_dingtalk_group_suspend_uses_unified_intro_and_group_card_targets():
+    """The pre-card text and card both retain the originating DingTalk group."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    external_conv_id = f"dingtalk_group_{uuid.uuid4().hex}"
+    session = await _make_session(
+        agent_id,
+        user_id,
+        source_channel="dingtalk",
+        external_conv_id=external_conv_id,
+        is_group=True,
+    )
+
+    with (
+        patch.object(cs, "_broadcast", new=AsyncMock()),
+        patch.object(cs, "deliver_reply_to_origin", new=AsyncMock(return_value=True)) as deliver_intro,
+        patch.object(cs, "_deliver_channel_card", new=AsyncMock()) as deliver_card,
+    ):
+        row_id = await cs.suspend_for_confirmation(
+            agent_id=agent_id,
+            conversation_id=str(session.id),
+            chat_session_id=session.id,
+            source_channel="dingtalk",
+            user_id=user_id,
+            intro_text="请确认处理结果",
+            title="问题是否解决",
+            summary="请选择处理结果",
+            action=None,
+            risk_level="low",
+            buttons=[{"text": "已解决", "value": "resolved"}],
+        )
+
+    deliver_intro.assert_awaited_once_with(
+        agent_id=agent_id,
+        conversation_id=str(session.id),
+        reply="请确认处理结果",
+        require_transport=True,
+    )
+    deliver_card.assert_awaited_once_with(
+        agent_id,
+        str(row_id),
+        {
+            "title": "问题是否解决",
+            "summary": "请选择处理结果",
+            "action": None,
+            "risk_level": "low",
+            "buttons": [{"text": "已解决", "value": "resolved"}],
+            "force_confirmation": True,
+        },
+        external_conv_id,
+        True,
+    )
 
 
 async def test_confirmation_rejects_a_different_resolving_user():

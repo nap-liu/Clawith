@@ -625,6 +625,38 @@ async def test_deliver_recovered_reply_routes_dingtalk_from_chat_session(monkeyp
     }
 
 
+async def test_deliver_reply_to_origin_contains_transport_exceptions(monkeypatch):
+    """A channel outage must not unwind a turn whose assistant reply is already durable."""
+    from app.services import turn_runtime
+
+    agent_id = uuid.uuid4()
+    conversation_id = str(uuid.uuid4())
+
+    async def fake_load_turn_runtime(**_kwargs):
+        return turn_runtime.TurnRuntime(
+            session_found=True,
+            source_channel="dingtalk",
+            conversation_id=conversation_id,
+            external_conv_id="dingtalk_group_test",
+            is_group=True,
+        )
+
+    async def failing_delivery(**_kwargs):
+        raise RuntimeError("temporary channel outage")
+
+    monkeypatch.setattr(turn_runtime, "load_turn_runtime", fake_load_turn_runtime)
+    monkeypatch.setattr(turn_runtime, "deliver_message_to_runtime", failing_delivery)
+
+    delivered = await turn_runtime.deliver_reply_to_origin(
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        reply="already persisted",
+        require_transport=True,
+    )
+
+    assert delivered is False
+
+
 async def test_resume_turn_delivers_existing_assistant_before_completing(monkeypatch):
     """If a crash left reply persisted but anchor processing, recovery must send that reply."""
     from app.services import turn_recovery

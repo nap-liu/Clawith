@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
+from app.services.turn_runtime import deliver_reply_to_origin
 
 logger = logging.getLogger(__name__)
 
@@ -354,7 +355,12 @@ async def suspend_for_confirmation(
     # the intro text as a message first, then the interactive card.
     if resolved_channel == "dingtalk":
         if has_intro:
-            await _deliver_reply_to_channel(agent_id, str(conversation_id), intro_text)
+            await deliver_reply_to_origin(
+                agent_id=agent_id,
+                conversation_id=str(conversation_id),
+                reply=intro_text,
+                require_transport=True,
+            )
         await _deliver_channel_card(agent_id, str(row_id), args, ext_conv_id, is_group)
     logger.info("Confirmation suspended: row %s on channel %s (conv %s)", row_id, resolved_channel, conversation_id)
     return row_id
@@ -551,7 +557,19 @@ async def _reenter_loop(
                     conversation_id=conversation_id,
                     content=reply,
                 )
-            await _deliver_reply_to_channel(agent_id, conversation_id, reply)
+            delivered = await deliver_reply_to_origin(
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                reply=reply,
+                require_transport=True,
+            )
+            if not delivered:
+                logger.warning(
+                    "Confirmation reply persisted but origin delivery failed: "
+                    "agent=%s conversation=%s",
+                    agent_id,
+                    conversation_id,
+                )
         return reply
 
     await run_channel_message(
@@ -848,54 +866,6 @@ async def _update_origin_card(
         )
     except Exception:
         logger.exception("_update_origin_card failed for %s", out_track_id)
-
-
-async def _deliver_reply_to_channel(agent_id: uuid.UUID, conversation_id: str, reply: str) -> None:
-    """Send a follow-up/intro reply back to the originating IM channel (DingTalk P2P). The
-    click callback has no session_webhook, so use the robot oTo API. Never raises."""
-    if not reply or not reply.strip():
-        return
-    try:
-        from app.models.chat_session import ChatSession
-
-        try:
-            _sid = uuid.UUID(str(conversation_id))
-        except (ValueError, TypeError):
-            return
-        async with async_session() as db:
-            sess = (
-                await db.execute(select(ChatSession).where(ChatSession.id == _sid))
-            ).scalar_one_or_none()
-        if sess is None or sess.source_channel != "dingtalk" or not sess.external_conv_id:
-            return
-
-        from app.models.channel_config import ChannelConfig
-
-        async with async_session() as db:
-            cc = (
-                await db.execute(
-                    select(ChannelConfig).where(
-                        ChannelConfig.agent_id == agent_id,
-                        ChannelConfig.channel_type == "dingtalk",
-                    )
-                )
-            ).scalar_one_or_none()
-        if cc is None or not cc.app_id or not cc.app_secret:
-            return
-
-        from app.services.dingtalk_card import _parse_target
-
-        space_type, space_id = _parse_target(sess.external_conv_id, bool(getattr(sess, "is_group", False)))
-        if space_type == "IM_ROBOT":
-            from app.services.dingtalk_service import send_dingtalk_v1_robot_oto_message
-
-            await send_dingtalk_v1_robot_oto_message(
-                cc.app_id, cc.app_secret, [space_id], reply, msg_type="markdown", robot_code=cc.app_id
-            )
-        else:
-            logger.info(f"[DingTalkCard] group continuation reply delivery not yet wired (conv {conversation_id})")
-    except Exception:
-        logger.exception("[DingTalkCard] _deliver_reply_to_channel failed")
 
 
 async def resolve_confirmation_via_dingtalk(
