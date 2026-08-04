@@ -17,6 +17,7 @@ from app.database import async_session, engine
 from app.services.agent_context import (
     SCENE_QUICK_ACTION_CONTEXT_MAX_CHARS,
     SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE,
+    _markdown_table_cell,
     _render_scene_quick_actions,
     build_agent_context,
 )
@@ -220,16 +221,13 @@ async def test_scene_quick_actions_follow_scene_prompts_in_dynamic_context():
     prompt_position = dynamic_p.index("### Response style")
     actions_position = dynamic_p.index("### Available Quick Actions")
     assert prompt_position < actions_position
-    assert "### 我要报修" in dynamic_p
-    assert "- ID: action_repair_id" in dynamic_p
-    assert "- Type: send_message" in dynamic_p
-    assert "- Action: 我要申请设备保修" in dynamic_p
-    assert "- Detailed context:" in dynamic_p
-    assert "仅适用于仍在保修期内的设备。\n提交前先确认设备编号。" in dynamic_p
-    assert "### 查看工单" in dynamic_p
-    assert "- ID: action_orders_id" in dynamic_p
-    assert "- Action: /orders" in dynamic_p
-    assert "do not grant additional permission" in dynamic_p
+    assert "| Title | Type | Content | AI Context |" in dynamic_p
+    assert (
+        "| 我要报修 | send_message | 我要申请设备保修 | "
+        "仅适用于仍在保修期内的设备。<br>提交前先确认设备编号。 |"
+    ) in dynamic_p
+    assert "| 查看工单 | open_uri | /orders |  |" in dynamic_p
+    assert "action_repair_id" not in dynamic_p
     assert "暂停入口" not in dynamic_p
     assert "不应进入上下文" not in dynamic_p
     assert "Available Quick Actions" not in static_p
@@ -258,9 +256,34 @@ async def test_scene_quick_actions_use_stable_bounded_context_projection():
     rendered = _render_scene_quick_actions(actions)
 
     assert len(rendered) <= SCENE_QUICK_ACTION_CONTEXT_MAX_CHARS
-    assert "### First action" in rendered
-    assert "### Second action" not in rendered
+    assert "| First action | send_message |" in rendered
+    assert "| Second action | send_message |" not in rendered
     assert rendered.endswith(SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE)
+
+
+async def test_scene_quick_action_table_cells_escape_markdown_compactly():
+    assert _markdown_table_cell("a\\b|c\r\nd\ne\rf") == "a\\\\b\\|c<br>d<br>e<br>f"
+
+
+async def test_scene_quick_action_keeps_single_row_after_escape_expansion():
+    rendered = _render_scene_quick_actions(
+        [
+            {
+                "id": "escaped",
+                "label": "Escaped action",
+                "type": "send_message",
+                "ai_visible": True,
+                "message": "|" * 12_000,
+                "ai_context": "\\" * 4_000,
+            }
+        ]
+    )
+
+    assert len(rendered) <= SCENE_QUICK_ACTION_CONTEXT_MAX_CHARS
+    assert "| Escaped action | send_message |" in rendered
+    assert "\\|" in rendered
+    assert "…" in rendered
+    assert not rendered.endswith(SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE)
 
 
 async def test_build_agent_context_does_not_inject_focus_block():

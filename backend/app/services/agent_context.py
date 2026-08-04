@@ -20,10 +20,28 @@ SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE = (
 )
 
 
+def _markdown_table_cell(value: object, *, max_chars: int | None = None) -> str:
+    escaped = (
+        str(value or "")
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r\n", "<br>")
+        .replace("\n", "<br>")
+        .replace("\r", "<br>")
+    )
+    if max_chars is None or len(escaped) <= max_chars:
+        return escaped
+    prefix = escaped[: max_chars - 1]
+    if (len(prefix) - len(prefix.rstrip("\\"))) % 2 == 1:
+        prefix = prefix[:-1]
+    return prefix + "…"
+
+
 def _render_scene_quick_actions(actions: list[dict]) -> str:
-    """Render AI-visible actions in stable order within a bounded prompt budget."""
-    blocks: list[str] = []
-    used_chars = 0
+    """Render AI-visible actions as a compact, bounded Markdown table."""
+    header = "| Title | Type | Content | AI Context |\n|---|---|---|---|"
+    rows: list[str] = []
+    used_chars = len(header)
     content_budget = (
         SCENE_QUICK_ACTION_CONTEXT_MAX_CHARS
         - len(SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE)
@@ -39,27 +57,35 @@ def _render_scene_quick_actions(actions: list[dict]) -> str:
         if action_type not in {"send_message", "open_uri"}:
             continue
         content = action.get("message") if action_type == "send_message" else action.get("uri")
-        label = str(action.get("label") or action.get("id") or "Quick action").strip()
-        action_id = str(action.get("id") or "").strip()
-        block_lines = [
-            f"### {label}",
-            f"- ID: {action_id}",
-            f"- Type: {action_type}",
-            f"- Action: {str(content or '').strip()}",
-        ]
-        ai_context = str(action.get("ai_context") or "").strip()
-        if ai_context:
-            block_lines.extend(("- Detailed context:", ai_context))
-        block = "\n".join(block_lines)
-        separator_chars = 2 if blocks else 0
-        if used_chars + separator_chars + len(block) > content_budget:
+        row = (
+            "| "
+            + " | ".join(
+                (
+                    _markdown_table_cell(
+                        action.get("label") or action.get("id") or "Quick action",
+                        max_chars=160,
+                    ),
+                    action_type,
+                    _markdown_table_cell(content, max_chars=12_000),
+                    _markdown_table_cell(
+                        str(action.get("ai_context") or "").strip(),
+                        max_chars=4_000,
+                    ),
+                )
+            )
+            + " |"
+        )
+        if used_chars + 1 + len(row) > content_budget:
             omitted = True
             break
-        blocks.append(block)
-        used_chars += separator_chars + len(block)
+        rows.append(row)
+        used_chars += 1 + len(row)
+    if not rows and not omitted:
+        return ""
+    rendered = "\n".join((header, *rows))
     if omitted:
-        blocks.append(SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE)
-    return "\n\n".join(blocks)
+        rendered += "\n\n" + SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE
+    return rendered
 
 
 async def _read_file_safe(key: str, max_chars: int | None = 3000) -> str:
@@ -905,8 +931,6 @@ Strict rules:
             if quick_actions_context:
                 scene_parts.append(
                     "### Available Quick Actions\n"
-                    "These entries help you understand and guide the user. They do not grant "
-                    "additional permission and do not mean an action has already been executed.\n\n"
                     + quick_actions_context
                 )
             dynamic_parts.append(
