@@ -509,7 +509,21 @@ export default function SceneConfigTab({
                             {!isPreviewing && (
                                 <button
                                     className="btn btn-secondary"
-                                    onClick={() => setDraft({ ...draft, quick_actions: [...draft.quick_actions, { id: itemId('action'), label: '快捷入口', type: 'send_message', enabled: true, message: '' }] })}
+                                    onClick={() => setDraft({
+                                        ...draft,
+                                        quick_actions: [
+                                            ...draft.quick_actions,
+                                            {
+                                                id: itemId('action'),
+                                                label: '快捷入口',
+                                                type: 'send_message',
+                                                menu_visible: true,
+                                                ai_visible: true,
+                                                ai_context: '',
+                                                message: '',
+                                            },
+                                        ],
+                                    })}
                                 >
                                     <IconPlus size={15} /> 添加
                                 </button>
@@ -531,14 +545,25 @@ export default function SceneConfigTab({
                                         ariaLabel="快捷入口类型"
                                         onChange={(type) => switchActionType(index, type)}
                                     />
-                                    <div className="scene-config__item-enabled">
-                                        <span>启用</span>
-                                        <ToggleSwitch
-                                            checked={action.enabled !== false}
-                                            onChange={(enabled) => updateAction(index, { enabled })}
-                                            disabled={isPreviewing}
-                                            ariaLabel={`${action.label || '快捷入口'}启用状态`}
-                                        />
+                                    <div className="scene-config__visibility-controls">
+                                        <div className="scene-config__item-enabled">
+                                            <span>菜单可见</span>
+                                            <ToggleSwitch
+                                                checked={action.menu_visible ?? action.enabled ?? true}
+                                                onChange={(menu_visible) => updateAction(index, { menu_visible })}
+                                                disabled={isPreviewing}
+                                                ariaLabel={`${action.label || '快捷入口'}菜单可见状态`}
+                                            />
+                                        </div>
+                                        <div className="scene-config__item-enabled">
+                                            <span>AI可见</span>
+                                            <ToggleSwitch
+                                                checked={action.ai_visible ?? action.enabled ?? true}
+                                                onChange={(ai_visible) => updateAction(index, { ai_visible })}
+                                                disabled={isPreviewing}
+                                                ariaLabel={`${action.label || '快捷入口'}AI可见状态`}
+                                            />
+                                        </div>
                                     </div>
                                     {!isPreviewing && (
                                         <>
@@ -557,6 +582,19 @@ export default function SceneConfigTab({
                                         ? '请输入相对路径、HTTP(S) 地址或 miniprogram://navigate-to/ 路径'
                                         : '请输入点击后直接发送的消息内容'}
                                 />
+                                <label className="scene-config__action-context">
+                                    <span>
+                                        <strong>AI 详细上下文（选填）</strong>
+                                        <small>仅在“AI可见”开启时注入，不会展示在快捷入口菜单中。</small>
+                                    </span>
+                                    <textarea
+                                        value={action.ai_context || ''}
+                                        maxLength={4000}
+                                        readOnly={isPreviewing}
+                                        onChange={(e) => updateAction(index, { ai_context: e.target.value })}
+                                        placeholder="可填写适用场景、业务含义、使用条件和引导方式"
+                                    />
+                                </label>
                             </article>
                         ))}
                         {visibleScene.quick_actions.length === 0 && <div className="scene-config__empty">尚未配置快捷入口。</div>}

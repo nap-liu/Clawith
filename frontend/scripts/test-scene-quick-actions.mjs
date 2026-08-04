@@ -5,25 +5,28 @@ import { loadTypeScriptModule } from './load-typescript-module.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const {
-    enabledSceneQuickActions,
-    findEnabledSceneQuickAction,
+    findMenuVisibleSceneQuickAction,
     isSceneQuickActionUnavailable,
+    menuVisibleSceneQuickActions,
 } = loadTypeScriptModule(
     resolve(__dirname, '../src/utils/sceneQuickActions.ts'),
 );
 
 const actions = [
-    { id: 'default-enabled', label: 'Default' },
-    { id: 'enabled', label: 'Enabled', enabled: true },
-    { id: 'disabled', label: 'Disabled', enabled: false },
+    { id: 'default-visible', label: 'Default' },
+    { id: 'menu-only', label: 'Menu only', menu_visible: true, ai_visible: false },
+    { id: 'ai-only', label: 'AI only', menu_visible: false, ai_visible: true },
+    { id: 'legacy-visible', label: 'Legacy visible', enabled: true },
+    { id: 'legacy-hidden', label: 'Legacy hidden', enabled: false },
 ];
 
 assert.deepEqual(
-    enabledSceneQuickActions(actions).map((action) => action.id),
-    ['default-enabled', 'enabled'],
+    menuVisibleSceneQuickActions(actions).map((action) => action.id),
+    ['default-visible', 'menu-only', 'legacy-visible'],
 );
-assert.equal(findEnabledSceneQuickAction(actions, 'enabled')?.label, 'Enabled');
-assert.equal(findEnabledSceneQuickAction(actions, 'disabled'), undefined);
+assert.equal(findMenuVisibleSceneQuickAction(actions, 'menu-only')?.label, 'Menu only');
+assert.equal(findMenuVisibleSceneQuickAction(actions, 'ai-only'), undefined);
+assert.equal(findMenuVisibleSceneQuickAction(actions, 'legacy-hidden'), undefined);
 assert.equal(
     isSceneQuickActionUnavailable(
         { id: 'send', type: 'send_message' },

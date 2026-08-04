@@ -355,6 +355,37 @@
     font-size: 12px;
 }
 
+.scene-config__visibility-controls {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.scene-config__action-context {
+    display: block;
+    margin-top: 12px;
+}
+
+.scene-config__action-context > span {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.scene-config__action-context small {
+    color: var(--text-tertiary);
+    font-size: 11px;
+    font-weight: 400;
+}
+
+.scene-config__action-context textarea {
+    min-height: 90px;
+}
+
 .scene-config__item-toolbar label {
     display: inline-flex;
     align-items: center;
@@ -458,5 +489,19 @@
 
     .scene-config__item-toolbar {
         flex-wrap: wrap;
+    }
+
+    .scene-config__visibility-controls {
+        width: 100%;
+        justify-content: flex-start;
+    }
+
+    .scene-config__action-context > span {
+        display: block;
+    }
+
+    .scene-config__action-context small {
+        display: block;
+        margin-top: 4px;
     }
 }

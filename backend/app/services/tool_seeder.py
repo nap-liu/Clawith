@@ -211,9 +211,9 @@ BUILTIN_TOOLS = [
                     "description": (
                         "Optional ordered quick actions. Omit to preserve the current list "
                         "during an incremental save; use an empty array to clear it. "
-                        "When supplied, the whole list replaces the previous list. Each supplied "
-                        "item whose enabled field is omitted becomes enabled, including an item "
-                        "with the same id as a previously disabled item. No item count limit is imposed."
+                        "When supplied, the whole list replaces the previous list. For each supplied "
+                        "item, omitted menu_visible and ai_visible fields default to true, including "
+                        "an item with the same id as a previously hidden item. No item count limit is imposed."
                     ),
                     "items": {
                         "type": "object",
@@ -222,13 +222,28 @@ BUILTIN_TOOLS = [
                             "id": {"type": "string", "minLength": 1, "maxLength": 120},
                             "label": {"type": "string", "minLength": 1, "maxLength": 80},
                             "type": {"type": "string", "enum": ["open_uri", "send_message"]},
-                            "enabled": {
+                            "menu_visible": {
                                 "type": "boolean",
                                 "default": True,
                                 "description": (
-                                    "Whether this quick action is available. "
-                                    "Omit when creating an enabled action; set false to "
-                                    "temporarily hide it without deleting its configuration."
+                                    "Whether this quick action is shown in the user-facing quick-action menu. "
+                                    "Omitting it makes the supplied action menu-visible."
+                                ),
+                            },
+                            "ai_visible": {
+                                "type": "boolean",
+                                "default": True,
+                                "description": (
+                                    "Whether this quick action and its detailed context are included in the "
+                                    "current scene's AI context. Omitting it makes the supplied action AI-visible."
+                                ),
+                            },
+                            "ai_context": {
+                                "type": "string",
+                                "maxLength": 4000,
+                                "description": (
+                                    "Optional AI-only detailed context, such as business meaning, applicable "
+                                    "situations, prerequisites, and guidance. It is never displayed in the menu."
                                 ),
                             },
                             "uri": {

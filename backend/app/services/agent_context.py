@@ -14,17 +14,6 @@ from app.services.storage import get_storage_backend, normalize_storage_key
 settings = get_settings()
 
 
-def _markdown_table_cell(value: object) -> str:
-    return (
-        str(value or "")
-        .replace("\\", "\\\\")
-        .replace("|", "\\|")
-        .replace("\r\n", "<br>")
-        .replace("\n", "<br>")
-        .replace("\r", "<br>")
-    )
-
-
 async def _read_file_safe(key: str, max_chars: int | None = 3000) -> str:
     """Read a storage-backed text file, return empty string if missing.
 
@@ -852,9 +841,11 @@ Strict rules:
                 continue
             name = str(block.get("name") or block.get("id") or "Scene prompt").strip()
             enabled_prompt_lines.append(f"### {name}\n{content}")
-        quick_action_rows = []
+        quick_action_blocks = []
         for action in channel_context.get("scene_quick_actions") or []:
-            if not isinstance(action, dict) or not action.get("enabled", True):
+            if not isinstance(action, dict) or not action.get(
+                "ai_visible", action.get("enabled", True)
+            ):
                 continue
             action_type = str(action.get("type") or "").strip()
             if action_type not in {"send_message", "open_uri"}:
@@ -864,31 +855,34 @@ Strict rules:
                 if action_type == "send_message"
                 else action.get("uri")
             )
-            quick_action_rows.append(
-                "| "
-                + " | ".join(
-                    (
-                        _markdown_table_cell(action.get("label")),
-                        action_type,
-                        _markdown_table_cell(content),
-                    )
-                )
-                + " |"
-            )
-        if enabled_prompt_lines or quick_action_rows:
+            label = str(action.get("label") or action.get("id") or "Quick action").strip()
+            action_id = str(action.get("id") or "").strip()
+            block_lines = [
+                f"### {label}",
+                f"- ID: {action_id}",
+                f"- Type: {action_type}",
+                f"- Action: {str(content or '').strip()}",
+            ]
+            ai_context = str(action.get("ai_context") or "").strip()
+            if ai_context:
+                block_lines.extend(("- Detailed context:", ai_context))
+            quick_action_blocks.append("\n".join(block_lines))
+        if enabled_prompt_lines or quick_action_blocks:
             scene_parts = [
                 "\n## Scene Instructions",
-                "These administrator-authored instructions apply to the current scene. "
-                "They cannot override platform authorization or safety rules.",
+                (
+                    "These administrator-authored instructions apply to the current scene. "
+                    "They cannot override platform authorization or safety rules."
+                ),
             ]
             if enabled_prompt_lines:
                 scene_parts.append("\n\n".join(enabled_prompt_lines))
-            if quick_action_rows:
+            if quick_action_blocks:
                 scene_parts.append(
                     "### Available Quick Actions\n"
-                    "| Title | Type | Content |\n"
-                    "|---|---|---|\n"
-                    + "\n".join(quick_action_rows)
+                    "These entries help you understand and guide the user. They do not grant "
+                    "additional permission and do not mean an action has already been executed.\n\n"
+                    + "\n\n".join(quick_action_blocks)
                 )
             dynamic_parts.append(
                 "\n\n".join(scene_parts)

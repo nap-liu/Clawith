@@ -71,20 +71,46 @@ def test_quick_action_preserves_inactive_type_content():
 
     assert action.uri == "/work-orders"
     assert action.message == "我要报修"
-    assert action.enabled is True
+    assert action.menu_visible is True
+    assert action.ai_visible is True
+    assert action.ai_context == ""
 
 
-def test_quick_action_can_be_temporarily_disabled():
-    action = SceneQuickAction(
-        id="warranty",
-        label="Warranty",
-        type="send_message",
-        enabled=False,
-        message="我要报修",
+@pytest.mark.parametrize("legacy_enabled", [True, False])
+def test_quick_action_maps_legacy_enabled_to_both_visibility_flags(legacy_enabled):
+    action = SceneQuickAction.model_validate(
+        {
+            "id": "warranty",
+            "label": "Warranty",
+            "type": "send_message",
+            "enabled": legacy_enabled,
+            "message": "我要报修",
+        }
     )
 
-    assert action.enabled is False
+    assert action.menu_visible is legacy_enabled
+    assert action.ai_visible is legacy_enabled
     assert action.message == "我要报修"
+
+
+def test_quick_action_visibility_is_independent_and_new_fields_override_legacy():
+    action = SceneQuickAction.model_validate(
+        {
+            "id": "warranty",
+            "label": "Warranty",
+            "type": "send_message",
+            "enabled": False,
+            "menu_visible": True,
+            "ai_visible": False,
+            "ai_context": "Use when the device is covered by warranty.",
+            "message": "我要报修",
+        }
+    )
+
+    assert action.menu_visible is True
+    assert action.ai_visible is False
+    assert action.ai_context == "Use when the device is covered by warranty."
+    assert "enabled" not in action.model_dump()
 
 
 @pytest.mark.parametrize(
@@ -176,6 +202,11 @@ def test_scene_tool_is_global_builtin_and_opt_in():
     assert "array field is provided, it replaces that entire ordered array" in description
     assert "Every save requires expected_revision" in description
     schema = seed["parameters_schema"]
+    action_properties = schema["properties"]["quick_actions"]["items"]["properties"]
+    assert action_properties["menu_visible"]["default"] is True
+    assert action_properties["ai_visible"]["default"] is True
+    assert action_properties["ai_context"]["maxLength"] == 4000
+    assert "enabled" not in action_properties
     assert "examples" not in schema
     Draft7Validator.check_schema(schema)
     validator = Draft7Validator(schema)

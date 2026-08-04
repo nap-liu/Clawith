@@ -1,20 +1,24 @@
 type SceneQuickActionState = {
     id: string;
+    menu_visible?: boolean;
+    /** Compatibility-only field returned by older backends. */
     enabled?: boolean;
     type?: string;
 };
 
-export function enabledSceneQuickActions<T extends SceneQuickActionState>(
+export function menuVisibleSceneQuickActions<T extends SceneQuickActionState>(
     actions: readonly T[] | null | undefined,
 ): T[] {
-    return (actions || []).filter((action) => action.enabled !== false);
+    return (actions || []).filter((action) => (
+        action.menu_visible ?? action.enabled ?? true
+    ));
 }
 
-export function findEnabledSceneQuickAction<T extends SceneQuickActionState>(
+export function findMenuVisibleSceneQuickAction<T extends SceneQuickActionState>(
     actions: readonly T[] | null | undefined,
     actionId: string,
 ): T | undefined {
-    return enabledSceneQuickActions(actions).find((action) => action.id === actionId);
+    return menuVisibleSceneQuickActions(actions).find((action) => action.id === actionId);
 }
 
 export function isSceneQuickActionUnavailable(

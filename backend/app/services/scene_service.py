@@ -300,7 +300,9 @@ def build_scene_channel_context(
                     item for item in manifest.get("system_prompts", []) if item.get("enabled", True)
                 ],
                 "scene_quick_actions": [
-                    item for item in manifest.get("quick_actions", []) if item.get("enabled", True)
+                    item
+                    for item in manifest.get("quick_actions", [])
+                    if item.get("ai_visible", item.get("enabled", True))
                 ],
             }
         )

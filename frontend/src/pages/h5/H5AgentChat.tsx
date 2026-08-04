@@ -50,9 +50,9 @@ import {
     type ChatModelOption,
 } from '../../utils/chatAttachments';
 import {
-    enabledSceneQuickActions,
-    findEnabledSceneQuickAction,
+    findMenuVisibleSceneQuickAction,
     isSceneQuickActionUnavailable,
+    menuVisibleSceneQuickActions,
 } from '../../utils/sceneQuickActions';
 import {
     applyAssistantStreamMessage,
@@ -739,7 +739,7 @@ export default function H5AgentChat() {
     }, [pageResumeRevision, refreshSceneManifest]);
 
     const activeQuickActions = useMemo(
-        () => enabledSceneQuickActions(sceneManifest?.quick_actions),
+        () => menuVisibleSceneQuickActions(sceneManifest?.quick_actions),
         [sceneManifest?.quick_actions],
     );
 
@@ -1865,7 +1865,7 @@ export default function H5AgentChat() {
         quickActionActivationRef.current = true;
         try {
             const latestManifest = await refreshSceneManifest();
-            const action = findEnabledSceneQuickAction(
+            const action = findMenuVisibleSceneQuickAction(
                 latestManifest?.quick_actions,
                 snapshot.id,
             );

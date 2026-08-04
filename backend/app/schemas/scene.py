@@ -30,9 +30,25 @@ class SceneQuickAction(BaseModel):
     id: str = Field(max_length=64)
     label: str = Field(min_length=1, max_length=80)
     type: Literal["open_uri", "send_message"]
-    enabled: bool = True
+    menu_visible: bool = True
+    ai_visible: bool = True
+    ai_context: str = Field(default="", max_length=4000)
     uri: str | None = Field(default=None, max_length=2048)
     message: str | None = Field(default=None, max_length=12000)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_visibility(cls, value):
+        """Map the former shared enabled flag to both independent surfaces."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        legacy_enabled = normalized.pop("enabled", None)
+        if "menu_visible" not in normalized:
+            normalized["menu_visible"] = True if legacy_enabled is None else legacy_enabled
+        if "ai_visible" not in normalized:
+            normalized["ai_visible"] = True if legacy_enabled is None else legacy_enabled
+        return normalized
 
     @field_validator("id")
     @classmethod

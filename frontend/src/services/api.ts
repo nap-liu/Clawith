@@ -98,7 +98,11 @@ export type SceneQuickAction = {
     id: string;
     label: string;
     type: 'open_uri' | 'send_message';
-    enabled: boolean;
+    menu_visible: boolean;
+    ai_visible: boolean;
+    ai_context: string;
+    /** Compatibility-only field returned by older backends. */
+    enabled?: boolean;
     uri?: string | null;
     message?: string | null;
 };

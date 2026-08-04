@@ -190,21 +190,22 @@ async def test_scene_quick_actions_follow_scene_prompts_in_dynamic_context():
                     "id": "action_repair_id",
                     "label": "我要报修",
                     "type": "send_message",
-                    "enabled": True,
+                    "ai_visible": True,
+                    "ai_context": "仅适用于仍在保修期内的设备。\n提交前先确认设备编号。",
                     "message": "我要申请设备保修",
                 },
                 {
                     "id": "action_orders_id",
                     "label": "查看工单",
                     "type": "open_uri",
-                    "enabled": True,
+                    "ai_visible": True,
                     "uri": "/orders",
                 },
                 {
                     "id": "disabled",
                     "label": "暂停入口",
                     "type": "send_message",
-                    "enabled": False,
+                    "ai_visible": False,
                     "message": "不应进入上下文",
                 },
             ],
@@ -214,11 +215,16 @@ async def test_scene_quick_actions_follow_scene_prompts_in_dynamic_context():
     prompt_position = dynamic_p.index("### Response style")
     actions_position = dynamic_p.index("### Available Quick Actions")
     assert prompt_position < actions_position
-    assert "| Title | Type | Content |" in dynamic_p
-    assert "| 我要报修 | send_message | 我要申请设备保修 |" in dynamic_p
-    assert "| 查看工单 | open_uri | /orders |" in dynamic_p
-    assert "action_repair_id" not in dynamic_p
-    assert "action_orders_id" not in dynamic_p
+    assert "### 我要报修" in dynamic_p
+    assert "- ID: action_repair_id" in dynamic_p
+    assert "- Type: send_message" in dynamic_p
+    assert "- Action: 我要申请设备保修" in dynamic_p
+    assert "- Detailed context:" in dynamic_p
+    assert "仅适用于仍在保修期内的设备。\n提交前先确认设备编号。" in dynamic_p
+    assert "### 查看工单" in dynamic_p
+    assert "- ID: action_orders_id" in dynamic_p
+    assert "- Action: /orders" in dynamic_p
+    assert "do not grant additional permission" in dynamic_p
     assert "暂停入口" not in dynamic_p
     assert "不应进入上下文" not in dynamic_p
     assert "Available Quick Actions" not in static_p
