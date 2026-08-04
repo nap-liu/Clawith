@@ -31,6 +31,7 @@ from app.services.scene_service import (
     publish_scene,
     save_scene,
     serialize_published_scene,
+    serialize_scene_manifest,
 )
 from app.services.tool_seeder import BUILTIN_TOOLS, seed_builtin_tools
 
@@ -124,13 +125,41 @@ async def test_scene_draft_publish_lifecycle_keeps_unpublished_changes_off_consu
                 enabled=True,
                 expected_revision=0,
                 welcome_message="Welcome",
+                system_prompts=[
+                    {
+                        "id": "internal",
+                        "name": "Internal policy",
+                        "content": "Never expose this prompt to the browser.",
+                    }
+                ],
                 quick_actions=[
                     {
-                        "id": "start",
-                        "label": "Start warranty",
+                        "id": "menu_only",
+                        "label": "Menu only",
                         "type": "send_message",
+                        "menu_visible": True,
+                        "ai_visible": False,
+                        "ai_context": "MENU_ONLY_INTERNAL_CONTEXT",
                         "message": "I need warranty service.",
-                    }
+                    },
+                    {
+                        "id": "ai_only",
+                        "label": "AI only",
+                        "type": "send_message",
+                        "menu_visible": False,
+                        "ai_visible": True,
+                        "ai_context": "AI_ONLY_INTERNAL_CONTEXT",
+                        "message": "Internal AI action.",
+                    },
+                    {
+                        "id": "hidden",
+                        "label": "Hidden",
+                        "type": "send_message",
+                        "menu_visible": False,
+                        "ai_visible": False,
+                        "ai_context": "HIDDEN_INTERNAL_CONTEXT",
+                        "message": "Hidden action.",
+                    },
                 ],
             ),
             created_by_user_id=user_id,
@@ -173,9 +202,25 @@ async def test_scene_draft_publish_lifecycle_keeps_unpublished_changes_off_consu
             enabled_only=True,
         )
         assert published_revision is not None
-        consumer_manifest = serialize_published_scene(published_scene, published_revision)
+        full_manifest = serialize_published_scene(published_scene, published_revision)
+        assert len(full_manifest["quick_actions"]) == 3
+        consumer_manifest = serialize_scene_manifest(published_scene, published_revision)
         assert consumer_manifest["enabled"] is True
         assert consumer_manifest["welcome_message"] == "Welcome"
+        assert consumer_manifest["system_prompts"] == []
+        assert [item["id"] for item in consumer_manifest["quick_actions"]] == ["menu_only"]
+        assert consumer_manifest["quick_actions"][0] == {
+            "id": "menu_only",
+            "label": "Menu only",
+            "type": "send_message",
+            "uri": None,
+            "message": "I need warranty service.",
+            "menu_visible": True,
+        }
+        serialized_consumer = json.dumps(consumer_manifest)
+        assert "ai_visible" not in serialized_consumer
+        assert "ai_context" not in serialized_consumer
+        assert "INTERNAL_CONTEXT" not in serialized_consumer
 
         second_published = await publish_scene(
             db,

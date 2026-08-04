@@ -165,6 +165,28 @@ def serialize_published_scene(scene: AgentScene, revision: AgentSceneRevision) -
     }
 
 
+def serialize_scene_manifest(scene: AgentScene, revision: AgentSceneRevision) -> dict:
+    """Return the least-privilege scene projection consumed by user-facing clients."""
+    published = serialize_published_scene(scene, revision)
+    menu_actions = []
+    for action in published.get("quick_actions", []):
+        if not action.get("menu_visible", action.get("enabled", True)):
+            continue
+        menu_actions.append(
+            {
+                key: action.get(key)
+                for key in ("id", "label", "type", "uri", "message", "menu_visible")
+            }
+        )
+    return {
+        **published,
+        # Prompt blocks and AI-only action metadata are server-side context, not a
+        # browser contract. Keep the existing shape while withholding their content.
+        "system_prompts": [],
+        "quick_actions": menu_actions,
+    }
+
+
 async def list_scenes(db: AsyncSession, agent_id: uuid.UUID) -> list[dict]:
     result = await db.execute(
         select(AgentScene).where(AgentScene.agent_id == agent_id).order_by(AgentScene.created_at, AgentScene.scene_key)

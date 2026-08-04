@@ -213,13 +213,20 @@ BUILTIN_TOOLS = [
                         "during an incremental save; use an empty array to clear it. "
                         "When supplied, the whole list replaces the previous list. For each supplied "
                         "item, omitted menu_visible and ai_visible fields default to true, including "
-                        "an item with the same id as a previously hidden item. No item count limit is imposed."
+                        "an item with the same id as a previously hidden item. No item count limit is imposed. "
+                        "AI-visible entries are injected in list order up to a shared 24000-character "
+                        "runtime context budget; overflow is omitted with an explicit marker."
                     ),
                     "items": {
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
-                            "id": {"type": "string", "minLength": 1, "maxLength": 120},
+                            "id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64,
+                                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+                            },
                             "label": {"type": "string", "minLength": 1, "maxLength": 80},
                             "type": {"type": "string", "enum": ["open_uri", "send_message"]},
                             "menu_visible": {

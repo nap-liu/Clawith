@@ -14,7 +14,12 @@ from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
 from app.models.participant import Participant  # noqa: F401
 from app.models.agent import Agent
 from app.database import async_session, engine
-from app.services.agent_context import build_agent_context
+from app.services.agent_context import (
+    SCENE_QUICK_ACTION_CONTEXT_MAX_CHARS,
+    SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE,
+    _render_scene_quick_actions,
+    build_agent_context,
+)
 
 
 pytestmark = pytest.mark.asyncio
@@ -228,6 +233,34 @@ async def test_scene_quick_actions_follow_scene_prompts_in_dynamic_context():
     assert "暂停入口" not in dynamic_p
     assert "不应进入上下文" not in dynamic_p
     assert "Available Quick Actions" not in static_p
+
+
+async def test_scene_quick_actions_use_stable_bounded_context_projection():
+    actions = [
+        {
+            "id": "first",
+            "label": "First action",
+            "type": "send_message",
+            "ai_visible": True,
+            "message": "m" * 12000,
+            "ai_context": "c" * 4000,
+        },
+        {
+            "id": "second",
+            "label": "Second action",
+            "type": "send_message",
+            "ai_visible": True,
+            "message": "n" * 12000,
+            "ai_context": "d" * 4000,
+        },
+    ]
+
+    rendered = _render_scene_quick_actions(actions)
+
+    assert len(rendered) <= SCENE_QUICK_ACTION_CONTEXT_MAX_CHARS
+    assert "### First action" in rendered
+    assert "### Second action" not in rendered
+    assert rendered.endswith(SCENE_QUICK_ACTION_CONTEXT_TRUNCATION_NOTICE)
 
 
 async def test_build_agent_context_does_not_inject_focus_block():

@@ -20,8 +20,8 @@ from app.services.scene_service import (
     rollback_scene,
     save_scene,
     scene_tool_enabled,
-    serialize_published_scene,
     serialize_scene,
+    serialize_scene_manifest,
 )
 
 router = APIRouter(prefix="/agents/{agent_id}/scenes", tags=["scenes"])
@@ -187,4 +187,4 @@ async def get_scene_manifest(
     scene, revision = found
     if revision is None:
         raise HTTPException(status_code=404, detail="Published scene not found")
-    return serialize_published_scene(scene, revision)
+    return serialize_scene_manifest(scene, revision)

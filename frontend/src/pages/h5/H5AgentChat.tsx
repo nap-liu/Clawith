@@ -31,8 +31,8 @@ import {
     sceneApi,
     tenantApi,
     uploadFileWithProgress,
-    type Scene,
-    type SceneQuickAction,
+    type SceneManifest,
+    type SceneManifestQuickAction,
 } from '../../services/api';
 import type { Agent, TokenResponse } from '../../types';
 import {
@@ -376,7 +376,7 @@ export default function H5AgentChat() {
     const [authError, setAuthError] = useState('');
     const [agent, setAgent] = useState<Agent | null>(null);
     const [agentError, setAgentError] = useState('');
-    const [sceneManifest, setSceneManifest] = useState<Scene | null>(null);
+    const [sceneManifest, setSceneManifest] = useState<SceneManifest | null>(null);
     const [quickActionsOverflow, setQuickActionsOverflow] = useState(false);
     const [quickActionsMenuOpen, setQuickActionsMenuOpen] = useState(false);
     const [quickActionsMenuClosing, setQuickActionsMenuClosing] = useState(false);
@@ -409,7 +409,7 @@ export default function H5AgentChat() {
     const [imagePreview, setImagePreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
 
     const wsRef = useRef<WebSocket | null>(null);
-    const sceneManifestRef = useRef<Scene | null>(null);
+    const sceneManifestRef = useRef<SceneManifest | null>(null);
     const sceneManifestRequestRef = useRef(0);
     const quickActionActivationRef = useRef(false);
     const sessionIdRef = useRef<string | null>(initialSessionId);
@@ -1838,7 +1838,7 @@ export default function H5AgentChat() {
         || isBusy
         || isStartingNew
         || isSwitchingSession;
-    const quickActionUnavailable = (action: SceneQuickAction) => (
+    const quickActionUnavailable = (action: SceneManifestQuickAction) => (
         isSceneQuickActionUnavailable(action, {
             confirmationPending,
             sendMessageUnavailable: quickMessageDisabled,
@@ -1854,7 +1854,7 @@ export default function H5AgentChat() {
                 .includes(query)
         ));
     }, [activeQuickActions, quickActionSearch]);
-    const activateQuickAction = async (snapshot: SceneQuickAction) => {
+    const activateQuickAction = async (snapshot: SceneManifestQuickAction) => {
         if (
             quickActionActivationRef.current
             || confirmationPending

@@ -203,6 +203,12 @@ def test_scene_tool_is_global_builtin_and_opt_in():
     assert "Every save requires expected_revision" in description
     schema = seed["parameters_schema"]
     action_properties = schema["properties"]["quick_actions"]["items"]["properties"]
+    assert action_properties["id"] == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+    }
     assert action_properties["menu_visible"]["default"] is True
     assert action_properties["ai_visible"]["default"] is True
     assert action_properties["ai_context"]["maxLength"] == 4000
@@ -286,6 +292,32 @@ def test_scene_tool_is_global_builtin_and_opt_in():
             "scene_key": "warranty",
             "quick_actions": [
                 {"id": "repair", "label": "Repair", "type": "send_message"}
+            ],
+        },
+        {
+            "operation": "save",
+            "scene_key": "warranty",
+            "expected_revision": 2,
+            "quick_actions": [
+                {
+                    "id": "bad id",
+                    "label": "Repair",
+                    "type": "send_message",
+                    "message": "Repair",
+                }
+            ],
+        },
+        {
+            "operation": "save",
+            "scene_key": "warranty",
+            "expected_revision": 2,
+            "quick_actions": [
+                {
+                    "id": "a" * 65,
+                    "label": "Repair",
+                    "type": "send_message",
+                    "message": "Repair",
+                }
             ],
         },
     ):

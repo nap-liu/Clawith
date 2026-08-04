@@ -126,6 +126,13 @@ export type Scene = {
     }>;
 };
 
+export type SceneManifestQuickAction = Omit<SceneQuickAction, 'ai_visible' | 'ai_context'>;
+
+export type SceneManifest = Omit<Scene, 'system_prompts' | 'quick_actions'> & {
+    system_prompts: [];
+    quick_actions: SceneManifestQuickAction[];
+};
+
 export const sceneApi = {
     list: (agentId: string) =>
         request<Scene[]>(`/agents/${agentId}/scenes`),
@@ -134,7 +141,7 @@ export const sceneApi = {
     revision: (agentId: string, sceneKey: string, revision: number) =>
         request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}/revisions/${revision}`),
     manifest: (agentId: string, sceneKey: string) =>
-        request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}/manifest`),
+        request<SceneManifest>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}/manifest`),
     save: (agentId: string, sceneKey: string, data: Omit<Scene, 'id' | 'scene_key' | 'revision' | 'has_unpublished_changes' | 'updated_at' | 'revisions'> & { expected_revision: number }) =>
         request<Scene>(`/agents/${agentId}/scenes/${encodeURIComponent(sceneKey)}`, {
             method: 'PUT',
