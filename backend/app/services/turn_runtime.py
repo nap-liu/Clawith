@@ -18,6 +18,7 @@ from sqlalchemy import or_, select
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
 from app.models.chat_session import ChatSession
+from app.services.channel_dispatch import run_channel_send
 
 
 @dataclass(frozen=True)
@@ -270,6 +271,27 @@ async def _deliver_dingtalk(
     at_user_ids: list[str] | None = None,
     session_webhook: str | None = None,
 ) -> bool:
+    return await run_channel_send(
+        f"im-send:{runtime.conversation_id}",
+        lambda: _deliver_dingtalk_unlocked(
+            agent_id,
+            runtime,
+            reply,
+            at_user_ids=at_user_ids,
+            session_webhook=session_webhook,
+        ),
+    )
+
+
+async def _deliver_dingtalk_unlocked(
+    agent_id: uuid.UUID,
+    runtime: TurnRuntime,
+    reply: str,
+    *,
+    at_user_ids: list[str] | None = None,
+    session_webhook: str | None = None,
+) -> bool:
+    """Send one DingTalk message while the caller owns the conversation send lock."""
     if not runtime.external_conv_id:
         logger.warning("[turn_runtime] DingTalk runtime missing external_conv_id: %s", runtime.conversation_id)
         return False
@@ -286,33 +308,35 @@ async def _deliver_dingtalk(
         logger.warning("[turn_runtime] DingTalk runtime has empty target: %s", runtime.external_conv_id)
         return False
 
-    if space_type == "IM_ROBOT":
-        result = await send_dingtalk_v1_robot_oto_message(
-            cfg.app_id,
-            cfg.app_secret,
-            [space_id],
-            reply,
-            msg_type="markdown",
-            robot_code=cfg.app_id,
-        )
-    elif at_user_ids:
-        if not session_webhook:
-            logger.warning(
-                "[turn_runtime] DingTalk group mention missing temporary session webhook"
+    async def _send() -> dict:
+        if space_type == "IM_ROBOT":
+            return await send_dingtalk_v1_robot_oto_message(
+                cfg.app_id,
+                cfg.app_secret,
+                [space_id],
+                reply,
+                msg_type="markdown",
+                robot_code=cfg.app_id,
             )
-            return False
-        result = await _send_dingtalk_group_mention(
-            session_webhook=session_webhook,
-            message=reply,
-            at_user_ids=at_user_ids,
-        )
-    else:
-        result = await _send_dingtalk_group_markdown(
+        if at_user_ids:
+            if not session_webhook:
+                logger.warning(
+                    "[turn_runtime] DingTalk group mention missing temporary session webhook"
+                )
+                return {"errcode": -1, "errmsg": "missing session webhook"}
+            return await _send_dingtalk_group_mention(
+                session_webhook=session_webhook,
+                message=reply,
+                at_user_ids=at_user_ids,
+            )
+        return await _send_dingtalk_group_markdown(
             app_id=cfg.app_id,
             app_secret=cfg.app_secret,
             open_conversation_id=space_id,
             message=reply,
         )
+
+    result = await _send()
     ok = result.get("errcode") == 0
     if not ok:
         logger.warning("[turn_runtime] DingTalk recovered reply delivery failed: %s", result)

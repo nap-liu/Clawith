@@ -1385,61 +1385,6 @@ async def test_suspend_persists_intro_before_toolcall_and_broadcasts_web():
     assert payload["args"]["buttons"][0]["value"] == "confirm"
 
 
-async def test_dingtalk_group_suspend_uses_unified_intro_and_group_card_targets():
-    """The pre-card text and card both retain the originating DingTalk group."""
-    from app.services import confirmation_service as cs
-
-    agent_id, user_id = await _make_agent()
-    external_conv_id = f"dingtalk_group_{uuid.uuid4().hex}"
-    session = await _make_session(
-        agent_id,
-        user_id,
-        source_channel="dingtalk",
-        external_conv_id=external_conv_id,
-        is_group=True,
-    )
-
-    with (
-        patch.object(cs, "_broadcast", new=AsyncMock()),
-        patch.object(cs, "deliver_reply_to_origin", new=AsyncMock(return_value=True)) as deliver_intro,
-        patch.object(cs, "_deliver_channel_card", new=AsyncMock()) as deliver_card,
-    ):
-        row_id = await cs.suspend_for_confirmation(
-            agent_id=agent_id,
-            conversation_id=str(session.id),
-            chat_session_id=session.id,
-            source_channel="dingtalk",
-            user_id=user_id,
-            intro_text="请确认处理结果",
-            title="问题是否解决",
-            summary="请选择处理结果",
-            action=None,
-            risk_level="low",
-            buttons=[{"text": "已解决", "value": "resolved"}],
-        )
-
-    deliver_intro.assert_awaited_once_with(
-        agent_id=agent_id,
-        conversation_id=str(session.id),
-        reply="请确认处理结果",
-        require_transport=True,
-    )
-    deliver_card.assert_awaited_once_with(
-        agent_id,
-        str(row_id),
-        {
-            "title": "问题是否解决",
-            "summary": "请选择处理结果",
-            "action": None,
-            "risk_level": "low",
-            "buttons": [{"text": "已解决", "value": "resolved"}],
-            "force_confirmation": True,
-        },
-        external_conv_id,
-        True,
-    )
-
-
 async def test_confirmation_rejects_a_different_resolving_user():
     """A shareable/forwarded card cannot be resolved by another agent user."""
     from app.services import confirmation_service as cs

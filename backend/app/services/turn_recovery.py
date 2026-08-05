@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -14,7 +13,6 @@ from sqlalchemy import func, select, text
 from app.database import async_session
 from app.models.agent import Agent, DEFAULT_CONTEXT_WINDOW_SIZE
 from app.models.audit import ChatMessage
-from app.models.chat_session import ChatSession
 from app.services.channel_llm import _call_agent_llm
 from app.services.chat_history import (
     load_recoverable_messages_for_turn,
@@ -29,8 +27,6 @@ from app.services.llm.tool_output_store import finalize_tool_output
 
 RECOVERY_ADVISORY_LOCK_KEY = 2026070801
 DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
-DEFAULT_DELIVERY_RETRY_MAX_AGE_MINUTES = 10.0
-ASSISTANT_TAIL_REDELIVERY_CHANNELS = frozenset({"dingtalk"})
 
 @dataclass
 class RecoveryStats:
@@ -50,26 +46,6 @@ def _recovery_max_age_hours() -> float:
         logger.warning(f"[turn_recovery] invalid TURN_RECOVERY_MAX_AGE_HOURS={raw!r}; using default")
         return DEFAULT_RECOVERY_MAX_AGE_HOURS
     return max(value, 0.0)
-
-
-def _delivery_retry_max_age_minutes() -> float:
-    raw = os.environ.get("TURN_RECOVERY_DELIVERY_MAX_AGE_MINUTES")
-    if raw is None or raw.strip() == "":
-        return DEFAULT_DELIVERY_RETRY_MAX_AGE_MINUTES
-    try:
-        value = float(raw)
-    except ValueError:
-        logger.warning(
-            f"[turn_recovery] invalid TURN_RECOVERY_DELIVERY_MAX_AGE_MINUTES={raw!r}; using default"
-        )
-        return DEFAULT_DELIVERY_RETRY_MAX_AGE_MINUTES
-    return max(value, 0.0)
-
-
-def _as_aware_utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
 
 
 async def execute_tool(*args, **kwargs):
@@ -209,23 +185,6 @@ async def _load_recoverable_anchors(db, *, limit: int) -> list[ChatMessage]:
     return anchors
 
 
-async def _source_channel_for_row(db, row: ChatMessage) -> str:
-    try:
-        session_id = uuid.UUID(str(row.conversation_id))
-    except (TypeError, ValueError):
-        return "web"
-
-    session = (
-        await db.execute(
-            select(ChatSession.source_channel).where(
-                ChatSession.id == session_id,
-                ChatSession.agent_id == row.agent_id,
-            )
-        )
-    ).scalar_one_or_none()
-    return str(session or "web")
-
-
 async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
     meta = row.message_meta if isinstance(getattr(row, "message_meta", None), dict) else {}
     if meta.get("consumed_by_onmessage") or meta.get("kind") == "on_message_event":
@@ -234,11 +193,11 @@ async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
         # LLM invocation for the same event.
         return False
     if row.role == "assistant":
-        source_channel = await _source_channel_for_row(db, row)
-        if source_channel not in ASSISTANT_TAIL_REDELIVERY_CHANNELS:
-            return False
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=_delivery_retry_max_age_minutes())
-        return _as_aware_utc(row.created_at) >= cutoff
+        # Persisted assistant output is the durable completion boundary. Without a
+        # separate delivery receipt, startup cannot distinguish "persisted before
+        # send" from "already sent"; retrying here duplicates every recent IM reply
+        # on each restart. Recover only turns that stopped before assistant output.
+        return False
     if row.role == "user":
         return True
     if row.role != "tool_call":
@@ -341,16 +300,9 @@ async def resume_turn(anchor: ChatMessage) -> bool:
             return False
         last_role = history[-1].get("role")
         if last_role == "assistant":
-            reply = str(history[-1].get("content") or "")
-            delivered = await deliver_recovered_reply_to_origin(
-                agent_id=anchor.agent_id,
-                conversation_id=anchor.conversation_id,
-                reply=reply,
-            )
-            if not delivered:
-                logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")
-                return False
-            return True
+            # Defensive guard for direct callers and races after anchor selection:
+            # a persisted assistant means this turn is already complete.
+            return False
 
         reply = await _call_agent_llm(
             db,

@@ -1094,29 +1094,40 @@ async def process_dingtalk_message(
             # Reply via session webhook (markdown). File/image sending is handled by the
             # channel_file_sender ContextVar above.
             try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(session_webhook, json={
-                        "msgtype": "markdown",
-                        "markdown": {
-                            "title": agent_obj.name or "AI Reply",
-                            "text": reply_text,
-                        },
-                    })
+                from app.services.channel_dispatch import run_channel_send
+
+                async def _send_reply():
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        try:
+                            response = await client.post(session_webhook, json={
+                                "msgtype": "markdown",
+                                "markdown": {
+                                    "title": agent_obj.name or "AI Reply",
+                                    "text": reply_text,
+                                },
+                            })
+                            response.raise_for_status()
+                            return response
+                        except Exception as markdown_error:
+                            logger.warning(
+                                "[DingTalk] Markdown reply failed; trying text fallback: %s",
+                                type(markdown_error).__name__,
+                            )
+                            response = await client.post(session_webhook, json={
+                                "msgtype": "text",
+                                "text": {"content": reply_text},
+                            })
+                            response.raise_for_status()
+                            return response
+
+                await run_channel_send(
+                    f"im-send:{session_conv_id}",
+                    _send_reply,
+                )
             except Exception as e:
                 logger.error(
-                    f"[DingTalk] Failed to reply via webhook: {type(e).__name__}"
+                    f"[DingTalk] Markdown and fallback text reply failed: {type(e).__name__}"
                 )
-                # Fallback: try plain text
-                try:
-                    async with httpx.AsyncClient(timeout=10) as client:
-                        await client.post(session_webhook, json={
-                            "msgtype": "text",
-                            "text": {"content": reply_text},
-                        })
-                except Exception as e2:
-                    logger.error(
-                        f"[DingTalk] Fallback text reply also failed: {type(e2).__name__}"
-                    )
 
         # Log activity
         from app.services.activity_logger import log_activity

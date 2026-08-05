@@ -54,6 +54,8 @@ _session_locks: dict[str, asyncio.Lock] = {}
 _session_locks_guard = asyncio.Lock()
 _running_turns: dict[str, set[asyncio.Task]] = {}
 _running_turns_guard = asyncio.Lock()
+_send_locks: dict[str, asyncio.Lock] = {}
+_send_locks_guard = asyncio.Lock()
 
 
 async def _get_session_lock(lock_key: str) -> asyncio.Lock:
@@ -63,6 +65,16 @@ async def _get_session_lock(lock_key: str) -> asyncio.Lock:
         if lock is None:
             lock = asyncio.Lock()
             _session_locks[lock_key] = lock
+    return lock
+
+
+async def _get_send_lock(lock_key: str) -> asyncio.Lock:
+    """Get-or-create the per-session send lock for channel outbound operations."""
+    async with _send_locks_guard:
+        lock = _send_locks.get(lock_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _send_locks[lock_key] = lock
         return lock
 
 
@@ -180,3 +192,10 @@ async def run_channel_message(
     finally:
         if current_task is not None:
             await _clear_running_turn(lock_key, current_task)
+
+
+async def run_channel_send(lock_key: str, work: Callable[[], Awaitable[object]]) -> object:
+    """Serialize outbound channel operations for the same session/route."""
+    lock = await _get_send_lock(lock_key)
+    async with lock:
+        return await work()

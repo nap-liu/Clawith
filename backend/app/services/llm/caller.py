@@ -793,6 +793,7 @@ async def _build_turn_context(
     user_id,
     current_user_name_override: str | None,
     is_group: bool,
+    session_id: str,
     channel_context: dict | None,
 ) -> tuple[str, str]:
     """Build the immutable static/dynamic context pair for one logical turn."""
@@ -803,6 +804,10 @@ async def _build_turn_context(
 
     from app.services.agent_context import build_agent_context
 
+    runtime_channel_context = dict(channel_context or {})
+    if session_id:
+        runtime_channel_context["session_id"] = session_id
+
     return await build_agent_context(
         agent_id,
         agent_name,
@@ -810,7 +815,7 @@ async def _build_turn_context(
         current_user_name=user_name,
         current_user_id=None if current_user_name_override else user_id,
         is_group=is_group,
-        channel_context=channel_context,
+        channel_context=runtime_channel_context,
     )
 
 
@@ -1145,6 +1150,7 @@ async def call_llm(
             user_id=user_id,
             current_user_name_override=current_user_name_override,
             is_group=is_group,
+            session_id=session_id,
             channel_context=channel_context,
         )
     else:
@@ -1738,6 +1744,7 @@ async def call_llm_with_failover(
         user_id=user_id,
         current_user_name_override=current_user_name_override,
         is_group=is_group,
+        session_id=session_id,
         channel_context=channel_context,
     )
     if skip_tools:

@@ -58,6 +58,7 @@ import {
 } from '../../utils/chatAttachments';
 import { createClientId } from '../../utils/clientId';
 import { parseFileDeliveryToolResult, type ChatFileDelivery } from '../../utils/chatFileDelivery';
+import { normalizeChatTimelineMessages } from '../h5/chatTimeline';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import {
     IconBrain,
@@ -2580,7 +2581,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error('保存失败', { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; confirmationToolCalls?: ChatMsg[]; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const confirmationPending = chatMessages.some(isPendingConfirmationToolCall);
     const getToolTargetKey = (args: any): string => {
@@ -2625,6 +2626,9 @@ export default function AgentDetailPage() {
             const runningIdx = [...prev].reverse().findIndex(sameTool);
             if (runningIdx >= 0) {
                 const idx = prev.length - 1 - runningIdx;
+                if (prev[idx].toolStatus === 'done' && toolMsg.toolStatus !== 'done') {
+                    return prev;
+                }
                 return [...prev.slice(0, idx), { ...prev[idx], ...toolMsg }, ...prev.slice(idx + 1)];
             }
             return [...prev, toolMsg];
@@ -4005,6 +4009,7 @@ export default function AgentDetailPage() {
             hideAvatar?: boolean;
         },
     ) => {
+        messages = normalizeChatTimelineMessages(messages);
         // Pass 1: mark each index as 'analysis' or 'final'
         const msgClass: ('analysis' | 'final')[] = new Array(messages.length).fill('final');
 
@@ -4221,7 +4226,7 @@ export default function AgentDetailPage() {
             }
             return (
                 <ChatMessageItem
-                    key={i}
+                    key={`msg-${i}`}
                     msg={msg}
                     i={i}
                     isLeft={v.isLeft}

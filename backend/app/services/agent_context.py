@@ -900,7 +900,14 @@ Strict rules:
 
     if channel_context:
         channel_lines = ["\n## Current Channel"]
-        for key in ("source_channel", "display_name", "client_surface", "scene_key", "scene_revision"):
+        for key in (
+            "source_channel",
+            "display_name",
+            "client_surface",
+            "session_id",
+            "scene_key",
+            "scene_revision",
+        ):
             value = channel_context.get(key)
             if value:
                 channel_lines.append(f"{key}: {value}")

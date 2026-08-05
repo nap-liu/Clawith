@@ -36,6 +36,7 @@ const fileDeliveryModule = compileTsModule(fileDeliveryPath);
 const sourcePath = resolve(__dirname, '../src/pages/h5/chatTimeline.ts');
 const timelineRequire = (id) => {
     if (id === '../../utils/chatFileDelivery') return fileDeliveryModule.exports;
+    if (id === '../../utils/clientId') return { createClientId: () => 'test-client-id' };
     return require(id);
 };
 
@@ -49,9 +50,27 @@ const {
     isConfirmationToolCall,
     mapHistoryMessage,
     mergeHistoryMessages,
+    normalizeChatTimelineMessages,
     toolCallMessageFromEvent,
     upsertToolCallMessage,
 } = module.exports;
+
+{
+    const normalized = normalizeChatTimelineMessages([
+        { id: 'confirmation', role: 'tool_call', toolCallId: 'confirmation', toolName: 'request_confirmation', toolStatus: 'done' },
+        { id: 'empty-completed', role: 'assistant', content: '   ', streaming: false },
+        { id: 'thinking-only', role: 'assistant', content: '', thinking: '仍需展示思考过程' },
+        { id: 'streaming-placeholder', role: 'assistant', content: '', streaming: true },
+        { id: 'attachment-only', role: 'assistant', content: '', fileName: 'report.pdf' },
+        { id: 'final', role: 'assistant', content: '确认流程已完成' },
+    ]);
+
+    assert.equal(normalized.some((message) => message.id === 'empty-completed'), false);
+    assert.equal(normalized.some((message) => message.id === 'thinking-only'), true);
+    assert.equal(normalized.some((message) => message.id === 'streaming-placeholder'), true);
+    assert.equal(normalized.some((message) => message.id === 'attachment-only'), true);
+    assert.equal(normalized.some((message) => message.id === 'final'), true);
+}
 
 {
     const tool = toolCallMessageFromEvent({

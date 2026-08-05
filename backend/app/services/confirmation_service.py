@@ -27,11 +27,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
-from app.services.turn_runtime import deliver_reply_to_origin
+from app.services.turn_runtime import (
+    _deliver_dingtalk_unlocked,
+    deliver_reply_to_origin,
+    load_turn_runtime,
+)
+from app.services.channel_dispatch import run_channel_send
 
 logger = logging.getLogger(__name__)
 
 CONFIRMATION_EXPIRY_HOURS = 24
+
+
+def _im_send_lock_key(conversation_id: str) -> str:
+    return f"im-send:{conversation_id}"
 
 
 class ConfirmationActorMismatch(PermissionError):
@@ -354,14 +363,36 @@ async def suspend_for_confirmation(
     # Additionally deliver to the originating IM channel. DingTalk doesn't stream, so send
     # the intro text as a message first, then the interactive card.
     if resolved_channel == "dingtalk":
-        if has_intro:
-            await deliver_reply_to_origin(
+        runtime = await load_turn_runtime(
+            agent_id=agent_id,
+            conversation_id=str(conversation_id),
+        )
+
+        async def _send_intro_then_card() -> bool:
+            if has_intro:
+                intro_delivered = await _deliver_dingtalk_unlocked(
+                    agent_id,
+                    runtime,
+                    intro_text or "",
+                )
+                if not intro_delivered:
+                    logger.warning(
+                        "Confirmation %s: intro delivery failed; card suppressed",
+                        row_id,
+                    )
+                    return False
+            return await _deliver_channel_card_unlocked(
                 agent_id=agent_id,
-                conversation_id=str(conversation_id),
-                reply=intro_text,
-                require_transport=True,
+                out_track_id=str(row_id),
+                args=args,
+                external_conv_id=ext_conv_id,
+                is_group=is_group,
             )
-        await _deliver_channel_card(agent_id, str(row_id), args, ext_conv_id, is_group)
+
+        await run_channel_send(
+            _im_send_lock_key(str(conversation_id)),
+            _send_intro_then_card,
+        )
     logger.info("Confirmation suspended: row %s on channel %s (conv %s)", row_id, resolved_channel, conversation_id)
     return row_id
 
@@ -477,6 +508,7 @@ async def resolve_confirmation(
         await _update_origin_card(
             agent_id,
             conversation_id,
+            conversation_id,
             card_instance_id,
             payload.get("args") or {},
             label,
@@ -586,13 +618,40 @@ async def _reenter_loop(
 
 
 async def _deliver_channel_card(
-    agent_id: uuid.UUID, out_track_id: str, args: dict, external_conv_id: str | None, is_group: bool
-) -> None:
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    out_track_id: str,
+    args: dict,
+    external_conv_id: str | None,
+    is_group: bool,
+) -> bool:
     """Best-effort: deliver the confirmation as a DingTalk interactive card whose outTrackId
     IS the tool_call row id (so the click callback maps straight back). Never raises."""
+    return await run_channel_send(
+        _im_send_lock_key(conversation_id),
+        lambda: _deliver_channel_card_unlocked(
+            agent_id=agent_id,
+            out_track_id=out_track_id,
+            args=args,
+            external_conv_id=external_conv_id,
+            is_group=is_group,
+        ),
+    )
+
+
+async def _deliver_channel_card_unlocked(
+    *,
+    agent_id: uuid.UUID,
+    out_track_id: str,
+    args: dict,
+    external_conv_id: str | None,
+    is_group: bool,
+) -> bool:
+    """Send one card while the caller owns the conversation send lock."""
     try:
         if not external_conv_id:
-            return
+            return False
         from app.models.channel_config import ChannelConfig
 
         async with async_session() as db:
@@ -606,7 +665,7 @@ async def _deliver_channel_card(
             ).scalar_one_or_none()
         if cc is None or not cc.app_id or not cc.app_secret:
             logger.warning("Confirmation %s: no usable dingtalk ChannelConfig for agent %s", out_track_id, agent_id)
-            return
+            return False
         # The card template id is a STANDARD tool config field on request_confirmation
         # (agent override → tenant default → tool default), read via the usual tool-config
         # path — no bespoke channel/extra_config concept.
@@ -619,7 +678,7 @@ async def _deliver_channel_card(
                 "Confirmation %s: request_confirmation tool has no card_template_id configured for agent %s",
                 out_track_id, agent_id,
             )
-            return
+            return False
         from app.services.dingtalk_card import build_confirmation_card_data, send_confirmation_card
 
         card_data = build_confirmation_card_data(
@@ -630,7 +689,7 @@ async def _deliver_channel_card(
             status="pending",
             buttons=args.get("buttons"),
         )
-        await send_confirmation_card(
+        return bool(await send_confirmation_card(
             app_id=cc.app_id,
             app_secret=cc.app_secret,
             card_template_id=template_id,
@@ -638,9 +697,10 @@ async def _deliver_channel_card(
             card_data=card_data,
             external_conv_id=external_conv_id,
             is_group=is_group,
-        )
+        ))
     except Exception:
         logger.exception("_deliver_channel_card failed for confirmation %s", out_track_id)
+        return False
 
 
 async def redeliver_pending_confirmation(pending: PendingConfirmation) -> bool:
@@ -664,6 +724,7 @@ async def redeliver_pending_confirmation(pending: PendingConfirmation) -> bool:
 
         from app.models.audit import ChatMessage
         from app.models.channel_config import ChannelConfig
+        from app.models.chat_session import ChatSession
 
         async with async_session() as db:
             cc = (
@@ -699,19 +760,29 @@ async def redeliver_pending_confirmation(pending: PendingConfirmation) -> bool:
             status="pending",
             buttons=pending.args.get("buttons"),
         )
-        sent = await send_confirmation_card(
-            app_id=cc.app_id,
-            app_secret=cc.app_secret,
-            card_template_id=template_id,
-            out_track_id=delivery_id,
-            card_data=card_data,
-            external_conv_id=external_conv_id,
-            is_group=is_group,
+        sent = await run_channel_send(
+            _im_send_lock_key(pending.conversation_id),
+            lambda: send_confirmation_card(
+                app_id=cc.app_id,
+                app_secret=cc.app_secret,
+                card_template_id=template_id,
+                out_track_id=delivery_id,
+                card_data=card_data,
+                external_conv_id=external_conv_id,
+                is_group=is_group,
+            ),
         )
         if not sent:
             return False
 
         async with async_session() as db:
+            # Serialize the post-send state check with resolve_confirmation. If
+            # resolution won the race, this fresh card is immediately expired;
+            # if redelivery wins, resolve sees and disables this delivery id.
+            sid = uuid.UUID(str(pending.conversation_id))
+            await db.execute(
+                select(ChatSession.id).where(ChatSession.id == sid).with_for_update()
+            )
             row = await db.get(ChatMessage, pending.row_id)
             if row is None:
                 return True
@@ -728,11 +799,11 @@ async def redeliver_pending_confirmation(pending: PendingConfirmation) -> bool:
             still_pending = payload.get("status") == "pending"
             await db.commit()
         if not still_pending:
-            await _mark_card_expired(cc, delivery_id, pending.args)
+            await _mark_card_expired(cc, pending.conversation_id, delivery_id, pending.args)
         elif previous_delivery_id != delivery_id:
             # Only the newest transport card remains actionable. This keeps delivery
             # metadata bounded and prevents a trail of visually active stale cards.
-            await _mark_card_expired(cc, previous_delivery_id, pending.args)
+            await _mark_card_expired(cc, pending.conversation_id, previous_delivery_id, pending.args)
         return True
     except Exception:
         logger.exception(
@@ -801,6 +872,7 @@ async def publish_ignored_confirmation(
     await _update_origin_card(
         pending.agent_id,
         pending.conversation_id,
+        pending.conversation_id,
         str(pending.row_id),
         pending.args,
         "未确认",
@@ -831,6 +903,7 @@ def _mark_selected_buttons(buttons: list | None, selected_value: str) -> list:
 async def _update_origin_card(
     agent_id: uuid.UUID,
     conversation_id: str,
+    runtime_conversation_id: str,
     out_track_id: str,
     args: dict,
     label: str,
@@ -863,6 +936,7 @@ async def _update_origin_card(
             fields,
             status_text=status_text,
             buttons_disabled=True,
+            conversation_id=runtime_conversation_id,
         )
     except Exception:
         logger.exception("_update_origin_card failed for %s", out_track_id)
@@ -896,6 +970,7 @@ async def resolve_confirmation_via_dingtalk(
                 logger.warning(f"[DingTalkCard] callback for unknown confirmation row {out_track_id}")
                 return
             agent_id = row.agent_id
+            conversation_id = row.conversation_id
             try:
                 _payload = json.loads(row.content or "{}")
             except Exception:
@@ -941,7 +1016,12 @@ async def resolve_confirmation_via_dingtalk(
         # disable the card with an 已过期 state and tell the user, so a still-clickable DingTalk
         # card can't drive a duplicate action.
         if card_status != "pending":
-            await _mark_card_expired(cc, out_track_id, args)
+            await _mark_card_expired(
+                cc,
+                conversation_id,
+                out_track_id,
+                args,
+            )
             return
 
         if user_id is None:
@@ -961,21 +1041,44 @@ async def resolve_confirmation_via_dingtalk(
         # Race: another path (web) resolved it between our status read and resolve's lock.
         # resolve returned None (already done) — correct the card to the 已过期 state.
         if result is None:
-            await _mark_card_expired(cc, out_track_id, args)
+            await _mark_card_expired(
+                cc,
+                conversation_id,
+                out_track_id,
+                args,
+            )
     except Exception:
         logger.exception("[DingTalkCard] resolve_confirmation_via_dingtalk failed")
 
 
-async def _mark_card_expired(cc, out_track_id: str, args: dict) -> None:
+async def _mark_card_expired(
+    cc,
+    conversation_id: str,
+    out_track_id: str,
+    args: dict,
+) -> None:
     """A stale DingTalk click on an already-resolved/expired card: just replace its buttons
     with a single disabled 已过期 button. Framework-level card update ONLY — no message
     delivery, no agent wake-up (the stale click is a no-op beyond the visual update)."""
     fields = {**(args or {}), "buttons": [{"text": "已过期", "value": "expired", "color": "gray"}]}
-    await _push_card_state(cc, out_track_id, fields, status_text="", buttons_disabled=True)
+    await _push_card_state(
+        cc,
+        out_track_id,
+        fields,
+        status_text="",
+        buttons_disabled=True,
+        conversation_id=conversation_id,
+    )
 
 
 async def _push_card_state(
-    cc, out_track_id: str, fields: dict, *, status_text: str, buttons_disabled: bool
+    cc,
+    out_track_id: str,
+    fields: dict,
+    *,
+    status_text: str,
+    buttons_disabled: bool,
+    conversation_id: str,
 ) -> None:
     """Best-effort DingTalk card update — status text + button enabled/disabled."""
     try:
@@ -992,8 +1095,14 @@ async def _push_card_state(
             buttons=fields.get("buttons"),
             buttons_disabled=buttons_disabled,
         )
-        await update_confirmation_card(
-            app_id=cc.app_id, app_secret=cc.app_secret, out_track_id=out_track_id, card_data=card_data
+        await run_channel_send(
+            _im_send_lock_key(conversation_id),
+            lambda: update_confirmation_card(
+                app_id=cc.app_id,
+                app_secret=cc.app_secret,
+                out_track_id=out_track_id,
+                card_data=card_data,
+            ),
         )
     except Exception:
         logger.exception("[DingTalkCard] _push_card_state failed")

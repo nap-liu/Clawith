@@ -287,6 +287,9 @@ export function upsertToolCallMessage(messages: H5ChatMessage[], toolMsg: H5Chat
 
     const idx = messages.length - 1 - runningIdx;
     const previous = messages[idx];
+    if (previous.toolStatus === 'done' && toolMsg.toolStatus !== 'done') {
+        return messages;
+    }
     const nextToolArgs = Object.keys(parseToolArgs(toolMsg.toolArgs)).length > 0
         ? toolMsg.toolArgs
         : previous.toolArgs;
@@ -298,6 +301,63 @@ export function upsertToolCallMessage(messages: H5ChatMessage[], toolMsg: H5Chat
         created_at: previous.created_at || toolMsg.created_at,
     };
     return [...messages.slice(0, idx), merged, ...messages.slice(idx + 1)];
+}
+
+export function normalizeChatTimelineMessages<T extends Record<string, any>>(messages: T[]): T[] {
+    const normalized: T[] = [];
+    const toolIndexByCallId = new Map<string, number>();
+
+    for (const message of messages) {
+        if (message?.role === 'assistant') {
+            const hasContent = typeof message.content === 'string'
+                ? message.content.trim().length > 0
+                : Boolean(message.content);
+            const hasThinking = typeof message.thinking === 'string'
+                ? message.thinking.trim().length > 0
+                : Boolean(message.thinking);
+            const hasAttachment = Boolean(
+                message.fileName
+                || message.imageUrl
+                || (Array.isArray(message.previewImages) && message.previewImages.length > 0),
+            );
+            const isStreaming = Boolean(message.streaming || message._streaming);
+            if (!hasContent && !hasThinking && !hasAttachment && !isStreaming) {
+                continue;
+            }
+        }
+
+        if (message?.role !== 'tool_call') {
+            normalized.push(message);
+            continue;
+        }
+
+        const parsed = parseStoredToolPayload(message.content);
+        const callId = String(message.toolCallId || parsed.call_id || parsed.id || '');
+        if (!callId || !toolIndexByCallId.has(callId)) {
+            if (callId) toolIndexByCallId.set(callId, normalized.length);
+            normalized.push(message);
+            continue;
+        }
+
+        const index = toolIndexByCallId.get(callId)!;
+        const previous = normalized[index];
+        const previousParsed = parseStoredToolPayload(previous.content);
+        const previousStatus = normalizeToolStatus(previous.toolStatus || previousParsed.status);
+        const incomingStatus = normalizeToolStatus(message.toolStatus || parsed.status);
+        if (previousStatus === 'done' && incomingStatus !== 'done') continue;
+
+        normalized[index] = {
+            ...previous,
+            ...message,
+            id: previous.id || message.id,
+            created_at: previous.created_at || message.created_at,
+            toolArgs: Object.keys(parseToolArgs(message.toolArgs ?? parsed.args)).length > 0
+                ? (message.toolArgs ?? parsed.args)
+                : (previous.toolArgs ?? previousParsed.args),
+        };
+    }
+
+    return normalized;
 }
 
 export function toolCallMessageFromEvent(data: any, makeId: () => string = defaultMakeId, now = new Date().toISOString()): H5ChatMessage {
@@ -357,6 +417,8 @@ function fileDeliveryFromMessage(msg: H5ChatMessage): ChatFileDelivery | null {
 }
 
 export function buildH5ConversationEntries(messages: H5ChatMessage[]): H5ConversationEntry[] {
+    messages = normalizeChatTimelineMessages(messages);
+
     const msgClass: ('analysis' | 'final')[] = new Array(messages.length).fill('final');
     let hasFutureTool = false;
 

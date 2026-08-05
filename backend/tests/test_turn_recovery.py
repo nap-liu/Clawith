@@ -405,8 +405,8 @@ async def test_startup_scan_recovers_any_channel_tail_without_adapter(monkeypatc
     assert reply is not None
 
 
-async def test_startup_scan_redelivers_recent_dingtalk_assistant_tail(monkeypatch):
-    """A recent DingTalk assistant tail may represent crash after DB write before IM delivery."""
+async def test_startup_scan_skips_recent_dingtalk_assistant_tail(monkeypatch):
+    """A completed DingTalk turn must not be delivered again after a restart."""
     from app.services import turn_recovery
 
     agent_id, user_id = await _make_agent_with_model()
@@ -436,7 +436,7 @@ async def test_startup_scan_redelivers_recent_dingtalk_assistant_tail(monkeypatc
                     user_id=user_id,
                     conversation_id=conv,
                     role="assistant",
-                    content="persisted before delivery",
+                    content="already delivered",
                     created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
                 ),
             ]
@@ -444,7 +444,7 @@ async def test_startup_scan_redelivers_recent_dingtalk_assistant_tail(monkeypatc
         await db.commit()
 
     async def fail_if_llm_called(*_args, **_kwargs):
-        raise AssertionError("assistant-tail recovery must redeliver without rerunning LLM")
+        raise AssertionError("a completed assistant tail must not rerun the LLM")
 
     delivered = []
 
@@ -457,9 +457,9 @@ async def test_startup_scan_redelivers_recent_dingtalk_assistant_tail(monkeypatc
 
     stats = await turn_recovery.startup_turn_resume_once(limit=10)
 
-    assert stats.scanned == 1
-    assert stats.resumed == 1
-    assert delivered == [(agent_id, conv, "persisted before delivery")]
+    assert stats.scanned == 0
+    assert stats.resumed == 0
+    assert delivered == []
 
 
 async def test_resume_turn_continues_from_recoverable_history_and_marks_completed(monkeypatch):
@@ -655,68 +655,6 @@ async def test_deliver_reply_to_origin_contains_transport_exceptions(monkeypatch
     )
 
     assert delivered is False
-
-
-async def test_resume_turn_delivers_existing_assistant_before_completing(monkeypatch):
-    """If a crash left reply persisted but anchor processing, recovery must send that reply."""
-    from app.services import turn_recovery
-    from app.services.chat_history import persist_assistant_reply_row, persist_incoming_user_message
-
-    agent_id, user_id = await _make_agent_with_model(context_window_size=4)
-    async with async_session() as db:
-        session = ChatSession(
-            agent_id=agent_id,
-            user_id=user_id,
-            title="DingTalk",
-            source_channel="dingtalk",
-            external_conv_id="dingtalk_p2p_staff-2",
-        )
-        db.add(session)
-        await db.flush()
-        conv = str(session.id)
-        anchor = await persist_incoming_user_message(
-            db,
-            agent_id=agent_id,
-            user_id=user_id,
-            conversation_id=conv,
-            content="interrupted from dingtalk",
-        )
-        anchor_id = anchor.id
-        await db.commit()
-
-    async with async_session() as db:
-        await persist_assistant_reply_row(
-            db,
-            agent_id=agent_id,
-            user_id=user_id,
-            conversation_id=conv,
-            content="already persisted reply",
-        )
-        await db.commit()
-
-    async def fail_if_llm_called(*_args, **_kwargs):
-        raise AssertionError("existing assistant reply should be delivered without rerunning LLM")
-
-    delivered = []
-
-    async def fake_deliver(*, agent_id, conversation_id, reply):
-        delivered.append((agent_id, conversation_id, reply))
-        return True
-
-    monkeypatch.setattr(turn_recovery, "_call_agent_llm", fail_if_llm_called)
-    monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", fake_deliver, raising=False)
-
-    async with async_session() as db:
-        anchor = (await db.execute(select(ChatMessage).where(ChatMessage.id == anchor_id))).scalar_one()
-
-    result = await turn_recovery.resume_turn(anchor)
-
-    assert result is True
-    assert len(delivered) == 1
-    delivered_agent_id, delivered_conv, delivered_reply = delivered[0]
-    assert delivered_agent_id == agent_id
-    assert delivered_conv == conv
-    assert delivered_reply == "already persisted reply"
 
 
 async def test_resume_turn_continues_after_completed_tool_call_tail(monkeypatch):
@@ -1147,8 +1085,8 @@ async def test_resume_turn_does_not_execute_running_tool_call_from_later_turn(mo
     assert captured["history"] == [{"role": "user", "content": "old interrupted"}]
 
 
-async def test_resume_turn_retries_existing_assistant_delivery_without_rerunning_llm(monkeypatch):
-    """Crash/failure after final reply persistence should retry delivery only."""
+async def test_resume_turn_skips_existing_assistant_without_redelivery(monkeypatch):
+    """Direct recovery calls must treat persisted assistant output as completed."""
     from app.services import turn_recovery
     from app.services.chat_history import persist_assistant_reply_row, persist_incoming_user_message
 
@@ -1185,15 +1123,14 @@ async def test_resume_turn_retries_existing_assistant_delivery_without_rerunning
     async def fail_if_llm_called(*_args, **_kwargs):
         raise AssertionError("delivery retry must not rerun the LLM")
 
-    delivery_results = [False, True]
     deliveries = []
 
-    async def flaky_deliver(*, agent_id, conversation_id, reply):
+    async def fake_deliver(*, agent_id, conversation_id, reply):
         deliveries.append((agent_id, conversation_id, reply))
-        return delivery_results.pop(0)
+        return True
 
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fail_if_llm_called)
-    monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", flaky_deliver, raising=False)
+    monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", fake_deliver, raising=False)
 
     async with async_session() as db:
         anchor = (await db.execute(select(ChatMessage).where(ChatMessage.id == anchor_id))).scalar_one()
@@ -1204,9 +1141,8 @@ async def test_resume_turn_retries_existing_assistant_delivery_without_rerunning
 
     second = await turn_recovery.resume_turn(anchor)
 
-    assert second is True
-    assert len(deliveries) == 2
-    assert all(delivery[2] == "reply persisted before crash" for delivery in deliveries)
+    assert second is False
+    assert deliveries == []
     async with async_session() as db:
         assistant_rows = (
             await db.execute(
