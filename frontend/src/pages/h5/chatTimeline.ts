@@ -1,6 +1,6 @@
 import type { ChatPreviewImage } from '../../utils/chatAttachments';
-import { parseFileDeliveryToolResult, type ChatFileDelivery } from '../../utils/chatFileDelivery';
 import { createClientId } from '../../utils/clientId';
+import { getChatToolRenderIdentity, getChatToolRenderType } from '../../components/ChatToolCallRenderer';
 
 export type H5ToolStatus = 'running' | 'done';
 
@@ -28,7 +28,7 @@ export type H5AnalysisItem =
 
 export type H5ConversationEntry =
     | { type: 'analysis_group'; items: H5AnalysisItem[]; key: string; running: boolean }
-    | { type: 'file_delivery'; delivery: ChatFileDelivery; msg: H5ChatMessage; key: string }
+    | { type: 'special_render'; renderType: string; msg: H5ChatMessage; key: string }
     | { type: 'message'; msg: H5ChatMessage; key: string };
 
 export type H5AssistantStreamMessage = {
@@ -120,7 +120,7 @@ export function hasPendingConfirmation(messages: H5ChatMessage[]): boolean {
 export function findStreamingAssistantIndex(messages: H5ChatMessage[]) {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
         const msg = messages[i];
-        if (msg.role === 'assistant' && msg.streaming) return i;
+        if (msg.role === 'assistant' && (msg.streaming || (msg as any)._streaming)) return i;
     }
     return -1;
 }
@@ -135,9 +135,65 @@ function findStreamingAssistantIndexAfterLastTool(messages: H5ChatMessage[]) {
     }
     for (let i = messages.length - 1; i > lastToolIndex; i -= 1) {
         const msg = messages[i];
-        if (msg.role === 'assistant' && msg.streaming) return i;
+        if (msg.role === 'assistant' && (msg.streaming || (msg as any)._streaming)) return i;
     }
     return -1;
+}
+
+export function applyAssistantDoneMessage<T extends Record<string, any>>(
+    messages: T[],
+    event: { content?: string; now?: string; messageId?: string },
+    makeId: () => string = defaultMakeId,
+): T[] {
+    const identifiedIdx = event.messageId
+        ? messages.findIndex((message) => String(message.id || '') === event.messageId)
+        : -1;
+    const content = event.content || '';
+    const now = event.now || new Date().toISOString();
+    const afterLastToolIdx = findStreamingAssistantIndexAfterLastTool(
+        messages as unknown as H5ChatMessage[],
+    );
+    const fallbackStreamingIdx = !content
+        ? findStreamingAssistantIndex(messages as unknown as H5ChatMessage[])
+        : -1;
+    const idx = identifiedIdx >= 0
+        ? identifiedIdx
+        : afterLastToolIdx >= 0
+            ? afterLastToolIdx
+            : fallbackStreamingIdx;
+
+    if (idx >= 0) {
+        const previous = messages[idx];
+        const next = [...messages];
+        next[idx] = {
+            ...previous,
+            content: content || previous.content || '',
+            streaming: false,
+            _streaming: false,
+            created_at: previous.created_at || now,
+            timestamp: previous.timestamp || now,
+        };
+        return next;
+    }
+
+    if (!content) return messages;
+    const last = messages[messages.length - 1];
+    if (
+        !event.messageId
+        && last?.role === 'assistant'
+        && !last.streaming
+        && !last._streaming
+        && last.content === content
+    ) {
+        return messages;
+    }
+    return [...messages, {
+        id: event.messageId || makeId(),
+        role: 'assistant',
+        content,
+        created_at: now,
+        timestamp: now,
+    } as unknown as T];
 }
 
 export function applyAssistantStreamMessage(
@@ -183,36 +239,15 @@ export function applyAssistantStreamMessage(
         }];
     }
 
-    if (idx >= 0) {
-        const next = [...messages];
-        next[idx] = {
-            ...next[idx],
-            content: content || next[idx].content,
-            streaming: false,
-            created_at: now,
-        };
-        return next;
-    }
-    if (!content) return messages;
-    return [...messages, {
-        id: event.messageId || makeId(),
-        role: 'assistant',
-        content,
-        created_at: now,
-    }];
+    return applyAssistantDoneMessage(messages, event, makeId);
 }
 
 export function isSameMessage(a: H5ChatMessage, b: H5ChatMessage) {
     if (a.role === 'tool_call' || b.role === 'tool_call') {
         if (a.role !== b.role) return false;
         if (a.toolCallId && a.toolCallId === b.toolCallId) return true;
-        const aDelivery = fileDeliveryFromMessage(a);
-        const bDelivery = fileDeliveryFromMessage(b);
-        return !!aDelivery
-            && !!bDelivery
-            && aDelivery.path === bDelivery.path
-            && aDelivery.filename === bDelivery.filename
-            && (aDelivery.message || '') === (bDelivery.message || '');
+        const aRenderIdentity = getChatToolRenderIdentity(a);
+        return !!aRenderIdentity && aRenderIdentity === getChatToolRenderIdentity(b);
     }
     return a.role === b.role
         && a.content === b.content
@@ -380,9 +415,7 @@ export function toolCallMessageFromEvent(data: any, makeId: () => string = defau
 }
 
 export function isConfirmationToolCall(msg: H5ChatMessage) {
-    if (msg.role !== 'tool_call') return false;
-    const parsed = parseStoredToolPayload(msg.content);
-    return (msg.toolName || parsed.name || '').toLowerCase() === CONFIRMATION_TOOL;
+    return getChatToolRenderType(msg) === 'confirmation';
 }
 
 function pushThinking(items: H5AnalysisItem[], content?: string) {
@@ -407,34 +440,8 @@ function toolItemFromMessage(msg: H5ChatMessage): Extract<H5AnalysisItem, { type
     };
 }
 
-function fileDeliveryFromMessage(msg: H5ChatMessage): ChatFileDelivery | null {
-    if (msg.role !== 'tool_call') return null;
-    const parsed = parseStoredToolPayload(msg.content);
-    const toolName = msg.toolName || parsed.name || '';
-    const toolArgs = msg.toolArgs ?? parsed.args ?? {};
-    const toolResult = msg.toolResult || parsed.result || (!parsed.name ? msg.content : undefined);
-    return parseFileDeliveryToolResult(toolName, toolResult, toolArgs, msg.toolCallId);
-}
-
 export function buildH5ConversationEntries(messages: H5ChatMessage[]): H5ConversationEntry[] {
     messages = normalizeChatTimelineMessages(messages);
-
-    const msgClass: ('analysis' | 'final')[] = new Array(messages.length).fill('final');
-    let hasFutureTool = false;
-
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-        const msg = messages[i];
-        if (fileDeliveryFromMessage(msg)) {
-            msgClass[i] = 'final';
-        } else if (msg.role === 'tool_call' && !isConfirmationToolCall(msg)) {
-            msgClass[i] = 'analysis';
-            hasFutureTool = true;
-        } else if (msg.role === 'user') {
-            hasFutureTool = false;
-        } else if (msg.role === 'assistant' && hasFutureTool) {
-            msgClass[i] = 'analysis';
-        }
-    }
 
     const grouped: H5ConversationEntry[] = [];
     let currentGroup: H5AnalysisItem[] | null = null;
@@ -456,38 +463,44 @@ export function buildH5ConversationEntries(messages: H5ChatMessage[]): H5Convers
 
     for (let i = 0; i < messages.length; i += 1) {
         const msg = messages[i];
-        const fileDelivery = fileDeliveryFromMessage(msg);
-        if (fileDelivery) {
+        const renderType = getChatToolRenderType(msg);
+        if (renderType) {
             flushGroup();
             grouped.push({
-                type: 'file_delivery',
-                delivery: fileDelivery,
+                type: 'special_render',
+                renderType,
                 msg,
-                key: `file-delivery-${fileDelivery.id}`,
+                key: msg.id || `special-${i}`,
             });
             continue;
         }
 
-        if (msgClass[i] === 'analysis') {
+        if (msg.role === 'tool_call') {
             if (!currentGroup) {
                 currentGroup = [];
                 groupStartIndex = i;
             }
-            if (msg.role === 'tool_call') {
-                pushThinking(currentGroup, msg.toolThinking);
-                currentGroup.push(toolItemFromMessage(msg));
-            } else if (msg.role === 'assistant') {
-                pushThinking(currentGroup, msg.thinking);
-                pushThinking(currentGroup, msg.content);
-            }
+            pushThinking(currentGroup, msg.toolThinking);
+            currentGroup.push(toolItemFromMessage(msg));
             continue;
         }
 
-        if (msg.role === 'assistant' && msg.thinking && currentGroup?.some((item) => item.type === 'tool')) {
-            pushThinking(currentGroup, msg.thinking);
+        if (msg.role === 'assistant') {
             const contentText = msg.content?.trim() || '';
+            if (msg.thinking) {
+                if (!currentGroup) {
+                    currentGroup = [];
+                    groupStartIndex = i;
+                }
+                pushThinking(currentGroup, msg.thinking);
+            }
+            if (!contentText) continue;
             flushGroup();
-            if (contentText) grouped.push({ type: 'message', msg: { ...msg, thinking: undefined }, key: msg.id || `msg-${i}` });
+            grouped.push({
+                type: 'message',
+                msg: msg.thinking ? { ...msg, thinking: undefined } : msg,
+                key: msg.id || `msg-${i}`,
+            });
             continue;
         }
 
@@ -524,8 +537,6 @@ export function getH5ScrollAnchor(entries: H5ConversationEntry[], isWaiting: boo
         ? 'empty'
         : last.type === 'analysis_group'
             ? `${last.key}:${analysisAnchor(last.items)}`
-            : last.type === 'file_delivery'
-                ? `${last.key}:${last.delivery.path}:${last.delivery.size || 0}:${last.delivery.message?.length || 0}`
-                : `${last.key}:${messageAnchor(last.msg)}`;
+            : `${last.key}:${messageAnchor(last.msg)}`;
     return `${entries.length}:${isWaiting ? 'waiting' : 'idle'}:${lastAnchor}`;
 }

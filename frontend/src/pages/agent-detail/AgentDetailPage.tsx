@@ -9,7 +9,6 @@ import { useToast } from '../../components/Toast/ToastProvider';
 import type { FileBrowserApi } from '../../components/FileBrowser';
 import FileBrowser from '../../components/FileBrowser';
 import ChatImageLightbox from '../../components/ChatImageLightbox';
-import ChatFileDeliveryCard from '../../components/ChatFileDeliveryCard';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
 import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
@@ -18,7 +17,7 @@ import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/Wor
 import { activityApi, agentApi, channelApi, chatSessionApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import type { FocusApiItem } from '../../services/api';
 import ModelSwitcher from '../../components/ModelSwitcher';
-import ConfirmationCard from '../../components/ConfirmationCard';
+import ChatToolCallRenderer, { getChatToolRenderType } from '../../components/ChatToolCallRenderer';
 import OrgMemberAccessPicker, {
     type AgentAccessDepartment,
     type AgentAccessUser,
@@ -28,11 +27,8 @@ import './AccessPermissionsPanel.css';
 
 // A confirmation card is just a `request_confirmation` tool_call rendered specially —
 // the left/right perspective logic stays unaware of it; the renderer keys off the tool name.
-const CONFIRMATION_TOOL = 'request_confirmation';
 const isConfirmationToolCall = (msg: any): boolean => {
-    if (!msg || msg.role !== 'tool_call') return false;
-    const name = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })();
-    return name === CONFIRMATION_TOOL;
+    return getChatToolRenderType(msg) === 'confirmation';
 };
 const isPendingConfirmationToolCall = (msg: any): boolean => {
     if (!isConfirmationToolCall(msg)) return false;
@@ -57,8 +53,7 @@ import {
     type ChatPreviewImage,
 } from '../../utils/chatAttachments';
 import { createClientId } from '../../utils/clientId';
-import { parseFileDeliveryToolResult, type ChatFileDelivery } from '../../utils/chatFileDelivery';
-import { normalizeChatTimelineMessages } from '../h5/chatTimeline';
+import { applyAssistantDoneMessage, normalizeChatTimelineMessages } from '../h5/chatTimeline';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import {
     IconBrain,
@@ -104,17 +99,6 @@ import SkillsTab from './tabs/SkillsTab';
 import ToolsTab from './tabs/ToolsTab';
 import { useAgentDetailRoute } from './hooks/useAgentDetailRoute';
 import { fetchAuth } from './utils/fetchAuth';
-
-const fileDeliveryFromToolCall = (msg: any): ChatFileDelivery | null => {
-    if (!msg || msg.role !== 'tool_call') return null;
-    const parsed = (() => { try { return JSON.parse(msg.content || '{}'); } catch { return {}; } })();
-    return parseFileDeliveryToolResult(
-        msg.toolName || parsed.name || '',
-        msg.toolResult || parsed.result || (!parsed.name ? msg.content : undefined),
-        msg.toolArgs ?? parsed.args ?? {},
-        msg.toolCallId || parsed.call_id || parsed.id,
-    );
-};
 
 const WORKSPACE_TOOLS = new Set([
     'write_file',
@@ -3307,7 +3291,7 @@ export default function AgentDetailPage() {
                 upsertToolCallMessage({
                     role: 'tool_call',
                     content: '',
-                    toolName: CONFIRMATION_TOOL,
+                    toolName: d.name || 'request_confirmation',
                     toolCallId: String(d.call_id || ''),
                     toolArgs: d.args,
                     toolStatus: 'running',
@@ -3492,15 +3476,11 @@ export default function AgentDetailPage() {
                     return [...prev, { role: 'assistant', content: d.content, _streaming: true } as any];
                 });
             } else if (d.type === 'done') {
-                setChatMessages(prev => {
-                    const revIdx = [...prev].reverse().findIndex(m => m.role === 'assistant' && (m as any)._streaming);
-                    if (revIdx >= 0) {
-                        const realIdx = prev.length - 1 - revIdx;
-                        const thinking = prev[realIdx].thinking;
-                        return [...prev.slice(0, realIdx), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() }), ...prev.slice(realIdx + 1)];
-                    }
-                    return [...prev, parseChatMsg({ role: d.role, content: d.content, timestamp: new Date().toISOString() })];
-                });
+                setChatMessages(prev => applyAssistantDoneMessage(prev, {
+                    content: d.content || '',
+                    messageId: d.message_id ? String(d.message_id) : undefined,
+                    now: new Date().toISOString(),
+                }));
                 const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                 if (currentSessionId) clearUnreadForSession(currentSessionId);
                 fetchMySessions(true, agentId);
@@ -4010,37 +3990,9 @@ export default function AgentDetailPage() {
         },
     ) => {
         messages = normalizeChatTimelineMessages(messages);
-        // Pass 1: mark each index as 'analysis' or 'final'
-        const msgClass: ('analysis' | 'final')[] = new Array(messages.length).fill('final');
-
-        // Walk backwards: once we see a tool_call, all preceding
-        // assistant messages (until the previous user turn or start)
-        // are reclassified as 'analysis'.
-        let hasFutureTool = false;
-        for (let i = messages.length - 1; i >= 0; i--) {
-            const msg = messages[i];
-            if (fileDeliveryFromToolCall(msg)) {
-                msgClass[i] = 'final';
-            } else if (msg.role === 'tool_call' && !isConfirmationToolCall(msg)) {
-                msgClass[i] = 'analysis';
-                hasFutureTool = true;
-            } else if (msg.role === 'user') {
-                // User turn resets the lookahead boundary
-                hasFutureTool = false;
-            } else if (msg.role === 'assistant') {
-                if (hasFutureTool) {
-                    // This assistant message (thinking-only or with content)
-                    // precedes more tool calls → it's part of the analysis
-                    msgClass[i] = 'analysis';
-                }
-                // else: it's a final answer, keep 'final'
-            }
-        }
-
-        // Pass 2: build grouped entries
         type GroupedEntry =
             | { type: 'analysis_group'; items: AnalysisItem[]; key: number }
-            | { type: 'file_delivery'; delivery: ChatFileDelivery; msg: any; i: number }
+            | { type: 'special_render'; renderType: NonNullable<ReturnType<typeof getChatToolRenderType>>; msg: any; i: number }
             | { type: 'msg'; msg: any; i: number };
         const grouped: GroupedEntry[] = [];
         let currentGroup: AnalysisItem[] | null = null;
@@ -4053,64 +4005,51 @@ export default function AgentDetailPage() {
         };
         for (let i = 0; i < messages.length; i++) {
             const msg = messages[i];
-            const fileDelivery = fileDeliveryFromToolCall(msg);
-            if (fileDelivery) {
+            const renderType = getChatToolRenderType(msg);
+            if (renderType) {
                 flushGroup();
-                grouped.push({ type: 'file_delivery', delivery: fileDelivery, msg, i });
+                grouped.push({ type: 'special_render', renderType, msg, i });
                 continue;
             }
 
-            if (msgClass[i] === 'analysis') {
-                // Open a new group if needed
+            if (msg.role === 'tool_call') {
                 if (!currentGroup) { currentGroup = []; groupStartKey = i; }
-                if (msg.role === 'tool_call') {
-                    // Read-only history persists tool fields packed into `content`
-                    // JSON; live messages carry them as discrete fields. Normalize.
-                    const parsed = (() => { try { return JSON.parse(msg.content || '{}'); } catch { return {}; } })();
-                    const toolThinking = msg.toolThinking;
-                    const toolName = msg.toolName || parsed.name || 'tool';
-                    const toolArgs = msg.toolArgs || parsed.args || {};
-                    const toolStatus = msg.toolStatus;
-                    const toolResult = msg.toolResult ?? parsed.result ?? undefined;
-                    if (toolThinking?.trim()) {
-                        const lastItem = currentGroup[currentGroup.length - 1];
-                        if (!(lastItem?.type === 'thinking' && lastItem.content === toolThinking)) {
-                            currentGroup.push({ type: 'thinking', content: toolThinking });
-                        }
-                    }
-                    currentGroup.push({
-                        type: 'tool',
-                        name: toolName,
-                        args: toolArgs,
-                        status: toolStatus === 'running' ? 'running' : 'done',
-                        result: toolResult || undefined,
-                    });
-                } else if (msg.role === 'assistant') {
-                    // Could be thinking-only OR has content (mid-flow text)
-                    const thinkingText = msg.thinking || '';
-                    const contentText = msg.content?.trim() || '';
-                    // Add thinking block first (if present)
-                    if (thinkingText) {
-                        currentGroup.push({ type: 'thinking', content: thinkingText });
-                    }
-                    // Add mid-flow content as a thinking block too
-                    // (displayed with slightly different style to distinguish)
-                    if (contentText) {
-                        currentGroup.push({ type: 'thinking', content: contentText });
+                const parsed = (() => { try { return JSON.parse(msg.content || '{}'); } catch { return {}; } })();
+                const toolThinking = msg.toolThinking;
+                const toolName = msg.toolName || parsed.name || 'tool';
+                const toolArgs = msg.toolArgs || parsed.args || {};
+                const toolStatus = msg.toolStatus;
+                const toolResult = msg.toolResult ?? parsed.result ?? undefined;
+                if (toolThinking?.trim()) {
+                    const lastItem = currentGroup[currentGroup.length - 1];
+                    if (!(lastItem?.type === 'thinking' && lastItem.content === toolThinking)) {
+                        currentGroup.push({ type: 'thinking', content: toolThinking });
                     }
                 }
-            } else {
-                // 'final': flush any open group first, then emit as chat bubble
-                if (msg.role === 'assistant' && msg.thinking && currentGroup?.some(item => item.type === 'tool')) {
-                    currentGroup.push({ type: 'thinking', content: msg.thinking });
-                    const contentText = msg.content?.trim() || '';
-                    flushGroup();
-                    if (contentText) grouped.push({ type: 'msg', msg: { ...msg, thinking: undefined }, i });
-                    continue;
-                }
-                flushGroup();
-                grouped.push({ type: 'msg', msg, i });
+                currentGroup.push({
+                    type: 'tool',
+                    name: toolName,
+                    args: toolArgs,
+                    status: toolStatus === 'running' ? 'running' : 'done',
+                    result: toolResult || undefined,
+                });
+                continue;
             }
+
+            if (msg.role === 'assistant') {
+                const contentText = msg.content?.trim() || '';
+                if (msg.thinking) {
+                    if (!currentGroup) { currentGroup = []; groupStartKey = i; }
+                    currentGroup.push({ type: 'thinking', content: msg.thinking });
+                }
+                if (!contentText) continue;
+                flushGroup();
+                grouped.push({ type: 'msg', msg: msg.thinking ? { ...msg, thinking: undefined } : msg, i });
+                continue;
+            }
+
+            flushGroup();
+            grouped.push({ type: 'msg', msg, i });
         }
         flushGroup(); // flush any trailing group
 
@@ -4152,20 +4091,6 @@ export default function AgentDetailPage() {
                     </div>
                 );
             }
-            if (entry.type === 'file_delivery') {
-                const cardAvatar = (((agent as any)?.name || 'Agent')[0]) || 'A';
-                return (
-                    <div key={`file-delivery-${entry.delivery.id}-${entry.i}`} className="chat-msg-row chat-msg-row--file-delivery">
-                        <div className="chat-msg-avatar">{cardAvatar}</div>
-                        <ChatFileDeliveryCard
-                            agentId={id!}
-                            delivery={entry.delivery}
-                            mode="pc"
-                            onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
-                        />
-                    </div>
-                );
-            }
             const { msg, i } = entry;
             const v = viewOf(msg);
             // All remaining messages have real content; render as chat bubbles
@@ -4193,26 +4118,17 @@ export default function AgentDetailPage() {
                     </React.Fragment>
                 );
             }
-            if (msg.role === 'tool_call' && isConfirmationToolCall(msg)) {
-                // A confirmation card is the rich rendering of a suspended request_confirmation
-                // tool_call. Like any tool call it lives on the agent's side (analysis groups
-                // default the same via { isLeft: true }); the left/right viewOf logic stays
-                // unaware of it. Content = the tool_call args; state = its status/result.
-                const parsed = (() => { try { return JSON.parse(msg.content || '{}'); } catch { return {}; } })();
-                const cardArgs = (msg as any).toolArgs || parsed.args || {};
-                const cardStatus = (msg as any).toolStatus || parsed.status;
-                const cardResult = (msg as any).toolResult ?? parsed.result ?? '';
+            if (entry.type === 'special_render') {
                 const cardAvatar = (((agent as any)?.name || 'Agent')[0]) || 'A';
                 return (
-                    <div key={i} className="chat-msg-row">
+                    <div key={i} className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}>
                         <div className="chat-msg-avatar">{cardAvatar}</div>
-                        <ConfirmationCard
+                        <ChatToolCallRenderer
                             agentId={id!}
+                            message={msg}
                             t={t}
-                            callId={(msg as any).toolCallId || ''}
-                            args={cardArgs}
-                            resolved={cardStatus === 'done'}
-                            result={cardResult}
+                            mode="pc"
+                            onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
                             onResolved={(resolvedResult) => {
                                 upsertToolCallMessage({
                                     ...msg,

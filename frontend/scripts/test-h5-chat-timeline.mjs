@@ -37,12 +37,35 @@ const sourcePath = resolve(__dirname, '../src/pages/h5/chatTimeline.ts');
 const timelineRequire = (id) => {
     if (id === '../../utils/chatFileDelivery') return fileDeliveryModule.exports;
     if (id === '../../utils/clientId') return { createClientId: () => 'test-client-id' };
+    if (id === '../../components/ChatToolCallRenderer') {
+        return {
+            getChatToolRenderType: (message) => (
+                message?.role !== 'tool_call'
+                    ? null
+                    : message?.toolName === 'request_confirmation'
+                        ? 'confirmation'
+                        : message?.toolName === 'send_channel_file'
+                            ? 'file-delivery'
+                            : null
+            ),
+            getChatToolRenderIdentity: (message) => {
+                if (message?.role !== 'tool_call' || message?.toolName !== 'send_channel_file') return null;
+                try {
+                    const delivery = JSON.parse(message.toolResult || '{}');
+                    return ['file-delivery', delivery.path, delivery.filename, delivery.message || ''].join(':');
+                } catch {
+                    return null;
+                }
+            },
+        };
+    }
     return require(id);
 };
 
 const module = compileTsModule(sourcePath, timelineRequire);
 
 const {
+    applyAssistantDoneMessage,
     applyAssistantStreamMessage,
     buildH5ConversationEntries,
     getH5ScrollAnchor,
@@ -89,24 +112,6 @@ const {
 }
 
 {
-    const messages = [
-        { id: 'u1', role: 'user', content: '你添加一下，然后发一条测试消息' },
-        { id: 'a1', role: 'assistant', content: '我先查找联系人。' },
-        { id: 't1', role: 'tool_call', content: '', toolName: 'search_contacts', toolCallId: 'tc1', toolArgs: { query: '朱志超' }, toolStatus: 'done', toolResult: 'ok' },
-        { id: 't2', role: 'tool_call', content: '', toolName: 'add_contact', toolCallId: 'tc2', toolArgs: { user_id: 'u' }, toolStatus: 'done', toolResult: 'ok' },
-        { id: 't3', role: 'tool_call', content: '', toolName: 'send_channel_message', toolCallId: 'tc3', toolArgs: { text: '测试消息' }, toolStatus: 'done', toolResult: 'ok' },
-        { id: 'a2', role: 'assistant', content: '已完成！' },
-    ];
-
-    const entries = buildH5ConversationEntries(messages);
-    assert.equal(JSON.stringify(entries.map((entry) => entry.type)), JSON.stringify(['message', 'analysis_group', 'message']));
-    assert.equal(entries[1].items.filter((item) => item.type === 'tool').length, 3);
-    assert.equal(entries[1].items[0].type, 'thinking');
-    assert.equal(entries[2].msg.role, 'assistant');
-    assert.equal(entries[2].msg.content, '已完成！');
-}
-
-{
     const history = [
         { role: 'user', content: '移除联系人', created_at: '2026-07-10T01:20:00Z' },
         { role: 'tool_call', content: '', toolName: 'search_contacts', toolCallId: 'call-search', toolArgs: { query: '胡云' }, toolStatus: 'done', toolResult: 'found' },
@@ -147,10 +152,8 @@ const {
         { id: 'a1', role: 'assistant', content: '已发送' },
     ]);
 
-    assert.equal(JSON.stringify(entries.map((entry) => entry.type)), JSON.stringify(['message', 'file_delivery', 'message']));
-    assert.equal(entries[1].delivery.path, 'workspace/reports/report.pdf');
-    assert.equal(entries[1].delivery.filename, 'report.pdf');
-    assert.equal(entries[1].delivery.message, '这是报告');
+    assert.equal(JSON.stringify(entries.map((entry) => entry.type)), JSON.stringify(['message', 'special_render', 'message']));
+    assert.equal(entries[1].renderType, 'file-delivery');
 }
 
 {
@@ -205,6 +208,28 @@ const {
     assert.equal(messages.length, 1);
     assert.equal(messages[0].id, messageId);
     assert.equal(messages[0].content, '欢迎使用报修服务');
+}
+
+{
+    let messages = [
+        { id: 'body', role: 'assistant', content: '这段正文必须保留', streaming: true },
+        { id: 'card', role: 'tool_call', toolCallId: 'card', toolName: 'request_confirmation', toolStatus: 'running' },
+    ];
+    messages = applyAssistantDoneMessage(messages, { type: 'done', content: '' });
+    assert.equal(messages.length, 2);
+    assert.equal(messages[0].content, '这段正文必须保留');
+    assert.equal(messages[0].streaming, false);
+
+    messages = applyAssistantDoneMessage(messages, { type: 'done', content: '确认后的最终答复' });
+    messages = applyAssistantDoneMessage(messages, { type: 'done', content: '确认后的最终答复' });
+    assert.equal(messages.filter((message) => message.content === '确认后的最终答复').length, 1);
+
+    messages = applyAssistantDoneMessage(messages, {
+        type: 'done',
+        content: '确认后的最终答复',
+        messageId: 'different-message',
+    });
+    assert.equal(messages.filter((message) => message.content === '确认后的最终答复').length, 2);
 }
 
 {
@@ -272,9 +297,28 @@ const {
     assert.equal(hasPendingConfirmation(merged), false);
 
     const entries = buildH5ConversationEntries(merged);
-    assert.equal(JSON.stringify(entries.map((entry) => entry.type)), JSON.stringify(['message']));
+    assert.equal(JSON.stringify(entries.map((entry) => entry.type)), JSON.stringify(['special_render']));
+    assert.equal(entries[0].renderType, 'confirmation');
     assert.equal(entries[0].msg.role, 'tool_call');
     assert.equal(isConfirmationToolCall(entries[0].msg), true);
+}
+
+{
+    const entries = buildH5ConversationEntries([
+        { id: 'u1', role: 'user', content: '奶茶机扫码不出料怎么办？' },
+        { id: 'lookup', role: 'tool_call', toolCallId: 'lookup', toolName: 'knowledge_search', toolStatus: 'done', toolResult: 'result' },
+        { id: 'answer', role: 'assistant', content: '这是完整且必须展示的知识库排查正文。' },
+        { id: 'confirm', role: 'tool_call', toolCallId: 'confirm', toolName: 'request_confirmation', toolStatus: 'done', toolResult: 'NO' },
+        { id: 'feedback', role: 'tool_call', toolCallId: 'feedback', toolName: 'work_order_feedback', toolStatus: 'done', toolResult: 'ok' },
+        { id: 'final', role: 'assistant', content: '已记录反馈。' },
+    ]);
+
+    assert.equal(JSON.stringify(entries.map((entry) => entry.type)), JSON.stringify([
+        'message', 'analysis_group', 'message', 'special_render', 'analysis_group', 'message',
+    ]));
+    assert.equal(entries[2].msg.id, 'answer');
+    assert.equal(entries[2].msg.content, '这是完整且必须展示的知识库排查正文。');
+    assert.equal(entries[3].renderType, 'confirmation');
 }
 
 {
@@ -320,7 +364,9 @@ const {
     assert.equal(merged[1].id, 'row-history');
     assert.equal(merged.filter((msg) => msg.role === 'tool_call').length, 1);
     const entries = buildH5ConversationEntries(merged);
-    assert.equal(entries.filter((entry) => entry.type === 'file_delivery').length, 1);
+    assert.equal(entries.filter((entry) => (
+        entry.type === 'special_render' && entry.renderType === 'file-delivery'
+    )).length, 1);
 }
 
 {

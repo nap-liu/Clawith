@@ -9,58 +9,68 @@ REQUEST_CONFIRMATION_TOOL_DEFINITION: dict[str, Any] = {
     "function": {
         "name": REQUEST_CONFIRMATION_TOOL_NAME,
         "description": (
-            "在执行不可逆或有对外副作用的业务操作前(例如创建单据、写入外部系统、对外发送消息),"
-            "用本工具向用户出示一张确认卡片征求许可。调用即把控制权交给用户并结束当前回合。"
-            "用户点击卡片按钮后,你会在后续回合被告知他点了哪个按钮(按钮文字),"
-            "然后由你自己决定后续——同意就自己去执行该操作,拒绝就据此继续对话。"
-            "force_confirmation=true 时用户只能点击卡片才能继续;"
-            "force_confirmation=false 时用户也可以直接发送新消息来忽略本次确认,"
-            "平台会明确告知你本次操作没有获得确认。"
-            "平台只忠实地把用户的点击带回给你,不会替你执行任何操作。卡片有效期 24 小时,过期作废。"
+            "向用户展示确认卡片并等待明确选择。适用于后续处理需要用户确认、授权、接受风险或选择处理分支的场景，"
+            "尤其是不可逆或有外部副作用的操作；普通信息展示或不需要等待用户选择时不要使用。"
+            "如果需要在卡片前提供说明或答复，必须在同一次响应的 content 字段中输出完整正文；"
+            "工具参数仅描述卡片本身。content 与卡片相互独立，不得将独立正文放入 summary 或其他卡片参数。"
+            "调用本工具后，当前回合结束并等待用户处理卡片。用户点击按钮后，后续回合会返回按钮的文字和值，"
+            "由你根据用户选择决定后续处理。action 仅用于展示拟执行动作，本工具不会代替你执行该动作。"
+            "卡片有效期为 24 小时，过期后作废。force_confirmation=true 时，用户必须点击卡片按钮才能继续；"
+            "force_confirmation=false 时，用户也可以发送新消息跳过本次确认，届时会明确返回本次操作未获得确认。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "卡片标题,简短点明要做的事,如 '创建采购单 PO-2026-0312'",
+                    "description": "卡片标题，简短点明需要用户确认或选择的事项。",
                 },
                 "summary": {
                     "type": "string",
-                    "description": "markdown 正文:做什么 / 关键参数 / 影响范围 / 是否可逆,讲清楚让用户能判断",
+                    "description": (
+                        "卡片的 Markdown 正文：说明做什么、关键参数、影响范围、是否可逆，"
+                        "讲清楚让用户能够判断。仅承载卡片自身的确认信息，不承载 content 中的独立正文。"
+                    ),
                 },
                 "action": {
                     "type": "object",
-                    "description": "(可选,仅展示用)你打算执行的动作,会显示在卡片上让用户知情。平台不会替你执行;确认后由你自己去做。",
+                    "description": (
+                        "可选的动作预览，用于告知用户确认后拟执行的操作。仅用于展示，"
+                        "本工具不会自动执行；获得确认后仍需由你执行实际操作。"
+                    ),
                     "properties": {
                         "tool": {
                             "type": "string",
-                            "description": "要执行的工具名(必须是你当前已启用的工具)",
+                            "description": "拟执行的工具名称，必须是当前已启用的工具。",
                         },
-                        "args": {"type": "object", "description": "该工具的参数"},
+                        "args": {
+                            "type": "object",
+                            "description": "拟执行工具的参数，仅用于动作预览。",
+                        },
                     },
                     "required": ["tool"],
                 },
                 "buttons": {
                     "type": "array",
                     "description": (
-                        "卡片上的按钮,由你动态定义,数量和行为不限。最常见是两个:确认/取消"
-                        "(不传 buttons 就默认用这两个),但你也可以放任意按钮,如「同意」「驳回」"
-                        "「稍后再说」「方案A」「方案B」等。用户点击后,平台会把该按钮的 value 和文字"
-                        "原样带回给你,由你判断处理。"
+                        "卡片按钮列表。不传时默认使用“确认”和“取消”；也可以按当前选择动态定义其他按钮。"
+                        "用户点击后，按钮的 text 和 value 会原样返回，由你据此处理。"
                     ),
                     "items": {
                         "type": "object",
                         "properties": {
-                            "text": {"type": "string", "description": "按钮显示文字"},
+                            "text": {"type": "string", "description": "按钮上显示的文字。"},
                             "value": {
                                 "type": "string",
-                                "description": "该按钮的回传值,点击后原样带回给你(自定义,如 confirm/cancel/approve/plan_a)",
+                                "description": "按钮对应的返回值，用户点击后原样返回，用于识别用户选择。",
                             },
                             "color": {
                                 "type": "string",
                                 "enum": ["blue", "red", "gray"],
-                                "description": "按钮配色,只能是 blue(主/蓝)、red(危险/红)、gray(次要/灰)三选一,默认 blue。",
+                                "description": (
+                                    "按钮颜色，只能是 blue、red 或 gray；blue 表示主要操作，"
+                                    "red 表示危险操作，gray 表示次要操作，默认 blue。"
+                                ),
                             },
                         },
                         "required": ["text", "value"],
@@ -69,14 +79,13 @@ REQUEST_CONFIRMATION_TOOL_DEFINITION: dict[str, Any] = {
                 "risk_level": {
                     "type": "string",
                     "enum": ["low", "medium", "high"],
-                    "description": "风险等级,仅影响卡片配色,默认 medium",
+                    "description": "确认事项的风险等级，仅影响卡片的视觉提示，不改变处理逻辑，默认 medium。",
                 },
                 "force_confirmation": {
                     "type": "boolean",
                     "description": (
-                        "是否强制用户点击卡片后才能继续。默认 true。"
-                        "true:卡片未处理前拒绝普通输入;"
-                        "false:用户发送新消息时视为忽略本次确认,平台会返回明确的未确认结果。"
+                        "是否必须通过卡片按钮完成选择，默认 true。true 表示卡片处理前不接受普通输入；"
+                        "false 表示用户可以发送新消息跳过本次确认，并返回本次操作未获得确认。"
                     ),
                 },
             },

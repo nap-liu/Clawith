@@ -18,8 +18,7 @@ import {
     IconX,
 } from '@tabler/icons-react';
 import ChatImageLightbox from '../../components/ChatImageLightbox';
-import ChatFileDeliveryCard from '../../components/ChatFileDeliveryCard';
-import ConfirmationCard from '../../components/ConfirmationCard';
+import ChatToolCallRenderer from '../../components/ChatToolCallRenderer';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
 import { useToast } from '../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../stores';
@@ -59,7 +58,6 @@ import {
     buildH5ConversationEntries,
     getH5ScrollAnchor,
     hasPendingConfirmation,
-    isConfirmationToolCall,
     mapHistoryMessage,
     mergeHistoryMessages,
     toolCallMessageFromEvent,
@@ -344,7 +342,6 @@ function estimateConversationEntrySize(entry: ReturnType<typeof buildH5Conversat
     if (entry.type === 'analysis_group') {
         return expanded ? Math.min(360, 52 + entry.items.length * 74) : 52;
     }
-    if (entry.type === 'file_delivery') return entry.delivery.message ? 142 : 86;
     const msg = entry.msg;
     if (msg.role === 'tool_call') return 190;
     const text = `${msg.content || ''}${msg.thinking || ''}`;
@@ -1691,19 +1688,6 @@ export default function H5AgentChat() {
             );
         }
 
-        if (entry.type === 'file_delivery') {
-            return (
-                <article className="h5-chat__message h5-chat__message--assistant h5-chat__message--file-delivery">
-                    <ChatFileDeliveryCard
-                        agentId={agentId || ''}
-                        delivery={entry.delivery}
-                        mode="h5"
-                        onPreviewImages={(images, index) => setImagePreview({ images, index })}
-                    />
-                </article>
-            );
-        }
-
         const msg = entry.msg;
         const rawDisplayContent = msg.fileName ? stripAttachmentDisplayPrefix(msg.content) : msg.content;
         const displayContent = stripChatImageDataMarkers(rawDisplayContent);
@@ -1713,17 +1697,16 @@ export default function H5AgentChat() {
         const previewedImageNames = new Set(previewImages.map((image) => image.filename).filter(Boolean));
         const fileChips = splitAttachmentFileNames(msg.fileName)
             .filter((name) => !previewedImageNames.has(name));
-        if (msg.role === 'tool_call' && isConfirmationToolCall(msg)) {
+        if (entry.type === 'special_render') {
             return (
-                <article className="h5-chat__message h5-chat__message--assistant h5-chat__message--confirmation">
-                    <div className="h5-chat__confirmation-card">
-                        <ConfirmationCard
+                <article className={`h5-chat__message h5-chat__message--assistant h5-chat__message--special-render h5-chat__message--${entry.renderType}`}>
+                    <div className={`h5-chat__special-render h5-chat__${entry.renderType}-card`}>
+                        <ChatToolCallRenderer
                             agentId={agentId || ''}
-                            callId={msg.toolCallId || ''}
-                            args={msg.toolArgs || {}}
-                            resolved={msg.toolStatus === 'done'}
-                            result={msg.toolResult}
+                            message={msg}
                             t={h5T}
+                            mode="h5"
+                            onPreviewImages={(images, index) => setImagePreview({ images, index })}
                             onResolved={(resolvedResult) => {
                                 setMessages((prev) => upsertToolCallMessage(prev, {
                                     ...msg,
