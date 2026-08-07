@@ -6938,6 +6938,12 @@ select:focus {
   font-size: 11px;
   border: 1px solid var(--border-subtle);
   color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+}
+.chat-msg-file-chip:disabled {
+  cursor: default;
+  opacity: 0.75;
 }
 [data-theme="dark"] .chat-msg-file-chip {
   background: rgba(255, 255, 255, 0.05);

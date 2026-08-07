@@ -553,6 +553,29 @@ def _observable_tool_result(tool_name: str, result: str) -> str:
         return result
 
 
+def _send_media_result_is_durable_in_current_session(
+    tool_name: str, result: str, session_id: str
+) -> bool:
+    """True when send_media already updated the current Session's tool row."""
+    if tool_name != "send_media":
+        return False
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("type") in {
+            "platform_media_delivery", "media_delivery_result",
+        }
+        and payload.get("status") in {
+            "sent", "already_sent", "failed", "unsupported", "unknown",
+        }
+        and str(payload.get("session_id") or "") == str(session_id or "")
+        and str(payload.get("message_id") or "")
+    )
+
+
 async def _persist_tool_call_events_strict(
     events: list[dict],
     *,
@@ -1061,7 +1084,11 @@ async def _process_tool_call(
         "result": _observable_tool_result(tool_name, llm_view),
         "reasoning_content": full_reasoning_content,
     }
-    if await _persist_tool_call_events_strict(
+    if _send_media_result_is_durable_in_current_session(
+        tool_name, str(llm_view), session_id
+    ):
+        done_evt["_durable_persisted"] = True
+    elif await _persist_tool_call_events_strict(
         [done_evt],
         agent_id=agent_id,
         user_id=user_id,

@@ -8,6 +8,8 @@ import { useDialog } from '../../components/Dialog/DialogProvider';
 import { useToast } from '../../components/Toast/ToastProvider';
 import type { FileBrowserApi } from '../../components/FileBrowser';
 import FileBrowser from '../../components/FileBrowser';
+import ChatAttachmentIcon from '../../components/ChatAttachmentIcon';
+import ChatMediaCard from '../../components/ChatMediaCard';
 import ChatImageLightbox from '../../components/ChatImageLightbox';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
 import PromptModal from '../../components/PromptModal';
@@ -45,11 +47,13 @@ import {
     buildChatAttachmentPayload,
     buildPreviewImage,
     buildPreviewImagesFromAttachments,
+    downloadChatAttachment,
     extractChatImageDataMarkers,
-    isPreviewableImageName,
+    normalizeChatAttachmentFields,
     splitAttachmentFileNames,
     stripChatImageDataMarkers,
     type ChatAttachedFile,
+    type ChatMessageAttachment,
     type ChatPreviewImage,
 } from '../../utils/chatAttachments';
 import { createClientId } from '../../utils/clientId';
@@ -2436,6 +2440,8 @@ export default function AgentDetailPage() {
             if (activeSessionIdRef.current !== sess.id) return;
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
+                ...(Object.prototype.hasOwnProperty.call(m, 'display_content') && { display_content: m.display_content || '' }),
+                ...(Object.prototype.hasOwnProperty.call(m, 'attachments') && { attachments: m.attachments || [] }),
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
                 ...(m.toolCallId && { toolCallId: m.toolCallId }),
                 ...(m.thinking && { thinking: m.thinking }),
@@ -2565,7 +2571,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error('保存失败', { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; confirmationToolCalls?: ChatMsg[]; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; display_content?: string; attachments?: ChatMessageAttachment[]; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; confirmationToolCalls?: ChatMsg[]; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const confirmationPending = chatMessages.some(isPendingConfirmationToolCall);
     const getToolTargetKey = (args: any): string => {
@@ -2654,16 +2660,18 @@ export default function AgentDetailPage() {
     type PendingChatMessage = {
         runtimeKey: SessionRuntimeKey;
         contentForLLM: string;
-        userMsg: string;
+        displayContent: string;
         fileName: string;
         imageUrl?: string;
         previewImages: ChatPreviewImage[];
+        attachments: ChatMessageAttachment[];
         modelId?: string | null;
         messageId: string;
     };
     const [attachedFiles, setAttachedFiles] = useState<ChatAttachedFile[]>([]);
     const attachedImagePreviews = useMemo(() => buildPreviewImagesFromAttachments(attachedFiles), [attachedFiles]);
     const [chatImagePreview, setChatImagePreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
+    const [unavailableAttachmentKeys, setUnavailableAttachmentKeys] = useState<Set<string>>(() => new Set());
     const dismissedWorkspaceRefPath = useRef<string | null>(null);
     const pendingChatSendRef = useRef<PendingChatMessage | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
@@ -2673,6 +2681,28 @@ export default function AgentDetailPage() {
     const chatInputRef = useRef<HTMLTextAreaElement>(null);
     const chatInputAreaRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+
+    useEffect(() => {
+        setUnavailableAttachmentKeys(new Set());
+    }, [activeSession?.id]);
+
+    const markAttachmentUnavailable = useCallback((key: string) => {
+        setUnavailableAttachmentKeys((current) => {
+            if (current.has(key)) return current;
+            const next = new Set(current);
+            next.add(key);
+            return next;
+        });
+    }, []);
+
+    const handleAttachmentDownload = useCallback(async (path: string, name: string) => {
+        if (!id) return;
+        try {
+            await downloadChatAttachment(fileApi.downloadUrl(id, path), name);
+        } catch {
+            markAttachmentUnavailable(path);
+        }
+    }, [id, markAttachmentUnavailable]);
 
     const workspacePreviewLocked = !!workspaceLockedPath;
     useEffect(() => {
@@ -2855,44 +2885,26 @@ export default function AgentDetailPage() {
 
     // Load chat history + connect websocket when chat tab is active
     const parseChatMsg = (msg: ChatMsg): ChatMsg => {
-        if (msg.role !== 'user') return msg;
-        let parsed = { ...msg };
-        // Standard web chat format: [file:name.pdf]\ncontent
-        const newFmt = msg.content.match(/^\[file:([^\]]+)\]\n?/);
-        if (newFmt) { parsed = { ...msg, fileName: newFmt[1], content: msg.content.slice(newFmt[0].length).trim() }; }
-        // Feishu/Slack channel format: [文件已上传: workspace/uploads/name]
-        const chanFmt = !newFmt && msg.content.match(/^\[\u6587\u4ef6\u5df2\u4e0a\u4f20: (?:workspace\/uploads\/)?([^\]\n]+)\]/);
-        if (chanFmt) {
-            const raw = chanFmt[1]; const fileName = raw.split('/').pop() || raw;
-            parsed = { ...msg, fileName, content: msg.content.slice(chanFmt[0].length).trim() };
-        }
-        // Old format: [File: name.pdf]\nFile location:...\nQuestion: user_msg
-        const oldFmt = !newFmt && !chanFmt && msg.content.match(/^\[File: ([^\]]+)\]/);
-        if (oldFmt) {
-            const fileName = oldFmt[1];
-            const qMatch = msg.content.match(/\nQuestion: ([\s\S]+)$/);
-            parsed = { ...msg, fileName, content: qMatch ? qMatch[1].trim() : '' };
-        }
-        const markerImages = extractChatImageDataMarkers(parsed.content || '');
-        if (markerImages.length > 0) {
-            parsed = { ...parsed, content: stripChatImageDataMarkers(parsed.content || '') };
-        }
-        // If files are images and no live data URL was provided, build download URLs for preview.
-        if (parsed.fileName && id) {
-            const previewImages = splitAttachmentFileNames(parsed.fileName)
-                .filter(isPreviewableImageName)
-                .map((name) => buildPreviewImage(
-                    `/api/agents/${id}/files/download?path=workspace/uploads/${encodeURIComponent(name)}&token=${token}`,
-                    name,
-                ));
-            const images = previewImages.length > 0 ? previewImages : markerImages;
-            if (!parsed.previewImages && images.length > 0) parsed.previewImages = images;
-            if (!parsed.imageUrl && images.length === 1) parsed.imageUrl = images[0].src;
-        } else if (!parsed.previewImages && markerImages.length > 0) {
-            parsed.previewImages = markerImages;
-            if (!parsed.imageUrl && markerImages.length === 1) parsed.imageUrl = markerImages[0].src;
-        }
-        return parsed;
+        const hasStructuredAttachments = Object.prototype.hasOwnProperty.call(msg, 'attachments');
+        if (msg.role !== 'user' && !(msg.role === 'assistant' && hasStructuredAttachments)) return msg;
+        if (!id) return msg;
+        const normalized = normalizeChatAttachmentFields({
+            raw: msg as Record<string, any>,
+            sourceChannel: activeSession?.source_channel,
+            buildDownloadUrl: (path, inline) => fileApi.downloadUrl(id, path, { inline }),
+        });
+        const markerImages = normalized.previewImages.length === 0
+            ? extractChatImageDataMarkers(msg.content || '')
+            : [];
+        const images = normalized.previewImages.length > 0 ? normalized.previewImages : markerImages;
+        return {
+            ...msg,
+            content: normalized.displayContent,
+            attachments: normalized.attachments,
+            fileName: normalized.fileName || msg.fileName,
+            previewImages: msg.previewImages || images,
+            imageUrl: msg.imageUrl || (images.length === 1 ? images[0].src : undefined),
+        };
     };
 
     // Fold one live WS broadcast event into the READ-ONLY view's message list
@@ -2904,14 +2916,31 @@ export default function AgentDetailPage() {
         const last = prev[prev.length - 1];
         const isStreamingAssistant = last && last.role === 'assistant' && (last as any)._streaming;
         if (d.type === 'channel_user_message') {
+            if (d.id && prev.some((message) => message.id === String(d.id))) return prev;
             if (last && last.role === 'user' && last.content === d.content
                 && ((last as any).sender_name || '') === (d.sender_name || '')) return prev;
             return [...prev, parseChatMsg({
+                id: d.id ? String(d.id) : undefined,
                 role: 'user', content: d.content || '',
+                ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
+                ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
                 ...(d.sender_name ? { sender_name: d.sender_name } : {}),
                 ...(d.user_id ? { sender_user_id: String(d.user_id) } : {}),
-                timestamp: new Date().toISOString(),
+                timestamp: d.created_at || new Date().toISOString(),
             } as any)];
+        }
+        if (d.type === 'assistant_message_committed') {
+            const committed = parseChatMsg({
+                id: d.id ? String(d.id) : undefined,
+                role: 'assistant',
+                content: d.content || '',
+                ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
+                ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
+                timestamp: d.created_at || new Date().toISOString(),
+            } as any);
+            const index = committed.id ? prev.findIndex((message) => message.id === committed.id) : -1;
+            if (index < 0) return [...prev, committed];
+            return [...prev.slice(0, index), { ...prev[index], ...committed }, ...prev.slice(index + 1)];
         }
         if (d.type === 'thinking') {
             if (isStreamingAssistant) return [...prev.slice(0, -1), { ...last, thinking: (last.thinking || '') + d.content }];
@@ -3261,7 +3290,7 @@ export default function AgentDetailPage() {
             // conversation as it streams in, so a monitored channel / other-user
             // session updates live instead of only on reload.
             if (activeReadOnlyRef.current) {
-                if (['channel_user_message', 'thinking', 'chunk', 'tool_call', 'done'].includes(d.type)) {
+                if (['channel_user_message', 'assistant_message_committed', 'thinking', 'chunk', 'tool_call', 'done'].includes(d.type)) {
                     const hel = historyContainerRef.current;
                     const nearBottom = !hel || hel.scrollHeight - hel.scrollTop - hel.clientHeight < 120;
                     setHistoryMsgs(prev => applyMonitorEvent(prev, d));
@@ -3449,22 +3478,48 @@ export default function AgentDetailPage() {
                     if (currentSessionId) clearUnreadForSession(currentSessionId);
                     queryClient.invalidateQueries({ queryKey: ['agents'] });
                 }
+            } else if (d.type === 'user_message_committed') {
+                const clientMessageId = String(d.client_message_id || '');
+                const messageId = String(d.message_id || '');
+                if (clientMessageId && messageId) {
+                    setChatMessages(prev => prev.map(message => (
+                        String(message.id || '') === clientMessageId ? { ...message, id: messageId } : message
+                    )));
+                }
+            } else if (d.type === 'assistant_message_committed') {
+                const committed = parseChatMsg({
+                    id: d.id ? String(d.id) : undefined,
+                    role: 'assistant',
+                    content: d.content || '',
+                    ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
+                    ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
+                    timestamp: d.created_at || new Date().toISOString(),
+                });
+                setChatMessages(prev => {
+                    const index = committed.id ? prev.findIndex(message => message.id === committed.id) : -1;
+                    if (index < 0) return [...prev, committed];
+                    return [...prev.slice(0, index), { ...prev[index], ...committed }, ...prev.slice(index + 1)];
+                });
             } else if (d.type === 'channel_user_message') {
                 // An IM (DingTalk/Feishu/…) user sent a message in this session —
                 // mirror it live so a web viewer sees the user's own message
                 // without reloading (the agent reply already streams in).
                 setChatMessages(prev => {
                     const last = prev[prev.length - 1];
+                    if (d.id && prev.some((message) => message.id === String(d.id))) return prev;
                     if (last && last.role === 'user' && last.content === d.content
                         && ((last as any).sender_name || '') === (d.sender_name || '')
                         && ((last as any).sender_user_id || '') === (d.sender_user_id || d.user_id || '')) return prev;
                     return [...prev, parseChatMsg({
+                        id: d.id ? String(d.id) : undefined,
                         role: 'user',
                         content: d.content,
+                        ...(Object.prototype.hasOwnProperty.call(d, 'display_content') && { display_content: d.display_content || '' }),
+                        ...(Object.prototype.hasOwnProperty.call(d, 'attachments') && { attachments: d.attachments || [] }),
                         ...(d.sender_name ? { sender_name: d.sender_name } : {}),
                         ...((d.sender_user_id || d.user_id) ? { sender_user_id: d.sender_user_id || d.user_id } : {}),
                         ...(d.sender_agent_id ? { sender_agent_id: d.sender_agent_id } : {}),
-                        timestamp: new Date().toISOString(),
+                        timestamp: d.created_at || new Date().toISOString(),
                     })];
                 });
                 const cuSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
@@ -3561,17 +3616,20 @@ export default function AgentDetailPage() {
         setChatMessages(prev => [...prev, parseChatMsg({
             id: payload.messageId,
             role: 'user',
-            content: payload.userMsg,
+            content: payload.displayContent,
+            display_content: payload.displayContent,
             fileName: payload.fileName,
             imageUrl: payload.imageUrl,
             previewImages: payload.previewImages,
+            attachments: payload.attachments,
             timestamp: new Date().toISOString()
         })]);
         socket.send(JSON.stringify({
             message_id: payload.messageId,
             content: payload.contentForLLM,
-            display_content: payload.userMsg,
+            display_content: payload.displayContent,
             file_name: payload.fileName,
+            attachments: payload.attachments,
             model_id: payload.modelId,
         }));
     };
@@ -3769,6 +3827,8 @@ export default function AgentDetailPage() {
             }
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
+                ...(Object.prototype.hasOwnProperty.call(m, 'display_content') && { display_content: m.display_content || '' }),
+                ...(Object.prototype.hasOwnProperty.call(m, 'attachments') && { attachments: m.attachments || [] }),
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
                 ...(m.toolCallId && { toolCallId: m.toolCallId }),
                 ...(m.thinking && { thinking: m.thinking }),
@@ -3867,7 +3927,28 @@ export default function AgentDetailPage() {
             ? msg.previewImages
             : (msg.imageUrl ? [buildPreviewImage(msg.imageUrl, msg.fileName)] : []);
         const previewedImageNames = new Set(previewImages.map(image => image.filename).filter(Boolean));
-        const fileChips = splitAttachmentFileNames(msg.fileName).filter(name => !previewedImageNames.has(name));
+        const mediaAttachments: ChatMessageAttachment[] = msg.role === 'user' && Array.isArray(msg.attachments)
+            ? msg.attachments.filter((attachment: ChatMessageAttachment) => (
+                attachment.kind === 'audio' || attachment.kind === 'video'
+            ))
+            : [];
+        const fileChips: Array<{
+            name: string;
+            path?: string;
+            kind?: ChatMessageAttachment['kind'];
+            mimeType?: string;
+        }> = Array.isArray(msg.attachments)
+            ? msg.attachments
+                .filter((attachment: ChatMessageAttachment) => !['image', 'audio', 'video'].includes(attachment.kind))
+                .map((attachment: ChatMessageAttachment) => ({
+                    name: attachment.display_name,
+                    path: attachment.path,
+                    kind: attachment.kind,
+                    mimeType: attachment.mime_type,
+                }))
+            : splitAttachmentFileNames(msg.fileName)
+                .filter(name => !previewedImageNames.has(name))
+                .map(name => ({ name }));
         const resolvedSenderLabel = msg.sender_name || senderLabel;
         const resolvedAvatarText = avatarText || (resolvedSenderLabel ? resolvedSenderLabel[0] : (isLeft ? 'A' : 'U'));
         const showSenderLabel = !!resolvedSenderLabel && (forceSenderLabel || !!msg.sender_name);
@@ -3912,25 +3993,66 @@ export default function AgentDetailPage() {
                             {previewImages.length > 0 ? (
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: displayContent ? '6px' : '4px' }}>
                                     {previewImages.map((image, idx) => (
-                                        <button
-                                            key={`${image.src}-${idx}`}
-                                            type="button"
-                                            className="chat-msg-image-preview"
-                                            onClick={() => setChatImagePreview({ images: previewImages, index: idx })}
-                                            title={t('common.preview', 'Preview')}
-                                        >
-                                            <img src={image.src} alt={image.alt || image.filename || 'image'} style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '8px', border: '1px solid var(--border-subtle)', objectFit: 'cover' }} loading="lazy" />
-                                        </button>
+                                        unavailableAttachmentKeys.has(image.path || image.src) ? (
+                                            <div key={`${image.path || image.src}-${idx}`} className="chat-msg-file-chip">
+                                                <IconAlertTriangle size={14} stroke={1.8} />
+                                                <span>{image.filename || '图片'} · 当前不可访问</span>
+                                            </div>
+                                        ) : (
+                                            <button
+                                                key={`${image.src}-${idx}`}
+                                                type="button"
+                                                className="chat-msg-image-preview"
+                                                onClick={() => setChatImagePreview({ images: previewImages, index: idx })}
+                                                title={t('common.preview', 'Preview')}
+                                            >
+                                                <img
+                                                    src={image.src}
+                                                    alt={image.alt || image.filename || 'image'}
+                                                    style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '8px', border: '1px solid var(--border-subtle)', objectFit: 'cover' }}
+                                                    loading="lazy"
+                                                    onError={() => markAttachmentUnavailable(image.path || image.src)}
+                                                />
+                                            </button>
+                                        )
+                                    ))}
+                                </div>
+                            ) : null}
+                            {mediaAttachments.length > 0 ? (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: displayContent ? '6px' : '4px' }}>
+                                    {mediaAttachments.map((attachment, mediaIndex) => (
+                                        <ChatMediaCard
+                                            key={`${attachment.path}-${mediaIndex}`}
+                                            agentId={id || ''}
+                                            messageId={String(msg.id || '')}
+                                            attachment={attachment}
+                                            onDownload={() => void handleAttachmentDownload(attachment.path, attachment.display_name)}
+                                            onUnavailable={() => markAttachmentUnavailable(attachment.path)}
+                                        />
                                     ))}
                                 </div>
                             ) : null}
                             {fileChips.length > 0 && (
                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: displayContent ? '4px' : '0' }}>
-                                    {fileChips.map((fileName: string) => (
-                                        <div key={fileName} className="chat-msg-file-chip">
-                                            <IconPaperclip size={14} stroke={1.8} />
-                                            <span style={{ fontWeight: 500, color: 'var(--text-primary)', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{fileName}</span>
-                                        </div>
+                                    {fileChips.map((file, fileIndex) => (
+                                        <button
+                                            key={`${file.path || file.name}-${fileIndex}`}
+                                            type="button"
+                                            className="chat-msg-file-chip"
+                                            disabled={!file.path || unavailableAttachmentKeys.has(file.path)}
+                                            onClick={() => file.path && void handleAttachmentDownload(file.path, file.name)}
+                                        >
+                                            <ChatAttachmentIcon
+                                                name={file.name}
+                                                kind={file.kind}
+                                                mimeType={file.mimeType}
+                                                size={16}
+                                                stroke={1.8}
+                                            />
+                                            <span style={{ fontWeight: 500, color: 'var(--text-primary)', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                {file.name}{file.path && unavailableAttachmentKeys.has(file.path) ? ' · 当前不可访问' : ''}
+                                            </span>
+                                        </button>
                                     ))}
                                 </div>
                             )}
@@ -3968,7 +4090,7 @@ export default function AgentDetailPage() {
                 </div>
             </div>
         );
-    }), [t]);
+    }), [handleAttachmentDownload, markAttachmentUnavailable, t, unavailableAttachmentKeys]);
 
     // ── Unified grouped conversation renderer ──
     //
@@ -4038,11 +4160,12 @@ export default function AgentDetailPage() {
 
             if (msg.role === 'assistant') {
                 const contentText = msg.content?.trim() || '';
+                const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
                 if (msg.thinking) {
                     if (!currentGroup) { currentGroup = []; groupStartKey = i; }
                     currentGroup.push({ type: 'thinking', content: msg.thinking });
                 }
-                if (!contentText) continue;
+                if (!contentText && !hasAttachments) continue;
                 flushGroup();
                 grouped.push({ type: 'msg', msg: msg.thinking ? { ...msg, thinking: undefined } : msg, i });
                 continue;
@@ -4274,10 +4397,11 @@ export default function AgentDetailPage() {
         const payload: PendingChatMessage = {
             runtimeKey: activeRuntimeKey,
             contentForLLM: attachmentPayload.contentForLLM,
-            userMsg: attachmentPayload.userMsg,
+            displayContent: attachmentPayload.displayContent,
             fileName: attachmentPayload.fileName,
             imageUrl: attachmentPayload.imageUrl,
             previewImages: attachmentPayload.previewImages,
+            attachments: attachmentPayload.attachments,
             modelId: effectiveChatModelId,
             messageId: createClientId(),
         };
@@ -4352,6 +4476,8 @@ export default function AgentDetailPage() {
                         text: data.extracted_text,
                         path: data.workspace_path,
                         imageUrl: data.image_data_url || undefined,
+                        mimeType: file.type || undefined,
+                        sizeBytes: data.size ?? file.size,
                     }].slice(0, 10),
                 );
             } catch (err: any) {
@@ -4430,6 +4556,8 @@ export default function AgentDetailPage() {
                         text: data.extracted_text,
                         path: data.workspace_path,
                         imageUrl: data.image_data_url || undefined,
+                        mimeType: file.type || undefined,
+                        sizeBytes: data.size ?? file.size,
                     }].slice(0, 10),
                 );
             } catch (err: any) {
@@ -4465,7 +4593,14 @@ export default function AgentDetailPage() {
                     600_000, // large files: align with nginx /api/ 600s
                 );
                 const data = await promise;
-                setAttachedFiles(prev => [...prev, { name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined }]);
+                setAttachedFiles(prev => [...prev, {
+                    name: data.filename,
+                    text: data.extracted_text,
+                    path: data.workspace_path,
+                    imageUrl: data.image_data_url || undefined,
+                    mimeType: file.type || undefined,
+                    sizeBytes: data.size ?? file.size,
+                }]);
             } catch (err: any) {
                 if (err?.message !== 'Upload cancelled') {
                     toast.error(t('agent.upload.failed'), { details: String(err?.message || '') });
@@ -6773,7 +6908,7 @@ export default function AgentDetailPage() {
                                                                     <img className="chat-file-pill__thumb" src={draft.previewUrl} alt="" />
                                                                 ) : (
                                                                     <span className="chat-file-pill__icon">
-                                                                        <IconPaperclip size={14} stroke={1.75} />
+                                                                        <ChatAttachmentIcon name={draft.name} size={16} />
                                                                     </span>
                                                                 )}
                                                                 <span className="chat-file-pill__name">{draft.name}</span>
@@ -6814,7 +6949,11 @@ export default function AgentDetailPage() {
                                                                         </button>
                                                                     ) : (
                                                                         <span className="chat-file-pill__icon">
-                                                                            <IconPaperclip size={14} stroke={1.75} />
+                                                                            <ChatAttachmentIcon
+                                                                                name={file.name}
+                                                                                mimeType={file.mimeType}
+                                                                                size={16}
+                                                                            />
                                                                         </span>
                                                                     )}
                                                                     <span className="chat-file-pill__name">{file.name}</span>

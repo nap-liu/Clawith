@@ -1,4 +1,4 @@
-import type { ChatPreviewImage } from '../../utils/chatAttachments';
+import type { ChatMessageAttachment, ChatPreviewImage } from '../../utils/chatAttachments';
 import { createClientId } from '../../utils/clientId';
 import { getChatToolRenderIdentity, getChatToolRenderType } from '../../components/ChatToolCallRenderer';
 
@@ -11,6 +11,8 @@ export type H5ChatMessage = {
     thinking?: string;
     streaming?: boolean;
     created_at?: string | null;
+    display_content?: string;
+    attachments?: ChatMessageAttachment[];
     toolCallId?: string;
     toolName?: string;
     toolArgs?: any;
@@ -105,6 +107,8 @@ export function mapHistoryMessage(raw: any, makeId: () => string = defaultMakeId
         content: raw.content || '',
         thinking: raw.thinking || undefined,
         created_at: raw.created_at || null,
+        ...(Object.prototype.hasOwnProperty.call(raw, 'display_content') ? { display_content: raw.display_content || '' } : {}),
+        ...(Object.prototype.hasOwnProperty.call(raw, 'attachments') ? { attachments: raw.attachments || [] } : {}),
     };
 }
 
@@ -353,7 +357,13 @@ export function normalizeChatTimelineMessages<T extends Record<string, any>>(mes
             const hasAttachment = Boolean(
                 message.fileName
                 || message.imageUrl
-                || (Array.isArray(message.previewImages) && message.previewImages.length > 0),
+                || (Array.isArray(message.previewImages) && message.previewImages.length > 0)
+                || (
+                    Array.isArray(message.attachments)
+                    && message.attachments.some((attachment: ChatMessageAttachment) => (
+                        attachment.kind !== 'audio' && attachment.kind !== 'video'
+                    ))
+                ),
             );
             const isStreaming = Boolean(message.streaming || message._streaming);
             if (!hasContent && !hasThinking && !hasAttachment && !isStreaming) {
@@ -487,6 +497,7 @@ export function buildH5ConversationEntries(messages: H5ChatMessage[]): H5Convers
 
         if (msg.role === 'assistant') {
             const contentText = msg.content?.trim() || '';
+            const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
             if (msg.thinking) {
                 if (!currentGroup) {
                     currentGroup = [];
@@ -494,7 +505,7 @@ export function buildH5ConversationEntries(messages: H5ChatMessage[]): H5Convers
                 }
                 pushThinking(currentGroup, msg.thinking);
             }
-            if (!contentText) continue;
+            if (!contentText && !hasAttachments) continue;
             flushGroup();
             grouped.push({
                 type: 'message',

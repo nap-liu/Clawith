@@ -178,7 +178,10 @@ async def load_messages_for_session(
         for row in reversed(rows_q.scalars().all())
         if not (
             isinstance(getattr(row, "message_meta", None), dict)
-            and row.message_meta.get("consumed_by_onmessage")
+            and (
+                row.message_meta.get("consumed_by_onmessage")
+                or row.message_meta.get("delivery_claim")
+            )
         )
     ]
 
@@ -751,6 +754,10 @@ async def ingest_incoming_chat_message(
         "source_channel": source_channel,
         "actor_ref": str(actor_ref or user_id),
     }
+    # Protocol marker: every newly ingested message has authoritative attachment
+    # metadata, including an empty list. Rows without this key are therefore
+    # unambiguously legacy and may use the historical [file:...] parser.
+    meta.setdefault("attachments", [])
     # Snapshot the published scene while holding the same session-row lock used
     # to order inbound events.  A /scene command racing with an older in-flight
     # turn can therefore affect only messages ingested after the command wins
@@ -1075,6 +1082,7 @@ async def persist_assistant_reply_row(
     if not (content or "").strip():
         raise ValueError("assistant reply content must be non-empty")
     final_meta = dict(message_meta or {})
+    final_meta.setdefault("attachments", [])
     if turn_anchor_id is not None:
         final_meta.update(
             {

@@ -6,10 +6,23 @@ export type ChatFileDelivery = {
     mimeType?: string;
     size?: number;
     toolCallId?: string;
+    mediaKind?: 'audio' | 'video';
+    messageId?: string;
+    allowDownload?: boolean;
 };
 
-const FILE_DELIVERY_TOOL = 'send_channel_file';
+export type ChatMediaDeliveryError = {
+    deliveryError: true;
+    status: 'failed' | 'unsupported' | 'unknown';
+    code: string;
+    message: string;
+    retryable: boolean;
+    mediaKind?: 'audio' | 'video';
+};
+
+const FILE_DELIVERY_TOOLS = new Set(['send_channel_file', 'send_media', 'send_audio', 'send_video']);
 const FILE_DELIVERY_TYPE = 'platform_file_delivery';
+const MEDIA_DELIVERY_TYPE = 'platform_media_delivery';
 
 function toRecord(value: any): Record<string, any> {
     if (!value) return {};
@@ -65,6 +78,15 @@ function buildDelivery(payload: Record<string, any>, toolArgs: any, toolCallId?:
     const message = firstString(payload.message);
     const mimeType = firstString(payload.mime_type, payload.mimeType);
     const size = normalizeSize(payload.size);
+    const rawMediaKind = firstString(payload.media_kind, payload.mediaKind);
+    const mediaKind = rawMediaKind === 'audio' || rawMediaKind === 'video' ? rawMediaKind : undefined;
+    const messageId = firstString(
+        payload.message_id,
+        payload.messageId,
+        payload.receipt_message_id,
+        payload.receiptMessageId,
+    );
+    const allowDownload = payload.allow_download === true || payload.allowDownload === true;
     return {
         id,
         path,
@@ -73,6 +95,9 @@ function buildDelivery(payload: Record<string, any>, toolArgs: any, toolCallId?:
         ...(mimeType ? { mimeType } : {}),
         ...(size !== undefined ? { size } : {}),
         ...(toolCallId ? { toolCallId } : {}),
+        ...(mediaKind ? { mediaKind } : {}),
+        ...(messageId ? { messageId } : {}),
+        ...(mediaKind ? { allowDownload } : {}),
     };
 }
 
@@ -89,6 +114,27 @@ function parseStructuredResult(toolResult: any) {
     } catch {
         return null;
     }
+}
+
+export function parseMediaDeliveryErrorResult(
+    toolName: string | undefined,
+    toolResult: any,
+): ChatMediaDeliveryError | null {
+    if (!['send_media', 'send_audio', 'send_video'].includes((toolName || '').toLowerCase())) return null;
+    const payload = parseStructuredResult(toolResult);
+    if (!payload || !['media_delivery_result', MEDIA_DELIVERY_TYPE].includes(payload.type)) return null;
+    const rawStatus = firstString(payload.status).toLowerCase();
+    if (!['failed', 'unsupported', 'unknown'].includes(rawStatus)) return null;
+    const rawMediaKind = firstString(payload.media_kind, payload.mediaKind);
+    const mediaKind = rawMediaKind === 'audio' || rawMediaKind === 'video' ? rawMediaKind : undefined;
+    return {
+        deliveryError: true,
+        status: rawStatus as ChatMediaDeliveryError['status'],
+        code: firstString(payload.code) || 'MEDIA_DELIVERY_FAILED',
+        message: firstString(payload.message) || '媒体发送未完成',
+        retryable: payload.retryable === true,
+        ...(mediaKind ? { mediaKind } : {}),
+    };
 }
 
 function parseLegacyMarkdownResult(toolResult: any): Record<string, any> | null {
@@ -119,10 +165,14 @@ export function parseFileDeliveryToolResult(
     toolArgs: any = {},
     toolCallId?: string,
 ): ChatFileDelivery | null {
-    if ((toolName || '').toLowerCase() !== FILE_DELIVERY_TOOL) return null;
+    if (!FILE_DELIVERY_TOOLS.has((toolName || '').toLowerCase())) return null;
     const structured = parseStructuredResult(toolResult);
     if (structured) {
-        if (structured.type !== FILE_DELIVERY_TYPE) return null;
+        if (![FILE_DELIVERY_TYPE, MEDIA_DELIVERY_TYPE].includes(structured.type)) return null;
+        if (
+            structured.type === MEDIA_DELIVERY_TYPE
+            && !['sent', 'already_sent'].includes(firstString(structured.status).toLowerCase())
+        ) return null;
         return buildDelivery(structured, toolArgs, toolCallId);
     }
     const legacy = parseLegacyMarkdownResult(toolResult);

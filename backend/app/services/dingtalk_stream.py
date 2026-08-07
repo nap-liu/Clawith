@@ -7,6 +7,7 @@ Uses the dingtalk-stream SDK to receive bot messages via persistent connections.
 import asyncio
 import base64
 import json
+import tempfile
 import threading
 import uuid
 from concurrent.futures import CancelledError as FutureCancelledError
@@ -29,6 +30,8 @@ from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
 from app.services.dingtalk_token import dingtalk_token_manager
 from app.services.storage import store_agent_upload
 
+DINGTALK_VOICE_MAX_BYTES = 2 * 1024 * 1024
+DINGTALK_VIDEO_MAX_BYTES = 20 * 1024 * 1024
 
 # ─── DingTalk Media Helpers ─────────────────────────────
 
@@ -259,6 +262,8 @@ async def _upload_dingtalk_media(
     app_secret: str,
     file_path: str,
     media_type: str = "file",
+    *,
+    raise_on_transport_error: bool = False,
 ) -> Optional[str]:
     """Upload a media file to DingTalk and return the mediaId.
 
@@ -281,7 +286,7 @@ async def _upload_dingtalk_media(
         return None
 
     try:
-        file_bytes = file_p.read_bytes()
+        file_bytes = await asyncio.to_thread(file_p.read_bytes)
         async with httpx.AsyncClient(timeout=60) as client:
             # Use the legacy oapi endpoint which is more reliable and widely supported.
             # The newer api.dingtalk.com/v1.0/robot/messageFiles/upload requires
@@ -306,6 +311,8 @@ async def _upload_dingtalk_media(
             return None
     except Exception as e:
         logger.error(f"[DingTalk] Upload error: {e}")
+        if raise_on_transport_error:
+            raise
         return None
 
 
@@ -317,6 +324,10 @@ async def _send_dingtalk_media_message(
     media_type: str,
     conversation_type: str,
     filename: Optional[str] = None,
+    pic_media_id: Optional[str] = None,
+    duration_ms: int = 60_000,
+    *,
+    raise_on_transport_error: bool = False,
 ) -> bool:
     """Send a media message via DingTalk proactive message API.
 
@@ -328,6 +339,8 @@ async def _send_dingtalk_media_message(
         media_type: One of 'image', 'voice', 'video', 'file'.
         conversation_type: '1' for P2P, '2' for group.
         filename: Original filename (used for file/video types).
+        pic_media_id: Required thumbnail mediaId for native video messages.
+        duration_ms: Video/audio duration advertised to DingTalk, in milliseconds.
 
     Returns:
         True on success, False on failure.
@@ -344,17 +357,19 @@ async def _send_dingtalk_media_message(
         msg_param = json.dumps({"photoURL": media_id})
     elif media_type == "voice":
         msg_key = "sampleAudio"
-        msg_param = json.dumps({"mediaId": media_id, "duration": "3000"})
+        msg_param = json.dumps({"mediaId": media_id, "duration": str(duration_ms)})
     elif media_type == "video":
-        # sampleVideo requires picMediaId (thumbnail) which we don't have;
-        # use sampleFile instead for broader compatibility (same as OpenClaw plugin).
+        if not pic_media_id:
+            logger.error("[DingTalk] Native video requires picMediaId; refusing file-card fallback")
+            return False
         safe_name = filename or "video.mp4"
         ext = Path(safe_name).suffix.lstrip(".") or "mp4"
-        msg_key = "sampleFile"
+        msg_key = "sampleVideo"
         msg_param = json.dumps({
-            "mediaId": media_id,
-            "fileName": safe_name,
-            "fileType": ext,
+            "duration": str(duration_ms),
+            "videoMediaId": media_id,
+            "videoType": ext,
+            "picMediaId": pic_media_id,
         })
     else:
         # file
@@ -407,7 +422,82 @@ async def _send_dingtalk_media_message(
             return True
     except Exception as e:
         logger.error(f"[DingTalk] Send media error: {e}")
+        if raise_on_transport_error:
+            raise
         return False
+
+
+def _create_dingtalk_video_thumbnail(video_path: Path) -> Path | None:
+    """Create a dependency-light thumbnail accepted by DingTalk sampleVideo."""
+    try:
+        from PIL import Image, ImageDraw
+
+        image = Image.new("RGB", (640, 360), "#152033")
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((244, 104, 396, 256), radius=76, fill="#1677ff")
+        draw.polygon(((305, 145), (305, 215), (365, 180)), fill="white")
+        label = video_path.name[:64]
+        draw.text((24, 324), label, fill="#dbe7f7")
+        handle = tempfile.NamedTemporaryFile(
+            prefix="clawith-dingtalk-video-", suffix=".jpg", delete=False
+        )
+        handle.close()
+        thumbnail = Path(handle.name)
+        image.save(thumbnail, format="JPEG", quality=86, optimize=True)
+        return thumbnail
+    except Exception as exc:
+        logger.error(f"[DingTalk] Video thumbnail creation failed: {type(exc).__name__}")
+        return None
+
+
+async def _send_dingtalk_native_video(
+    app_key: str,
+    app_secret: str,
+    target_id: str,
+    file_path: Path,
+    conversation_type: str,
+    cover_image_path: Path | None = None,
+    *,
+    raise_on_transport_error: bool = False,
+) -> tuple[bool, str]:
+    """Upload video + thumbnail and send a real sampleVideo message."""
+    if file_path.stat().st_size > DINGTALK_VIDEO_MAX_BYTES:
+        return False, "MEDIA_TOO_LARGE"
+    generated_thumbnail = cover_image_path is None
+    thumbnail = cover_image_path or _create_dingtalk_video_thumbnail(file_path)
+    if thumbnail is None:
+        return False, "VIDEO_THUMBNAIL_FAILED"
+    try:
+        # DingTalk's OAPI upload expects videos used by sampleVideo as file media.
+        strict_kwargs = {"raise_on_transport_error": True} if raise_on_transport_error else {}
+        video_media_id = await _upload_dingtalk_media(
+            app_key, app_secret, str(file_path), "file", **strict_kwargs
+        )
+        if not video_media_id:
+            return False, "MEDIA_UPLOAD_FAILED"
+        pic_media_id = await _upload_dingtalk_media(
+            app_key, app_secret, str(thumbnail), "image", **strict_kwargs
+        )
+        if not pic_media_id:
+            return False, "VIDEO_THUMBNAIL_UPLOAD_FAILED"
+        sent = await _send_dingtalk_media_message(
+            app_key,
+            app_secret,
+            target_id,
+            video_media_id,
+            "video",
+            conversation_type,
+            filename=file_path.name,
+            pic_media_id=pic_media_id,
+            **strict_kwargs,
+        )
+        return sent, "MEDIA_SENT" if sent else "MEDIA_SEND_FAILED"
+    finally:
+        if generated_thumbnail:
+            try:
+                thumbnail.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("[DingTalk] Failed to remove temporary video thumbnail")
 
 
 # ─── Stream Manager ─────────────────────────────────────

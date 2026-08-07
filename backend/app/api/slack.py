@@ -17,6 +17,7 @@ from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
+from app.services.chat_attachments import attachment_from_workspace_path
 from app.services.storage import store_agent_upload
 
 router = APIRouter(tags=["slack"])
@@ -407,7 +408,14 @@ async def slack_event_webhook(
             provider_event_id=event_id or event.get("client_msg_id") or event.get("ts"),
             channel_config_id=config.id,
             actor_ref=sender_id,
-            message_meta={"message_type": "file"},
+            message_meta={
+                "message_type": "file",
+                "attachments": [
+                    attachment_from_workspace_path(path)
+                    for path in _file_user_messages
+                ],
+                "display_content": "",
+            },
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
@@ -431,7 +439,7 @@ async def slack_event_webhook(
         # real time (matches what a reload renders: the [file:...] row).
         from app.services.channel_llm import broadcast_channel_user_message
         await broadcast_channel_user_message(
-            agent_id, session_conv_id, content=_file_content,
+            agent_id, session_conv_id, message=_file_ingested.message,
             sender_name=_slack_real_name or None, user_id=platform_user_id,
         )
         if _bot_token and channel_id:
@@ -439,6 +447,7 @@ async def slack_event_webhook(
         return {"ok": True}
 
     # Append uploaded file paths to user message for context
+    _file_display_text = user_text
     if _file_user_messages and user_text:
         user_text += "\n" + " ".join(f"[file:{p.split('/')[-1]}]" for p in _file_user_messages)
 
@@ -462,6 +471,13 @@ async def slack_event_webhook(
             channel_config_id=config.id,
             actor_ref=sender_id,
             reply_to_external_message_id=event.get("thread_ts"),
+            message_meta={
+                "attachments": [
+                    attachment_from_workspace_path(path)
+                    for path in _file_user_messages
+                ],
+                "display_content": _file_display_text,
+            },
         )
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
@@ -471,7 +487,7 @@ async def slack_event_webhook(
         # message show up live too, not only on reload.
         from app.services.channel_llm import broadcast_channel_user_message
         await broadcast_channel_user_message(
-            agent_id, session_conv_id, content=user_text,
+            agent_id, session_conv_id, message=ingested.message,
             sender_name=_slack_real_name or None, user_id=platform_user_id,
         )
 

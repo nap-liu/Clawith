@@ -6,6 +6,7 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone as tz
 from time import perf_counter
+from typing import Any
 
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -684,6 +685,7 @@ class WebSocketChatHandler:
             content = data.get("content", "")
             display_content = data.get("display_content", "")
             file_name = data.get("file_name", "")
+            raw_attachments = data.get("attachments") if "attachments" in data else None
             override_model_id = data.get("model_id")
             is_onboarding_trigger = data.get("kind") == "onboarding_trigger"
             logger.info(f"[WS] Received: {content[:50]}" + (" [onboarding]" if is_onboarding_trigger else ""))
@@ -700,6 +702,21 @@ class WebSocketChatHandler:
                     {"type": "error", "content": "只读监看会话,无法在此发送消息。"}
                 )
                 continue
+
+            validated_attachments = None
+            if raw_attachments is not None:
+                from app.services.chat_attachments import validate_client_attachments
+
+                try:
+                    validated_attachments = await validate_client_attachments(
+                        self.agent_id,
+                        raw_attachments,
+                    )
+                except (TypeError, ValueError) as exc:
+                    await self.websocket.send_json(
+                        {"type": "error", "content": f"附件无效：{exc}"}
+                    )
+                    continue
 
             # Scene changes apply to the next turn. The session itself remains
             # unchanged; the exact scene revision used is recorded on messages.
@@ -730,6 +747,8 @@ class WebSocketChatHandler:
 
             self.current_user_text = content
 
+            client_message_id = data.get("message_id") or data.get("client_message_id")
+
             # Persist the first fixed greeting, if any, in the same transaction
             # as the first real user message. Opening a session alone never
             # writes the greeting to history.
@@ -744,13 +763,23 @@ class WebSocketChatHandler:
                 display_content,
                 file_name,
                 is_onboarding_trigger,
-                client_message_id=(data.get("message_id") or data.get("client_message_id")),
+                client_message_id=client_message_id,
                 model_id=(
                     str(effective_llm_model.id)
                     if effective_llm_model is not None
                     else None
                 ),
+                attachments=validated_attachments,
             )
+
+            if turn_anchor_id is not None and client_message_id:
+                await self._safe_send(
+                    {
+                        "type": "user_message_committed",
+                        "client_message_id": str(client_message_id),
+                        "message_id": str(turn_anchor_id),
+                    }
+                )
 
             if pending_confirmation is not None:
                 await self._safe_send(
@@ -1020,6 +1049,7 @@ class WebSocketChatHandler:
         is_onboarding_trigger: bool,
         client_message_id: str | None = None,
         model_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> tuple[
         uuid.UUID | None,
         bool,
@@ -1084,6 +1114,14 @@ class WebSocketChatHandler:
                     message_meta={
                         **self._scene_message_meta(),
                         **({"model_id": model_id} if model_id else {}),
+                        **(
+                            {
+                                "attachments": attachments,
+                                "display_content": display_content,
+                            }
+                            if attachments is not None
+                            else {}
+                        ),
                     },
                     created_at=first_user_created_at,
                 )

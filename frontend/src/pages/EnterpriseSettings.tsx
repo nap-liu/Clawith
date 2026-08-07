@@ -1229,8 +1229,10 @@ export default function EnterpriseSettings() {
                                 };
 
                                 const bulkToggle = async (tools: any[], enabled: boolean) => {
+                                    const controllableTools = tools.filter(tool => tool.can_disable !== false);
+                                    if (controllableTools.length === 0) return;
                                     try {
-                                        const payload = tools.map(t => ({ tool_id: t.id, enabled }));
+                                        const payload = controllableTools.map(t => ({ tool_id: t.id, enabled }));
                                         await fetchJson('/tools/bulk', { method: 'PUT', body: JSON.stringify(payload) });
                                         loadAllTools();
                                     } catch (err: any) {
@@ -1314,7 +1316,11 @@ export default function EnterpriseSettings() {
                                                         loadAgentInstalledTools();
                                                     }}>{t('common.delete')}</button>
                                                 )}
-                                                <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }}>
+                                                {tool.can_disable === false ? (
+                                                    <span style={{ fontSize: '11px', color: 'var(--accent-color)', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                                                        {t('agent.tools.alwaysAvailable', 'Always available')}
+                                                    </span>
+                                                ) : <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }}>
                                                     <input type="checkbox" checked={tool.enabled} onChange={async (e) => {
                                                         await fetchJson(`/tools/${tool.id}`, { method: 'PUT', body: JSON.stringify({ enabled: e.target.checked }) });
                                                         loadAllTools();
@@ -1322,7 +1328,7 @@ export default function EnterpriseSettings() {
                                                     <span style={switchTrack(tool.enabled)}>
                                                         <span style={switchKnob(tool.enabled)} />
                                                     </span>
-                                                </label>
+                                                </label>}
                                             </div>
                                         </div>
                                     );
@@ -1381,10 +1387,12 @@ export default function EnterpriseSettings() {
                                             const hasCategoryConfig = !!GLOBAL_CATEGORY_CONFIG_SCHEMAS[meta.configCategory];
                                             const label = meta.label;
                                             const enabledCount = allCatTools.filter((tool: any) => tool.enabled).length;
+                                            const controllableTools = allCatTools.filter((tool: any) => tool.can_disable !== false);
+                                            const controllableEnabledCount = controllableTools.filter((tool: any) => tool.enabled).length;
                                             const defaultCount = allCatTools.filter((tool: any) => tool.is_default).length;
                                             const configuredCount = allCatTools.filter((tool: any) => hasMeaningfulConfig(tool.config)).length;
-                                            const allEnabled = allCatTools.length > 0 && enabledCount === allCatTools.length;
-                                            const mixed = enabledCount > 0 && enabledCount < allCatTools.length;
+                                            const allEnabled = controllableTools.length > 0 && controllableEnabledCount === controllableTools.length;
+                                            const mixed = controllableEnabledCount > 0 && controllableEnabledCount < controllableTools.length;
                                             const expanded = expandedToolCategories.has(category) || !!toolSearch.trim();
                                             const visibleCount = (catTools as any[]).length;
 
@@ -1423,12 +1431,12 @@ export default function EnterpriseSettings() {
                                                                     {t('enterprise.tools.configure', 'Configure')}
                                                                 </button>
                                                             )}
-                                                            <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }} title={`Enable/Disable all ${label} tools`}>
+                                                            {controllableTools.length > 0 && <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }} title={`Enable/Disable all ${label} tools`}>
                                                                 <input type="checkbox" checked={allEnabled} onChange={(e) => void bulkToggle(allCatTools, e.target.checked)} style={{ opacity: 0, width: 0, height: 0 }} />
                                                                 <span style={switchTrack(allEnabled, mixed)}>
                                                                     <span style={switchKnob(allEnabled)} />
                                                                 </span>
-                                                            </label>
+                                                            </label>}
                                                         </div>
                                                     </div>
                                                     {expanded && (

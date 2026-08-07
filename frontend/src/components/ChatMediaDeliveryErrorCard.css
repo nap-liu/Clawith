@@ -1,0 +1,33 @@
+.chat-media-error-card {
+    display: flex;
+    width: min(100%, 360px);
+    align-items: flex-start;
+    gap: 10px;
+    padding: 11px 12px;
+    border: 1px solid color-mix(in srgb, #d65d67 34%, var(--border-subtle));
+    border-radius: 11px;
+    color: var(--text-primary);
+    background: color-mix(in srgb, #d65d67 7%, var(--bg-elevated));
+}
+
+.chat-media-error-card--unknown {
+    border-color: color-mix(in srgb, #d49a38 38%, var(--border-subtle));
+    background: color-mix(in srgb, #d49a38 8%, var(--bg-elevated));
+}
+
+.chat-media-error-card__icon {
+    display: grid;
+    width: 30px;
+    height: 30px;
+    flex: 0 0 30px;
+    place-items: center;
+    border-radius: 8px;
+    color: #c4515c;
+    background: color-mix(in srgb, #d65d67 12%, transparent);
+}
+
+.chat-media-error-card--unknown .chat-media-error-card__icon { color: #b57920; }
+.chat-media-error-card__content { min-width: 0; display: grid; gap: 3px; }
+.chat-media-error-card__content strong { font-size: 12.5px; font-weight: 650; }
+.chat-media-error-card__content span { font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.chat-media-error-card__content small { color: var(--text-tertiary); font-size: 10.5px; }

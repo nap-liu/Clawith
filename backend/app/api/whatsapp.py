@@ -352,7 +352,7 @@ async def whatsapp_event_webhook(
                     # makes the user's own message show up live too, not only on reload.
                     from app.services.channel_llm import broadcast_channel_user_message
                     await broadcast_channel_user_message(
-                        agent_id, session_conv_id, content=user_text,
+                        agent_id, session_conv_id, message=ingested.message,
                         sender_name=contact_name or None, user_id=platform_user_id,
                     )
 

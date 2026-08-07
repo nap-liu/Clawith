@@ -35,6 +35,7 @@ Known limitation — quoted reply (Phase 2 #3, 2026-05-08):
 """
 
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
@@ -47,6 +48,7 @@ from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
+from app.services.chat_attachments import attachment_from_workspace_path
 
 router = APIRouter(tags=["dingtalk"])
 
@@ -845,6 +847,10 @@ async def process_dingtalk_message(
             message_meta={
                 "sender_display_name": platform_user.display_name,
                 "sender_nickname": sender_nick or None,
+                "attachments": [
+                    attachment_from_workspace_path(path)
+                    for path in (saved_file_paths or [])
+                ],
             },
         )
         if await finish_blocked_confirmation_ingest(db, ingested):
@@ -885,7 +891,7 @@ async def process_dingtalk_message(
         # message show up live too, not only on reload.
         from app.services.channel_llm import broadcast_channel_user_message
         await broadcast_channel_user_message(
-            agent_id, session_conv_id, content=saved_content,
+            agent_id, session_conv_id, message=ingested.message,
             sender_name=platform_user.display_name or sender_nick or None,
             user_id=platform_user_id,
         )
@@ -899,8 +905,13 @@ async def process_dingtalk_message(
             return
 
         # ── Set up channel_file_sender so the agent can send files via DingTalk ──
-        from app.services.agent_tools import channel_file_sender as _cfs
+        from app.services.agent_tools import (
+            channel_audio_sender as _cas,
+            channel_file_sender as _cfs,
+            channel_video_sender as _cvs,
+        )
         from app.services.dingtalk_stream import (
+            _send_dingtalk_native_video,
             _upload_dingtalk_media,
             _send_dingtalk_media_message,
         )
@@ -917,6 +928,8 @@ async def process_dingtalk_message(
         _dt_app_secret = _dt_cfg.app_secret if _dt_cfg else None
 
         _cfs_token = None
+        _cas_token = None
+        _cvs_token = None
         if _dt_app_key and _dt_app_secret:
             # Determine send target: group → conversation_id, P2P → sender_staff_id
             _dt_target_id = conversation_id if conversation_type == "2" else sender_staff_id
@@ -924,9 +937,7 @@ async def process_dingtalk_message(
 
             async def _dingtalk_file_sender(file_path: str, msg: str = ""):
                 """Send a file/image/video via DingTalk proactive message API."""
-                from pathlib import Path as _P
-
-                _fp = _P(file_path)
+                _fp = Path(file_path)
                 _ext = _fp.suffix.lower()
 
                 # Determine media type from extension
@@ -939,30 +950,40 @@ async def process_dingtalk_message(
                 else:
                     _media_type = "file"
 
-                # Upload media to DingTalk
-                _mid = await _upload_dingtalk_media(
-                    _dt_app_key, _dt_app_secret, file_path, _media_type
-                )
-
-                if _mid:
-                    # Send via proactive message API
-                    _ok = await _send_dingtalk_media_message(
-                        _dt_app_key, _dt_app_secret,
-                        _dt_target_id, _mid, _media_type,
-                        _dt_conv_type, filename=_fp.name,
+                if _media_type == "video":
+                    _ok, _code = await _send_dingtalk_native_video(
+                        _dt_app_key,
+                        _dt_app_secret,
+                        _dt_target_id,
+                        _fp,
+                        _dt_conv_type,
                     )
-                    if _ok:
-                        # Also send accompany text if provided
-                        if msg:
-                            try:
-                                async with httpx.AsyncClient(timeout=10) as _cl:
-                                    await _cl.post(session_webhook, json={
-                                        "msgtype": "text",
-                                        "text": {"content": msg},
-                                    })
-                            except Exception:
-                                pass
-                        return
+                else:
+                    _mid = await _upload_dingtalk_media(
+                        _dt_app_key, _dt_app_secret, file_path, _media_type
+                    )
+                    _ok = False
+                    _code = "MEDIA_UPLOAD_FAILED"
+                    if _mid:
+                        # Send via proactive message API
+                        _ok = await _send_dingtalk_media_message(
+                            _dt_app_key, _dt_app_secret,
+                            _dt_target_id, _mid, _media_type,
+                            _dt_conv_type, filename=_fp.name,
+                        )
+                        _code = "MEDIA_SENT" if _ok else "MEDIA_SEND_FAILED"
+                if _ok:
+                    # Also send accompany text if provided
+                    if msg:
+                        try:
+                            async with httpx.AsyncClient(timeout=10) as _cl:
+                                await _cl.post(session_webhook, json={
+                                    "msgtype": "text",
+                                    "text": {"content": msg},
+                                })
+                        except Exception:
+                            pass
+                    return
 
                 # Fallback: send a text message with download link
                 from pathlib import Path as _P2
@@ -994,6 +1015,40 @@ async def process_dingtalk_message(
                     )
 
             _cfs_token = _cfs.set(_dingtalk_file_sender)
+
+            async def _dingtalk_audio_sender(file_path: str, msg: str = ""):
+                _fp = Path(file_path)
+                _mid = await _upload_dingtalk_media(
+                    _dt_app_key, _dt_app_secret, file_path, "voice"
+                )
+                if not _mid:
+                    raise RuntimeError("MEDIA_UPLOAD_FAILED")
+                _ok = await _send_dingtalk_media_message(
+                    _dt_app_key, _dt_app_secret,
+                    _dt_target_id, _mid, "voice", _dt_conv_type,
+                    filename=_fp.name,
+                )
+                if not _ok:
+                    raise RuntimeError("MEDIA_SEND_FAILED")
+
+            async def _dingtalk_video_sender(
+                file_path: str,
+                msg: str = "",
+                cover_image_path: Path | None = None,
+            ):
+                _ok, _code = await _send_dingtalk_native_video(
+                    _dt_app_key,
+                    _dt_app_secret,
+                    _dt_target_id,
+                    Path(file_path),
+                    _dt_conv_type,
+                    cover_image_path=cover_image_path,
+                )
+                if not _ok:
+                    raise RuntimeError(_code)
+
+            _cas_token = _cas.set(_dingtalk_audio_sender)
+            _cvs_token = _cvs.set(_dingtalk_video_sender)
 
         from app.services.sender_attribution import wrap_with_sender
 
@@ -1063,6 +1118,10 @@ async def process_dingtalk_message(
             # channel_dispatch on_complete hook, after the turn fully completes.)
             if _cfs_token is not None:
                 _cfs.reset(_cfs_token)
+            if _cas_token is not None:
+                _cas.reset(_cas_token)
+            if _cvs_token is not None:
+                _cvs.reset(_cvs_token)
 
         has_media = bool(image_base64_list or saved_file_paths)
         logger.info(

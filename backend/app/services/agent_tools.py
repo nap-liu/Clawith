@@ -47,6 +47,14 @@ from app.services.auth_registry import auth_provider_registry
 from app.services.agent_memory import CORE_MEMORY_TEMPLATE
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import get_platform_user_by_org_member
+from app.services.chat_attachments import (
+    attachment_from_workspace_path,
+    canonical_media_mime,
+    infer_attachment_kind,
+    MEDIA_PROBE_CHUNK_BYTES,
+    sniff_image_kind_bytes,
+    sniff_media_mime_bytes,
+)
 from app.services.document_conversion import (
     convert_html_to_pdf as convert_html_file_to_pdf,
     convert_html_to_pptx as convert_html_file_to_pptx,
@@ -89,6 +97,23 @@ _settings = get_settings()
 WORKSPACE_ROOT = Path(_settings.STORAGE_LOCAL_ROOT or _settings.AGENT_DATA_DIR)
 TOOL_MATERIALIZE_MAX_FILE_BYTES = 10 * 1024 * 1024
 TOOL_MATERIALIZE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
+MEDIA_TOOL_MAX_FILE_BYTES = 100 * 1024 * 1024
+
+
+def _media_materialization_size_error(
+    media_size: int,
+    cover_size: int | None = None,
+) -> str | None:
+    """Return the stable preflight error before selective materialization."""
+    if media_size > MEDIA_TOOL_MAX_FILE_BYTES:
+        return "MEDIA_TOO_LARGE"
+    if cover_size is not None and cover_size > TOOL_MATERIALIZE_MAX_FILE_BYTES:
+        return "VIDEO_COVER_TOO_LARGE"
+    if media_size + (cover_size or 0) > TOOL_MATERIALIZE_MAX_TOTAL_BYTES:
+        return "MEDIA_BUNDLE_TOO_LARGE"
+    return None
+
+
 TEMP_WORKSPACE_DEFAULT_PATHS = ["workspace", "memory", "skills", "focus.md", "soul.md", "HEARTBEAT.md"]
 MAX_EXEC_STDOUT_CAPTURE_BYTES = 1_000_000
 MAX_EXEC_STDERR_CAPTURE_BYTES = 500_000
@@ -170,6 +195,21 @@ def _set_cached_tool_config(agent_id: Optional[uuid.UUID], tool_name: str, confi
     _tool_config_cache[cache_key] = (config, expiry)
 
 
+def invalidate_tool_config_cache(
+    agent_id: Optional[uuid.UUID], tool_name: str | None = None
+) -> None:
+    """Invalidate cached config after an Agent or company-level update.
+
+    ``agent_id=None`` clears matching entries for every Agent because a company
+    configuration change can affect all of them.
+    """
+    agent_key = str(agent_id) if agent_id else None
+    for cache_key in list(_tool_config_cache):
+        agent_matches = agent_id is None or cache_key[0] == agent_key
+        if agent_matches and (tool_name is None or cache_key[1] == tool_name):
+            _tool_config_cache.pop(cache_key, None)
+
+
 async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Optional[dict]:
     """Get merged tool config (with caching).
 
@@ -244,6 +284,8 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
 # ContextVar set by each channel handler so send_channel_file knows where to send
 # Value: async callable(file_path: Path) -> None  |  None for web chat (returns URL)
 channel_file_sender: ContextVar = ContextVar('channel_file_sender', default=None)
+channel_audio_sender: ContextVar = ContextVar('channel_audio_sender', default=None)
+channel_video_sender: ContextVar = ContextVar('channel_video_sender', default=None)
 # For web chat: agent_id needed to build download URL
 channel_web_agent_id: ContextVar = ContextVar('channel_web_agent_id', default=None)
 # Set by Feishu channel handler — open_id of the message sender so calendar tool
@@ -629,6 +671,44 @@ AGENT_TOOLS = [
                     },
                 },
                 "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_media",
+            "description": (
+                "Send one workspace audio or video file. Set media_type to the file's real kind. "
+                "Choose exactly one target mode: "
+                "(1) CURRENT conversation: omit both session_id and user_id; "
+                "(2) EXACT existing person or group conversation: pass the exact session_id returned by "
+                "list_sessions/search_sessions; this preserves that Session's bound channel and group/person target; "
+                "(3) PERSON: pass the canonical user_id returned by search_contacts/Relationships; if the result says "
+                "several routes are available, retry with channel set to one of those routes. Groups can only be targeted "
+                "with session_id. Never invent IDs, never identify a target by name, never pass session_id and user_id "
+                "together, and never pass channel without user_id. cover_image_path is valid only for video: an "
+                "Agent-provided image wins; a channel that requires a cover generates a platform fallback when omitted. "
+                "The tool always exists; inspect its JSON status/code: sent or already_sent means do not retry, "
+                "but already_sent with code MEDIA_SENT_CAPTION_FAILED means the media was sent previously while its "
+                "caption failed, so report that partial result without resending the media; "
+                "unsupported means the resolved channel lacks this media delivery; failed means the platform rejected it; "
+                "unknown means delivery may have happened, so never retry the same tool call automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "media_type": {"type": "string", "enum": ["audio", "video"], "description": "Required media kind. It must match the actual file; use audio for recordings/music and video for playable video files."},
+                    "file_path": {"type": "string", "description": "Required workspace-relative path owned by this Agent, for example workspace/media/briefing.mp3 or workspace/media/demo.mp4. Do not pass a URL or absolute path."},
+                    "cover_image_path": {"type": "string", "description": "Video only. Optional workspace-relative image path owned by this Agent. Agent-provided cover wins; required channels generate a platform fallback when omitted. Do not pass this for audio."},
+                    "session_id": {"type": "string", "description": "Exact existing person-or-group ChatSession UUID from list_sessions/search_sessions. Omit for the current conversation or when using user_id."},
+                    "user_id": {"type": "string", "description": "Canonical natural-person user UUID from search_contacts/Relationships. Omit for current-conversation or exact-session delivery."},
+                    "channel": {"type": "string", "enum": ["feishu", "dingtalk", "wecom", "slack", "teams", "discord", "whatsapp", "wechat"], "description": "Optional direct-person route. Use only with user_id and only to resolve multiple available routes. The selected channel may return unsupported while keeping this tool contract unchanged."},
+                    "message": {"type": "string", "description": "Optional caption/business text delivered as a separate ordinary message immediately after the standalone media message. Omit it when no follow-up text is needed."},
+                },
+                "required": ["media_type", "file_path"],
+                "not": {"required": ["session_id", "user_id"]},
+                "additionalProperties": False,
             },
         },
     },
@@ -2248,6 +2328,7 @@ _ALWAYS_INCLUDE_CORE = {
     "remove_contact",
     "search_contacts",
     "send_channel_file",
+    "send_media",
     "send_file_to_agent",
     "upsert_focus_item",
     "write_file",
@@ -2288,6 +2369,24 @@ _FEISHU_TOOL_NAMES = {
 _always_core_tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _ALWAYS_INCLUDE_CORE]
 _feishu_tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _FEISHU_TOOL_NAMES]
 _channel_tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _CHANNEL_MESSAGE_TOOL_NAMES]
+_FIXED_MEDIA_TOOL_NAMES = ("send_media",)
+_LEGACY_MEDIA_TOOL_NAMES = frozenset({"send_audio", "send_video"})
+
+
+def _stabilize_media_tool_definitions(tools: list[dict]) -> list[dict]:
+    """Keep media tool schemas and relative order independent of channel state."""
+    canonical = {
+        item["function"]["name"]: item
+        for item in AGENT_TOOLS
+        if item["function"]["name"] in _FIXED_MEDIA_TOOL_NAMES
+    }
+    stable = [
+        item for item in tools
+        if item.get("function", {}).get("name")
+        not in {*_FIXED_MEDIA_TOOL_NAMES, *_LEGACY_MEDIA_TOOL_NAMES}
+    ]
+    stable.extend(canonical[name] for name in _FIXED_MEDIA_TOOL_NAMES)
+    return stable
 
 
 async def _get_computer_os_type(agent_id: uuid.UUID) -> str:
@@ -2469,8 +2568,9 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     """Load enabled tools for an agent from DB (OpenAI function-calling format).
 
     Falls back to hardcoded AGENT_TOOLS if DB not ready.
-    Includes core system tools (send_channel_file, write_file) unless the user
-    has explicitly disabled them via the Agent tool panel.
+    Includes stable core system tools. Required protocol tools such as
+    send_media cannot be disabled; other core tools respect explicit Agent
+    tool-panel assignments.
     Feishu tools are only included when the agent has a configured Feishu channel.
     send_channel_message is included when any channel (Feishu/DingTalk/WeCom) is configured.
 
@@ -2513,6 +2613,11 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
 
     try:
         from app.models.tool import Tool, AgentTool
+        from app.services.tool_enablement import (
+            REQUIRED_AGENT_TOOL_NAMES,
+            resolved_agent_tool_enabled,
+            tool_is_required,
+        )
 
         async with async_session() as db:
             # Get agent-specific assignments
@@ -2534,7 +2639,10 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
 
             # Get all tools visible within this agent's tenant boundary.
             all_tools_r = await db.execute(
-                select(Tool).where(Tool.enabled == True, or_(*visible_clauses))
+                select(Tool).where(
+                    or_(Tool.enabled == True, Tool.name.in_(REQUIRED_AGENT_TOOL_NAMES)),
+                    or_(*visible_clauses),
+                )
             )
             all_tools = all_tools_r.scalars().all()
 
@@ -2548,9 +2656,9 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             for t in all_tools:
                 tid = str(t.id)
                 at = assignments.get(tid)
-                enabled = agent_tool_enabled(at)
+                enabled = resolved_agent_tool_enabled(t.name, at)
                 if not enabled:
-                    if at and not at.enabled:
+                    if at and not at.enabled and not tool_is_required(t.name):
                         explicitly_disabled_names.add(t.name)
                     continue
 
@@ -2631,6 +2739,11 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                     )
                     continue
 
+                # Media tools are platform protocol, not tenant configuration.
+                # Always use the canonical static schema appended in fixed order.
+                if t.name in _FIXED_MEDIA_TOOL_NAMES:
+                    continue
+
                 result.append(tool_def)
                 db_tool_names.add(t.name)
 
@@ -2654,6 +2767,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 # Strip msg_type from send_message_to_agent when async A2A is disabled
                 if not _a2a_async:
                     result = _strip_a2a_msg_type(result)
+                result = _stabilize_media_tool_definitions(result)
                 # Final diagnostic: log the complete tool list and assignment stats
                 final_names = sorted(t["function"]["name"] for t in result)
                 logger.info(
@@ -2677,7 +2791,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     fallback = _patch_computer_tool_descriptions(_always_tools, computer_os_type)
     if not _a2a_async:
         fallback = _strip_a2a_msg_type(fallback)
-    return fallback
+    return _stabilize_media_tool_definitions(fallback)
 
 
 # ─── Workspace initialization ──────────────────────────────────
@@ -3015,6 +3129,7 @@ async def _run_with_temp_workspace(
     paths: list[str] | None = None,
     source_paths: list[str] | None = None,
     sync_back: bool = False,
+    max_file_bytes: int = TOOL_MATERIALIZE_MAX_FILE_BYTES,
 ) -> str:
     """Materialize a temporary workspace for tools that require local files."""
     materialized_paths = paths
@@ -3035,6 +3150,7 @@ async def _run_with_temp_workspace(
         agent_id,
         tenant_id=tenant_id,
         paths=materialized_paths,
+        max_file_bytes=max_file_bytes,
     )
     try:
         result = await runner(temp_workspace.root)
@@ -3650,6 +3766,86 @@ async def execute_tool(
                     lambda temp_ws: _send_channel_file(agent_id, temp_ws, arguments),
                     paths=[file_path],
                     source_paths=[file_path],
+                )
+        elif tool_name in {"send_media", "send_audio", "send_video"}:
+            media_kind = (
+                str(arguments.get("media_type") or "").strip().lower()
+                if tool_name == "send_media"
+                else ("audio" if tool_name == "send_audio" else "video")
+            )
+            file_path = (arguments.get("file_path") or "").strip()
+            if media_kind not in {"audio", "video"}:
+                result = json.dumps({
+                    "type": "media_delivery_result", "version": 1, "status": "failed",
+                    "code": "INVALID_MEDIA_TYPE", "media_kind": media_kind or None,
+                })
+            elif media_kind == "audio" and arguments.get("cover_image_path"):
+                result = json.dumps({
+                    "type": "media_delivery_result", "version": 1, "status": "failed",
+                    "code": "COVER_NOT_ALLOWED_FOR_AUDIO", "media_kind": media_kind,
+                })
+            elif not file_path:
+                result = json.dumps({
+                    "type": "media_delivery_result", "version": 1, "status": "failed",
+                    "code": "INVALID_FILE_PATH",
+                    "media_kind": media_kind,
+                })
+            else:
+                cover_path = (
+                    str(arguments.get("cover_image_path") or "").strip()
+                    if media_kind == "video"
+                    else ""
+                )
+                selected_paths = [file_path] + ([cover_path] if cover_path else [])
+                oversized_code = None
+                selected_sizes: list[int | None] = []
+                storage = get_storage_backend()
+                for selected_path in selected_paths:
+                    resolved = await _resolve_storage_source_path(
+                        agent_id, selected_path, _agent_tenant_id
+                    )
+                    if resolved.exists:
+                        entry = await storage.stat(resolved.storage_key)
+                        selected_sizes.append(entry.size)
+                    else:
+                        selected_sizes.append(None)
+                main_size = selected_sizes[0] if selected_sizes else None
+                if main_size is not None:
+                    oversized_code = _media_materialization_size_error(
+                        main_size,
+                        selected_sizes[1] if len(selected_sizes) > 1 else None,
+                    )
+                if oversized_code:
+                    result = json.dumps({
+                        "type": "media_delivery_result", "version": 1,
+                        "status": "failed", "code": oversized_code,
+                        "media_kind": media_kind,
+                    }, ensure_ascii=False)
+                else:
+                    result = await _run_with_temp_workspace(
+                        agent_id,
+                        _agent_tenant_id,
+                        lambda temp_ws: _send_channel_media(
+                            agent_id,
+                            temp_ws,
+                            arguments,
+                            media_kind=media_kind,
+                            tool_call_id=tool_call_id,
+                            origin_session_id=session_id,
+                            origin_turn_anchor_id=turn_anchor_id,
+                        ),
+                        paths=selected_paths,
+                        source_paths=selected_paths,
+                        max_file_bytes=MEDIA_TOOL_MAX_FILE_BYTES,
+                    )
+            try:
+                media_result_payload = json.loads(result)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                media_result_payload = None
+            if isinstance(media_result_payload, dict):
+                result = json.dumps(
+                    _describe_media_delivery_result(media_result_payload),
+                    ensure_ascii=False,
                 )
         elif tool_name == "web_search":
             result = await _web_search(arguments, agent_id)
@@ -4705,6 +4901,19 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     if not file_path.exists():
         return f"Error: File not found: {rel_path}"
 
+    detected_kind = _sniff_media_file_kind(file_path) or infer_attachment_kind(
+        file_path.name, mimetypes.guess_type(file_path.name)[0]
+    )
+    if detected_kind in {"audio", "video"}:
+        return json.dumps({
+            "type": "media_delivery_result",
+            "version": 1,
+            "status": "failed",
+            "code": "WRONG_MEDIA_TOOL",
+            "media_kind": detected_kind,
+            "message": f"Use send_media with media_type='{detected_kind}'.",
+        }, ensure_ascii=False)
+
     # Priority 1: explicit canonical recipient.
     if canonical_user_id:
         return await _send_file_to_recipient(
@@ -4732,6 +4941,794 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     except ValueError:
         file_rel = rel_path
     return _platform_file_delivery_result(file_path, file_rel, accompany_msg)
+
+
+async def _send_channel_media(
+    agent_id: uuid.UUID,
+    ws: Path,
+    arguments: dict,
+    *,
+    media_kind: str,
+    tool_call_id: str | None = None,
+    origin_session_id: str | None = None,
+    origin_turn_anchor_id: uuid.UUID | None = None,
+) -> str:
+    """Create one audio/video delivery without leaking renderer/IM details."""
+    if not str(tool_call_id or "").strip():
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "MISSING_DELIVERY_INTENT_ID", "media_kind": media_kind,
+        }, ensure_ascii=False)
+    raw_rel_path = arguments.get("file_path", "")
+    rel_path = raw_rel_path.strip() if isinstance(raw_rel_path, str) else ""
+    rel_path = _normalize_tool_workspace_rel_path(rel_path) if rel_path else None
+    if not rel_path:
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "INVALID_FILE_PATH", "media_kind": media_kind,
+        })
+    file_path = (ws / rel_path).resolve()
+    try:
+        file_path.relative_to(ws.resolve())
+    except ValueError:
+        file_path = (WORKSPACE_ROOT / str(agent_id) / rel_path).resolve()
+    if not file_path.exists() or not file_path.is_file():
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "MEDIA_NOT_FOUND", "media_kind": media_kind,
+        })
+
+    actual_mime = _sniff_media_file_mime(file_path)
+    actual_kind = actual_mime.split("/", 1)[0] if actual_mime else None
+    if actual_kind != media_kind:
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "MEDIA_KIND_MISMATCH", "media_kind": media_kind,
+            "actual_kind": actual_kind,
+        })
+
+    cover_path: Path | None = None
+    if media_kind == "video" and arguments.get("cover_image_path"):
+        raw_cover_path = str(arguments.get("cover_image_path") or "").strip()
+        cover_rel_path = _normalize_tool_workspace_rel_path(raw_cover_path)
+        if not cover_rel_path:
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1, "status": "failed",
+                "code": "INVALID_COVER_PATH", "media_kind": media_kind,
+            })
+        cover_path = (ws / cover_rel_path).resolve()
+        try:
+            cover_path.relative_to(ws.resolve())
+        except ValueError:
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1, "status": "failed",
+                "code": "INVALID_COVER_PATH", "media_kind": media_kind,
+            })
+        if (
+            not cover_path.exists()
+            or not cover_path.is_file()
+            or _sniff_image_file(cover_path) is None
+        ):
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1, "status": "failed",
+                "code": "INVALID_VIDEO_COVER", "media_kind": media_kind,
+            })
+
+    canonical_user_id = str(arguments.get("user_id") or "").strip()
+    requested_session_id = str(arguments.get("session_id") or "").strip()
+    requested_channel = str(arguments.get("channel") or "").strip().lower() or None
+    if canonical_user_id and requested_session_id:
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "AMBIGUOUS_MEDIA_TARGET", "media_kind": media_kind,
+        }, ensure_ascii=False)
+    if requested_channel and not canonical_user_id:
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "CHANNEL_REQUIRES_USER_TARGET", "media_kind": media_kind,
+        }, ensure_ascii=False)
+    target_session_id = requested_session_id or (
+        str(origin_session_id or "").strip() if not canonical_user_id else ""
+    )
+    if not target_session_id and not canonical_user_id:
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "SESSION_REQUIRED", "media_kind": media_kind,
+            "intent_id": tool_call_id or "",
+        }, ensure_ascii=False)
+
+    tool_config = await _get_tool_config(agent_id, "send_media") or {}
+    allow_download = tool_config.get("allow_download") is True
+    if target_session_id:
+        return await _send_media_to_session(
+            agent_id=agent_id,
+            session_id=target_session_id,
+            file_path=file_path,
+            workspace_path=rel_path,
+            media_kind=media_kind,
+            caption=str(arguments.get("message") or ""),
+            cover_path=cover_path,
+            intent_id=tool_call_id or "",
+            origin_session_id=origin_session_id,
+            origin_turn_anchor_id=origin_turn_anchor_id,
+            allow_download=allow_download,
+        )
+    if canonical_user_id:
+        return await _send_media_to_recipient(
+            agent_id=agent_id,
+            file_path=file_path,
+            workspace_path=rel_path,
+            user_id=canonical_user_id,
+            channel=requested_channel,
+            media_kind=media_kind,
+            caption=str(arguments.get("message") or ""),
+            cover_path=cover_path,
+            intent_id=tool_call_id or "",
+            origin_session_id=origin_session_id,
+            origin_turn_anchor_id=origin_turn_anchor_id,
+            allow_download=allow_download,
+        )
+
+    raise AssertionError("validated media target was not routed")
+
+
+_MEDIA_DELIVERY_MESSAGES = {
+    "INVALID_MEDIA_TYPE": "媒体类型必须是 audio 或 video。",
+    "COVER_NOT_ALLOWED_FOR_AUDIO": "音频不支持封面参数。",
+    "INVALID_FILE_PATH": "媒体文件路径无效，必须使用当前 Agent 工作区内的相对路径。",
+    "MEDIA_NOT_FOUND": "工作区中找不到要发送的媒体文件。",
+    "MEDIA_KIND_MISMATCH": "声明的媒体类型与文件实际内容不一致。",
+    "INVALID_COVER_PATH": "视频封面路径无效。",
+    "INVALID_VIDEO_COVER": "视频封面不存在或不是支持的图片格式。",
+    "AMBIGUOUS_MEDIA_TARGET": "不能同时指定 session_id 和 user_id。",
+    "CHANNEL_REQUIRES_USER_TARGET": "channel 只能与 user_id 一起使用。",
+    "SESSION_REQUIRED": "未找到当前会话；请指定有效的 session_id 或 user_id。",
+    "MISSING_DELIVERY_INTENT_ID": "缺少稳定的工具调用 ID，平台未执行发送。",
+    "SESSION_NOT_FOUND_OR_FORBIDDEN": "目标 Session 不存在或当前 Agent 无权访问。",
+    "SESSION_ROUTE_UNAVAILABLE": "目标 Session 没有可用的 IM 投递路由。",
+    "SESSION_ROUTE_MISMATCH": "目标 Session 的人员/群类型与 IM 路由不一致。",
+    "CHANNEL_MEDIA_UNSUPPORTED": "目标通道暂不支持此音视频发送能力。",
+    "RECIPIENT_MEDIA_ROUTE_UNAVAILABLE": "目标人员没有可用的音视频投递路由。",
+    "RECIPIENT_NOT_FOUND": "未找到目标人员。",
+    "MEDIA_TOO_LARGE": "媒体文件超过目标通道允许的大小。",
+    "VIDEO_COVER_TOO_LARGE": "视频封面超过允许的大小。",
+    "MEDIA_BUNDLE_TOO_LARGE": "视频与封面的合计大小超过允许值。",
+    "MEDIA_UPLOAD_FAILED": "媒体上传到目标通道失败。",
+    "MEDIA_SEND_FAILED": "目标通道拒绝或未完成媒体发送。",
+    "MEDIA_DELIVERY_FAILED": "媒体发送失败。",
+    "MEDIA_DELIVERY_STATE_UNKNOWN": "发送结果不确定，媒体可能已经送达；不要自动重试，以免重复发送。",
+    "MEDIA_SENT_CAPTION_FAILED": "媒体已发送，但后续说明文字发送失败；不要重发媒体。",
+}
+
+
+def _describe_media_delivery_result(payload: dict) -> dict:
+    """Add stable human/Agent-facing error semantics to a media result."""
+    status = str(payload.get("status") or "")
+    code = str(payload.get("code") or "")
+    if status in {"sent", "already_sent"} and code != "MEDIA_SENT_CAPTION_FAILED":
+        return payload
+    message = _MEDIA_DELIVERY_MESSAGES.get(
+        code,
+        "媒体发送未完成，请根据 status 和 code 向用户说明结果。",
+    )
+    if code == "MEDIA_SENT_CAPTION_FAILED":
+        agent_action = (
+            "Tell the user the media was sent but its caption failed; "
+            "do not resend the media."
+        )
+    elif status == "unknown":
+        agent_action = "Report the uncertain result and do not retry this call automatically."
+    else:
+        agent_action = "Tell the user the media delivery did not complete; do not claim success."
+    return {
+        **payload,
+        "message": payload.get("message") or message,
+        "retryable": False,
+        "agent_action": agent_action,
+    }
+
+
+def _sniff_media_file_kind(file_path: Path) -> str | None:
+    """Recognize common playable containers from bytes, not the filename."""
+    mime = _sniff_media_file_mime(file_path)
+    return mime.split("/", 1)[0] if mime else None
+
+
+def _sniff_media_file_mime(file_path: Path) -> str | None:
+    """Return the concrete media MIME represented by the file bytes."""
+    try:
+        with file_path.open("rb") as handle:
+            size = file_path.stat().st_size
+            if size <= MEDIA_PROBE_CHUNK_BYTES * 2:
+                probe = handle.read()
+            else:
+                head = handle.read(MEDIA_PROBE_CHUNK_BYTES)
+                handle.seek(max(0, size - MEDIA_PROBE_CHUNK_BYTES))
+                probe = head + handle.read(MEDIA_PROBE_CHUNK_BYTES)
+    except OSError:
+        return None
+    return sniff_media_mime_bytes(probe, file_path.name)
+
+
+def _sniff_image_file(file_path: Path) -> str | None:
+    """Return the common image format represented by the file bytes."""
+    try:
+        with file_path.open("rb") as handle:
+            head = handle.read(16)
+    except OSError:
+        return None
+    return sniff_image_kind_bytes(head)
+
+
+async def _send_media_to_session(
+    *,
+    agent_id: uuid.UUID,
+    session_id: str,
+    file_path: Path,
+    workspace_path: str,
+    media_kind: str,
+    caption: str,
+    cover_path: Path | None,
+    intent_id: str,
+    origin_session_id: str | None,
+    origin_turn_anchor_id: uuid.UUID | None,
+    allow_download: bool = False,
+) -> str:
+    """Deliver media through one exact Session with a durable no-duplicate claim."""
+    try:
+        target_session_id = uuid.UUID(str(session_id))
+    except (TypeError, ValueError):
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "SESSION_NOT_FOUND_OR_FORBIDDEN", "media_kind": media_kind,
+            "intent_id": intent_id,
+        }, ensure_ascii=False)
+
+    operation_key = _build_outbound_operation_key(
+        agent_id=agent_id,
+        origin_session_id=origin_session_id,
+        tool_call_id=intent_id or None,
+        origin_turn_anchor_id=origin_turn_anchor_id,
+    )
+    sniffed_mime = _sniff_media_file_mime(file_path)
+    mime_type = canonical_media_mime(file_path.name, media_kind, sniffed_mime)
+    attachment = attachment_from_workspace_path(
+        workspace_path,
+        display_name=file_path.name,
+        mime_type=mime_type,
+        size_bytes=file_path.stat().st_size,
+    )
+    if not operation_key:
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "MISSING_DELIVERY_INTENT_ID", "media_kind": media_kind,
+            "intent_id": intent_id,
+        }, ensure_ascii=False)
+
+    receipt_id: uuid.UUID
+    channel = ""
+    external_conv_id = ""
+    target_is_group = False
+    delivery_mode = "platform"
+    dingtalk_app_id = ""
+    dingtalk_app_secret = ""
+    target_id = ""
+    conversation_type = ""
+    async with async_session() as db:
+        await _lock_outbound_operation(db, operation_key)
+        existing = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.external_event_key == operation_key
+                ).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            meta = existing.message_meta if isinstance(existing.message_meta, dict) else {}
+            state = str(meta.get("delivery_status") or "unknown")
+            if state == "sent":
+                caption_status = str(meta.get("caption_status") or "not_requested")
+                existing_result = _describe_media_delivery_result({
+                    "type": "platform_media_delivery", "version": 1,
+                    "status": "already_sent",
+                    "code": (
+                        "MEDIA_SENT_CAPTION_FAILED"
+                        if caption_status == "failed"
+                        else "MEDIA_ALREADY_SENT"
+                    ),
+                    "caption_status": caption_status,
+                    "media_kind": media_kind, "intent_id": intent_id,
+                    "session_id": str(existing.conversation_id),
+                    "channel": str(meta.get("source_channel") or ""),
+                    "path": workspace_path,
+                    "filename": file_path.name,
+                    "mime_type": mime_type,
+                    "size": file_path.stat().st_size,
+                    "message_id": str(existing.id),
+                    "allow_download": meta.get("allow_download") is True,
+                })
+                return json.dumps(existing_result, ensure_ascii=False)
+            if state == "pending":
+                next_meta = {
+                    **meta,
+                    "delivery_status": "unknown",
+                    "delivery_code": "MEDIA_DELIVERY_STATE_UNKNOWN",
+                }
+                existing.message_meta = next_meta
+                unknown_result = _describe_media_delivery_result({
+                    "type": "media_delivery_result", "version": 1,
+                    "status": "unknown",
+                    "code": "MEDIA_DELIVERY_STATE_UNKNOWN",
+                    "media_kind": media_kind, "intent_id": intent_id,
+                    "session_id": str(existing.conversation_id),
+                    "channel": str(next_meta.get("source_channel") or ""),
+                    "message_id": str(existing.id),
+                })
+                if existing.role == "tool_call":
+                    try:
+                        existing_call = json.loads(existing.content or "")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        existing_call = {}
+                    existing.content = json.dumps({
+                        "name": str(existing_call.get("name") or "send_media"),
+                        "call_id": str(existing_call.get("call_id") or intent_id),
+                        "args": existing_call.get("args") or {
+                            "media_type": media_kind,
+                            "file_path": workspace_path,
+                        },
+                        "status": "done",
+                        "result": json.dumps(unknown_result, ensure_ascii=False),
+                        "reasoning_content": existing_call.get("reasoning_content"),
+                    }, ensure_ascii=False)
+                await db.commit()
+                return json.dumps(unknown_result, ensure_ascii=False)
+            existing_result = _describe_media_delivery_result({
+                "type": "media_delivery_result", "version": 1,
+                "status": state if state in {"failed", "unknown", "unsupported"} else "unknown",
+                "code": (
+                    "MEDIA_DELIVERY_STATE_UNKNOWN" if state == "unknown"
+                    else str(meta.get("delivery_code") or "MEDIA_DELIVERY_FAILED")
+                ),
+                "media_kind": media_kind, "intent_id": intent_id,
+                "session_id": str(existing.conversation_id),
+                "channel": str(meta.get("source_channel") or ""),
+                "message_id": str(existing.id),
+            })
+            return json.dumps(existing_result, ensure_ascii=False)
+
+        session = (
+            await db.execute(
+                select(ChatSession).where(
+                    ChatSession.id == target_session_id,
+                    ChatSession.agent_id == agent_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if session is None:
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1, "status": "failed",
+                "code": "SESSION_NOT_FOUND_OR_FORBIDDEN", "media_kind": media_kind,
+                "intent_id": intent_id,
+            }, ensure_ascii=False)
+
+        channel = str(session.source_channel or "").strip()
+        external_conv_id = str(session.external_conv_id or "").strip()
+        is_platform = channel in _PLATFORM_SESSION_CHANNELS
+        target_is_group = bool(session.is_group)
+        if is_platform:
+            delivery_mode = "platform"
+        elif channel == "dingtalk":
+            if not external_conv_id or "__archived_" in external_conv_id:
+                return json.dumps({
+                    "type": "media_delivery_result", "version": 1,
+                    "status": "failed", "code": "SESSION_ROUTE_UNAVAILABLE",
+                    "media_kind": media_kind, "intent_id": intent_id,
+                    "session_id": str(session.id), "channel": channel,
+                }, ensure_ascii=False)
+            config = (
+                await db.execute(
+                    select(ChannelConfig).where(
+                        ChannelConfig.agent_id == agent_id,
+                        ChannelConfig.channel_type == "dingtalk",
+                        ChannelConfig.is_configured.is_(True),
+                    )
+                )
+            ).scalar_one_or_none()
+            if not config or not config.app_id or not config.app_secret:
+                return json.dumps({
+                    "type": "media_delivery_result", "version": 1,
+                    "status": "unsupported", "code": "CHANNEL_MEDIA_UNSUPPORTED",
+                    "media_kind": media_kind, "intent_id": intent_id,
+                    "session_id": str(session.id), "channel": channel,
+                }, ensure_ascii=False)
+            expected_prefix = "dingtalk_group_" if target_is_group else "dingtalk_p2p_"
+            wrong_prefix = "dingtalk_p2p_" if target_is_group else "dingtalk_group_"
+            if not external_conv_id.startswith(expected_prefix) or external_conv_id.startswith(wrong_prefix):
+                return json.dumps({
+                    "type": "media_delivery_result", "version": 1,
+                    "status": "failed", "code": "SESSION_ROUTE_MISMATCH",
+                    "media_kind": media_kind, "intent_id": intent_id,
+                    "session_id": str(session.id), "channel": channel,
+                }, ensure_ascii=False)
+            target_id = external_conv_id[len(expected_prefix):].strip()
+            if not target_id:
+                return json.dumps({
+                    "type": "media_delivery_result", "version": 1,
+                    "status": "failed", "code": "SESSION_ROUTE_UNAVAILABLE",
+                    "media_kind": media_kind, "intent_id": intent_id,
+                    "session_id": str(session.id), "channel": channel,
+                }, ensure_ascii=False)
+            conversation_type = "2" if target_is_group else "1"
+            dingtalk_app_id = str(config.app_id)
+            dingtalk_app_secret = str(config.app_secret)
+            delivery_mode = "native"
+        else:
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1,
+                "status": "unsupported", "code": "CHANNEL_MEDIA_UNSUPPORTED",
+                "media_kind": media_kind, "intent_id": intent_id,
+                "session_id": str(session.id), "channel": channel,
+            }, ensure_ascii=False)
+
+        receipt: ChatMessage | None = None
+        if str(origin_session_id or "") == str(session.id) and origin_turn_anchor_id:
+            running_rows = (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.agent_id == agent_id,
+                        ChatMessage.conversation_id == str(session.id),
+                        ChatMessage.role == "tool_call",
+                        ChatMessage.external_event_key.is_(None),
+                        ChatMessage.message_meta["turn_anchor_id"].as_string()
+                        == str(origin_turn_anchor_id),
+                    ).order_by(ChatMessage.created_at.desc()).limit(20)
+                )
+            ).scalars().all()
+            for candidate in running_rows:
+                try:
+                    candidate_payload = json.loads(candidate.content or "")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if (
+                    isinstance(candidate_payload, dict)
+                    and str(candidate_payload.get("name") or "") == "send_media"
+                    and str(candidate_payload.get("call_id") or "") == intent_id
+                ):
+                    receipt = candidate
+                    break
+
+        is_cross_session_claim = str(origin_session_id or "") != str(session.id)
+        claim_meta = {
+            "direction": "outbound",
+            "source_channel": channel,
+            "target_session_id": str(session.id),
+            "origin_session_id": str(origin_session_id or ""),
+            "tool_call_id": intent_id,
+            "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
+            # Cross-session mirrors are UI delivery records, not part of the
+            # target Agent's reasoning history. A current-session row is the
+            # caller's canonical tool result and must remain in LLM replay.
+            "delivery_claim": is_cross_session_claim,
+            "delivery_status": "pending",
+        }
+        if receipt is None:
+            receipt = ChatMessage(
+                agent_id=agent_id,
+                user_id=session.user_id,
+                role="tool_call",
+                content=json.dumps({
+                    "name": "send_media",
+                    "call_id": intent_id,
+                    "args": {"media_type": media_kind, "file_path": workspace_path},
+                    "status": "running",
+                    "result": "",
+                    "reasoning_content": None,
+                }, ensure_ascii=False),
+                conversation_id=str(session.id),
+                external_event_key=operation_key,
+                message_meta=claim_meta,
+            )
+            db.add(receipt)
+        else:
+            receipt.external_event_key = operation_key
+            receipt.message_meta = {**dict(receipt.message_meta or {}), **claim_meta}
+        session.last_message_at = datetime.now(timezone.utc)
+        await db.flush()
+        receipt_meta = dict(receipt.message_meta or {})
+        receipt_meta["attachments"] = [attachment]
+        receipt_meta["media_kind"] = media_kind
+        receipt_meta["delivery_mode"] = delivery_mode
+        receipt_meta["caption_status"] = "pending" if caption.strip() else "not_requested"
+        receipt_meta["requested_caption"] = caption.strip()
+        receipt_meta["target_is_group"] = target_is_group
+        receipt_meta["delivery_code"] = "MEDIA_DELIVERY_PENDING"
+        receipt_meta["allow_download"] = allow_download
+        receipt.message_meta = receipt_meta
+        await db.commit()
+        receipt_id = receipt.id
+
+    sent = True
+    code = "MEDIA_SENT"
+    uncertain = False
+    caption_sent = channel != "dingtalk" or not bool(caption.strip())
+    if channel == "dingtalk":
+        from app.services.dingtalk_stream import (
+            DINGTALK_VOICE_MAX_BYTES,
+            _send_dingtalk_media_message,
+            _send_dingtalk_native_video,
+            _upload_dingtalk_media,
+        )
+
+        try:
+            if media_kind == "video":
+                sent, code = await _send_dingtalk_native_video(
+                    dingtalk_app_id,
+                    dingtalk_app_secret,
+                    target_id,
+                    file_path,
+                    conversation_type,
+                    cover_image_path=cover_path,
+                    raise_on_transport_error=True,
+                )
+            elif file_path.stat().st_size > DINGTALK_VOICE_MAX_BYTES:
+                sent, code = False, "MEDIA_TOO_LARGE"
+            else:
+                media_id = await _upload_dingtalk_media(
+                    dingtalk_app_id,
+                    dingtalk_app_secret,
+                    str(file_path),
+                    "voice",
+                    raise_on_transport_error=True,
+                )
+                sent = bool(media_id) and await _send_dingtalk_media_message(
+                    dingtalk_app_id,
+                    dingtalk_app_secret,
+                    target_id,
+                    str(media_id or ""),
+                    "voice",
+                    conversation_type,
+                    filename=file_path.name,
+                    raise_on_transport_error=True,
+                )
+                code = "MEDIA_SENT" if sent else (
+                    "MEDIA_SEND_FAILED" if media_id else "MEDIA_UPLOAD_FAILED"
+                )
+        except Exception:
+            logger.opt(exception=True).error("[SessionMedia] Provider result is unknown")
+            sent, uncertain, code = False, True, "MEDIA_DELIVERY_STATE_UNKNOWN"
+
+        if sent and caption.strip():
+            runtime = TurnRuntime(
+                session_found=True,
+                source_channel=channel,
+                conversation_id=str(target_session_id),
+                external_conv_id=external_conv_id,
+                is_group=target_is_group,
+            )
+            try:
+                caption_sent = await deliver_message_to_runtime(
+                    agent_id=agent_id,
+                    runtime=runtime,
+                    message=caption.strip(),
+                    require_transport=True,
+                )
+            except Exception:
+                logger.opt(exception=True).warning("[SessionMedia] Caption delivery failed")
+                caption_sent = False
+
+    final_status = "sent" if sent else ("unknown" if uncertain else "failed")
+    final_code = (
+        "MEDIA_SENT_CAPTION_FAILED" if sent and not caption_sent else code
+    )
+    events: list[dict] = []
+    async with async_session() as db:
+        final_receipt = await db.get(ChatMessage, receipt_id, with_for_update=True)
+        if final_receipt is None:
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1, "status": "unknown",
+                "code": "MEDIA_DELIVERY_STATE_UNKNOWN", "media_kind": media_kind,
+                "intent_id": intent_id, "session_id": str(target_session_id),
+                "channel": channel,
+            }, ensure_ascii=False)
+        final_meta = dict(final_receipt.message_meta or {})
+        final_meta["delivery_status"] = final_status
+        final_meta["delivery_code"] = final_code
+        final_meta["caption_status"] = (
+            "not_requested" if not caption.strip() else ("sent" if caption_sent else "failed")
+        )
+        final_receipt.message_meta = final_meta
+        result_payload: dict
+        if sent:
+            result_payload = {
+                "type": "platform_media_delivery",
+                "version": 1,
+                "status": final_status,
+                "code": final_code,
+                "media_kind": media_kind,
+                "path": workspace_path,
+                "filename": file_path.name,
+                "mime_type": mime_type,
+                "size": file_path.stat().st_size,
+                "message_id": str(final_receipt.id),
+                "allow_download": allow_download,
+                "intent_id": intent_id,
+                "session_id": str(target_session_id),
+                "channel": channel,
+                "conversation_type": "group" if target_is_group else "person",
+                "delivery_mode": delivery_mode,
+            }
+            result_payload = _describe_media_delivery_result(result_payload)
+        else:
+            result_payload = _describe_media_delivery_result({
+                "type": "media_delivery_result",
+                "version": 1,
+                "status": final_status,
+                "code": final_code,
+                "media_kind": media_kind,
+                "intent_id": intent_id,
+                "session_id": str(target_session_id),
+                "channel": channel,
+                "message_id": str(final_receipt.id),
+            })
+        final_receipt.content = json.dumps({
+            "name": "send_media",
+            "call_id": intent_id,
+            "args": {"media_type": media_kind, "file_path": workspace_path},
+            "status": "done",
+            "result": json.dumps(result_payload, ensure_ascii=False),
+            "reasoning_content": None,
+        }, ensure_ascii=False)
+        caption_row: ChatMessage | None = None
+        if sent and caption_sent and caption.strip():
+            caption_operation_key = f"{operation_key}:caption"
+            caption_row = (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.external_event_key == caption_operation_key
+                    )
+                )
+            ).scalar_one_or_none()
+            if caption_row is None:
+                caption_meta = {
+                    key: value
+                    for key, value in final_meta.items()
+                    if key not in {
+                        "attachments",
+                        "media_kind",
+                        "delivery_mode",
+                        "caption_status",
+                        "requested_caption",
+                        "delivery_code",
+                    }
+                }
+                # A caption is a normal assistant message. It must not inherit
+                # the media claim's LLM-history suppression marker.
+                caption_meta.pop("delivery_claim", None)
+                caption_meta.update({
+                    "attachments": [],
+                    "delivery_status": "sent",
+                    "media_caption_for": str(final_receipt.id),
+                })
+                caption_row = ChatMessage(
+                    agent_id=agent_id,
+                    user_id=final_receipt.user_id,
+                    role="assistant",
+                    content=caption.strip(),
+                    conversation_id=str(target_session_id),
+                    external_event_key=caption_operation_key,
+                    message_meta=caption_meta,
+                )
+                db.add(caption_row)
+                await db.flush()
+        await db.commit()
+        await db.refresh(final_receipt)
+        events.append({
+            "type": "tool_call",
+            "id": str(final_receipt.id),
+            "message_id": str(final_receipt.id),
+            "name": "send_media",
+            "call_id": intent_id,
+            "args": {
+                "media_type": media_kind,
+                "file_path": workspace_path,
+            },
+            "status": "done",
+            "result": json.dumps(result_payload, ensure_ascii=False),
+            "created_at": final_receipt.created_at.isoformat() if final_receipt.created_at else None,
+        })
+        if sent:
+            from app.services.chat_message_serializer import serialize_chat_message_for_client
+            if caption_row is not None:
+                await db.refresh(caption_row)
+                caption_event = serialize_chat_message_for_client(caption_row, source_channel=channel)
+                caption_event["type"] = "assistant_message_committed"
+                events.append(caption_event)
+
+    try:
+        from app.api.websocket import manager as ws_manager
+
+        for event in events:
+            event["session_id"] = str(target_session_id)
+            await ws_manager.send_to_session(str(agent_id), str(target_session_id), event)
+    except Exception:
+        logger.opt(exception=True).warning("[SessionMedia] Web live mirror failed")
+
+    return json.dumps(result_payload, ensure_ascii=False)
+
+
+async def _send_media_to_recipient(
+    *,
+    agent_id: uuid.UUID,
+    file_path: Path,
+    workspace_path: str,
+    user_id: str,
+    channel: str | None,
+    media_kind: str,
+    caption: str,
+    cover_path: Path | None,
+    intent_id: str,
+    origin_session_id: str | None,
+    origin_turn_anchor_id: uuid.UUID | None,
+    allow_download: bool = False,
+) -> str:
+    """Resolve a person, bind/reuse their Session, then use exact-Session delivery."""
+    from app.services.recipient_resolver import (
+        RecipientResolutionError,
+        resolve_human_channel_recipient,
+    )
+
+    async with async_session() as db:
+        try:
+            route = await resolve_human_channel_recipient(
+                db, agent_id, user_id, channel=channel
+            )
+        except RecipientResolutionError as exc:
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1,
+                "status": "unsupported", "code": exc.code,
+                "message": exc.message,
+                "media_kind": media_kind, "intent_id": intent_id,
+                "available_channels": exc.available_channels,
+            }, ensure_ascii=False)
+        if route.channel != "dingtalk":
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1,
+                "status": "unsupported", "code": "CHANNEL_MEDIA_UNSUPPORTED",
+                "media_kind": media_kind, "intent_id": intent_id,
+                "channel": route.channel,
+            }, ensure_ascii=False)
+        target_staff_id = str(route.member.external_id or "").strip()
+        if not target_staff_id:
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1,
+                "status": "unsupported", "code": "RECIPIENT_MEDIA_ROUTE_UNAVAILABLE",
+                "media_kind": media_kind, "intent_id": intent_id,
+                "channel": route.channel,
+            }, ensure_ascii=False)
+        session = await find_or_create_channel_session(
+            db=db,
+            agent_id=agent_id,
+            user_id=route.user.id,
+            external_conv_id=f"dingtalk_p2p_{target_staff_id}",
+            source_channel="dingtalk",
+            first_message_title=caption.strip()[:30] or file_path.name[:30],
+        )
+        await db.commit()
+        target_session_id = str(session.id)
+
+    return await _send_media_to_session(
+        agent_id=agent_id,
+        session_id=target_session_id,
+        file_path=file_path,
+        workspace_path=workspace_path,
+        media_kind=media_kind,
+        caption=caption,
+        cover_path=cover_path,
+        intent_id=intent_id,
+        origin_session_id=origin_session_id,
+        origin_turn_anchor_id=origin_turn_anchor_id,
+        allow_download=allow_download,
+    )
 
 
 def _normalize_tool_workspace_rel_path(raw_path: str) -> str | None:
@@ -7464,10 +8461,11 @@ def _build_outbound_operation_key(
     origin_turn_anchor_id: uuid.UUID | str | None = None,
 ) -> str | None:
     """Return the durable replay key for one messaging tool invocation."""
-    if not origin_session_id or not tool_call_id:
+    if not tool_call_id:
         return None
+    session_scope = str(origin_session_id or "no-session")
     turn_scope = str(origin_turn_anchor_id or "unanchored")
-    return f"outbound:{agent_id}:{origin_session_id}:{turn_scope}:{tool_call_id}"[:500]
+    return f"outbound:{agent_id}:{session_scope}:{turn_scope}:{tool_call_id}"[:500]
 
 
 async def _lock_outbound_operation(db, operation_key: str | None) -> None:
@@ -7527,6 +8525,7 @@ async def _persist_outbound_channel_message(
     tool_call_id: str | None,
     origin_turn_anchor_id: uuid.UUID | None,
     external_message_id: str | None = None,
+    delivery_status: str = "sent",
 ) -> ChatMessage:
     """Append/reuse the outbound receipt used by strict on_message binding."""
     operation_key = _build_outbound_operation_key(
@@ -7569,7 +8568,7 @@ async def _persist_outbound_channel_message(
             "tool_call_id": str(tool_call_id or ""),
             "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
             "external_message_id": str(external_message_id or ""),
-            "delivery_status": "sent",
+            "delivery_status": delivery_status,
         },
     )
     db.add(row)

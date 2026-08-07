@@ -10,6 +10,7 @@ from app.models.tenant_setting import TenantSetting
 from app.models.tool import Tool
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
 from app.services.tool_config import meaningful_config, tenant_tool_config_key
+from app.services.tool_enablement import tool_is_required
 
 _settings = get_settings()
 
@@ -871,6 +872,49 @@ BUILTIN_TOOLS = [
         },
         "config": {},
         "config_schema": {},
+    },
+    {
+        "name": "send_media",
+        "display_name": "Send Media",
+        "description": (
+            "Send one workspace audio or video file to the current conversation, "
+            "an exact existing person/group Session, or a directly resolved person. "
+            "The tool contract is always available even when the resolved IM channel "
+            "returns unsupported. Audio/video is rendered as a dedicated tool-call card."
+        ),
+        "category": "communication",
+        "icon": "🎬",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "media_type": {"type": "string", "enum": ["audio", "video"]},
+                "file_path": {"type": "string"},
+                "cover_image_path": {"type": "string"},
+                "session_id": {"type": "string"},
+                "user_id": {"type": "string"},
+                "channel": {
+                    "type": "string",
+                    "enum": ["feishu", "dingtalk", "wecom", "slack", "teams", "discord", "whatsapp", "wechat"],
+                },
+                "message": {"type": "string"},
+            },
+            "required": ["media_type", "file_path"],
+            "not": {"required": ["session_id", "user_id"]},
+            "additionalProperties": False,
+        },
+        "config": {"allow_download": False},
+        "config_schema": {
+            "fields": [
+                {
+                    "key": "allow_download",
+                    "label": "Allow media download",
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Show the download action on send_media cards in both Web and H5 chat.",
+                }
+            ]
+        },
     },
     # NOTE: send_feishu_message is defined in the 'feishu' category section below.
     # It was previously duplicated here under 'communication', which could cause
@@ -4631,6 +4675,7 @@ async def seed_builtin_tools():
             logger.info(f"[ToolSeeder] Merged legacy builtin tool into {new_name}")
 
         new_tool_ids = []
+        required_tool_ids = set()
         for t in BUILTIN_TOOLS:
             seed_config = _global_builtin_config(t)
             seed_enabled = builtin_tool_enabled(t)
@@ -4653,12 +4698,19 @@ async def seed_builtin_tools():
                 )
                 db.add(tool)
                 await db.flush()  # get tool.id
+                if tool_is_required(t["name"]):
+                    required_tool_ids.add(tool.id)
                 if t["is_default"]:
                     new_tool_ids.append(tool.id)
                 logger.info(f"[ToolSeeder] Created builtin tool: {t['name']}")
             else:
                 # Sync fields that may evolve
                 updated_fields = []
+                if tool_is_required(t["name"]):
+                    required_tool_ids.add(existing.id)
+                    if not existing.enabled:
+                        existing.enabled = True
+                        updated_fields.append("enabled")
                 if existing.category != t["category"]:
                     existing.category = t["category"]
                     updated_fields.append("category")
@@ -4716,22 +4768,31 @@ async def seed_builtin_tools():
                 if updated_fields:
                     logger.info(f"[ToolSeeder] Updated {', '.join(updated_fields)}: {t['name']}")
 
-        # Auto-assign new default tools to all existing agents
-        if new_tool_ids:
+        # Auto-assign new default tools and self-heal required protocol tools
+        # for every existing Agent. Required bindings cannot remain missing or
+        # disabled after startup, even if legacy control-plane data says so.
+        assignment_tool_ids = set(new_tool_ids) | required_tool_ids
+        if assignment_tool_ids:
             agents_result = await db.execute(select(Agent.id))
             agent_ids = [row[0] for row in agents_result.fetchall()]
+            assignments_result = await db.execute(
+                select(AgentTool).where(AgentTool.tool_id.in_(assignment_tool_ids))
+            )
+            assignments_by_pair = {
+                (assignment.agent_id, assignment.tool_id): assignment
+                for assignment in assignments_result.scalars().all()
+            }
             for agent_id in agent_ids:
-                for tool_id in new_tool_ids:
-                    # Check if already assigned
-                    check = await db.execute(
-                        select(AgentTool).where(
-                            AgentTool.agent_id == agent_id,
-                            AgentTool.tool_id == tool_id,
-                        )
-                    )
-                    if not check.scalar_one_or_none():
+                for tool_id in assignment_tool_ids:
+                    assignment = assignments_by_pair.get((agent_id, tool_id))
+                    if assignment is None:
                         db.add(AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=True))
-            logger.info(f"[ToolSeeder] Auto-assigned {len(new_tool_ids)} new tools to {len(agent_ids)} agents")
+                    elif tool_id in required_tool_ids and not assignment.enabled:
+                        assignment.enabled = True
+            logger.info(
+                f"[ToolSeeder] Ensured {len(assignment_tool_ids)} new/required "
+                f"tools for {len(agent_ids)} agents"
+            )
 
         OBSOLETE_TOOLS = ["bing_search", "manage_tasks"]
         for obsolete_name in OBSOLETE_TOOLS:

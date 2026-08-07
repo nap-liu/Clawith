@@ -341,7 +341,8 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
     };
 
     const bulkToggleCategory = async (catTools: any[], enabled: boolean) => {
-        const catToolIds = new Set(catTools.map(t => t.id));
+        const catToolIds = new Set(catTools.filter(t => t.can_disable !== false).map(t => t.id));
+        if (catToolIds.size === 0) return;
         setTools(prev => prev.map(t => catToolIds.has(t.id) ? { ...t, enabled } : t));
         try {
             const token = localStorage.getItem('token');
@@ -509,7 +510,11 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                             title={t('agent.tools.removeTool', 'Remove from agent')}
                         >{deletingToolId === tool.id ? '...' : '✕'}</button>
                     )}
-                    {canManage ? (
+                    {tool.can_disable === false ? (
+                        <span style={{ fontSize: '11px', color: 'var(--accent-primary)', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                            {t('agent.tools.alwaysAvailable', 'Always available')}
+                        </span>
+                    ) : canManage ? (
                         <ToggleSwitch
                             checked={tool.enabled}
                             onChange={(checked) => void toggleTool(tool.id, checked)}
@@ -537,9 +542,11 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                 const meta = getToolGroupMeta(category, allCatTools);
                 const label = meta.label;
                 const enabledCount = allCatTools.filter((tool: any) => tool.enabled).length;
+                const controllableTools = allCatTools.filter((tool: any) => tool.can_disable !== false);
+                const controllableEnabledCount = controllableTools.filter((tool: any) => tool.enabled).length;
                 const configuredCount = allCatTools.filter((tool: any) => tool.agent_config && Object.keys(tool.agent_config).length > 0).length;
-                const allEnabled = allCatTools.length > 0 && enabledCount === allCatTools.length;
-                const mixed = enabledCount > 0 && enabledCount < allCatTools.length;
+                const allEnabled = controllableTools.length > 0 && controllableEnabledCount === controllableTools.length;
+                const mixed = controllableEnabledCount > 0 && controllableEnabledCount < controllableTools.length;
                 const expanded = expandedCategories.has(category) || !!toolSearch.trim();
                 const visibleCount = (catTools as any[]).length;
                 const mcpServerId = allCatTools[0]?.mcp_server_id as string | undefined;
@@ -657,7 +664,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                         title={t('agent.tools.configureCategory', 'Configure {{category}}', { category: label })}
                                     ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
                                 )}
-                                {canManage && (
+                                {canManage && controllableTools.length > 0 && (
                                     <ToggleSwitch
                                         checked={allEnabled}
                                         mixed={mixed}

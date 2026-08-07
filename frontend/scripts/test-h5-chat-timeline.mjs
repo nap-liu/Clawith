@@ -32,6 +32,7 @@ function compileTsModule(sourcePath, requireOverride = require) {
 
 const fileDeliveryPath = resolve(__dirname, '../src/utils/chatFileDelivery.ts');
 const fileDeliveryModule = compileTsModule(fileDeliveryPath);
+const { parseFileDeliveryToolResult, parseMediaDeliveryErrorResult } = fileDeliveryModule.exports;
 
 const sourcePath = resolve(__dirname, '../src/pages/h5/chatTimeline.ts');
 const timelineRequire = (id) => {
@@ -46,7 +47,17 @@ const timelineRequire = (id) => {
                         ? 'confirmation'
                         : message?.toolName === 'send_channel_file'
                             ? 'file-delivery'
-                            : null
+                            : (parseFileDeliveryToolResult(
+                                message?.toolName,
+                                message?.toolResult,
+                                message?.toolArgs,
+                                message?.toolCallId,
+                            )?.mediaKind || parseMediaDeliveryErrorResult(
+                                message?.toolName,
+                                message?.toolResult,
+                            ))
+                                ? 'media-delivery'
+                                : null
             ),
             getChatToolRenderIdentity: (message) => {
                 if (message?.role !== 'tool_call' || message?.toolName !== 'send_channel_file') return null;
@@ -79,12 +90,69 @@ const {
 } = module.exports;
 
 {
+    const mapped = mapHistoryMessage({
+        id: 'user-with-attachments',
+        role: 'user',
+        content: '[file:a.jpg]\n正文',
+        display_content: '正文',
+        attachments: [{ display_name: 'a.jpg', path: 'workspace/uploads/a.jpg', kind: 'image' }],
+        created_at: '2026-08-07T00:00:00Z',
+    });
+    assert.equal(mapped.id, 'user-with-attachments');
+    assert.equal(mapped.display_content, '正文');
+    assert.equal(mapped.attachments.length, 1);
+}
+
+{
+    const error = parseMediaDeliveryErrorResult('send_media', JSON.stringify({
+        type: 'media_delivery_result',
+        status: 'unknown',
+        code: 'MEDIA_DELIVERY_STATE_UNKNOWN',
+        message: '发送结果不确定，媒体可能已经送达；不要自动重试，以免重复发送。',
+        retryable: false,
+        media_kind: 'video',
+    }));
+    assert.equal(error.status, 'unknown');
+    assert.equal(error.code, 'MEDIA_DELIVERY_STATE_UNKNOWN');
+    assert.equal(error.retryable, false);
+}
+
+{
+    const delivery = parseFileDeliveryToolResult(
+        'send_media',
+        JSON.stringify({
+            type: 'platform_media_delivery',
+            version: 1,
+            status: 'sent',
+            media_kind: 'video',
+            path: 'workspace/media/demo.mp4',
+            filename: 'demo.mp4',
+            mime_type: 'video/mp4',
+            size: 42,
+            message_id: 'tool-message-1',
+            allow_download: true,
+        }),
+        {},
+        'media-delivery:call-1',
+    );
+    assert.equal(delivery.mediaKind, 'video');
+    assert.equal(delivery.messageId, 'tool-message-1');
+    assert.equal(delivery.allowDownload, true);
+}
+
+{
     const normalized = normalizeChatTimelineMessages([
         { id: 'confirmation', role: 'tool_call', toolCallId: 'confirmation', toolName: 'request_confirmation', toolStatus: 'done' },
         { id: 'empty-completed', role: 'assistant', content: '   ', streaming: false },
         { id: 'thinking-only', role: 'assistant', content: '', thinking: '仍需展示思考过程' },
         { id: 'streaming-placeholder', role: 'assistant', content: '', streaming: true },
         { id: 'attachment-only', role: 'assistant', content: '', fileName: 'report.pdf' },
+        {
+            id: 'structured-media-only',
+            role: 'assistant',
+            content: '',
+            attachments: [{ display_name: 'demo.mp4', path: 'workspace/media/demo.mp4', kind: 'video' }],
+        },
         { id: 'final', role: 'assistant', content: '确认流程已完成' },
     ]);
 
@@ -92,7 +160,68 @@ const {
     assert.equal(normalized.some((message) => message.id === 'thinking-only'), true);
     assert.equal(normalized.some((message) => message.id === 'streaming-placeholder'), true);
     assert.equal(normalized.some((message) => message.id === 'attachment-only'), true);
+    assert.equal(normalized.some((message) => message.id === 'structured-media-only'), false);
     assert.equal(normalized.some((message) => message.id === 'final'), true);
+}
+
+{
+    const entries = buildH5ConversationEntries([{
+        id: 'media-only',
+        role: 'user',
+        content: '',
+        attachments: [{ display_name: 'voice.mp3', path: 'workspace/media/voice.mp3', kind: 'audio' }],
+    }]);
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].type, 'message');
+    assert.equal(entries[0].msg.id, 'media-only');
+}
+
+{
+    const entries = buildH5ConversationEntries([{
+        id: 'media-error-tool-row',
+        role: 'tool_call',
+        content: '',
+        toolName: 'send_media',
+        toolCallId: 'media-error-call',
+        toolStatus: 'done',
+        toolResult: JSON.stringify({
+            type: 'media_delivery_result',
+            status: 'failed',
+            code: 'MEDIA_SEND_FAILED',
+            message: '目标通道拒绝或未完成媒体发送。',
+            retryable: false,
+            media_kind: 'video',
+        }),
+    }]);
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].type, 'special_render');
+    assert.equal(entries[0].renderType, 'media-delivery');
+}
+
+{
+    const entries = buildH5ConversationEntries([{
+        id: 'media-tool-row',
+        role: 'tool_call',
+        content: '',
+        toolName: 'send_media',
+        toolCallId: 'media-delivery:call-1',
+        toolStatus: 'done',
+        toolResult: JSON.stringify({
+            type: 'platform_media_delivery',
+            status: 'sent',
+            media_kind: 'audio',
+            path: 'workspace/media/voice.mp3',
+            filename: 'voice.mp3',
+            message_id: 'tool-message-audio',
+            allow_download: false,
+        }),
+    }]);
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].type, 'special_render');
+    assert.equal(entries[0].renderType, 'media-delivery');
 }
 
 {

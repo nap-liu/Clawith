@@ -186,6 +186,16 @@ class S3StorageBackend(StorageBackend):
         body = response["Body"]
         return await asyncio.to_thread(body.read)
 
+    async def read_range(self, key: str, start: int, end: int) -> bytes:
+        client = self._client_or_raise()
+        response = await asyncio.to_thread(
+            client.get_object,
+            Bucket=self.bucket,
+            Key=self._object_key(key),
+            Range=f"bytes={max(0, start)}-{max(0, end)}",
+        )
+        return await asyncio.to_thread(response["Body"].read)
+
     async def read_text_lines(
         self,
         key: str,

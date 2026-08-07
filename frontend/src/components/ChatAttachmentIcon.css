@@ -1,0 +1,14 @@
+.chat-attachment-type-icon {
+    flex: 0 0 auto;
+}
+
+.chat-attachment-type-icon--pdf { color: #e5484d; }
+.chat-attachment-type-icon--word { color: #3b82f6; }
+.chat-attachment-type-icon--spreadsheet { color: #16a34a; }
+.chat-attachment-type-icon--presentation { color: #f97316; }
+.chat-attachment-type-icon--archive { color: #ca8a04; }
+.chat-attachment-type-icon--text { color: #64748b; }
+.chat-attachment-type-icon--code { color: #8b5cf6; }
+.chat-attachment-type-icon--audio { color: #db2777; }
+.chat-attachment-type-icon--video { color: #0891b2; }
+.chat-attachment-type-icon--generic { color: currentColor; }

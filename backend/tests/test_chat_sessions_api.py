@@ -373,11 +373,21 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
         user_id=owner_id,
         source_channel="web",
     )
+    message_id = uuid.uuid4()
+    attachment = {
+        "display_name": "invoice.png",
+        "path": "workspace/uploads/invoice.png",
+        "kind": "image",
+        "mime_type": "image/png",
+    }
     message = SimpleNamespace(
+        id=message_id,
         role="user",
         content="hello",
         created_at=now,
         participant_id=None,
+        message_meta={"attachments": [attachment, attachment, attachment]},
+        thinking=None,
     )
     db = RecordingDB(
         responses=[
@@ -405,10 +415,13 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
 
     assert messages == [
         {
-                "role": "user",
-                "content": "hello",
-                "created_at": now.isoformat(),
-                "sender_user_id": str(owner_id),
+            "id": str(message_id),
+            "role": "user",
+            "content": "hello",
+            "display_content": "hello",
+            "attachments": [attachment, attachment, attachment],
+            "created_at": now.isoformat(),
+            "sender_user_id": str(owner_id),
         }
     ]
 
@@ -430,11 +443,15 @@ async def test_creator_can_view_other_users_session_messages(monkeypatch):
         user_id=other_user_id,
         source_channel="web",
     )
+    message_id = uuid.uuid4()
     message = SimpleNamespace(
+        id=message_id,
         role="user",
         content="hello",
         created_at=now,
         participant_id=None,
+        message_meta=None,
+        thinking=None,
     )
     db = RecordingDB(
         responses=[
@@ -460,10 +477,13 @@ async def test_creator_can_view_other_users_session_messages(monkeypatch):
 
     assert messages == [
         {
-                "role": "user",
-                "content": "hello",
-                "created_at": now.isoformat(),
-                "sender_user_id": str(other_user_id),
+            "id": str(message_id),
+            "role": "user",
+            "content": "hello",
+            "display_content": "hello",
+            "attachments": [],
+            "created_at": now.isoformat(),
+            "sender_user_id": str(other_user_id),
         }
     ]
 

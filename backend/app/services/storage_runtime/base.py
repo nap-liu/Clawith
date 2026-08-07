@@ -72,6 +72,15 @@ class StorageBackend:
     async def read_bytes(self, key: str) -> bytes:
         raise NotImplementedError
 
+    async def read_range(self, key: str, start: int, end: int) -> bytes:
+        """Read an inclusive byte range.
+
+        Custom backends keep a compatibility fallback; production backends
+        override this so media playback never loads the whole object.
+        """
+        data = await self.read_bytes(key)
+        return data[max(0, start) : max(0, end) + 1]
+
     async def read_text(self, key: str, encoding: str = "utf-8", errors: str = "replace") -> str:
         raw = await self.read_bytes(key)
         return raw.decode(encoding, errors=errors)

@@ -23,6 +23,7 @@ from app.models.chat_session import ChatSession
 from app.models.agent import Agent
 from app.models.user import Identity, User
 from app.services.auth_code_exchange import validate_platform_login_channel
+from app.services.chat_message_serializer import serialize_chat_message_for_client
 from app.services.chat_session_service import (
     get_latest_platform_session,
     promote_platform_session,
@@ -598,7 +599,18 @@ async def get_session_messages(
     from sqlalchemy import desc
     query = (
         select(ChatMessage)
-        .where(ChatMessage.conversation_id == str(session_id))
+        .where(
+            ChatMessage.conversation_id == str(session_id),
+            or_(
+                ChatMessage.role != "assistant",
+                ChatMessage.message_meta["media_kind"].as_string().is_(None),
+                ChatMessage.message_meta["media_kind"].as_string().not_in(
+                    ["audio", "video"]
+                ),
+                ChatMessage.message_meta["delivery_status"].as_string().is_(None),
+                ChatMessage.message_meta["delivery_status"].as_string() == "sent",
+            ),
+        )
         # id tiebreak: own-transaction tool_call/assistant rows can share a
         # created_at microsecond; keep the render order deterministic. Fetched
         # desc + reversed below, so the page is the newest `limit` rows.
@@ -674,6 +686,16 @@ async def get_session_messages(
     out = []
     tool_call_positions: dict[str, int] = {}
     for m in messages:
+        raw_message_meta = getattr(m, "message_meta", None)
+        message_meta = raw_message_meta if isinstance(raw_message_meta, dict) else {}
+        if (
+            m.role == "assistant"
+            and message_meta.get("media_kind") in {"audio", "video"}
+            and (
+                message_meta.get("delivery_status") not in {None, "sent"}
+            )
+        ):
+            continue
         sender_user_id = getattr(m, "sender_user_id", None)
         sender_agent_id = getattr(m, "sender_agent_id", None)
         legacy_sender_name = None
@@ -698,7 +720,13 @@ async def get_session_messages(
 
         if m.role == "tool_call":
             from app.services.chat_history import parse_tool_call_for_display
-            entry: dict = {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
+            entry = serialize_chat_message_for_client(
+                m,
+                source_channel=session.source_channel,
+                sender_name=sender_name,
+                sender_user_id=sender_user_id,
+                sender_agent_id=sender_agent_id,
+            )
             # Canonical tool events persist the model call_id, shared by their append-only
             # running/done rows. Pending confirmation rows intentionally have no call_id;
             # their database row id remains the resolve handle.
@@ -709,12 +737,6 @@ async def get_session_messages(
                 entry.update(parsed)
             if entry.get("toolName") == "request_confirmation":
                 entry["toolCallId"] = str(m.id)
-            if sender_name:
-                entry["sender_name"] = sender_name
-            if sender_user_id:
-                entry["sender_user_id"] = str(sender_user_id)
-            if sender_agent_id:
-                entry["sender_agent_id"] = str(sender_agent_id)
             tool_call_id = entry["toolCallId"]
             previous_position = tool_call_positions.get(tool_call_id)
             if previous_position is None:
@@ -742,15 +764,13 @@ async def get_session_messages(
                     part["sender_agent_id"] = str(sender_agent_id)
                 out.append(part)
         else:
-            entry = {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
-            if hasattr(m, 'thinking') and m.thinking:
-                entry["thinking"] = m.thinking
-            if sender_name:
-                entry["sender_name"] = sender_name
-            if sender_user_id:
-                entry["sender_user_id"] = str(sender_user_id)
-            if sender_agent_id:
-                entry["sender_agent_id"] = str(sender_agent_id)
+            entry = serialize_chat_message_for_client(
+                m,
+                source_channel=session.source_channel,
+                sender_name=sender_name,
+                sender_user_id=sender_user_id,
+                sender_agent_id=sender_agent_id,
+            )
             out.append(entry)
 
     # NB: confirmation cards are NOT merged here any more — a card is just a

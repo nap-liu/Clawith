@@ -503,6 +503,25 @@ export const fileApi = {
             body: JSON.stringify({ skill_id: skillId }),
         }),
 
+    createPlaybackTicket: (agentId: string, path: string, messageId: string) =>
+        request<{
+            playback_session_id: string;
+            playback_url: string;
+            mime_type: string;
+            size_bytes: number;
+            absolute_expires_at: number;
+        }>(`/agents/${agentId}/files/playback-ticket`, {
+            method: 'POST',
+            body: JSON.stringify({ path, message_id: messageId }),
+        }),
+
+    playbackStatus: (agentId: string, sessionId: string, signature: string) =>
+        request<{ status: string; absolute_expires_at?: number }>(
+            `/agents/${agentId}/files/playback/${encodeURIComponent(sessionId)}/status?signature=${encodeURIComponent(signature)}`,
+            {},
+            { redirectOnUnauthorized: false },
+        ),
+
     downloadUrl: (agentId: string, path: string, options?: { inline?: boolean }) => {
         const token = localStorage.getItem('token');
         const params = new URLSearchParams({ path, token: token || '' });

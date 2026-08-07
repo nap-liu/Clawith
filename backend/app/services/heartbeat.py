@@ -408,16 +408,25 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                         if plaza_posts_made >= 1:
                             tool_result = "[BLOCKED] You have already made 1 plaza post this heartbeat. Do not post again."
                         else:
-                            tool_result = await execute_tool(tool_name, args, agent_id, agent_creator_id)
+                            tool_result = await execute_tool(
+                                tool_name, args, agent_id, agent_creator_id,
+                                tool_call_id=tc["id"],
+                            )
                             plaza_posts_made += 1
                     elif tool_name == "plaza_add_comment":
                         if plaza_comments_made >= 2:
                             tool_result = "[BLOCKED] You have already made 2 comments this heartbeat. Do not comment again."
                         else:
-                            tool_result = await execute_tool(tool_name, args, agent_id, agent_creator_id)
+                            tool_result = await execute_tool(
+                                tool_name, args, agent_id, agent_creator_id,
+                                tool_call_id=tc["id"],
+                            )
                             plaza_comments_made += 1
                     else:
-                        tool_result = await execute_tool(tool_name, args, agent_id, agent_creator_id)
+                        tool_result = await execute_tool(
+                            tool_name, args, agent_id, agent_creator_id,
+                            tool_call_id=tc["id"],
+                        )
 
                     llm_messages.append(LLMMessage(
                         role="tool",
@@ -774,7 +783,10 @@ async def run_agent_oneshot(
                         args = {}
 
                     logger.info(f"[Oneshot:{agent_name}] Tool call: {tool_name}({list(args.keys())})")
-                    tool_result = await execute_tool(tool_name, args, agent_id, agent_creator_id)
+                    tool_result = await execute_tool(
+                        tool_name, args, agent_id, agent_creator_id,
+                        tool_call_id=tc["id"],
+                    )
 
                     llm_messages.append(LLMMessage(
                         role="tool",

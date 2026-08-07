@@ -50,6 +50,11 @@ class FallbackStorageBackend(StorageBackend):
         await self.primary.write_bytes(key, data)
         return data
 
+    async def read_range(self, key: str, start: int, end: int) -> bytes:
+        if await self.primary.exists(key) and await self.primary.is_file(key):
+            return await self.primary.read_range(key, start, end)
+        return await self.fallback.read_range(key, start, end)
+
     async def read_text_lines(
         self,
         key: str,

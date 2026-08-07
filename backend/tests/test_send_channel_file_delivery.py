@@ -4,6 +4,8 @@ import uuid
 import pytest
 
 from app.services import agent_tools
+from app.services.llm import caller as llm_caller
+from app.services.tool_seeder import BUILTIN_TOOLS
 
 
 @pytest.mark.asyncio
@@ -61,3 +63,264 @@ async def test_send_channel_file_rejects_unsafe_relative_path(tmp_path, monkeypa
     )
 
     assert result == "Error: Invalid file_path"
+
+
+@pytest.mark.asyncio
+async def test_send_channel_file_rejects_audio_and_points_to_specialized_tool(tmp_path, monkeypatch):
+    agent_id = uuid.uuid4()
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    workspace = tmp_path / str(agent_id)
+    audio = workspace / "workspace" / "briefing.mp3"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"ID3-test")
+
+    payload = json.loads(await agent_tools._send_channel_file(
+        agent_id, workspace, {"file_path": "workspace/briefing.mp3"}
+    ))
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == "WRONG_MEDIA_TOOL"
+    assert payload["media_kind"] == "audio"
+
+
+@pytest.mark.asyncio
+async def test_send_media_without_current_or_explicit_session_fails_clearly(tmp_path, monkeypatch):
+    agent_id = uuid.uuid4()
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    workspace = tmp_path / str(agent_id)
+    audio = workspace / "workspace" / "briefing.mp3"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"ID3-test")
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        agent_id,
+        workspace,
+        {"file_path": "workspace/briefing.mp3", "message": "晨会录音"},
+        media_kind="audio",
+        tool_call_id="call-123",
+    ))
+
+    assert payload["type"] == "media_delivery_result"
+    assert payload["status"] == "failed"
+    assert payload["code"] == "SESSION_REQUIRED"
+    assert payload["intent_id"] == "call-123"
+    assert payload["media_kind"] == "audio"
+
+
+@pytest.mark.asyncio
+async def test_send_media_download_is_one_agent_config_not_a_call_argument(tmp_path, monkeypatch):
+    agent_id = uuid.uuid4()
+    workspace = tmp_path / str(agent_id)
+    audio = workspace / "workspace" / "briefing.mp3"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"ID3-test")
+    captured = {}
+
+    async def fake_config(_agent_id, tool_name):
+        assert tool_name == "send_media"
+        return {"allow_download": True}
+
+    async def fake_send_to_session(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"type": "platform_media_delivery", "status": "sent"})
+
+    monkeypatch.setattr(agent_tools, "_get_tool_config", fake_config)
+    monkeypatch.setattr(agent_tools, "_send_media_to_session", fake_send_to_session)
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        agent_id,
+        workspace,
+        {
+            "file_path": "workspace/briefing.mp3",
+            "session_id": str(uuid.uuid4()),
+        },
+        media_kind="audio",
+        tool_call_id="call-config",
+    ))
+
+    assert payload["status"] == "sent"
+    assert captured["allow_download"] is True
+    assert "allow_download" not in captured.get("arguments", {})
+
+
+@pytest.mark.asyncio
+async def test_legacy_file_sender_does_not_bypass_session_routing(tmp_path, monkeypatch):
+    agent_id = uuid.uuid4()
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    workspace = tmp_path / str(agent_id)
+    audio = workspace / "workspace" / "briefing.mp3"
+    audio.parent.mkdir(parents=True)
+    audio.write_bytes(b"ID3-test")
+
+    async def file_sender(_path, _message):
+        return None
+
+    token = agent_tools.channel_file_sender.set(file_sender)
+    try:
+        payload = json.loads(await agent_tools._send_channel_media(
+            agent_id,
+            workspace,
+            {"file_path": "workspace/briefing.mp3"},
+            media_kind="audio",
+            tool_call_id="call-im",
+        ))
+    finally:
+        agent_tools.channel_file_sender.reset(token)
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == "SESSION_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_legacy_media_sender_does_not_bypass_session_routing(tmp_path, monkeypatch):
+    agent_id = uuid.uuid4()
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    workspace = tmp_path / str(agent_id)
+    video = workspace / "workspace" / "briefing.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide")
+    received = []
+
+    async def video_sender(path, message):
+        received.append((path.name, message))
+
+    token = agent_tools.channel_video_sender.set(video_sender)
+    try:
+        payload = json.loads(await agent_tools._send_channel_media(
+            agent_id,
+            workspace,
+            {"file_path": "workspace/briefing.mp4", "message": "演示"},
+            media_kind="video",
+            tool_call_id="call-video",
+        ))
+    finally:
+        agent_tools.channel_video_sender.reset(token)
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == "SESSION_REQUIRED"
+    assert received == []
+
+
+@pytest.mark.asyncio
+async def test_media_kind_is_checked_from_file_bytes(tmp_path, monkeypatch):
+    agent_id = uuid.uuid4()
+    monkeypatch.setattr(agent_tools, "WORKSPACE_ROOT", tmp_path)
+    workspace = tmp_path / str(agent_id)
+    renamed = workspace / "workspace" / "fake.mp4"
+    renamed.parent.mkdir(parents=True)
+    renamed.write_bytes(b"ID3-this-is-audio")
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        agent_id,
+        workspace,
+        {"file_path": "workspace/fake.mp4"},
+        media_kind="video",
+        tool_call_id="call-mismatch",
+    ))
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == "MEDIA_KIND_MISMATCH"
+    assert payload["actual_kind"] == "audio"
+
+
+def test_media_tools_are_fixed_core_tools():
+    definitions = [item["function"]["name"] for item in agent_tools.AGENT_TOOLS]
+    assert definitions.count("send_media") == 1
+    assert "send_audio" not in definitions
+    assert "send_video" not in definitions
+    assert "send_media" in agent_tools._ALWAYS_INCLUDE_CORE
+    media_schema = next(
+        item["function"]["parameters"]
+        for item in agent_tools.AGENT_TOOLS
+        if item["function"]["name"] == "send_media"
+    )
+    assert "allow_download" not in media_schema["properties"]
+    seeded = next(tool for tool in BUILTIN_TOOLS if tool["name"] == "send_media")
+    assert seeded["config"] == {"allow_download": False}
+    assert seeded["config_schema"]["fields"] == [{
+        "key": "allow_download",
+        "label": "Allow media download",
+        "type": "boolean",
+        "default": False,
+        "description": "Show the download action on send_media cards in both Web and H5 chat.",
+    }]
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "message_fragment"),
+    [
+        ("failed", "MEDIA_SEND_FAILED", "发送"),
+        ("unsupported", "CHANNEL_MEDIA_UNSUPPORTED", "不支持"),
+        ("unknown", "MEDIA_DELIVERY_STATE_UNKNOWN", "不要自动重试"),
+    ],
+)
+def test_media_error_result_explicitly_informs_agent(status, code, message_fragment):
+    result = agent_tools._describe_media_delivery_result({
+        "type": "media_delivery_result",
+        "version": 1,
+        "status": status,
+        "code": code,
+        "media_kind": "video",
+    })
+
+    assert message_fragment in result["message"]
+    assert result["retryable"] is False
+    assert result["agent_action"]
+
+
+def test_current_session_media_result_prevents_duplicate_outer_done_row():
+    payload = json.dumps({
+        "type": "platform_media_delivery",
+        "status": "sent",
+        "session_id": "session-1",
+        "message_id": str(uuid.uuid4()),
+    })
+
+    assert llm_caller._send_media_result_is_durable_in_current_session(
+        "send_media", payload, "session-1"
+    ) is True
+    assert llm_caller._send_media_result_is_durable_in_current_session(
+        "send_media", payload, "different-session"
+    ) is False
+    assert llm_caller._send_media_result_is_durable_in_current_session(
+        "send_channel_file", payload, "session-1"
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("media_size", "cover_size", "expected"),
+    [
+        (11 * 1024 * 1024, None, None),
+        (100 * 1024 * 1024 + 1, None, "MEDIA_TOO_LARGE"),
+        (1, 10 * 1024 * 1024 + 1, "VIDEO_COVER_TOO_LARGE"),
+        (95 * 1024 * 1024, 9 * 1024 * 1024, "MEDIA_BUNDLE_TOO_LARGE"),
+    ],
+)
+def test_media_materialization_size_errors_are_precise(media_size, cover_size, expected):
+    assert agent_tools._media_materialization_size_error(media_size, cover_size) == expected
+
+
+def test_media_tool_schemas_are_canonical_across_dynamic_tool_states():
+    canonical = {
+        item["function"]["name"]: item
+        for item in agent_tools.AGENT_TOOLS
+        if item["function"]["name"] == "send_media"
+    }
+    rogue = [
+        {"type": "function", "function": {"name": "send_video", "description": "tenant override"}},
+        {"type": "function", "function": {"name": "custom_tool", "parameters": {}}},
+        {"type": "function", "function": {"name": "send_audio", "description": "disabled override"}},
+    ]
+
+    stabilized = agent_tools._stabilize_media_tool_definitions(rogue)
+
+    assert [item["function"]["name"] for item in stabilized] == [
+        "custom_tool",
+        "send_media",
+    ]
+    assert stabilized[-1] == canonical["send_media"]
+    description = stabilized[-1]["function"]["description"]
+    assert "CURRENT conversation" in description
+    assert "session_id" in description
+    assert "user_id" in description
+    assert "Groups can only be targeted with session_id" in description

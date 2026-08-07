@@ -634,6 +634,7 @@
         "setupGuide": "设置指南",
         "configureCategory": "配置 {{category}}",
         "enableDisableAll": "启用/禁用所有 {{category}} 工具",
+        "alwaysAvailable": "始终可用",
         "configurePerAgent": "配置员工级设置",
         "removeTool": "从员工移除",
         "confirmDelete": "确定从该员工移除 \"{{name}}\" 吗？",

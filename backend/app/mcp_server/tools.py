@@ -494,7 +494,7 @@ async def chat_with_agent(  # noqa: D401
         await broadcast_channel_user_message(
             target_agent_id,
             conv_id,
-            content=message,
+            message=turn_anchor,
             sender_name=user.display_name,
             user_id=user.id,
         )

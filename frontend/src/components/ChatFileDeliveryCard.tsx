@@ -1,12 +1,15 @@
-import { IconDownload, IconFile, IconPhoto } from '@tabler/icons-react';
+import { IconDownload, IconPhoto } from '@tabler/icons-react';
 import { fileApi } from '../services/api';
 import { isPreviewableImageName, type ChatPreviewImage } from '../utils/chatAttachments';
 import type { ChatFileDelivery } from '../utils/chatFileDelivery';
 import { formatFileSize } from '../utils/formatFileSize';
+import ChatAttachmentIcon from './ChatAttachmentIcon';
+import ChatMediaCard from './ChatMediaCard';
 import './ChatFileDeliveryCard.css';
 
 type Props = {
     agentId: string;
+    messageId: string;
     delivery: ChatFileDelivery;
     mode?: 'pc' | 'h5';
     onPreviewImages?: (images: ChatPreviewImage[], index: number) => void;
@@ -19,6 +22,7 @@ function isImageDelivery(delivery: ChatFileDelivery) {
 
 export default function ChatFileDeliveryCard({
     agentId,
+    messageId,
     delivery,
     mode = 'pc',
     onPreviewImages,
@@ -27,6 +31,9 @@ export default function ChatFileDeliveryCard({
     const previewUrl = agentId ? fileApi.downloadUrl(agentId, delivery.path, { inline: true }) : '';
     const isImage = isImageDelivery(delivery);
     const protectImage = mode === 'h5' && isImage;
+    const mediaKind = delivery.mediaKind
+        || ((delivery.mimeType || '').startsWith('audio/') ? 'audio' : undefined)
+        || ((delivery.mimeType || '').startsWith('video/') ? 'video' : undefined);
     const details = [
         delivery.size !== undefined ? formatFileSize(delivery.size) : '',
         delivery.mimeType || '',
@@ -41,6 +48,29 @@ export default function ChatFileDeliveryCard({
             alt: delivery.filename,
         }], 0);
     };
+
+    if (mediaKind) {
+        return (
+            <div className={`chat-file-delivery chat-file-delivery--${mode}`}>
+                {delivery.message ? <div className="chat-file-delivery__message">{delivery.message}</div> : null}
+                <ChatMediaCard
+                    agentId={agentId}
+                    messageId={messageId}
+                    mode={mode}
+                    attachment={{
+                        display_name: delivery.filename,
+                        path: delivery.path,
+                        kind: mediaKind,
+                        ...(delivery.mimeType ? { mime_type: delivery.mimeType } : {}),
+                        ...(delivery.size !== undefined ? { size_bytes: delivery.size } : {}),
+                    }}
+                    onDownload={delivery.allowDownload && downloadUrl
+                        ? () => { window.location.assign(downloadUrl); }
+                        : undefined}
+                />
+            </div>
+        );
+    }
 
     return (
         <div className={`chat-file-delivery chat-file-delivery--${mode}`}>
@@ -64,7 +94,16 @@ export default function ChatFileDeliveryCard({
                     </button>
                 ) : (
                     <div className="chat-file-delivery__thumb" aria-hidden="true">
-                        {isImage ? <IconPhoto size={20} stroke={1.8} /> : <IconFile size={20} stroke={1.8} />}
+                        {isImage ? (
+                            <IconPhoto size={20} stroke={1.8} />
+                        ) : (
+                            <ChatAttachmentIcon
+                                name={delivery.filename}
+                                mimeType={delivery.mimeType}
+                                size={20}
+                                stroke={1.8}
+                            />
+                        )}
                     </div>
                 )}
                 <div className="chat-file-delivery__meta">

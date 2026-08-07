@@ -62,24 +62,30 @@ async def _broadcast_to_web_session(agent_id, session_id, payload: dict) -> None
 
 
 async def broadcast_channel_user_message(
-    agent_id, session_id, *, content: str, sender_name: str | None = None, user_id=None
+    agent_id,
+    session_id,
+    *,
+    message,
+    sender_name: str | None = None,
+    user_id=None,
 ) -> None:
     """Mirror an inbound IM (channel) user message to web clients viewing the
     SAME session in real time. Without this, a person watching a DingTalk/Feishu
     conversation in the web UI sees the agent's reply stream (see
     ``_call_agent_llm``) but the channel user's OWN message would not appear
-    until reload. Pass the clean persisted content + sender so the live bubble
-    matches what a reload would render."""
-    await _broadcast_to_web_session(
-        agent_id,
-        session_id,
-        {
-            "type": "channel_user_message",
-            "content": content or "",
-            "sender_name": sender_name,
-            "user_id": str(user_id) if user_id is not None else None,
-        },
+    until reload. Serialize the persisted message through the same contract as
+    history so the live bubble matches what a reload would render."""
+    from app.services.chat_message_serializer import serialize_chat_message_for_client
+
+    payload = serialize_chat_message_for_client(
+        message,
+        sender_name=sender_name,
+        sender_user_id=user_id,
     )
+    payload["type"] = "channel_user_message"
+    # One-release compatibility for older Web clients.
+    payload["user_id"] = str(user_id) if user_id is not None else None
+    await _broadcast_to_web_session(agent_id, session_id, payload)
 
 
 def _normalize_history_messages(history: list[dict] | None) -> list[dict]:

@@ -18,6 +18,8 @@ import {
     IconX,
 } from '@tabler/icons-react';
 import ChatImageLightbox from '../../components/ChatImageLightbox';
+import ChatAttachmentIcon from '../../components/ChatAttachmentIcon';
+import ChatMediaCard from '../../components/ChatMediaCard';
 import ChatToolCallRenderer from '../../components/ChatToolCallRenderer';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
 import { useToast } from '../../components/Toast/ToastProvider';
@@ -27,6 +29,7 @@ import {
     authApi,
     chatSessionApi,
     enterpriseApi,
+    fileApi,
     sceneApi,
     tenantApi,
     uploadFileWithProgress,
@@ -38,13 +41,15 @@ import {
     buildChatAttachmentPayload,
     buildPreviewImage,
     buildPreviewImagesFromAttachments,
+    downloadChatAttachment,
     extractChatImageDataMarkers,
-    isPreviewableImageName,
     modelSupportsVision,
+    normalizeChatAttachmentFields,
     resolveEffectiveChatModelId,
     splitAttachmentFileNames,
     stripChatImageDataMarkers,
     type ChatAttachedFile,
+    type ChatMessageAttachment,
     type ChatPreviewImage,
     type ChatModelOption,
 } from '../../utils/chatAttachments';
@@ -213,10 +218,6 @@ function formatFileSize(bytes: number) {
 
 function stripAttachmentDisplayPrefix(content: string) {
     return (content || '').replace(/^(?:\[Attachment: [^\]]+\]\s*)+/, '').trim();
-}
-
-function buildAgentFileImageUrl(agentId: string, token: string | null | undefined, fileName: string) {
-    return `/api/agents/${agentId}/files/download?path=workspace/uploads/${encodeURIComponent(fileName)}${token ? `&token=${encodeURIComponent(token)}` : ''}`;
 }
 
 function resolveAgentAvatarUrl(avatarUrl: string | null | undefined, token: string | null | undefined) {
@@ -404,6 +405,7 @@ export default function H5AgentChat() {
     const [attachedFiles, setAttachedFiles] = useState<ChatAttachedFile[]>([]);
     const [uploadError, setUploadError] = useState('');
     const [imagePreview, setImagePreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
+    const [unavailableAttachmentKeys, setUnavailableAttachmentKeys] = useState<Set<string>>(() => new Set());
 
     const wsRef = useRef<WebSocket | null>(null);
     const sceneManifestRef = useRef<SceneManifest | null>(null);
@@ -425,6 +427,29 @@ export default function H5AgentChat() {
     const quickActionsMenuCloseTimerRef = useRef<number | null>(null);
     const messageDispatchLockedRef = useRef(false);
     const messageRuntimeBlockedRef = useRef(false);
+    const initialHistoryRequestedRef = useRef<string | null>(null);
+
+    useEffect(() => {
+        setUnavailableAttachmentKeys(new Set());
+    }, [sessionId]);
+
+    const markAttachmentUnavailable = useCallback((key: string) => {
+        setUnavailableAttachmentKeys((current) => {
+            if (current.has(key)) return current;
+            const next = new Set(current);
+            next.add(key);
+            return next;
+        });
+    }, []);
+
+    const handleAttachmentDownload = useCallback(async (path: string, name: string) => {
+        if (!agentId) return;
+        try {
+            await downloadChatAttachment(fileApi.downloadUrl(agentId, path), name);
+        } catch {
+            markAttachmentUnavailable(path);
+        }
+    }, [agentId, markAttachmentUnavailable]);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const uploadAbortRef = useRef<Map<string, () => void>>(new Map());
@@ -820,34 +845,27 @@ export default function H5AgentChat() {
 
     const normalizeHistoryMessage = useCallback((row: any): H5ChatMessage | null => {
         const msg = mapHistoryMessage(row, makeId);
-        if (!msg || msg.role !== 'user' || !agentId) return msg;
-        const fileMatch = msg.content.match(/^\[file:([^\]]+)\]\n?/);
-        if (!fileMatch) {
-            const markerImages = extractChatImageDataMarkers(msg.content);
-            if (markerImages.length === 0) return msg;
-            const next: H5ChatMessage = {
-                ...msg,
-                content: stripChatImageDataMarkers(msg.content),
-                previewImages: markerImages,
-            };
-            if (markerImages.length === 1) next.imageUrl = markerImages[0].src;
-            return next;
-        }
-        const fileName = fileMatch[1];
-        const contentWithMarkers = stripAttachmentDisplayPrefix(msg.content.slice(fileMatch[0].length).trim());
-        const markerImages = extractChatImageDataMarkers(contentWithMarkers);
-        const content = stripChatImageDataMarkers(contentWithMarkers);
-        const next: H5ChatMessage = { ...msg, content, fileName };
-        const previewImages = splitAttachmentFileNames(fileName)
-            .filter(isPreviewableImageName)
-            .map((name) => buildPreviewImage(buildAgentFileImageUrl(agentId, token, name), name));
-        const images = previewImages.length > 0 ? previewImages : markerImages;
-        if (images.length > 0) {
-            next.previewImages = images;
-            if (images.length === 1) next.imageUrl = images[0].src;
-        }
-        return next;
-    }, [agentId, token]);
+        const hasStructuredAttachments = Object.prototype.hasOwnProperty.call(row || {}, 'attachments');
+        if (!msg || !agentId || (msg.role !== 'user' && !(msg.role === 'assistant' && hasStructuredAttachments))) return msg;
+        const activeSource = sessions.find((item) => item.id === sessionIdRef.current)?.source_channel || channel;
+        const normalized = normalizeChatAttachmentFields({
+            raw: msg as Record<string, any>,
+            sourceChannel: activeSource,
+            buildDownloadUrl: (path, inline) => fileApi.downloadUrl(agentId, path, { inline }),
+        });
+        const markerImages = normalized.previewImages.length === 0
+            ? extractChatImageDataMarkers(msg.content)
+            : [];
+        const images = normalized.previewImages.length > 0 ? normalized.previewImages : markerImages;
+        return {
+            ...msg,
+            content: normalized.displayContent,
+            attachments: normalized.attachments,
+            fileName: normalized.fileName || msg.fileName,
+            previewImages: images.length > 0 ? images : undefined,
+            imageUrl: images.length === 1 ? images[0].src : undefined,
+        };
+    }, [agentId, channel, sessions]);
 
     const loadHistory = useCallback(async (nextSessionId: string) => {
         if (!agentId || !token) return false;
@@ -881,6 +899,24 @@ export default function H5AgentChat() {
         setMessages((prev) => mergeHistoryMessages(prev, history));
         return fullyLoaded;
     }, [agentId, normalizeHistoryMessage, token]);
+
+    const loadHistoryRef = useRef(loadHistory);
+    useEffect(() => {
+        loadHistoryRef.current = loadHistory;
+    }, [loadHistory]);
+
+    useEffect(() => {
+        if (
+            authStatus !== 'ready'
+            || !agent
+            || !token
+            || !initialSessionId
+            || initialHistoryRequestedRef.current === initialSessionId
+        ) return;
+        initialHistoryRequestedRef.current = initialSessionId;
+        sessionIdRef.current = initialSessionId;
+        void loadHistoryRef.current(initialSessionId);
+    }, [agent, authStatus, initialSessionId, token]);
 
     const loadSessions = useCallback(async () => {
         if (!agentId) return;
@@ -958,6 +994,38 @@ export default function H5AgentChat() {
             return;
         }
 
+        if (data.type === 'channel_user_message') {
+            const normalized = normalizeHistoryMessage({ ...data, role: 'user' });
+            if (!normalized) return;
+            setMessages((prev) => {
+                if (normalized.id && prev.some((message) => message.id === normalized.id)) return prev;
+                return [...prev, normalized];
+            });
+            return;
+        }
+
+        if (data.type === 'user_message_committed') {
+            const clientMessageId = String(data.client_message_id || '');
+            const messageId = String(data.message_id || '');
+            if (clientMessageId && messageId) {
+                setMessages((prev) => prev.map((message) => (
+                    message.id === clientMessageId ? { ...message, id: messageId } : message
+                )));
+            }
+            return;
+        }
+
+        if (data.type === 'assistant_message_committed') {
+            const normalized = normalizeHistoryMessage({ ...data, role: 'assistant' });
+            if (!normalized) return;
+            setMessages((prev) => {
+                const index = prev.findIndex((message) => message.id === normalized.id);
+                if (index < 0) return [...prev, normalized];
+                return [...prev.slice(0, index), { ...prev[index], ...normalized }, ...prev.slice(index + 1)];
+            });
+            return;
+        }
+
         if (data.type === 'thinking') {
             setIsWaiting(false);
             setIsStreaming(true);
@@ -1024,7 +1092,7 @@ export default function H5AgentChat() {
                 created_at: new Date().toISOString(),
             }]);
         }
-    }, [clearSocketConnectTimer, loadHistory, refreshSceneManifest]);
+    }, [clearSocketConnectTimer, loadHistory, normalizeHistoryMessage, refreshSceneManifest]);
 
     const openSocket = useCallback((requestedSessionId?: string | null) => {
         if (
@@ -1364,6 +1432,8 @@ export default function H5AgentChat() {
                     text: data.extracted_text || '',
                     path: data.workspace_path,
                     imageUrl: data.image_data_url || undefined,
+                    mimeType: file.type || undefined,
+                    sizeBytes: data.size ?? file.size,
                 }].slice(0, 10));
             } catch (error: any) {
                 if (error?.message !== 'Upload cancelled') {
@@ -1476,10 +1546,12 @@ export default function H5AgentChat() {
         setMessages((prev) => [...prev, {
             id: messageId,
             role: 'user',
-            content: stripAttachmentDisplayPrefix(payload.userMsg),
+            content: payload.displayContent,
+            display_content: payload.displayContent,
             fileName: payload.fileName,
             imageUrl: payload.imageUrl,
             previewImages: payload.previewImages,
+            attachments: payload.attachments,
             created_at: new Date().toISOString(),
         }]);
         if (consumeComposer) {
@@ -1491,8 +1563,9 @@ export default function H5AgentChat() {
         ws.send(JSON.stringify({
             message_id: messageId,
             content: payload.contentForLLM,
-            display_content: payload.userMsg,
+            display_content: payload.displayContent,
             file_name: payload.fileName,
+            attachments: payload.attachments,
             model_id: effectiveModelId,
         }));
     }, [confirmationPending, effectiveModelId, effectiveModelSupportsVision, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
@@ -1695,8 +1768,28 @@ export default function H5AgentChat() {
         const inlinePreviewImages = filePreviewImages.length > 0 ? [] : extractChatImageDataMarkers(rawDisplayContent);
         const previewImages = filePreviewImages.length > 0 ? filePreviewImages : inlinePreviewImages;
         const previewedImageNames = new Set(previewImages.map((image) => image.filename).filter(Boolean));
-        const fileChips = splitAttachmentFileNames(msg.fileName)
-            .filter((name) => !previewedImageNames.has(name));
+        const mediaAttachments: ChatMessageAttachment[] = msg.role === 'user' && Array.isArray(msg.attachments)
+            ? msg.attachments.filter((attachment: ChatMessageAttachment) => (
+                attachment.kind === 'audio' || attachment.kind === 'video'
+            ))
+            : [];
+        const fileChips: Array<{
+            name: string;
+            path?: string;
+            kind?: ChatMessageAttachment['kind'];
+            mimeType?: string;
+        }> = Array.isArray(msg.attachments)
+            ? msg.attachments
+                .filter((attachment: ChatMessageAttachment) => !['image', 'audio', 'video'].includes(attachment.kind))
+                .map((attachment: ChatMessageAttachment) => ({
+                    name: attachment.display_name,
+                    path: attachment.path,
+                    kind: attachment.kind,
+                    mimeType: attachment.mime_type,
+                }))
+            : splitAttachmentFileNames(msg.fileName)
+                .filter((name) => !previewedImageNames.has(name))
+                .map((name) => ({ name }));
         if (entry.type === 'special_render') {
             return (
                 <article className={`h5-chat__message h5-chat__message--assistant h5-chat__message--special-render h5-chat__message--${entry.renderType}`}>
@@ -1726,31 +1819,63 @@ export default function H5AgentChat() {
                     {previewImages.length > 0 ? (
                         <div className="h5-chat__image-grid">
                             {previewImages.map((image, index) => (
-                                <button
-                                    key={`${image.src}-${index}`}
-                                    type="button"
-                                    className="h5-chat__bubble-image-button"
-                                    onClick={() => setImagePreview({ images: previewImages, index })}
-                                    aria-label="预览图片"
-                                >
-                                    <img
-                                        className="h5-chat__bubble-image"
-                                        src={image.src}
-                                        alt={image.alt || image.filename || 'image'}
-                                        loading="lazy"
-                                        draggable={false}
-                                    />
-                                </button>
+                                unavailableAttachmentKeys.has(image.path || image.src) ? (
+                                    <div key={`${image.path || image.src}-${index}`} className="h5-chat__file-chip">
+                                        <IconAlertTriangle size={14} stroke={1.75} />
+                                        <span>{image.filename || '图片'} · 当前不可访问</span>
+                                    </div>
+                                ) : (
+                                    <button
+                                        key={`${image.src}-${index}`}
+                                        type="button"
+                                        className="h5-chat__bubble-image-button"
+                                        onClick={() => setImagePreview({ images: previewImages, index })}
+                                        aria-label="预览图片"
+                                    >
+                                        <img
+                                            className="h5-chat__bubble-image"
+                                            src={image.src}
+                                            alt={image.alt || image.filename || 'image'}
+                                            loading="lazy"
+                                            draggable={false}
+                                            onError={() => markAttachmentUnavailable(image.path || image.src)}
+                                        />
+                                    </button>
+                                )
+                            ))}
+                        </div>
+                    ) : null}
+                    {mediaAttachments.length > 0 ? (
+                        <div className="h5-chat__media-list">
+                            {mediaAttachments.map((attachment, mediaIndex) => (
+                                <ChatMediaCard
+                                    key={`${attachment.path}-${mediaIndex}`}
+                                    agentId={agentId || ''}
+                                    messageId={String(msg.id || '')}
+                                    attachment={attachment}
+                                    mode="h5"
+                                    onUnavailable={() => markAttachmentUnavailable(attachment.path)}
+                                />
                             ))}
                         </div>
                     ) : null}
                     {fileChips.length > 0 ? (
                         <div className="h5-chat__file-chip-list">
-                            {fileChips.map((fileName) => (
-                                <div key={fileName} className="h5-chat__file-chip">
-                                    <IconPaperclip size={14} stroke={1.75} />
-                                    <span>{fileName}</span>
-                                </div>
+                            {fileChips.map((file, fileIndex) => (
+                                <button
+                                    key={`${file.path || file.name}-${fileIndex}`}
+                                    type="button"
+                                    className="h5-chat__file-chip"
+                                    disabled={!file.path || unavailableAttachmentKeys.has(file.path)}
+                                    onClick={() => file.path && void handleAttachmentDownload(file.path, file.name)}
+                                >
+                                    <ChatAttachmentIcon
+                                        name={file.name}
+                                        kind={file.kind}
+                                        mimeType={file.mimeType}
+                                    />
+                                    <span>{file.name}{file.path && unavailableAttachmentKeys.has(file.path) ? ' · 当前不可访问' : ''}</span>
+                                </button>
                             ))}
                         </div>
                     ) : null}
@@ -1772,7 +1897,15 @@ export default function H5AgentChat() {
                 </div>
             </article>
         );
-    }, [agentId, analysisExpanded, handleMarkdownLinkClick, toggleAnalysis]);
+    }, [
+        agentId,
+        analysisExpanded,
+        handleAttachmentDownload,
+        handleMarkdownLinkClick,
+        markAttachmentUnavailable,
+        toggleAnalysis,
+        unavailableAttachmentKeys,
+    ]);
 
     const connectionLabel = connectionStatus === 'connected'
         ? '已连接'
@@ -2177,7 +2310,7 @@ export default function H5AgentChat() {
                                     {draft.previewUrl ? (
                                         <img className="h5-chat__file-thumb" src={draft.previewUrl} alt="" />
                                     ) : (
-                                        <span className="h5-chat__file-icon"><IconPaperclip size={14} stroke={1.75} /></span>
+                                        <span className="h5-chat__file-icon"><ChatAttachmentIcon name={draft.name} size={16} /></span>
                                     )}
                                     <span className="h5-chat__file-name">{draft.name}</span>
                                     <span className="h5-chat__file-size">{formatFileSize(draft.sizeBytes)}</span>
@@ -2210,7 +2343,9 @@ export default function H5AgentChat() {
                                                 <img className="h5-chat__file-thumb" src={file.imageUrl} alt="" />
                                             </button>
                                         ) : (
-                                            <span className="h5-chat__file-icon"><IconPaperclip size={14} stroke={1.75} /></span>
+                                            <span className="h5-chat__file-icon">
+                                                <ChatAttachmentIcon name={file.name} mimeType={file.mimeType} size={16} />
+                                            </span>
                                         )}
                                         <span className="h5-chat__file-name">{file.name}</span>
                                         <button

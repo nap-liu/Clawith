@@ -424,15 +424,26 @@ async def test_broadcast_channel_user_message_emits_event(monkeypatch):
 
     monkeypatch.setattr(ws_mod.manager, "send_to_session", _fake_send_to_session)
 
+    message = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="user",
+        content="[file:a.jpg]\n只看 report 的数据",
+        created_at=None,
+        message_meta={"source_channel": "dingtalk"},
+        thinking=None,
+    )
     await channel_llm.broadcast_channel_user_message(
-        "agent-1", "sess-9", content="只看 report 的数据", sender_name="刘喜", user_id="u-7"
+        "agent-1", "sess-9", message=message, sender_name="刘喜", user_id="u-7"
     )
 
     assert len(captured) == 1
     agent_id, session_id, payload = captured[0]
     assert agent_id == "agent-1" and session_id == "sess-9"
     assert payload["type"] == "channel_user_message"
-    assert payload["content"] == "只看 report 的数据"
+    assert payload["id"] == str(message.id)
+    assert payload["content"] == "[file:a.jpg]\n只看 report 的数据"
+    assert payload["display_content"] == "只看 report 的数据"
+    assert [item["display_name"] for item in payload["attachments"]] == ["a.jpg"]
     assert payload["sender_name"] == "刘喜"
     assert payload["user_id"] == "u-7"
 
@@ -446,7 +457,10 @@ async def test_broadcast_channel_user_message_no_session_noop(monkeypatch):
         captured.append(1)
 
     monkeypatch.setattr(ws_mod.manager, "send_to_session", _fake)
-    await channel_llm.broadcast_channel_user_message("a", "", content="x")
+    message = SimpleNamespace(
+        id=uuid.uuid4(), role="user", content="x", created_at=None, message_meta={}, thinking=None
+    )
+    await channel_llm.broadcast_channel_user_message("a", "", message=message)
     assert captured == [], "no session_id → no broadcast"
 
 

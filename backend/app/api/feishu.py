@@ -25,6 +25,7 @@ from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.channel_llm import _call_agent_llm  # noqa: F401
 from app.services.channel_dispatch import ChannelReactions, run_channel_message
 from app.services.channel_commands import is_channel_command, handle_channel_command
+from app.services.chat_attachments import attachment_from_workspace_path
 from app.services.feishu_service import feishu_service
 from app.services.im_thinking_output import resolve_im_thinking_enabled
 from app.services.storage import agent_upload_key, get_storage_backend, store_agent_upload
@@ -743,7 +744,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 # the user's own message show up live too, not only on reload.
                 from app.services.channel_llm import broadcast_channel_user_message
                 await broadcast_channel_user_message(
-                    agent_id, session_conv_id, content=user_text,
+                    agent_id, session_conv_id, message=ingested.message,
                     sender_name=sender_name or None, user_id=platform_user_id,
                 )
 
@@ -1408,6 +1409,8 @@ async def _handle_feishu_file(
                     message_meta={
                         "message_type": "image",
                         "workspace_path": workspace_path,
+                        "attachments": [attachment_from_workspace_path(workspace_path)],
+                        "display_content": "",
                         "actor_ref_type": "user_id" if sender_user_id_feishu else "open_id",
                     },
                 )
@@ -1429,7 +1432,7 @@ async def _handle_feishu_file(
             # in real time (matches what a reload renders: the [file:...] row).
             from app.services.channel_llm import broadcast_channel_user_message
             await broadcast_channel_user_message(
-                agent_id, session_conv_id_img, content=f"[file:{filename}]",
+                agent_id, session_conv_id_img, message=_image_ingested.message,
                 sender_name=sender_name_file or None, user_id=platform_user_id,
             )
 
@@ -1636,6 +1639,8 @@ async def _handle_feishu_file(
             message_meta={
                 "message_type": "file",
                 "workspace_path": workspace_path,
+                "attachments": [attachment_from_workspace_path(workspace_path)],
+                "display_content": "",
                 "actor_ref_type": "user_id" if sender_user_id_feishu else "open_id",
             },
         )
@@ -1646,7 +1651,7 @@ async def _handle_feishu_file(
     # real time (matches what a reload renders: the [file:...] row).
     from app.services.channel_llm import broadcast_channel_user_message
     await broadcast_channel_user_message(
-        agent_id, session_conv_id_ack, content=f"[file:{filename}]",
+        agent_id, session_conv_id_ack, message=_file_ingested.message,
         sender_name=sender_name_file or None, user_id=platform_user_id,
     )
 

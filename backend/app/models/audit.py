@@ -118,6 +118,11 @@ def _populate_canonical_chat_sender(_mapper, _connection, target: ChatMessage) -
     message belongs to the real human ``user_id`` while assistant/tool rows are
     authored by the owning Agent.  System rows intentionally remain actorless.
     """
+    if target.role in {"user", "assistant"}:
+        meta = dict(target.message_meta or {})
+        meta.setdefault("attachments", [])
+        target.message_meta = meta
+
     if target.sender_user_id is not None or target.sender_agent_id is not None:
         return
     if target.role == "user" and target.user_id is not None:

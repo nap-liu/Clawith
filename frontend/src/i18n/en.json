@@ -679,6 +679,7 @@
       "setupGuide": "Setup guide",
       "configureCategory": "Configure {{category}}",
       "enableDisableAll": "Enable/Disable all {{category}} tools",
+      "alwaysAvailable": "Always available",
       "configurePerAgent": "Configure per-agent settings",
       "removeTool": "Remove from agent",
       "confirmDelete": "Remove \"{{name}}\" from this agent?",

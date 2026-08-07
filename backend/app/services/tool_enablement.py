@@ -2,8 +2,9 @@
 
 Single source of truth for "does this agent have this tool enabled?".
 
-Rule (EXPLICIT-ONLY): a tool is enabled for an agent iff there is an
-``AgentTool`` row with ``enabled=True``. Absence of a row means NOT enabled.
+Rule (EXPLICIT-ONLY): a configurable tool is enabled for an agent iff there is
+an ``AgentTool`` row with ``enabled=True``. Absence of a row means NOT enabled.
+Required protocol tools are the narrow exception and always resolve enabled.
 ``Tool.is_default`` is NOT consulted at resolution time — it is only a
 seed-time template (see the planners below), read once when an agent is
 created or during the one-time backfill.
@@ -14,6 +15,22 @@ SimpleNamespace stubs, matching this repo's test convention.
 from __future__ import annotations
 
 from typing import Any, Iterable
+
+
+# Protocol tools whose schemas must remain present for every Agent. Keeping
+# this set here makes the runtime resolver, management APIs, and startup seed
+# agree on one authoritative rule.
+REQUIRED_AGENT_TOOL_NAMES = frozenset({"send_media"})
+
+
+def tool_is_required(tool_name: str) -> bool:
+    """Whether a tool is a platform protocol capability that cannot be disabled."""
+    return tool_name in REQUIRED_AGENT_TOOL_NAMES
+
+
+def resolved_agent_tool_enabled(tool_name: str, assignment: Any | None) -> bool:
+    """Resolve the effective per-Agent state, including required tools."""
+    return tool_is_required(tool_name) or agent_tool_enabled(assignment)
 
 
 def agent_tool_enabled(assignment: Any | None) -> bool:

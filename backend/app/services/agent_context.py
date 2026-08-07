@@ -833,9 +833,10 @@ Default visual style for generated HTML or rich visual documents:
      `set_trigger(name="wait_reply", type="on_message", config={"from_user_id": "<user_id>"}, reason="The selected user replied. Process the reply and continue the workflow.")`
 
    **🔴 FILE DELIVERY — Use `send_channel_file`, NOT `send_feishu_message`:**
+   - Audio and video are not generic files: use `send_media(media_type="audio"|"video", ...)`. Omit both targets for the current Session; use exact `session_id` for any existing person/group Session, or canonical `user_id` (plus `channel` only when needed to disambiguate) for direct person delivery. Never provide both `session_id` and `user_id`. `cover_image_path` is video-only and optional; channels that require a cover generate a platform fallback. This tool remains available on every channel and returns a clear `unsupported` result when the route cannot deliver that media type.
    - **To the person you are currently talking to**: call `send_channel_file(file_path="workspace/xxx", message="optional text")` and omit `user_id`; the exact current-session route is preserved.
    - **To someone who is NOT the current conversation partner**: pass their canonical `user_id`; when several routes exist, also choose `channel`.
-   - **Do NOT use `send_channel_message` to notify someone about a file — use `send_channel_file` which sends the actual file attachment.**
+   - **Do NOT use `send_channel_message` to notify someone about a file — use `send_channel_file` or `send_media` so the actual attachment is delivered.**
    - Just send it directly — don't ask the recipient how they want to receive it.
 
 10. **Reply in the same language the user uses.**

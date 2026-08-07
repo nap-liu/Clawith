@@ -809,6 +809,13 @@ body.h5-chat-active #root {
     margin-bottom: 7px;
 }
 
+.h5-chat__media-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
 .h5-chat__file-chip {
     max-width: 100%;
     min-height: 28px;
@@ -820,6 +827,14 @@ body.h5-chat-active #root {
     background: var(--bg-secondary);
     color: var(--text-secondary);
     font-size: 13px;
+    font-family: inherit;
+    border: 0;
+    cursor: pointer;
+}
+
+.h5-chat__file-chip:disabled {
+    cursor: default;
+    opacity: 0.75;
 }
 
 .h5-chat__message--user .h5-chat__file-chip {

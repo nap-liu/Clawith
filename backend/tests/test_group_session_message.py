@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -126,6 +126,109 @@ async def _seed_related_user(agent: Agent, *, display_name: str = "Session Recip
         await db.commit()
         await db.refresh(user)
         return user
+
+
+async def test_hidden_media_receipts_do_not_consume_history_page_limit():
+    from app.api.chat_sessions import get_session_messages
+
+    owner, _ = await _seed_agents()
+    async with async_session() as db:
+        current_user = await db.get(User, owner.creator_id)
+        assert current_user is not None
+    target = await _seed_session(
+        owner.id,
+        channel="web",
+        external_conv_id="web_history_media_filter",
+        is_group=False,
+        user_id=current_user.id,
+    )
+    now = datetime.now(timezone.utc)
+    visible_ids = [uuid.uuid4(), uuid.uuid4()]
+    async with async_session() as db:
+        db.add_all([
+            ChatMessage(
+                id=visible_ids[0],
+                agent_id=owner.id,
+                user_id=current_user.id,
+                role="user",
+                content="older visible",
+                conversation_id=str(target.id),
+                created_at=now - timedelta(seconds=4),
+            ),
+            ChatMessage(
+                id=visible_ids[1],
+                agent_id=owner.id,
+                user_id=current_user.id,
+                role="assistant",
+                content="newer visible",
+                conversation_id=str(target.id),
+                created_at=now - timedelta(seconds=3),
+            ),
+            *[
+                ChatMessage(
+                    agent_id=owner.id,
+                    user_id=current_user.id,
+                    role="assistant",
+                    content="",
+                    conversation_id=str(target.id),
+                    created_at=now - timedelta(seconds=offset),
+                    message_meta={
+                        "media_kind": "video",
+                        "delivery_status": status,
+                        "attachments": [{
+                            "display_name": f"{status}.mp4",
+                            "path": f"workspace/{status}.mp4",
+                            "kind": "video",
+                        }],
+                    },
+                )
+                for offset, status in [(2, "pending"), (1, "failed"), (0, "unknown")]
+            ],
+        ])
+        await db.commit()
+
+    async with async_session() as db:
+        messages = await get_session_messages(
+            agent_id=owner.id,
+            session_id=target.id,
+            limit=2,
+            before=None,
+            current_user=current_user,
+            db=db,
+        )
+
+    assert [item["id"] for item in messages] == [str(value) for value in visible_ids]
+
+
+async def test_new_ingress_writes_authoritative_empty_attachment_protocol_marker():
+    from app.services.chat_history import ingest_incoming_chat_message
+
+    owner, _ = await _seed_agents()
+    async with async_session() as db:
+        current_user = await db.get(User, owner.creator_id)
+        assert current_user is not None
+    target = await _seed_session(
+        owner.id,
+        channel="web",
+        external_conv_id="web_attachment_protocol_marker",
+        is_group=False,
+        user_id=current_user.id,
+    )
+
+    async with async_session() as db:
+        ingested = await ingest_incoming_chat_message(
+            db,
+            session=target,
+            agent_id=owner.id,
+            user_id=current_user.id,
+            content="[file:forged.mp4]",
+            source_channel="web",
+            provider_event_id=f"protocol-{uuid.uuid4()}",
+        )
+        await db.commit()
+        await db.refresh(ingested.message)
+
+    assert ingested.message.message_meta["attachments"] == []
 
 
 async def test_send_group_session_message_uses_exact_binding_and_persists_receipt(monkeypatch):
@@ -605,6 +708,523 @@ async def test_dingtalk_runtime_delivers_to_exact_group_conversation(monkeypatch
         "open_conversation_id": "open-conversation-exact",
         "message": "exact target",
     }
+
+
+async def test_send_video_targets_exact_group_session_with_custom_cover(
+    tmp_path, monkeypatch
+):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id,
+        channel="dingtalk",
+        external_conv_id="dingtalk_group_media-room",
+        is_group=True,
+    )
+    async with async_session() as db:
+        db.add(
+            ChannelConfig(
+                agent_id=owner.id,
+                channel_type="dingtalk",
+                app_id=f"ding-media-{uuid.uuid4().hex}",
+                app_secret="ding-secret",
+                is_configured=True,
+            )
+        )
+        await db.commit()
+    video = tmp_path / "demo.mp4"
+    cover = tmp_path / "cover.png"
+    video.write_bytes(b"video")
+    cover.write_bytes(b"cover")
+    calls = []
+
+    async def fake_video(app_id, app_secret, target_id, file_path, conversation_type, **kwargs):
+        calls.append({
+            "target_id": target_id,
+            "file_path": file_path,
+            "conversation_type": conversation_type,
+            "cover": kwargs.get("cover_image_path"),
+        })
+        return True, "MEDIA_SENT"
+
+    async def fake_caption(**_kwargs):
+        return True
+
+    live_events = []
+
+    async def fake_live_mirror(*args, **_kwargs):
+        live_events.append(args[-1])
+
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._send_dingtalk_native_video",
+        fake_video,
+    )
+    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fake_caption)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
+    kwargs = {
+        "agent_id": owner.id,
+        "session_id": str(target.id),
+        "file_path": video,
+        "workspace_path": "workspace/demo.mp4",
+        "media_kind": "video",
+        "caption": "群视频",
+        "cover_path": cover,
+        "intent_id": "media-group-call",
+        "origin_session_id": str(uuid.uuid4()),
+        "origin_turn_anchor_id": uuid.uuid4(),
+    }
+
+    first = json.loads(await agent_tools._send_media_to_session(**kwargs))
+    second = json.loads(await agent_tools._send_media_to_session(**kwargs))
+
+    assert first["status"] == "sent"
+    assert first["conversation_type"] == "group"
+    assert first["session_id"] == str(target.id)
+    assert second["status"] == "already_sent"
+    assert calls == [{
+        "target_id": target.external_conv_id.removeprefix("dingtalk_group_"),
+        "file_path": video,
+        "conversation_type": "2",
+        "cover": cover,
+    }]
+    assert len(live_events) == 2
+    assert live_events[0]["type"] == "tool_call"
+    assert live_events[0]["name"] == "send_media"
+    assert live_events[0]["call_id"] == "media-group-call"
+    render_result = json.loads(live_events[0]["result"])
+    assert render_result["type"] == "platform_media_delivery"
+    assert render_result["path"] == "workspace/demo.mp4"
+    assert render_result["allow_download"] is False
+    assert live_events[1]["type"] == "assistant_message_committed"
+    assert live_events[1]["content"] == "群视频"
+    assert live_events[1]["attachments"] == []
+    async with async_session() as db:
+        rows = list((
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(target.id),
+                    ChatMessage.external_event_key.is_not(None),
+                ).order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            )
+        ).scalars().all())
+    assert len(rows) == 2
+    receipt = next(row for row in rows if row.message_meta.get("media_kind") == "video")
+    caption_row = next(row for row in rows if row.message_meta.get("media_caption_for"))
+    assert receipt.role == "tool_call"
+    assert caption_row.content == "群视频"
+    assert caption_row.message_meta["attachments"] == []
+    assert caption_row.message_meta["media_caption_for"] == str(receipt.id)
+    assert receipt.message_meta["attachments"] == [{
+        "display_name": "demo.mp4",
+        "path": "workspace/demo.mp4",
+        "kind": "video",
+        "mime_type": "video/mp4",
+        "size_bytes": 5,
+    }]
+    assert receipt.message_meta["target_is_group"] is True
+    assert receipt.message_meta["delivery_claim"] is True
+    assert "delivery_claim" not in caption_row.message_meta
+    stored_render = json.loads(json.loads(receipt.content)["result"])
+    assert stored_render["message_id"] == str(receipt.id)
+    assert stored_render["allow_download"] is False
+
+
+async def test_send_media_caption_failure_is_preserved_on_replay(tmp_path, monkeypatch):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id,
+        channel="dingtalk",
+        external_conv_id="dingtalk_group_caption-failure",
+        is_group=True,
+    )
+    async with async_session() as db:
+        db.add(ChannelConfig(
+            agent_id=owner.id,
+            channel_type="dingtalk",
+            app_id=f"ding-caption-{uuid.uuid4().hex}",
+            app_secret="ding-secret",
+            is_configured=True,
+        ))
+        await db.commit()
+
+    video = tmp_path / "caption.mp4"
+    video.write_bytes(b"video")
+    provider_calls = []
+
+    async def fake_video(*_args, **_kwargs):
+        provider_calls.append(True)
+        return True, "MEDIA_SENT"
+
+    async def fail_caption(**_kwargs):
+        return False
+
+    async def fake_live_mirror(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._send_dingtalk_native_video",
+        fake_video,
+    )
+    monkeypatch.setattr(agent_tools, "deliver_message_to_runtime", fail_caption)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live_mirror)
+    kwargs = {
+        "agent_id": owner.id,
+        "session_id": str(target.id),
+        "file_path": video,
+        "workspace_path": "workspace/caption.mp4",
+        "media_kind": "video",
+        "caption": "应当失败的说明",
+        "cover_path": None,
+        "intent_id": "caption-failure-call",
+        "origin_session_id": str(uuid.uuid4()),
+        "origin_turn_anchor_id": uuid.uuid4(),
+    }
+
+    first = json.loads(await agent_tools._send_media_to_session(**kwargs))
+    replay = json.loads(await agent_tools._send_media_to_session(**kwargs))
+
+    assert first["status"] == "sent"
+    assert first["code"] == "MEDIA_SENT_CAPTION_FAILED"
+    assert "说明文字发送失败" in first["message"]
+    assert "do not resend the media" in first["agent_action"]
+    assert replay["status"] == "already_sent"
+    assert replay["code"] == "MEDIA_SENT_CAPTION_FAILED"
+    assert replay["caption_status"] == "failed"
+    assert replay["message"] == first["message"]
+    assert provider_calls == [True]
+
+
+async def test_send_media_reuses_current_running_tool_row_and_orders_caption_after_it(tmp_path, monkeypatch):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id, channel="web", is_group=False, user_id=owner.creator_id
+    )
+    video = tmp_path / "current.mp4"
+    video.write_bytes(b"video")
+    anchor_id = uuid.uuid4()
+    call_id = "current-media-call"
+
+    async with async_session() as db:
+        running = ChatMessage(
+            agent_id=owner.id,
+            user_id=target.user_id,
+            role="tool_call",
+            content=json.dumps({
+                "name": "send_media",
+                "call_id": call_id,
+                "args": {"media_type": "video", "file_path": "workspace/current.mp4"},
+                "status": "running",
+                "result": "",
+            }),
+            conversation_id=str(target.id),
+            message_meta={"turn_anchor_id": str(anchor_id)},
+        )
+        db.add(running)
+        await db.commit()
+        running_id = running.id
+
+    live_events = []
+
+    async def fake_live(*args, **_kwargs):
+        live_events.append(args[-1])
+
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live)
+    payload = json.loads(await agent_tools._send_media_to_session(
+        agent_id=owner.id,
+        session_id=str(target.id),
+        file_path=video,
+        workspace_path="workspace/current.mp4",
+        media_kind="video",
+        caption="卡片后的说明",
+        cover_path=None,
+        intent_id=call_id,
+        origin_session_id=str(target.id),
+        origin_turn_anchor_id=anchor_id,
+    ))
+
+    assert payload["status"] == "sent"
+    assert payload["message_id"] == str(running_id)
+    assert [event["type"] for event in live_events] == [
+        "tool_call", "assistant_message_committed",
+    ]
+    async with async_session() as db:
+        rows = list((await db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(target.id),
+                ChatMessage.external_event_key.is_not(None),
+            ).order_by(ChatMessage.created_at, ChatMessage.id)
+        )).scalars().all())
+    assert [row.role for row in rows] == ["tool_call", "assistant"]
+    assert rows[0].id == running_id
+    assert json.loads(rows[0].content)["status"] == "done"
+    assert rows[0].message_meta["delivery_claim"] is False
+    assert rows[1].message_meta["media_caption_for"] == str(running_id)
+    assert "delivery_claim" not in rows[1].message_meta
+    assert rows[0].created_at <= rows[1].created_at
+
+
+async def test_failed_media_claim_finishes_with_explicit_error_instead_of_running(tmp_path, monkeypatch):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id,
+        channel="dingtalk",
+        external_conv_id="dingtalk_group_failed-media",
+        is_group=True,
+    )
+    async with async_session() as db:
+        db.add(ChannelConfig(
+            agent_id=owner.id,
+            channel_type="dingtalk",
+            app_id=f"ding-failed-{uuid.uuid4().hex}",
+            app_secret="ding-secret",
+            is_configured=True,
+        ))
+        await db.commit()
+    video = tmp_path / "failed.mp4"
+    video.write_bytes(b"video")
+
+    async def fail_video(*_args, **_kwargs):
+        return False, "MEDIA_SEND_FAILED"
+
+    live_events = []
+
+    async def fake_live(*args, **_kwargs):
+        live_events.append(args[-1])
+
+    monkeypatch.setattr("app.services.dingtalk_stream._send_dingtalk_native_video", fail_video)
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session", fake_live)
+    payload = json.loads(await agent_tools._send_media_to_session(
+        agent_id=owner.id,
+        session_id=str(target.id),
+        file_path=video,
+        workspace_path="workspace/failed.mp4",
+        media_kind="video",
+        caption="",
+        cover_path=None,
+        intent_id="failed-media-call",
+        origin_session_id=str(uuid.uuid4()),
+        origin_turn_anchor_id=uuid.uuid4(),
+    ))
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == "MEDIA_SEND_FAILED"
+    assert "发送" in payload["message"]
+    assert len(live_events) == 1
+    assert live_events[0]["type"] == "tool_call"
+    live_result = json.loads(live_events[0]["result"])
+    assert live_result == payload
+    async with async_session() as db:
+        row = (await db.execute(select(ChatMessage).where(
+            ChatMessage.message_meta["tool_call_id"].as_string() == "failed-media-call"
+        ))).scalar_one()
+    stored = json.loads(row.content)
+    assert stored["status"] == "done"
+    stored_result = json.loads(stored["result"])
+    assert stored_result["status"] == "failed"
+    assert stored_result["message"] == payload["message"]
+
+
+async def test_send_media_pending_claim_replay_never_calls_provider(tmp_path, monkeypatch):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id,
+        channel="dingtalk",
+        external_conv_id="dingtalk_group_pending-media",
+        is_group=True,
+    )
+    origin_session_id = str(uuid.uuid4())
+    turn_anchor_id = uuid.uuid4()
+    intent_id = "media-crash-window-call"
+    operation_key = agent_tools._build_outbound_operation_key(
+        agent_id=owner.id,
+        origin_session_id=origin_session_id,
+        tool_call_id=intent_id,
+        origin_turn_anchor_id=turn_anchor_id,
+    )
+    async with async_session() as db:
+        db.add(ChatMessage(
+            agent_id=owner.id,
+            role="assistant",
+            content="",
+            conversation_id=str(target.id),
+            external_event_key=operation_key,
+            message_meta={
+                "source_channel": "dingtalk",
+                "delivery_status": "pending",
+                "delivery_code": "MEDIA_DELIVERY_PENDING",
+                "attachments": [{
+                    "display_name": "demo.mp4",
+                    "path": "workspace/demo.mp4",
+                    "kind": "video",
+                    "mime_type": "video/mp4",
+                }],
+            },
+        ))
+        await db.commit()
+
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide")
+    provider_calls = []
+
+    async def should_not_send(*_args, **_kwargs):
+        provider_calls.append(True)
+        return True, "MEDIA_SENT"
+
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._send_dingtalk_native_video",
+        should_not_send,
+    )
+    payload = json.loads(await agent_tools._send_media_to_session(
+        agent_id=owner.id,
+        session_id=str(target.id),
+        file_path=video,
+        workspace_path="workspace/demo.mp4",
+        media_kind="video",
+        caption="",
+        cover_path=None,
+        intent_id=intent_id,
+        origin_session_id=origin_session_id,
+        origin_turn_anchor_id=turn_anchor_id,
+    ))
+
+    assert payload["status"] == "unknown"
+    assert payload["code"] == "MEDIA_DELIVERY_STATE_UNKNOWN"
+    assert provider_calls == []
+    async with async_session() as db:
+        receipt = (
+            await db.execute(
+                select(ChatMessage).where(ChatMessage.external_event_key == operation_key)
+            )
+        ).scalar_one()
+    assert receipt.message_meta["delivery_status"] == "unknown"
+
+
+async def test_send_media_pending_standard_tool_call_replay_becomes_visible_unknown_error(
+    tmp_path, monkeypatch
+):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id,
+        channel="dingtalk",
+        external_conv_id="dingtalk_group_pending-standard-media",
+        is_group=True,
+    )
+    origin_session_id = str(uuid.uuid4())
+    turn_anchor_id = uuid.uuid4()
+    intent_id = "media-standard-crash-window-call"
+    operation_key = agent_tools._build_outbound_operation_key(
+        agent_id=owner.id,
+        origin_session_id=origin_session_id,
+        tool_call_id=intent_id,
+        origin_turn_anchor_id=turn_anchor_id,
+    )
+    async with async_session() as db:
+        pending = ChatMessage(
+            agent_id=owner.id,
+            role="tool_call",
+            content=json.dumps({
+                "name": "send_media",
+                "call_id": intent_id,
+                "args": {"media_type": "video", "file_path": "workspace/demo.mp4"},
+                "status": "running",
+                "result": "",
+            }),
+            conversation_id=str(target.id),
+            external_event_key=operation_key,
+            message_meta={
+                "source_channel": "dingtalk",
+                "delivery_claim": True,
+                "delivery_status": "pending",
+                "delivery_code": "MEDIA_DELIVERY_PENDING",
+            },
+        )
+        db.add(pending)
+        await db.commit()
+        pending_id = pending.id
+
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide")
+    provider_calls = []
+
+    async def should_not_send(*_args, **_kwargs):
+        provider_calls.append(True)
+        return True, "MEDIA_SENT"
+
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream._send_dingtalk_native_video",
+        should_not_send,
+    )
+    payload = json.loads(await agent_tools._send_media_to_session(
+        agent_id=owner.id,
+        session_id=str(target.id),
+        file_path=video,
+        workspace_path="workspace/demo.mp4",
+        media_kind="video",
+        caption="",
+        cover_path=None,
+        intent_id=intent_id,
+        origin_session_id=origin_session_id,
+        origin_turn_anchor_id=turn_anchor_id,
+    ))
+
+    assert payload["status"] == "unknown"
+    assert payload["message_id"] == str(pending_id)
+    assert payload["retryable"] is False
+    assert "不要自动重试" in payload["message"]
+    assert provider_calls == []
+    async with async_session() as db:
+        receipt = await db.get(ChatMessage, pending_id)
+    stored = json.loads(receipt.content)
+    assert stored["status"] == "done"
+    stored_result = json.loads(stored["result"])
+    assert stored_result == payload
+
+
+async def test_send_media_rejects_group_flag_and_route_prefix_mismatch(tmp_path):
+    owner, _ = await _seed_agents()
+    target = await _seed_session(
+        owner.id,
+        channel="dingtalk",
+        external_conv_id="dingtalk_p2p_wrong-for-group",
+        is_group=True,
+    )
+    async with async_session() as db:
+        db.add(ChannelConfig(
+            agent_id=owner.id,
+            channel_type="dingtalk",
+            app_id=f"ding-route-{uuid.uuid4().hex}",
+            app_secret="ding-secret",
+            is_configured=True,
+        ))
+        await db.commit()
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide")
+
+    payload = json.loads(await agent_tools._send_media_to_session(
+        agent_id=owner.id,
+        session_id=str(target.id),
+        file_path=video,
+        workspace_path="workspace/demo.mp4",
+        media_kind="video",
+        caption="",
+        cover_path=None,
+        intent_id="route-mismatch-call",
+        origin_session_id=None,
+        origin_turn_anchor_id=None,
+    ))
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == "SESSION_ROUTE_MISMATCH"
+
+
+async def test_outbound_operation_key_supports_sessionless_agent_turns():
+    key = agent_tools._build_outbound_operation_key(
+        agent_id=uuid.uuid4(),
+        origin_session_id=None,
+        tool_call_id="heartbeat-tool-call",
+    )
+
+    assert key is not None
+    assert ":no-session:unanchored:heartbeat-tool-call" in key
 
 
 async def test_dingtalk_runtime_uses_temporary_webhook_for_native_mentions(monkeypatch):

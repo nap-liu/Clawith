@@ -32,12 +32,32 @@ const {
     buildChatAttachmentPayload,
     collectMarkdownImages,
     extractChatImageDataMarkers,
+    getChatAttachmentIconKind,
     isPreviewableImageName,
     modelSupportsVision,
+    normalizeChatAttachmentFields,
     resolveEffectiveChatModelId,
     splitAttachmentFileNames,
     stripChatImageDataMarkers,
 } = module.exports;
+
+{
+    const cases = [
+        ['contract.PDF', undefined, undefined, 'pdf'],
+        ['proposal.docx', undefined, undefined, 'word'],
+        ['orders.xlsx', undefined, undefined, 'spreadsheet'],
+        ['roadmap.pptx', undefined, undefined, 'presentation'],
+        ['source.tar.gz', undefined, undefined, 'archive'],
+        ['README.md', undefined, undefined, 'text'],
+        ['settings.json', undefined, undefined, 'code'],
+        ['recording.bin', 'audio/mpeg', undefined, 'audio'],
+        ['clip.bin', undefined, 'video', 'video'],
+        ['payload.bin', undefined, undefined, 'generic'],
+    ];
+    cases.forEach(([name, mimeType, kind, expected]) => {
+        assert.equal(getChatAttachmentIconKind({ name, mimeType, kind }), expected);
+    });
+}
 
 {
     const payload = buildChatAttachmentPayload({
@@ -106,9 +126,9 @@ const {
 
 {
     const attachments = [
-        { name: 'one.png', text: '', imageUrl: 'data:image/png;base64,1' },
-        { name: 'two.jpg', text: '', imageUrl: 'data:image/jpeg;base64,2' },
-        { name: 'note.txt', text: 'hello' },
+        { name: 'one.png', text: '', path: 'workspace/uploads/one.png', imageUrl: 'data:image/png;base64,1' },
+        { name: 'two.jpg', text: '', path: 'workspace/uploads/two.jpg', imageUrl: 'data:image/jpeg;base64,2' },
+        { name: 'note.txt', text: 'hello', path: 'workspace/uploads/note.txt' },
     ];
     const images = buildPreviewImagesFromAttachments(attachments);
     const payload = buildChatAttachmentPayload({
@@ -120,6 +140,60 @@ const {
     assert.equal(images[0].filename, 'one.png');
     assert.equal(payload.previewImages.length, 2);
     assert.equal(payload.imageUrl, undefined);
+    assert.equal(payload.attachments.length, 3);
+    assert.equal(payload.attachments[0].display_name, 'one.png');
+}
+
+{
+    const normalized = normalizeChatAttachmentFields({
+        raw: {
+            content: '[file:one.jpg]\n[file:two.jpg]\n[file:two.jpg]\n比较图片',
+        },
+        sourceChannel: 'dingtalk',
+        buildDownloadUrl: (path) => `/download?path=${encodeURIComponent(path)}`,
+    });
+
+    assert.equal(normalized.displayContent, '比较图片');
+    assert.equal(normalized.attachments.length, 3);
+    assert.equal(normalized.previewImages.length, 3);
+    assert.equal(normalized.attachments[1].display_name, 'two.jpg');
+    assert.equal(normalized.attachments[2].display_name, 'two.jpg');
+}
+
+{
+    const normalized = normalizeChatAttachmentFields({
+        raw: {
+            content: '[file:fake.jpg]\n用户正文',
+            display_content: '[file:fake.jpg]\n用户正文',
+            attachments: [],
+        },
+        sourceChannel: 'dingtalk',
+        buildDownloadUrl: (path) => path,
+    });
+
+    assert.equal(normalized.displayContent, '[file:fake.jpg]\n用户正文');
+    assert.equal(normalized.attachments.length, 0);
+}
+
+{
+    const normalized = normalizeChatAttachmentFields({
+        raw: {
+            content: '[file:ignored.jpg]\nraw',
+            display_content: '结构化正文',
+            attachments: [
+                { display_name: '同名.jpg', path: 'workspace/uploads/a.jpg', kind: 'image' },
+                { display_name: '同名.jpg', path: 'workspace/uploads/b.jpg', kind: 'image' },
+                { display_name: '报告,最终版.pdf', path: 'workspace/uploads/report.pdf', kind: 'file' },
+            ],
+        },
+        sourceChannel: 'dingtalk',
+        buildDownloadUrl: (path) => path,
+    });
+
+    assert.equal(normalized.displayContent, '结构化正文');
+    assert.equal(normalized.attachments.length, 3);
+    assert.equal(normalized.previewImages.length, 2);
+    assert.equal(normalized.attachments[2].display_name, '报告,最终版.pdf');
 }
 
 {

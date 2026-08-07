@@ -68,6 +68,13 @@ class LocalStorageBackend(StorageBackend):
         async with aiofiles.open(path, "rb") as f:
             return await f.read()
 
+    async def read_range(self, key: str, start: int, end: int) -> bytes:
+        path = self._full_path(key)
+        length = max(0, end - start + 1)
+        async with aiofiles.open(path, "rb") as f:
+            await f.seek(max(0, start))
+            return await f.read(length)
+
     async def read_text_lines(
         self,
         key: str,
@@ -111,12 +118,7 @@ class LocalStorageBackend(StorageBackend):
     async def stat(self, key: str) -> StorageEntry:
         path = self._full_path(key)
         stat = path.stat()
-        file_hash = ""
         version_id = _local_version_token(stat, None)
-        if path.is_file():
-            data = await self.read_bytes(key)
-            file_hash = content_hash_bytes(data)
-            version_id = _local_version_token(stat, file_hash)
         return StorageEntry(
             name=path.name,
             key=normalize_storage_key(key),
@@ -124,8 +126,6 @@ class LocalStorageBackend(StorageBackend):
             size=stat.st_size if path.is_file() else 0,
             modified_at=str(stat.st_mtime),
             version_id=version_id,
-            etag=file_hash,
-            content_hash=file_hash,
         )
 
     async def get_version(self, key: str) -> StorageVersion:

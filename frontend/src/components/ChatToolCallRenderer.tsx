@@ -1,7 +1,9 @@
 import type { ReactNode } from 'react';
 import ChatFileDeliveryCard from './ChatFileDeliveryCard';
+import ChatMediaDeliveryErrorCard from './ChatMediaDeliveryErrorCard';
 import ConfirmationCard from './ConfirmationCard';
-import { parseFileDeliveryToolResult } from '../utils/chatFileDelivery';
+import { parseFileDeliveryToolResult, parseMediaDeliveryErrorResult } from '../utils/chatFileDelivery';
+import type { ChatFileDelivery, ChatMediaDeliveryError } from '../utils/chatFileDelivery';
 import type { ChatPreviewImage } from '../utils/chatAttachments';
 
 type ToolCallRenderContext = {
@@ -41,16 +43,59 @@ function toolName(context: ToolCallRenderContext): string {
 
 const TOOL_CALL_RENDERERS: ToolCallRendererRegistration[] = [
     {
+        type: 'media-delivery',
+        resolve: (context) => {
+            const delivery = parseFileDeliveryToolResult(
+                toolName(context),
+                context.message.toolResult ?? context.payload.result ?? (!context.payload.name ? context.message.content : undefined),
+                context.message.toolArgs ?? context.payload.args ?? {},
+                context.message.toolCallId,
+            );
+            if (delivery?.mediaKind) return delivery;
+            return parseMediaDeliveryErrorResult(
+                toolName(context),
+                context.message.toolResult ?? context.payload.result ?? (!context.payload.name ? context.message.content : undefined),
+            );
+        },
+        render: ({ agentId, mode, onPreviewImages }, context, delivery) => {
+            if ((delivery as ChatMediaDeliveryError).deliveryError) {
+                return <ChatMediaDeliveryErrorCard error={delivery as ChatMediaDeliveryError} />;
+            }
+            const item = delivery as ChatFileDelivery;
+            return (
+                <ChatFileDeliveryCard
+                    agentId={agentId}
+                    messageId={item.messageId || context.message.persistedMessageId || String(context.message.id || context.message.toolCallId || '')}
+                    delivery={item}
+                    mode={mode}
+                    onPreviewImages={onPreviewImages}
+                />
+            );
+        },
+        identity: (_context, delivery) => {
+            if ((delivery as ChatMediaDeliveryError).deliveryError) {
+                const error = delivery as ChatMediaDeliveryError;
+                return [error.status, error.code, error.message].join('\u0000');
+            }
+            const item = delivery as ChatFileDelivery;
+            return [item.messageId || '', item.path, item.filename].join('\u0000');
+        },
+    },
+    {
         type: 'file-delivery',
-        resolve: (context) => parseFileDeliveryToolResult(
-            toolName(context),
-            context.message.toolResult ?? context.payload.result ?? (!context.payload.name ? context.message.content : undefined),
-            context.message.toolArgs ?? context.payload.args ?? {},
-            context.message.toolCallId,
-        ),
-        render: ({ agentId, mode, onPreviewImages }, _context, delivery) => (
+        resolve: (context) => {
+            const delivery = parseFileDeliveryToolResult(
+                toolName(context),
+                context.message.toolResult ?? context.payload.result ?? (!context.payload.name ? context.message.content : undefined),
+                context.message.toolArgs ?? context.payload.args ?? {},
+                context.message.toolCallId,
+            );
+            return delivery && !delivery.mediaKind ? delivery : null;
+        },
+        render: ({ agentId, mode, onPreviewImages }, context, delivery) => (
             <ChatFileDeliveryCard
                 agentId={agentId}
+                messageId={String(context.message.id || context.message.toolCallId || '')}
                 delivery={delivery as NonNullable<ReturnType<typeof parseFileDeliveryToolResult>>}
                 mode={mode}
                 onPreviewImages={onPreviewImages}
