@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +15,6 @@ from app.database import get_db
 from app.models.identity import SSOScanSession
 from app.models.user import User
 from app.services.auth_provider import GoogleWorkspaceAuthProvider
-from app.services.auth_registry import auth_provider_registry
 from app.services.google_workspace_oauth import (
     GOOGLE_CALLBACK_PATH,
     GOOGLE_SSO_STATE_KIND,
@@ -26,7 +25,6 @@ from app.services.google_workspace_oauth import (
     probe_google_directory,
     sign_google_oauth_state,
 )
-from app.services.identity_provider_lookup import get_preferred_identity_provider
 
 router = APIRouter(tags=["google_workspace"])
 settings = get_settings()
@@ -60,56 +58,53 @@ async def _handle_google_sso_callback(
     provider_id: uuid.UUID | None,
     request: Request | None,
     db: AsyncSession,
+    login_query: str = "",
 ):
+    from app.services.sso_login_state import (
+        get_enabled_sso_provider,
+        sso_browser_cookie_name,
+        sso_completion_url,
+        sso_error_url,
+        verify_sso_browser_binding,
+    )
+    if sid is None or provider_id is None:
+        return RedirectResponse(sso_error_url("invalid_state", login_query), status_code=302)
+    if not verify_sso_browser_binding(sid, request.cookies.get(sso_browser_cookie_name(sid))):
+        return RedirectResponse(sso_error_url("browser_mismatch", login_query), status_code=302)
     tenant_id = None
     if sid:
         s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
         session = s_res.scalar_one_or_none()
-        if session:
+        if session and session.expires_at >= datetime.now(timezone.utc) and session.status in {"pending", "scanned"}:
             tenant_id = session.tenant_id
+        else:
+            return RedirectResponse(sso_error_url("invalid_session", login_query), status_code=302)
 
-    provider = None
-    if provider_id:
-        provider = await get_google_provider(db, provider_id)
-        if tenant_id and provider.tenant_id != tenant_id:
-            return HTMLResponse("Auth failed: provider does not belong to this tenant")
-
-    auth_provider = None
-    if provider:
-        auth_provider = GoogleWorkspaceAuthProvider(provider=provider, config=provider.config or {})
-    else:
-        auth_provider = await auth_provider_registry.get_provider(
-            db, "google_workspace", str(tenant_id) if tenant_id else None
-        )
-    if not auth_provider:
-        return HTMLResponse("Auth failed: Google Workspace provider not configured for this tenant")
-
+    provider = await get_enabled_sso_provider(db, provider_id, "google_workspace", tenant_id)
     if not provider:
-        provider = await get_preferred_identity_provider(
-            db,
-            "google_workspace",
-            str(tenant_id) if tenant_id else None,
-        )
-    if provider:
-        redirect_uri = await get_google_redirect_uri(db, provider, request)
-        auth_provider.config["redirect_uri"] = redirect_uri
+        return RedirectResponse(sso_error_url("provider_unavailable", login_query), status_code=302)
+
+    auth_provider = GoogleWorkspaceAuthProvider(provider=provider, config=provider.config or {})
+
+    redirect_uri = await get_google_redirect_uri(db, provider, request)
+    auth_provider.config["redirect_uri"] = redirect_uri
 
     try:
         token_data = await auth_provider.exchange_code_for_token(code)
         access_token = token_data.get("access_token")
         if not access_token:
             logger.error(f"Google Workspace token exchange failed: {token_data}")
-            return HTMLResponse("Auth failed: Token exchange error")
+            return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
 
         user_info = await auth_provider.get_user_info(access_token)
         user, _is_new = await auth_provider.find_or_create_user(
             db, user_info, tenant_id=str(tenant_id) if tenant_id else None
         )
         if not user:
-            return HTMLResponse("Auth failed: User resolution failed")
+            return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
     except Exception as e:
         logger.error(f"Google Workspace login error: {e}")
-        return HTMLResponse(f"Auth failed: {str(e)}")
+        return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
 
     token = create_access_token(str(user.id), user.role)
 
@@ -124,17 +119,11 @@ async def _handle_google_sso_callback(
                 session.access_token = token
                 session.error_msg = None
                 await db.commit()
-                return HTMLResponse(
-                    f"""<html><head><meta charset="utf-8" /></head>
-                    <body style="font-family: sans-serif; padding: 24px;">
-                        <div>SSO login successful. Redirecting...</div>
-                        <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
-                    </body></html>"""
-                )
+                return RedirectResponse(sso_completion_url(sid, login_query), status_code=302)
         except Exception as e:
             logger.exception("Failed to update SSO session (google_workspace) %s", e)
 
-    return HTMLResponse(f"Logged in. Token: {token}")
+    return RedirectResponse(sso_error_url("session_update_failed", login_query), status_code=302)
 
 
 async def _handle_google_admin_sync_callback(
@@ -168,23 +157,13 @@ async def _handle_google_admin_sync_callback(
     except Exception as e:
         logger.error(f"Google Workspace admin sync authorization failed: {e}")
         await db.rollback()
-        return HTMLResponse(
-            f"""<html><head><meta charset="utf-8" /></head>
-            <body style="font-family: sans-serif; padding: 24px;">
-                <div>Google Workspace admin authorization failed: {e}</div>
-            </body></html>"""
+        return RedirectResponse(
+            "/oauth/admin-result?provider=google_workspace&status=error&code=authorization_failed",
+            status_code=302,
         )
-    return HTMLResponse(
-        """<html><head><meta charset="utf-8" /></head>
-        <body style="font-family: sans-serif; padding: 24px;">
-            <div>Google Workspace admin authorization successful. You can close this window.</div>
-            <script>
-              if (window.opener) {
-                window.opener.postMessage({ type: "google-workspace-sync-authorized" }, "*");
-                window.close();
-              }
-            </script>
-        </body></html>"""
+    return RedirectResponse(
+        "/oauth/admin-result?provider=google_workspace&status=success",
+        status_code=302,
     )
 
 
@@ -196,6 +175,12 @@ async def google_workspace_callback(
     db: AsyncSession = Depends(get_db),
 ):
     """Unified callback for Google Workspace SSO login and admin authorization."""
+    from app.services.sso_login_state import parse_sso_login_state
+
+    carried_state = parse_sso_login_state(state)
+    if carried_state:
+        sid, provider_id, login_query = carried_state
+        return await _handle_google_sso_callback(code, sid, provider_id, request, db, login_query)
     parsed_state = parse_google_oauth_state(state) if state else None
     if parsed_state:
         state_kind, state_value = parsed_state
@@ -211,6 +196,6 @@ async def google_workspace_callback(
         try:
             sid = uuid.UUID(state)
         except (ValueError, AttributeError):
-            return HTMLResponse("Authorization failed: invalid state")
+            return RedirectResponse("/sso/entry?error=invalid_state", status_code=302)
 
     return await _handle_google_sso_callback(code, sid, None, request, db)

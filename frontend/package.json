@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "npm run test:client-id && npm run test:chat-attachments && npm run test:h5-chat-timeline && npm run test:h5-theme && npm run test:h5-link && npm run test:h5-lifecycle && npm run test:h5-auth && npm run test:h5-content-protection && npm run test:platform-watermark && npm run test:vconsole",
+    "prebuild": "npm run test:client-id && npm run test:login-return && npm run test:chat-attachments && npm run test:h5-chat-timeline && npm run test:h5-theme && npm run test:h5-link && npm run test:h5-lifecycle && npm run test:h5-auth && npm run test:h5-content-protection && npm run test:platform-watermark && npm run test:vconsole",
     "build": "tsc && vite build",
     "test:h5-theme": "node scripts/test-h5-url-params.mjs && node scripts/test-h5-theme-tokens.mjs && node scripts/test-h5-theme-runtime.mjs",
     "test:h5-link": "node scripts/test-miniprogram-uri.mjs && node scripts/test-scene-quick-actions.mjs && node scripts/test-h5-link-policy.mjs && node scripts/test-h5-link-feedback.mjs && node scripts/test-h5-container-runtime.mjs && node scripts/test-dingtalk-link-runtime.mjs && node scripts/test-wechat-miniprogram-link-runtime.mjs",
@@ -16,6 +16,7 @@
     "test:platform-watermark": "node scripts/test-platform-watermark.mjs",
     "test:vconsole": "node scripts/test-vconsole-runtime.mjs",
     "test:client-id": "node scripts/test-client-id.mjs",
+    "test:login-return": "node scripts/test-login-return.mjs",
     "test:chat-attachments": "node scripts/test-chat-attachments.mjs",
     "test:h5-chat-timeline": "node scripts/test-h5-chat-timeline.mjs",
     "check:identity-contract": "node scripts/check-identity-contract.mjs",

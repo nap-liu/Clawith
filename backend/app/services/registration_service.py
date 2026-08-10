@@ -8,7 +8,7 @@ This module handles user registration including:
 
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select, or_, and_
@@ -55,6 +55,7 @@ class RegistrationService:
             name=name or provider_type.capitalize(),
             is_active=True,
             sso_login_enabled=sso_login_enabled,
+            sso_enabled_at=datetime.now(timezone.utc) if sso_login_enabled else None,
             config={},
             tenant_id=tenant_id,
         )

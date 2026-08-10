@@ -11,6 +11,7 @@ import {
 } from '@tabler/icons-react';
 import { AtlasFrame, OriginPlate } from '../components/atlas';
 import { applyDocumentTheme, readSavedTheme } from '../utils/themeMode';
+import { isAutomaticLoginRequested, safeLoginReturnTo } from '../utils/loginReturn';
 
 export default function Login() {
     const { t, i18n } = useTranslation();
@@ -18,6 +19,10 @@ export default function Login() {
     const [searchParams] = useSearchParams();
     const invitationCode = searchParams.get('code');
     const invitedEmail = searchParams.get('email') || '';
+    const returnTo = safeLoginReturnTo(searchParams.get('return_to'));
+    const automaticLogin = isAutomaticLoginRequested(searchParams.get('auto_login'));
+    const requestedSso = searchParams.get('sso') || '';
+    const requestedTenantId = searchParams.get('tenant_id') || '';
     const setAuth = useAuthStore((s) => s.setAuth);
     // Default to register if there's an invitation code — will be overridden after email check
     const [isRegister, setIsRegister] = useState(!!invitationCode);
@@ -38,6 +43,7 @@ export default function Login() {
     const [verificationEmail, setVerificationEmail] = useState('');
     const [verificationCode, setVerificationCode] = useState('');
     const [verificationEntryMode, setVerificationEntryMode] = useState<'create' | 'join' | 'home'>('home');
+    const [ssoAutoStarted, setSsoAutoStarted] = useState(false);
 
     const [form, setForm] = useState({
         login_identifier: invitedEmail,  // Pre-fill invited email if present
@@ -116,18 +122,17 @@ export default function Login() {
 
     useEffect(() => {
         let cancelled = false;
-        if (!tenant?.sso_enabled || isRegister) {
+        const tenantId = tenant?.id || requestedTenantId;
+        if (!tenantId || isRegister) {
             setSsoProviders([]);
             setSsoError('');
             return;
         }
-        if (!tenant?.id) return;
 
         setSsoLoading(true);
         setSsoError('');
 
-        fetchJson<{ session_id: string }>(`/sso/session?tenant_id=${tenant.id}`, { method: 'POST' })
-            .then(res => fetchJson<any[]>(`/sso/config?sid=${res.session_id}`))
+        fetchJson<any[]>(`/sso/providers?tenant_id=${tenantId}`)
             .then(providers => {
                 if (cancelled) return;
                 setSsoProviders(providers || []);
@@ -143,7 +148,40 @@ export default function Login() {
             });
 
         return () => { cancelled = true; };
-    }, [tenant?.id, tenant?.sso_enabled, isRegister, t]);
+    }, [tenant?.id, requestedTenantId, isRegister, t]);
+
+    const finishLogin = (fallback = '/') => {
+        if (returnTo) {
+            window.location.replace(returnTo);
+        } else {
+            navigate(fallback);
+        }
+    };
+
+    const startSsoLogin = async (providerType?: string) => {
+        const tenantId = tenant?.id || requestedTenantId;
+        if (!tenantId) return;
+        try {
+            const res = await fetchJson<{ authorization_url?: string | null }>('/sso/start', {
+                method: 'POST',
+                body: JSON.stringify({
+                    tenant_id: tenantId,
+                    provider_type: providerType || null,
+                    login_query: window.location.search.slice(1),
+                }),
+            });
+            if (res?.authorization_url) window.location.href = res.authorization_url;
+        } catch {
+            // Missing, disabled, or unavailable requested SSO stays on normal login silently.
+        }
+    };
+
+    useEffect(() => {
+        if (!automaticLogin || ssoLoading || ssoAutoStarted || isRegister || ssoProviders.length === 0) return;
+        if (requestedSso && !ssoProviders.some(p => p.provider_type === requestedSso)) return;
+        setSsoAutoStarted(true);
+        void startSsoLogin(requestedSso || undefined);
+    }, [automaticLogin, ssoLoading, ssoAutoStarted, isRegister, requestedSso, ssoProviders]);
 
     const toggleLang = () => {
         i18n.changeLanguage(i18n.language === 'zh' ? 'en' : 'zh');
@@ -189,7 +227,7 @@ export default function Login() {
                 return;
             }
 
-            navigate('/');
+            finishLogin();
         } catch (err: any) {
             setError(err.message || (isZh ? '验证码无效或已过期' : 'The verification code is invalid or expired.'));
         } finally {
@@ -242,7 +280,7 @@ export default function Login() {
                             state: { fromRegister: true, email: regRes.email || form.login_identifier },
                         });
                     } else {
-                        navigate('/');
+                        finishLogin();
                     }
                     return;
                 }
@@ -303,7 +341,7 @@ export default function Login() {
                 if (tokenRes.user && !tokenRes.user.tenant_id) {
                     navigate('/setup-company');
                 } else {
-                    navigate('/');
+                    finishLogin();
                 }
             }
         } catch (err: any) {
@@ -368,7 +406,7 @@ export default function Login() {
             if (tokenRes.user && !tokenRes.user.tenant_id) {
                 navigate('/setup-company');
             } else {
-                navigate('/');
+                finishLogin();
             }
         } catch (err: any) {
             const msg = err.message || '';
@@ -390,7 +428,7 @@ export default function Login() {
         try {
             const redirectUri = `${window.location.origin}/oauth/callback/${providerType}`;
             const res = await fetchJson<{ authorization_url: string }>(
-                `/auth/${providerType}/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`
+                `/auth/${providerType}/authorize?redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(window.location.search.slice(1))}`
             );
             if (res?.authorization_url) {
                 window.location.href = res.authorization_url;
@@ -467,7 +505,7 @@ export default function Login() {
                         </div>
                     )}
 
-                    {tenant && tenant.sso_enabled && !isRegister && !showVerification && (
+                    {(tenant?.id || requestedTenantId) && ssoProviders.length > 0 && !isRegister && !showVerification && (
                         <div style={{ marginBottom: '24px' }}>
                             <div style={{
                                 padding: '16px', borderRadius: '12px', background: 'rgba(59,130,246,0.08)',
@@ -475,7 +513,7 @@ export default function Login() {
                                 textAlign: 'center'
                             }}>
                                 <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--accent-primary)', marginBottom: '4px' }}>
-                                    {tenant.name}
+                                    {tenant?.name || t('auth.enterpriseLogin', 'Enterprise login')}
                                 </div>
                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
                                     {t('auth.ssoNotice', 'Enterprise SSO is enabled for this domain.')}
@@ -505,7 +543,7 @@ export default function Login() {
                                                     gap: '10px',
                                                     border: '1px solid var(--border-subtle)',
                                                 }}
-                                                onClick={() => window.location.href = p.url}
+                                                onClick={() => startSsoLogin(p.provider_type)}
                                             >
                                                 {meta.icon ? (
                                                     <img src={meta.icon} alt={meta.label} width={18} height={18} />

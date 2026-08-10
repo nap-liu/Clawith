@@ -33,7 +33,9 @@ async function request<T>(
         if (res.status === 401 && !isAuthEndpoint && behavior.redirectOnUnauthorized !== false) {
             localStorage.removeItem('token');
             localStorage.removeItem('user');
-            window.location.href = '/login';
+            const onLoginPage = window.location.pathname === '/login';
+            const loginParams = onLoginPage ? '' : `?${new URLSearchParams({ return_to: window.location.href })}`;
+            window.location.replace(`/login${loginParams}`);
             throw new Error('Session expired');
         }
         const bodyText = await res.text();

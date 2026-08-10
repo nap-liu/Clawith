@@ -461,6 +461,13 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                     </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                    {tool.name === 'publish_page' && (
+                        <a
+                            href={`/published-pages?agent_id=${encodeURIComponent(agentId)}`}
+                            onClick={event => event.stopPropagation()}
+                            style={{ border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '3px 8px', fontSize: '11px', color: 'var(--text-secondary)', display: 'inline-flex', alignItems: 'center', gap: '4px', textDecoration: 'none' }}
+                        ><IconFileText size={12} stroke={1.8} /> 管理已发布内容</a>
+                    )}
                     {canManage && tool.type === 'mcp' && tool.mcp_server_id && (
                         <button
                             onClick={(e) => {

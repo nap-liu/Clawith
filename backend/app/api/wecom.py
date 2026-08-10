@@ -17,7 +17,7 @@ import asyncio
 import httpx
 from Crypto.Cipher import AES
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,7 +32,6 @@ from app.models.channel_config import ChannelConfig
 from app.models.identity import IdentityProvider, SSOScanSession
 from app.models.user import User
 from app.services.activity_logger import log_activity
-from app.services.auth_registry import auth_provider_registry
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
 from app.services.platform_service import platform_service
@@ -762,57 +761,51 @@ async def _process_wecom_text(
 @router.get("/auth/wecom/callback")
 async def wecom_callback(
     code: str,
+    request: Request,
     state: str = None,
     db: AsyncSession = Depends(get_db),
 ):
+    from app.services.auth_provider import WeComAuthProvider
+    from app.services.sso_login_state import (
+        get_enabled_sso_provider,
+        parse_sso_or_legacy_state,
+        sso_browser_cookie_name,
+        sso_completion_url,
+        sso_error_url,
+        verify_sso_browser_binding,
+    )
     # 1. Resolve session to get tenant context
+    sid, provider_id, login_query = parse_sso_or_legacy_state(state)
+    if sid is None or provider_id is None:
+        return RedirectResponse(sso_error_url("invalid_state", login_query), status_code=302)
+    if not verify_sso_browser_binding(sid, request.cookies.get(sso_browser_cookie_name(sid))):
+        return RedirectResponse(sso_error_url("browser_mismatch", login_query), status_code=302)
     tenant_id = None
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                tenant_id = session.tenant_id
-        except (ValueError, AttributeError):
-            pass
+    if sid:
+        s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+        session = s_res.scalar_one_or_none()
+        if session and session.expires_at >= datetime.now(timezone.utc) and session.status in {"pending", "scanned"}:
+            tenant_id = session.tenant_id
+        else:
+            return RedirectResponse(sso_error_url("invalid_session", login_query), status_code=302)
 
     # 1. Get WeCom provider config
-    provider_query = select(IdentityProvider).where(IdentityProvider.provider_type == "wecom")
-    if tenant_id:
-        # Strict scope
-        provider_query = provider_query.where(IdentityProvider.tenant_id == tenant_id)
-    else:
-        # Fallback to unscoped
-        provider_query = provider_query.where(IdentityProvider.tenant_id.is_(None))
-
-    provider_result = await db.execute(provider_query)
-    provider = provider_result.scalar_one_or_none()
+    provider = await get_enabled_sso_provider(db, provider_id, "wecom", tenant_id)
     if not provider:
-        raise HTTPException(status_code=404, detail="WeCom provider not configured for this tenant")
-
-    config = provider.config
-    corp_id = config.get("app_id") or config.get("corp_id")
-    secret = config.get("app_secret") or config.get("secret")
+        return RedirectResponse(sso_error_url("provider_unavailable", login_query), status_code=302)
 
     # 2. Extract user info and login/register via RegistrationService
     try:
-        auth_provider = await auth_provider_registry.get_provider(
-            db,
-            "wecom",
-            str(tenant_id) if tenant_id else (str(provider.tenant_id) if provider.tenant_id else None),
-        )
-        if not auth_provider:
-            return HTMLResponse("Auth failed: WeCom provider unavailable")
+        auth_provider = WeComAuthProvider(provider=provider, config=provider.config or {})
         
         token_data = await auth_provider.exchange_code_for_token(code)
         access_token_str = token_data.get("access_token")
         if not access_token_str:
-            return HTMLResponse("Auth failed: Token error")
+            return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
             
         user_info = await auth_provider.get_user_info(access_token_str)
         if not user_info.provider_user_id:
-            return HTMLResponse("Auth failed: No UserId returned")
+            return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
             
         # Find or Create User (handles Identity and OrgMember linking)
         user, _is_new = await auth_provider.find_or_create_user(
@@ -820,15 +813,14 @@ async def wecom_callback(
         )
     except Exception as e:
         logger.exception(f"WeCom login/register error: {e}")
-        return HTMLResponse(f"Auth failed: {str(e)}")
+        return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
 
 
     # Standard login
     token = create_access_token(str(user.id), user.role)
 
-    if state:
+    if sid:
         try:
-            sid = uuid.UUID(state)
             s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
             session = s_res.scalar_one_or_none()
             if session:
@@ -838,14 +830,8 @@ async def wecom_callback(
                 session.access_token = token
                 session.error_msg = None
                 await db.commit()
-                return HTMLResponse(
-                    f"""<html><head><meta charset="utf-8" /></head>
-                    <body style="font-family: sans-serif; padding: 24px;">
-                        <div>SSO login successful. Redirecting...</div>
-                        <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
-                    </body></html>"""
-                )
+                return RedirectResponse(sso_completion_url(sid, login_query), status_code=302)
         except Exception as e:
             logger.exception("Failed to update SSO session (wecom) %s", e)
 
-    return HTMLResponse(f"Logged in. Token: {token}")
+    return RedirectResponse(sso_error_url("session_update_failed", login_query), status_code=302)

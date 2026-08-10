@@ -74,6 +74,8 @@ type DirectoryMembersResponse = {
 type Props = {
     open: boolean;
     agentId: string;
+    directoryBaseUrl?: string;
+    membersOnly?: boolean;
     users: AgentAccessUser[];
     departments: AgentAccessDepartment[];
     onClose: () => void;
@@ -102,7 +104,16 @@ function initials(name: string) {
     return name.trim().slice(-2) || '?';
 }
 
-export default function OrgMemberAccessPicker({ open, agentId, users, departments, onClose, onSave }: Props) {
+export default function OrgMemberAccessPicker({
+    open,
+    agentId,
+    directoryBaseUrl,
+    membersOnly = false,
+    users,
+    departments,
+    onClose,
+    onSave,
+}: Props) {
     const { i18n } = useTranslation();
     const isChinese = i18n.language?.startsWith('zh');
     const labels = isChinese ? {
@@ -169,6 +180,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
         page: 'page',
     };
 
+    const directoryUrl = directoryBaseUrl || `/agents/${agentId}/permissions/directory`;
     const requiredUsers = useMemo(() => users.filter(user => user.is_required), [users]);
     const requiredIds = useMemo(() => new Set(requiredUsers.map(user => user.id)), [requiredUsers]);
     const businessUsers = useMemo(() => users.filter(user => !user.is_required), [users]);
@@ -212,7 +224,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
             const params = new URLSearchParams();
             if (parentId) params.set('parent_id', parentId);
             const response = await fetchJson<DirectoryDepartmentsResponse>(
-                `/agents/${agentId}/permissions/directory/departments${params.size ? `?${params}` : ''}`,
+                `${directoryUrl}/departments${params.size ? `?${params}` : ''}`,
             );
             mergeDepartments(response.items);
             setChildrenByParent(current => ({ ...current, [key]: response.items.map(item => item.id) }));
@@ -229,7 +241,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
         } finally {
             loadingParentsRef.current.delete(key);
         }
-    }, [agentId, mergeDepartments]);
+    }, [directoryUrl, mergeDepartments]);
 
     useEffect(() => {
         if (!open) {
@@ -239,7 +251,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
         if (wasOpenRef.current) return;
         wasOpenRef.current = true;
         setDraftUsers(new Map(businessUsers.map(user => [user.id, { ...user }])));
-        setDraftDepartments(new Map(departments.map(department => [department.id, { ...department }])));
+        setDraftDepartments(membersOnly ? new Map() : new Map(departments.map(department => [department.id, { ...department }])));
         setDepartmentsById({});
         setChildrenByParent({});
         setExpandedIds(new Set());
@@ -256,7 +268,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
         void loadChildren(null);
         const focusTimer = window.setTimeout(() => searchInputRef.current?.focus(), 80);
         return () => window.clearTimeout(focusTimer);
-    }, [open, businessUsers, departments, loadChildren]);
+    }, [open, businessUsers, departments, loadChildren, membersOnly]);
 
     useEffect(() => {
         if (!open) return;
@@ -277,9 +289,9 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
     }, [selectedDepartmentId, includeDescendants, debouncedMemberSearch]);
 
     const departmentSearchQuery = useQuery({
-        queryKey: ['agent-permission-department-search', agentId, debouncedDepartmentSearch],
+        queryKey: ['permission-department-search', directoryUrl, debouncedDepartmentSearch],
         queryFn: () => fetchJson<DirectoryDepartmentsResponse>(
-            `/agents/${agentId}/permissions/directory/departments?search=${encodeURIComponent(debouncedDepartmentSearch)}`,
+            `${directoryUrl}/departments?search=${encodeURIComponent(debouncedDepartmentSearch)}`,
         ),
         enabled: open && !!debouncedDepartmentSearch,
         staleTime: 30_000,
@@ -287,8 +299,8 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
 
     const membersQuery = useQuery({
         queryKey: [
-            'agent-permission-directory-members',
-            agentId,
+            'permission-directory-members',
+            directoryUrl,
             selectedDepartmentId,
             includeDescendants,
             debouncedMemberSearch,
@@ -303,7 +315,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
                 params.set('include_descendants', String(includeDescendants));
             }
             return fetchJson<DirectoryMembersResponse>(
-                `/agents/${agentId}/permissions/directory/members?${params}`,
+                `${directoryUrl}/members?${params}`,
             );
         },
         enabled: open && (!!debouncedMemberSearch || !!selectedDepartmentId),
@@ -426,7 +438,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
         setSaving(true);
         setSaveError(null);
         try {
-            await onSave(Array.from(draftUsers.values()), Array.from(draftDepartments.values()));
+            await onSave(Array.from(draftUsers.values()), membersOnly ? [] : Array.from(draftDepartments.values()));
             onClose();
         } catch (error) {
             setSaveError(error instanceof Error ? error.message : String(error));
@@ -584,7 +596,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
                                 </label>
                             )}
                         </div>
-                        {!debouncedMemberSearch && selectedDepartment && (
+                        {!membersOnly && !debouncedMemberSearch && selectedDepartment && (
                             <label className={`org-access-picker__department-grant${selectedDepartmentGrant ? ' is-selected' : ''}`}>
                                 <input
                                     type="checkbox"
@@ -642,7 +654,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
 
                     <aside className="org-access-picker__selected">
                         <div className="org-access-picker__panel-title">{labels.selected} <span>{selectedDepartmentCount + selectedCount}</span></div>
-                        <div className="org-access-picker__selected-section-title">{labels.selectedDepartments} <span>{selectedDepartmentCount}</span></div>
+                        {!membersOnly && <><div className="org-access-picker__selected-section-title">{labels.selectedDepartments} <span>{selectedDepartmentCount}</span></div>
                         <div className="org-access-picker__selected-list">
                             {selectedDepartmentCount > 0 ? Array.from(draftDepartments.values()).map(department => (
                                 <div key={department.id} className="org-access-picker__selected-row org-access-picker__selected-row--department">
@@ -662,7 +674,7 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
                                     <button type="button" onClick={() => removeDepartment(department.id)} aria-label={`${labels.cancel} ${department.name}`}><IconX size={14} /></button>
                                 </div>
                             )) : <div className="org-access-picker__empty org-access-picker__empty--compact">{labels.noDepartments}</div>}
-                        </div>
+                        </div></>}
                         <div className="org-access-picker__selected-section-title">{labels.selectedMembers} <span>{selectedCount}</span></div>
                         <div className="org-access-picker__selected-list">
                             {selectedCount > 0 ? Array.from(draftUsers.values()).map(user => (
@@ -671,31 +683,31 @@ export default function OrgMemberAccessPicker({ open, agentId, users, department
                                         <strong>{user.name}</strong>
                                         <small>{compactDepartmentPath(user.department_path) || user.email || ''}</small>
                                     </div>
-                                    <select
+                                    {!membersOnly && <select
                                         value={user.access_level}
                                         onChange={event => updateLevel(user.id, event.target.value as 'use' | 'manage')}
                                         aria-label={`${user.name} access`}
                                     >
                                         <option value="use">{labels.use}</option>
                                         <option value="manage">{labels.manage}</option>
-                                    </select>
+                                    </select>}
                                     <button type="button" onClick={() => removeUser(user.id)} aria-label={`${labels.cancel} ${user.name}`}><IconX size={14} /></button>
                                 </div>
                             )) : <div className="org-access-picker__empty">{labels.noMembers}</div>}
                         </div>
-                        <details className="org-access-picker__required">
+                        {!membersOnly && <details className="org-access-picker__required">
                             <summary>{labels.systemManagers} {requiredUsers.length}</summary>
                             <div>
                                 {hasCreator && <span>{labels.creator} · {labels.manage}</span>}
                                 {companyAdminCount > 0 && <span>{labels.companyAdmins} {companyAdminCount} · {labels.manage}</span>}
                             </div>
-                        </details>
+                        </details>}
                     </aside>
                 </div>
 
                 <footer className="org-access-picker__footer">
                     <div>
-                        <span>{selectedDepartmentCount} {labels.selectedDepartments} · {selectedCount}{labels.businessMembers}</span>
+                        <span>{membersOnly ? `${selectedCount}${labels.businessMembers}` : `${selectedDepartmentCount} ${labels.selectedDepartments} · ${selectedCount}${labels.businessMembers}`}</span>
                         {saveError && <span className="org-access-picker__error">{saveError}</span>}
                     </div>
                     <div>

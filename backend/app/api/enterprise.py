@@ -2,6 +2,7 @@
 
 import uuid
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -1055,6 +1056,7 @@ async def create_identity_provider(
         name=data.name,
         is_active=data.is_active,
         sso_login_enabled=data.sso_login_enabled,
+        sso_enabled_at=datetime.now(timezone.utc) if data.sso_login_enabled else None,
         config=data.config,
         tenant_id=tid
     )
@@ -1095,6 +1097,7 @@ async def create_oauth2_provider(
         name=data.name,
         is_active=data.is_active,
         sso_login_enabled=data.sso_login_enabled,
+        sso_enabled_at=datetime.now(timezone.utc) if data.sso_login_enabled else None,
         config=config_dict,
         tenant_id=tid if isinstance(tid, uuid.UUID) else uuid.UUID(tid) if tid else None,
     )
@@ -1134,6 +1137,8 @@ async def update_oauth2_provider(
     if data.is_active is not None:
         provider.is_active = data.is_active
     if data.sso_login_enabled is not None:
+        if data.sso_login_enabled and not provider.sso_login_enabled:
+            provider.sso_enabled_at = datetime.now(timezone.utc)
         provider.sso_login_enabled = data.sso_login_enabled
 
     # Update config if provided
@@ -1194,6 +1199,7 @@ async def update_identity_provider(
                     status_code=400,
                     detail="IP address does not support multi-tenant SSO. Another tenant already has SSO enabled."
                 )
+            provider.sso_enabled_at = datetime.now(timezone.utc)
         provider.sso_login_enabled = data.sso_login_enabled
     if data.config is not None:
         # Merge config
