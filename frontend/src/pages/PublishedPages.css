@@ -1,3 +1,9 @@
+.published-pages {
+    width: min(100%, 1120px);
+    margin: 0 auto;
+    padding: 28px 32px;
+}
+
 .published-pages-row {
     grid-template-columns: minmax(220px, .95fr) minmax(260px, 1.15fr) 90px 130px;
     transition: background-color 120ms ease;
@@ -28,5 +34,11 @@
     .published-pages-row__metrics {
         grid-column: 3;
         grid-row: 1;
+    }
+}
+
+@media (max-width: 680px) {
+    .published-pages {
+        padding: 20px 16px;
     }
 }

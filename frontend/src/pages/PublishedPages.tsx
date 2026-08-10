@@ -10,12 +10,15 @@ import {
     IconHistory,
     IconLock,
     IconSettings,
+    IconTrash,
     IconUsers,
     IconWorld,
     IconX,
 } from '@tabler/icons-react';
 
 import OrgMemberAccessPicker, { type AgentAccessUser } from '../components/OrgMemberAccessPicker';
+import ConfirmModal from '../components/ConfirmModal';
+import PublishedPageFilters, { type PublishedPageAgentOption } from '../components/PublishedPageFilters';
 import { useToast } from '../components/Toast/ToastProvider';
 import { fetchJson } from '../services/api';
 import { copyToClipboard } from '../utils/clipboard';
@@ -79,18 +82,32 @@ export default function PublishedPages() {
     const [searchParams, setSearchParams] = useSearchParams();
     const selectedPageId = searchParams.get('page');
     const agentId = searchParams.get('agent_id') || '';
+    const selectedAgentIds = Array.from(new Set([
+        ...searchParams.getAll('agent_ids'),
+        ...(agentId ? [agentId] : []),
+    ])).sort();
+    const selectedAgentIdsKey = selectedAgentIds.join(',');
+    const searchQuery = searchParams.get('q') || '';
     const pageNo = Math.max(1, Number(searchParams.get('page_no')) || 1);
     const [activeTab, setActiveTab] = useState<'permissions' | 'visitors'>('permissions');
     const [visitorPage, setVisitorPage] = useState(1);
     const [mode, setMode] = useState<AccessMode>('public');
     const [selectedPeople, setSelectedPeople] = useState<AgentAccessUser[]>([]);
     const [showMemberPicker, setShowMemberPicker] = useState(false);
+    const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+    const [deleting, setDeleting] = useState(false);
     const [saving, setSaving] = useState(false);
+    const [searchDraft, setSearchDraft] = useState(searchQuery);
 
     const listParams = new URLSearchParams({ page: String(pageNo), page_size: String(PAGE_SIZE) });
-    if (agentId) listParams.set('agent_id', agentId);
+    selectedAgentIds.forEach(id => listParams.append('agent_ids', id));
+    if (searchQuery) listParams.set('q', searchQuery);
+    const { data: agentOptions = [] } = useQuery({
+        queryKey: ['published-pages', 'agent-options'],
+        queryFn: () => fetchJson<PublishedPageAgentOption[]>('/pages/agent-options'),
+    });
     const { data: pageData, isLoading } = useQuery({
-        queryKey: ['published-pages', 'list', pageNo, agentId],
+        queryKey: ['published-pages', 'list', pageNo, selectedAgentIdsKey, searchQuery],
         queryFn: () => fetchJson<Paged<PublishedPage>>(`/pages/mine?${listParams}`),
     });
     const pages = pageData?.items || [];
@@ -106,6 +123,10 @@ export default function PublishedPages() {
     });
 
     useEffect(() => {
+        setSearchDraft(searchQuery);
+    }, [searchQuery]);
+
+    useEffect(() => {
         if (!selected) return;
         setMode(selected.access_mode);
         setSelectedPeople(selected.access_users.filter(user => user.status === 'approved').map(user => ({
@@ -116,6 +137,7 @@ export default function PublishedPages() {
         })));
         setActiveTab('permissions');
         setVisitorPage(1);
+        setShowDeleteConfirm(false);
     }, [selectedPageId, selected]);
 
     const originalApprovedIds = useMemo(
@@ -132,12 +154,25 @@ export default function PublishedPages() {
         Object.entries(updates).forEach(([key, value]) => value === null ? next.delete(key) : next.set(key, value));
         setSearchParams(next);
     };
+    const updateAgentFilter = (ids: string[]) => {
+        const next = new URLSearchParams(searchParams);
+        next.delete('agent_id');
+        next.delete('agent_ids');
+        ids.slice().sort().forEach(id => next.append('agent_ids', id));
+        next.delete('page_no');
+        next.delete('page');
+        setSearchParams(next);
+    };
     const refresh = async () => {
         await queryClient.invalidateQueries({ queryKey: ['published-pages'] });
     };
     const copyPageUrl = async (url: string) => {
         if (await copyToClipboard(absolutePageUrl(url))) toast.success('发布地址已复制');
         else toast.error('复制失败，请手动复制地址');
+    };
+    const searchPages = () => {
+        const normalized = searchDraft.trim();
+        updateSearch({ q: normalized || null, page_no: null, page: null });
     };
 
     const save = async () => {
@@ -173,20 +208,52 @@ export default function PublishedPages() {
         }
     };
 
+    const deletePage = async () => {
+        if (!selected || deleting) return;
+        setDeleting(true);
+        try {
+            await fetchJson(`/pages/${selected.id}`, { method: 'DELETE' });
+            setShowDeleteConfirm(false);
+            updateSearch({ page: null, page_no: null });
+            await refresh();
+            toast.success('发布地址已删除');
+        } catch (error: any) {
+            toast.error('删除发布地址失败', { details: error?.message || String(error) });
+        } finally {
+            setDeleting(false);
+        }
+    };
+
     const totalPages = Math.max(1, Math.ceil((pageData?.total || 0) / PAGE_SIZE));
     const visitorPages = Math.max(1, Math.ceil((visitorData?.total || 0) / PAGE_SIZE));
     const pendingUsers = selected?.access_users.filter(user => user.status === 'pending') || [];
+    const hasAppliedFilters = Boolean(searchQuery || selectedAgentIds.length);
+    const hasResettableFilters = Boolean(searchDraft.trim() || selectedAgentIds.length);
 
     return (
-        <div style={{ padding: '28px 32px', maxWidth: 1120, margin: '0 auto' }}>
+        <div className="published-pages">
             <div style={{ marginBottom: 24 }}>
                 <h1 style={{ fontSize: 24, margin: 0 }}>发布管理</h1>
-                <p style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>管理 Agent 发布的网页、访问权限和访问记录</p>
+                <p style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>管理数字员工发布的网页、访问权限和访问记录</p>
             </div>
+
+            <PublishedPageFilters
+                agents={agentOptions}
+                selectedAgentIds={selectedAgentIds}
+                query={searchDraft}
+                hasActiveFilters={hasResettableFilters}
+                onAgentChange={updateAgentFilter}
+                onQueryChange={setSearchDraft}
+                onSearch={searchPages}
+                onReset={() => {
+                    setSearchDraft('');
+                    updateSearch({ q: null, agent_id: null, agent_ids: null, page_no: null, page: null });
+                }}
+            />
 
             {isLoading ? <p>加载中…</p> : pages.length === 0 ? (
                 <div style={{ padding: 40, textAlign: 'center', border: '1px solid var(--border-subtle)', borderRadius: 10, color: 'var(--text-tertiary)' }}>
-                    暂无已发布内容，可让 Agent 使用 Publish Page 工具发布网页
+                    {hasAppliedFilters ? '没有匹配的发布页面' : '暂无已发布内容，可让数字员工使用 Publish Page 工具发布网页'}
                 </div>
             ) : (
                 <>
@@ -263,6 +330,11 @@ export default function PublishedPages() {
                         <button type="button" aria-label="复制发布地址" title="复制发布地址" onClick={() => void copyPageUrl(selected.url)} style={{ border: 0, background: 'transparent', color: 'var(--text-secondary)', padding: 3, cursor: 'pointer', display: 'inline-flex' }}><IconCopy size={15} /></button>
                         <a href={absolutePageUrl(selected.url)} target="_blank" rel="noreferrer" aria-label="打开发布页面" title="打开发布页面" style={{ color: 'var(--text-secondary)', display: 'inline-flex' }}><IconExternalLink size={15} /></a>
                     </div>
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
+                        <button type="button" className="btn btn-danger btn-sm" onClick={() => setShowDeleteConfirm(true)}>
+                            <IconTrash size={14} /> 删除发布地址
+                        </button>
+                    </div>
 
                     <div style={{ display: 'flex', gap: 4, borderBottom: '1px solid var(--border-subtle)', marginTop: 24 }}>
                         {([['permissions', '权限设置', IconSettings], ['visitors', `访问记录 ${selected.visitor_count}`, IconHistory]] as const).map(([value, label, Icon]) => (
@@ -338,6 +410,16 @@ export default function PublishedPages() {
                     />
                 </aside>
             </div>}
+            <ConfirmModal
+                open={showDeleteConfirm && Boolean(selected)}
+                title="删除发布地址"
+                message={`删除后，“${selected?.title || selected?.source_path || '此页面'}”的发布地址将立即失效，权限和访问记录也会一并删除。数字员工工作区中的源文件会保留。`}
+                confirmLabel={deleting ? '删除中…' : '确认删除'}
+                cancelLabel="取消"
+                danger
+                onConfirm={() => void deletePage()}
+                onCancel={() => { if (!deleting) setShowDeleteConfirm(false); }}
+            />
         </div>
     );
 }

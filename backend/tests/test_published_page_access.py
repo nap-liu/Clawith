@@ -1,4 +1,3 @@
-import asyncio
 import pathlib
 import uuid
 from datetime import datetime, timezone
@@ -31,7 +30,7 @@ from app.services.agent_tools import (
     _search_page_viewers,
     _update_published_page_access,
 )
-from app.services.published_page_access import PAGE_SESSION_COOKIE, create_page_frame_token, create_page_session
+from app.services.published_page_access import PAGE_SESSION_COOKIE, create_page_session
 from app.services.tool_seeder import BUILTIN_TOOLS
 
 
@@ -125,40 +124,12 @@ async def test_protected_page_uses_frontend_access_route_and_returns_after_appro
         assert context.status_code == 200
         assert context.json()["watermark_identity"]["display_name"] == "Viewer"
         assert context.json()["allow_top_navigation"] is False
-        frame_token = context.json()["frame_token"]
-        missing_destination = await client.get(
-            f"/api/pages/{short_id}/content?frame_token={frame_token}",
-        )
-        assert missing_destination.status_code == 404
-        direct_content = await client.get(
-            f"/api/pages/{short_id}/content?frame_token={frame_token}",
-            headers={"Sec-Fetch-Dest": "document"},
-        )
-        assert direct_content.status_code == 404
-        wrong_page_token = create_page_frame_token(uuid.uuid4(), viewer_id)
-        wrong_page = await client.get(
-            f"/api/pages/{short_id}/content?frame_token={wrong_page_token}",
-            headers={"Sec-Fetch-Dest": "iframe"},
-        )
-        assert wrong_page.status_code == 404
-        before_content = await client.get(
-            f"/api/pages/{short_id}/frame-status?frame_token={frame_token}",
-        )
-        assert before_content.status_code == 409
-        content = await client.get(
-            f"/api/pages/{short_id}/content?frame_token={frame_token}",
-            headers={"Sec-Fetch-Dest": "iframe"},
-        )
+        content = await client.get(f"/api/pages/{short_id}/content")
         assert content.status_code == 200
         assert content.headers["content-type"].startswith("text/html")
         assert content.headers["cache-control"] == "no-store"
         assert content.headers["content-security-policy"] == "frame-ancestors 'self'"
         assert "secret" in content.text
-        frame_status = await client.get(
-            f"/api/pages/{short_id}/frame-status?frame_token={frame_token}",
-        )
-        assert frame_status.status_code == 200
-        assert frame_status.json() == {"loaded": True}
 
         cleared = await client.delete("/api/pages/session")
         assert cleared.status_code == 200
@@ -172,37 +143,6 @@ async def test_protected_page_uses_frontend_access_route_and_returns_after_appro
         ))
         assert visitor is not None
         assert visitor.view_count == 1
-
-
-async def test_frame_receipts_are_isolated_for_concurrent_tabs():
-    short_id, page_id, _agent_id, _owner_id, viewer_id = await _make_restricted_page()
-    async with async_session() as db:
-        db.add(PublishedPageAccess(page_id=page_id, user_id=viewer_id, status="approved"))
-        await db.commit()
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        client.cookies.set(PAGE_SESSION_COOKIE, create_page_session(viewer_id), path="/")
-        first_context, second_context = await asyncio.gather(
-            client.get(f"/api/pages/{short_id}/viewer-context"),
-            client.get(f"/api/pages/{short_id}/viewer-context"),
-        )
-        first_token = first_context.json()["frame_token"]
-        second_token = second_context.json()["frame_token"]
-        assert first_token != second_token
-
-        for frame_token in (first_token, second_token):
-            content = await client.get(
-                f"/api/pages/{short_id}/content?frame_token={frame_token}",
-                headers={"Sec-Fetch-Dest": "iframe"},
-            )
-            assert content.status_code == 200
-
-        for frame_token in (first_token, second_token):
-            status = await client.get(
-                f"/api/pages/{short_id}/frame-status?frame_token={frame_token}",
-            )
-            assert status.status_code == 200
 
 
 async def test_access_request_is_idempotent_and_notifies_publisher():
@@ -259,11 +199,7 @@ async def test_public_and_authenticated_modes_keep_expected_access_boundaries():
         authenticated = await client.get(f"/p/{short_id}")
         assert authenticated.status_code == 200
         assert authenticated.headers["x-accel-redirect"] == "/__published_page_viewer"
-        context = await client.get(f"/api/pages/{short_id}/viewer-context")
-        content = await client.get(
-            f"/api/pages/{short_id}/content?frame_token={context.json()['frame_token']}",
-            headers={"Sec-Fetch-Dest": "iframe"},
-        )
+        content = await client.get(f"/api/pages/{short_id}/content")
         assert content.status_code == 200
         assert content.text == "<h1>secret</h1>"
 
@@ -498,6 +434,43 @@ async def test_only_page_managers_can_update_access_and_resolve_requests():
         assert bridge.json()["allowed"] is True
 
 
+async def test_page_manager_can_delete_published_address_without_deleting_source_file():
+    short_id, page_id, agent_id, owner_id, viewer_id = await _make_restricted_page()
+    source = pathlib.Path(settings.AGENT_DATA_DIR) / str(agent_id) / "out/protected.html"
+    async with async_session() as db:
+        db.add(PublishedPageAccess(page_id=page_id, user_id=viewer_id, status="approved"))
+        db.add(PublishedPageVisitor(page_id=page_id, user_id=viewer_id, view_count=2))
+        db.add(PublishedPageAnonymousVisitor(page_id=page_id, visitor_key="a" * 64, view_count=3))
+        await db.commit()
+
+    owner_token = create_access_token(str(owner_id), "member")
+    viewer_token = create_access_token(str(viewer_id), "member")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.delete(
+            f"/api/pages/{page_id}", headers={"Authorization": f"Bearer {viewer_token}"},
+        )
+        assert denied.status_code == 404
+
+        deleted = await client.delete(
+            f"/api/pages/{page_id}", headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        assert deleted.status_code == 200
+        assert deleted.json() == {"ok": True}
+
+        unavailable = await client.get(f"/p/{short_id}", follow_redirects=False)
+        assert unavailable.status_code == 302
+        assert unavailable.headers["location"] == "/published-page-unavailable"
+
+    async with async_session() as db:
+        assert await db.get(PublishedPage, page_id) is None
+        assert await db.scalar(select(PublishedPageAccess).where(PublishedPageAccess.page_id == page_id)) is None
+        assert await db.scalar(select(PublishedPageVisitor).where(PublishedPageVisitor.page_id == page_id)) is None
+        assert await db.scalar(select(PublishedPageAnonymousVisitor).where(PublishedPageAnonymousVisitor.page_id == page_id)) is None
+    assert source.exists()
+    assert source.read_text(encoding="utf-8") == "<h1>secret</h1>"
+
+
 async def test_shared_agent_user_cannot_change_page_access_through_tools():
     short_id, page_id, agent_id, owner_id, viewer_id = await _make_restricted_page()
     denied = await _update_published_page_access(
@@ -553,6 +526,89 @@ async def test_page_list_returns_summary_and_detail_is_loaded_separately():
         assert visitors.json()["total"] == 1
         assert visitors.json()["items"][0]["id"] == str(viewer_id)
         assert visitors.json()["items"][0]["view_count"] == 3
+
+
+async def test_page_list_filters_multiple_agents_and_fuzzy_searches_title_or_path():
+    _short_id, page_id, agent_id, owner_id, _viewer_id = await _make_restricted_page()
+    marker = uuid.uuid4().hex[:10]
+    agent_term = f"agent-{marker}"
+    title_term = f"title-{marker}"
+    path_term = f"path-{marker}"
+    async with async_session() as db:
+        agent = await db.get(Agent, agent_id)
+        page = await db.get(PublishedPage, page_id)
+        agent.name = f"Search {agent_term}"
+        page.title = f"Search {title_term}"
+        page.source_path = f"reports/{path_term}.html"
+        second_agent = Agent(
+            name=f"Second {marker}", role_description="", creator_id=owner_id,
+            tenant_id=page.tenant_id, agent_type="native",
+        )
+        db.add(second_agent)
+        await db.flush()
+        second_page = PublishedPage(
+            short_id=f"p{uuid.uuid4().hex[:7]}", agent_id=second_agent.id, user_id=owner_id,
+            tenant_id=page.tenant_id, source_path="reports/second.html", title="Second page",
+            access_mode="authenticated",
+        )
+        db.add(second_page)
+        await db.commit()
+        second_agent_id, second_page_id = second_agent.id, second_page.id
+
+    token = create_access_token(str(owner_id), "member")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for term in (title_term.upper(), path_term):
+            response = await client.get(
+                "/api/pages/mine",
+                params={"q": term},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert response.status_code == 200
+            assert any(item["id"] == str(page_id) for item in response.json()["items"])
+
+        agent_name_is_not_part_of_fuzzy_search = await client.get(
+            "/api/pages/mine",
+            params={"q": agent_term},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert agent_name_is_not_part_of_fuzzy_search.status_code == 200
+        assert agent_name_is_not_part_of_fuzzy_search.json()["total"] == 0
+
+        single_agent = await client.get(
+            "/api/pages/mine",
+            params={"agent_ids": str(agent_id)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert single_agent.status_code == 200
+        assert {item["id"] for item in single_agent.json()["items"]} == {str(page_id)}
+
+        agent_options = await client.get(
+            "/api/pages/agent-options",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert agent_options.status_code == 200
+        assert {option["id"] for option in agent_options.json()} == {
+            str(agent_id), str(second_agent_id),
+        }
+
+        legacy_single_agent = await client.get(
+            "/api/pages/mine",
+            params={"agent_id": str(agent_id)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert legacy_single_agent.status_code == 200
+        assert {item["id"] for item in legacy_single_agent.json()["items"]} == {str(page_id)}
+
+        multiple_agents = await client.get(
+            "/api/pages/mine",
+            params=[("agent_ids", str(agent_id)), ("agent_ids", str(second_agent_id))],
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert multiple_agents.status_code == 200
+        assert {item["id"] for item in multiple_agents.json()["items"]} == {
+            str(page_id), str(second_page_id),
+        }
 
 
 async def test_publish_tool_defaults_new_pages_to_authenticated_and_preserves_existing_access():

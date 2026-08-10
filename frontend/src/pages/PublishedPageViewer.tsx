@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { IconFileAlert, IconLoader2 } from '@tabler/icons-react';
 import { useParams } from 'react-router-dom';
 import {
@@ -13,7 +13,6 @@ type ViewerContext = {
     access_mode: 'authenticated' | 'restricted';
     watermark_identity: PlatformWatermarkIdentity;
     allow_top_navigation: boolean;
-    frame_token: string;
 };
 
 function retryThroughPublishedUrl(shortId: string) {
@@ -40,8 +39,6 @@ export default function PublishedPageViewer() {
     const { shortId = '' } = useParams();
     const [context, setContext] = useState<ViewerContext | null>(null);
     const [error, setError] = useState('');
-    const checkingFrameToken = useRef<string | null>(null);
-    const verifiedFrameToken = useRef<string | null>(null);
 
     useEffect(() => {
         if (!shortId) {
@@ -90,25 +87,6 @@ export default function PublishedPageViewer() {
         return capabilities.join(' ');
     }, [context?.allow_top_navigation]);
 
-    const verifyFrameLoad = async () => {
-        const frameToken = context?.frame_token;
-        if (!frameToken || checkingFrameToken.current === frameToken || verifiedFrameToken.current === frameToken) return;
-        checkingFrameToken.current = frameToken;
-        try {
-            const response = await fetch(
-                `/api/pages/${encodeURIComponent(shortId)}/frame-status?frame_token=${encodeURIComponent(frameToken)}`,
-                { credentials: 'same-origin', cache: 'no-store' },
-            );
-            if (handleViewerStatus(shortId, response.status)) return;
-            if (!response.ok) throw new Error('页面内容加载失败，请刷新后重试');
-            verifiedFrameToken.current = frameToken;
-        } catch (frameError) {
-            setError((frameError as Error).message || '页面内容暂时不可用');
-        } finally {
-            if (checkingFrameToken.current === frameToken) checkingFrameToken.current = null;
-        }
-    };
-
     if (error) {
         return (
             <main className="published-page-viewer-state" role="alert">
@@ -135,8 +113,7 @@ export default function PublishedPageViewer() {
                 className="published-page-viewer-frame"
                 title={context.title || '发布页面'}
                 sandbox={sandbox}
-                src={`/api/pages/${encodeURIComponent(shortId)}/content?frame_token=${encodeURIComponent(context.frame_token)}`}
-                onLoad={() => void verifyFrameLoad()}
+                src={`/api/pages/${encodeURIComponent(shortId)}/content`}
             />
         </main>
     );

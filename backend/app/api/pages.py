@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.config import get_settings
+from app.core.permissions import build_visible_agents_query
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
@@ -30,18 +31,12 @@ from app.models.user import Identity, User
 from app.services.notification_service import send_notification
 from app.services.org_directory import canonical_org_member_id_subquery, department_subtree_cte, same_directory_provider
 from app.services.published_page_access import (
-    PAGE_FRAME_RECEIPT_MINUTES,
     PAGE_SESSION_COOKIE,
     PAGE_SESSION_HOURS,
     can_manage_page,
     can_view_page,
-    create_page_frame_receipt,
-    create_page_frame_token,
     create_page_session,
-    page_frame_receipt_cookie_name,
     page_user_from_session,
-    verify_page_frame_receipt,
-    verify_page_frame_token,
 )
 from app.services.storage import get_storage_backend, normalize_storage_key
 
@@ -352,7 +347,6 @@ async def get_page_viewer_context(
             "primary_mobile": identity.phone if identity else None,
         },
         "allow_top_navigation": "/sdk/clawith.js" in html_content,
-        "frame_token": create_page_frame_token(page.id, user.id),
     }
 
 
@@ -360,17 +354,9 @@ async def get_page_viewer_context(
 async def get_page_viewer_content(
     short_id: str,
     request: Request,
-    frame_token: str = Query(..., min_length=1),
     db: AsyncSession = Depends(get_db),
 ):
-    # This is a browser-renderable internal resource. Require both an iframe
-    # navigation and the short-lived token issued to the authorized Viewer.
-    fetch_destination = request.headers.get("sec-fetch-dest", "").lower()
-    if fetch_destination != "iframe":
-        raise HTTPException(status_code=404, detail="Protected page content not found")
     page, user = await _protected_viewer_page(short_id, request, db)
-    if not verify_page_frame_token(frame_token, page.id, user.id):
-        raise HTTPException(status_code=404, detail="Protected page content not found")
     storage = get_storage_backend()
     storage_key = _page_storage_key(page)
     if not await _page_source_exists(page):
@@ -378,7 +364,7 @@ async def get_page_viewer_content(
     html_content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
     await _record_view(db, page, user)
     await db.commit()
-    content_response = HTMLResponse(
+    return HTMLResponse(
         html_content,
         headers={
             "Cache-Control": "no-store",
@@ -390,44 +376,6 @@ async def get_page_viewer_content(
             "X-Content-Type-Options": "nosniff",
         },
     )
-    content_response.set_cookie(
-        page_frame_receipt_cookie_name(frame_token),
-        create_page_frame_receipt(frame_token, page.id, user.id),
-        max_age=PAGE_FRAME_RECEIPT_MINUTES * 60,
-        httponly=True,
-        samesite="lax",
-        secure=request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip() == "https",
-        path=f"/api/pages/{short_id}/frame-status",
-    )
-    return content_response
-
-
-@router.get("/{short_id}/frame-status")
-async def get_page_frame_status(
-    short_id: str,
-    request: Request,
-    response: Response,
-    frame_token: str = Query(..., min_length=1),
-    db: AsyncSession = Depends(get_db),
-):
-    page, user = await _protected_viewer_page(short_id, request, db)
-    if not verify_page_frame_token(frame_token, page.id, user.id):
-        raise HTTPException(status_code=409, detail="Protected page frame expired")
-    if not await _page_source_exists(page):
-        raise HTTPException(status_code=404, detail="Source file no longer exists")
-    if not verify_page_frame_receipt(
-        request.cookies.get(page_frame_receipt_cookie_name(frame_token)),
-        frame_token,
-        page.id,
-        user.id,
-    ):
-        raise HTTPException(status_code=409, detail="Protected page content did not load")
-    response.delete_cookie(
-        page_frame_receipt_cookie_name(frame_token),
-        path=f"/api/pages/{short_id}/frame-status",
-        samesite="lax",
-    )
-    return {"loaded": True}
 
 
 @router.post("/{short_id}/request-access")
@@ -591,20 +539,46 @@ async def _page_summaries(db: AsyncSession, rows: list[tuple[PublishedPage, str]
     return summaries
 
 
+@router.get("/agent-options")
+async def list_page_agent_options(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    visible_agents = (await db.scalars(
+        build_visible_agents_query(current_user, tenant_id=current_user.tenant_id)
+        .order_by(Agent.name.asc(), Agent.id.asc())
+    )).all()
+    return [{"id": str(option.id), "name": option.name} for option in visible_agents]
+
+
 @router.get("/mine")
 async def list_my_pages(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     agent_id: uuid.UUID | None = None,
+    agent_ids: list[uuid.UUID] = Query(default=[]),
+    q: str | None = Query(default=None, max_length=200),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    conditions = [
+    base_conditions = [
         or_(PublishedPage.tenant_id == current_user.tenant_id, PublishedPage.tenant_id.is_(None)),
         or_(Agent.creator_id == current_user.id, PublishedPage.user_id == current_user.id),
     ]
+    conditions = list(base_conditions)
+    selected_agent_ids = set(agent_ids)
     if agent_id:
-        conditions.append(PublishedPage.agent_id == agent_id)
+        selected_agent_ids.add(agent_id)
+    if selected_agent_ids:
+        conditions.append(PublishedPage.agent_id.in_(selected_agent_ids))
+    search_text = (q or "").strip()
+    if search_text:
+        escaped = search_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        conditions.append(or_(
+            PublishedPage.title.ilike(pattern, escape="\\"),
+            PublishedPage.source_path.ilike(pattern, escape="\\"),
+        ))
     total = await db.scalar(
         select(func.count()).select_from(PublishedPage).join(Agent, Agent.id == PublishedPage.agent_id).where(*conditions)
     )
@@ -630,6 +604,20 @@ async def get_page_detail(page_id: uuid.UUID, current_user: User = Depends(get_c
     if not page or not await can_manage_page(db, page, current_user):
         raise HTTPException(404, "Page not found")
     return await _page_detail(db, page)
+
+
+@router.delete("/{page_id}")
+async def delete_published_page(
+    page_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    page = await db.get(PublishedPage, page_id)
+    if not page or not await can_manage_page(db, page, current_user):
+        raise HTTPException(404, "Page not found")
+    await db.delete(page)
+    await db.commit()
+    return {"ok": True}
 
 
 @router.get("/{page_id}/visitors")
