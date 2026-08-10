@@ -11,7 +11,7 @@ import {
 } from '@tabler/icons-react';
 import { AtlasFrame, OriginPlate } from '../components/atlas';
 import { applyDocumentTheme, readSavedTheme } from '../utils/themeMode';
-import { isAutomaticLoginRequested, safeLoginReturnTo } from '../utils/loginReturn';
+import { isAutomaticLoginRequested, resolveLoginTenantId, safeLoginReturnTo } from '../utils/loginReturn';
 
 export default function Login() {
     const { t, i18n } = useTranslation();
@@ -44,6 +44,7 @@ export default function Login() {
     const [verificationCode, setVerificationCode] = useState('');
     const [verificationEntryMode, setVerificationEntryMode] = useState<'create' | 'join' | 'home'>('home');
     const [ssoAutoStarted, setSsoAutoStarted] = useState(false);
+    const loginTenantId = resolveLoginTenantId(requestedTenantId, tenant?.id);
 
     const [form, setForm] = useState({
         login_identifier: invitedEmail,  // Pre-fill invited email if present
@@ -122,7 +123,7 @@ export default function Login() {
 
     useEffect(() => {
         let cancelled = false;
-        const tenantId = tenant?.id || requestedTenantId;
+        const tenantId = loginTenantId;
         if (!tenantId || isRegister) {
             setSsoProviders([]);
             setSsoError('');
@@ -148,7 +149,7 @@ export default function Login() {
             });
 
         return () => { cancelled = true; };
-    }, [tenant?.id, requestedTenantId, isRegister, t]);
+    }, [loginTenantId, isRegister, t]);
 
     const finishLogin = (fallback = '/') => {
         if (returnTo) {
@@ -159,7 +160,7 @@ export default function Login() {
     };
 
     const startSsoLogin = async (providerType?: string) => {
-        const tenantId = tenant?.id || requestedTenantId;
+        const tenantId = loginTenantId;
         if (!tenantId) return;
         try {
             const res = await fetchJson<{ authorization_url?: string | null }>('/sso/start', {
@@ -295,11 +296,13 @@ export default function Login() {
                 const res = await authApi.login({
                     login_identifier: form.login_identifier,
                     password: form.password,
-                    // Only pass tenant_id for dedicated SSO subdomain login (not IP-mode SSO).
-                    // IP-mode SSO resolves a tenant for SSO buttons only and must NOT constrain
-                    // password-based login to that tenant (it would reject users from other tenants).
-                    ...(tenant?.id && tenant.sso_domain && !tenant.sso_domain.match(/^https?:\/\/\d{1,3}(\.\d{1,3}){3}(:\d+)?$/)
-                        ? { tenant_id: tenant.id }
+                    // Published-page login carries an explicit tenant and must stay in that tenant.
+                    // Otherwise only dedicated SSO domains constrain password login; IP-mode domain
+                    // discovery remains limited to SSO buttons so other-tenant users can still sign in.
+                    ...(requestedTenantId
+                        ? { tenant_id: requestedTenantId }
+                        : tenant?.id && tenant.sso_domain && !tenant.sso_domain.match(/^https?:\/\/\d{1,3}(\.\d{1,3}){3}(:\d+)?$/)
+                            ? { tenant_id: tenant.id }
                         : {}
                     ),
                 });
@@ -505,7 +508,7 @@ export default function Login() {
                         </div>
                     )}
 
-                    {(tenant?.id || requestedTenantId) && ssoProviders.length > 0 && !isRegister && !showVerification && (
+                    {loginTenantId && ssoProviders.length > 0 && !isRegister && !showVerification && (
                         <div style={{ marginBottom: '24px' }}>
                             <div style={{
                                 padding: '16px', borderRadius: '12px', background: 'rgba(59,130,246,0.08)',
@@ -513,7 +516,7 @@ export default function Login() {
                                 textAlign: 'center'
                             }}>
                                 <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--accent-primary)', marginBottom: '4px' }}>
-                                    {tenant?.name || t('auth.enterpriseLogin', 'Enterprise login')}
+                                    {(tenant?.id === loginTenantId && tenant?.name) || t('auth.enterpriseLogin', 'Enterprise login')}
                                 </div>
                                 <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
                                     {t('auth.ssoNotice', 'Enterprise SSO is enabled for this domain.')}
