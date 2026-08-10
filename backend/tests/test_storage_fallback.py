@@ -33,6 +33,9 @@ class MemoryStorageBackend(StorageBackend):
     async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
         self.files[key] = data
 
+    async def write_local_file(self, key, path, content_type=None) -> None:
+        self.files[key] = path.read_bytes()
+
     async def delete(self, key: str) -> None:
         self.files.pop(key, None)
 
@@ -84,3 +87,20 @@ async def test_fallback_storage_writes_only_to_primary():
 
     assert "agent-id/focus.md" in primary.files
     assert "agent-id/focus.md" not in fallback.files
+
+
+async def test_fallback_local_file_write_only_targets_primary(tmp_path):
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video-bytes")
+    primary = MemoryStorageBackend()
+    fallback = MemoryStorageBackend()
+    storage = FallbackStorageBackend(primary=primary, fallback=fallback)
+
+    await storage.write_local_file(
+        "agent-id/workspace/media/clip.mp4",
+        source,
+        content_type="video/mp4",
+    )
+
+    assert primary.files["agent-id/workspace/media/clip.mp4"] == b"video-bytes"
+    assert "agent-id/workspace/media/clip.mp4" not in fallback.files

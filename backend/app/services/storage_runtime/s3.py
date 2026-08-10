@@ -231,6 +231,21 @@ class S3StorageBackend(StorageBackend):
         async with self._async_client() as client:
             await client.put_object(**kwargs)
 
+    async def write_local_file(
+        self,
+        key: str,
+        path: Path,
+        content_type: str | None = None,
+    ) -> None:
+        client = self._client_or_raise()
+        await asyncio.to_thread(
+            client.upload_file,
+            str(path),
+            self.bucket,
+            self._object_key(key),
+            ExtraArgs={"ContentType": content_type or "application/octet-stream"},
+        )
+
     async def delete(self, key: str) -> None:
         async with self._async_client() as client:
             await client.delete_object(

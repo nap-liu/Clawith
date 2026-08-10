@@ -27,8 +27,11 @@ export default function ChatFileDeliveryCard({
     mode = 'pc',
     onPreviewImages,
 }: Props) {
-    const downloadUrl = agentId ? fileApi.downloadUrl(agentId, delivery.path) : '';
-    const previewUrl = agentId ? fileApi.downloadUrl(agentId, delivery.path, { inline: true }) : '';
+    const downloadUrl = delivery.url
+        || (agentId && delivery.path ? fileApi.downloadUrl(agentId, delivery.path) : '');
+    const previewUrl = agentId && delivery.path
+        ? fileApi.downloadUrl(agentId, delivery.path, { inline: true })
+        : '';
     const isImage = isImageDelivery(delivery);
     const protectImage = mode === 'h5' && isImage;
     const mediaKind = delivery.mediaKind
@@ -59,11 +62,12 @@ export default function ChatFileDeliveryCard({
                     mode={mode}
                     attachment={{
                         display_name: delivery.filename,
-                        path: delivery.path,
+                        path: delivery.path || '',
                         kind: mediaKind,
                         ...(delivery.mimeType ? { mime_type: delivery.mimeType } : {}),
                         ...(delivery.size !== undefined ? { size_bytes: delivery.size } : {}),
                     }}
+                    externalUrl={delivery.url}
                     onDownload={delivery.allowDownload && downloadUrl
                         ? () => { window.location.assign(downloadUrl); }
                         : undefined}

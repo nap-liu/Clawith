@@ -78,7 +78,7 @@ const TOOL_CALL_RENDERERS: ToolCallRendererRegistration[] = [
                 return [error.status, error.code, error.message].join('\u0000');
             }
             const item = delivery as ChatFileDelivery;
-            return [item.messageId || '', item.path, item.filename].join('\u0000');
+            return [item.messageId || '', item.path || item.url || '', item.filename].join('\u0000');
         },
     },
     {
@@ -103,7 +103,7 @@ const TOOL_CALL_RENDERERS: ToolCallRendererRegistration[] = [
         ),
         identity: (_context, delivery) => {
             const item = delivery as NonNullable<ReturnType<typeof parseFileDeliveryToolResult>>;
-            return [item.path, item.filename, item.message || ''].join('\u0000');
+            return [item.path || item.url || '', item.filename, item.message || ''].join('\u0000');
         },
     },
     {

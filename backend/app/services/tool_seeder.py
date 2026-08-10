@@ -9,6 +9,7 @@ from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
 from app.models.tool import Tool
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
+from app.services.media_tool_contract import SEND_MEDIA_TOOL_SEED
 from app.services.tool_config import meaningful_config, tenant_tool_config_key
 from app.services.tool_enablement import tool_is_required
 
@@ -873,49 +874,7 @@ BUILTIN_TOOLS = [
         "config": {},
         "config_schema": {},
     },
-    {
-        "name": "send_media",
-        "display_name": "Send Media",
-        "description": (
-            "Send one workspace audio or video file to the current conversation, "
-            "an exact existing person/group Session, or a directly resolved person. "
-            "The tool contract is always available even when the resolved IM channel "
-            "returns unsupported. Audio/video is rendered as a dedicated tool-call card."
-        ),
-        "category": "communication",
-        "icon": "🎬",
-        "is_default": True,
-        "parameters_schema": {
-            "type": "object",
-            "properties": {
-                "media_type": {"type": "string", "enum": ["audio", "video"]},
-                "file_path": {"type": "string"},
-                "cover_image_path": {"type": "string"},
-                "session_id": {"type": "string"},
-                "user_id": {"type": "string"},
-                "channel": {
-                    "type": "string",
-                    "enum": ["feishu", "dingtalk", "wecom", "slack", "teams", "discord", "whatsapp", "wechat"],
-                },
-                "message": {"type": "string"},
-            },
-            "required": ["media_type", "file_path"],
-            "not": {"required": ["session_id", "user_id"]},
-            "additionalProperties": False,
-        },
-        "config": {"allow_download": False},
-        "config_schema": {
-            "fields": [
-                {
-                    "key": "allow_download",
-                    "label": "Allow media download",
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Show the download action on send_media cards in both Web and H5 chat.",
-                }
-            ]
-        },
-    },
+    SEND_MEDIA_TOOL_SEED,
     # NOTE: send_feishu_message is defined in the 'feishu' category section below.
     # It was previously duplicated here under 'communication', which could cause
     # 'Tool names must be unique' errors when the DB lacked a UNIQUE constraint.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,6 +111,16 @@ class StorageBackend:
 
     async def write_text(self, key: str, content: str, encoding: str = "utf-8") -> None:
         await self.write_bytes(key, content.encode(encoding), content_type="text/plain; charset=utf-8")
+
+    async def write_local_file(
+        self,
+        key: str,
+        path: Path,
+        content_type: str | None = None,
+    ) -> None:
+        """Persist a local file; remote backends should override to stream uploads."""
+        data = await asyncio.to_thread(path.read_bytes)
+        await self.write_bytes(key, data, content_type=content_type)
 
     async def delete(self, key: str) -> None:
         raise NotImplementedError

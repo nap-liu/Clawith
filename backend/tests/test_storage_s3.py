@@ -116,3 +116,25 @@ async def test_s3_read_text_lines_streams_and_closes_body(monkeypatch):
         Bucket="bucket",
         Key="agents/a/report.txt",
     )
+
+
+@pytest.mark.asyncio
+async def test_s3_write_local_file_uses_streaming_upload(tmp_path, monkeypatch):
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video-bytes")
+    client = Mock()
+    backend = S3StorageBackend(bucket="bucket", prefix="agents")
+    monkeypatch.setattr(backend, "_client_or_raise", lambda: client)
+
+    await backend.write_local_file(
+        "agent-id/workspace/media/clip.mp4",
+        source,
+        content_type="video/mp4",
+    )
+
+    client.upload_file.assert_called_once_with(
+        str(source),
+        "bucket",
+        "agents/agent-id/workspace/media/clip.mp4",
+        ExtraArgs={"ContentType": "video/mp4"},
+    )

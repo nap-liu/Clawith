@@ -5,6 +5,7 @@ import pytest
 
 from app.services import agent_tools
 from app.services.llm import caller as llm_caller
+from app.services.media_tool_contract import SEND_MEDIA_PARAMETERS_SCHEMA
 from app.services.tool_seeder import BUILTIN_TOOLS
 
 
@@ -213,7 +214,7 @@ async def test_media_kind_is_checked_from_file_bytes(tmp_path, monkeypatch):
     payload = json.loads(await agent_tools._send_channel_media(
         agent_id,
         workspace,
-        {"file_path": "workspace/fake.mp4"},
+        {"file_path": "workspace/fake.mp4", "session_id": str(uuid.uuid4())},
         media_kind="video",
         tool_call_id="call-mismatch",
     ))
@@ -235,7 +236,10 @@ def test_media_tools_are_fixed_core_tools():
         if item["function"]["name"] == "send_media"
     )
     assert "allow_download" not in media_schema["properties"]
+    assert media_schema == SEND_MEDIA_PARAMETERS_SCHEMA
+    assert set(media_schema["properties"]["url_mode"]["enum"]) == {"external", "managed"}
     seeded = next(tool for tool in BUILTIN_TOOLS if tool["name"] == "send_media")
+    assert seeded["parameters_schema"] == media_schema
     assert seeded["config"] == {"allow_download": False}
     assert seeded["config_schema"]["fields"] == [{
         "key": "allow_download",
@@ -323,4 +327,140 @@ def test_media_tool_schemas_are_canonical_across_dynamic_tool_states():
     assert "CURRENT conversation" in description
     assert "session_id" in description
     assert "user_id" in description
-    assert "Groups can only be targeted with session_id" in description
+    assert "Groups require session_id" in description
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_code"),
+    [
+        ({}, "INVALID_MEDIA_SOURCE"),
+        ({"file_path": "workspace/a.mp3", "url": "https://example.com/a.mp3"}, "INVALID_MEDIA_SOURCE"),
+        ({"url": "https://example.com/a.mp3"}, "INVALID_URL_MODE"),
+        ({"url": "https://example.com/a.mp3", "url_mode": "copy"}, "INVALID_URL_MODE"),
+    ],
+)
+async def test_send_media_requires_one_explicit_source(tmp_path, arguments, expected_code):
+    payload = json.loads(await agent_tools._send_channel_media(
+        uuid.uuid4(),
+        tmp_path,
+        {**arguments, "session_id": str(uuid.uuid4())},
+        media_kind="audio",
+        tool_call_id="call-source",
+    ))
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == expected_code
+
+
+@pytest.mark.asyncio
+async def test_external_url_publishes_without_downloading(tmp_path, monkeypatch):
+    captured = {}
+
+    async def fake_validate(url, *, external):
+        assert external is True
+        return url
+
+    async def fake_publish(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"type": "platform_media_delivery", "status": "sent"})
+
+    async def fail_import(*args, **kwargs):
+        raise AssertionError("external URL must not be downloaded")
+
+    monkeypatch.setattr(agent_tools, "validate_media_url", fake_validate)
+    monkeypatch.setattr(agent_tools, "_publish_external_media_to_session", fake_publish)
+    monkeypatch.setattr(agent_tools, "import_managed_media_url", fail_import)
+    monkeypatch.setattr(agent_tools, "_get_tool_config", lambda *_args: _async_value({"allow_download": True}))
+
+    target_session = str(uuid.uuid4())
+    payload = json.loads(await agent_tools._send_channel_media(
+        uuid.uuid4(),
+        tmp_path,
+        {
+            "media_type": "video",
+            "url": "https://media.example/demo.mp4",
+            "url_mode": "external",
+            "session_id": target_session,
+        },
+        media_kind="video",
+        tool_call_id="call-external",
+    ))
+
+    assert payload["status"] == "sent"
+    assert captured["media_url"] == "https://media.example/demo.mp4"
+    assert captured["session_id"] == target_session
+    assert captured["allow_download"] is True
+
+
+@pytest.mark.asyncio
+async def test_managed_url_replay_returns_before_preflight_or_download(tmp_path, monkeypatch):
+    async def fake_replay(**_kwargs):
+        return {
+            "type": "platform_media_delivery",
+            "status": "already_sent",
+            "code": "MEDIA_ALREADY_SENT",
+        }
+
+    async def should_not_run(**_kwargs):
+        raise AssertionError("terminal replay must not preflight or download")
+
+    monkeypatch.setattr(agent_tools, "_replay_terminal_media_delivery", fake_replay)
+    monkeypatch.setattr(agent_tools, "_preflight_managed_media_target", should_not_run)
+    monkeypatch.setattr(agent_tools, "import_managed_media_url", should_not_run)
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        uuid.uuid4(),
+        tmp_path,
+        {
+            "url": "https://expired.example/audio.mp3",
+            "url_mode": "managed",
+            "session_id": str(uuid.uuid4()),
+        },
+        media_kind="audio",
+        tool_call_id="call-replay",
+        origin_session_id=str(uuid.uuid4()),
+    ))
+
+    assert payload["status"] == "already_sent"
+
+
+@pytest.mark.asyncio
+async def test_managed_url_invalid_target_is_rejected_before_download(tmp_path, monkeypatch):
+    async def no_replay(**_kwargs):
+        return None
+
+    async def fake_preflight(**_kwargs):
+        return {
+            "type": "media_delivery_result",
+            "version": 1,
+            "status": "failed",
+            "code": "SESSION_NOT_FOUND_OR_FORBIDDEN",
+            "media_kind": "audio",
+        }
+
+    async def should_not_download(*_args, **_kwargs):
+        raise AssertionError("invalid target must not download")
+
+    monkeypatch.setattr(agent_tools, "_replay_terminal_media_delivery", no_replay)
+    monkeypatch.setattr(agent_tools, "_preflight_managed_media_target", fake_preflight)
+    monkeypatch.setattr(agent_tools, "import_managed_media_url", should_not_download)
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        uuid.uuid4(),
+        tmp_path,
+        {
+            "url": "https://media.example/audio.mp3",
+            "url_mode": "managed",
+            "session_id": str(uuid.uuid4()),
+        },
+        media_kind="audio",
+        tool_call_id="call-invalid-target",
+    ))
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == "SESSION_NOT_FOUND_OR_FORBIDDEN"
+
+
+async def _async_value(value):
+    return value
