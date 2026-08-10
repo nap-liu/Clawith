@@ -1,6 +1,8 @@
 export type ChatFileDelivery = {
     id: string;
-    path: string;
+    path?: string;
+    url?: string;
+    sourceMode?: 'workspace' | 'managed_url' | 'external_url';
     filename: string;
     message?: string;
     mimeType?: string;
@@ -57,6 +59,17 @@ function basename(path: string) {
     return path.split('/').filter(Boolean).pop() || 'download';
 }
 
+function normalizeExternalMediaUrl(rawUrl: any): string | null {
+    if (typeof rawUrl !== 'string' || !rawUrl.trim()) return null;
+    try {
+        const url = new URL(rawUrl.trim());
+        if (url.protocol !== 'https:' || url.username || url.password) return null;
+        return url.toString();
+    } catch {
+        return null;
+    }
+}
+
 function normalizeFilename(rawFilename: any, path: string) {
     const value = typeof rawFilename === 'string' && rawFilename.trim()
         ? rawFilename.trim().replace(/\\/g, '/')
@@ -72,9 +85,14 @@ function normalizeSize(value: any) {
 function buildDelivery(payload: Record<string, any>, toolArgs: any, toolCallId?: string): ChatFileDelivery | null {
     const args = toRecord(toolArgs);
     const path = normalizePlatformFilePath(firstString(payload.path, payload.file_path, args.file_path));
-    if (!path) return null;
-    const filename = normalizeFilename(firstString(payload.filename, args.filename), path);
-    const id = toolCallId || `${path}:${filename}`;
+    const sourceMode = firstString(payload.source_mode, payload.sourceMode);
+    const url = sourceMode === 'external_url'
+        ? normalizeExternalMediaUrl(firstString(payload.url, args.url))
+        : null;
+    if (!path && !url) return null;
+    const sourceIdentity = path || url || '';
+    const filename = normalizeFilename(firstString(payload.filename, args.filename), sourceIdentity);
+    const id = toolCallId || `${sourceIdentity}:${filename}`;
     const message = firstString(payload.message);
     const mimeType = firstString(payload.mime_type, payload.mimeType);
     const size = normalizeSize(payload.size);
@@ -89,7 +107,11 @@ function buildDelivery(payload: Record<string, any>, toolArgs: any, toolCallId?:
     const allowDownload = payload.allow_download === true || payload.allowDownload === true;
     return {
         id,
-        path,
+        ...(path ? { path } : {}),
+        ...(url ? { url } : {}),
+        ...(sourceMode === 'external_url' || sourceMode === 'managed_url' || sourceMode === 'workspace'
+            ? { sourceMode }
+            : {}),
         filename,
         ...(message ? { message } : {}),
         ...(mimeType ? { mimeType } : {}),

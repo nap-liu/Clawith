@@ -85,6 +85,14 @@ class FallbackStorageBackend(StorageBackend):
     async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
         await self.primary.write_bytes(key, data, content_type=content_type)
 
+    async def write_local_file(
+        self,
+        key: str,
+        path: Path,
+        content_type: str | None = None,
+    ) -> None:
+        await self.primary.write_local_file(key, path, content_type=content_type)
+
     async def delete(self, key: str) -> None:
         await self.primary.delete(key)
         await self.fallback.delete(key)

@@ -34,6 +34,14 @@ const fileDeliveryPath = resolve(__dirname, '../src/utils/chatFileDelivery.ts');
 const fileDeliveryModule = compileTsModule(fileDeliveryPath);
 const { parseFileDeliveryToolResult, parseMediaDeliveryErrorResult } = fileDeliveryModule.exports;
 
+const mediaCardSource = readFileSync(
+    resolve(__dirname, '../src/components/ChatMediaCard.tsx'),
+    'utf8',
+);
+assert.match(mediaCardSource, /externalStarted\s*&&\s*mediaRef\.current/);
+assert.match(mediaCardSource, /mediaRef\.current\.load\(\)/);
+assert.match(mediaCardSource, /manual\)\s*void mediaRef\.current\.play\(\)/);
+
 const sourcePath = resolve(__dirname, '../src/pages/h5/chatTimeline.ts');
 const timelineRequire = (id) => {
     if (id === '../../utils/chatFileDelivery') return fileDeliveryModule.exports;
@@ -138,6 +146,45 @@ const {
     assert.equal(delivery.mediaKind, 'video');
     assert.equal(delivery.messageId, 'tool-message-1');
     assert.equal(delivery.allowDownload, true);
+}
+
+{
+    const delivery = parseFileDeliveryToolResult(
+        'send_media',
+        JSON.stringify({
+            type: 'platform_media_delivery',
+            version: 1,
+            status: 'sent',
+            media_kind: 'audio',
+            source_mode: 'external_url',
+            url: 'https://media.example/voice.mp3?token=temporary',
+            filename: 'voice.mp3',
+            message_id: 'tool-message-external',
+            allow_download: false,
+        }),
+        {},
+        'media-delivery:external',
+    );
+    assert.equal(delivery.mediaKind, 'audio');
+    assert.equal(delivery.path, undefined);
+    assert.equal(delivery.url, 'https://media.example/voice.mp3?token=temporary');
+    assert.equal(delivery.sourceMode, 'external_url');
+    assert.equal(delivery.allowDownload, false);
+}
+
+{
+    const delivery = parseFileDeliveryToolResult(
+        'send_media',
+        JSON.stringify({
+            type: 'platform_media_delivery',
+            status: 'sent',
+            media_kind: 'video',
+            source_mode: 'external_url',
+            url: 'http://media.example/demo.mp4',
+            filename: 'demo.mp4',
+        }),
+    );
+    assert.equal(delivery, null);
 }
 
 {

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
+import shutil
 
 import aiofiles
 from fastapi import HTTPException, status
@@ -99,6 +101,23 @@ class LocalStorageBackend(StorageBackend):
         path.parent.mkdir(parents=True, exist_ok=True)
         async with aiofiles.open(path, "wb") as f:
             await f.write(data)
+
+    async def write_local_file(
+        self,
+        key: str,
+        path: Path,
+        content_type: str | None = None,
+    ) -> None:
+        target = self._full_path(key)
+        if path.resolve() == target.resolve():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(f".{target.name}.importing")
+        try:
+            await asyncio.to_thread(shutil.copyfile, path, partial)
+            await asyncio.to_thread(os.replace, partial, target)
+        finally:
+            partial.unlink(missing_ok=True)
 
     async def delete(self, key: str) -> None:
         path = self._full_path(key)

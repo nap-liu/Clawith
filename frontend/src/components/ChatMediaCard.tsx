@@ -11,6 +11,7 @@ type Props = {
     agentId: string;
     messageId: string;
     attachment: ChatMessageAttachment;
+    externalUrl?: string;
     mode?: 'pc' | 'h5';
     onDownload?: () => void;
     onUnavailable?: () => void;
@@ -30,6 +31,7 @@ export default function ChatMediaCard({
     agentId,
     messageId,
     attachment,
+    externalUrl,
     mode = 'pc',
     onDownload,
     onUnavailable,
@@ -39,12 +41,25 @@ export default function ChatMediaCard({
     const automaticRecoveryCountRef = useRef(0);
     const resumeAtRef = useRef(0);
     const [ticket, setTicket] = useState<Ticket | null>(null);
+    const [externalStarted, setExternalStarted] = useState(false);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState('');
 
     const requestPlayback = useCallback(async (resumeAt = 0, manual = false) => {
-        if (!agentId || loading) return;
+        if (loading) return;
         if (manual) automaticRecoveryCountRef.current = 0;
+        if (externalUrl) {
+            resumeAtRef.current = resumeAt;
+            setError('');
+            if (externalStarted && mediaRef.current) {
+                mediaRef.current.load();
+                if (manual) void mediaRef.current.play().catch(() => undefined);
+                return;
+            }
+            setExternalStarted(true);
+            return;
+        }
+        if (!agentId || !attachment.path) return;
         setLoading(true);
         setError('');
         try {
@@ -57,11 +72,15 @@ export default function ChatMediaCard({
         } finally {
             setLoading(false);
         }
-    }, [agentId, attachment.path, loading, messageId, onUnavailable]);
+    }, [agentId, attachment.path, externalStarted, externalUrl, loading, messageId, onUnavailable]);
 
     const handleMediaError = useCallback(async () => {
         const media = mediaRef.current;
         const resumeAt = media?.currentTime || 0;
+        if (externalUrl) {
+            setError('第三方媒体暂时无法播放，请检查源地址或稍后重试');
+            return;
+        }
         if (!ticket || recoveryRef.current || automaticRecoveryCountRef.current >= 1) {
             setError('播放中断，请重新加载');
             return;
@@ -85,7 +104,7 @@ export default function ChatMediaCard({
         } finally {
             recoveryRef.current = false;
         }
-    }, [agentId, requestPlayback, ticket]);
+    }, [agentId, externalUrl, requestPlayback, ticket]);
 
     const handleLoadedMetadata = useCallback(() => {
         const media = mediaRef.current;
@@ -104,6 +123,11 @@ export default function ChatMediaCard({
         setError('');
     }, []);
 
+    const setMediaElement = useCallback((node: HTMLMediaElement | null) => {
+        mediaRef.current = node;
+        if (node && externalUrl) node.setAttribute('referrerpolicy', 'no-referrer');
+    }, [externalUrl]);
+
     useEffect(() => () => {
         if (mediaRef.current) {
             mediaRef.current.pause();
@@ -117,6 +141,7 @@ export default function ChatMediaCard({
         attachment.mime_type || '',
     ].filter(Boolean).join(' · ');
     const isVideo = attachment.kind === 'video';
+    const playbackUrl = externalUrl && externalStarted ? externalUrl : ticket?.playback_url;
 
     return (
         <section className={`chat-media-card chat-media-card--${mode} chat-media-card--${attachment.kind}`}>
@@ -140,13 +165,14 @@ export default function ChatMediaCard({
                 ) : null}
             </div>
 
-            {ticket ? (
+            {playbackUrl ? (
                 isVideo ? (
                     <video
-                        ref={(node) => { mediaRef.current = node; }}
+                        ref={setMediaElement}
                         className="chat-media-card__video"
-                        src={ticket.playback_url}
+                        src={playbackUrl}
                         controls
+                        controlsList={onDownload ? undefined : 'nodownload'}
                         playsInline
                         preload="metadata"
                         onError={() => void handleMediaError()}
@@ -155,10 +181,11 @@ export default function ChatMediaCard({
                     />
                 ) : (
                     <audio
-                        ref={(node) => { mediaRef.current = node; }}
+                        ref={setMediaElement}
                         className="chat-media-card__audio"
-                        src={ticket.playback_url}
+                        src={playbackUrl}
                         controls
+                        controlsList={onDownload ? undefined : 'nodownload'}
                         preload="metadata"
                         onError={() => void handleMediaError()}
                         onLoadedMetadata={handleLoadedMetadata}

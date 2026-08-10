@@ -23,6 +23,10 @@ NOISY_CONNECTION_LOGGERS = {
     "uvicorn.protocols.websockets.websockets_impl": logging.WARNING,
     # Supress "Failed to parse headers" warning from urllib3 when interacting with MinIO.
     "urllib3.connection": logging.ERROR,
+    # httpx/httpcore INFO request lines include the complete URL, including
+    # signed query parameters. Warnings and errors remain observable.
+    "httpx": logging.WARNING,
+    "httpcore": logging.WARNING,
 }
 
 

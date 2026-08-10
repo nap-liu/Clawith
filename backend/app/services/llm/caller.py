@@ -536,8 +536,42 @@ def _coerce_uuid(value) -> uuid.UUID | None:
 _SENSITIVE_RESULT_TOOLS = {"list_installed_mcp_servers"}
 
 
+def _observable_tool_args(tool_name: str, args: dict[str, Any]) -> str:
+    """Return useful tool-call metadata without logging private media URLs."""
+    if tool_name != "send_media":
+        return json.dumps(args, ensure_ascii=False, default=str)
+    summary = {
+        "keys": sorted(str(key) for key in args),
+        "media_type": args.get("media_type"),
+        "source": "url" if args.get("url") else "file_path" if args.get("file_path") else None,
+        "url_mode": args.get("url_mode"),
+        "has_session_id": bool(args.get("session_id")),
+        "has_user_id": bool(args.get("user_id")),
+        "channel": args.get("channel"),
+        "has_message": bool(args.get("message")),
+        "has_cover_image_path": bool(args.get("cover_image_path")),
+    }
+    return json.dumps(summary, ensure_ascii=False, default=str)
+
+
 def _observable_tool_result(tool_name: str, result: str) -> str:
     """Mask credential values while preserving the complete diagnostic shape."""
+    if tool_name == "send_media":
+        try:
+            payload = json.loads(result)
+            if not isinstance(payload, dict):
+                return "{\"type\": \"media_delivery_result\", \"status\": \"unparseable\"}"
+            safe_keys = (
+                "type", "version", "status", "code", "media_kind",
+                "source_mode", "channel", "http_status", "actual_kind",
+                "size", "mime_type", "caption_sent",
+            )
+            summary = {key: payload[key] for key in safe_keys if key in payload}
+            summary["has_url"] = bool(payload.get("url"))
+            summary["has_path"] = bool(payload.get("path") or payload.get("managed_path"))
+            return json.dumps(summary, ensure_ascii=False, default=str)
+        except Exception:
+            return "{\"type\": \"media_delivery_result\", \"status\": \"unparseable\"}"
     if tool_name not in _SENSITIVE_RESULT_TOOLS:
         return result
     try:
@@ -964,11 +998,9 @@ async def _process_tool_call(
     turn_anchor_id: uuid.UUID | None = None,
 ) -> str:
     """Process a single tool call and return result."""
-    raw_args = tc["function"].get("arguments", "{}")
-    logger.info(f"[LLM] Calling tool: {tc['function']['name']}({json.dumps(raw_args, ensure_ascii=False)[:100]})")
-
     args = _canonicalize_tc_arguments(tc, session_id)
     tool_name = tc["function"]["name"]
+    logger.info(f"[LLM] Calling tool: {tool_name}({_observable_tool_args(tool_name, args)[:500]})")
 
     # Guard: check if tool requires arguments
     should_execute, error_msg = _check_tool_requires_args(tool_name, args)
@@ -1081,7 +1113,7 @@ async def _process_tool_call(
         "call_id": tc.get("id", ""),
         "args": args,
         "status": "done",
-        "result": _observable_tool_result(tool_name, llm_view),
+        "result": llm_view,
         "reasoning_content": full_reasoning_content,
     }
     if _send_media_result_is_durable_in_current_session(
