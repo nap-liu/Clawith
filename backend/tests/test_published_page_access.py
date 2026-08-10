@@ -1,3 +1,4 @@
+import asyncio
 import pathlib
 import uuid
 from datetime import datetime, timezone
@@ -30,7 +31,7 @@ from app.services.agent_tools import (
     _search_page_viewers,
     _update_published_page_access,
 )
-from app.services.published_page_access import PAGE_SESSION_COOKIE, create_page_session
+from app.services.published_page_access import PAGE_SESSION_COOKIE, create_page_frame_token, create_page_session
 from app.services.tool_seeder import BUILTIN_TOOLS
 
 
@@ -123,10 +124,41 @@ async def test_protected_page_uses_frontend_access_route_and_returns_after_appro
         context = await client.get(f"/api/pages/{short_id}/viewer-context")
         assert context.status_code == 200
         assert context.json()["watermark_identity"]["display_name"] == "Viewer"
-        content = await client.get(f"/api/pages/{short_id}/content")
+        assert context.json()["allow_top_navigation"] is False
+        frame_token = context.json()["frame_token"]
+        missing_destination = await client.get(
+            f"/api/pages/{short_id}/content?frame_token={frame_token}",
+        )
+        assert missing_destination.status_code == 404
+        direct_content = await client.get(
+            f"/api/pages/{short_id}/content?frame_token={frame_token}",
+            headers={"Sec-Fetch-Dest": "document"},
+        )
+        assert direct_content.status_code == 404
+        wrong_page_token = create_page_frame_token(uuid.uuid4(), viewer_id)
+        wrong_page = await client.get(
+            f"/api/pages/{short_id}/content?frame_token={wrong_page_token}",
+            headers={"Sec-Fetch-Dest": "iframe"},
+        )
+        assert wrong_page.status_code == 404
+        before_content = await client.get(
+            f"/api/pages/{short_id}/frame-status?frame_token={frame_token}",
+        )
+        assert before_content.status_code == 409
+        content = await client.get(
+            f"/api/pages/{short_id}/content?frame_token={frame_token}",
+            headers={"Sec-Fetch-Dest": "iframe"},
+        )
         assert content.status_code == 200
-        assert content.headers["content-type"].startswith("text/plain")
+        assert content.headers["content-type"].startswith("text/html")
+        assert content.headers["cache-control"] == "no-store"
+        assert content.headers["content-security-policy"] == "frame-ancestors 'self'"
         assert "secret" in content.text
+        frame_status = await client.get(
+            f"/api/pages/{short_id}/frame-status?frame_token={frame_token}",
+        )
+        assert frame_status.status_code == 200
+        assert frame_status.json() == {"loaded": True}
 
         cleared = await client.delete("/api/pages/session")
         assert cleared.status_code == 200
@@ -140,6 +172,37 @@ async def test_protected_page_uses_frontend_access_route_and_returns_after_appro
         ))
         assert visitor is not None
         assert visitor.view_count == 1
+
+
+async def test_frame_receipts_are_isolated_for_concurrent_tabs():
+    short_id, page_id, _agent_id, _owner_id, viewer_id = await _make_restricted_page()
+    async with async_session() as db:
+        db.add(PublishedPageAccess(page_id=page_id, user_id=viewer_id, status="approved"))
+        await db.commit()
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        client.cookies.set(PAGE_SESSION_COOKIE, create_page_session(viewer_id), path="/")
+        first_context, second_context = await asyncio.gather(
+            client.get(f"/api/pages/{short_id}/viewer-context"),
+            client.get(f"/api/pages/{short_id}/viewer-context"),
+        )
+        first_token = first_context.json()["frame_token"]
+        second_token = second_context.json()["frame_token"]
+        assert first_token != second_token
+
+        for frame_token in (first_token, second_token):
+            content = await client.get(
+                f"/api/pages/{short_id}/content?frame_token={frame_token}",
+                headers={"Sec-Fetch-Dest": "iframe"},
+            )
+            assert content.status_code == 200
+
+        for frame_token in (first_token, second_token):
+            status = await client.get(
+                f"/api/pages/{short_id}/frame-status?frame_token={frame_token}",
+            )
+            assert status.status_code == 200
 
 
 async def test_access_request_is_idempotent_and_notifies_publisher():
@@ -196,9 +259,36 @@ async def test_public_and_authenticated_modes_keep_expected_access_boundaries():
         authenticated = await client.get(f"/p/{short_id}")
         assert authenticated.status_code == 200
         assert authenticated.headers["x-accel-redirect"] == "/__published_page_viewer"
-        content = await client.get(f"/api/pages/{short_id}/content")
+        context = await client.get(f"/api/pages/{short_id}/viewer-context")
+        content = await client.get(
+            f"/api/pages/{short_id}/content?frame_token={context.json()['frame_token']}",
+            headers={"Sec-Fetch-Dest": "iframe"},
+        )
         assert content.status_code == 200
         assert content.text == "<h1>secret</h1>"
+
+
+async def test_missing_page_and_source_use_the_frontend_unavailable_page():
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        missing = await client.get("/p/missing-page", follow_redirects=False)
+        assert missing.status_code == 302
+        assert missing.headers["location"] == "/published-page-unavailable"
+
+    short_id, _page_id, agent_id, _owner_id, _viewer_id = await _make_restricted_page()
+    source = pathlib.Path(settings.AGENT_DATA_DIR) / str(agent_id) / "out" / "protected.html"
+    source.unlink()
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        unavailable = await client.get(f"/p/{short_id}", follow_redirects=False)
+        assert unavailable.status_code == 302
+        assert unavailable.headers["location"] == "/published-page-unavailable"
+        viewer_token = create_access_token(str(_viewer_id), "member")
+        bridge = await client.post(
+            "/api/pages/session",
+            json={"short_id": short_id},
+            headers={"Authorization": f"Bearer {viewer_token}"},
+        )
+        assert bridge.status_code == 404
 
 
 async def test_public_anonymous_visits_are_aggregated_by_platform_cookie():

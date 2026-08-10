@@ -1,5 +1,7 @@
 """Small shared helpers for published-page authorization."""
 
+import hashlib
+import hmac
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +17,9 @@ from app.models.user import User
 
 PAGE_SESSION_COOKIE = "published_page_session"
 PAGE_SESSION_HOURS = 12
+PAGE_FRAME_TOKEN_MINUTES = 10
+PAGE_FRAME_RECEIPT_COOKIE_PREFIX = "published_page_frame_receipt_"
+PAGE_FRAME_RECEIPT_MINUTES = PAGE_FRAME_TOKEN_MINUTES
 
 
 def create_page_session(user_id: uuid.UUID) -> str:
@@ -40,6 +45,74 @@ def decode_page_session(token: str | None) -> uuid.UUID | None:
         return uuid.UUID(payload["sub"])
     except (JWTError, KeyError, TypeError, ValueError):
         return None
+
+
+def create_page_frame_token(page_id: uuid.UUID, user_id: uuid.UUID) -> str:
+    return jwt.encode(
+        {
+            "sub": str(user_id),
+            "page_id": str(page_id),
+            "jti": str(uuid.uuid4()),
+            "typ": "published_page_frame",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=PAGE_FRAME_TOKEN_MINUTES),
+        },
+        get_settings().SECRET_KEY,
+        algorithm="HS256",
+    )
+
+
+def verify_page_frame_token(token: str | None, page_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    if not token:
+        return False
+    try:
+        payload = jwt.decode(token, get_settings().SECRET_KEY, algorithms=["HS256"])
+        return (
+            payload.get("typ") == "published_page_frame"
+            and uuid.UUID(payload["page_id"]) == page_id
+            and uuid.UUID(payload["sub"]) == user_id
+        )
+    except (JWTError, KeyError, TypeError, ValueError):
+        return False
+
+
+def create_page_frame_receipt(frame_token: str, page_id: uuid.UUID, user_id: uuid.UUID) -> str:
+    return jwt.encode(
+        {
+            "sub": str(user_id),
+            "page_id": str(page_id),
+            "frame_hash": hashlib.sha256(frame_token.encode()).hexdigest(),
+            "typ": "published_page_frame_receipt",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=PAGE_FRAME_RECEIPT_MINUTES),
+        },
+        get_settings().SECRET_KEY,
+        algorithm="HS256",
+    )
+
+
+def page_frame_receipt_cookie_name(frame_token: str) -> str:
+    token_key = hashlib.sha256(frame_token.encode()).hexdigest()[:16]
+    return f"{PAGE_FRAME_RECEIPT_COOKIE_PREFIX}{token_key}"
+
+
+def verify_page_frame_receipt(
+    receipt: str | None,
+    frame_token: str,
+    page_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> bool:
+    if not receipt:
+        return False
+    try:
+        payload = jwt.decode(receipt, get_settings().SECRET_KEY, algorithms=["HS256"])
+        expected_hash = hashlib.sha256(frame_token.encode()).hexdigest()
+        return (
+            payload.get("typ") == "published_page_frame_receipt"
+            and uuid.UUID(payload["page_id"]) == page_id
+            and uuid.UUID(payload["sub"]) == user_id
+            and hmac.compare_digest(str(payload.get("frame_hash", "")), expected_hash)
+        )
+    except (JWTError, KeyError, TypeError, ValueError):
+        return False
 
 
 async def page_user_from_session(db: AsyncSession, token: str | None) -> User | None:

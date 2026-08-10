@@ -39,7 +39,13 @@ export default function PublishedPageAccess() {
         }).then(result => {
             if (result.allowed) window.location.replace(returnTo);
             else setAccess(result);
-        }).catch((e: any) => setError(e.message || '暂时无法验证访问权限'));
+        }).catch((e: any) => {
+            if (e.status === 404 || e.status === 410) {
+                window.location.replace('/published-page-unavailable');
+                return;
+            }
+            setError(e.message || '暂时无法验证访问权限');
+        });
     }, [automaticLogin, requestedSso, returnTo, shortId, tenantId]);
 
     const requestAccess = async () => {
@@ -55,11 +61,11 @@ export default function PublishedPageAccess() {
     return <main style={shell}>
         <IconAlertTriangle size={32} color="var(--warning, #d97706)" />
         <h1 style={{ fontSize: 21, margin: '14px 0 4px' }}>无权访问此页面</h1>
-        <p style={{ color: 'var(--text-tertiary)', fontSize: 14 }}>{access?.title || '该页面'} 仅对指定人员开放。</p>
-        {access?.access_mode === 'restricted' && <button className="btn btn-primary" disabled={requesting || access.request_pending} onClick={requestAccess}>
+        <p style={{ color: 'var(--text-tertiary)', fontSize: 14, lineHeight: 1.6 }}>{access?.title || '该页面'} 仅对指定人员开放。</p>
+        {access?.access_mode === 'restricted' && <button className="btn btn-primary" style={{ marginTop: 20 }} disabled={requesting || access.request_pending} onClick={requestAccess}>
             {access.request_pending ? '已申请，请等待发布者处理' : requesting ? '正在申请…' : '申请访问权限'}
         </button>}
-        {error && <p style={{ color: 'var(--error)', fontSize: 13 }}>{error}</p>}
+        {error && <p style={{ color: 'var(--error)', fontSize: 13, marginTop: 16 }}>{error}</p>}
     </main>;
 }
 

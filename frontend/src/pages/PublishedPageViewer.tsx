@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { IconFileAlert, IconLoader2 } from '@tabler/icons-react';
 import { useParams } from 'react-router-dom';
 import {
@@ -12,17 +12,36 @@ type ViewerContext = {
     title: string;
     access_mode: 'authenticated' | 'restricted';
     watermark_identity: PlatformWatermarkIdentity;
+    allow_top_navigation: boolean;
+    frame_token: string;
 };
 
 function retryThroughPublishedUrl(shortId: string) {
     window.location.replace(`/p/${encodeURIComponent(shortId)}${window.location.search}${window.location.hash}`);
 }
 
+function showUnavailablePage() {
+    window.location.replace('/published-page-unavailable');
+}
+
+function handleViewerStatus(shortId: string, status: number): boolean {
+    if (status === 401 || status === 403) {
+        retryThroughPublishedUrl(shortId);
+        return true;
+    }
+    if (status === 404 || status === 410) {
+        showUnavailablePage();
+        return true;
+    }
+    return false;
+}
+
 export default function PublishedPageViewer() {
     const { shortId = '' } = useParams();
     const [context, setContext] = useState<ViewerContext | null>(null);
-    const [html, setHtml] = useState<string | null>(null);
     const [error, setError] = useState('');
+    const checkingFrameToken = useRef<string | null>(null);
+    const verifiedFrameToken = useRef<string | null>(null);
 
     useEffect(() => {
         if (!shortId) {
@@ -36,25 +55,11 @@ export default function PublishedPageViewer() {
                     `/api/pages/${encodeURIComponent(shortId)}/viewer-context`,
                     { credentials: 'same-origin', cache: 'no-store', signal: controller.signal },
                 );
-                if (contextResponse.status === 401 || contextResponse.status === 403) {
-                    retryThroughPublishedUrl(shortId);
-                    return;
-                }
+                if (handleViewerStatus(shortId, contextResponse.status)) return;
                 if (!contextResponse.ok) throw new Error('暂时无法打开这个页面');
                 const viewerContext = await contextResponse.json() as ViewerContext;
                 setContext(viewerContext);
                 document.title = viewerContext.title;
-
-                const contentResponse = await fetch(
-                    `/api/pages/${encodeURIComponent(shortId)}/content`,
-                    { credentials: 'same-origin', cache: 'no-store', signal: controller.signal },
-                );
-                if (contentResponse.status === 401 || contentResponse.status === 403) {
-                    retryThroughPublishedUrl(shortId);
-                    return;
-                }
-                if (!contentResponse.ok) throw new Error('页面内容暂时不可用');
-                setHtml(await contentResponse.text());
             } catch (loadError) {
                 if ((loadError as Error).name !== 'AbortError') {
                     setError((loadError as Error).message || '暂时无法打开这个页面');
@@ -81,9 +86,28 @@ export default function PublishedPageViewer() {
 
     const sandbox = useMemo(() => {
         const capabilities = ['allow-scripts', 'allow-forms', 'allow-popups', 'allow-modals', 'allow-downloads'];
-        if (html?.includes('/sdk/clawith.js')) capabilities.push('allow-top-navigation');
+        if (context?.allow_top_navigation) capabilities.push('allow-top-navigation');
         return capabilities.join(' ');
-    }, [html]);
+    }, [context?.allow_top_navigation]);
+
+    const verifyFrameLoad = async () => {
+        const frameToken = context?.frame_token;
+        if (!frameToken || checkingFrameToken.current === frameToken || verifiedFrameToken.current === frameToken) return;
+        checkingFrameToken.current = frameToken;
+        try {
+            const response = await fetch(
+                `/api/pages/${encodeURIComponent(shortId)}/frame-status?frame_token=${encodeURIComponent(frameToken)}`,
+                { credentials: 'same-origin', cache: 'no-store' },
+            );
+            if (handleViewerStatus(shortId, response.status)) return;
+            if (!response.ok) throw new Error('页面内容加载失败，请刷新后重试');
+            verifiedFrameToken.current = frameToken;
+        } catch (frameError) {
+            setError((frameError as Error).message || '页面内容暂时不可用');
+        } finally {
+            if (checkingFrameToken.current === frameToken) checkingFrameToken.current = null;
+        }
+    };
 
     if (error) {
         return (
@@ -96,7 +120,7 @@ export default function PublishedPageViewer() {
         );
     }
 
-    if (html === null) {
+    if (context === null) {
         return (
             <main className="published-page-viewer-state" aria-live="polite">
                 <IconLoader2 className="published-page-viewer-spinner" size={26} aria-hidden="true" />
@@ -109,9 +133,10 @@ export default function PublishedPageViewer() {
         <main className="published-page-viewer">
             <iframe
                 className="published-page-viewer-frame"
-                title={context?.title || '发布页面'}
+                title={context.title || '发布页面'}
                 sandbox={sandbox}
-                srcDoc={html}
+                src={`/api/pages/${encodeURIComponent(shortId)}/content?frame_token=${encodeURIComponent(context.frame_token)}`}
+                onLoad={() => void verifyFrameLoad()}
             />
         </main>
     );

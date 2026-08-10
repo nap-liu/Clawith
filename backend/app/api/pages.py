@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import String, and_, func, literal, or_, select, union_all, update
 from sqlalchemy.dialects.postgresql import insert
@@ -30,12 +30,18 @@ from app.models.user import Identity, User
 from app.services.notification_service import send_notification
 from app.services.org_directory import canonical_org_member_id_subquery, department_subtree_cte, same_directory_provider
 from app.services.published_page_access import (
+    PAGE_FRAME_RECEIPT_MINUTES,
     PAGE_SESSION_COOKIE,
     PAGE_SESSION_HOURS,
     can_manage_page,
     can_view_page,
+    create_page_frame_receipt,
+    create_page_frame_token,
     create_page_session,
+    page_frame_receipt_cookie_name,
     page_user_from_session,
+    verify_page_frame_receipt,
+    verify_page_frame_token,
 )
 from app.services.storage import get_storage_backend, normalize_storage_key
 
@@ -45,6 +51,7 @@ PUBLIC_VISITOR_COOKIE = "published_page_visitor"
 PUBLIC_VISITOR_COOKIE_MAX_AGE = 365 * 24 * 3600
 MAX_ANONYMOUS_VISITORS_PER_PAGE = 10_000
 ANONYMOUS_VISITOR_OVERFLOW_KEY = "0" * 64
+PUBLISHED_PAGE_UNAVAILABLE_PATH = "/published-page-unavailable"
 
 
 class PageSessionRequest(BaseModel):
@@ -78,6 +85,16 @@ def _access_ui_redirect(page: PublishedPage, request: Request, denied: bool = Fa
     if denied:
         params["denied"] = "1"
     return RedirectResponse(f"/published-page-access?{urlencode(params)}", status_code=302)
+
+
+def _page_storage_key(page: PublishedPage) -> str:
+    return normalize_storage_key(f"{page.agent_id}/{page.source_path}")
+
+
+async def _page_source_exists(page: PublishedPage) -> bool:
+    storage = get_storage_backend()
+    storage_key = _page_storage_key(page)
+    return await storage.exists(storage_key) and await storage.is_file(storage_key)
 
 
 def _anonymous_visitor(request: Request, page_id: uuid.UUID) -> tuple[str, str | None]:
@@ -188,18 +205,18 @@ async def _record_view(
 async def render_page(short_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     page = await db.scalar(select(PublishedPage).where(PublishedPage.short_id == short_id))
     if not page:
-        raise HTTPException(status_code=404, detail="Page not found")
+        return RedirectResponse(PUBLISHED_PAGE_UNAVAILABLE_PATH, status_code=302)
+
+    storage = get_storage_backend()
+    storage_key = _page_storage_key(page)
+    if not await _page_source_exists(page):
+        return RedirectResponse(PUBLISHED_PAGE_UNAVAILABLE_PATH, status_code=302)
 
     user = await page_user_from_session(db, request.cookies.get(PAGE_SESSION_COOKIE))
     if page.access_mode != "public" and user is None:
         return _access_ui_redirect(page, request)
     if not await can_view_page(db, page, user):
         return _access_ui_redirect(page, request, denied=True)
-
-    storage = get_storage_backend()
-    storage_key = normalize_storage_key(f"{page.agent_id}/{page.source_path}")
-    if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
-        raise HTTPException(status_code=404, detail="Source file no longer exists")
 
     # Public pages intentionally keep the original direct-rendering path. This
     # preserves every existing public report's URL, document context, and HTML
@@ -266,6 +283,8 @@ async def create_render_session(
         raise HTTPException(404, "Page not found")
     if page.tenant_id != current_user.tenant_id:
         raise HTTPException(403, "无权访问此页面")
+    if not await _page_source_exists(page):
+        raise HTTPException(404, "Source file no longer exists")
     response.set_cookie(
         PAGE_SESSION_COOKIE,
         create_page_session(current_user.id),
@@ -318,6 +337,11 @@ async def get_page_viewer_context(
     db: AsyncSession = Depends(get_db),
 ):
     page, user = await _protected_viewer_page(short_id, request, db)
+    storage = get_storage_backend()
+    storage_key = _page_storage_key(page)
+    if not await _page_source_exists(page):
+        raise HTTPException(status_code=404, detail="Source file no longer exists")
+    html_content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
     identity = await db.get(Identity, user.identity_id) if user.identity_id else None
     return {
         "title": page.title or page.source_path,
@@ -327,29 +351,83 @@ async def get_page_viewer_context(
             "username": identity.username if identity else None,
             "primary_mobile": identity.phone if identity else None,
         },
+        "allow_top_navigation": "/sdk/clawith.js" in html_content,
+        "frame_token": create_page_frame_token(page.id, user.id),
     }
 
 
-@router.get("/{short_id}/content", response_class=PlainTextResponse)
+@router.get("/{short_id}/content", response_class=HTMLResponse)
 async def get_page_viewer_content(
     short_id: str,
     request: Request,
+    frame_token: str = Query(..., min_length=1),
     db: AsyncSession = Depends(get_db),
 ):
+    # This is a browser-renderable internal resource. Require both an iframe
+    # navigation and the short-lived token issued to the authorized Viewer.
+    fetch_destination = request.headers.get("sec-fetch-dest", "").lower()
+    if fetch_destination != "iframe":
+        raise HTTPException(status_code=404, detail="Protected page content not found")
     page, user = await _protected_viewer_page(short_id, request, db)
+    if not verify_page_frame_token(frame_token, page.id, user.id):
+        raise HTTPException(status_code=404, detail="Protected page content not found")
     storage = get_storage_backend()
-    storage_key = normalize_storage_key(f"{page.agent_id}/{page.source_path}")
-    if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
+    storage_key = _page_storage_key(page)
+    if not await _page_source_exists(page):
         raise HTTPException(status_code=404, detail="Source file no longer exists")
     html_content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
     await _record_view(db, page, user)
     await db.commit()
-    # text/plain prevents this internal API from becoming a second unwatermarked
-    # browser-renderable page. The frontend reads it as text and renders srcDoc.
-    return PlainTextResponse(
+    content_response = HTMLResponse(
         html_content,
-        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        headers={
+            "Cache-Control": "no-store",
+            # Resource origins stay unrestricted so published reports can use
+            # third-party scripts, styles, fonts, media, and API endpoints.
+            # The frontend iframe owns the execution sandbox; this header only
+            # prevents the protected document from being framed off-platform.
+            "Content-Security-Policy": "frame-ancestors 'self'",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
+    content_response.set_cookie(
+        page_frame_receipt_cookie_name(frame_token),
+        create_page_frame_receipt(frame_token, page.id, user.id),
+        max_age=PAGE_FRAME_RECEIPT_MINUTES * 60,
+        httponly=True,
+        samesite="lax",
+        secure=request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip() == "https",
+        path=f"/api/pages/{short_id}/frame-status",
+    )
+    return content_response
+
+
+@router.get("/{short_id}/frame-status")
+async def get_page_frame_status(
+    short_id: str,
+    request: Request,
+    response: Response,
+    frame_token: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+):
+    page, user = await _protected_viewer_page(short_id, request, db)
+    if not verify_page_frame_token(frame_token, page.id, user.id):
+        raise HTTPException(status_code=409, detail="Protected page frame expired")
+    if not await _page_source_exists(page):
+        raise HTTPException(status_code=404, detail="Source file no longer exists")
+    if not verify_page_frame_receipt(
+        request.cookies.get(page_frame_receipt_cookie_name(frame_token)),
+        frame_token,
+        page.id,
+        user.id,
+    ):
+        raise HTTPException(status_code=409, detail="Protected page content did not load")
+    response.delete_cookie(
+        page_frame_receipt_cookie_name(frame_token),
+        path=f"/api/pages/{short_id}/frame-status",
+        samesite="lax",
+    )
+    return {"loaded": True}
 
 
 @router.post("/{short_id}/request-access")

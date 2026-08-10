@@ -30,6 +30,7 @@ const H5AgentChat = lazy(() => import('./pages/h5/H5AgentChat'));
 const PublishedPages = lazy(() => import('./pages/PublishedPages'));
 const PublishedPageAccess = lazy(() => import('./pages/PublishedPageAccess'));
 const PublishedPageViewer = lazy(() => import('./pages/PublishedPageViewer'));
+const PublishedPageUnavailable = lazy(() => import('./pages/PublishedPageUnavailable'));
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
@@ -300,6 +301,7 @@ export default function App() {
                 <Route path="/oauth/admin-result" element={<OAuthAdminResult />} />
                 <Route path="/sso/entry" element={<SSOEntry />} />
                 <Route path="/published-page-access" element={<PublishedPageAccess />} />
+                <Route path="/published-page-unavailable" element={<PublishedPageUnavailable />} />
                 <Route path="/p/:shortId" element={<PublishedPageViewer />} />
                 <Route path="/setup-company" element={<CompanySetup />} />
                 <Route path="/onboarding" element={<ProtectedRoute><Onboarding /></ProtectedRoute>} />

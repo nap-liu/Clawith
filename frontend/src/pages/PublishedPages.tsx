@@ -307,8 +307,15 @@ export default function PublishedPages() {
                         </div>
                     </> : <section style={{ marginTop: 18 }}>
                         {visitorsLoading ? <p>加载中…</p> : !visitorData?.items.length ? <p style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>暂无访问记录</p> : visitorData.items.map(visitor => (
-                            <div key={visitor.id} style={{ padding: '12px 0', borderBottom: '1px solid var(--border-subtle)', display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 10 }}>
-                                <div><strong style={{ fontSize: 13 }}>{visitor.display_name}</strong>{visitor.visitor_type === 'anonymous' && <span style={{ marginLeft: 7, color: 'var(--text-tertiary)', fontSize: 10 }}>未登录</span>}{visitor.email && <div style={{ color: 'var(--text-tertiary)', fontSize: 11, marginTop: 2 }}>{visitor.email}</div>}<div style={{ color: 'var(--text-tertiary)', fontSize: 11, marginTop: 5 }}>首次：{formatTime(visitor.first_viewed_at)} · 最近：{formatTime(visitor.last_viewed_at)}</div></div>
+                            <div key={visitor.id} style={{ padding: '10px 0', borderBottom: '1px solid var(--border-subtle)', display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 10 }}>
+                                <div style={{ minWidth: 0 }}>
+                                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }}>
+                                        <strong title={visitor.display_name} style={{ minWidth: 0, maxWidth: visitor.email ? '42%' : '75%', fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{visitor.display_name}</strong>
+                                        {visitor.email && <span title={visitor.email} style={{ minWidth: 0, color: 'var(--text-tertiary)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{visitor.email}</span>}
+                                        {visitor.visitor_type === 'anonymous' && <span style={{ color: 'var(--text-tertiary)', fontSize: 10, flexShrink: 0 }}>未登录</span>}
+                                    </div>
+                                    <div style={{ color: 'var(--text-tertiary)', fontSize: 11, marginTop: 4 }}>首次：{formatTime(visitor.first_viewed_at)} · 最近：{formatTime(visitor.last_viewed_at)}</div>
+                                </div>
                                 <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{visitor.view_count} 次</span>
                             </div>
                         ))}
