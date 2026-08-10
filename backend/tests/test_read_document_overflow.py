@@ -56,6 +56,7 @@ def test_read_document_budget_is_40k():
 
 def test_oversized_read_document_overflows_to_file(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_LOCAL_ROOT", str(tmp_path))
     from app.config import get_settings
 
     get_settings.cache_clear()

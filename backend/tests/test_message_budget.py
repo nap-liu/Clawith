@@ -39,6 +39,7 @@ def agent_id() -> str:
 @pytest.fixture
 def tmp_workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_LOCAL_ROOT", str(tmp_path))
     from app.config import get_settings
 
     get_settings.cache_clear()

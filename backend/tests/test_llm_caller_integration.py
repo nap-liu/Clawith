@@ -20,6 +20,7 @@ from app.services.llm import tool_output_store as tos
 def tmp_workspace(tmp_path, monkeypatch):
     """把 AGENT_DATA_DIR 指向临时目录，隔离 finalize_tool_output 的落盘副作用。"""
     monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_LOCAL_ROOT", str(tmp_path))
     from app.config import get_settings
 
     get_settings.cache_clear()
