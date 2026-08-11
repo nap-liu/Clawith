@@ -55,7 +55,7 @@ export default function ChatFileDeliveryCard({
 
     if (mediaKind) {
         return (
-            <div className={`chat-file-delivery chat-file-delivery--${mode}`}>
+            <div className={`chat-file-delivery chat-file-delivery--media chat-file-delivery--${mode}`}>
                 {delivery.message ? <div className="chat-file-delivery__message">{delivery.message}</div> : null}
                 <ChatMediaCard
                     agentId={agentId}

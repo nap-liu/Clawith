@@ -459,6 +459,15 @@ body.h5-chat-active #root {
     align-self: flex-start;
 }
 
+.h5-chat__message--file-delivery {
+    width: 88%;
+}
+
+.h5-chat__file-delivery-card {
+    width: 100%;
+    min-width: 0;
+}
+
 .h5-chat__message--user {
     align-self: flex-end;
 }

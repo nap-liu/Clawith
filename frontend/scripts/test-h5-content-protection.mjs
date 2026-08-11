@@ -87,6 +87,7 @@ try {
         assert.match(mediaCard, /示例媒体标题/);
         assert.doesNotMatch(mediaCard, /opaque-preview/);
         assert.match(mediaCard, /14 MB · video\/mp4/);
+        assert.match(mediaCard, /chat-file-delivery--media/);
     }
 
     console.log('h5 content protection tests passed');
