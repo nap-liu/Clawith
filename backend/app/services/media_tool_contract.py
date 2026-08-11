@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
+MAX_MEDIA_DISPLAY_TITLE_LENGTH = 160
+
+
+def normalize_media_display_title(value: object) -> str:
+    """Return one safe, compact card title without changing file identity."""
+    if not isinstance(value, str):
+        return ""
+    printable = "".join(character if character.isprintable() else " " for character in value)
+    return " ".join(printable.split())[:MAX_MEDIA_DISPLAY_TITLE_LENGTH].strip()
+
+
 SEND_MEDIA_DESCRIPTION = (
     "Send one audio or video source to the current conversation, an exact existing "
     "person/group Session, or a directly resolved person. Use exactly one source: "
@@ -13,7 +24,8 @@ SEND_MEDIA_DESCRIPTION = (
     "platform-managed media store before delivery "
     "so history uses platform-managed playback. The tool contract is always available "
     "even when the resolved IM channel returns unsupported. Audio/video is rendered as "
-    "a dedicated tool-call card."
+    "a dedicated tool-call card. An optional title customizes the Web/H5 card label "
+    "without renaming the source file or acting as a caption."
 )
 
 SEND_MEDIA_PARAMETERS_SCHEMA = {
@@ -96,6 +108,14 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
             "description": (
                 "Optional caption/business text delivered as a separate ordinary message "
                 "after the standalone media message."
+            ),
+        },
+        "title": {
+            "type": "string",
+            "maxLength": MAX_MEDIA_DISPLAY_TITLE_LENGTH,
+            "description": (
+                "Optional concise display title for the Web/H5 media card. This does "
+                "not rename the file and is not delivered as an IM caption."
             ),
         },
     },

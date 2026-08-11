@@ -135,6 +135,7 @@ const {
             media_kind: 'video',
             path: 'workspace/media/demo.mp4',
             filename: 'demo.mp4',
+            title: '示例媒体标题',
             mime_type: 'video/mp4',
             size: 42,
             message_id: 'tool-message-1',
@@ -144,6 +145,7 @@ const {
         'media-delivery:call-1',
     );
     assert.equal(delivery.mediaKind, 'video');
+    assert.equal(delivery.title, '示例媒体标题');
     assert.equal(delivery.messageId, 'tool-message-1');
     assert.equal(delivery.allowDownload, true);
 }

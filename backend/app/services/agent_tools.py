@@ -83,7 +83,10 @@ from app.services.access_relationships import ensure_access_granted_platform_rel
 from app.services.tool_enablement import agent_tool_enabled
 from app.config import get_settings
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
-from app.services.media_tool_contract import SEND_MEDIA_FUNCTION_TOOL
+from app.services.media_tool_contract import (
+    SEND_MEDIA_FUNCTION_TOOL,
+    normalize_media_display_title,
+)
 from app.services.media_url_source import (
     MediaUrlError,
     import_managed_media_url,
@@ -5706,6 +5709,7 @@ async def _publish_external_media_to_session(
         }), ensure_ascii=False)
 
     filename = _external_media_filename(media_url, media_kind)
+    display_title = normalize_media_display_title(tool_args.get("title"))
     guessed_mime = mimetypes.guess_type(filename)[0]
     mime_type = guessed_mime if str(guessed_mime or "").startswith(f"{media_kind}/") else None
     events: list[dict] = []
@@ -5798,6 +5802,7 @@ async def _publish_external_media_to_session(
             "attachments": [],
             "allow_download": allow_download,
             "caption_status": "sent" if caption.strip() else "not_requested",
+            "display_title": display_title,
         }
         if receipt is None:
             receipt = ChatMessage(
@@ -5824,6 +5829,7 @@ async def _publish_external_media_to_session(
             "url": media_url,
             "source_mode": "external_url",
             "filename": filename,
+            **({"title": display_title} if display_title else {}),
             **({"mime_type": mime_type} if mime_type else {}),
             "message_id": str(receipt.id),
             "allow_download": allow_download,
@@ -5969,6 +5975,7 @@ async def _send_media_to_session_under_lifecycle_lock(
         size_bytes=file_path.stat().st_size,
     )
     persisted_args = dict(tool_args or {"media_type": media_kind, "file_path": workspace_path})
+    display_title = normalize_media_display_title(persisted_args.get("title"))
     if not operation_key:
         return json.dumps({
             "type": "media_delivery_result", "version": 1, "status": "failed",
@@ -5998,6 +6005,9 @@ async def _send_media_to_session_under_lifecycle_lock(
             state = str(meta.get("delivery_status") or "unknown")
             if state == "sent":
                 caption_status = str(meta.get("caption_status") or "not_requested")
+                existing_display_title = normalize_media_display_title(
+                    meta.get("display_title")
+                )
                 existing_result = _describe_media_delivery_result({
                     "type": "platform_media_delivery", "version": 1,
                     "status": "already_sent",
@@ -6012,6 +6022,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                     "channel": str(meta.get("source_channel") or ""),
                     "path": workspace_path,
                     "filename": file_path.name,
+                    **({"title": existing_display_title} if existing_display_title else {}),
                     "mime_type": mime_type,
                     "size": file_path.stat().st_size,
                     "message_id": str(existing.id),
@@ -6215,6 +6226,7 @@ async def _send_media_to_session_under_lifecycle_lock(
         receipt_meta["delivery_code"] = "MEDIA_DELIVERY_PENDING"
         receipt_meta["allow_download"] = allow_download
         receipt_meta["source_mode"] = source_mode
+        receipt_meta["display_title"] = display_title
         receipt.message_meta = receipt_meta
         await db.commit()
         receipt_id = receipt.id
@@ -6337,6 +6349,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                 "media_kind": media_kind,
                 "path": workspace_path,
                 "filename": file_path.name,
+                **({"title": display_title} if display_title else {}),
                 "mime_type": mime_type,
                 "size": file_path.stat().st_size,
                 "message_id": str(final_receipt.id),
@@ -6390,6 +6403,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                         "caption_status",
                         "requested_caption",
                         "delivery_code",
+                        "display_title",
                     }
                 }
                 # A caption is a normal assistant message. It must not inherit

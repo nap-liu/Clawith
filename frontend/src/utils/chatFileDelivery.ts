@@ -4,6 +4,7 @@ export type ChatFileDelivery = {
     url?: string;
     sourceMode?: 'workspace' | 'managed_url' | 'external_url';
     filename: string;
+    title?: string;
     message?: string;
     mimeType?: string;
     size?: number;
@@ -77,6 +78,16 @@ function normalizeFilename(rawFilename: any, path: string) {
     return basename(value);
 }
 
+function normalizeDisplayTitle(rawTitle: any) {
+    if (typeof rawTitle !== 'string') return '';
+    return rawTitle
+        .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 160)
+        .trim();
+}
+
 function normalizeSize(value: any) {
     const size = Number(value);
     return Number.isFinite(size) && size >= 0 ? size : undefined;
@@ -92,6 +103,12 @@ function buildDelivery(payload: Record<string, any>, toolArgs: any, toolCallId?:
     if (!path && !url) return null;
     const sourceIdentity = path || url || '';
     const filename = normalizeFilename(firstString(payload.filename, args.filename), sourceIdentity);
+    const title = normalizeDisplayTitle(firstString(
+        payload.title,
+        payload.display_title,
+        payload.displayTitle,
+        args.title,
+    ));
     const id = toolCallId || `${sourceIdentity}:${filename}`;
     const message = firstString(payload.message);
     const mimeType = firstString(payload.mime_type, payload.mimeType);
@@ -113,6 +130,7 @@ function buildDelivery(payload: Record<string, any>, toolArgs: any, toolCallId?:
             ? { sourceMode }
             : {}),
         filename,
+        ...(mediaKind && title ? { title } : {}),
         ...(message ? { message } : {}),
         ...(mimeType ? { mimeType } : {}),
         ...(size !== undefined ? { size } : {}),

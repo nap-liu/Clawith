@@ -6,7 +6,11 @@ import pytest
 
 from app.services import agent_tools
 from app.services.llm import caller as llm_caller
-from app.services.media_tool_contract import SEND_MEDIA_PARAMETERS_SCHEMA
+from app.services.media_tool_contract import (
+    MAX_MEDIA_DISPLAY_TITLE_LENGTH,
+    SEND_MEDIA_PARAMETERS_SCHEMA,
+    normalize_media_display_title,
+)
 from app.services.storage_runtime.local import LocalStorageBackend
 from app.services.tool_seeder import BUILTIN_TOOLS
 
@@ -348,6 +352,14 @@ def test_media_tools_are_fixed_core_tools():
         if item["function"]["name"] == "send_media"
     )
     assert "allow_download" not in media_schema["properties"]
+    assert media_schema["properties"]["title"] == {
+        "type": "string",
+        "maxLength": MAX_MEDIA_DISPLAY_TITLE_LENGTH,
+        "description": (
+            "Optional concise display title for the Web/H5 media card. This does "
+            "not rename the file and is not delivered as an IM caption."
+        ),
+    }
     assert media_schema == SEND_MEDIA_PARAMETERS_SCHEMA
     assert set(media_schema["properties"]["url_mode"]["enum"]) == {"external", "managed"}
     seeded = next(tool for tool in BUILTIN_TOOLS if tool["name"] == "send_media")
@@ -360,6 +372,18 @@ def test_media_tools_are_fixed_core_tools():
         "default": False,
         "description": "Show the download action on send_media cards in both Web and H5 chat.",
     }]
+
+
+def test_media_display_title_is_safe_compact_and_bounded():
+    raw = "  示例媒体\n\x00展示\t标题  " + ("占位" * 100)
+
+    title = normalize_media_display_title(raw)
+
+    assert title.startswith("示例媒体 展示 标题")
+    assert "\n" not in title
+    assert "\x00" not in title
+    assert len(title) == MAX_MEDIA_DISPLAY_TITLE_LENGTH
+    assert normalize_media_display_title(None) == ""
 
 
 @pytest.mark.parametrize(
