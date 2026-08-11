@@ -58,7 +58,7 @@ services:
       - cli_binaries:/data/cli_binaries:ro
       - cli_tool_state:/data/cli_state
     healthcheck:
-      test: ["CMD-SHELL", "command -v jq >/dev/null && curl -fsS http://localhost:8080/v1/sandbox"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/sandbox"]
       interval: 10s
       timeout: 5s
       retries: 30
