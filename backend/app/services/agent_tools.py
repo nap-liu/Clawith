@@ -5117,6 +5117,17 @@ async def _send_channel_media(
                 intent_id=tool_call_id or "",
                 max_bytes=MEDIA_TOOL_MAX_FILE_BYTES,
                 expected_media_kind=media_kind,
+                operation_scope=(
+                    _build_outbound_operation_key(
+                        agent_id=agent_id,
+                        origin_session_id=(
+                            origin_session_id or target_session_id or None
+                        ),
+                        tool_call_id=tool_call_id,
+                        origin_turn_anchor_id=origin_turn_anchor_id,
+                    )
+                    or f"outbound-untracked:{agent_id}:{uuid.uuid4().hex}"
+                ),
             )
         except MediaUrlError as exc:
             payload = {

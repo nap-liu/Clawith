@@ -523,6 +523,9 @@ async def test_managed_url_uses_origin_session_result_scope_and_agent_media_stor
 
     assert payload["status"] == "sent"
     assert captured["import"]["session_id"] == origin_session_id
+    assert captured["import"]["operation_scope"] == (
+        f"outbound:{agent_id}:{origin_session_id}:unanchored:call-managed-layout"
+    )
     assert captured["storage"] == (
         f"{agent_id}/media/imported/managed-demo.mp4",
         managed_file,
