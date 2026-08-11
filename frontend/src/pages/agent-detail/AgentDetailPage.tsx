@@ -5612,7 +5612,7 @@ export default function AgentDetailPage() {
                                             ref={historyContainerRef}
                                             data-conversation-scroller="web-history"
                                             tabIndex={0}
-                                            aria-label={isZh ? '只读会话消息' : 'Read-only conversation messages'}
+                                            aria-label={i18n.language?.startsWith('zh') ? '只读会话消息' : 'Read-only conversation messages'}
                                             onScroll={handleHistoryScroll}
                                             {...historyAutoFollowInteractionProps}
                                             style={{ flex: 1, overflowY: 'auto', padding: '48px 16px 12px' }}
@@ -5703,7 +5703,7 @@ export default function AgentDetailPage() {
                                             ref={chatContainerRef}
                                             data-conversation-scroller="web-live"
                                             tabIndex={0}
-                                            aria-label={isZh ? '会话消息' : 'Conversation messages'}
+                                            aria-label={i18n.language?.startsWith('zh') ? '会话消息' : 'Conversation messages'}
                                             onScroll={handleChatScroll}
                                             {...liveAutoFollowInteractionProps}
                                             style={{ flex: 1, overflowY: 'auto', padding: '12px 16px' }}
