@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 
 import httpx
 import pytest
@@ -85,6 +86,53 @@ async def test_managed_url_rejects_wrong_media_bytes_before_final_move(tmp_path,
     assert exc_info.value.actual_kind == "audio"
     assert list(_staging_dir(tmp_path).glob("*.partial")) == []
     assert list((tmp_path / "media" / "imported").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_managed_url_revalidates_cached_file_size(tmp_path, monkeypatch):
+    original_client = httpx.AsyncClient
+    fetch_count = 0
+
+    def handler(request):
+        nonlocal fetch_count
+        fetch_count += 1
+        return httpx.Response(200, content=MP4_BYTES, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    imported = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4",
+        agent_workspace=tmp_path,
+        session_id=SESSION_ID,
+        intent_id="cached-size",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+    imported.close()
+    (tmp_path / imported.workspace_path).write_bytes(MP4_BYTES + b"x" * 2048)
+
+    with pytest.raises(media_url_source.MediaUrlError) as exc_info:
+        await media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=tmp_path,
+            session_id=SESSION_ID,
+            intent_id="cached-size",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+
+    assert exc_info.value.code == "MEDIA_URL_TOO_LARGE"
+    assert fetch_count == 1
 
 
 @pytest.mark.asyncio
@@ -339,6 +387,108 @@ async def test_managed_import_delivery_copy_stays_bound_to_validated_bytes(
     assert delivery_path.read_bytes() == MP4_BYTES
     imported.close()
     assert delivery_path.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_managed_import_validates_the_exact_delivery_copy(
+    tmp_path,
+    monkeypatch,
+):
+    original_client = httpx.AsyncClient
+    original_copy = media_url_source._copy_delivery_file
+    delivery_dirs = []
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=MP4_BYTES, request=request)
+    )
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    def replace_content_before_copy(final_fd, final_name, delivery_dir):
+        delivery_dirs.append(delivery_dir)
+        durable_file = tmp_path / "media" / "imported" / final_name
+        durable_file.write_bytes(b"attacker-not-media")
+        return original_copy(final_fd, final_name, delivery_dir)
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(
+        media_url_source,
+        "_copy_delivery_file",
+        replace_content_before_copy,
+    )
+
+    with pytest.raises(media_url_source.MediaUrlError) as exc_info:
+        await media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=tmp_path,
+            session_id=SESSION_ID,
+            intent_id="validate-delivery-copy",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+
+    assert exc_info.value.code == "MEDIA_KIND_MISMATCH"
+    assert delivery_dirs and delivery_dirs[0].exists() is False
+
+
+@pytest.mark.asyncio
+async def test_managed_import_cancellation_cleans_owned_delivery_directory(
+    tmp_path,
+    monkeypatch,
+):
+    original_client = httpx.AsyncClient
+    original_copy = media_url_source._copy_delivery_file
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    captured = {}
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=MP4_BYTES, request=request)
+    )
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    def blocking_copy(final_fd, final_name, delivery_dir):
+        captured["delivery_dir"] = delivery_dir
+        started.set()
+        try:
+            release.wait(timeout=2)
+            return original_copy(final_fd, final_name, delivery_dir)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(media_url_source, "_copy_delivery_file", blocking_copy)
+
+    task = asyncio.create_task(
+        media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=tmp_path,
+            session_id=SESSION_ID,
+            intent_id="cancel-delivery-copy",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 2)
+
+    assert captured["delivery_dir"].exists() is False
 
 
 @pytest.mark.asyncio

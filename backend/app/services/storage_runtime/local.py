@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 import shutil
+import uuid
+from pathlib import Path
 
 import aiofiles
 from fastapi import HTTPException, status
@@ -112,7 +113,7 @@ class LocalStorageBackend(StorageBackend):
         if path.resolve() == target.resolve():
             return
         target.parent.mkdir(parents=True, exist_ok=True)
-        partial = target.with_name(f".{target.name}.importing")
+        partial = target.with_name(f".{target.name}.{uuid.uuid4().hex}.importing")
         try:
             await asyncio.to_thread(shutil.copyfile, path, partial)
             await asyncio.to_thread(os.replace, partial, target)

@@ -312,7 +312,20 @@ def _sniff_file_mime_fd(fd: int, name: str) -> str | None:
     return sniff_media_mime_bytes(probe, name)
 
 
-def _validated_media_mime_fd(fd: int, name: str, expected_media_kind: str) -> str:
+def _validated_media_mime_fd(
+    fd: int,
+    name: str,
+    expected_media_kind: str,
+    max_bytes: int,
+) -> str:
+    try:
+        size = os.fstat(fd).st_size
+    except OSError as exc:
+        raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
+    if size == 0:
+        raise MediaUrlError("MEDIA_URL_EMPTY")
+    if size > max_bytes:
+        raise MediaUrlError("MEDIA_URL_TOO_LARGE")
     mime_type = _sniff_file_mime_fd(fd, name)
     actual_kind = mime_type.split("/", 1)[0] if mime_type else None
     if actual_kind != expected_media_kind:
@@ -344,17 +357,12 @@ def _verify_visible_final(paths: _ManagedMediaPaths, final_fd: int) -> None:
         raise MediaUrlError("MEDIA_STORAGE_FAILED")
 
 
-def _copy_delivery_file(final_fd: int, final_name: str) -> tuple[Path, Path]:
-    delivery_dir = Path(tempfile.mkdtemp(prefix="clawith-media-delivery-"))
+def _copy_delivery_file(final_fd: int, final_name: str, delivery_dir: Path) -> Path:
     delivery_path = delivery_dir / final_name
-    try:
-        read_fd = os.dup(final_fd)
-        with os.fdopen(read_fd, "rb") as source, delivery_path.open("xb") as target:
-            shutil.copyfileobj(source, target)
-    except Exception:
-        shutil.rmtree(delivery_dir, ignore_errors=True)
-        raise
-    return delivery_path, delivery_dir
+    read_fd = os.dup(final_fd)
+    with os.fdopen(read_fd, "rb") as source, delivery_path.open("xb") as target:
+        shutil.copyfileobj(source, target)
+    return delivery_path
 
 
 async def _managed_import_result(
@@ -362,17 +370,33 @@ async def _managed_import_result(
     paths: _ManagedMediaPaths,
     final_fd: int,
     source_url: str,
-    mime_type: str,
+    expected_media_kind: str,
+    max_bytes: int,
 ) -> ManagedMediaImport:
     _verify_visible_final(paths, final_fd)
+    delivery_dir = Path(tempfile.mkdtemp(prefix="clawith-media-delivery-"))
     try:
-        delivery_path, delivery_dir = await asyncio.to_thread(
+        delivery_path = await asyncio.to_thread(
             _copy_delivery_file,
             final_fd,
             paths.final_name,
+            delivery_dir,
         )
-    except OSError as exc:
-        raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
+        delivery_fd = os.open(delivery_path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            mime_type = _validated_media_mime_fd(
+                delivery_fd,
+                paths.final_name,
+                expected_media_kind,
+                max_bytes,
+            )
+        finally:
+            os.close(delivery_fd)
+    except BaseException as exc:
+        shutil.rmtree(delivery_dir, ignore_errors=True)
+        if isinstance(exc, OSError):
+            raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
+        raise
     return ManagedMediaImport(
         file_path=delivery_path,
         workspace_path=paths.workspace_path,
@@ -416,16 +440,18 @@ async def import_managed_media_url(
         raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
     if existing_fd is not None:
         try:
-            mime_type = _validated_media_mime_fd(
+            _validated_media_mime_fd(
                 existing_fd,
                 paths.final_name,
                 expected_media_kind,
+                max_bytes,
             )
             return await _managed_import_result(
                 paths=paths,
                 final_fd=existing_fd,
                 source_url=current_url,
-                mime_type=mime_type,
+                expected_media_kind=expected_media_kind,
+                max_bytes=max_bytes,
             )
         finally:
             os.close(existing_fd)
@@ -512,10 +538,11 @@ async def import_managed_media_url(
                                     dir_fd=paths.staging_fd,
                                 )
                                 try:
-                                    mime_type = _validated_media_mime_fd(
+                                    _validated_media_mime_fd(
                                         partial_read_fd,
                                         paths.partial_name,
                                         expected_media_kind,
+                                        max_bytes,
                                     )
                                     try:
                                         # dir_fd anchors both sides even if an Agent renames or
@@ -538,16 +565,18 @@ async def import_managed_media_url(
                                     dir_fd=paths.imported_fd,
                                 )
                                 try:
-                                    mime_type = _validated_media_mime_fd(
+                                    _validated_media_mime_fd(
                                         final_fd,
                                         paths.final_name,
                                         expected_media_kind,
+                                        max_bytes,
                                     )
                                     return await _managed_import_result(
                                         paths=paths,
                                         final_fd=final_fd,
                                         source_url=current_url,
-                                        mime_type=mime_type,
+                                        expected_media_kind=expected_media_kind,
+                                        max_bytes=max_bytes,
                                     )
                                 finally:
                                     os.close(final_fd)
