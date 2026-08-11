@@ -81,7 +81,7 @@ async def _load_accessible_session(
     session_id: uuid.UUID,
 ) -> tuple[Agent, ChatSession, Literal["mine", "all"]]:
     """Resolve one session and the web picker scope that can display it."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    agent, agent_access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     result = await db.execute(
         select(ChatSession).where(
@@ -118,10 +118,11 @@ async def _load_accessible_session(
         )
         is_group_member = member_result.scalar_one_or_none() is not None
 
-    if not (is_owner or is_privileged or is_group_member):
+    source_channel = str(session.source_channel or "web").lower()
+    is_trigger_manager = agent_access == "manage" and source_channel == "trigger"
+    if not (is_owner or is_privileged or is_group_member or is_trigger_manager):
         raise HTTPException(status_code=403, detail="Not authorized to view this session")
 
-    source_channel = str(session.source_channel or "web").lower()
     view_scope: Literal["mine", "all"] = (
         "mine"
         if source_channel not in {"agent", "trigger"} and (is_owner or is_group_member)
@@ -467,6 +468,41 @@ async def get_session(
     """Get one accessible session so a URL can restore it without scanning a paged list."""
     _, session, view_scope = await _load_accessible_session(db, current_user, agent_id, session_id)
     return await _build_session_detail_out(db, session, view_scope)
+
+
+@router.get("/{agent_id}/sessions/{session_id}/execution")
+async def get_session_execution(
+    agent_id: uuid.UUID,
+    session_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the latest execution provenance for an accessible conversation."""
+    from app.models.trigger_execution import TriggerExecution
+
+    await _load_accessible_session(db, current_user, agent_id, session_id)
+    execution = (
+        await db.execute(
+            select(TriggerExecution)
+            .where(TriggerExecution.conversation_id == session_id)
+            .order_by(TriggerExecution.scheduled_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if execution is None:
+        return None
+    return {
+        "id": str(execution.id),
+        "source": execution.source,
+        "status": execution.status,
+        "scheduled_at": execution.scheduled_at.isoformat(),
+        "finished_at": execution.finished_at.isoformat() if execution.finished_at else None,
+        # Standard conversations are visible to session participants. Keep raw
+        # provider/internal diagnostics on the manage-only execution endpoint.
+        "last_error": "Execution failed. Open execution details for diagnostics."
+        if execution.last_error
+        else None,
+    }
 
 
 @router.post("/{agent_id}/sessions", status_code=201)

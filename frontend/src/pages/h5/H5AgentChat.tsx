@@ -22,6 +22,8 @@ import ChatAttachmentIcon from '../../components/ChatAttachmentIcon';
 import ChatMediaCard from '../../components/ChatMediaCard';
 import ChatToolCallRenderer from '../../components/ChatToolCallRenderer';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
+import ConversationScrollToBottomButton from '../../features/conversation/ConversationScrollToBottomButton';
+import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
 import { useToast } from '../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../stores';
 import {
@@ -421,13 +423,13 @@ export default function H5AgentChat() {
         typeof document !== 'undefined' && document.visibilityState === 'hidden',
     );
     const unmountedRef = useRef(false);
-    const messagesEndRef = useRef<HTMLDivElement | null>(null);
     const messagesScrollerRef = useRef<HTMLElement | null>(null);
     const quickActionsRef = useRef<HTMLDivElement | null>(null);
     const quickActionsMenuCloseTimerRef = useRef<number | null>(null);
     const messageDispatchLockedRef = useRef(false);
     const messageRuntimeBlockedRef = useRef(false);
     const initialHistoryRequestedRef = useRef<string | null>(null);
+    const resumeAutoFollowRef = useRef<() => void>(() => undefined);
 
     useEffect(() => {
         setUnavailableAttachmentKeys(new Set());
@@ -1543,6 +1545,7 @@ export default function H5AgentChat() {
             supportsVision: effectiveModelSupportsVision || files.some((file) => !!file.imageUrl),
         });
         const messageId = makeId();
+        resumeAutoFollowRef.current();
         setMessages((prev) => [...prev, {
             id: messageId,
             role: 'user',
@@ -1604,6 +1607,27 @@ export default function H5AgentChat() {
         overscan: 8,
         enabled: virtualizeMessages,
     });
+    const alignH5ConversationBottom = useCallback((scroller: HTMLElement) => {
+        if (virtualizeMessages && virtualItemCount > 0) {
+            rowVirtualizer.measure();
+            rowVirtualizer.scrollToIndex(virtualItemCount - 1, { align: 'end' });
+        }
+        scroller.scrollTop = scroller.scrollHeight;
+    }, [rowVirtualizer, virtualItemCount, virtualizeMessages]);
+    const {
+        showScrollToBottom,
+        resumeAutoFollow,
+        interactionProps: autoFollowInteractionProps,
+    } = useConversationAutoFollow({
+        scrollerRef: messagesScrollerRef,
+        contentKey: `${scrollAnchor}:${connectionStatus}:${pageResumeRevision}`,
+        resetKey: sessionId,
+        enabled: authStatus === 'ready' && !!agent && !agentError,
+        alignBottom: alignH5ConversationBottom,
+    });
+    useEffect(() => {
+        resumeAutoFollowRef.current = resumeAutoFollow;
+    }, [resumeAutoFollow]);
     const toggleAnalysis = useCallback((key: string) => {
         setAnalysisExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
     }, []);
@@ -1616,22 +1640,6 @@ export default function H5AgentChat() {
         });
         return () => window.cancelAnimationFrame(frame);
     }, [pageResumeRevision, rowVirtualizer]);
-
-    useEffect(() => {
-        const total = conversationEntries.length + (isWaiting ? 1 : 0);
-        const scrollToBottom = () => {
-            if (virtualizeMessages && total > 0) {
-                rowVirtualizer.scrollToIndex(total - 1, { align: 'end' });
-            } else {
-                messagesEndRef.current?.scrollIntoView({ block: 'end' });
-            }
-        };
-        const frame = window.requestAnimationFrame(() => {
-            scrollToBottom();
-            window.requestAnimationFrame(scrollToBottom);
-        });
-        return () => window.cancelAnimationFrame(frame);
-    }, [connectionStatus, rowVirtualizer, scrollAnchor, virtualizeMessages]);
 
     const renderWaitingMessage = useCallback(() => (
         <article className="h5-chat__message h5-chat__message--assistant">
@@ -2149,51 +2157,62 @@ export default function H5AgentChat() {
                     <div>{authStatus === 'exchanging' ? '正在登录' : '加载中'}</div>
                 </section>
             ) : (
-                <section
-                    ref={messagesScrollerRef}
-                    className={`h5-chat__messages${virtualizeMessages ? ' h5-chat__messages--virtual' : ''}`}
-                    aria-live="polite"
-                    onCopyCapture={preventProtectedContentAction}
-                    onCutCapture={preventProtectedContentAction}
-                    onContextMenuCapture={preventProtectedContentAction}
-                    onDragStartCapture={preventProtectedImageDrag}
-                >
-                    {virtualizeMessages ? (
-                        <div
-                            className="h5-chat__virtual-spacer"
-                            style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
-                        >
-                            {rowVirtualizer.getVirtualItems().map((virtualItem) => {
-                                const entry = conversationEntries[virtualItem.index];
-                                return (
-                                    <div
-                                        key={virtualItem.key}
-                                        ref={rowVirtualizer.measureElement}
-                                        data-index={virtualItem.index}
-                                        className="h5-chat__virtual-row"
-                                        style={{ transform: `translateY(${virtualItem.start}px)` }}
-                                    >
-                                        {entry ? renderConversationEntry(entry) : renderWaitingMessage()}
+                <div className="h5-chat__messages-shell">
+                    <section
+                        ref={messagesScrollerRef}
+                        data-conversation-scroller="h5"
+                        className={`h5-chat__messages${virtualizeMessages ? ' h5-chat__messages--virtual' : ''}`}
+                        aria-live="polite"
+                        aria-label="会话消息"
+                        tabIndex={0}
+                        {...autoFollowInteractionProps}
+                        onCopyCapture={preventProtectedContentAction}
+                        onCutCapture={preventProtectedContentAction}
+                        onContextMenuCapture={preventProtectedContentAction}
+                        onDragStartCapture={preventProtectedImageDrag}
+                    >
+                        {virtualizeMessages ? (
+                            <div
+                                className="h5-chat__virtual-spacer"
+                                style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
+                            >
+                                {rowVirtualizer.getVirtualItems().map((virtualItem) => {
+                                    const entry = conversationEntries[virtualItem.index];
+                                    return (
+                                        <div
+                                            key={virtualItem.key}
+                                            ref={rowVirtualizer.measureElement}
+                                            data-index={virtualItem.index}
+                                            className="h5-chat__virtual-row"
+                                            style={{ transform: `translateY(${virtualItem.start}px)` }}
+                                        >
+                                            {entry ? renderConversationEntry(entry) : renderWaitingMessage()}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        ) : (
+                            <div className="h5-chat__flow-content">
+                                {conversationEntries.map((entry) => (
+                                    <div key={entry.key} className="h5-chat__flow-row">
+                                        {renderConversationEntry(entry)}
                                     </div>
-                                );
-                            })}
-                        </div>
-                    ) : (
-                        <>
-                            {conversationEntries.map((entry) => (
-                                <div key={entry.key} className="h5-chat__flow-row">
-                                    {renderConversationEntry(entry)}
-                                </div>
-                            ))}
-                            {isWaiting ? (
-                                <div className="h5-chat__flow-row">
-                                    {renderWaitingMessage()}
-                                </div>
-                            ) : null}
-                        </>
-                    )}
-                    <div ref={messagesEndRef} />
-                </section>
+                                ))}
+                                {isWaiting ? (
+                                    <div className="h5-chat__flow-row">
+                                        {renderWaitingMessage()}
+                                    </div>
+                                ) : null}
+                            </div>
+                        )}
+                    </section>
+                    {showScrollToBottom ? (
+                        <ConversationScrollToBottomButton
+                            variant="h5"
+                            onClick={resumeAutoFollow}
+                        />
+                    ) : null}
+                </div>
             )}
 
             {quickActionsMenuOpen ? (

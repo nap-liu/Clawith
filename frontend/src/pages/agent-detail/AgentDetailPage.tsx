@@ -9,9 +9,7 @@ import { useToast } from '../../components/Toast/ToastProvider';
 import type { FileBrowserApi } from '../../components/FileBrowser';
 import FileBrowser from '../../components/FileBrowser';
 import ChatAttachmentIcon from '../../components/ChatAttachmentIcon';
-import ChatMediaCard from '../../components/ChatMediaCard';
 import ChatImageLightbox from '../../components/ChatImageLightbox';
-import MarkdownRenderer from '../../components/MarkdownRenderer';
 import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
 import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
@@ -19,7 +17,11 @@ import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/Wor
 import { activityApi, agentApi, channelApi, chatSessionApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import type { FocusApiItem } from '../../services/api';
 import ModelSwitcher from '../../components/ModelSwitcher';
-import ChatToolCallRenderer, { getChatToolRenderType } from '../../components/ChatToolCallRenderer';
+import { getChatToolRenderType } from '../../components/ChatToolCallRenderer';
+import ConversationScrollToBottomButton from '../../features/conversation/ConversationScrollToBottomButton';
+import ConversationTimeline from '../../features/conversation/web/ConversationTimeline';
+import { buildConversationEntries, getConversationScrollAnchor } from '../../features/conversation/core/chatTimeline';
+import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
 import OrgMemberAccessPicker, {
     type AgentAccessDepartment,
     type AgentAccessUser,
@@ -45,26 +47,24 @@ import { copyToClipboard } from '../../utils/clipboard';
 import { formatFileSize } from '../../utils/formatFileSize';
 import {
     buildChatAttachmentPayload,
-    buildPreviewImage,
     buildPreviewImagesFromAttachments,
     downloadChatAttachment,
     extractChatImageDataMarkers,
     normalizeChatAttachmentFields,
-    splitAttachmentFileNames,
-    stripChatImageDataMarkers,
     type ChatAttachedFile,
     type ChatMessageAttachment,
     type ChatPreviewImage,
 } from '../../utils/chatAttachments';
 import { createClientId } from '../../utils/clientId';
-import { applyAssistantDoneMessage, normalizeChatTimelineMessages } from '../h5/chatTimeline';
+import {
+    applyAssistantDoneMessage,
+    normalizeChatTimelineMessages,
+} from '../../features/conversation/core/chatTimeline';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import {
     IconBrain,
-    IconBrowser,
     IconBuilding,
     IconCheck,
-    IconChevronDown,
     IconClock,
     IconDna,
     IconDownload,
@@ -78,10 +78,8 @@ import {
     IconPaperclip,
     IconPlugConnected,
     IconRobot,
-    IconSearch,
     IconSend,
     IconSettings,
-    IconTerminal2,
     IconTools,
     IconUser,
     IconWorld,
@@ -353,59 +351,6 @@ const getRelationOptions = (t: any) => [
 ];
 
 const getAgentRelationOptions = getRelationOptions;
-
-/** Tiny copy button shown on hover at the bottom of message bubbles */
-function CopyMessageButton({ text }: { text: string }) {
-    const [copied, setCopied] = React.useState(false);
-    const handleCopy = (e: React.MouseEvent) => {
-        e.stopPropagation();
-        const copySuccess = () => {
-            setCopied(true);
-            setTimeout(() => setCopied(false), 1500);
-        };
-        
-        if (navigator.clipboard && window.isSecureContext) {
-            copyToClipboard(text).then(copySuccess).catch(err => console.error('Clipboard API failed', err));
-        } else {
-            // Fallback for non-HTTPS dev environments
-            const textArea = document.createElement("textarea");
-            textArea.value = text;
-            textArea.style.position = "fixed";  // Avoid scrolling to bottom
-            document.body.appendChild(textArea);
-            textArea.focus();
-            textArea.select();
-            try {
-                if (document.execCommand('copy')) {
-                    copySuccess();
-                }
-            } catch (err) {
-                console.error('Fallback copy failed', err);
-            }
-            document.body.removeChild(textArea);
-        }
-    };
-    return (
-        <button
-            onClick={handleCopy}
-            title="Copy"
-            style={{
-                background: 'none', border: 'none', cursor: 'pointer', padding: '2px',
-                color: copied ? 'var(--accent-text)' : 'var(--text-tertiary)',
-                opacity: copied ? 1 : 0.5, transition: 'opacity .15s, color .15s',
-                display: 'inline-flex', alignItems: 'center', verticalAlign: 'middle',
-                marginLeft: '6px', flexShrink: 0,
-            }}
-            onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-            onMouseLeave={e => (e.currentTarget.style.opacity = copied ? '1' : '0.5')}
-        >
-            {copied ? (
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
-            ) : (
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
-            )}
-        </button>
-    );
-}
 
 type AccessUser = AgentAccessUser;
 type AccessDepartment = AgentAccessDepartment;
@@ -752,493 +697,6 @@ function AccessPermissionsPanel({
         </div>
     );
 }
-
-// ── Pulse LED keyframe (shared with Chat.tsx, guarded by ID) ──────────────
-const _PULSE_STYLE_ID = 'cw-tool-pulse-style';
-if (typeof document !== 'undefined' && !document.getElementById(_PULSE_STYLE_ID)) {
-    const _s = document.createElement('style');
-    _s.id = _PULSE_STYLE_ID;
-    _s.textContent = `
-        @keyframes cw-pulse-led {
-            0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 0 0 rgba(107,114,128,0.45); }
-            50%       { opacity: 0.55; transform: scale(1.5); box-shadow: 0 0 0 4px rgba(107,114,128,0); }
-        }
-        .cw-running-led { animation: cw-pulse-led 1.4s ease-in-out infinite; }
-    `;
-    document.head.appendChild(_s);
-}
-
-
-/**
- * AnalysisCard — unified controlled collapsible card for all agent-internal processing.
- *
- * Covers three scenarios:
- *   - Thinking only (no tools): agent reasoned before answering directly
- *   - Tools only: agent called tools without visible thinking
- *   - Thinking + Tools: interleaved thinking and tool calls (most common)
- *
- * CONTROLLED component (expanded + onToggle from parent) to survive WS re-renders.
- */
-type AnalysisItem =
-    | { type: 'thinking'; content: string }
-    | { type: 'tool'; name: string; args: any; status: 'running' | 'done'; result?: string };
-
-type AnalysisToolMeta = {
-    title: string;
-    label: string;
-    target?: string;
-    kind: 'command' | 'file' | 'search' | 'browser' | 'message' | 'agent' | 'mcp' | 'unknown';
-};
-
-function getToolProvider(name: string): string {
-    const lower = (name || '').toLowerCase();
-    if (lower.startsWith('agentbay_')) return 'AgentBay';
-    if (lower.includes('tavily')) return 'Tavily';
-    if (lower.includes('jina')) return 'Jina';
-    if (lower.includes('duckduckgo')) return 'DuckDuckGo';
-    if (lower.includes('exa')) return 'Exa';
-    if (lower.includes('google')) return 'Google';
-    if (lower.includes('bing')) return 'Bing';
-    if (lower.includes('e2b')) return 'E2B';
-    if (lower.startsWith('feishu_') || lower.includes('lark')) return 'Feishu';
-    if (lower.startsWith('mcp_') || lower.includes(':')) return 'MCP';
-    if (lower.includes('web_search') || lower.includes('read_webpage')) return 'Built-in';
-    return 'Built-in';
-}
-
-function titleCaseToolName(name: string): string {
-    return (name || 'tool')
-        .replace(/^mcp[_:-]/i, '')
-        .replace(/[_-]+/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .replace(/\b\w/g, ch => ch.toUpperCase());
-}
-
-function basename(path?: string): string {
-    if (!path) return '';
-    const clean = String(path).split('?')[0].replace(/\\/g, '/');
-    return clean.split('/').filter(Boolean).pop() || clean;
-}
-
-function firstString(...values: any[]): string | undefined {
-    for (const value of values) {
-        if (typeof value === 'string' && value.trim()) return value.trim();
-    }
-    return undefined;
-}
-
-function getToolMeta(item: Extract<AnalysisItem, { type: 'tool' }>): AnalysisToolMeta {
-    const name = item.name || 'tool';
-    const args = item.args && typeof item.args === 'object' && !Array.isArray(item.args) ? item.args : {};
-    const resultText = typeof item.result === 'string' ? item.result : '';
-    const path = firstString(args.output_path, args.path, args.file_path, args.filename, args.name);
-    const url = firstString(args.url, args.link, args.uri);
-    const query = firstString(args.query, args.q, args.keyword, args.search);
-    const recipient = firstString(args.to, args.recipient, args.user, args.channel, args.agent_name);
-    const target = path || url || query || recipient;
-    const lower = name.toLowerCase();
-
-    if (lower.includes('write_file') || lower.includes('create_file')) {
-        return { title: path ? `Created ${basename(path)}` : 'Created a file', label: 'Workspace', target: path, kind: 'file' };
-    }
-    if (lower.includes('edit_file') || lower.includes('update_file')) {
-        return { title: path ? `Updated ${basename(path)}` : 'Updated a file', label: 'Workspace', target: path, kind: 'file' };
-    }
-    if (lower.includes('move_file')) {
-        const destinationPath = firstString(args.destination_path, args.to_path, args.target_path);
-        const sourcePath = firstString(args.source_path, args.from_path, args.path);
-        const titlePath = destinationPath || sourcePath;
-        return { title: titlePath ? `Moved ${basename(titlePath)}` : 'Moved a file', label: 'Workspace', target: titlePath, kind: 'file' };
-    }
-    if (lower.includes('delete_file')) {
-        return { title: path ? `Deleted ${basename(path)}` : 'Deleted a file', label: 'Workspace', target: path, kind: 'file' };
-    }
-    if (lower.startsWith('convert_') || lower.includes('convert_')) {
-        return { title: path ? `Converted ${basename(path)}` : titleCaseToolName(name), label: 'Workspace', target: path, kind: 'file' };
-    }
-    if (lower.includes('read_webpage') || lower.includes('browser') || lower.includes('webpage')) {
-        return { title: url ? `Read ${url.replace(/^https?:\/\//, '').split('/')[0]}` : titleCaseToolName(name), label: 'Browser', target: url, kind: 'browser' };
-    }
-    if (lower.includes('search')) {
-        return { title: query ? `Searched ${query}` : titleCaseToolName(name), label: 'Search', target: query, kind: 'search' };
-    }
-    if (lower.includes('send_') || lower.includes('message')) {
-        return { title: recipient ? `Sent message to ${recipient}` : titleCaseToolName(name), label: 'Message', target: recipient, kind: 'message' };
-    }
-    if (lower.includes('agent')) {
-        return { title: titleCaseToolName(name), label: 'Agent', target, kind: 'agent' };
-    }
-    if (lower.includes('mcp') || lower.includes(':')) {
-        return { title: titleCaseToolName(name), label: 'MCP', target, kind: 'mcp' };
-    }
-    if (/created|saved|updated|wrote/i.test(resultText) && path) {
-        return { title: `Updated ${basename(path)}`, label: 'Workspace', target: path, kind: 'file' };
-    }
-    return { title: titleCaseToolName(name), label: 'Tool', target, kind: 'command' };
-}
-
-function getToolIcon(kind: AnalysisToolMeta['kind']) {
-    switch (kind) {
-        case 'file': return IconFileText;
-        case 'search': return IconSearch;
-        case 'browser': return IconBrowser;
-        case 'message': return IconMessageCircle;
-        case 'agent': return IconBrain;
-        case 'mcp': return IconTools;
-        case 'command':
-        case 'unknown':
-        default:
-            return IconTerminal2;
-    }
-}
-
-function describeAnalysis(items: AnalysisItem[], t: (k: string, opts?: any) => string): string {
-    const toolItems = items.filter(i => i.type === 'tool') as Extract<AnalysisItem, { type: 'tool' }>[];
-    if (toolItems.length === 0) return t('agent.chat.thoughtProcess');
-
-    let created = 0;
-    let updated = 0;
-    let deleted = 0;
-    let commands = 0;
-    let agents = 0;
-    const agentMessageTools = new Set([
-        'send_message_to_agent',
-        'send_file_to_agent',
-    ]);
-    for (const item of toolItems) {
-        const name = item.name.toLowerCase();
-        if (name.includes('write_file') || name.includes('create_file')) created += 1;
-        else if (name.includes('edit_file') || name.includes('update_file') || name.includes('move_file') || name.startsWith('convert_')) updated += 1;
-        else if (name.includes('delete_file')) deleted += 1;
-        else if (agentMessageTools.has(name)) agents += 1;
-        else commands += 1;
-    }
-
-    const parts: string[] = [];
-    if (created) parts.push(t('agent.chat.createdFiles', { count: created }));
-    if (updated) parts.push(t('agent.chat.updatedFiles', { count: updated }));
-    if (deleted) parts.push(t('agent.chat.deletedFiles', { count: deleted }));
-    if (commands) parts.push(t('agent.chat.ranCommands', { count: commands }));
-    if (agents) parts.push(t('agent.chat.ranAgents', { count: agents }));
-    if (!parts.length) parts.push(t('agent.chat.ranCommands', { count: toolItems.length }));
-    return parts.join(', ');
-}
-
-function AnalysisCard({
-    items, t, expanded, onToggle, isGroupRunning,
-}: {
-    items: AnalysisItem[];
-    t: (k: string, opts?: any) => string;
-    expanded: boolean;
-    onToggle: () => void;
-    /** True when parent isWaiting/isStreaming AND this is the last active group */
-    isGroupRunning: boolean;
-}) {
-    const toolItems = items.filter(i => i.type === 'tool') as Extract<AnalysisItem, { type: 'tool' }>[];
-    const hasTools = toolItems.length > 0;
-    const hasRunningTool = toolItems.some(tc => tc.status === 'running');
-    const isRunning = hasRunningTool || (!hasTools && isGroupRunning);
-    const runningTool = [...toolItems].reverse().find(tc => tc.status === 'running') ?? null;
-    const headerTitle = isRunning && runningTool ? getToolMeta(runningTool).title : describeAnalysis(items, t);
-
-    return (
-        <div className={`analysis-trace${expanded ? ' analysis-trace--open' : ''}${isRunning ? ' analysis-trace--running' : ''}`}>
-            <div className="analysis-trace-shell">
-                <button
-                    className="analysis-trace-header"
-                    onClick={onToggle}
-                >
-                    <span className="analysis-trace-signal" aria-hidden="true">
-                        <span />
-                        <span />
-                        <span />
-                    </span>
-                    <span className="analysis-trace-title">
-                        {headerTitle}
-                    </span>
-                    <IconChevronDown
-                        className="analysis-trace-chevron"
-                        size={15}
-                        stroke={1.8}
-                    />
-                </button>
-                {expanded && (
-                    <div className="analysis-trace-body">
-                        {items.map((item, idx) => {
-                            const isLast = idx === items.length - 1;
-                            if (item.type === 'thinking') {
-                                const itemPreview = item.content.length > 360 ? item.content.slice(0, 360).trimEnd() + '...' : item.content;
-                                return (
-                                    <div key={idx} className="analysis-trace-row">
-                                        <div className="analysis-trace-node-wrap">
-                                            <div className="analysis-trace-node analysis-trace-node--thought">
-                                                <IconClock size={18} stroke={1.65} />
-                                            </div>
-                                            {!isLast && <div className="analysis-trace-rail" />}
-                                        </div>
-                                        <div className="analysis-trace-row-content" style={{ paddingBottom: isLast ? 0 : '18px' }}>
-                                            <div style={{ fontSize: '13px', lineHeight: 1.5, color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                                                {itemPreview}
-                                            </div>
-                                            {item.content.length > itemPreview.length && (
-                                                <details style={{ marginTop: '8px' }}>
-                                                    <summary style={{ cursor: 'pointer', color: 'var(--text-tertiary)', fontSize: '12px', listStyle: 'none' }}>
-                                                        {t('agent.chat.showMore')}
-                                                    </summary>
-                                                    <div style={{ marginTop: '8px', color: 'var(--text-secondary)', fontSize: '13px', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                                                        {item.content}
-                                                    </div>
-                                                </details>
-                                            )}
-                                        </div>
-                                    </div>
-                                );
-                            }
-
-                            const tc = item;
-                            const running = tc.status === 'running';
-                            const meta = getToolMeta(tc);
-                            const ToolIcon = getToolIcon(meta.kind);
-                            const provider = getToolProvider(tc.name);
-                            const argsStr = tc.args && Object.keys(tc.args).length > 0
-                                ? JSON.stringify(tc.args, null, 2) : '';
-                            const hasDetail = true;
-                            return (
-                                <div key={idx} className={`analysis-trace-row${running ? ' analysis-trace-row--running' : ''}`}>
-                                    <div className="analysis-trace-node-wrap">
-                                        <div
-                                            className={`analysis-trace-node analysis-trace-node--tool analysis-tool-icon${running ? ' analysis-tool-icon--running' : ''}`}
-                                        >
-                                            <ToolIcon size={18} stroke={1.65} />
-                                        </div>
-                                        {!isLast && <div className="analysis-trace-rail" />}
-                                    </div>
-                                    <div className="analysis-trace-row-content" style={{ paddingBottom: isLast ? 0 : '18px' }}>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
-                                            <div style={{
-                                                minWidth: 0,
-                                                overflow: 'hidden',
-                                                textOverflow: 'ellipsis',
-                                                whiteSpace: 'nowrap',
-                                                color: running ? 'var(--text-secondary)' : 'var(--text-tertiary)',
-                                                fontSize: '13px',
-                                                lineHeight: 1.5,
-                                            }}>
-                                                {meta.title}
-                                            </div>
-                                            {running && (
-                                                <span style={{ color: 'var(--text-tertiary)', fontSize: '12px', flexShrink: 0 }}>
-                                                    {t('common.loading')}
-                                                </span>
-                                            )}
-                                        </div>
-                                        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px', marginTop: '8px' }}>
-                                            <span style={{
-                                                display: 'inline-flex',
-                                                alignItems: 'center',
-                                                height: '24px',
-                                                padding: '0 10px',
-                                                borderRadius: '7px',
-                                                background: 'color-mix(in srgb, var(--bg-secondary) 72%, var(--bg-primary))',
-                                                color: 'var(--text-tertiary)',
-                                                fontSize: '12px',
-                                                lineHeight: 1,
-                                            }}>
-                                                {meta.label}
-                                            </span>
-                                            {meta.target && (
-                                                <span style={{
-                                                    display: 'inline-flex',
-                                                    alignItems: 'center',
-                                                    maxWidth: 'min(520px, 100%)',
-                                                    height: '24px',
-                                                    padding: '0 10px',
-                                                    borderRadius: '7px',
-                                                    background: 'var(--bg-secondary)',
-                                                    color: 'var(--text-secondary)',
-                                                    fontSize: '12px',
-                                                    lineHeight: 1,
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap',
-                                                }}>
-                                                    {meta.target}
-                                                </span>
-                                            )}
-                                        </div>
-                                    {hasDetail && (
-                                        <details style={{ marginTop: '8px' }}>
-                                            <summary style={{
-                                                cursor: 'pointer',
-                                                color: 'var(--text-tertiary)',
-                                                fontSize: '12px',
-                                                listStyle: 'none',
-                                                userSelect: 'none',
-                                            }}>
-                                                {t('agent.chat.viewDetails')}
-                                            </summary>
-                                            <div style={{ marginTop: '8px' }}>
-                                            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px', marginBottom: '8px' }}>
-                                                <span style={{
-                                                    display: 'inline-flex',
-                                                    alignItems: 'center',
-                                                    height: '22px',
-                                                    padding: '0 8px',
-                                                    borderRadius: '6px',
-                                                    background: 'var(--bg-secondary)',
-                                                    color: 'var(--text-tertiary)',
-                                                    fontSize: '11px',
-                                                    lineHeight: 1,
-                                                }}>
-                                                    {t('agent.chat.provider', 'Provider')}: {provider}
-                                                </span>
-                                                <span style={{
-                                                    display: 'inline-flex',
-                                                    alignItems: 'center',
-                                                    maxWidth: '100%',
-                                                    height: '22px',
-                                                    padding: '0 8px',
-                                                    borderRadius: '6px',
-                                                    background: 'var(--bg-secondary)',
-                                                    color: 'var(--text-secondary)',
-                                                    fontFamily: 'var(--font-mono)',
-                                                    fontSize: '11px',
-                                                    lineHeight: 1,
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap',
-                                                }}>
-                                                    {t('agent.chat.toolName', 'Tool')}: {tc.name || 'tool'}
-                                                </span>
-                                            </div>
-                                            {argsStr && (
-                                                <div style={{
-                                                    fontFamily: 'var(--font-mono)', fontSize: '10px',
-                                                    color: 'var(--text-tertiary)', whiteSpace: 'pre-wrap',
-                                                    wordBreak: 'break-all', maxHeight: '80px', overflowY: 'auto',
-                                                    background: 'var(--bg-secondary)', borderRadius: '4px',
-                                                    padding: '4px 6px', marginBottom: tc.result ? '4px' : 0,
-                                                }}>{argsStr}</div>
-                                            )}
-                                            {tc.result && (
-                                                <div style={{
-                                                    fontSize: '10px', color: 'var(--text-secondary)',
-                                                    whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-                                                    maxHeight: '120px', overflowY: 'auto',
-                                                    borderTop: argsStr ? '1px solid var(--border-subtle)' : 'none',
-                                                    paddingTop: argsStr ? '4px' : 0,
-                                                }}>
-                                                    {tc.result.length > 500 ? tc.result.slice(0, 500) + '…' : tc.result}
-                                                </div>
-                                            )}
-                                            </div>
-                                        </details>
-                                    )}
-                                    </div>
-                                </div>
-                            );
-                        })}
-                        {isRunning && (
-                            <div className="analysis-trace-row analysis-trace-row--done">
-                                <div className="analysis-trace-node-wrap">
-                                    <div className="analysis-trace-node analysis-trace-node--done analysis-trace-node--pending">
-                                    <IconClock size={18} stroke={1.65} />
-                                    </div>
-                                </div>
-                                <div style={{ color: 'var(--text-tertiary)', fontSize: '13px', lineHeight: 1.5 }}>
-                                    {t('agent.chat.inProgress')}
-                                </div>
-                            </div>
-                        )}
-                    </div>
-                )}
-            </div>
-        </div>
-    );
-}
-
-function ThoughtDisclosure({
-    content,
-    t,
-    streaming = false,
-}: {
-    content: string;
-    t: (k: string, opts?: any) => string;
-    streaming?: boolean;
-}) {
-    const [expanded, setExpanded] = React.useState(false);
-    const text = content.trim();
-    if (!text) return null;
-
-    return (
-        <details
-            className={`thought-disclosure analysis-trace thought-trace${streaming ? ' analysis-trace--running' : ''}`}
-            open={expanded}
-            onToggle={(event) => setExpanded(event.currentTarget.open)}
-        >
-            <summary className="analysis-trace-shell analysis-trace-header thought-trace-header">
-                <span className="analysis-trace-signal thought-trace-signal" aria-hidden="true">
-                    <span />
-                    <span />
-                    <span />
-                </span>
-                <span className="analysis-trace-title">
-                    {streaming ? t('agent.chat.thinkingLabel') : t('agent.chat.thoughtProcess')}
-                </span>
-                <IconChevronDown
-                    className="thought-disclosure-chevron analysis-trace-chevron"
-                    size={14}
-                    stroke={1.8}
-                />
-            </summary>
-            <div className="analysis-trace-body thought-trace-body">
-                <div className="analysis-trace-row">
-                    <div className="analysis-trace-node-wrap">
-                        <div
-                            className={`analysis-trace-node analysis-trace-node--thought${streaming ? ' cw-running-led' : ''}`}
-                        >
-                            <IconClock size={18} stroke={1.65} />
-                        </div>
-                        <div className="analysis-trace-rail" />
-                    </div>
-                    <div style={{
-                        paddingBottom: '14px',
-                        color: 'var(--text-secondary)',
-                        fontSize: '13px',
-                        lineHeight: 1.5,
-                        whiteSpace: 'pre-wrap',
-                        wordBreak: 'break-word',
-                        maxHeight: '260px',
-                        overflow: 'auto',
-                        minWidth: 0,
-                    }}>
-                        {text}
-                    </div>
-                </div>
-                {streaming && (
-                    <div className="analysis-trace-row analysis-trace-row--done">
-                        <div className="analysis-trace-node-wrap">
-                            <div className="analysis-trace-node analysis-trace-node--done analysis-trace-node--pending">
-                            <IconClock size={18} stroke={1.65} />
-                            </div>
-                        </div>
-                        <div style={{ color: 'var(--text-tertiary)', fontSize: '13px', lineHeight: 1.5 }}>
-                            {t('agent.chat.inProgress')}
-                        </div>
-                    </div>
-                )}
-            </div>
-        </details>
-    );
-}
-
-
-
-
-
-
-
 
 function RelationshipEditor({ agentId, readOnly = false }: { agentId: string; readOnly?: boolean }) {
     const { t, i18n } = useTranslation();
@@ -2052,18 +1510,53 @@ export default function AgentDetailPage() {
     });
 
     // ── Aware tab data: reflection sessions (trigger monologues) ──
-    const { data: reflectionSessions = [] } = useQuery({
+    const { data: awareSessionRows = [] } = useQuery({
         queryKey: ['reflection-sessions', id],
         queryFn: async () => {
             const tkn = localStorage.getItem('token');
             const res = await fetch(`/api/agents/${id}/sessions?scope=all`, { headers: { Authorization: `Bearer ${tkn}` } });
             if (!res.ok) return [];
-            const all = await res.json();
-            return all.filter((s: any) => s.source_channel === 'trigger');
+            return await res.json();
         },
         enabled: !!id && awareDataActive,
         refetchInterval: awareDataActive ? 10000 : false,
     });
+    const { data: triggerExecutions = [] } = useQuery({
+        queryKey: ['trigger-executions', id],
+        queryFn: () => triggerApi.executions(id!, 200),
+        enabled: !!id && awareDataActive,
+        refetchInterval: awareDataActive ? 10000 : false,
+    });
+    const reflectionSessions = useMemo(() => {
+        const sessions = awareSessionRows as any[];
+        const sessionById = new Map(sessions.map((session) => [session.id, session]));
+        const linkedConversationIds = new Set<string>();
+        const executionRows = (triggerExecutions as any[]).map((execution) => {
+            const session = execution.conversation_id
+                ? sessionById.get(execution.conversation_id)
+                : null;
+            if (execution.conversation_id) linkedConversationIds.add(execution.conversation_id);
+            return {
+                ...(session || {}),
+                id: session?.id || `execution:${execution.id}`,
+                record_id: execution.id,
+                conversation_id: execution.conversation_id,
+                conversation_missing: !session,
+                title: execution.trigger_name,
+                created_at: execution.scheduled_at,
+                last_message_at: execution.finished_at || execution.scheduled_at,
+                message_count: session?.message_count || 0,
+                source_channel: session?.source_channel || execution.source,
+                execution,
+            };
+        });
+        const legacyRows = sessions
+            .filter((session) => session.source_channel === 'trigger' && !linkedConversationIds.has(session.id))
+            .map((session) => ({ ...session, record_id: `legacy:${session.id}`, conversation_id: session.id, execution: null }));
+        return [...executionRows, ...legacyRows].sort((a, b) => (
+            new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime()
+        ));
+    }, [awareSessionRows, triggerExecutions]);
 
     // ── Aware tab state ──
     const [expandedFocusIds, setExpandedFocusIds] = useState<Set<string>>(() => new Set());
@@ -2151,6 +1644,12 @@ export default function AgentDetailPage() {
     const [sessions, setSessions] = useState<any[]>([]);
     const [allSessions, setAllSessions] = useState<any[]>([]);
     const [activeSession, setActiveSession] = useState<any | null>(null);
+    const { data: activeSessionExecution = null } = useQuery({
+        queryKey: ['session-execution', id, activeSession?.id],
+        queryFn: () => chatSessionApi.execution(id!, activeSession.id).catch(() => null),
+        enabled: !!id && !!activeSession?.id,
+        refetchInterval: activeSession?.id ? 10000 : false,
+    });
     const [chatScope, setChatScope] = useState<'mine' | 'all'>('mine');
     const [scopeDropdownOpen, setScopeDropdownOpen] = useState(false);
     const scopeDropdownRef = useRef<HTMLDivElement>(null);
@@ -2402,11 +1901,6 @@ export default function AgentDetailPage() {
         const runtimeState = sessionUiStateRef.current[runtimeKey] || { isWaiting: false, isStreaming: false, isStopping: false };
         const writable = isWritableSession(sess, scopeOverride);
         activeSessionIdRef.current = sess.id;
-        isFirstLoad.current = true;
-        isNearBottom.current = true;
-        userPinnedAwayFromBottomRef.current = false;
-        pendingLiveInitialScrollRef.current = writable;
-        pendingHistoryInitialScrollRef.current = !writable;
         setChatMessages([]);
         setHistoryMsgs([]);
         setHistoryOldestTs(null);
@@ -2627,19 +2121,6 @@ export default function AgentDetailPage() {
     // Transient info banner (e.g. fallback model switch notification)
     const [chatInfoMsg, setChatInfoMsg] = useState<string | null>(null);
     const chatInfoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    // Stable expanded-state map for tool groups — keyed by groupStartIndex.
-    // Stored in a ref so it survives parent re-renders without causing extra renders.
-    const toolGroupExpandedRef = useRef<Map<number, boolean>>(new Map());
-    const [toolGroupExpandedVersion, setToolGroupExpandedVersion] = useState(0);
-    const toggleToolGroup = (key: number) => {
-        const m = toolGroupExpandedRef.current;
-        const nextExpanded = !m.get(key);
-        m.set(key, nextExpanded);
-        setToolGroupExpandedVersion(v => v + 1); // trigger re-render
-        if (nextExpanded) {
-            scheduleLiveScrollToBottom();
-        }
-    };
     const [liveState, setLiveState] = useState<LivePreviewState>({});
     const [workspaceActivePath, setWorkspaceActivePath] = useState<string | null>(null);
     const [workspaceLockedPath, setWorkspaceLockedPath] = useState<string | null>(null);
@@ -2676,7 +2157,6 @@ export default function AgentDetailPage() {
     const pendingChatSendRef = useRef<PendingChatMessage | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
 
-    const chatEndRef = useRef<HTMLDivElement>(null);
     const chatContainerRef = useRef<HTMLDivElement>(null);
     const chatInputRef = useRef<HTMLTextAreaElement>(null);
     const chatInputAreaRef = useRef<HTMLDivElement>(null);
@@ -3291,10 +2771,7 @@ export default function AgentDetailPage() {
             // session updates live instead of only on reload.
             if (activeReadOnlyRef.current) {
                 if (['channel_user_message', 'assistant_message_committed', 'thinking', 'chunk', 'tool_call', 'done'].includes(d.type)) {
-                    const hel = historyContainerRef.current;
-                    const nearBottom = !hel || hel.scrollHeight - hel.scrollTop - hel.clientHeight < 120;
                     setHistoryMsgs(prev => applyMonitorEvent(prev, d));
-                    if (nearBottom) scheduleHistoryScrollToBottom();
                     if (d.type === 'done') {
                         const sid = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                         if (sid) clearUnreadForSession(sid);
@@ -3722,22 +3199,39 @@ export default function AgentDetailPage() {
         };
     }, []);
 
-    // Smart scroll: only auto-scroll if user is at the bottom
-    const isNearBottom = useRef(true);
-    const isFirstLoad = useRef(true);
-    const pendingLiveInitialScrollRef = useRef(false);
-    const pendingHistoryInitialScrollRef = useRef(false);
-    const liveAutoFollowUntilRef = useRef(0);
-    const userPinnedAwayFromBottomRef = useRef(false);
-    const liveScrollJobRef = useRef(0);
-    const liveScrollTimersRef = useRef<number[]>([]);
-    const chatTouchStartYRef = useRef<number | null>(null);
-    const [showScrollBtn, setShowScrollBtn] = useState(false);
+    // Conversation auto-follow is shared with H5. Any explicit user scroll
+    // gesture pauses it until the floating button is clicked or a message is sent.
     const [chatScrollBtnBottom, setChatScrollBtnBottom] = useState(96);
-    // Read-only history scroll-to-bottom
     const historyContainerRef = useRef<HTMLDivElement>(null);
     const historyAutoLoadCursorRef = useRef<string | null>(null);
-    const [showHistoryScrollBtn, setShowHistoryScrollBtn] = useState(false);
+    const liveScrollAnchor = useMemo(() => getConversationScrollAnchor(
+        buildConversationEntries(chatMessages as any),
+        isWaiting,
+    ), [chatMessages, isWaiting]);
+    const historyScrollAnchor = useMemo(() => getConversationScrollAnchor(
+        buildConversationEntries(historyMsgs as any),
+        false,
+    ), [historyMsgs]);
+    const {
+        showScrollToBottom: showScrollBtn,
+        resumeAutoFollow: scrollToBottom,
+        interactionProps: liveAutoFollowInteractionProps,
+    } = useConversationAutoFollow({
+        scrollerRef: chatContainerRef,
+        contentKey: liveScrollAnchor,
+        resetKey: activeSession?.id,
+        enabled: activeTab === 'chat' && !!activeSession && isWritableSession(activeSession),
+    });
+    const {
+        showScrollToBottom: showHistoryScrollBtn,
+        resumeAutoFollow: scrollHistoryToBottom,
+        interactionProps: historyAutoFollowInteractionProps,
+    } = useConversationAutoFollow({
+        scrollerRef: historyContainerRef,
+        contentKey: historyScrollAnchor,
+        resetKey: activeSession?.id,
+        enabled: activeTab === 'chat' && !!activeSession && !isWritableSession(activeSession),
+    });
     const scheduleComposerFocus = useCallback(() => {
         let attempts = 0;
         const focusWhenReady = () => {
@@ -3754,54 +3248,6 @@ export default function AgentDetailPage() {
         };
         requestAnimationFrame(focusWhenReady);
     }, [activeTab]);
-    const cancelLiveAutoFollow = useCallback(() => {
-        liveAutoFollowUntilRef.current = 0;
-        liveScrollJobRef.current += 1;
-        liveScrollTimersRef.current.forEach((timer) => window.clearTimeout(timer));
-        liveScrollTimersRef.current = [];
-    }, []);
-    const pinChatAwayFromBottom = useCallback(() => {
-        cancelLiveAutoFollow();
-        userPinnedAwayFromBottomRef.current = true;
-        isNearBottom.current = false;
-        setShowScrollBtn(true);
-    }, [cancelLiveAutoFollow]);
-    const scheduleLiveScrollToBottom = useCallback(() => {
-        if (userPinnedAwayFromBottomRef.current) return;
-        cancelLiveAutoFollow();
-        const jobId = liveScrollJobRef.current;
-        liveAutoFollowUntilRef.current = Date.now() + 1500;
-        let attempts = 0;
-        const scroll = () => {
-            if (jobId !== liveScrollJobRef.current) return;
-            if (userPinnedAwayFromBottomRef.current) return;
-            const el = chatContainerRef.current;
-            if (el) el.scrollTop = el.scrollHeight;
-            setShowScrollBtn(false);
-            if (attempts++ < 2) requestAnimationFrame(scroll);
-        };
-        requestAnimationFrame(scroll);
-        liveScrollTimersRef.current = [
-            window.setTimeout(scroll, 80),
-            window.setTimeout(scroll, 220),
-        ];
-    }, [cancelLiveAutoFollow]);
-    useEffect(() => {
-        return () => cancelLiveAutoFollow();
-    }, [cancelLiveAutoFollow]);
-    const scheduleHistoryScrollToBottom = useCallback(() => {
-        let attempts = 0;
-        const scroll = () => {
-            const el = historyContainerRef.current;
-            if (el) el.scrollTop = el.scrollHeight;
-            setShowHistoryScrollBtn(false);
-            if (attempts++ < 8) requestAnimationFrame(scroll);
-        };
-        requestAnimationFrame(scroll);
-        window.setTimeout(scroll, 120);
-        window.setTimeout(scroll, 360);
-    }, []);
-
     const loadMoreHistoryMessages = useCallback(async () => {
         if (historyLoadingMore || !historyHasMore || !activeSession || !id) return;
         // Cursor pagination: without a cursor we cannot page older, and an empty
@@ -3879,491 +3325,25 @@ export default function AgentDetailPage() {
     const handleHistoryScroll = () => {
         const el = historyContainerRef.current;
         if (!el) return;
-        const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-        setShowHistoryScrollBtn(distFromBottom > 200);
         // Load more when scrolling near the top
         if (el.scrollTop < 100 && historyHasMore && !historyLoadingMore) {
             loadMoreHistoryMessages();
         }
-    };
-    const scrollHistoryToBottom = () => {
-        scheduleHistoryScrollToBottom();
     };
     useEffect(() => {
         if (activeTab === 'chat' && activeSession && isWritableSession(activeSession)) {
             scheduleComposerFocus();
         }
     }, [activeTab, activeSession?.id, scheduleComposerFocus]);
-    // Auto-show button when history messages overflow the container
-    useEffect(() => {
-        const el = historyContainerRef.current;
-        if (!el) return;
-        // Use a small timeout to let the DOM render the messages first
-        const timer = setTimeout(() => {
-            if (pendingHistoryInitialScrollRef.current && historyMsgs.length > 0) {
-                pendingHistoryInitialScrollRef.current = false;
-                scheduleHistoryScrollToBottom();
-                return;
-            }
-            const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-            setShowHistoryScrollBtn(distFromBottom > 200);
-        }, 100);
-        return () => clearTimeout(timer);
-    }, [historyMsgs, activeSession?.id, scheduleHistoryScrollToBottom]);
     // Memoized component for each chat message to avoid re-renders while typing
-    const ChatMessageItem = React.useMemo(() => React.memo(({
-        msg, i, isLeft, t, senderLabel, avatarText, forceSenderLabel = false, hideAvatar = false,
-    }: {
-        msg: any;
-        i: number;
-        isLeft: boolean;
-        t: any;
-        senderLabel?: string;
-        avatarText?: string;
-        forceSenderLabel?: boolean;
-        hideAvatar?: boolean;
-    }) => {
-        const previewImages: ChatPreviewImage[] = msg.previewImages?.length
-            ? msg.previewImages
-            : (msg.imageUrl ? [buildPreviewImage(msg.imageUrl, msg.fileName)] : []);
-        const previewedImageNames = new Set(previewImages.map(image => image.filename).filter(Boolean));
-        const mediaAttachments: ChatMessageAttachment[] = msg.role === 'user' && Array.isArray(msg.attachments)
-            ? msg.attachments.filter((attachment: ChatMessageAttachment) => (
-                attachment.kind === 'audio' || attachment.kind === 'video'
-            ))
-            : [];
-        const fileChips: Array<{
-            name: string;
-            path?: string;
-            kind?: ChatMessageAttachment['kind'];
-            mimeType?: string;
-        }> = Array.isArray(msg.attachments)
-            ? msg.attachments
-                .filter((attachment: ChatMessageAttachment) => !['image', 'audio', 'video'].includes(attachment.kind))
-                .map((attachment: ChatMessageAttachment) => ({
-                    name: attachment.display_name,
-                    path: attachment.path,
-                    kind: attachment.kind,
-                    mimeType: attachment.mime_type,
-                }))
-            : splitAttachmentFileNames(msg.fileName)
-                .filter(name => !previewedImageNames.has(name))
-                .map(name => ({ name }));
-        const resolvedSenderLabel = msg.sender_name || senderLabel;
-        const resolvedAvatarText = avatarText || (resolvedSenderLabel ? resolvedSenderLabel[0] : (isLeft ? 'A' : 'U'));
-        const showSenderLabel = !!resolvedSenderLabel && (forceSenderLabel || !!msg.sender_name);
-
-        const rawDisplayContent = msg.content || '';
-        const inlineImagePreviews = previewImages.length === 0
-            ? extractChatImageDataMarkers(rawDisplayContent)
-            : [];
-        const displayContent = stripChatImageDataMarkers(rawDisplayContent);
-
-        const timestampHtml = msg.timestamp ? (() => {
-            const d = new Date(msg.timestamp);
-            const now = new Date();
-            const diffMs = now.getTime() - d.getTime();
-            const isToday = d.toDateString() === now.toDateString();
-            // Align chat timestamps with the app language (upstream #608).
-            const messageTimestampLocale = i18n.language?.startsWith('zh') ? 'zh-CN' : 'en-US';
-            let timeStr = '';
-            if (isToday) timeStr = d.toLocaleTimeString(messageTimestampLocale, { hour: '2-digit', minute: '2-digit' });
-            else if (diffMs < 7 * 86400000) timeStr = d.toLocaleDateString(messageTimestampLocale, { weekday: 'short' }) + ' ' + d.toLocaleTimeString(messageTimestampLocale, { hour: '2-digit', minute: '2-digit' });
-            else timeStr = d.toLocaleDateString(messageTimestampLocale, { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString(messageTimestampLocale, { hour: '2-digit', minute: '2-digit' });
-            return (
-                <div className="chat-msg-timestamp">
-                    {timeStr}
-                    {displayContent && <CopyMessageButton text={displayContent} />}
-                </div>
-            );
-        })() : null;
-
-        return (
-            <div key={i} className={`chat-msg-row${isLeft ? '' : ' chat-msg-row--user'}`}>
-                <div
-                    className={`chat-msg-avatar${isLeft ? '' : ' chat-msg-avatar--user'}`}
-                    style={hideAvatar ? { visibility: 'hidden' } : undefined}
-                >
-                    {resolvedAvatarText}
-                </div>
-                <div className="chat-msg-col">
-                    <div className={isLeft ? '' : 'chat-msg-user-line'}>
-                        <div className={`chat-msg-bubble${isLeft ? '' : ' chat-msg-bubble--user'}${(msg as any)._streaming && !msg.content && !msg.thinking ? ' chat-msg-bubble--thinking' : ''}`}>
-                            {showSenderLabel && <div className="chat-msg-sender">{resolvedSenderLabel}</div>}
-                            {previewImages.length > 0 ? (
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: displayContent ? '6px' : '4px' }}>
-                                    {previewImages.map((image, idx) => (
-                                        unavailableAttachmentKeys.has(image.path || image.src) ? (
-                                            <div key={`${image.path || image.src}-${idx}`} className="chat-msg-file-chip">
-                                                <IconAlertTriangle size={14} stroke={1.8} />
-                                                <span>{image.filename || '图片'} · 当前不可访问</span>
-                                            </div>
-                                        ) : (
-                                            <button
-                                                key={`${image.src}-${idx}`}
-                                                type="button"
-                                                className="chat-msg-image-preview"
-                                                onClick={() => setChatImagePreview({ images: previewImages, index: idx })}
-                                                title={t('common.preview', 'Preview')}
-                                            >
-                                                <img
-                                                    src={image.src}
-                                                    alt={image.alt || image.filename || 'image'}
-                                                    style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '8px', border: '1px solid var(--border-subtle)', objectFit: 'cover' }}
-                                                    loading="lazy"
-                                                    onError={() => markAttachmentUnavailable(image.path || image.src)}
-                                                />
-                                            </button>
-                                        )
-                                    ))}
-                                </div>
-                            ) : null}
-                            {mediaAttachments.length > 0 ? (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: displayContent ? '6px' : '4px' }}>
-                                    {mediaAttachments.map((attachment, mediaIndex) => (
-                                        <ChatMediaCard
-                                            key={`${attachment.path}-${mediaIndex}`}
-                                            agentId={id || ''}
-                                            messageId={String(msg.id || '')}
-                                            attachment={attachment}
-                                            onDownload={() => void handleAttachmentDownload(attachment.path, attachment.display_name)}
-                                            onUnavailable={() => markAttachmentUnavailable(attachment.path)}
-                                        />
-                                    ))}
-                                </div>
-                            ) : null}
-                            {fileChips.length > 0 && (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: displayContent ? '4px' : '0' }}>
-                                    {fileChips.map((file, fileIndex) => (
-                                        <button
-                                            key={`${file.path || file.name}-${fileIndex}`}
-                                            type="button"
-                                            className="chat-msg-file-chip"
-                                            disabled={!file.path || unavailableAttachmentKeys.has(file.path)}
-                                            onClick={() => file.path && void handleAttachmentDownload(file.path, file.name)}
-                                        >
-                                            <ChatAttachmentIcon
-                                                name={file.name}
-                                                kind={file.kind}
-                                                mimeType={file.mimeType}
-                                                size={16}
-                                                stroke={1.8}
-                                            />
-                                            <span style={{ fontWeight: 500, color: 'var(--text-primary)', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                {file.name}{file.path && unavailableAttachmentKeys.has(file.path) ? ' · 当前不可访问' : ''}
-                                            </span>
-                                        </button>
-                                    ))}
-                                </div>
-                            )}
-                            {inlineImagePreviews.length > 0 && (
-                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: displayContent ? '6px' : '0' }}>
-                                    {inlineImagePreviews.map((image, idx) => (
-                                        <button
-                                            key={idx}
-                                            type="button"
-                                            className="chat-msg-image-preview"
-                                            onClick={() => setChatImagePreview({ images: inlineImagePreviews, index: idx })}
-                                            title={t('common.preview', 'Preview')}
-                                        >
-                                            <img
-                                                src={image.src}
-                                                alt={image.alt || 'attached image'}
-                                                style={{ maxWidth: '200px', maxHeight: '150px', borderRadius: '8px', border: '1px solid var(--border-subtle)', objectFit: 'cover' }}
-                                                loading="lazy"
-                                            />
-                                        </button>
-                                    ))}
-                                </div>
-                            )}
-                            {msg.role === 'assistant' ? (
-                                (msg as any)._streaming && !msg.content && !msg.thinking ? (
-                                    <div className="thinking-indicator">
-                                        <div className="thinking-dots"><span /><span /><span /></div>
-                                        <span style={{ color: 'var(--text-tertiary)', fontSize: '13px' }}>{t('agent.chat.thinking', 'Thinking...')}</span>
-                                    </div>
-                                ) : <MarkdownRenderer content={displayContent} />
-                            ) : <MarkdownRenderer content={displayContent} />}
-                        </div>
-                    </div>
-                    {timestampHtml}
-                </div>
-            </div>
-        );
-    }), [handleAttachmentDownload, markAttachmentUnavailable, t, unavailableAttachmentKeys]);
-
-    // ── Unified grouped conversation renderer ──
-    //
-    // Shared by both the live WebSocket chat and the read-only history view.
-    // Runs the same two-pass lookahead grouping algorithm (analysis steps —
-    // thinking + tool calls + mid-flow text — merge into a single AnalysisCard;
-    // only the *final* answer becomes a real chat bubble), while keeping the
-    // participant-perspective logic (left/right side, sender label, avatar)
-    // pluggable via the `viewOf` callback so A2A / group-chat / read-only views
-    // keep their distinct speaker rendering.
-    const renderGroupedConversation = (
-        messages: any[],
-        viewOf: (m: any) => {
-            isLeft: boolean;
-            senderLabel?: string;
-            avatarText?: string;
-            forceSenderLabel?: boolean;
-            hideAvatar?: boolean;
-        },
-    ) => {
-        messages = normalizeChatTimelineMessages(messages);
-        type GroupedEntry =
-            | { type: 'analysis_group'; items: AnalysisItem[]; key: number }
-            | { type: 'special_render'; renderType: NonNullable<ReturnType<typeof getChatToolRenderType>>; msg: any; i: number }
-            | { type: 'msg'; msg: any; i: number };
-        const grouped: GroupedEntry[] = [];
-        let currentGroup: AnalysisItem[] | null = null;
-        let groupStartKey = 0;
-        const flushGroup = () => {
-            if (currentGroup && currentGroup.length > 0) {
-                grouped.push({ type: 'analysis_group', items: currentGroup, key: groupStartKey });
-                currentGroup = null;
-            }
-        };
-        for (let i = 0; i < messages.length; i++) {
-            const msg = messages[i];
-            const renderType = getChatToolRenderType(msg);
-            if (renderType) {
-                flushGroup();
-                grouped.push({ type: 'special_render', renderType, msg, i });
-                continue;
-            }
-
-            if (msg.role === 'tool_call') {
-                if (!currentGroup) { currentGroup = []; groupStartKey = i; }
-                const parsed = (() => { try { return JSON.parse(msg.content || '{}'); } catch { return {}; } })();
-                const toolThinking = msg.toolThinking;
-                const toolName = msg.toolName || parsed.name || 'tool';
-                const toolArgs = msg.toolArgs || parsed.args || {};
-                const toolStatus = msg.toolStatus;
-                const toolResult = msg.toolResult ?? parsed.result ?? undefined;
-                if (toolThinking?.trim()) {
-                    const lastItem = currentGroup[currentGroup.length - 1];
-                    if (!(lastItem?.type === 'thinking' && lastItem.content === toolThinking)) {
-                        currentGroup.push({ type: 'thinking', content: toolThinking });
-                    }
-                }
-                currentGroup.push({
-                    type: 'tool',
-                    name: toolName,
-                    args: toolArgs,
-                    status: toolStatus === 'running' ? 'running' : 'done',
-                    result: toolResult || undefined,
-                });
-                continue;
-            }
-
-            if (msg.role === 'assistant') {
-                const contentText = msg.content?.trim() || '';
-                const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
-                if (msg.thinking) {
-                    if (!currentGroup) { currentGroup = []; groupStartKey = i; }
-                    currentGroup.push({ type: 'thinking', content: msg.thinking });
-                }
-                if (!contentText && !hasAttachments) continue;
-                flushGroup();
-                grouped.push({ type: 'msg', msg: msg.thinking ? { ...msg, thinking: undefined } : msg, i });
-                continue;
-            }
-
-            flushGroup();
-            grouped.push({ type: 'msg', msg, i });
-        }
-        flushGroup(); // flush any trailing group
-
-        return grouped.map((entry, entryIdx) => {
-            const previousEntry = grouped[entryIdx - 1];
-            const hideAssistantAvatar = entry.type === 'msg'
-                && entry.msg.role === 'assistant'
-                && previousEntry?.type === 'analysis_group';
-            if (entry.type === 'analysis_group') {
-                // Group is considered running if it has a running tool,
-                // or if it's the very last entry and the agent is still active
-                const isLastEntry = entryIdx === grouped.length - 1;
-                const hasRunningTool = entry.items.some(
-                    it => it.type === 'tool' && it.status === 'running'
-                );
-                const hasToolItems = entry.items.some(it => it.type === 'tool');
-                const groupIsRunning = hasRunningTool || (!hasToolItems && isLastEntry && (isWaiting || isStreaming || isStopping));
-                // Owner = first final assistant message after this group; its
-                // perspective (left/right + avatar) drives the card alignment.
-                let owner: any = null;
-                for (let k = entryIdx + 1; k < grouped.length; k++) {
-                    const e = grouped[k];
-                    if (e.type === 'msg' && e.msg.role === 'assistant') { owner = e.msg; break; }
-                }
-                const ownerView = owner ? viewOf(owner) : { isLeft: true, avatarText: undefined as string | undefined };
-                return (
-                    <div
-                        key={`ag-${entry.key}`}
-                        className={`chat-msg-row chat-msg-row--analysis${ownerView.isLeft ? '' : ' chat-msg-row--user'}`}
-                    >
-                        <div className="chat-msg-avatar">{ownerView.avatarText || ((agent as any)?.name || 'Agent')[0]}</div>
-                        <AnalysisCard
-                            items={entry.items}
-                            t={t}
-                            expanded={toolGroupExpandedRef.current.has(entry.key) ? !!toolGroupExpandedRef.current.get(entry.key) : false}
-                            onToggle={() => toggleToolGroup(entry.key)}
-                            isGroupRunning={groupIsRunning}
-                        />
-                    </div>
-                );
-            }
-            const { msg, i } = entry;
-            const v = viewOf(msg);
-            // All remaining messages have real content; render as chat bubbles
-            if (msg.role === 'assistant' && msg.thinking) {
-                const contentText = msg.content?.trim() || '';
-                return (
-                    <React.Fragment key={i}>
-                        <ThoughtDisclosure
-                            content={msg.thinking}
-                            t={t}
-                            streaming={!!((msg as any)._streaming && !contentText)}
-                        />
-                        {contentText && (
-                            <ChatMessageItem
-                                msg={{ ...msg, thinking: undefined }}
-                                i={i}
-                                isLeft={v.isLeft}
-                                t={t}
-                                senderLabel={v.senderLabel}
-                                avatarText={v.avatarText}
-                                forceSenderLabel={v.forceSenderLabel}
-                                hideAvatar={v.hideAvatar || hideAssistantAvatar}
-                            />
-                        )}
-                    </React.Fragment>
-                );
-            }
-            if (entry.type === 'special_render') {
-                const cardAvatar = (((agent as any)?.name || 'Agent')[0]) || 'A';
-                return (
-                    <div key={i} className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}>
-                        <div className="chat-msg-avatar">{cardAvatar}</div>
-                        <ChatToolCallRenderer
-                            agentId={id!}
-                            message={msg}
-                            t={t}
-                            mode="pc"
-                            onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
-                            onResolved={(resolvedResult) => {
-                                upsertToolCallMessage({
-                                    ...msg,
-                                    toolStatus: 'done',
-                                    toolResult: resolvedResult,
-                                });
-                            }}
-                        />
-                    </div>
-                );
-            }
-            return (
-                <ChatMessageItem
-                    key={`msg-${i}`}
-                    msg={msg}
-                    i={i}
-                    isLeft={v.isLeft}
-                    t={t}
-                    senderLabel={v.senderLabel}
-                    avatarText={v.avatarText}
-                    forceSenderLabel={v.forceSenderLabel}
-                    hideAvatar={v.hideAvatar || hideAssistantAvatar}
-                />
-            );
-        });
-    };
 
     const handleChatScroll = () => {
         const el = chatContainerRef.current;
         if (!el) return;
-        const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-        isNearBottom.current = distFromBottom < 160;
-        userPinnedAwayFromBottomRef.current = distFromBottom > 260;
-        if (userPinnedAwayFromBottomRef.current) {
-            cancelLiveAutoFollow();
-        }
-        setShowScrollBtn(distFromBottom > 200);
         if (el.scrollTop < 100 && historyHasMore && !historyLoadingMore) {
             loadMoreHistoryMessages();
         }
     };
-    const handleChatWheelCapture = (event: React.WheelEvent<HTMLDivElement>) => {
-        const el = chatContainerRef.current;
-        if (!el) return;
-        if (event.deltaY < 0 && el.scrollTop > 0) {
-            pinChatAwayFromBottom();
-        }
-    };
-    const handleChatTouchStartCapture = (event: React.TouchEvent<HTMLDivElement>) => {
-        chatTouchStartYRef.current = event.touches[0]?.clientY ?? null;
-    };
-    const handleChatTouchMoveCapture = (event: React.TouchEvent<HTMLDivElement>) => {
-        const startY = chatTouchStartYRef.current;
-        const currentY = event.touches[0]?.clientY;
-        const el = chatContainerRef.current;
-        if (startY == null || currentY == null || !el) return;
-        if (currentY - startY > 6 && el.scrollTop > 0) {
-            pinChatAwayFromBottom();
-        }
-    };
-    const scrollToBottom = () => {
-        userPinnedAwayFromBottomRef.current = false;
-        scheduleLiveScrollToBottom();
-    };
-    useEffect(() => {
-        if (activeTab !== 'chat' || !activeSession || !isWritableSession(activeSession)) return;
-        const el = chatContainerRef.current;
-        if (!el) return;
-        const shouldFollow = () => (
-            !userPinnedAwayFromBottomRef.current &&
-            (isNearBottom.current || Date.now() < liveAutoFollowUntilRef.current)
-        );
-        const maybeFollow = () => {
-            if (shouldFollow()) scheduleLiveScrollToBottom();
-        };
-        const mutationObserver = new MutationObserver(maybeFollow);
-        mutationObserver.observe(el, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['open', 'class', 'style'],
-        });
-        let resizeObserver: ResizeObserver | null = null;
-        if (typeof ResizeObserver !== 'undefined') {
-            resizeObserver = new ResizeObserver(maybeFollow);
-            resizeObserver.observe(el);
-            Array.from(el.children).forEach(child => resizeObserver?.observe(child));
-        }
-        return () => {
-            mutationObserver.disconnect();
-            resizeObserver?.disconnect();
-        };
-    }, [activeTab, activeSession?.id, scheduleLiveScrollToBottom]);
-    useEffect(() => {
-        if (!chatEndRef.current) return;
-        if (pendingLiveInitialScrollRef.current && chatMessages.length > 0) {
-            pendingLiveInitialScrollRef.current = false;
-            isFirstLoad.current = false;
-            isNearBottom.current = true;
-            scheduleLiveScrollToBottom();
-            return;
-        }
-        if (isFirstLoad.current && chatMessages.length > 0) {
-            // First load: instant jump to bottom, no animation
-            scheduleLiveScrollToBottom();
-            isFirstLoad.current = false;
-            return;
-        }
-        if (isNearBottom.current) {
-            scheduleLiveScrollToBottom();
-        }
-    }, [chatMessages, scheduleLiveScrollToBottom]);
 
     useEffect(() => {
         const gapAboveComposer = 14;
@@ -4407,8 +3387,7 @@ export default function AgentDetailPage() {
         };
 
         setChatInput('');
-        userPinnedAwayFromBottomRef.current = false;
-        isNearBottom.current = true;
+        scrollToBottom();
         // Reset textarea height after clearing content
         if (chatInputRef.current) {
             chatInputRef.current.style.height = 'auto';
@@ -5272,18 +4251,6 @@ export default function AgentDetailPage() {
                 )}
             </div>
         );
-        const reflectionPreview = (msg: any) => {
-            if (!msg) return '';
-            if (msg.role === 'tool_call') {
-                const name = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'tool';
-                return isZh ? `调用工具：${name}` : `Tool call: ${name}`;
-            }
-            if (msg.role === 'tool_result') {
-                const name = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'result';
-                return isZh ? `工具结果：${name}` : `Tool result: ${name}`;
-            }
-            return String(msg.content || '').replace(/\s+/g, ' ').trim();
-        };
         return (
             <div className="aware-side-preview">
                 <div className="aware-side-section">
@@ -5350,14 +4317,16 @@ export default function AgentDetailPage() {
                     )}
                 </div>
                 <div className="aware-side-section">
-                    <div className="aware-side-section-title">{t('agent.aware.reflections')}</div>
+                    <div className="aware-side-section-title">{isZh ? '执行记录' : 'Executions'}</div>
                     {(reflectionSessions as any[]).length === 0 ? (
-                        <div className="aware-side-empty">{isZh ? '暂无自主思考记录' : 'No reflections yet'}</div>
+                        <div className="aware-side-empty">{isZh ? '暂无执行记录' : 'No executions yet'}</div>
                     ) : (reflectionSessions as any[]).slice(0, 10).map((session: any) => {
-                        const isExpanded = expandedReflection === session.id;
-                        const msgs = reflectionMessages[session.id] || [];
+                        const recordId = session.record_id || session.id;
+                        const conversationId = session.conversation_id || (!session.conversation_missing ? session.id : null);
+                        const isExpanded = expandedReflection === recordId;
+                        const msgs = conversationId ? (reflectionMessages[conversationId] || []) : [];
                         return (
-                            <div key={session.id} className="aware-side-reflection">
+                            <div key={recordId} className="aware-side-reflection">
                                 <button
                                     type="button"
                                     className="aware-side-reflection-head"
@@ -5366,13 +4335,17 @@ export default function AgentDetailPage() {
                                             setExpandedReflection(null);
                                             return;
                                         }
-                                        setExpandedReflection(session.id);
-                                        await loadReflectionMessages(session.id);
+                                        setExpandedReflection(recordId);
+                                        if (conversationId) await loadReflectionMessages(conversationId);
                                     }}
                                 >
                                     <span className="aware-side-dot active" />
                                     <div className="aware-side-trigger-main">
-                                        <div className="aware-side-item-title">{formatReflectionTitle(session.title, !!isZh)}</div>
+                                        <div className="aware-side-item-title">
+                                            {session.execution
+                                                ? `${session.execution.trigger_name} · ${session.execution.source}`
+                                                : formatReflectionTitle(session.title, !!isZh)}
+                                        </div>
                                         <div className="aware-side-item-meta">
                                             {new Date(session.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                                             {session.message_count > 0 ? ` · ${session.message_count}` : ''}
@@ -5382,56 +4355,37 @@ export default function AgentDetailPage() {
                                 </button>
                                 {isExpanded && (
                                     <div className="aware-side-reflection-detail">
-                                        {msgs.length === 0 ? (
+                                        {!conversationId ? (
+                                            <ConversationTimeline
+                                                agentId={id!}
+                                                agentName={agent.name || 'Agent'}
+                                                messages={[]}
+                                                provenance={session.execution}
+                                                viewOf={() => ({ isLeft: true })}
+                                            />
+                                        ) : msgs.length === 0 ? (
                                             <div className="aware-side-empty compact">{isZh ? '正在加载...' : 'Loading...'}</div>
-                                        ) : msgs.map((msg: any, index: number) => {
-                                            const isTool = msg.role === 'tool_call' || msg.role === 'tool_result';
-                                            const toolName = isTool
-                                                ? (msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'tool')
-                                                : '';
-                                            const toolArgs = isTool
-                                                ? (msg.toolArgs || (() => { try { return JSON.parse(msg.content || '{}').args; } catch { return {}; } })())
-                                                : null;
-                                            const toolResult = isTool ? (msg.toolResult || '') : '';
-                                            const argsText = typeof toolArgs === 'string' ? toolArgs : JSON.stringify(toolArgs || {}, null, 2);
-                                            const resultText = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult, null, 2);
-                                            const body = String(msg.content || '');
-                                            return (
-                                                <details key={index} className={`aware-side-reflection-message role-${msg.role}`}>
-                                                    <summary style={{ display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer', listStyle: 'none' } as any}>
-                                                        <span className="aware-side-reflection-role">{msg.role}</span>
-                                                        <span className="aware-side-reflection-text">{reflectionPreview(msg).slice(0, 180)}</span>
-                                                    </summary>
-                                                    <div style={{
-                                                        marginTop: '6px',
-                                                        paddingTop: '6px',
-                                                        borderTop: '1px solid var(--border-subtle)',
-                                                        whiteSpace: 'pre-wrap',
-                                                        maxHeight: '260px',
-                                                        overflow: 'auto',
-                                                        fontFamily: isTool ? 'monospace' : undefined,
-                                                        fontSize: isTool ? '10px' : '11px',
-                                                        lineHeight: 1.5,
-                                                        color: 'var(--text-secondary)',
-                                                    }}>
-                                                        {isTool ? (
-                                                            <>
-                                                                <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{toolName}</div>
-                                                                <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{isZh ? '参数' : 'Arguments'}</div>
-                                                                {argsText || '{}'}
-                                                                {resultText && (
-                                                                    <>
-                                                                        <div style={{ borderTop: '1px dashed var(--border-subtle)', margin: '8px 0', opacity: 0.5 }} />
-                                                                        <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{isZh ? '结果' : 'Result'}</div>
-                                                                        {resultText}
-                                                                    </>
-                                                                )}
-                                                            </>
-                                                        ) : body}
-                                                    </div>
-                                                </details>
-                                            );
-                                        })}
+                                        ) : (
+                                            <ConversationTimeline
+                                                agentId={id!}
+                                                agentName={agent.name || 'Agent'}
+                                                messages={msgs}
+                                                provenance={session.execution}
+                                                viewOf={(message) => ({
+                                                    isLeft: message.role !== 'user',
+                                                    senderLabel: message.role === 'user'
+                                                        ? (isZh ? '触发事件' : 'Trigger event')
+                                                        : (agent.name || 'Agent'),
+                                                    avatarText: message.role === 'user' ? 'T' : (agent.name || 'A')[0],
+                                                    forceSenderLabel: true,
+                                                })}
+                                                unavailableAttachmentKeys={unavailableAttachmentKeys}
+                                                onAttachmentDownload={handleAttachmentDownload}
+                                                onAttachmentUnavailable={markAttachmentUnavailable}
+                                                onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
+                                                onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
+                                            />
+                                        )}
                                     </div>
                                 )}
                             </div>
@@ -6166,8 +5120,10 @@ export default function AgentDetailPage() {
                                     <div className="card" style={{ padding: '16px' }}>
                                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                                             <div>
-                                                <h4 style={{ margin: 0, fontSize: '14px', fontWeight: 600 }}>{t('agent.aware.reflections')}</h4>
-                                                <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('agent.aware.reflectionsDesc')}</span>
+                                                <h4 style={{ margin: 0, fontSize: '14px', fontWeight: 600 }}>{isZh ? '执行记录' : 'Executions'}</h4>
+                                                <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                                    {isZh ? '所有触发入口的状态与标准会话记录' : 'Status and standard conversations for every trigger entry'}
+                                                </span>
                                             </div>
                                             <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
                                                 {reflectionSessions.length} session{reflectionSessions.length > 1 ? 's' : ''}
@@ -6175,10 +5131,12 @@ export default function AgentDetailPage() {
                                         </div>
                                         <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
                                             {visibleSessions.map((session: any) => {
-                                                const isExpanded = expandedReflection === session.id;
-                                                const msgs = reflectionMessages[session.id] || [];
+                                                const recordId = session.record_id || session.id;
+                                                const conversationId = session.conversation_id || (!session.conversation_missing ? session.id : null);
+                                                const isExpanded = expandedReflection === recordId;
+                                                const msgs = conversationId ? (reflectionMessages[conversationId] || []) : [];
                                                 return (
-                                                    <div key={session.id} style={{
+                                                    <div key={recordId} style={{
                                                         borderRadius: '8px',
                                                         border: '1px solid var(--border-subtle)',
                                                         overflow: 'hidden',
@@ -6190,8 +5148,8 @@ export default function AgentDetailPage() {
                                                                     setExpandedReflection(null);
                                                                     return;
                                                                 }
-                                                                setExpandedReflection(session.id);
-                                                                await loadReflectionMessages(session.id);
+                                                                setExpandedReflection(recordId);
+                                                                if (conversationId) await loadReflectionMessages(conversationId);
                                                             }}
                                                             style={{
                                                                 padding: '10px 16px',
@@ -6207,7 +5165,9 @@ export default function AgentDetailPage() {
                                                             }} />
                                                             <div style={{ flex: 1, minWidth: 0 }}>
                                                                 <div style={{ fontSize: '12px', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                                    {formatReflectionTitle(session.title, !!isZh)}
+                                                                    {session.execution
+                                                                        ? `${session.execution.trigger_name} · ${session.execution.source}`
+                                                                        : formatReflectionTitle(session.title, !!isZh)}
                                                                 </div>
                                                                 <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '1px' }}>
                                                                     {new Date(session.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
@@ -6222,126 +5182,37 @@ export default function AgentDetailPage() {
                                                         </div>
                                                         {isExpanded && (
                                                             <div style={{ padding: '0 16px 12px', borderTop: '1px solid var(--border-subtle)' }}>
-                                                                {msgs.length === 0 ? (
+                                                                {!conversationId ? (
+                                                                    <ConversationTimeline
+                                                                        agentId={id!}
+                                                                        agentName={agent.name || 'Agent'}
+                                                                        messages={[]}
+                                                                        provenance={session.execution}
+                                                                        viewOf={() => ({ isLeft: true })}
+                                                                    />
+                                                                ) : msgs.length === 0 ? (
                                                                     <div style={{ padding: '12px 0', fontSize: '12px', color: 'var(--text-tertiary)' }}>Loading...</div>
                                                                 ) : (
-                                                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '8px' }}>
-                                                                        {msgs.map((msg: any, mi: number) => {
-                                                                            if (msg.role === 'tool_call') {
-                                                                                const tName = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'tool';
-                                                                                const tArgs = msg.toolArgs || (() => { try { return JSON.parse(msg.content || '{}').args; } catch { return {}; } })();
-                                                                                const tResult = msg.toolResult || '';
-                                                                                const argsStr = typeof tArgs === 'string' ? tArgs : JSON.stringify(tArgs || {}, null, 2);
-                                                                                const resultStr = typeof tResult === 'string' ? tResult : JSON.stringify(tResult, null, 2);
-                                                                                return (
-                                                                                    <details key={mi} style={{ borderRadius: '6px', background: 'var(--bg-secondary)', overflow: 'hidden' }}>
-                                                                                        <summary style={{
-                                                                                            padding: '5px 10px',
-                                                                                            fontSize: '11px', cursor: 'pointer',
-                                                                                            display: 'flex', alignItems: 'center', gap: '8px',
-                                                                                            listStyle: 'none',
-                                                                                            WebkitAppearance: 'none',
-                                                                                        } as any}>
-                                                                                            <span style={{ fontSize: '8px', color: 'var(--text-tertiary)', flexShrink: 0 }}>&#9654;</span>
-                                                                                            <span style={{
-                                                                                                fontWeight: 600, fontSize: '10px', color: 'var(--text-primary)',
-                                                                                                padding: '1px 6px', borderRadius: '3px',
-                                                                                                background: 'var(--bg-tertiary, rgba(0,0,0,0.06))',
-                                                                                                flexShrink: 0, fontFamily: 'monospace',
-                                                                                            }}>{tName}</span>
-                                                                                            <span style={{
-                                                                                                color: 'var(--text-tertiary)', fontFamily: 'monospace', fontSize: '10px',
-                                                                                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                                                                                            }}>
-                                                                                                {argsStr.replace(/\n/g, ' ').substring(0, 60)}{argsStr.length > 60 ? '...' : ''}
-                                                                                            </span>
-                                                                                        </summary>
-                                                                                        <div style={{
-                                                                                            padding: '8px 10px', borderTop: '1px solid var(--border-subtle)',
-                                                                                            fontFamily: 'monospace', fontSize: '10px', lineHeight: 1.5,
-                                                                                            whiteSpace: 'pre-wrap', maxHeight: '260px', overflow: 'auto',
-                                                                                            color: 'var(--text-secondary)',
-                                                                                        }}>
-                                                                                            <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{isZh ? '参数' : 'Arguments'}</div>
-                                                                                            {argsStr || '{}'}
-                                                                                            {resultStr && (
-                                                                                                <>
-                                                                                                    <div style={{ borderTop: '1px dashed var(--border-subtle)', margin: '8px 0', opacity: 0.5 }} />
-                                                                                                    <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{isZh ? '结果' : 'Result'}</div>
-                                                                                                    {resultStr.substring(0, 1000)}
-                                                                                                </>
-                                                                                            )}
-                                                                                        </div>
-                                                                                    </details>
-                                                                                );
-                                                                            }
-                                                                            if (msg.role === 'tool_result') {
-                                                                                const tName = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'result';
-                                                                                const tResult = msg.toolResult || msg.content || '';
-                                                                                const resultStr = typeof tResult === 'string' ? tResult : JSON.stringify(tResult, null, 2);
-                                                                                if (!resultStr) return null;
-                                                                                return (
-                                                                                    <details key={mi} style={{ borderRadius: '6px', background: 'var(--bg-secondary)', overflow: 'hidden' }}>
-                                                                                        <summary style={{
-                                                                                            padding: '5px 10px',
-                                                                                            fontSize: '11px', cursor: 'pointer',
-                                                                                            display: 'flex', alignItems: 'center', gap: '8px',
-                                                                                            listStyle: 'none',
-                                                                                            WebkitAppearance: 'none',
-                                                                                        } as any}>
-                                                                                            <span style={{ fontSize: '8px', color: 'var(--text-tertiary)', flexShrink: 0 }}>&#9654;</span>
-                                                                                            <span style={{
-                                                                                                fontWeight: 600, fontSize: '10px', color: 'var(--text-primary)',
-                                                                                                padding: '1px 6px', borderRadius: '3px',
-                                                                                                background: 'var(--bg-tertiary, rgba(0,0,0,0.06))',
-                                                                                                flexShrink: 0, fontFamily: 'monospace',
-                                                                                            }}>{tName}</span>
-                                                                                            <span style={{
-                                                                                                color: 'var(--text-tertiary)', fontFamily: 'monospace', fontSize: '10px',
-                                                                                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                                                                                            }}>
-                                                                                                → {resultStr.replace(/\n/g, ' ').substring(0, 80)}
-                                                                                            </span>
-                                                                                        </summary>
-                                                                                        <div style={{
-                                                                                            padding: '8px 10px', borderTop: '1px solid var(--border-subtle)',
-                                                                                            fontFamily: 'monospace', fontSize: '10px', lineHeight: 1.5,
-                                                                                            whiteSpace: 'pre-wrap', maxHeight: '200px', overflow: 'auto',
-                                                                                            color: 'var(--text-secondary)',
-                                                                                        }}>
-                                                                                            {resultStr.substring(0, 1000)}
-                                                                                        </div>
-                                                                                    </details>
-                                                                                );
-                                                                            }
-                                                                            if (msg.role === 'assistant') {
-                                                                                return (
-                                                                                    <div key={mi} style={{
-                                                                                        padding: '8px 10px', borderRadius: '6px',
-                                                                                        background: 'var(--bg-secondary)',
-                                                                                        fontSize: '12px', color: 'var(--text-primary)',
-                                                                                        whiteSpace: 'pre-wrap', lineHeight: '1.5',
-                                                                                        maxHeight: '200px', overflow: 'auto',
-                                                                                    }}>
-                                                                                        {msg.content}
-                                                                                    </div>
-                                                                                );
-                                                                            }
-                                                                            if (msg.role === 'user') {
-                                                                                return (
-                                                                                    <div key={mi} style={{
-                                                                                        padding: '6px 10px', borderRadius: '6px',
-                                                                                        background: 'var(--bg-secondary)',
-                                                                                        borderLeft: '2px solid var(--border-subtle)',
-                                                                                        fontSize: '11px', color: 'var(--text-secondary)',
-                                                                                        whiteSpace: 'pre-wrap', maxHeight: '100px', overflow: 'auto',
-                                                                                    }}>
-                                                                                        {(msg.content || '').substring(0, 300)}
-                                                                                    </div>
-                                                                                );
-                                                                            }
-                                                                            return null;
-                                                                        })}
+                                                                    <div style={{ marginTop: '8px' }}>
+                                                                        <ConversationTimeline
+                                                                            agentId={id!}
+                                                                            agentName={agent.name || 'Agent'}
+                                                                            messages={msgs}
+                                                                            provenance={session.execution}
+                                                                            viewOf={(message) => ({
+                                                                                isLeft: message.role !== 'user',
+                                                                                senderLabel: message.role === 'user'
+                                                                                    ? (isZh ? '触发事件' : 'Trigger event')
+                                                                                    : (agent.name || 'Agent'),
+                                                                                avatarText: message.role === 'user' ? 'T' : (agent.name || 'A')[0],
+                                                                                forceSenderLabel: true,
+                                                                            })}
+                                                                            unavailableAttachmentKeys={unavailableAttachmentKeys}
+                                                                            onAttachmentDownload={handleAttachmentDownload}
+                                                                            onAttachmentUnavailable={markAttachmentUnavailable}
+                                                                            onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
+                                                                            onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
+                                                                        />
                                                                     </div>
                                                                 )}
                                                             </div>
@@ -6737,7 +5608,15 @@ export default function AgentDetailPage() {
                                                 <>Read-only · {activeSession.username || 'User'}</>
                                             )}
                                         </div>
-                                        <div ref={historyContainerRef} onScroll={handleHistoryScroll} style={{ flex: 1, overflowY: 'auto', padding: '48px 16px 12px' }}>
+                                        <div
+                                            ref={historyContainerRef}
+                                            data-conversation-scroller="web-history"
+                                            tabIndex={0}
+                                            aria-label={isZh ? '只读会话消息' : 'Read-only conversation messages'}
+                                            onScroll={handleHistoryScroll}
+                                            {...historyAutoFollowInteractionProps}
+                                            style={{ flex: 1, overflowY: 'auto', padding: '48px 16px 12px' }}
+                                        >
                                             {historyLoadingMore && (
                                                 <div style={{ textAlign: 'center', padding: '12px', color: 'var(--text-tertiary)', fontSize: '13px' }}>
                                                     Loading more messages...
@@ -6755,11 +5634,17 @@ export default function AgentDetailPage() {
                                                 const isHumanReadonly = !isA2A && !activeSession.is_group;
                                                 const thisAgentId = (agent as any)?.id != null ? String((agent as any).id) : null;
                                                 const viewerId = currentUser?.id != null ? String(currentUser.id) : null;
-                                                // Route history through the same grouped renderer as the live
-                                                // chat so A2A / group / read-only views also collapse thinking
-                                                // + tool calls into a single AnalysisCard. The participant
-                                                // perspective (left/right, label, avatar) stays distinct here.
-                                                return renderGroupedConversation(historyMsgs, (m: any) => {
+                                                return <ConversationTimeline
+                                                    agentId={id!}
+                                                    agentName={(agent as any)?.name || 'Agent'}
+                                                    messages={historyMsgs as any}
+                                                    provenance={activeSessionExecution}
+                                                    unavailableAttachmentKeys={unavailableAttachmentKeys}
+                                                    onAttachmentDownload={handleAttachmentDownload}
+                                                    onAttachmentUnavailable={markAttachmentUnavailable}
+                                                    onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
+                                                    onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
+                                                    viewOf={(m: any) => {
                                                     // Determine if this message is from "this agent" (left) or peer (right).
                                                     // Group chat: assistant always left; user msgs are RIGHT only when sent
                                                     // by the logged-in viewer themself, otherwise LEFT (so each distinct
@@ -6790,12 +5675,17 @@ export default function AgentDetailPage() {
                                                                 ? ((((agent as any)?.name || 'Agent')[0]) || 'A')
                                                                 : ((m.sender_name && m.sender_name[0]) || 'U'))
                                                             : undefined;
-                                                    return { isLeft, senderLabel, avatarText, forceSenderLabel: isHumanReadonly || isGroupChat };
-                                                });
+                                                        return { isLeft, senderLabel, avatarText, forceSenderLabel: isHumanReadonly || isGroupChat };
+                                                    }}
+                                                />;
                                             })()}
                                         </div>
                                         {showHistoryScrollBtn && (
-                                            <button onClick={scrollHistoryToBottom} className="chat-scroll-btn" style={{ bottom: '20px' }} title="Scroll to bottom">↓</button>
+                                            <ConversationScrollToBottomButton
+                                                variant="web"
+                                                onClick={scrollHistoryToBottom}
+                                                label={i18n.language?.startsWith('zh') ? '滚动到底' : 'Scroll to bottom'}
+                                            />
                                         )}
                                     </>
                                 ) : (
@@ -6811,10 +5701,11 @@ export default function AgentDetailPage() {
                                         {showNoModelState && renderNoModelGuide('floating')}
                                         <div
                                             ref={chatContainerRef}
+                                            data-conversation-scroller="web-live"
+                                            tabIndex={0}
+                                            aria-label={isZh ? '会话消息' : 'Conversation messages'}
                                             onScroll={handleChatScroll}
-                                            onWheelCapture={handleChatWheelCapture}
-                                            onTouchStartCapture={handleChatTouchStartCapture}
-                                            onTouchMoveCapture={handleChatTouchMoveCapture}
+                                            {...liveAutoFollowInteractionProps}
                                             style={{ flex: 1, overflowY: 'auto', padding: '12px 16px' }}
                                         >
                                             {chatMessages.length === 0 && !showNoModelState && (
@@ -6831,21 +5722,27 @@ export default function AgentDetailPage() {
                                                         return !(msg?.role === 'assistant' && (content.includes('no LLM model') || content.includes('No model')));
                                                     })
                                                     : chatMessages;
-                                                // Route the live chat through the shared grouped renderer. The
-                                                // two-pass lookahead grouping (thinking + tool calls + mid-flow
-                                                // text → single AnalysisCard, only final answers as bubbles)
-                                                // now lives in renderGroupedConversation; the viewOf callback
-                                                // supplies the 1:1 live-chat perspective (assistant left, the
-                                                // logged-in user right) so behavior is identical to before.
-                                                return renderGroupedConversation(visibleChatMessages, (m: any) => ({
-                                                    isLeft: m.role === 'assistant',
-                                                    senderLabel: m.role === 'assistant'
-                                                        ? ((agent as any)?.name || 'Agent')
-                                                        : (currentUser?.display_name || undefined),
-                                                    avatarText: m.role === 'assistant'
-                                                        ? (((agent as any)?.name || 'Agent')[0])
-                                                        : (currentUser?.display_name?.[0] || undefined),
-                                                }));
+                                                return <ConversationTimeline
+                                                    agentId={id!}
+                                                    agentName={(agent as any)?.name || 'Agent'}
+                                                    messages={visibleChatMessages as any}
+                                                    provenance={activeSessionExecution}
+                                                    isRunning={isWaiting || isStreaming || isStopping}
+                                                    unavailableAttachmentKeys={unavailableAttachmentKeys}
+                                                    onAttachmentDownload={handleAttachmentDownload}
+                                                    onAttachmentUnavailable={markAttachmentUnavailable}
+                                                    onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
+                                                    onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
+                                                    viewOf={(m: any) => ({
+                                                        isLeft: m.role === 'assistant',
+                                                        senderLabel: m.role === 'assistant'
+                                                            ? ((agent as any)?.name || 'Agent')
+                                                            : (currentUser?.display_name || undefined),
+                                                        avatarText: m.role === 'assistant'
+                                                            ? (((agent as any)?.name || 'Agent')[0])
+                                                            : (currentUser?.display_name?.[0] || undefined),
+                                                    })}
+                                                />;
                                             })()
                                             }
                                             {isWaiting && (
@@ -6861,10 +5758,14 @@ export default function AgentDetailPage() {
                                                     </div>
                                                 </div>
                                             )}
-                                            <div ref={chatEndRef} />
                                         </div>
                                         {showScrollBtn && (
-                                            <button onClick={scrollToBottom} className="chat-scroll-btn" style={{ bottom: `${chatScrollBtnBottom}px` }} title="Scroll to bottom">↓</button>
+                                            <ConversationScrollToBottomButton
+                                                variant="web"
+                                                bottom={chatScrollBtnBottom}
+                                                onClick={scrollToBottom}
+                                                label={i18n.language?.startsWith('zh') ? '滚动到底' : 'Scroll to bottom'}
+                                            />
                                         )}
                                         {/* Transient info banner — e.g. fallback model switch */}
                                         {chatInfoMsg && (

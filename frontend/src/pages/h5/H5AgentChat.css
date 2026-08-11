@@ -398,8 +398,20 @@ body.h5-chat-active #root {
     }
 }
 
+.h5-chat__messages-shell {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+}
+
+.h5-chat__messages-shell > .conversation-scroll-bottom {
+    --conversation-scroll-bottom-offset: 14px;
+}
+
 .h5-chat__messages {
     flex: 1 1 auto;
+    width: 100%;
     min-height: 0;
     overflow-y: auto;
     padding: 14px var(--h5-edge-padding-right) calc(18px + var(--h5-safe-area-bottom)) var(--h5-edge-padding-left);
@@ -425,6 +437,13 @@ body.h5-chat-active #root {
     width: 100%;
     display: flex;
     flex-direction: column;
+}
+
+.h5-chat__flow-content {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
 }
 
 .h5-chat__messages--virtual {
