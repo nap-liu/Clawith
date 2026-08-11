@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 import shutil
+import stat as stat_module
+import uuid
+from pathlib import Path, PurePosixPath
 
 import aiofiles
 from fastapi import HTTPException, status
@@ -30,52 +32,108 @@ class LocalStorageBackend(StorageBackend):
         normalized = normalize_storage_key(key)
         full = (self.root / normalized).resolve()
         root_resolved = self.root.resolve()
-        if not str(full).startswith(str(root_resolved)):
+        try:
+            full.relative_to(root_resolved)
+        except ValueError:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Path traversal not allowed")
         return full
 
+    def _open_readonly_fd(self, key: str, *, directory: bool = False) -> int:
+        """Open one storage key without following symlinks in any component."""
+        normalized = normalize_storage_key(key)
+        parts = PurePosixPath(normalized).parts if normalized else ()
+        current_fd = os.open(
+            self.root.resolve(),
+            os.O_RDONLY | os.O_DIRECTORY,
+        )
+        try:
+            for index, part in enumerate(parts):
+                is_final = index == len(parts) - 1
+                flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                if not is_final or directory:
+                    flags |= os.O_DIRECTORY
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+        except BaseException:
+            os.close(current_fd)
+            raise
+
     async def exists(self, key: str) -> bool:
-        return self._full_path(key).exists()
+        try:
+            fd = self._open_readonly_fd(key)
+        except OSError:
+            return False
+        os.close(fd)
+        return True
 
     async def is_file(self, key: str) -> bool:
-        return self._full_path(key).is_file()
+        try:
+            fd = self._open_readonly_fd(key)
+        except OSError:
+            return False
+        try:
+            return stat_module.S_ISREG(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)
 
     async def is_dir(self, key: str) -> bool:
-        return self._full_path(key).is_dir()
+        try:
+            fd = self._open_readonly_fd(key, directory=True)
+        except OSError:
+            return False
+        os.close(fd)
+        return True
 
     async def list_dir(self, key: str) -> list[StorageEntry]:
-        base = self._full_path(key)
-        if not base.exists() or not base.is_dir():
+        normalized = normalize_storage_key(key)
+        try:
+            base_fd = self._open_readonly_fd(normalized, directory=True)
+        except OSError:
             return []
-        entries: list[StorageEntry] = []
-        for entry in sorted(base.iterdir(), key=lambda item: (not item.is_dir(), item.name)):
-            if entry.name == ".gitkeep":
-                continue
-            stat = entry.stat()
-            rel = str(entry.resolve().relative_to(self.root.resolve()))
-            entries.append(
-                StorageEntry(
-                    name=entry.name,
-                    key=rel,
-                    is_dir=entry.is_dir(),
-                    size=stat.st_size if entry.is_file() else 0,
-                    modified_at=str(stat.st_mtime),
-                    version_id=_local_version_token(stat, None),
+        try:
+            entries: list[StorageEntry] = []
+            entry_stats = []
+            for name in os.listdir(base_fd):
+                if name == ".gitkeep":
+                    continue
+                entry_stat = os.stat(name, dir_fd=base_fd, follow_symlinks=False)
+                if stat_module.S_ISLNK(entry_stat.st_mode):
+                    continue
+                entry_stats.append((name, entry_stat))
+            for name, entry_stat in sorted(
+                entry_stats,
+                key=lambda item: (not stat_module.S_ISDIR(item[1].st_mode), item[0]),
+            ):
+                is_dir = stat_module.S_ISDIR(entry_stat.st_mode)
+                is_file = stat_module.S_ISREG(entry_stat.st_mode)
+                rel = f"{normalized.rstrip('/')}/{name}" if normalized else name
+                entries.append(
+                    StorageEntry(
+                        name=name,
+                        key=rel,
+                        is_dir=is_dir,
+                        size=entry_stat.st_size if is_file else 0,
+                        modified_at=str(entry_stat.st_mtime),
+                        version_id=_local_version_token(entry_stat, None),
+                    )
                 )
-            )
-        return entries
+            return entries
+        finally:
+            os.close(base_fd)
 
     async def read_bytes(self, key: str) -> bytes:
-        path = self._full_path(key)
-        async with aiofiles.open(path, "rb") as f:
-            return await f.read()
+        return await asyncio.to_thread(self._read_bytes_sync, key)
 
     async def read_range(self, key: str, start: int, end: int) -> bytes:
-        path = self._full_path(key)
         length = max(0, end - start + 1)
-        async with aiofiles.open(path, "rb") as f:
-            await f.seek(max(0, start))
-            return await f.read(length)
+        return await asyncio.to_thread(
+            self._read_range_sync,
+            key,
+            max(0, start),
+            length,
+        )
 
     async def read_text_lines(
         self,
@@ -86,15 +144,26 @@ class LocalStorageBackend(StorageBackend):
         encoding: str = "utf-8",
         errors: str = "replace",
     ) -> TextLineRange:
-        path = self._full_path(key)
         return await asyncio.to_thread(
             _local_read_text_lines,
-            path,
+            self,
+            key,
             max(0, offset),
             max(0, limit),
             encoding,
             errors,
         )
+
+    def _read_bytes_sync(self, key: str) -> bytes:
+        fd = self._open_readonly_fd(key)
+        with os.fdopen(fd, "rb") as file_obj:
+            return file_obj.read()
+
+    def _read_range_sync(self, key: str, start: int, length: int) -> bytes:
+        fd = self._open_readonly_fd(key)
+        with os.fdopen(fd, "rb") as file_obj:
+            file_obj.seek(start)
+            return file_obj.read(length)
 
     async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
         path = self._full_path(key)
@@ -112,7 +181,7 @@ class LocalStorageBackend(StorageBackend):
         if path.resolve() == target.resolve():
             return
         target.parent.mkdir(parents=True, exist_ok=True)
-        partial = target.with_name(f".{target.name}.importing")
+        partial = target.with_name(f".{target.name}.{uuid.uuid4().hex}.importing")
         try:
             await asyncio.to_thread(shutil.copyfile, path, partial)
             await asyncio.to_thread(os.replace, partial, target)
@@ -135,35 +204,44 @@ class LocalStorageBackend(StorageBackend):
         await asyncio.to_thread(_local_delete_tree, path)
 
     async def stat(self, key: str) -> StorageEntry:
-        path = self._full_path(key)
-        stat = path.stat()
-        version_id = _local_version_token(stat, None)
-        return StorageEntry(
-            name=path.name,
-            key=normalize_storage_key(key),
-            is_dir=path.is_dir(),
-            size=stat.st_size if path.is_file() else 0,
-            modified_at=str(stat.st_mtime),
-            version_id=version_id,
-        )
+        normalized = normalize_storage_key(key)
+        fd = self._open_readonly_fd(normalized)
+        try:
+            stat = os.fstat(fd)
+            version_id = _local_version_token(stat, None)
+            return StorageEntry(
+                name=PurePosixPath(normalized).name,
+                key=normalized,
+                is_dir=stat_module.S_ISDIR(stat.st_mode),
+                size=stat.st_size if stat_module.S_ISREG(stat.st_mode) else 0,
+                modified_at=str(stat.st_mtime),
+                version_id=version_id,
+            )
+        finally:
+            os.close(fd)
 
     async def get_version(self, key: str) -> StorageVersion:
-        path = self._full_path(key)
-        if not path.exists():
+        normalized = normalize_storage_key(key)
+        try:
+            fd = self._open_readonly_fd(normalized)
+        except OSError:
             return StorageVersion(key=normalize_storage_key(key), exists=False, is_dir=False)
-        stat = path.stat()
-        if path.is_dir():
-            return StorageVersion(
-                key=normalize_storage_key(key),
-                exists=True,
-                is_dir=True,
-                modified_at=str(stat.st_mtime),
-                version_id=_local_version_token(stat, None),
-            )
+        try:
+            stat = os.fstat(fd)
+            if stat_module.S_ISDIR(stat.st_mode):
+                return StorageVersion(
+                    key=normalized,
+                    exists=True,
+                    is_dir=True,
+                    modified_at=str(stat.st_mtime),
+                    version_id=_local_version_token(stat, None),
+                )
+        finally:
+            os.close(fd)
         data = await self.read_bytes(key)
         file_hash = content_hash_bytes(data)
         return StorageVersion(
-            key=normalize_storage_key(key),
+            key=normalized,
             exists=True,
             is_dir=False,
             size=stat.st_size,
@@ -221,7 +299,8 @@ def _local_create_exclusive(path: Path, data: bytes) -> None:
 
 
 def _local_read_text_lines(
-    path: Path,
+    backend: LocalStorageBackend,
+    key: str,
     offset: int,
     limit: int,
     encoding: str,
@@ -230,7 +309,14 @@ def _local_read_text_lines(
     selected: list[str] = []
     end = offset + limit
     total_lines = 0
-    with path.open("r", encoding=encoding, errors=errors, newline=None) as file_obj:
+    fd = backend._open_readonly_fd(key)
+    with os.fdopen(
+        fd,
+        "r",
+        encoding=encoding,
+        errors=errors,
+        newline=None,
+    ) as file_obj:
         for line_index, line in enumerate(file_obj):
             total_lines = line_index + 1
             if offset <= line_index < end:
