@@ -65,25 +65,36 @@ async def get_inbox(
 
     result_list = []
     for sess in sessions:
-        # Get latest messages from this session
+        # The inbox is a conversation index, not a second message renderer.
+        # Return one human-readable preview per A2A session; the Web client
+        # opens the canonical conversation for the complete tool/thinking flow.
         msgs_q = await db.execute(
             select(ChatMessage)
-            .where(ChatMessage.conversation_id == str(sess.id))
+            .where(
+                ChatMessage.conversation_id == str(sess.id),
+                ChatMessage.role.in_(["user", "assistant"]),
+            )
             .order_by(ChatMessage.created_at.desc())
-            .limit(3)
+            .limit(1)
         )
         for msg in msgs_q.scalars().all():
             sender_name = "未知"
-            if msg.participant_id:
+            if msg.sender_agent_id:
+                name_r = await db.execute(select(Agent.name).where(Agent.id == msg.sender_agent_id))
+                sender_name = name_r.scalar_one_or_none() or "未知"
+            elif msg.participant_id:
                 p_r = await db.execute(select(Participant.display_name).where(Participant.id == msg.participant_id))
                 sender_name = p_r.scalar_one_or_none() or "未知"
 
             result_list.append({
                 "id": str(msg.id),
+                "session_id": str(sess.id),
+                "agent_id": str(sess.agent_id if sess.agent_id in my_agent_ids else sess.peer_agent_id),
                 "sender_type": "agent",
                 "sender_name": sender_name,
                 "content": msg.content,
                 "session_title": sess.title,
+                "source_channel": sess.source_channel,
                 "created_at": msg.created_at.isoformat() if msg.created_at else None,
             })
 

@@ -415,6 +415,9 @@ export const chatSessionApi = {
     get: (agentId: string, sessionId: string) =>
         request<Record<string, any> & { view_scope: 'mine' | 'all' }>(`/agents/${agentId}/sessions/${sessionId}`),
 
+    execution: (agentId: string, sessionId: string) =>
+        request<Record<string, any> | null>(`/agents/${agentId}/sessions/${sessionId}/execution`),
+
     create: (agentId: string, data: { title?: string; source_channel?: string }) =>
         request<any>(`/agents/${agentId}/sessions`, { method: 'POST', body: JSON.stringify(data) }),
 
@@ -705,6 +708,9 @@ export const skillApi = {
 export const triggerApi = {
     list: (agentId: string) =>
         request<any[]>(`/agents/${agentId}/triggers`),
+
+    executions: (agentId: string, limit = 100) =>
+        request<any[]>(`/agents/${agentId}/trigger-executions?limit=${limit}`),
 
     update: (agentId: string, triggerId: string, data: any) =>
         request<any>(`/agents/${agentId}/triggers/${triggerId}`, { method: 'PATCH', body: JSON.stringify(data) }),

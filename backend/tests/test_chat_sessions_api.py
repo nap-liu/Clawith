@@ -170,6 +170,48 @@ async def test_member_cannot_resolve_other_users_session(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_custom_manager_can_resolve_trigger_session_only(monkeypatch):
+    viewer_id = uuid.uuid4()
+    owner_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    now = datetime.now(UTC)
+    current_user = SimpleNamespace(id=viewer_id, role="member")
+    agent = SimpleNamespace(id=agent_id, creator_id=owner_id)
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    trigger_session = _session_summary(agent_id=agent_id, owner_id=owner_id, now=now)
+    trigger_session.source_channel = "trigger"
+    trigger_db = RecordingDB(
+        responses=[
+            DummyResult([trigger_session]),
+            DummyResult(scalar_value=2),
+        ]
+    )
+    detail = await chat_sessions_api.get_session(
+        agent_id=agent_id,
+        session_id=trigger_session.id,
+        current_user=current_user,
+        db=trigger_db,
+    )
+    assert detail.view_scope == "all"
+
+    web_session = _session_summary(agent_id=agent_id, owner_id=owner_id, now=now)
+    web_db = RecordingDB(responses=[DummyResult([web_session])])
+    with pytest.raises(HTTPException) as exc:
+        await chat_sessions_api.get_session(
+            agent_id=agent_id,
+            session_id=web_session.id,
+            current_user=current_user,
+            db=web_db,
+        )
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_group_member_resolves_link_in_mine_scope(monkeypatch):
     member_id = uuid.uuid4()
     owner_id = uuid.uuid4()
@@ -664,3 +706,59 @@ async def test_create_session_returns_web_session_shape(monkeypatch):
     assert db.committed is True
     assert db.flush_count == 1
     assert len(db.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_session_execution_returns_latest_provenance(monkeypatch):
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    user = SimpleNamespace(id=uuid.uuid4(), role="member")
+    now = datetime.now(UTC)
+    execution = SimpleNamespace(
+        id=uuid.uuid4(),
+        source="on_message",
+        status="failed",
+        scheduled_at=now - timedelta(seconds=5),
+        finished_at=now,
+        last_error="origin no longer exists",
+    )
+    db = RecordingDB(responses=[DummyResult([execution])])
+
+    async def fake_load(_db, _user, _agent_id, _session_id):
+        return SimpleNamespace(id=agent_id), SimpleNamespace(id=session_id), "all"
+
+    monkeypatch.setattr(chat_sessions_api, "_load_accessible_session", fake_load)
+
+    result = await chat_sessions_api.get_session_execution(
+        agent_id=agent_id,
+        session_id=session_id,
+        current_user=user,
+        db=db,
+    )
+
+    assert result["source"] == "on_message"
+    assert result["status"] == "failed"
+    assert result["last_error"] == "Execution failed. Open execution details for diagnostics."
+    assert result["finished_at"] == now.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_get_session_execution_returns_none_without_link(monkeypatch):
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    user = SimpleNamespace(id=uuid.uuid4(), role="member")
+    db = RecordingDB(responses=[DummyResult()])
+
+    async def fake_load(_db, _user, _agent_id, _session_id):
+        return SimpleNamespace(id=agent_id), SimpleNamespace(id=session_id), "mine"
+
+    monkeypatch.setattr(chat_sessions_api, "_load_accessible_session", fake_load)
+
+    result = await chat_sessions_api.get_session_execution(
+        agent_id=agent_id,
+        session_id=session_id,
+        current_user=user,
+        db=db,
+    )
+
+    assert result is None

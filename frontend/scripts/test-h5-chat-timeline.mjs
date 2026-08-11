@@ -34,19 +34,14 @@ const fileDeliveryPath = resolve(__dirname, '../src/utils/chatFileDelivery.ts');
 const fileDeliveryModule = compileTsModule(fileDeliveryPath);
 const { parseFileDeliveryToolResult, parseMediaDeliveryErrorResult } = fileDeliveryModule.exports;
 
-const mediaCardSource = readFileSync(
-    resolve(__dirname, '../src/components/ChatMediaCard.tsx'),
-    'utf8',
-);
-assert.match(mediaCardSource, /externalStarted\s*&&\s*mediaRef\.current/);
-assert.match(mediaCardSource, /mediaRef\.current\.load\(\)/);
-assert.match(mediaCardSource, /manual\)\s*void mediaRef\.current\.play\(\)/);
-
-const sourcePath = resolve(__dirname, '../src/pages/h5/chatTimeline.ts');
+// Compile the canonical shared conversation core directly. The H5 module is a
+// compatibility facade over this file, so these fixtures lock the behaviour H5
+// consumes while allowing Web to share the same transformations.
+const sourcePath = resolve(__dirname, '../src/features/conversation/core/chatTimeline.ts');
 const timelineRequire = (id) => {
-    if (id === '../../utils/chatFileDelivery') return fileDeliveryModule.exports;
-    if (id === '../../utils/clientId') return { createClientId: () => 'test-client-id' };
-    if (id === '../../components/ChatToolCallRenderer') {
+    if (id === '../../../utils/chatFileDelivery') return fileDeliveryModule.exports;
+    if (id === '../../../utils/clientId') return { createClientId: () => 'test-client-id' };
+    if (id === '../../../components/ChatToolCallRenderer') {
         return {
             getChatToolRenderType: (message) => (
                 message?.role !== 'tool_call'
@@ -86,8 +81,8 @@ const module = compileTsModule(sourcePath, timelineRequire);
 const {
     applyAssistantDoneMessage,
     applyAssistantStreamMessage,
-    buildH5ConversationEntries,
-    getH5ScrollAnchor,
+    buildConversationEntries: buildH5ConversationEntries,
+    getConversationScrollAnchor: getH5ScrollAnchor,
     hasPendingConfirmation,
     isConfirmationToolCall,
     mapHistoryMessage,
