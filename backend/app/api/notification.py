@@ -18,7 +18,7 @@ router = APIRouter(tags=["notifications"])
 # Category -> type mapping for filtering
 CATEGORY_TYPE_MAP: dict[str, list[str]] = {
     "tool": ["autonomy_l2"],
-    "approval": ["approval_pending", "approval_resolved"],
+    "approval": ["approval_pending", "approval_resolved", "page_access_pending", "page_access_resolved"],
     "social": ["plaza_comment", "plaza_reply", "mention", "broadcast"],
     "broadcast": ["broadcast"],
 }

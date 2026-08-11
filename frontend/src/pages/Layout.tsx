@@ -32,6 +32,7 @@ import {
     IconChevronDown,
     IconCheck,
     IconApps,
+    IconFileDescription,
 } from '@tabler/icons-react';
 import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
@@ -687,7 +688,8 @@ export default function Layout() {
         }, 160);
     }, []);
 
-    const handleLogout = () => {
+    const handleLogout = async () => {
+        await fetch('/api/pages/session', { method: 'DELETE' }).catch(() => undefined);
         logout();
         navigate('/login');
     };
@@ -1075,6 +1077,12 @@ export default function Layout() {
                                 </svg>
                             </span>
                             <span className="sidebar-item-text">{t('nav.okr', 'OKR')}</span>
+                        </NavLink>
+                        <NavLink to="/published-pages" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                            <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                                <IconFileDescription size={14} stroke={1.5} />
+                            </span>
+                            <span className="sidebar-item-text">{isChinese ? '发布管理' : 'Published content'}</span>
                         </NavLink>
                     </div>
                 </div>

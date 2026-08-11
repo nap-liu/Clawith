@@ -35,9 +35,10 @@ Known limitation — quoted reply (Phase 2 #3, 2026-05-08):
 """
 
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1202,31 +1203,44 @@ async def process_dingtalk_message(
 @router.get("/auth/dingtalk/callback")
 async def dingtalk_callback(
     authCode: str, # DingTalk uses authCode parameter
+    request: Request,
     state: str = None,
     db: AsyncSession = Depends(get_db),
 ):
     """Callback for DingTalk OAuth2 login."""
     from app.models.identity import SSOScanSession
     from app.core.security import create_access_token
-    from fastapi.responses import HTMLResponse
-    from app.services.auth_registry import auth_provider_registry
+    from fastapi.responses import RedirectResponse
+    from app.services.auth_provider import DingTalkAuthProvider
+    from app.services.sso_login_state import (
+        get_enabled_sso_provider,
+        parse_sso_or_legacy_state,
+        sso_browser_cookie_name,
+        sso_completion_url,
+        sso_error_url,
+        verify_sso_browser_binding,
+    )
 
     # 1. Resolve session to get tenant context
+    sid, provider_id, login_query = parse_sso_or_legacy_state(state)
+    if sid is None or provider_id is None:
+        return RedirectResponse(sso_error_url("invalid_state", login_query), status_code=302)
+    if not verify_sso_browser_binding(sid, request.cookies.get(sso_browser_cookie_name(sid))):
+        return RedirectResponse(sso_error_url("browser_mismatch", login_query), status_code=302)
     tenant_id = None
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                tenant_id = session.tenant_id
-        except (ValueError, AttributeError):
-            pass
+    if sid:
+        s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+        session = s_res.scalar_one_or_none()
+        if session and session.expires_at >= datetime.now(timezone.utc) and session.status in {"pending", "scanned"}:
+            tenant_id = session.tenant_id
+        else:
+            return RedirectResponse(sso_error_url("invalid_session", login_query), status_code=302)
 
     # 2. Get DingTalk provider config
-    auth_provider = await auth_provider_registry.get_provider(db, "dingtalk", str(tenant_id) if tenant_id else None)
-    if not auth_provider:
-        return HTMLResponse("Auth failed: DingTalk provider not configured for this tenant")
+    provider = await get_enabled_sso_provider(db, provider_id, "dingtalk", tenant_id)
+    if not provider:
+        return RedirectResponse(sso_error_url("provider_unavailable", login_query), status_code=302)
+    auth_provider = DingTalkAuthProvider(provider=provider, config=provider.config or {})
 
     # 3. Exchange code for token and get user info
     try:
@@ -1235,31 +1249,30 @@ async def dingtalk_callback(
         access_token = token_data.get("access_token")
         if not access_token:
             logger.error(f"DingTalk token exchange failed: {token_data}")
-            return HTMLResponse("Auth failed: Token exchange error")
+            return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
 
         # Step 2: Get user info using modern v1.0 API
         user_info = await auth_provider.get_user_info(access_token)
         if not user_info.provider_union_id:
             logger.error(f"DingTalk user info missing unionId: {user_info.raw_data}")
-            return HTMLResponse("Auth failed: No unionid returned")
+            return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
 
         # Step 3: Find or create user (handles OrgMember linking)
         user, is_new = await auth_provider.find_or_create_user(
             db, user_info, tenant_id=str(tenant_id) if tenant_id else None
         )
         if not user:
-            return HTMLResponse("Auth failed: User resolution failed")
+            return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
 
     except Exception as e:
         logger.error(f"DingTalk login error: {e}")
-        return HTMLResponse(f"Auth failed: {str(e)}")
+        return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
 
     # 4. Standard login
     token = create_access_token(str(user.id), user.role)
 
-    if state:
+    if sid:
         try:
-            sid = uuid.UUID(state)
             s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
             session = s_res.scalar_one_or_none()
             if session:
@@ -1269,14 +1282,8 @@ async def dingtalk_callback(
                 session.access_token = token
                 session.error_msg = None
                 await db.commit()
-                return HTMLResponse(
-                    f"""<html><head><meta charset="utf-8" /></head>
-                    <body style="font-family: sans-serif; padding: 24px;">
-                        <div>SSO login successful. Redirecting...</div>
-                        <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
-                    </body></html>"""
-                )
+                return RedirectResponse(sso_completion_url(sid, login_query), status_code=302)
         except Exception as e:
             logger.exception("Failed to update SSO session (dingtalk) %s", e)
 
-    return HTMLResponse(f"Logged in. Token: {token}")
+    return RedirectResponse(sso_error_url("session_update_failed", login_query), status_code=302)

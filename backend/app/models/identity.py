@@ -36,6 +36,7 @@ class IdentityProvider(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # When True, this provider can be used for SSO login (not just directory sync)
     sso_login_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    sso_enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     config: Mapped[dict] = mapped_column(JSON, default=dict)
 
     # Optional tenant_id for enterprise-specific providers (no FK - soft coupling)

@@ -32,7 +32,7 @@ from urllib.parse import unquote, urlsplit
 import re
 
 from loguru import logger
-from sqlalchemy import select, or_
+from sqlalchemy import func, select, or_
 from sqlalchemy.orm import selectinload
 
 from app.database import async_session, engine
@@ -83,7 +83,10 @@ from app.services.access_relationships import ensure_access_granted_platform_rel
 from app.services.tool_enablement import agent_tool_enabled
 from app.config import get_settings
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
-from app.services.media_tool_contract import SEND_MEDIA_FUNCTION_TOOL
+from app.services.media_tool_contract import (
+    SEND_MEDIA_FUNCTION_TOOL,
+    normalize_media_display_title,
+)
 from app.services.media_url_source import (
     MediaUrlError,
     import_managed_media_url,
@@ -2018,13 +2021,35 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "publish_page",
-            "description": "Publish an HTML file from workspace as a public page. Returns a public URL that anyone can access without login. Only .html/.htm files can be published.",
+            "description": (
+                "Publish an HTML file from this Agent's workspace. New pages require login by default: "
+                "omit access_mode for authenticated access, use public only when the user explicitly wants "
+                "anyone with the link to open it, and use restricted for specified users. Before restricted "
+                "publishing, use search_page_viewers to obtain user IDs and pass them in allowed_user_ids. "
+                "Republishing the same path updates the existing page at the same URL and preserves its current "
+                "permissions unless access_mode is explicitly supplied. Non-public pages receive the platform "
+                "watermark automatically. Automatic SSO is opt-in only: append auto_login=1 to the Page URL only "
+                "when the user explicitly requests automatic login; optionally add sso=<provider_type>, otherwise "
+                "the first enabled SSO provider is used. Always give the user both the Page URL and Management URL exactly as returned."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "File path in workspace, e.g. 'workspace/output.html'",
+                    },
+                    "access_mode": {
+                        "type": "string", "enum": ["public", "authenticated", "restricted"], "default": "authenticated",
+                        "description": (
+                            "Optional. Defaults to authenticated for a new page. public = anyone with the link, "
+                            "authenticated = any logged-in user in the page's company, restricted = only the publisher, "
+                            "Agent creator, and users listed in allowed_user_ids. Omit when republishing to preserve existing permissions."
+                        ),
+                    },
+                    "allowed_user_ids": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Required only for restricted access. Get IDs with search_page_viewers; use [] when nobody else should be allowed.",
                     },
                 },
                 "required": ["path"],
@@ -2034,11 +2059,60 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_page_viewers",
+            "description": "Search active users in this Agent's company by display name or email. Returns user IDs for allowed_user_ids. Call this before publish_page or update_published_page_access when the user requests restricted access for named people.",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_published_page_access",
+            "description": "Change an existing page published by this Agent. Use its short_id from publish_page or list_published_pages. For restricted access, first call search_page_viewers and pass the complete replacement allowed_user_ids list; [] allows only the publisher and Agent creator. For public or authenticated access, pass allowed_user_ids as [].",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "short_id": {"type": "string"},
+                    "access_mode": {"type": "string", "enum": ["public", "authenticated", "restricted"]},
+                    "allowed_user_ids": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["short_id", "access_mode", "allowed_user_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_published_pages",
-            "description": "List all pages published by this agent, showing their public URLs and view counts.",
+            "description": "List pages published by this Agent, including Page URL, Management URL, access mode, views, and pending access-request count. Use list_page_access_requests when request details or statuses are needed.",
             "parameters": {
                 "type": "object",
                 "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_page_access_requests",
+            "description": (
+                "List real user-initiated access requests for one page published by this Agent. "
+                "Use the short_id returned by publish_page or list_published_pages. Returns requester identity, "
+                "pending/approved/rejected status, request time, resolution time, totals, and the Management URL. "
+                "This tool only reads request status; it does not approve, reject, or change page permissions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "short_id": {"type": "string", "description": "Published page short ID, without the /p/ prefix."},
+                    "status": {
+                        "type": "string", "enum": ["all", "pending", "approved", "rejected"], "default": "all",
+                        "description": "Optional status filter. Defaults to all request statuses.",
+                    },
+                    "page": {"type": "integer", "minimum": 1, "default": 1, "description": "Result page number."},
+                    "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Requests per page."},
+                },
+                "required": ["short_id"],
             },
         },
     },
@@ -4002,6 +4076,12 @@ async def execute_tool(
             result = await _publish_page(agent_id, user_id, ws, arguments)
         elif tool_name == "list_published_pages":
             result = await _list_published_pages(agent_id)
+        elif tool_name == "list_page_access_requests":
+            result = await _list_page_access_requests(agent_id, user_id, arguments)
+        elif tool_name == "search_page_viewers":
+            result = await _search_page_viewers(agent_id, user_id, arguments)
+        elif tool_name == "update_published_page_access":
+            result = await _update_published_page_access(agent_id, user_id, arguments)
         # ── aio-sandbox Browser ──
         elif tool_name == "browse":
             result = await _run_with_temp_workspace(
@@ -5012,6 +5092,7 @@ async def _send_channel_media(
         }, ensure_ascii=False)
 
     file_path: Path | None = None
+    managed_import = None
     source_mode = "workspace"
     if has_file:
         rel_path = _normalize_tool_workspace_rel_path(rel_path)
@@ -5020,11 +5101,16 @@ async def _send_channel_media(
                 "type": "media_delivery_result", "version": 1, "status": "failed",
                 "code": "INVALID_FILE_PATH", "media_kind": media_kind,
             }, ensure_ascii=False)
-        file_path = (ws / rel_path).resolve()
+        agent_root = ws.resolve()
+        file_path = (agent_root / rel_path).resolve()
         try:
-            file_path.relative_to(ws.resolve())
+            file_path.relative_to(agent_root)
         except ValueError:
-            file_path = (WORKSPACE_ROOT / str(agent_id) / rel_path).resolve()
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1,
+                "status": "failed", "code": "INVALID_FILE_PATH",
+                "media_kind": media_kind,
+            }, ensure_ascii=False)
         if not file_path.exists() or not file_path.is_file():
             return json.dumps({
                 "type": "media_delivery_result", "version": 1, "status": "failed",
@@ -5125,9 +5211,21 @@ async def _send_channel_media(
             imported = await import_managed_media_url(
                 media_url,
                 agent_workspace=_agent_workspace_root(agent_id),
+                session_id=origin_session_id or target_session_id or None,
                 intent_id=tool_call_id or "",
                 max_bytes=MEDIA_TOOL_MAX_FILE_BYTES,
                 expected_media_kind=media_kind,
+                operation_scope=(
+                    _build_outbound_operation_key(
+                        agent_id=agent_id,
+                        origin_session_id=(
+                            origin_session_id or target_session_id or None
+                        ),
+                        tool_call_id=tool_call_id,
+                        origin_turn_anchor_id=origin_turn_anchor_id,
+                    )
+                    or f"outbound-untracked:{agent_id}:{uuid.uuid4().hex}"
+                ),
             )
         except MediaUrlError as exc:
             payload = {
@@ -5142,57 +5240,69 @@ async def _send_channel_media(
             return json.dumps(_describe_media_delivery_result(payload), ensure_ascii=False)
         file_path = imported.file_path
         rel_path = imported.workspace_path
+        managed_import = imported
         source_mode = "managed_url"
-        try:
-            await get_storage_backend().write_local_file(
-                normalize_storage_key(f"{agent_id}/{rel_path}"),
-                file_path,
-                content_type=imported.mime_type,
+
+    try:
+        if managed_import is not None:
+            try:
+                await get_storage_backend().write_local_file(
+                    normalize_storage_key(f"{agent_id}/{rel_path}"),
+                    file_path,
+                    content_type=managed_import.mime_type,
+                )
+            except Exception:
+                logger.opt(exception=True).error(
+                    "[SessionMedia] Managed import persistence failed"
+                )
+                return json.dumps(_describe_media_delivery_result({
+                    "type": "media_delivery_result", "version": 1,
+                    "status": "failed", "code": "MEDIA_STORAGE_FAILED",
+                    "media_kind": media_kind, "intent_id": tool_call_id or "",
+                    "managed_path": rel_path,
+                }), ensure_ascii=False)
+
+        assert file_path is not None and rel_path is not None
+        if target_session_id:
+            return await _send_media_to_session(
+                agent_id=agent_id,
+                session_id=target_session_id,
+                file_path=file_path,
+                workspace_path=rel_path,
+                media_kind=media_kind,
+                caption=str(arguments.get("message") or ""),
+                cover_path=cover_path,
+                intent_id=tool_call_id or "",
+                origin_session_id=origin_session_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                allow_download=allow_download,
+                source_mode=source_mode,
+                tool_args=arguments,
             )
-        except Exception:
-            logger.opt(exception=True).error("[SessionMedia] Managed import persistence failed")
-            return json.dumps(_describe_media_delivery_result({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "MEDIA_STORAGE_FAILED", "media_kind": media_kind,
-                "intent_id": tool_call_id or "", "managed_path": rel_path,
-            }), ensure_ascii=False)
+        if canonical_user_id:
+            return await _send_media_to_recipient(
+                agent_id=agent_id,
+                file_path=file_path,
+                workspace_path=rel_path,
+                user_id=canonical_user_id,
+                channel=requested_channel,
+                media_kind=media_kind,
+                caption=str(arguments.get("message") or ""),
+                cover_path=cover_path,
+                intent_id=tool_call_id or "",
+                origin_session_id=origin_session_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                allow_download=allow_download,
+                source_mode=source_mode,
+                tool_args=arguments,
+            )
 
-    assert file_path is not None and rel_path is not None
-    if target_session_id:
-        return await _send_media_to_session(
-            agent_id=agent_id,
-            session_id=target_session_id,
-            file_path=file_path,
-            workspace_path=rel_path,
-            media_kind=media_kind,
-            caption=str(arguments.get("message") or ""),
-            cover_path=cover_path,
-            intent_id=tool_call_id or "",
-            origin_session_id=origin_session_id,
-            origin_turn_anchor_id=origin_turn_anchor_id,
-            allow_download=allow_download,
-            source_mode=source_mode,
-            tool_args=arguments,
-        )
-    if canonical_user_id:
-        return await _send_media_to_recipient(
-            agent_id=agent_id,
-            file_path=file_path,
-            workspace_path=rel_path,
-            user_id=canonical_user_id,
-            channel=requested_channel,
-            media_kind=media_kind,
-            caption=str(arguments.get("message") or ""),
-            cover_path=cover_path,
-            intent_id=tool_call_id or "",
-            origin_session_id=origin_session_id,
-            origin_turn_anchor_id=origin_turn_anchor_id,
-            allow_download=allow_download,
-            source_mode=source_mode,
-            tool_args=arguments,
-        )
-
-    raise AssertionError("validated media target was not routed")
+        raise AssertionError("validated media target was not routed")
+    finally:
+        if managed_import is not None:
+            close_import = getattr(managed_import, "close", None)
+            if callable(close_import):
+                close_import()
 
 
 async def _replay_terminal_media_delivery(
@@ -5611,6 +5721,7 @@ async def _publish_external_media_to_session(
         }), ensure_ascii=False)
 
     filename = _external_media_filename(media_url, media_kind)
+    display_title = normalize_media_display_title(tool_args.get("title"))
     guessed_mime = mimetypes.guess_type(filename)[0]
     mime_type = guessed_mime if str(guessed_mime or "").startswith(f"{media_kind}/") else None
     events: list[dict] = []
@@ -5703,6 +5814,7 @@ async def _publish_external_media_to_session(
             "attachments": [],
             "allow_download": allow_download,
             "caption_status": "sent" if caption.strip() else "not_requested",
+            "display_title": display_title,
         }
         if receipt is None:
             receipt = ChatMessage(
@@ -5729,6 +5841,7 @@ async def _publish_external_media_to_session(
             "url": media_url,
             "source_mode": "external_url",
             "filename": filename,
+            **({"title": display_title} if display_title else {}),
             **({"mime_type": mime_type} if mime_type else {}),
             "message_id": str(receipt.id),
             "allow_download": allow_download,
@@ -5874,6 +5987,7 @@ async def _send_media_to_session_under_lifecycle_lock(
         size_bytes=file_path.stat().st_size,
     )
     persisted_args = dict(tool_args or {"media_type": media_kind, "file_path": workspace_path})
+    display_title = normalize_media_display_title(persisted_args.get("title"))
     if not operation_key:
         return json.dumps({
             "type": "media_delivery_result", "version": 1, "status": "failed",
@@ -5903,6 +6017,9 @@ async def _send_media_to_session_under_lifecycle_lock(
             state = str(meta.get("delivery_status") or "unknown")
             if state == "sent":
                 caption_status = str(meta.get("caption_status") or "not_requested")
+                existing_display_title = normalize_media_display_title(
+                    meta.get("display_title")
+                )
                 existing_result = _describe_media_delivery_result({
                     "type": "platform_media_delivery", "version": 1,
                     "status": "already_sent",
@@ -5917,6 +6034,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                     "channel": str(meta.get("source_channel") or ""),
                     "path": workspace_path,
                     "filename": file_path.name,
+                    **({"title": existing_display_title} if existing_display_title else {}),
                     "mime_type": mime_type,
                     "size": file_path.stat().st_size,
                     "message_id": str(existing.id),
@@ -6120,6 +6238,7 @@ async def _send_media_to_session_under_lifecycle_lock(
         receipt_meta["delivery_code"] = "MEDIA_DELIVERY_PENDING"
         receipt_meta["allow_download"] = allow_download
         receipt_meta["source_mode"] = source_mode
+        receipt_meta["display_title"] = display_title
         receipt.message_meta = receipt_meta
         await db.commit()
         receipt_id = receipt.id
@@ -6242,6 +6361,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                 "media_kind": media_kind,
                 "path": workspace_path,
                 "filename": file_path.name,
+                **({"title": display_title} if display_title else {}),
                 "mime_type": mime_type,
                 "size": file_path.stat().st_size,
                 "message_id": str(final_receipt.id),
@@ -6295,6 +6415,7 @@ async def _send_media_to_session_under_lifecycle_lock(
                         "caption_status",
                         "requested_caption",
                         "delivery_code",
+                        "display_title",
                     }
                 }
                 # A caption is a normal assistant message. It must not inherit
@@ -15968,13 +16089,18 @@ async def _resolve_public_base_url() -> str:
 
 
 async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, arguments: dict) -> str:
-    """Publish an HTML file as a public page."""
+    """Publish an HTML file with optional access control."""
     import secrets
     import re
 
     path = arguments.get("path", "")
+    access_mode = arguments.get("access_mode", "authenticated")
+    effective_access_mode = access_mode
+    allowed_user_ids = arguments.get("allowed_user_ids", []) if access_mode == "restricted" else []
     if not path:
         return "Missing required argument 'path'"
+    if access_mode not in {"public", "authenticated", "restricted"}:
+        return "Invalid access_mode; use public, authenticated, or restricted"
 
     # Validate file extension
     if not path.lower().endswith((".html", ".htm")):
@@ -16003,6 +16129,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     # only mint a new id when the file was never published before.
     from app.models.published_page import PublishedPage
     reused = False
+    page_id: uuid.UUID | None = None
     try:
         async with async_session() as db:
             existing = (
@@ -16018,10 +16145,23 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
             ).scalar_one_or_none()
             if existing is not None:
                 short_id = existing.short_id
+                page_id = existing.id
                 reused = True
                 if title and existing.title != title:
                     existing.title = title  # refresh title; same link
-                    await db.commit()
+                if "access_mode" in arguments:
+                    from app.models.user import User
+                    from app.services.published_page_access import can_manage_page
+
+                    actor = await db.get(User, user_id)
+                    if actor is None or not await can_manage_page(db, existing, actor):
+                        return "Permission denied: only the page publisher or Agent creator can change page access"
+                    if existing.tenant_id is None:
+                        existing.tenant_id = actor.tenant_id
+                    existing.access_mode = access_mode
+                    await _replace_page_allowed_users(db, existing, allowed_user_ids, user_id)
+                effective_access_mode = existing.access_mode
+                await db.commit()
             else:
                 # New file → mint a short_id and resolve tenant_id for the row.
                 tenant_id = None
@@ -16029,6 +16169,9 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
                     from app.models.agent import Agent as _AgModel
                     _r = await db.execute(select(_AgModel.tenant_id).where(_AgModel.id == agent_id))
                     tenant_id = _r.scalar_one_or_none()
+                    if tenant_id is None:
+                        from app.models.user import User as _UserModel
+                        tenant_id = await db.scalar(select(_UserModel.tenant_id).where(_UserModel.id == user_id))
                 except Exception:
                     tenant_id = None
                 short_id = secrets.token_urlsafe(6)[:8]  # 8-char URL-safe string
@@ -16040,8 +16183,14 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
                         tenant_id=tenant_id,
                         source_path=path,
                         title=title,
+                        access_mode=access_mode,
                     )
                 )
+                await db.flush()
+                created = await db.scalar(select(PublishedPage).where(PublishedPage.short_id == short_id))
+                if created:
+                    page_id = created.id
+                    await _replace_page_allowed_users(db, created, allowed_user_ids, user_id)
                 await db.commit()
     except Exception as e:
         return f"Failed to publish: {e}"
@@ -16063,55 +16212,250 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     else:
         url = f"{public_base}/p/{short_id}"
         url_note = ""
+    management_path = f"/published-pages?page={page_id}" if page_id else "/published-pages"
+    management_url = f"{public_base}{management_path}" if public_base else management_path
 
     headline = (
-        "Updated in place — the page already had a public link, so the SAME URL "
+        "Updated in place — the page already had a published link, so the SAME URL "
         "now serves the latest content (no new link is created)."
         if reused
         else "Published successfully!"
     )
     return (
         f"{headline}\n\n"
-        f"Public URL: {url}\n"
+        f"Page URL: {url}\n"
+        f"Management URL: {management_url}\n"
         f"Title: {title}\n\n"
-        f"Anyone can access this page without logging in.{url_note}\n\n"
-        "Optional — to stamp each viewer's identity (name + mobile tail) as an anti-leak "
-        "watermark tiled across the page, include the Clawith SDK with the data-watermark "
-        "attribute in the HTML <head>:\n"
-        '   <script src="/sdk/clawith.js" data-watermark></script>\n'
-        "The viewer signs in via company OAuth on open, then their watermark renders on top."
+        f"Access: {effective_access_mode}.\n"
+        f"Platform watermark: {'disabled for public access' if effective_access_mode == 'public' else 'enabled automatically'}.\n"
+        "Automatic SSO: off by default; append ?auto_login=1 only when explicitly requested, "
+        "and optionally append &sso=<provider_type>."
+        f"{url_note}"
     )
 
 
 
 async def _list_published_pages(agent_id: uuid.UUID) -> str:
     """List all published pages for this agent."""
-    from app.models.published_page import PublishedPage
+    from app.models.published_page import PublishedPage, PublishedPageAccess
     public_base = await _resolve_public_base_url()
 
     try:
         async with async_session() as db:
+            pending_requests = (
+                select(
+                    PublishedPageAccess.page_id.label("page_id"),
+                    func.count(PublishedPageAccess.id).label("pending_count"),
+                )
+                .where(
+                    PublishedPageAccess.status == "pending",
+                    PublishedPageAccess.requested_at.is_not(None),
+                )
+                .group_by(PublishedPageAccess.page_id)
+                .subquery()
+            )
             result = await db.execute(
-                select(PublishedPage)
+                select(PublishedPage, func.coalesce(pending_requests.c.pending_count, 0))
+                .outerjoin(pending_requests, pending_requests.c.page_id == PublishedPage.id)
                 .where(PublishedPage.agent_id == agent_id)
                 .order_by(PublishedPage.created_at.desc())
             )
-            pages = result.scalars().all()
+            pages = result.all()
 
         if not pages:
             return "No published pages yet."
 
-        lines = [f"Published pages ({len(pages)} total):\n"]
-        for p in pages:
+        management_path = f"/published-pages?agent_id={agent_id}"
+        management_url = f"{public_base}{management_path}" if public_base else management_path
+        lines = [f"Published pages ({len(pages)} total):", f"Management URL: {management_url}\n"]
+        for p, pending_count in pages:
             url = f"{public_base}/p/{p.short_id}" if public_base else f"/p/{p.short_id}"
+            page_management_path = f"/published-pages?page={p.id}"
+            page_management_url = f"{public_base}{page_management_path}" if public_base else page_management_path
             lines.append(f"- {p.title or 'Untitled'}")
             lines.append(f"  URL: {url}")
+            lines.append(f"  Management: {page_management_url}")
             lines.append(f"  Source: {p.source_path}")
             lines.append(f"  Views: {p.view_count}")
+            lines.append(f"  Access: {p.access_mode}")
+            lines.append(f"  Pending access requests: {int(pending_count or 0)}")
             lines.append("")
         return "\n".join(lines)
     except Exception as e:
         return f"Failed to list pages: {e}"
+
+
+async def _list_page_access_requests(agent_id: uuid.UUID, user_id: uuid.UUID, arguments: dict) -> str:
+    """List user-initiated access requests for a page managed by the caller."""
+    from app.models.published_page import PublishedPage, PublishedPageAccess
+    from app.models.user import Identity, User
+    from app.services.published_page_access import can_manage_page
+
+    short_id = str(arguments.get("short_id") or "").strip()
+    if not short_id:
+        return "Missing required argument 'short_id'"
+    status = str(arguments.get("status") or "all").strip().lower()
+    if status not in {"all", "pending", "approved", "rejected"}:
+        return "Invalid status; use all, pending, approved, or rejected"
+    try:
+        page_number = max(1, int(arguments.get("page", 1)))
+        page_size = min(50, max(1, int(arguments.get("page_size", 20))))
+    except (TypeError, ValueError):
+        return "Invalid pagination; page and page_size must be integers"
+
+    try:
+        async with async_session() as db:
+            published_page = await db.scalar(select(PublishedPage).where(
+                PublishedPage.agent_id == agent_id,
+                PublishedPage.short_id == short_id,
+            ))
+            if not published_page:
+                return "Published page not found for this Agent"
+            actor = await db.get(User, user_id)
+            if actor is None or not await can_manage_page(db, published_page, actor):
+                return "Permission denied: only the page publisher or Agent creator can view access requests"
+
+            conditions = [
+                PublishedPageAccess.page_id == published_page.id,
+                PublishedPageAccess.requested_at.is_not(None),
+            ]
+            if status != "all":
+                conditions.append(PublishedPageAccess.status == status)
+            total = int(await db.scalar(
+                select(func.count()).select_from(PublishedPageAccess).where(*conditions)
+            ) or 0)
+            pending_count = int(await db.scalar(
+                select(func.count()).select_from(PublishedPageAccess).where(
+                    PublishedPageAccess.page_id == published_page.id,
+                    PublishedPageAccess.requested_at.is_not(None),
+                    PublishedPageAccess.status == "pending",
+                )
+            ) or 0)
+            rows = (await db.execute(
+                select(User, Identity, PublishedPageAccess)
+                .join(PublishedPageAccess, PublishedPageAccess.user_id == User.id)
+                .outerjoin(Identity, Identity.id == User.identity_id)
+                .where(*conditions)
+                .order_by(PublishedPageAccess.requested_at.desc(), PublishedPageAccess.id.desc())
+                .offset((page_number - 1) * page_size)
+                .limit(page_size)
+            )).all()
+
+        public_base = await _resolve_public_base_url()
+        management_path = f"/published-pages?page={published_page.id}"
+        management_url = f"{public_base}{management_path}" if public_base else management_path
+        lines = [
+            f"Access requests for {published_page.title or published_page.source_path} (/p/{short_id})",
+            f"Filter: {status}; page {page_number}; showing {len(rows)} of {total}",
+            f"Pending requests: {pending_count}",
+            f"Management URL: {management_url}",
+        ]
+        if not rows:
+            lines.append("No matching user-initiated access requests.")
+            return "\n".join(lines)
+        for requester, identity, access_request in rows:
+            requester_email = identity.email if identity and identity.email else "no email"
+            lines.extend([
+                "",
+                f"- {requester.display_name} ({requester_email})",
+                f"  User ID: {requester.id}",
+                f"  Status: {access_request.status}",
+                f"  Requested at: {access_request.requested_at.isoformat()}",
+                f"  Resolved at: {access_request.resolved_at.isoformat() if access_request.resolved_at else 'not resolved'}",
+            ])
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"Failed to list page access requests: {exc}"
+
+
+async def _replace_page_allowed_users(db, page, raw_user_ids, resolved_by: uuid.UUID) -> None:
+    from datetime import datetime, timezone
+    from app.models.published_page import PublishedPageAccess
+    from app.models.user import User
+
+    try:
+        user_ids = {uuid.UUID(str(value)) for value in (raw_user_ids or [])}
+    except ValueError as exc:
+        raise ValueError("allowed_user_ids contains an invalid user ID") from exc
+    if user_ids:
+        valid_ids = set((await db.scalars(select(User.id).where(
+            User.id.in_(user_ids), User.tenant_id == page.tenant_id, User.is_active.is_(True)
+        ))).all())
+        if valid_ids != user_ids:
+            raise ValueError("All allowed users must be active members of the page's company")
+    rows = (await db.scalars(select(PublishedPageAccess).where(PublishedPageAccess.page_id == page.id))).all()
+    by_user = {row.user_id: row for row in rows}
+    for row in rows:
+        if row.status == "approved" and row.user_id not in user_ids:
+            await db.delete(row)
+    now = datetime.now(timezone.utc)
+    for viewer_id in user_ids:
+        row = by_user.get(viewer_id)
+        if row:
+            row.status, row.resolved_at, row.resolved_by = "approved", now, resolved_by
+        else:
+            db.add(PublishedPageAccess(
+                page_id=page.id, user_id=viewer_id, status="approved", resolved_at=now, resolved_by=resolved_by
+            ))
+
+
+async def _search_page_viewers(agent_id: uuid.UUID, user_id: uuid.UUID, arguments: dict) -> str:
+    from sqlalchemy import or_
+    from app.models.agent import Agent
+    from app.models.user import Identity, User
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        return "Missing required argument 'query'"
+    async with async_session() as db:
+        from app.core.permissions import check_agent_access
+        actor = await db.get(User, user_id)
+        if actor is None:
+            return "Permission denied: user not found"
+        try:
+            _agent, access = await check_agent_access(db, actor, agent_id)
+        except Exception:
+            return "Permission denied: Agent manage access required"
+        if access != "manage":
+            return "Permission denied: Agent manage access required"
+        tenant_id = await db.scalar(select(Agent.tenant_id).where(Agent.id == agent_id))
+        rows = (await db.execute(
+            select(User, Identity).outerjoin(Identity, Identity.id == User.identity_id).where(
+                User.tenant_id == tenant_id, User.is_active.is_(True),
+                or_(User.display_name.ilike(f"%{query}%"), Identity.email.ilike(f"%{query}%")),
+            ).order_by(User.display_name).limit(20)
+        )).all()
+    if not rows:
+        return "No matching users."
+    return "\n".join(f"- {user.display_name} ({identity.email if identity else 'no email'}): {user.id}" for user, identity in rows)
+
+
+async def _update_published_page_access(agent_id: uuid.UUID, user_id: uuid.UUID, arguments: dict) -> str:
+    from app.models.published_page import PublishedPage
+    from app.models.user import User
+    from app.services.published_page_access import can_manage_page
+    short_id = str(arguments.get("short_id") or "")
+    access_mode = arguments.get("access_mode")
+    if access_mode not in {"public", "authenticated", "restricted"}:
+        return "Invalid access_mode; use public, authenticated, or restricted"
+    try:
+        async with async_session() as db:
+            page = await db.scalar(select(PublishedPage).where(
+                PublishedPage.agent_id == agent_id, PublishedPage.short_id == short_id
+            ))
+            if not page:
+                return "Published page not found for this agent"
+            actor = await db.get(User, user_id)
+            if actor is None or not await can_manage_page(db, page, actor):
+                return "Permission denied: only the page publisher or Agent creator can change page access"
+            if page.tenant_id is None:
+                page.tenant_id = actor.tenant_id
+            page.access_mode = access_mode
+            allowed_user_ids = arguments.get("allowed_user_ids", []) if access_mode == "restricted" else []
+            await _replace_page_allowed_users(db, page, allowed_user_ids, user_id)
+            await db.commit()
+        return f"Updated /p/{short_id} access to {access_mode}."
+    except Exception as exc:
+        return f"Failed to update page access: {exc}"
 
 
 # ─── AgentBay Tool Handlers ─────────────────────────────────────

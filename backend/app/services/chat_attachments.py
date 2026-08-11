@@ -30,18 +30,22 @@ _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 _AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".amr", ".m4a", ".aac"}
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 MEDIA_PROBE_CHUNK_BYTES = 2 * 1024 * 1024
+_CLIENT_ATTACHMENT_PATH_PREFIXES = ("workspace/", "skills/", "media/")
 
 
 def _clean_workspace_path(raw_path: Any) -> str | None:
-    path = str(raw_path or "").strip().replace("\\", "/").strip("/")
+    path = str(raw_path or "").strip().replace("\\", "/")
     if not path or len(path) > MAX_ATTACHMENT_PATH_LENGTH:
+        return None
+    if path.startswith("/") or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", path):
         return None
     candidate = PurePosixPath(path)
     if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
         return None
-    if not path.startswith(("workspace/", "skills/")):
+    canonical = candidate.as_posix()
+    if canonical in {"", "."}:
         return None
-    return candidate.as_posix()
+    return canonical
 
 
 def _safe_legacy_name(raw_name: Any) -> str | None:
@@ -175,7 +179,7 @@ def attachment_from_workspace_path(
 ) -> dict[str, Any]:
     path = _clean_workspace_path(workspace_path)
     if path is None:
-        raise ValueError("attachment path must be a canonical agent workspace path")
+        raise ValueError("attachment path must be a canonical agent file path")
     name = _safe_legacy_name(display_name or PurePosixPath(path).name)
     if name is None:
         raise ValueError("attachment display name is invalid")
@@ -331,6 +335,11 @@ async def validate_client_attachments(agent_id: Any, raw_attachments: Any) -> li
     normalized = normalize_attachment_metadata(raw_attachments)
     if len(normalized) != len(raw_attachments):
         raise ValueError("one or more attachments are invalid")
+    if any(
+        not item["path"].startswith(_CLIENT_ATTACHMENT_PATH_PREFIXES)
+        for item in normalized
+    ):
+        raise ValueError("one or more client attachment paths are not allowed")
     storage = get_storage_backend()
     for item in normalized:
         key = agent_storage_key(agent_id, item["path"])

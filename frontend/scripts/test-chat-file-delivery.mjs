@@ -81,6 +81,41 @@ const { parseFileDeliveryToolResult } = module.exports;
     assert.equal(delivery.message, '请下载');
 }
 
+{
+    const delivery = parseFileDeliveryToolResult(
+        'send_media',
+        JSON.stringify({
+            type: 'platform_media_delivery',
+            status: 'sent',
+            media_kind: 'video',
+            path: 'media/imported/opaque-preview.mp4',
+            filename: 'opaque-preview.mp4',
+            title: '  示例媒体\n\u0000展示标题  ',
+        }),
+        { title: '不应覆盖回执标题' },
+        'tc-media-title',
+    );
+
+    assert.equal(delivery.title, '示例媒体 展示标题');
+    assert.equal(delivery.filename, 'opaque-preview.mp4');
+}
+
+{
+    const delivery = parseFileDeliveryToolResult(
+        'send_media',
+        JSON.stringify({
+            type: 'platform_media_delivery',
+            status: 'sent',
+            media_kind: 'audio',
+            path: 'exports/briefing.mp3',
+            filename: 'briefing.mp3',
+        }),
+        { title: '示例音频标题' },
+    );
+
+    assert.equal(delivery.title, '示例音频标题');
+}
+
 assert.equal(parseFileDeliveryToolResult('send_channel_message', '{"type":"platform_file_delivery","path":"workspace/a.pdf"}'), null);
 assert.equal(parseFileDeliveryToolResult('send_channel_file', '{"type":"platform_file_delivery","path":"/etc/passwd"}'), null);
 assert.equal(parseFileDeliveryToolResult('send_channel_file', '{"type":"platform_file_delivery","path":"../secret.txt"}'), null);

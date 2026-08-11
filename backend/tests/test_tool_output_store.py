@@ -216,6 +216,21 @@ def test_filename_sanitizes_unsafe_tool_call_id(tmp_workspace, agent_id):
     assert files[0].read_text() == big
 
 
+def test_materialization_sanitizes_unsafe_session_id(tmp_workspace, agent_id):
+    big = "d" * 60_000
+    view = _finalize(
+        big,
+        tool_name="grep",
+        agent_id=agent_id,
+        session_id="../unsafe/session",
+        tool_call_id="safe-call",
+    )
+
+    expected = ".tool_results/unsafe_session/grep_safe-call.txt"
+    assert expected in view
+    assert (tmp_workspace / agent_id / expected).read_text() == big
+
+
 def test_budget_for_unknown_tool_uses_default():
     assert tos.budget_for("nonexistent_tool_xyz") == tos.TOOL_OUTPUT_MAX_CHARS["_default"]
 

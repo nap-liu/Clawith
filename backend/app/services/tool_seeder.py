@@ -3360,7 +3360,16 @@ BUILTIN_TOOLS = [
     {
         "name": "publish_page",
         "display_name": "Publish Page",
-        "description": "Publish an HTML file from workspace as a public page. Returns a public URL that anyone can access without login. Only .html/.htm files can be published.",
+        "description": (
+            "Publish an HTML file from this Agent's workspace. New pages require login by default: omit access_mode "
+            "for authenticated access, use public only when the user explicitly wants anyone with the link to open it, "
+            "and use restricted for specified users. Before restricted publishing, use search_page_viewers to obtain "
+            "user IDs and pass them in allowed_user_ids. Republishing the same path updates the existing page at the "
+            "same URL and preserves its current permissions unless access_mode is explicitly supplied. Non-public pages "
+            "receive the platform watermark automatically. Automatic SSO is opt-in only: append auto_login=1 to the Page URL only "
+            "when the user explicitly requests automatic login; optionally add sso=<provider_type>, otherwise "
+            "the first enabled SSO provider is used. Always give the user both the Page URL and Management URL exactly as returned."
+        ),
         "category": "pages",
         "icon": "🌐",
         "is_default": True,
@@ -3368,6 +3377,18 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path in workspace, e.g. 'workspace/output.html'"},
+                "access_mode": {
+                    "type": "string", "enum": ["public", "authenticated", "restricted"], "default": "authenticated",
+                    "description": (
+                        "Optional. Defaults to authenticated for a new page. public = anyone with the link, "
+                        "authenticated = any logged-in user in the page's company, restricted = only the publisher, "
+                        "Agent creator, and users listed in allowed_user_ids. Omit when republishing to preserve existing permissions."
+                    ),
+                },
+                "allowed_user_ids": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Required only for restricted access. Get IDs with search_page_viewers; use [] when nobody else should be allowed.",
+                },
             },
             "required": ["path"],
         },
@@ -3375,15 +3396,61 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "search_page_viewers", "display_name": "Search Page Viewers",
+        "description": "Search active users in this Agent's company by display name or email. Returns user IDs for allowed_user_ids. Call this before publish_page or update_published_page_access when the user requests restricted access for named people.",
+        "category": "pages", "icon": "🔎", "is_default": True,
+        "parameters_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        "config": {}, "config_schema": {},
+    },
+    {
+        "name": "update_published_page_access", "display_name": "Update Page Access",
+        "description": "Change an existing page published by this Agent. Use its short_id from publish_page or list_published_pages. For restricted access, first call search_page_viewers and pass the complete replacement allowed_user_ids list; [] allows only the publisher and Agent creator. For public or authenticated access, pass allowed_user_ids as [].",
+        "category": "pages", "icon": "🔐", "is_default": True,
+        "parameters_schema": {"type": "object", "properties": {
+            "short_id": {"type": "string"},
+            "access_mode": {"type": "string", "enum": ["public", "authenticated", "restricted"]},
+            "allowed_user_ids": {"type": "array", "items": {"type": "string"}},
+        }, "required": ["short_id", "access_mode", "allowed_user_ids"]},
+        "config": {}, "config_schema": {},
+    },
+    {
         "name": "list_published_pages",
         "display_name": "List Published Pages",
-        "description": "List all pages published by this agent, showing their public URLs and view counts.",
+        "description": "List pages published by this Agent, including Page URL, Management URL, access mode, views, and pending access-request count. Use list_page_access_requests when request details or statuses are needed.",
         "category": "pages",
         "icon": "📋",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {},
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "list_page_access_requests",
+        "display_name": "List Page Access Requests",
+        "description": (
+            "List real user-initiated access requests for one page published by this Agent. Use the short_id returned by "
+            "publish_page or list_published_pages. Returns requester identity, pending/approved/rejected status, request "
+            "time, resolution time, totals, and the Management URL. This tool only reads request status; it does not "
+            "approve, reject, or change page permissions."
+        ),
+        "category": "pages",
+        "icon": "🛂",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "short_id": {"type": "string", "description": "Published page short ID, without the /p/ prefix."},
+                "status": {
+                    "type": "string", "enum": ["all", "pending", "approved", "rejected"], "default": "all",
+                    "description": "Optional status filter. Defaults to all request statuses.",
+                },
+                "page": {"type": "integer", "minimum": 1, "default": 1, "description": "Result page number."},
+                "page_size": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Requests per page."},
+            },
+            "required": ["short_id"],
         },
         "config": {},
         "config_schema": {},

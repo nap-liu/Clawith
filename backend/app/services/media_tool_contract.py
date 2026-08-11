@@ -2,19 +2,30 @@
 
 from __future__ import annotations
 
+MAX_MEDIA_DISPLAY_TITLE_LENGTH = 160
+
+
+def normalize_media_display_title(value: object) -> str:
+    """Return one safe, compact card title without changing file identity."""
+    if not isinstance(value, str):
+        return ""
+    printable = "".join(character if character.isprintable() else " " for character in value)
+    return " ".join(printable.split())[:MAX_MEDIA_DISPLAY_TITLE_LENGTH].strip()
+
 
 SEND_MEDIA_DESCRIPTION = (
     "Send one audio or video source to the current conversation, an exact existing "
     "person/group Session, or a directly resolved person. Use exactly one source: "
-    "file_path for an Agent-owned workspace file, or url plus url_mode for a third-party "
+    "file_path for an Agent-owned file, or url plus url_mode for a third-party "
     "URL. url_mode='external' accepts HTTPS only, publishes the URL without downloading "
     "it, and is "
     "available only when the resolved destination can render a third-party media URL; "
     "url_mode='managed' accepts HTTP or HTTPS and downloads the media into this Agent's "
-    "workspace before delivery "
+    "platform-managed media store before delivery "
     "so history uses platform-managed playback. The tool contract is always available "
     "even when the resolved IM channel returns unsupported. Audio/video is rendered as "
-    "a dedicated tool-call card."
+    "a dedicated tool-call card. An optional title customizes the Web/H5 card label "
+    "without renaming the source file or acting as a caption."
 )
 
 SEND_MEDIA_PARAMETERS_SCHEMA = {
@@ -24,15 +35,15 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
             "type": "string",
             "enum": ["audio", "video"],
             "description": (
-                "Required media kind. It must match the actual managed/workspace file; "
+                "Required media kind. It must match the actual managed or Agent-owned file; "
                 "external URLs are rendered using this declared kind."
             ),
         },
         "file_path": {
             "type": "string",
             "description": (
-                "Agent-owned workspace-relative file path, for example "
-                "workspace/media/briefing.mp3. Use either file_path or url, never both."
+                "Any existing file path relative to the current Agent root, for example "
+                "exports/briefing.mp3. Use either file_path or url, never both."
             ),
         },
         "url": {
@@ -50,13 +61,13 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
                 "Required with url. external requires HTTPS, publishes the third-party "
                 "URL without downloading, and does not guarantee future availability. "
                 "managed accepts HTTP or HTTPS and imports the media into "
-                "workspace/media/imported before delivery."
+                "media/imported before delivery."
             ),
         },
         "cover_image_path": {
             "type": "string",
             "description": (
-                "Video only. Optional Agent-owned workspace-relative image path. "
+                "Video only. Optional image path relative to the current Agent root. "
                 "An Agent cover wins; required channels generate a fallback when omitted."
             ),
         },
@@ -97,6 +108,14 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
             "description": (
                 "Optional caption/business text delivered as a separate ordinary message "
                 "after the standalone media message."
+            ),
+        },
+        "title": {
+            "type": "string",
+            "maxLength": MAX_MEDIA_DISPLAY_TITLE_LENGTH,
+            "description": (
+                "Optional concise display title for the Web/H5 media card. This does "
+                "not rename the file and is not delivered as an IM caption."
             ),
         },
     },

@@ -3,6 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { fetchJson } from '../services/api';
 import { useAuthStore } from '../stores';
+import { safeLoginReturnTo } from '../utils/loginReturn';
 
 interface TenantChoice {
     tenant_id: string;
@@ -20,6 +21,14 @@ export default function OAuthCallback() {
     const [tenants, setTenants] = useState<TenantChoice[] | null>(null);
     const [pendingToken, setPendingToken] = useState('');
     const [loading, setLoading] = useState(false);
+    const returnTo = safeLoginReturnTo(
+        new URLSearchParams(new URLSearchParams(window.location.search).get('state') || '').get('return_to'),
+    );
+
+    const finishLogin = () => {
+        if (returnTo) window.location.replace(returnTo);
+        else navigate('/', { replace: true });
+    };
 
     useEffect(() => {
         if (tenants) return; // Already showing selection UI
@@ -58,7 +67,7 @@ export default function OAuthCallback() {
                     navigate('/setup-company', { replace: true });
                     return;
                 }
-                navigate('/', { replace: true });
+                finishLogin();
             })
             .catch((err: any) => {
                 setError(err.message || t('oauth.oauthLoginFailed'));
@@ -84,7 +93,7 @@ export default function OAuthCallback() {
                 navigate('/setup-company', { replace: true });
                 return;
             }
-            navigate('/', { replace: true });
+            finishLogin();
         } catch (err: any) {
             setError(err.message || t('oauth.loginFailed'));
             setLoading(false);

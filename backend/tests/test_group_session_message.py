@@ -773,6 +773,11 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
         "intent_id": "media-group-call",
         "origin_session_id": str(uuid.uuid4()),
         "origin_turn_anchor_id": uuid.uuid4(),
+        "tool_args": {
+            "media_type": "video",
+            "file_path": "workspace/demo.mp4",
+            "title": "示例媒体标题",
+        },
     }
 
     first = json.loads(await agent_tools._send_media_to_session(**kwargs))
@@ -781,7 +786,9 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
     assert first["status"] == "sent"
     assert first["conversation_type"] == "group"
     assert first["session_id"] == str(target.id)
+    assert first["title"] == "示例媒体标题"
     assert second["status"] == "already_sent"
+    assert second["title"] == "示例媒体标题"
     assert calls == [{
         "target_id": target.external_conv_id.removeprefix("dingtalk_group_"),
         "file_path": video,
@@ -795,6 +802,7 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
     render_result = json.loads(live_events[0]["result"])
     assert render_result["type"] == "platform_media_delivery"
     assert render_result["path"] == "workspace/demo.mp4"
+    assert render_result["title"] == "示例媒体标题"
     assert render_result["allow_download"] is False
     assert live_events[1]["type"] == "assistant_message_committed"
     assert live_events[1]["content"] == "群视频"
@@ -823,11 +831,13 @@ async def test_send_video_targets_exact_group_session_with_custom_cover(
         "size_bytes": 5,
     }]
     assert receipt.message_meta["target_is_group"] is True
+    assert receipt.message_meta["display_title"] == "示例媒体标题"
     assert receipt.message_meta["delivery_claim"] is True
     assert "delivery_claim" not in caption_row.message_meta
     stored_render = json.loads(json.loads(receipt.content)["result"])
     assert stored_render["message_id"] == str(receipt.id)
     assert stored_render["allow_download"] is False
+    assert stored_render["title"] == "示例媒体标题"
 
 
 async def test_send_media_caption_failure_is_preserved_on_replay(tmp_path, monkeypatch):
@@ -1557,6 +1567,7 @@ async def test_external_media_url_reuses_standard_current_tool_call(monkeypatch)
         "media_type": "video",
         "url": "https://media.example/demo.mp4?token=short-lived",
         "url_mode": "external",
+        "title": "  外部媒体\n标题  ",
     }
     async with async_session() as db:
         running = ChatMessage(
@@ -1601,14 +1612,17 @@ async def test_external_media_url_reuses_standard_current_tool_call(monkeypatch)
     assert first["status"] == "sent"
     assert first["source_mode"] == "external_url"
     assert first["url"] == tool_args["url"]
+    assert first["title"] == "外部媒体 标题"
     assert "path" not in first
     assert replay["status"] == "already_sent"
+    assert replay["title"] == "外部媒体 标题"
     assert len(live_events) == 1
     async with async_session() as db:
         stored = await db.get(ChatMessage, running_id)
     assert stored is not None
     assert stored.message_meta["attachments"] == []
     assert stored.message_meta["delivery_status"] == "sent"
+    assert stored.message_meta["display_title"] == "外部媒体 标题"
     stored_call = json.loads(stored.content)
     assert stored_call["status"] == "done"
     assert stored_call["args"] == tool_args

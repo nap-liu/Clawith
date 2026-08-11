@@ -210,6 +210,7 @@ async def lifespan(fastapi_app: FastAPI):
             import app.models.scene          # noqa
 
             import app.models.identity       # noqa
+            import app.models.published_page  # noqa
             async with engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             logger.info("[startup] Database tables ready")

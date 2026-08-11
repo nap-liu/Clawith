@@ -23,15 +23,18 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import uuid
 from pathlib import Path
 
 from loguru import logger
 
 from app.config import get_settings
-from .tool_result_shaping import shape_tool_result
+from app.services.tool_result_paths import (
+    sanitize_tool_result_component,
+    tool_result_session_dir,
+)
 
+from .tool_result_shaping import shape_tool_result
 
 PERSISTED_OPEN = "<persisted-output>"
 PERSISTED_CLOSE = "</persisted-output>"
@@ -65,9 +68,6 @@ TOOL_OUTPUT_MAX_CHARS: dict[str, int | float] = {
 
 ENV_OVERRIDE = "CLAWITH_TOOL_OUTPUT_MAX_CHARS"
 
-_FILENAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
 def _default_budget() -> int:
     override = os.environ.get(ENV_OVERRIDE)
     if override:
@@ -88,8 +88,7 @@ def budget_for(tool_name: str) -> int | float:
 
 def _sanitize(name: str) -> str:
     """Make a string safe for use as a filename component."""
-    cleaned = _FILENAME_SAFE.sub("_", name).strip("_.") or "unnamed"
-    return cleaned[:80]
+    return sanitize_tool_result_component(name)
 
 
 def _store_dir(agent_id, session_id: str) -> Path:
@@ -103,8 +102,7 @@ def _store_dir(agent_id, session_id: str) -> Path:
     return (
         Path(settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR)
         / str(agent_id)
-        / ".tool_results"
-        / _sanitize(session_id or "nosession")
+        / Path(tool_result_session_dir(session_id))
     )
 
 
@@ -187,7 +185,7 @@ def _materialize_to_file(
 
     full_path.write_text(result, encoding="utf-8")
 
-    rel_path = f".tool_results/{_sanitize(session_id or 'nosession')}/{filename}"
+    rel_path = (tool_result_session_dir(session_id) / filename).as_posix()
     preview = result[:PREVIEW_CHARS]
     view = _render_persisted(
         tool_name=tool_name,

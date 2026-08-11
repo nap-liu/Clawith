@@ -22,6 +22,12 @@ class TriggerExecution(Base):
     agent_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chat_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="webhook")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -38,4 +44,6 @@ class TriggerExecution(Base):
     __table_args__ = (
         UniqueConstraint("trigger_id", "idempotency_key", name="uq_trigger_execution_idempotency"),
         Index("ix_trigger_executions_status_scheduled", "status", "scheduled_at"),
+        Index("ix_trigger_executions_agent_scheduled", "agent_id", "scheduled_at"),
+        Index("ix_trigger_executions_conversation_scheduled", "conversation_id", "scheduled_at"),
     )

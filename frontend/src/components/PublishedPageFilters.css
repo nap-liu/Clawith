@@ -1,0 +1,24 @@
+.published-page-filters {
+    display: grid;
+    grid-template-columns: 200px minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    margin-bottom: 14px;
+}
+
+.published-page-filters__agent {
+    width: 200px;
+}
+
+@media (max-width: 680px) {
+    .published-page-filters {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
+
+    .published-page-filters__agent,
+    .published-page-filters__query {
+        grid-column: 1 / -1;
+        width: 100%;
+    }
+}

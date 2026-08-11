@@ -37,6 +37,7 @@ export default function ChatFileDeliveryCard({
     const mediaKind = delivery.mediaKind
         || ((delivery.mimeType || '').startsWith('audio/') ? 'audio' : undefined)
         || ((delivery.mimeType || '').startsWith('video/') ? 'video' : undefined);
+    const mediaDisplayTitle = delivery.title || delivery.filename;
     const details = [
         delivery.size !== undefined ? formatFileSize(delivery.size) : '',
         delivery.mimeType || '',
@@ -54,14 +55,14 @@ export default function ChatFileDeliveryCard({
 
     if (mediaKind) {
         return (
-            <div className={`chat-file-delivery chat-file-delivery--${mode}`}>
+            <div className={`chat-file-delivery chat-file-delivery--media chat-file-delivery--${mode}`}>
                 {delivery.message ? <div className="chat-file-delivery__message">{delivery.message}</div> : null}
                 <ChatMediaCard
                     agentId={agentId}
                     messageId={messageId}
                     mode={mode}
                     attachment={{
-                        display_name: delivery.filename,
+                        display_name: mediaDisplayTitle,
                         path: delivery.path || '',
                         kind: mediaKind,
                         ...(delivery.mimeType ? { mime_type: delivery.mimeType } : {}),

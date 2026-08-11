@@ -67,6 +67,29 @@ try {
     }));
     assert.match(desktopFileCard, /aria-label="下载文件"/);
 
+    const mediaDelivery = {
+        id: 'media-delivery',
+        path: 'media/imported/opaque-preview.mp4',
+        filename: 'opaque-preview.mp4',
+        title: '示例媒体标题',
+        mediaKind: 'video',
+        mimeType: 'video/mp4',
+        size: 14 * 1024 * 1024,
+        messageId: 'media-message',
+    };
+    for (const mode of ['h5', 'pc']) {
+        const mediaCard = renderToStaticMarkup(React.createElement(ChatFileDeliveryCard, {
+            agentId: '00000000-0000-0000-0000-000000000001',
+            messageId: 'media-message',
+            delivery: mediaDelivery,
+            mode,
+        }));
+        assert.match(mediaCard, /示例媒体标题/);
+        assert.doesNotMatch(mediaCard, /opaque-preview/);
+        assert.match(mediaCard, /14 MB · video\/mp4/);
+        assert.match(mediaCard, /chat-file-delivery--media/);
+    }
+
     console.log('h5 content protection tests passed');
 } finally {
     await server.close();

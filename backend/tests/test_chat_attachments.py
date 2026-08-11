@@ -143,6 +143,46 @@ def test_serializer_exposes_structured_agent_media_attachments():
     assert result["attachments"] == [attachment]
 
 
+def test_platform_managed_media_path_is_a_canonical_attachment():
+    attachment = chat_attachments.attachment_from_workspace_path(
+        "media/imported/managed-demo.mp4",
+        mime_type="video/mp4",
+        size_bytes=42,
+    )
+
+    assert attachment == {
+        "display_name": "managed-demo.mp4",
+        "path": "media/imported/managed-demo.mp4",
+        "kind": "video",
+        "mime_type": "video/mp4",
+        "size_bytes": 42,
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "exports/demo.mp4",
+        "briefing.mp3",
+        ".tool_results/session-1/result.mp4",
+    ],
+)
+def test_any_canonical_agent_relative_path_can_become_an_attachment(path):
+    attachment = chat_attachments.attachment_from_workspace_path(path)
+
+    assert attachment["path"] == path
+    assert chat_attachments.normalize_attachment_metadata([attachment]) == [attachment]
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/etc/passwd", "../outside.mp4", "https://example.com/demo.mp4", "C:/demo.mp4"],
+)
+def test_non_agent_relative_attachment_path_is_rejected(path):
+    with pytest.raises(ValueError, match="canonical agent file path"):
+        chat_attachments.attachment_from_workspace_path(path)
+
+
 def test_serializer_does_not_create_a_non_tool_media_render_protocol():
     attachment = chat_attachments.attachment_from_workspace_path(
         "workspace/demo.mp4", mime_type="video/mp4"
@@ -245,3 +285,20 @@ async def test_client_attachment_validation_preserves_duplicates_and_checks_stor
 
     assert len(result) == 2
     assert len(checked) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["private/secret.mp4", ".tool_results/session-1/result.mp4"],
+)
+async def test_client_attachment_validation_keeps_the_inbound_path_allowlist(
+    path,
+):
+    attachment = chat_attachments.attachment_from_workspace_path(path)
+
+    with pytest.raises(ValueError, match="client attachment paths are not allowed"):
+        await chat_attachments.validate_client_attachments(
+            uuid.uuid4(),
+            [attachment],
+        )

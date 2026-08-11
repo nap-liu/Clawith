@@ -62,6 +62,9 @@
   --space-10: 40px;
   --space-12: 48px;
 
+  /* Form controls */
+  --control-height-md: 36px;
+
   /* Typography */
   --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
@@ -1696,7 +1699,7 @@ select:focus {
   font-size: var(--text-sm);
   font-weight: 500;
   line-height: 1;
-  height: 34px;
+  height: var(--control-height-md);
   transition: all var(--transition-fast);
   white-space: nowrap;
 }
@@ -2253,7 +2256,7 @@ select:focus {
 
 .form-input {
   width: 100%;
-  height: 38px;
+  height: var(--control-height-md);
 }
 
 .form-input.input-error {
@@ -6928,6 +6931,123 @@ select:focus {
   white-space: nowrap;
 }
 
+.conversation-copy-button {
+  border: 0;
+  padding: 0 2px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.65;
+}
+
+.conversation-copy-button:hover,
+.conversation-copy-button:focus-visible {
+  opacity: 1;
+}
+
+.conversation-image-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.conversation-image-list img {
+  display: block;
+  max-width: 200px;
+  max-height: 150px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  object-fit: cover;
+}
+
+.conversation-media-list,
+.conversation-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.conversation-tool-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--bg-secondary) 72%, var(--bg-primary));
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.conversation-tool-chip--target {
+  max-width: min(520px, 100%);
+  overflow: hidden;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-tool-details {
+  margin-top: 8px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.conversation-provenance {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 12px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--text-tertiary);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--bg-secondary) 76%, transparent);
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.conversation-provenance--completed { border-left-color: var(--success, #4f8a65); }
+.conversation-provenance--failed { border-left-color: var(--danger, #b95c5c); }
+.conversation-provenance--processing { border-left-color: var(--accent-primary); }
+.conversation-provenance-source,
+.conversation-provenance-status {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.conversation-provenance-time { margin-left: auto; }
+.conversation-provenance-error {
+  flex-basis: 100%;
+  color: var(--danger, #b95c5c);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.conversation-tool-details summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.conversation-tool-details pre {
+  max-height: 140px;
+  margin: 7px 0 0;
+  overflow: auto;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .chat-msg-file-chip {
   display: inline-flex;
   align-items: center;
@@ -7205,38 +7325,6 @@ select:focus {
   border-radius: 999px;
   padding: 8px 14px;
   font-size: 12px;
-}
-
-/* Scroll-to-bottom button */
-.chat-scroll-btn {
-  position: absolute;
-  right: 20px;
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.75);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid var(--border-subtle);
-  color: var(--text-secondary);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 16px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-  z-index: 10;
-  transition: background 120ms ease, box-shadow 120ms ease;
-}
-.chat-scroll-btn:hover {
-  background: rgba(255, 255, 255, 0.9);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-}
-[data-theme="dark"] .chat-scroll-btn {
-  background: rgba(40, 40, 50, 0.75);
-}
-[data-theme="dark"] .chat-scroll-btn:hover {
-  background: rgba(50, 50, 60, 0.9);
 }
 
 .chat-input-area {
@@ -8067,4 +8155,7 @@ select:focus {
 
 .enterprise-tool-source-tabs {
   margin-bottom: 16px;
+}
+.conversation-timeline {
+    width: 100%;
 }

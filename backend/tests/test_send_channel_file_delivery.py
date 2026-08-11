@@ -1,11 +1,17 @@
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
 from app.services import agent_tools
 from app.services.llm import caller as llm_caller
-from app.services.media_tool_contract import SEND_MEDIA_PARAMETERS_SCHEMA
+from app.services.media_tool_contract import (
+    MAX_MEDIA_DISPLAY_TITLE_LENGTH,
+    SEND_MEDIA_PARAMETERS_SCHEMA,
+    normalize_media_display_title,
+)
+from app.services.storage_runtime.local import LocalStorageBackend
 from app.services.tool_seeder import BUILTIN_TOOLS
 
 
@@ -224,6 +230,116 @@ async def test_media_kind_is_checked_from_file_bytes(tmp_path, monkeypatch):
     assert payload["actual_kind"] == "audio"
 
 
+@pytest.mark.asyncio
+async def test_send_media_accepts_any_file_under_current_agent_root(
+    tmp_path,
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    workspace = tmp_path / str(agent_id)
+    video = workspace / "exports" / "review" / "demo.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(
+        b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+    )
+    captured = {}
+
+    async def fake_config(_agent_id, _tool_name):
+        return {}
+
+    async def fake_send_to_session(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"type": "platform_media_delivery", "status": "sent"})
+
+    monkeypatch.setattr(agent_tools, "_get_tool_config", fake_config)
+    monkeypatch.setattr(agent_tools, "_send_media_to_session", fake_send_to_session)
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        agent_id,
+        workspace,
+        {
+            "file_path": "exports/review/demo.mp4",
+            "session_id": str(uuid.uuid4()),
+        },
+        media_kind="video",
+        tool_call_id="call-agent-root-file",
+    ))
+
+    assert payload["status"] == "sent"
+    assert captured["file_path"] == video
+    assert captured["workspace_path"] == "exports/review/demo.mp4"
+
+
+@pytest.mark.asyncio
+async def test_send_media_rejects_symlink_that_escapes_current_agent_root(tmp_path):
+    agent_id = uuid.uuid4()
+    workspace = tmp_path / str(agent_id)
+    outside = tmp_path / "outside.mp4"
+    workspace.mkdir(parents=True)
+    outside.write_bytes(
+        b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+    )
+    (workspace / "linked.mp4").symlink_to(outside)
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        agent_id,
+        workspace,
+        {
+            "file_path": "linked.mp4",
+            "session_id": str(uuid.uuid4()),
+        },
+        media_kind="video",
+        tool_call_id="call-symlink-escape",
+    ))
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == "INVALID_FILE_PATH"
+
+
+@pytest.mark.asyncio
+async def test_send_media_runtime_does_not_materialize_another_agent_symlink(
+    tmp_path,
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    other_agent_id = uuid.uuid4()
+    storage_root = tmp_path / "storage"
+    agent_root = storage_root / str(agent_id)
+    other_media = storage_root / str(other_agent_id) / "private" / "secret.mp4"
+    agent_root.mkdir(parents=True)
+    other_media.parent.mkdir(parents=True)
+    other_media.write_bytes(
+        b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+    )
+    (agent_root / "linked.mp4").symlink_to(other_media)
+    storage = LocalStorageBackend(str(storage_root))
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    async def run_send_media(temp_workspace):
+        return await agent_tools._send_channel_media(
+            agent_id,
+            temp_workspace,
+            {
+                "file_path": "linked.mp4",
+                "session_id": str(uuid.uuid4()),
+            },
+            media_kind="video",
+            tool_call_id="call-cross-agent-symlink",
+        )
+
+    result = await agent_tools._run_with_temp_workspace(
+        agent_id,
+        None,
+        run_send_media,
+        paths=["linked.mp4"],
+        source_paths=["linked.mp4"],
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "failed"
+    assert payload["code"] == "MEDIA_NOT_FOUND"
+
+
 def test_media_tools_are_fixed_core_tools():
     definitions = [item["function"]["name"] for item in agent_tools.AGENT_TOOLS]
     assert definitions.count("send_media") == 1
@@ -236,6 +352,14 @@ def test_media_tools_are_fixed_core_tools():
         if item["function"]["name"] == "send_media"
     )
     assert "allow_download" not in media_schema["properties"]
+    assert media_schema["properties"]["title"] == {
+        "type": "string",
+        "maxLength": MAX_MEDIA_DISPLAY_TITLE_LENGTH,
+        "description": (
+            "Optional concise display title for the Web/H5 media card. This does "
+            "not rename the file and is not delivered as an IM caption."
+        ),
+    }
     assert media_schema == SEND_MEDIA_PARAMETERS_SCHEMA
     assert set(media_schema["properties"]["url_mode"]["enum"]) == {"external", "managed"}
     seeded = next(tool for tool in BUILTIN_TOOLS if tool["name"] == "send_media")
@@ -248,6 +372,18 @@ def test_media_tools_are_fixed_core_tools():
         "default": False,
         "description": "Show the download action on send_media cards in both Web and H5 chat.",
     }]
+
+
+def test_media_display_title_is_safe_compact_and_bounded():
+    raw = "  示例媒体\n\x00展示\t标题  " + ("占位" * 100)
+
+    title = normalize_media_display_title(raw)
+
+    assert title.startswith("示例媒体 展示 标题")
+    assert "\n" not in title
+    assert "\x00" not in title
+    assert len(title) == MAX_MEDIA_DISPLAY_TITLE_LENGTH
+    assert normalize_media_display_title(None) == ""
 
 
 @pytest.mark.parametrize(
@@ -460,6 +596,82 @@ async def test_managed_url_invalid_target_is_rejected_before_download(tmp_path, 
 
     assert payload["status"] == "failed"
     assert payload["code"] == "SESSION_NOT_FOUND_OR_FORBIDDEN"
+
+
+@pytest.mark.asyncio
+async def test_managed_url_uses_origin_session_result_scope_and_agent_media_storage(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+    agent_id = uuid.uuid4()
+    origin_session_id = str(uuid.uuid4())
+    target_session_id = str(uuid.uuid4())
+    managed_file = tmp_path / "media" / "imported" / "managed-demo.mp4"
+    managed_file.parent.mkdir(parents=True)
+    managed_file.write_bytes(
+        b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+    )
+
+    async def no_replay(**_kwargs):
+        return None
+
+    async def valid_target(**_kwargs):
+        return None
+
+    async def fake_import(_url, **kwargs):
+        captured["import"] = kwargs
+        def close_import():
+            captured["import_closed"] = True
+
+        return SimpleNamespace(
+            file_path=managed_file,
+            workspace_path="media/imported/managed-demo.mp4",
+            mime_type="video/mp4",
+            close=close_import,
+        )
+
+    class Storage:
+        async def write_local_file(self, key, path, *, content_type=None):
+            captured["storage"] = (key, path, content_type)
+
+    async def fake_send(**kwargs):
+        captured["send"] = kwargs
+        return json.dumps({"type": "platform_media_delivery", "status": "sent"})
+
+    monkeypatch.setattr(agent_tools, "_replay_terminal_media_delivery", no_replay)
+    monkeypatch.setattr(agent_tools, "_preflight_managed_media_target", valid_target)
+    monkeypatch.setattr(agent_tools, "import_managed_media_url", fake_import)
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(agent_tools, "_get_tool_config", lambda *_args: _async_value({}))
+    monkeypatch.setattr(agent_tools, "_send_media_to_session", fake_send)
+    monkeypatch.setattr(agent_tools, "_agent_workspace_root", lambda _agent_id: tmp_path)
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        agent_id,
+        tmp_path,
+        {
+            "url": "https://media.example/demo.mp4",
+            "url_mode": "managed",
+            "session_id": target_session_id,
+        },
+        media_kind="video",
+        tool_call_id="call-managed-layout",
+        origin_session_id=origin_session_id,
+    ))
+
+    assert payload["status"] == "sent"
+    assert captured["import"]["session_id"] == origin_session_id
+    assert captured["import"]["operation_scope"] == (
+        f"outbound:{agent_id}:{origin_session_id}:unanchored:call-managed-layout"
+    )
+    assert captured["storage"] == (
+        f"{agent_id}/media/imported/managed-demo.mp4",
+        managed_file,
+        "video/mp4",
+    )
+    assert captured["send"]["workspace_path"] == "media/imported/managed-demo.mp4"
+    assert captured["import_closed"] is True
 
 
 async def _async_value(value):

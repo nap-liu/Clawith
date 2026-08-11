@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { IconAlertTriangle } from '@tabler/icons-react';
 import { useAuthStore } from '../stores';
 import { fetchJson } from '../services/api';
+import { safeLoginReturnTo } from '../utils/loginReturn';
 
 export default function SSOEntry() {
     const { t } = useTranslation();
@@ -12,6 +13,8 @@ export default function SSOEntry() {
     const setAuth = useAuthStore((s) => s.setAuth);
     const sid = searchParams.get('sid');
     const complete = searchParams.get('complete') === '1';
+    const returnTo = safeLoginReturnTo(searchParams.get('return_to'));
+    const callbackError = searchParams.get('error') || '';
     const [error, setError] = useState('');
     const [providers, setProviders] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
@@ -20,6 +23,19 @@ export default function SSOEntry() {
     const [polling, setPolling] = useState(complete);
 
     useEffect(() => {
+        if (callbackError) {
+            const messages: Record<string, string> = {
+                browser_mismatch: '登录请求与当前浏览器不匹配，请从登录页重新发起。',
+                provider_unavailable: '登录方式当前不可用，请返回登录页重试。',
+                invalid_state: '登录状态无效或已过期，请重新登录。',
+                invalid_session: '登录会话无效或已过期，请重新登录。',
+                authentication_failed: '身份认证失败，请重试。',
+                session_update_failed: '登录结果保存失败，请重试。',
+            };
+            setError(messages[callbackError] || t('sso.sessionExpired'));
+            setLoading(false);
+            return;
+        }
         if (!sid) {
             setError(t('sso.missingSessionId'));
             setLoading(false);
@@ -62,10 +78,10 @@ export default function SSOEntry() {
         } else {
             setLoading(false);
         }
-    }, [sid, complete]);
+    }, [sid, complete, callbackError, t]);
 
     useEffect(() => {
-        if (!sid) return;
+        if (!sid || callbackError) return;
         let cancelled = false;
         let timer: number | undefined;
 
@@ -78,6 +94,8 @@ export default function SSOEntry() {
                     setAuth(res.user, res.access_token);
                     if (res.user && !res.user.tenant_id) {
                         navigate('/setup-company');
+                    } else if (returnTo) {
+                        window.location.replace(returnTo);
                     } else {
                         navigate('/');
                     }
@@ -105,7 +123,7 @@ export default function SSOEntry() {
             cancelled = true;
             if (timer) window.clearTimeout(timer);
         };
-    }, [sid, setAuth, navigate]);
+    }, [sid, setAuth, navigate, returnTo, callbackError]);
 
     if (loading) {
         return (

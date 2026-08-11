@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 
 import httpx
 import pytest
@@ -8,12 +9,20 @@ from loguru import logger
 from app.core.logging_config import intercept_standard_logging
 from app.services import media_url_source
 
-
 MP4_BYTES = b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+SESSION_ID = "session-managed"
+
+
+def _staging_dir(agent_root, session_id=SESSION_ID):
+    return agent_root / ".tool_results" / session_id / ".media"
+
+
+def _fail_temp_directory(**_kwargs):
+    raise OSError("temp full")
 
 
 @pytest.mark.asyncio
-async def test_managed_url_streams_inside_agent_workspace_and_finishes_atomically(tmp_path, monkeypatch):
+async def test_managed_url_streams_into_agent_media_store_and_finishes_atomically(tmp_path, monkeypatch):
     original_client = httpx.AsyncClient
     transport = httpx.MockTransport(lambda request: httpx.Response(
         200,
@@ -36,15 +45,16 @@ async def test_managed_url_streams_inside_agent_workspace_and_finishes_atomicall
     imported = await media_url_source.import_managed_media_url(
         "https://media.example/demo.mp4",
         agent_workspace=tmp_path,
+        session_id=SESSION_ID,
         intent_id="call-managed",
         max_bytes=1024,
         expected_media_kind="video",
     )
 
     assert imported.file_path.read_bytes() == MP4_BYTES
-    assert imported.workspace_path.startswith("workspace/media/imported/")
+    assert imported.workspace_path.startswith("media/imported/")
     assert imported.mime_type == "video/mp4"
-    assert list((tmp_path / "workspace" / ".media-staging").glob("*.partial")) == []
+    assert list(_staging_dir(tmp_path).glob("*.partial")) == []
 
 
 @pytest.mark.asyncio
@@ -70,6 +80,7 @@ async def test_managed_url_rejects_wrong_media_bytes_before_final_move(tmp_path,
         await media_url_source.import_managed_media_url(
             "https://media.example/fake.mp4",
             agent_workspace=tmp_path,
+            session_id=SESSION_ID,
             intent_id="call-mismatch",
             max_bytes=1024,
             expected_media_kind="video",
@@ -77,8 +88,106 @@ async def test_managed_url_rejects_wrong_media_bytes_before_final_move(tmp_path,
 
     assert exc_info.value.code == "MEDIA_KIND_MISMATCH"
     assert exc_info.value.actual_kind == "audio"
-    assert list((tmp_path / "workspace" / ".media-staging").glob("*.partial")) == []
-    assert list((tmp_path / "workspace" / "media" / "imported").iterdir()) == []
+    assert list(_staging_dir(tmp_path).glob("*.partial")) == []
+    assert list((tmp_path / "media" / "imported").iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_managed_url_revalidates_cached_file_size(tmp_path, monkeypatch):
+    original_client = httpx.AsyncClient
+    fetch_count = 0
+
+    def handler(request):
+        nonlocal fetch_count
+        fetch_count += 1
+        return httpx.Response(200, content=MP4_BYTES, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    imported = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4",
+        agent_workspace=tmp_path,
+        session_id=SESSION_ID,
+        intent_id="cached-size",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+    imported.close()
+    (tmp_path / imported.workspace_path).write_bytes(MP4_BYTES + b"x" * 2048)
+
+    with pytest.raises(media_url_source.MediaUrlError) as exc_info:
+        await media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=tmp_path,
+            session_id=SESSION_ID,
+            intent_id="cached-size",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+
+    assert exc_info.value.code == "MEDIA_URL_TOO_LARGE"
+    assert fetch_count == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_url_maps_cached_delivery_temp_failure(tmp_path, monkeypatch):
+    original_client = httpx.AsyncClient
+    fetch_count = 0
+
+    def handler(request):
+        nonlocal fetch_count
+        fetch_count += 1
+        return httpx.Response(200, content=MP4_BYTES, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    imported = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4",
+        agent_workspace=tmp_path,
+        session_id=SESSION_ID,
+        intent_id="cached-temp-failure",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+    imported.close()
+    monkeypatch.setattr(
+        media_url_source.tempfile,
+        "mkdtemp",
+        _fail_temp_directory,
+    )
+
+    with pytest.raises(media_url_source.MediaUrlError) as exc_info:
+        await media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=tmp_path,
+            session_id=SESSION_ID,
+            intent_id="cached-temp-failure",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+
+    assert exc_info.value.code == "MEDIA_STORAGE_FAILED"
+    assert fetch_count == 1
 
 
 @pytest.mark.asyncio
@@ -126,38 +235,51 @@ async def test_malformed_ipv6_url_returns_structured_validation_error(external):
 
 
 @pytest.mark.asyncio
-async def test_managed_import_rejects_malformed_url_before_workspace_write(tmp_path):
+async def test_managed_import_rejects_malformed_url_before_agent_storage_write(tmp_path):
     with pytest.raises(media_url_source.MediaUrlError) as exc_info:
         await media_url_source.import_managed_media_url(
             "https://[bad/a.mp4",
             agent_workspace=tmp_path,
+            session_id=SESSION_ID,
             intent_id="malformed-url",
             max_bytes=1024,
             expected_media_kind="video",
         )
 
     assert exc_info.value.code == "INVALID_MEDIA_URL"
-    assert not (tmp_path / "workspace").exists()
+    assert not (tmp_path / ".tool_results").exists()
+    assert not (tmp_path / "media").exists()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("symlink_location", ["workspace", "staging", "imported"])
-async def test_managed_import_rejects_workspace_directory_symlink_escape(
+@pytest.mark.parametrize(
+    "symlink_location",
+    ["tool_results", "session", "staging", "media", "imported"],
+)
+async def test_managed_import_rejects_agent_directory_symlink_escape(
     tmp_path,
     symlink_location,
 ):
     agent_root = tmp_path / "agent"
     outside = tmp_path / f"outside-{symlink_location}"
     agent_root.mkdir()
-    workspace = agent_root / "workspace"
-    if symlink_location == "workspace":
-        workspace.symlink_to(outside, target_is_directory=True)
+    tool_results = agent_root / ".tool_results"
+    if symlink_location == "tool_results":
+        tool_results.symlink_to(outside, target_is_directory=True)
+    elif symlink_location == "session":
+        tool_results.mkdir()
+        (tool_results / SESSION_ID).symlink_to(outside, target_is_directory=True)
     elif symlink_location == "staging":
-        workspace.mkdir()
-        (workspace / ".media-staging").symlink_to(outside, target_is_directory=True)
-    else:
-        (workspace / "media").mkdir(parents=True)
-        (workspace / "media" / "imported").symlink_to(
+        (tool_results / SESSION_ID).mkdir(parents=True)
+        (tool_results / SESSION_ID / ".media").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+    elif symlink_location == "media":
+        (agent_root / "media").symlink_to(outside, target_is_directory=True)
+    elif symlink_location == "imported":
+        (agent_root / "media").mkdir()
+        (agent_root / "media" / "imported").symlink_to(
             outside,
             target_is_directory=True,
         )
@@ -166,6 +288,7 @@ async def test_managed_import_rejects_workspace_directory_symlink_escape(
         await media_url_source.import_managed_media_url(
             "https://media.example/demo.mp4",
             agent_workspace=agent_root,
+            session_id=SESSION_ID,
             intent_id=f"symlink-{symlink_location}",
             max_bytes=1024,
             expected_media_kind="video",
@@ -173,6 +296,254 @@ async def test_managed_import_rejects_workspace_directory_symlink_escape(
 
     assert exc_info.value.code == "MEDIA_STORAGE_FAILED"
     assert outside.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_managed_import_keeps_open_directory_anchor_during_symlink_swap(
+    tmp_path,
+    monkeypatch,
+):
+    agent_root = tmp_path / "agent"
+    outside = tmp_path / "outside"
+    agent_root.mkdir()
+    outside.mkdir()
+    original_client = httpx.AsyncClient
+    original_target = media_url_source._managed_request_target
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=MP4_BYTES, request=request)
+    )
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    async def swap_visible_staging_dir(url):
+        target = await original_target(url)
+        staging = _staging_dir(agent_root)
+        anchored_staging = staging.with_name(".media-anchored")
+        staging.rename(anchored_staging)
+        staging.symlink_to(outside, target_is_directory=True)
+        return target
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(
+        media_url_source,
+        "_managed_request_target",
+        swap_visible_staging_dir,
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    imported = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4",
+        agent_workspace=agent_root,
+        session_id=SESSION_ID,
+        intent_id="swap-staging",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+
+    assert imported.file_path.read_bytes() == MP4_BYTES
+    assert list(outside.iterdir()) == []
+    assert list(
+        (_staging_dir(agent_root).with_name(".media-anchored")).iterdir()
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_managed_import_rejects_visible_imported_directory_swap(
+    tmp_path,
+    monkeypatch,
+):
+    agent_root = tmp_path / "agent"
+    outside = tmp_path / "outside"
+    agent_root.mkdir()
+    outside.mkdir()
+    original_client = httpx.AsyncClient
+    original_target = media_url_source._managed_request_target
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=MP4_BYTES, request=request)
+    )
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    async def swap_visible_imported_dir(url):
+        target = await original_target(url)
+        imported = agent_root / "media" / "imported"
+        imported.rename(imported.with_name("imported-anchored"))
+        imported.symlink_to(outside, target_is_directory=True)
+        return target
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(
+        media_url_source,
+        "_managed_request_target",
+        swap_visible_imported_dir,
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    with pytest.raises(media_url_source.MediaUrlError) as exc_info:
+        await media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=agent_root,
+            session_id=SESSION_ID,
+            intent_id="swap-imported",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+
+    assert exc_info.value.code == "MEDIA_STORAGE_FAILED"
+    anchored_files = list(
+        (agent_root / "media" / "imported-anchored").iterdir()
+    )
+    assert len(anchored_files) == 1
+    assert anchored_files[0].read_bytes() == MP4_BYTES
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_managed_import_delivery_copy_stays_bound_to_validated_bytes(
+    tmp_path,
+    monkeypatch,
+):
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=MP4_BYTES, request=request)
+    )
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    imported = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4",
+        agent_workspace=tmp_path,
+        session_id=SESSION_ID,
+        intent_id="stable-delivery-copy",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+    delivery_path = imported.file_path
+    (tmp_path / imported.workspace_path).write_bytes(MP4_BYTES + b"ATTACKER")
+
+    assert delivery_path.read_bytes() == MP4_BYTES
+    imported.close()
+    assert delivery_path.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_managed_import_validates_the_exact_delivery_copy(
+    tmp_path,
+    monkeypatch,
+):
+    original_client = httpx.AsyncClient
+    original_copy = media_url_source._copy_delivery_file
+    delivery_dirs = []
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=MP4_BYTES, request=request)
+    )
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    def replace_content_before_copy(final_fd, final_name, delivery_dir):
+        delivery_dirs.append(delivery_dir)
+        durable_file = tmp_path / "media" / "imported" / final_name
+        durable_file.write_bytes(b"attacker-not-media")
+        return original_copy(final_fd, final_name, delivery_dir)
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(
+        media_url_source,
+        "_copy_delivery_file",
+        replace_content_before_copy,
+    )
+
+    with pytest.raises(media_url_source.MediaUrlError) as exc_info:
+        await media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=tmp_path,
+            session_id=SESSION_ID,
+            intent_id="validate-delivery-copy",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+
+    assert exc_info.value.code == "MEDIA_KIND_MISMATCH"
+    assert delivery_dirs and delivery_dirs[0].exists() is False
+
+
+@pytest.mark.asyncio
+async def test_managed_import_cancellation_cleans_owned_delivery_directory(
+    tmp_path,
+    monkeypatch,
+):
+    original_client = httpx.AsyncClient
+    original_copy = media_url_source._copy_delivery_file
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    captured = {}
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=MP4_BYTES, request=request)
+    )
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    def blocking_copy(final_fd, final_name, delivery_dir):
+        captured["delivery_dir"] = delivery_dir
+        started.set()
+        try:
+            release.wait(timeout=2)
+            return original_copy(final_fd, final_name, delivery_dir)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(media_url_source, "_copy_delivery_file", blocking_copy)
+
+    task = asyncio.create_task(
+        media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=tmp_path,
+            session_id=SESSION_ID,
+            intent_id="cancel-delivery-copy",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 2)
+
+    assert captured["delivery_dir"].exists() is False
 
 
 @pytest.mark.asyncio
@@ -224,6 +595,7 @@ async def test_managed_redirect_uses_fresh_client_for_each_hostname(tmp_path, mo
     imported = await media_url_source.import_managed_media_url(
         "https://media.example/demo.mp4",
         agent_workspace=tmp_path,
+        session_id=SESSION_ID,
         intent_id="redirect-hosts",
         max_bytes=1024,
         expected_media_kind="video",
@@ -263,6 +635,7 @@ async def test_managed_url_falls_back_across_validated_public_ips(tmp_path, monk
     imported = await media_url_source.import_managed_media_url(
         "https://media.example/demo.mp4",
         agent_workspace=tmp_path,
+        session_id=SESSION_ID,
         intent_id="dual-stack",
         max_bytes=1024,
         expected_media_kind="video",
@@ -270,6 +643,51 @@ async def test_managed_url_falls_back_across_validated_public_ips(tmp_path, monk
 
     assert imported.file_path.read_bytes() == MP4_BYTES
     assert attempted_ips == ["2001:4860:4860::8888", "93.184.216.34"]
+
+
+@pytest.mark.asyncio
+async def test_managed_url_cleans_partial_before_fallback_after_read_error(
+    tmp_path,
+    monkeypatch,
+):
+    original_client = httpx.AsyncClient
+    attempted_ips = []
+
+    class InterruptedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield MP4_BYTES[:12]
+            raise httpx.ReadError("stream interrupted")
+
+    def handler(request):
+        attempted_ips.append(request.url.host)
+        if request.url.host == "93.184.216.34":
+            return httpx.Response(200, stream=InterruptedStream(), request=request)
+        return httpx.Response(200, content=MP4_BYTES, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34", "93.184.216.35"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    imported = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4",
+        agent_workspace=tmp_path,
+        session_id=SESSION_ID,
+        intent_id="read-error-fallback",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+
+    assert imported.file_path.read_bytes() == MP4_BYTES
+    assert attempted_ips == ["93.184.216.34", "93.184.216.35"]
+    assert list(_staging_dir(tmp_path).glob("*.partial")) == []
 
 
 @pytest.mark.asyncio
@@ -300,6 +718,7 @@ async def test_managed_import_never_logs_signed_url_or_local_path(tmp_path, monk
         imported = await media_url_source.import_managed_media_url(
             signed_url,
             agent_workspace=tmp_path,
+            session_id=SESSION_ID,
             intent_id="logging-redaction",
             max_bytes=1024,
             expected_media_kind="video",
@@ -358,6 +777,7 @@ async def test_concurrent_managed_imports_converge_on_one_atomic_final(tmp_path,
         media_url_source.import_managed_media_url(
             "https://media.example/demo.mp4",
             agent_workspace=tmp_path,
+            session_id=SESSION_ID,
             intent_id="same-intent",
             max_bytes=1024,
             expected_media_kind="video",
@@ -365,9 +785,61 @@ async def test_concurrent_managed_imports_converge_on_one_atomic_final(tmp_path,
         for _ in range(2)
     ])
 
-    assert first.file_path == second.file_path
+    assert first.workspace_path == second.workspace_path
     assert first.file_path.read_bytes() == MP4_BYTES
-    assert list((tmp_path / "workspace" / ".media-staging").glob("*.partial")) == []
+    assert (tmp_path / first.workspace_path).read_bytes() == MP4_BYTES
+    assert list(_staging_dir(tmp_path).glob("*.partial")) == []
+
+
+@pytest.mark.asyncio
+async def test_same_provider_intent_in_different_sessions_does_not_reuse_media(
+    tmp_path,
+    monkeypatch,
+):
+    original_client = httpx.AsyncClient
+    fetch_count = 0
+
+    def handler(request):
+        nonlocal fetch_count
+        fetch_count += 1
+        suffix = b"ONE" if request.url.params.get("variant") == "one" else b"TWO"
+        return httpx.Response(200, content=MP4_BYTES + suffix, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    first = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4?variant=one",
+        agent_workspace=tmp_path,
+        session_id="session-one",
+        intent_id="provider-call-1",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+    second = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4?variant=two",
+        agent_workspace=tmp_path,
+        session_id="session-two",
+        intent_id="provider-call-1",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+
+    assert first.workspace_path != second.workspace_path
+    assert first.file_path.read_bytes().endswith(b"ONE")
+    assert second.file_path.read_bytes().endswith(b"TWO")
+    assert (tmp_path / first.workspace_path).read_bytes().endswith(b"ONE")
+    assert (tmp_path / second.workspace_path).read_bytes().endswith(b"TWO")
+    assert fetch_count == 2
 
 
 async def _async_addresses(value):

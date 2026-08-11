@@ -2,7 +2,7 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -10,6 +10,7 @@ from app.api.auth import get_current_user
 from app.core.permissions import check_agent_access
 from app.database import async_session
 from app.models.trigger import AgentTrigger
+from app.models.trigger_execution import TriggerExecution
 
 router = APIRouter(prefix="/api/agents", tags=["triggers"])
 
@@ -38,6 +39,19 @@ class TriggerUpdate(BaseModel):
     max_fires: int | None = None
     cooldown_seconds: int | None = None
     expires_at: str | None = None
+
+
+class TriggerExecutionResponse(BaseModel):
+    id: str
+    trigger_id: str
+    trigger_name: str
+    source: str
+    status: str
+    conversation_id: str | None = None
+    scheduled_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    last_error: str | None = None
 
 
 _PRIVATE_CONFIG_PARTS = ("token", "secret", "password", "api_key", "webhook_queue")
@@ -129,6 +143,45 @@ async def list_agent_triggers(agent_id: uuid.UUID, user=Depends(get_current_user
             expires_at=t.expires_at.isoformat() if t.expires_at else None,
         )
         for t in triggers
+    ]
+
+
+@router.get(
+    "/{agent_id}/trigger-executions",
+    response_model=list[TriggerExecutionResponse],
+)
+async def list_trigger_executions(
+    agent_id: uuid.UUID,
+    limit: int = Query(100, ge=1, le=200),
+    user=Depends(get_current_user),
+):
+    """List durable trigger runs and their canonical Web conversation."""
+    async with async_session() as db:
+        await _require_manage(db, user, agent_id)
+        rows = (
+            await db.execute(
+                select(TriggerExecution, AgentTrigger.name)
+                .join(AgentTrigger, AgentTrigger.id == TriggerExecution.trigger_id)
+                .where(TriggerExecution.agent_id == agent_id)
+                .order_by(TriggerExecution.scheduled_at.desc())
+                .limit(limit)
+            )
+        ).all()
+
+    return [
+        TriggerExecutionResponse(
+            id=str(execution.id),
+            trigger_id=str(execution.trigger_id),
+            trigger_name=trigger_name,
+            source=execution.source,
+            status=execution.status,
+            conversation_id=str(execution.conversation_id) if execution.conversation_id else None,
+            scheduled_at=execution.scheduled_at.isoformat(),
+            started_at=execution.started_at.isoformat() if execution.started_at else None,
+            finished_at=execution.finished_at.isoformat() if execution.finished_at else None,
+            last_error=execution.last_error,
+        )
+        for execution, trigger_name in rows
     ]
 
 

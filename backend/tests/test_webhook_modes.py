@@ -9,12 +9,14 @@ from app.api import webhooks as webhooks_api
 from app.database import async_session, engine
 from app.main import app
 from app.models.agent import Agent
+from app.models.chat_session import ChatSession
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 from app.models.user import User, Identity
 from app.services.trigger_daemon import (
     _finalize_invocation_executions,
+    _link_invocation_executions,
     _evaluate_trigger,
     _merge_webhook_payloads,
     _advance_webhook_trigger,
@@ -382,6 +384,7 @@ async def test_ingress_and_advance_preserve_late_payload_and_finalize_atomically
             "ok",
             None,
             False,
+            None,
         ),
     )
     assert response.status_code == 200
@@ -433,6 +436,7 @@ async def test_merge_burst_and_parallel_ticks_create_one_complete_batch():
         "ok",
         None,
         False,
+        None,
     )
 
     async with async_session() as db:
@@ -468,6 +472,7 @@ async def test_early_skip_advances_webhook_and_completes_execution():
         None,
         None,
         False,
+        None,
     )
 
     async with async_session() as db:
@@ -476,6 +481,84 @@ async def test_early_skip_advances_webhook_and_completes_execution():
         assert stored.config["_webhook_queue"] == []
         assert stored.config["_webhook_active"] is False
         assert execution.status == "completed"
+
+
+async def test_finalize_stale_conversation_still_reaches_terminal_state():
+    """A deleted conversation must not strand a claimed execution forever."""
+    _agent_id, trigger_id = await _make_persisted_webhook_trigger("queue", ["a"])
+    async with async_session() as db:
+        trigger = await db.get(AgentTrigger, trigger_id)
+        execution = TriggerExecution(
+            trigger_id=trigger.id,
+            agent_id=trigger.agent_id,
+            source="webhook",
+            status="processing",
+            idempotency_key=f"stale-conversation:{uuid.uuid4()}",
+            payload={},
+            payload_text="",
+        )
+        db.add(execution)
+        await db.commit()
+        execution_id = execution.id
+        db.expunge(trigger)
+
+    await _finalize_invocation_executions(
+        [execution_id],
+        [trigger],
+        None,
+        "origin conversation disappeared",
+        False,
+        uuid.uuid4(),
+    )
+
+    async with async_session() as db:
+        execution = await db.get(TriggerExecution, execution_id)
+        assert execution.status == "failed"
+        assert execution.conversation_id is None
+        assert execution.lease_owner is None
+        assert execution.lease_expires_at is None
+
+
+async def test_link_execution_validates_origin_and_agent_ownership():
+    """Only a durable conversation owned by the execution's agent may be linked."""
+    agent_id, trigger_id = await _make_persisted_webhook_trigger("queue", ["a"])
+    async with async_session() as db:
+        trigger = await db.get(AgentTrigger, trigger_id)
+        agent = await db.get(Agent, agent_id)
+        owner = await db.get(User, agent.creator_id)
+        tenant = Tenant(name=f"origin-{uuid.uuid4().hex[:8]}", slug=f"origin-{uuid.uuid4().hex[:8]}")
+        db.add(tenant)
+        await db.flush()
+        owner.tenant_id = tenant.id
+        agent.tenant_id = tenant.id
+        await db.flush()
+        execution = TriggerExecution(
+            trigger_id=trigger.id,
+            agent_id=agent_id,
+            source="on_message",
+            status="processing",
+            idempotency_key=f"origin-link:{uuid.uuid4()}",
+            payload={},
+            payload_text="",
+        )
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=agent.creator_id,
+            source_channel="web",
+            title="origin",
+        )
+        db.add_all([execution, session])
+        await db.commit()
+        execution_id = execution.id
+        session_id = session.id
+
+    with pytest.raises(RuntimeError, match="no longer exists"):
+        await _link_invocation_executions([execution_id], uuid.uuid4())
+
+    await _link_invocation_executions([execution_id], session_id)
+    async with async_session() as db:
+        execution = await db.get(TriggerExecution, execution_id)
+        assert execution.conversation_id == session_id
 
 
 async def test_advance_failure_rolls_back_execution_terminal_state(monkeypatch):
@@ -513,6 +596,7 @@ async def test_advance_failure_rolls_back_execution_terminal_state(monkeypatch):
             "ok",
             None,
             False,
+            None,
         )
 
     async with async_session() as db:

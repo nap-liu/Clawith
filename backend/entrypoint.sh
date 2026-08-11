@@ -99,6 +99,7 @@ async def main():
     import app.models.okr                # noqa
     import app.models.onboarding         # noqa
     import app.models.identity           # noqa
+    import app.models.published_page     # noqa
 
     # Create all tables that don't exist yet (safe to run on every startup)
     async with engine.begin() as conn:

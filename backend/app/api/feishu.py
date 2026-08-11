@@ -4,7 +4,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from loguru import logger
@@ -16,7 +16,6 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
-from app.models.identity import IdentityProvider
 from app.schemas.schemas import ChannelConfigCreate, TokenResponse, UserOut
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 # Shared, channel-agnostic LLM entry point now lives in services/channel_llm.
@@ -168,33 +167,46 @@ class _SerialPatchQueue:
 
 # ─── OAuth ──────────────────────────────────────────────
 
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import RedirectResponse
 
 @router.get("/auth/feishu/callback")
 @router.post("/auth/feishu/callback", response_model=TokenResponse)
 async def feishu_oauth_callback(
     code: str, 
+    request: Request,
     state: str = None, 
     db: AsyncSession = Depends(get_db)
 ):
     """Handle Feishu OAuth callback — exchange code for user session."""
-    # Parse state if it's a UUID (session ID) or other context
     from app.models.identity import SSOScanSession
+    from app.services.sso_login_state import (
+        get_enabled_sso_provider,
+        parse_sso_or_legacy_state,
+        sso_browser_cookie_name,
+        sso_completion_url,
+        sso_error_url,
+        verify_sso_browser_binding,
+    )
+    sid, provider_id, login_query = parse_sso_or_legacy_state(state)
+    if state and sid is None:
+        return RedirectResponse(sso_error_url("invalid_state"), status_code=302)
+    if sid and (
+        provider_id is None
+        or not verify_sso_browser_binding(sid, request.cookies.get(sso_browser_cookie_name(sid)))
+    ):
+        return RedirectResponse(sso_error_url("browser_mismatch", login_query), status_code=302)
     tenant_id = None
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                tenant_id = session.tenant_id
-        except (ValueError, AttributeError):
-            pass
+    if sid:
+        s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
+        session = s_res.scalar_one_or_none()
+        if session and session.expires_at >= datetime.now(timezone.utc) and session.status in {"pending", "scanned"}:
+            tenant_id = session.tenant_id
+        else:
+            return RedirectResponse(sso_error_url("invalid_session", login_query), status_code=302)
 
     try:
         # Use FeishuAuthProvider instead of legacy feishu_service
         from app.services.auth_provider import FeishuAuthProvider
-        from app.models.identity import IdentityProvider
         from app.config import get_settings
 
         # Get Feishu credentials from settings
@@ -207,19 +219,15 @@ async def feishu_oauth_callback(
         # Get or create provider via auth provider
         provider = None
         if tenant_id:
-            result = await db.execute(
-                select(IdentityProvider).where(
-                    IdentityProvider.provider_type == "feishu",
-                    IdentityProvider.tenant_id == tenant_id
-                )
-            )
-            provider = result.scalar_one_or_none()
+            provider = await get_enabled_sso_provider(db, provider_id, "feishu", tenant_id)
+            if not provider:
+                return RedirectResponse(sso_error_url("provider_unavailable", login_query), status_code=302)
 
         auth_provider = FeishuAuthProvider(provider=provider, config=feishu_config)
 
-        # Ensure provider exists (will create if not)
-        await auth_provider._ensure_provider(db, tenant_id)
-        provider = auth_provider.provider
+        if not sid:
+            # Non-SSO API callers retain the legacy provider bootstrap behavior.
+            await auth_provider._ensure_provider(db, tenant_id)
 
         # Exchange code for user info
         token_data = await auth_provider.exchange_code_for_token(code)
@@ -234,12 +242,13 @@ async def feishu_oauth_callback(
         token = create_access_token(str(user.id), user.role)
 
     except Exception as e:
+        if sid:
+            return RedirectResponse(sso_error_url("authentication_failed", login_query), status_code=302)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Feishu auth failed: {e}")
 
     # If this is an SSO session, store result and redirect to frontend completion
-    if state:
+    if sid:
         try:
-            sid = uuid.UUID(state)
             s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
             session = s_res.scalar_one_or_none()
             if session:
@@ -249,13 +258,7 @@ async def feishu_oauth_callback(
                 session.access_token = token
                 session.error_msg = None
                 await db.commit()
-                return HTMLResponse(
-                    f"""<html><head><meta charset="utf-8" /></head>
-                    <body style="font-family: sans-serif; padding: 24px;">
-                        <div>SSO login successful. Redirecting...</div>
-                        <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
-                    </body></html>"""
-                )
+                return RedirectResponse(sso_completion_url(sid, login_query), status_code=302)
         except Exception as e:
             logger.exception("Failed to update SSO session (feishu) %s", e)
 

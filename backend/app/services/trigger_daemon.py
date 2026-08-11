@@ -619,6 +619,7 @@ async def _finalize_invocation_executions(
     reply: str | None,
     invocation_error: str | None,
     invocation_retryable: bool,
+    conversation_id: uuid.UUID | None,
 ) -> None:
     """Finalize durable executions and webhook queue state atomically.
 
@@ -632,6 +633,18 @@ async def _finalize_invocation_executions(
 
     now = datetime.now(timezone.utc)
     async with async_session() as db:
+        valid_conversation_id: uuid.UUID | None = None
+        if conversation_id is not None:
+            from app.models.chat_session import ChatSession
+
+            if await db.get(ChatSession, conversation_id) is not None:
+                valid_conversation_id = conversation_id
+            else:
+                logger.warning(
+                    "Skipping stale conversation link %s while finalizing executions %s",
+                    conversation_id,
+                    execution_ids,
+                )
         executions = (
             await db.execute(
                 select(TriggerExecution)
@@ -640,6 +653,8 @@ async def _finalize_invocation_executions(
             )
         ).scalars().all()
         for execution in executions:
+            if valid_conversation_id is not None:
+                execution.conversation_id = valid_conversation_id
             if invocation_error is None:
                 execution.status = "completed"
                 execution.finished_at = now
@@ -671,11 +686,102 @@ async def _finalize_invocation_executions(
         await db.commit()
 
 
+async def _link_invocation_executions(
+    execution_ids: list[uuid.UUID],
+    conversation_id: uuid.UUID,
+) -> None:
+    """Expose a canonical conversation as soon as execution starts."""
+    if not execution_ids:
+        return
+    async with async_session() as db:
+        from app.models.chat_session import ChatSession
+
+        session = await db.get(ChatSession, conversation_id)
+        if session is None:
+            raise RuntimeError("Origin conversation no longer exists")
+        executions = (
+            await db.execute(
+                select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
+            )
+        ).scalars().all()
+        for execution in executions:
+            if session.agent_id != execution.agent_id and session.peer_agent_id != execution.agent_id:
+                raise RuntimeError("Origin conversation belongs to a different agent")
+            execution.conversation_id = conversation_id
+        await db.commit()
+
+
 _ONMESSAGE_TURN_NAMESPACE = uuid.UUID("1cb1fc5c-c7c4-4f02-aa83-fab956557622")
 
 
 class RetryableOnMessageError(RuntimeError):
     """A durable on_message turn completed locally but delivery should retry."""
+
+
+async def _create_failed_trigger_conversation(
+    agent_id: uuid.UUID,
+    triggers: list[AgentTrigger],
+    error: str,
+) -> uuid.UUID | None:
+    """Persist a failed run in the same conversation store used by successful runs."""
+    from app.models.audit import ChatMessage
+    from app.models.chat_session import ChatSession
+    from app.models.participant import Participant
+
+    try:
+        async with async_session() as db:
+            agent = await db.get(Agent, agent_id)
+            if agent is None:
+                return None
+            participant = (
+                await db.execute(
+                    select(Participant).where(
+                        Participant.type == "agent",
+                        Participant.ref_id == agent_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            names = [trigger.name for trigger in triggers] or ["trigger"]
+            source_lines = [
+                f"Trigger: {trigger.name} ({trigger.type})\nReason: {trigger.reason or '-'}"
+                for trigger in triggers
+            ]
+            now = datetime.now(timezone.utc)
+            session = ChatSession(
+                agent_id=agent_id,
+                user_id=None,
+                participant_id=participant.id if participant else None,
+                source_channel="trigger",
+                title=f"Execution failed: {', '.join(names)}"[:200],
+                last_message_at=now,
+            )
+            db.add(session)
+            await db.flush()
+            db.add_all([
+                ChatMessage(
+                    agent_id=agent_id,
+                    conversation_id=str(session.id),
+                    role="user",
+                    content="===== Wake Context =====\n" + "\n---\n".join(source_lines),
+                    participant_id=participant.id if participant else None,
+                ),
+                ChatMessage(
+                    agent_id=agent_id,
+                    conversation_id=str(session.id),
+                    role="assistant",
+                    content=f"Execution failed before completion.\n\n{error}",
+                    participant_id=participant.id if participant else None,
+                ),
+            ])
+            await db.commit()
+            return session.id
+    except Exception as persist_error:
+        logger.warning(
+            "Failed to persist failed trigger conversation for agent {}: {}",
+            agent_id,
+            persist_error,
+        )
+        return None
 
 
 async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: AgentTrigger) -> None:
@@ -990,6 +1096,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     invocation_error: str | None = None
     invocation_retryable = False
     reply: str | None = None
+    conversation_id: uuid.UUID | None = None
     lease_heartbeat_task: asyncio.Task | None = None
 
     if execution_ids:
@@ -1011,6 +1118,9 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             and (triggers[0].config or {}).get("_matched_message_id")
             and (triggers[0].config or {}).get("_execution_id")
         ):
+            origin_conversation_id = uuid.UUID(str((triggers[0].config or {})["_origin_session_id"]))
+            await _link_invocation_executions(execution_ids, origin_conversation_id)
+            conversation_id = origin_conversation_id
             await _resume_origin_session_for_on_message(agent_id, triggers[0])
             return
 
@@ -1019,20 +1129,18 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
             agent = result.scalar_one_or_none()
             if not agent or agent.is_expired:
-                return
+                raise RuntimeError("Agent is unavailable or expired")
 
             # Load LLM model
             if not agent.primary_model_id:
-                logger.warning(f"Agent {agent.name} has no LLM model, skipping trigger invocation")
-                return
+                raise RuntimeError(f"Agent {agent.name} has no LLM model")
             result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
             model = result.scalar_one_or_none()
             if not model:
-                return
+                raise RuntimeError("Configured LLM model was not found")
             # Skip invocation if model is disabled by admin
             if not model.enabled:
-                logger.warning(f"Agent {agent.name}'s model {model.model} is disabled, skipping trigger invocation")
-                return
+                raise RuntimeError(f"Agent {agent.name}'s model {model.model} is disabled")
 
             # Build trigger context. Keep this model-facing prompt in English so
             # autonomous wakeups behave consistently across UI locales.
@@ -1163,7 +1271,18 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                 user_id=agent.creator_id,
                 participant_id=agent_participant.id if agent_participant else None,
             ))
+            if execution_ids:
+                execution_rows = (
+                    await db.execute(
+                        select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
+                    )
+                ).scalars().all()
+                for execution in execution_rows:
+                    execution.conversation_id = session_id
             await db.commit()
+            # Treat the link as durable only after the session, first message,
+            # and execution FK have committed atomically.
+            conversation_id = session_id
             # Cache participant ID for callbacks
             agent_participant_id = agent_participant.id if agent_participant else None
 
@@ -1440,6 +1559,12 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     except Exception as e:
         invocation_error = str(e)
         invocation_retryable = isinstance(e, RetryableOnMessageError)
+        if conversation_id is None and execution_ids and not invocation_retryable:
+            conversation_id = await _create_failed_trigger_conversation(
+                agent_id,
+                triggers,
+                invocation_error,
+            )
         logger.error(f"Failed to invoke agent {agent_id} for triggers: {e}")
         import traceback
         traceback.print_exc()
@@ -1460,6 +1585,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
                     reply,
                     invocation_error,
                     invocation_retryable,
+                    conversation_id,
                 )
             except Exception as _mark_err:
                 logger.warning(

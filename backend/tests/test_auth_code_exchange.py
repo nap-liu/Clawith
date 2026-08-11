@@ -18,6 +18,10 @@ from app.services.auth_code_exchange import validate_platform_login_channel
 from app.services.auth_provider import OAuth2AuthProvider
 from app.services.auth_registry import auth_provider_registry
 from app.services.oauth_identity import oauth_authority_scope, sign_oauth2_sso_state
+from app.services.sso_login_state import (
+    create_sso_browser_binding,
+    sso_browser_cookie_name,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -150,6 +154,7 @@ async def test_h5_and_regular_sso_share_code_only_token_exchange(monkeypatch):
         db.add_all([provider, scan_session])
         await db.commit()
         tenant_id = tenant.id
+        scan_session_id = scan_session.id
         sso_state = sign_oauth2_sso_state(scan_session.id, provider.id)
 
     captured_token_forms: list[dict[str, str]] = []
@@ -181,6 +186,11 @@ async def test_h5_and_regular_sso_share_code_only_token_exchange(monkeypatch):
 
     transport = httpx.ASGITransport(app=app)
     async with _RealAsyncClient(transport=transport, base_url="http://test") as client:
+        client.cookies.set(
+            sso_browser_cookie_name(scan_session_id),
+            create_sso_browser_binding(scan_session_id),
+            path="/",
+        )
         resp = await client.post(
             "/api/auth/code/exchange",
             json={
@@ -207,8 +217,8 @@ async def test_h5_and_regular_sso_share_code_only_token_exchange(monkeypatch):
     assert body["token_type"] == "bearer"
     assert body["user"]["display_name"] == "H5 User"
     assert body["needs_company_setup"] is False
-    assert sso_resp.status_code == 200
-    assert "SSO login successful" in sso_resp.text
+    assert sso_resp.status_code == 302
+    assert sso_resp.headers["location"] == f"/sso/entry?sid={scan_session_id}&complete=1"
     assert captured_token_forms == [
         {"grant_type": "authorization_code", "code": "CODE-H5"},
         {"grant_type": "authorization_code", "code": "CODE-SSO"},
@@ -332,13 +342,18 @@ async def test_qr_oauth_failure_rolls_back_authoritative_email_and_audit(monkeyp
     monkeypatch.setattr("app.services.auth_provider.httpx.AsyncClient", _PatchedAsyncClient)
     transport = httpx.ASGITransport(app=app)
     async with real_async_client(transport=transport, base_url="http://test") as client:
+        client.cookies.set(
+            sso_browser_cookie_name(scan_session_id),
+            create_sso_browser_binding(scan_session_id),
+            path="/",
+        )
         response = await client.get(
             "/api/auth/oauth2/callback",
             params={"code": "CODE-QR", "state": state},
         )
 
-    assert response.status_code == 200
-    assert "Auth failed" in response.text
+    assert response.status_code == 302
+    assert response.headers["location"].startswith("/sso/entry?error=authentication_failed")
     async with async_session() as db:
         assert (await db.get(Identity, identity_id)).email == old_email
         assert (await db.get(OrgMember, member_id)).email == old_email
