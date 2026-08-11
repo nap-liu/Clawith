@@ -17,6 +17,10 @@ def _staging_dir(agent_root, session_id=SESSION_ID):
     return agent_root / ".tool_results" / session_id / ".media"
 
 
+def _fail_temp_directory(**_kwargs):
+    raise OSError("temp full")
+
+
 @pytest.mark.asyncio
 async def test_managed_url_streams_into_agent_media_store_and_finishes_atomically(tmp_path, monkeypatch):
     original_client = httpx.AsyncClient
@@ -132,6 +136,57 @@ async def test_managed_url_revalidates_cached_file_size(tmp_path, monkeypatch):
         )
 
     assert exc_info.value.code == "MEDIA_URL_TOO_LARGE"
+    assert fetch_count == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_url_maps_cached_delivery_temp_failure(tmp_path, monkeypatch):
+    original_client = httpx.AsyncClient
+    fetch_count = 0
+
+    def handler(request):
+        nonlocal fetch_count
+        fetch_count += 1
+        return httpx.Response(200, content=MP4_BYTES, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    imported = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4",
+        agent_workspace=tmp_path,
+        session_id=SESSION_ID,
+        intent_id="cached-temp-failure",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+    imported.close()
+    monkeypatch.setattr(
+        media_url_source.tempfile,
+        "mkdtemp",
+        _fail_temp_directory,
+    )
+
+    with pytest.raises(media_url_source.MediaUrlError) as exc_info:
+        await media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=tmp_path,
+            session_id=SESSION_ID,
+            intent_id="cached-temp-failure",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+
+    assert exc_info.value.code == "MEDIA_STORAGE_FAILED"
     assert fetch_count == 1
 
 

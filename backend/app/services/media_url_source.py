@@ -374,8 +374,9 @@ async def _managed_import_result(
     max_bytes: int,
 ) -> ManagedMediaImport:
     _verify_visible_final(paths, final_fd)
-    delivery_dir = Path(tempfile.mkdtemp(prefix="clawith-media-delivery-"))
+    delivery_dir: Path | None = None
     try:
+        delivery_dir = Path(tempfile.mkdtemp(prefix="clawith-media-delivery-"))
         delivery_path = await asyncio.to_thread(
             _copy_delivery_file,
             final_fd,
@@ -393,7 +394,8 @@ async def _managed_import_result(
         finally:
             os.close(delivery_fd)
     except BaseException as exc:
-        shutil.rmtree(delivery_dir, ignore_errors=True)
+        if delivery_dir is not None:
+            shutil.rmtree(delivery_dir, ignore_errors=True)
         if isinstance(exc, OSError):
             raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
         raise
