@@ -30,6 +30,19 @@ assert.equal(await detectH5ContainerRuntime({
 }), 'dingtalk-miniapp-webview');
 
 assert.equal(await detectH5ContainerRuntime({
+    targetWindow: {
+        dd: {
+            navigateTo() {},
+        },
+    },
+    userAgent: [
+        'Mozilla/5.0 (Linux; Android 13)',
+        'Nebula AliApp(DingTalk/8.3.35)',
+        'com.alibaba.android.rimet MiniProgram NebulaX/1.0.0',
+    ].join(' '),
+}), 'dingtalk-miniapp-webview');
+
+assert.equal(await detectH5ContainerRuntime({
     targetWindow: {},
     userAgent: 'Mozilla/5.0 Chrome/150.0 Safari/537.36',
 }), 'standard');

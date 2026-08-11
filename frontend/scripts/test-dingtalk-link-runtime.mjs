@@ -28,6 +28,21 @@ assert.equal(
     true,
 );
 assert.equal(isDingTalkMiniProgramWebViewCandidate('Mozilla/5.0 AliApp(AP/10.7.66.8000)'), false);
+const dingtalkAndroidMiniProgramUserAgent = [
+    'Mozilla/5.0 (Linux; Android 13)',
+    'Nebula AliApp(DingTalk/8.3.35)',
+    'com.alibaba.android.rimet MiniProgram NebulaX/1.0.0',
+].join(' ');
+assert.equal(
+    isDingTalkMiniProgramWebViewCandidate(dingtalkAndroidMiniProgramUserAgent),
+    true,
+);
+assert.equal(
+    isDingTalkMiniProgramWebViewCandidate(
+        'Mozilla/5.0 AliApp(DingTalk/8.3.35) com.alibaba.android.rimet',
+    ),
+    false,
+);
 
 assert.equal(await isDingTalkMiniProgramWebViewRuntime({
     targetWindow: {},
@@ -46,6 +61,10 @@ const loadedWindow = {
 assert.equal(await isDingTalkMiniProgramWebViewRuntime({
     targetWindow: loadedWindow,
     userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
+}), true);
+assert.equal(await isDingTalkMiniProgramWebViewRuntime({
+    targetWindow: loadedWindow,
+    userAgent: dingtalkAndroidMiniProgramUserAgent,
 }), true);
 
 const navigateCalls = [];
@@ -82,6 +101,21 @@ await navigateDingTalkMiniProgramPage('/pages/order/detail?id=123', {
     navigateTimeoutMs: 50,
 });
 assert.deepEqual(directPageCalls, ['/pages/order/detail?id=123']);
+const androidTransitCalls = [];
+await navigateDingTalkMiniProgramPage('/pages/transit/index?mode=1010000451', {
+    targetWindow: {
+        dd: {
+            navigateTo(options) {
+                androidTransitCalls.push(options.url);
+                options.success?.();
+            },
+        },
+    },
+    userAgent: dingtalkAndroidMiniProgramUserAgent,
+    duplicateWindowMs: 0,
+    navigateTimeoutMs: 50,
+});
+assert.deepEqual(androidTransitCalls, ['/pages/transit/index?mode=1010000451']);
 await assert.rejects(
     navigateDingTalkMiniProgramPage('//evil.example/page', {
         targetWindow: loadedWindow,

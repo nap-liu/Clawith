@@ -61,7 +61,8 @@ function hasWebViewNavigationSdk(targetWindow?: DingTalkHostWindow): boolean {
  * whether the business navigation policy is active.
  */
 export function isDingTalkMiniProgramWebViewCandidate(userAgent: string): boolean {
-    return /dd-web/i.test(userAgent);
+    return /dd-web/i.test(userAgent)
+        || (/AliApp\(DingTalk/i.test(userAgent) && /MiniProgram/i.test(userAgent));
 }
 
 function normalizeError(error: unknown, fallbackMessage: string): Error {
