@@ -525,6 +525,13 @@ async def test_link_execution_validates_origin_and_agent_ownership():
     async with async_session() as db:
         trigger = await db.get(AgentTrigger, trigger_id)
         agent = await db.get(Agent, agent_id)
+        owner = await db.get(User, agent.creator_id)
+        tenant = Tenant(name=f"origin-{uuid.uuid4().hex[:8]}", slug=f"origin-{uuid.uuid4().hex[:8]}")
+        db.add(tenant)
+        await db.flush()
+        owner.tenant_id = tenant.id
+        agent.tenant_id = tenant.id
+        await db.flush()
         execution = TriggerExecution(
             trigger_id=trigger.id,
             agent_id=agent_id,

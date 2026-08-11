@@ -189,6 +189,7 @@ async def test_custom_manager_can_resolve_trigger_session_only(monkeypatch):
         responses=[
             DummyResult([trigger_session]),
             DummyResult(scalar_value=2),
+            DummyResult(scalar_value="Owner"),
         ]
     )
     detail = await chat_sessions_api.get_session(
