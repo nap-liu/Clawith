@@ -397,6 +397,78 @@ async def test_cli_tool_is_standalone_function_not_folded(llm_tools_session):
 
 
 @pytest.mark.asyncio
+async def test_toolscall_prompt_is_visible_only_for_explicit_agent_opt_in(
+    llm_tools_session,
+):
+    from app.models.tool import AgentTool, Tool
+    from app.services.agent_tools import get_agent_tools_for_llm
+
+    opted_in_agent = _uuid.uuid4()
+    default_off_agent = _uuid.uuid4()
+
+    async with llm_tools_session() as s:
+        aio_tool = Tool(
+            name="execute_code_aio",
+            display_name="Sandbox",
+            description="Run code in sandbox.",
+            type="builtin",
+            category="code",
+            icon="💻",
+            source="builtin",
+            enabled=True,
+            is_default=True,
+            parameters_schema={"type": "object", "properties": {}},
+            # Even a broader true value must not advertise the capability.
+            config={"toolscall_enabled": True},
+            config_schema={
+                "fields": [
+                    {
+                        "key": "toolscall_enabled",
+                        "type": "checkbox",
+                        "default": False,
+                        "agent_only": True,
+                    }
+                ]
+            },
+        )
+        s.add(aio_tool)
+        await s.flush()
+        s.add_all(
+            [
+                AgentTool(
+                    agent_id=opted_in_agent,
+                    tool_id=aio_tool.id,
+                    enabled=True,
+                    config={"toolscall_enabled": True},
+                ),
+                AgentTool(
+                    agent_id=default_off_agent,
+                    tool_id=aio_tool.id,
+                    enabled=True,
+                    config={},
+                ),
+            ]
+        )
+        await s.commit()
+
+    enabled_tools = await get_agent_tools_for_llm(opted_in_agent)
+    disabled_tools = await get_agent_tools_for_llm(default_off_agent)
+    enabled_description = next(
+        item["function"]["description"]
+        for item in enabled_tools
+        if item["function"]["name"] == "execute_code_aio"
+    )
+    disabled_description = next(
+        item["function"]["description"]
+        for item in disabled_tools
+        if item["function"]["name"] == "execute_code_aio"
+    )
+
+    assert "toolscall <tool>" in enabled_description
+    assert "toolscall <tool>" not in disabled_description
+
+
+@pytest.mark.asyncio
 async def test_non_agentbay_context_does_not_read_agentbay_os_config(
     llm_tools_session, monkeypatch
 ):

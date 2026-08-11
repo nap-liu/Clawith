@@ -242,7 +242,10 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
 
     from app.models.tool import Tool, AgentTool
     from app.models.agent import Agent as AgentModel
-    from app.services.tool_config import get_tenant_tool_config
+    from app.services.tool_config import (
+        get_tenant_tool_config,
+        merge_tool_config_layers,
+    )
 
     async with async_session() as db:
         agent_tenant_id = None
@@ -264,8 +267,14 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
                 tenant_config = {}
                 if tool_source == "builtin":
                     tenant_config = await get_tenant_tool_config(db, agent_tenant_id, db_tool_name, config_schema)
-                # Merge: agent overrides global
-                merged = {**base_config, **tenant_config, **(agent_config or {})}
+                # Merge: agent overrides company/global. Fields declared
+                # agent_only are never inherited from broader layers.
+                merged = merge_tool_config_layers(
+                    base_config,
+                    tenant_config,
+                    agent_config,
+                    config_schema,
+                )
                 if merged:
                     # Decrypt with schema awareness
                     merged = _decrypt_sensitive_fields(merged, config_schema)
@@ -281,7 +290,12 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
             if tool.source == "builtin":
                 tenant_config = await get_tenant_tool_config(db, agent_tenant_id, tool.name, tool.config_schema)
             base_config = tool.config or {}
-            merged = {**base_config, **tenant_config}
+            merged = merge_tool_config_layers(
+                base_config,
+                tenant_config,
+                None,
+                tool.config_schema,
+            )
         else:
             merged = {}
         if tool and merged:
@@ -2767,12 +2781,32 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 # OKR-system-only tools, even if the DB default says enabled.
                 if (t.config or {}).get("okr_agent_only") and not is_system_agent:
                     continue
+                description = t.description
+                if t.name == "execute_code_aio":
+                    from app.services.toolscall.capability import (
+                        TOOLSCALL_USAGE_DESCRIPTION,
+                    )
+
+                    # This is an Agent-level rollout switch. The platform seed
+                    # defaults it off; only an explicit per-Agent override may
+                    # advertise the capability in that Agent's tool schema.
+                    toolscall_enabled = (
+                        (at.config or {}).get("toolscall_enabled") is True
+                        if at
+                        else False
+                    )
+                    if toolscall_enabled:
+                        description = (
+                            str(description or "").rstrip()
+                            + TOOLSCALL_USAGE_DESCRIPTION
+                        )
+
                 # Build OpenAI function-calling format
                 tool_def = {
                     "type": "function",
                     "function": {
                         "name": t.name,
-                        "description": t.description,
+                        "description": description,
                         "parameters": t.parameters_schema or {"type": "object", "properties": {}},
                     },
                 }
@@ -12408,10 +12442,18 @@ async def _execute_code(
             # tool) — avoid a second DB round-trip.
             injection = cli_injection
         elif tool_name == "execute_code_aio":
-            # All languages (bash/node/python) get native CLI wrappers and the
-            # current turn's standard ToolCall bridge in the same PATH.
+            # All languages (bash/node/python) get native CLI wrappers. The
+            # current turn's ToolCall bridge is an explicit per-Agent opt-in.
             injection = await build_cli_injection(agent_id, user_id)
-            if agent_id and user_id and tools_for_llm is not None:
+            toolscall_enabled = (
+                (tool_config or {}).get("toolscall_enabled") is True
+            )
+            if (
+                toolscall_enabled
+                and agent_id
+                and user_id
+                and tools_for_llm is not None
+            ):
                 from app.services.toolscall.capability import build_toolscall_wrapper
 
                 try:

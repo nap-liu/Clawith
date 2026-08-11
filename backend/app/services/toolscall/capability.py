@@ -33,6 +33,18 @@ TOOLSCALL_CONTEXT_ENV = "TOOLSCALL_CONTEXT"
 TOOLSCALL_TOKEN_VERSION = 1
 _LOCAL_SCOPE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+TOOLSCALL_USAGE_DESCRIPTION = (
+    "\n\nBash tool composition with toolscall (enabled for this Agent):\n"
+    "- `toolscall <tool> --key value` invokes any standard builtin or MCP "
+    "tool already present in the current turn. Pipe one JSON object to "
+    "stdin for structured arguments; do not combine stdin JSON with flags.\n"
+    "- `toolscall <cli-tool> <argv...>` invokes an available native CLI "
+    "tool with ordinary argv/stdin/stdout/stderr and exit-code semantics.\n"
+    "- `toolscall` has no list or describe operation because the current "
+    "tool schemas are already visible. Its stdout is the original tool output, "
+    "so it can be piped directly to jq, rg, files, or another command."
+)
+
 
 ToolscallUnavailable = ToolscallRuntimeUnavailable
 

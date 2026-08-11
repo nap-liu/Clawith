@@ -27,6 +27,33 @@ def tenant_tool_config_key(tool_name: str) -> str:
     return f"{TENANT_TOOL_CONFIG_PREFIX}{tool_name}"
 
 
+def merge_tool_config_layers(
+    global_config: dict | None,
+    tenant_config: dict | None,
+    agent_config: dict | None,
+    config_schema: dict | None = None,
+) -> dict:
+    """Merge config while keeping ``agent_only`` fields Agent-scoped.
+
+    A company/global value for an Agent-only field must never become a runtime
+    default. This lets capability rollouts remain opt-in even if a stale or
+    direct API write placed the same key in a broader config layer.
+    """
+    agent_only_keys = {
+        str(field.get("key"))
+        for field in (config_schema or {}).get("fields", [])
+        if field.get("agent_only") and field.get("key")
+    }
+    merged = {
+        key: value
+        for layer in (global_config or {}, tenant_config or {})
+        for key, value in layer.items()
+        if key not in agent_only_keys
+    }
+    merged.update(agent_config or {})
+    return merged
+
+
 def get_sensitive_keys(config_schema: dict | None = None) -> set[str]:
     keys = set(SENSITIVE_FIELD_KEYS)
     if config_schema:

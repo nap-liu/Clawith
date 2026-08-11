@@ -213,7 +213,7 @@ async def test_execute_code_aio_adds_toolscall_from_current_turn_snapshot(tmp_pa
         patch("app.config.get_sandbox_config", return_value=_FakeSandboxConfig()),
         patch(
             "app.services.agent_tools._get_tool_config",
-            new=AsyncMock(return_value=None),
+            new=AsyncMock(return_value={"toolscall_enabled": True}),
         ),
     ):
         await _execute_code(
@@ -235,6 +235,55 @@ async def test_execute_code_aio_adds_toolscall_from_current_turn_snapshot(tmp_pa
     assert build_toolscall.await_args.kwargs["aio_base_url"] == "http://aio-sandbox:8080"
     assert build_toolscall.await_args.kwargs["ttl_seconds"] == 90
     assert build_toolscall.await_args.kwargs["native_tool_names"] == {"native-tool"}
+
+
+@pytest.mark.asyncio
+async def test_execute_code_aio_does_not_add_toolscall_when_switch_is_off(tmp_path):
+    """The platform capability is opt-in even when turn tools are available."""
+    from app.services.agent_tools import _execute_code
+
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    mock_backend = _make_mock_backend()
+    cli_injection = {"wrappers": [{"name": "native-tool", "binary_path": "/x"}]}
+    build_toolscall = AsyncMock()
+
+    with (
+        patch(
+            "app.services.agent_tools.build_cli_injection",
+            new=AsyncMock(return_value=cli_injection),
+        ),
+        patch(
+            "app.services.toolscall.capability.build_toolscall_wrapper",
+            new=build_toolscall,
+        ),
+        patch(
+            "app.services.sandbox.registry.get_sandbox_backend",
+            return_value=mock_backend,
+        ),
+        patch("app.config.get_sandbox_config", return_value=_FakeSandboxConfig()),
+        patch(
+            "app.services.agent_tools._get_tool_config",
+            new=AsyncMock(return_value={"toolscall_enabled": False}),
+        ),
+    ):
+        await _execute_code(
+            agent_id,
+            tmp_path,
+            {"language": "bash", "code": "echo ordinary"},
+            tool_name="execute_code_aio",
+            user_id=user_id,
+            session_id="session-1",
+            tools_for_llm=[
+                {
+                    "type": "function",
+                    "function": {"name": "sample", "parameters": {}},
+                }
+            ],
+        )
+
+    build_toolscall.assert_not_awaited()
+    assert mock_backend.execute.call_args.kwargs["inject"] == cli_injection
 
 
 @pytest.mark.asyncio
@@ -262,7 +311,7 @@ async def test_toolscall_setup_failure_does_not_break_unrelated_aio_code(tmp_pat
         patch("app.config.get_sandbox_config", return_value=_FakeSandboxConfig()),
         patch(
             "app.services.agent_tools._get_tool_config",
-            new=AsyncMock(return_value=None),
+            new=AsyncMock(return_value={"toolscall_enabled": True}),
         ),
     ):
         result = await _execute_code(

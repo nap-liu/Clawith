@@ -4,6 +4,7 @@ import uuid
 from types import SimpleNamespace
 
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_SEED
+from app.services.tool_config import merge_tool_config_layers
 from app.services.tool_seeder import (
     BUILTIN_TOOLS,
     FORCE_DISABLED_BUILTIN_CATEGORIES,
@@ -23,6 +24,45 @@ def test_requested_builtin_default_flags_are_canonical():
     assert _seed("execute_code_aio")["is_default"] is True
     assert _seed("read_image")["is_default"] is True
     assert REQUEST_CONFIRMATION_TOOL_SEED["is_default"] is True
+
+
+def test_toolscall_is_agent_scoped_and_defaults_off():
+    seed = _seed("execute_code_aio")
+    assert seed["config"]["toolscall_enabled"] is False
+    field = next(
+        item
+        for item in seed["config_schema"]["fields"]
+        if item["key"] == "toolscall_enabled"
+    )
+    assert field["type"] == "checkbox"
+    assert field["default"] is False
+    assert field["agent_only"] is True
+
+
+def test_agent_only_toolscall_flag_cannot_be_enabled_by_broader_config():
+    schema = {
+        "fields": [
+            {"key": "toolscall_enabled", "type": "checkbox", "agent_only": True},
+            {"key": "max_timeout", "type": "number"},
+        ]
+    }
+
+    inherited = merge_tool_config_layers(
+        {"toolscall_enabled": True, "max_timeout": 300},
+        {"toolscall_enabled": True, "max_timeout": 120},
+        {},
+        schema,
+    )
+    assert "toolscall_enabled" not in inherited
+    assert inherited["max_timeout"] == 120
+
+    opted_in = merge_tool_config_layers(
+        {"toolscall_enabled": False},
+        {},
+        {"toolscall_enabled": True},
+        schema,
+    )
+    assert opted_in["toolscall_enabled"] is True
 
 
 def test_requested_builtin_flags_are_synced_to_existing_databases():

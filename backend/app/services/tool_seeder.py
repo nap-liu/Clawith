@@ -1685,16 +1685,6 @@ BUILTIN_TOOLS = [
             "ssh-keygen / ssh-agent / rsync, vim, nano, jq, rg, htop, "
             "imagemagick, yt-dlp.\n"
             "\n"
-            "Bash tool composition:\n"
-            "- `toolscall <tool> --key value` invokes any standard builtin or MCP "
-            "tool already present in the current turn. Pipe one JSON object to "
-            "stdin for structured arguments; do not combine stdin JSON with flags.\n"
-            "- `toolscall <cli-tool> <argv...>` invokes an available native CLI "
-            "tool with ordinary argv/stdin/stdout/stderr and exit-code semantics.\n"
-            "- `toolscall` has no list or describe operation because the current "
-            "tool schemas are already visible. Its stdout is the original tool output, "
-            "so it can be piped directly to jq, rg, files, or another command.\n"
-            "\n"
             "Pre-installed Python (3.10) packages: requests, numpy, pandas.\n"
             "\n"
             "Network: outbound internet is available.\n"
@@ -1785,6 +1775,7 @@ BUILTIN_TOOLS = [
             "required": ["execution_mode"],
         },
         "config": {
+            "toolscall_enabled": False,
             "sandbox_type": "aio_sandbox",
             "api_url": "http://aio-sandbox:8080",
             "api_key": "",
@@ -1795,6 +1786,17 @@ BUILTIN_TOOLS = [
         },
         "config_schema": {
             "fields": [
+                {
+                    "key": "toolscall_enabled",
+                    "label": "Enable toolscall",
+                    "type": "checkbox",
+                    "default": False,
+                    "agent_only": True,
+                    "help_text": (
+                        "Allow this Agent to call its current-turn builtin, MCP, "
+                        "and native CLI tools from AIO shell pipelines."
+                    ),
+                },
                 {
                     "key": "api_url",
                     "label": "Sandbox URL",
