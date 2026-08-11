@@ -30,8 +30,8 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
         "file_path": {
             "type": "string",
             "description": (
-                "Agent-owned path relative to the Agent root, for example "
-                "workspace/media/briefing.mp3. Use either file_path or url, never both."
+                "Any existing file path relative to the current Agent root, for example "
+                "exports/briefing.mp3. Use either file_path or url, never both."
             ),
         },
         "url": {
@@ -55,7 +55,7 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
         "cover_image_path": {
             "type": "string",
             "description": (
-                "Video only. Optional Agent-owned workspace-relative image path. "
+                "Video only. Optional image path relative to the current Agent root. "
                 "An Agent cover wins; required channels generate a fallback when omitted."
             ),
         },

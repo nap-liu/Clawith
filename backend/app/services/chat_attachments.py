@@ -33,15 +33,18 @@ MEDIA_PROBE_CHUNK_BYTES = 2 * 1024 * 1024
 
 
 def _clean_workspace_path(raw_path: Any) -> str | None:
-    path = str(raw_path or "").strip().replace("\\", "/").strip("/")
+    path = str(raw_path or "").strip().replace("\\", "/")
     if not path or len(path) > MAX_ATTACHMENT_PATH_LENGTH:
+        return None
+    if path.startswith("/") or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", path):
         return None
     candidate = PurePosixPath(path)
     if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
         return None
-    if not path.startswith(("workspace/", "skills/", "media/")):
+    canonical = candidate.as_posix()
+    if canonical in {"", "."}:
         return None
-    return candidate.as_posix()
+    return canonical
 
 
 def _safe_legacy_name(raw_name: Any) -> str | None:

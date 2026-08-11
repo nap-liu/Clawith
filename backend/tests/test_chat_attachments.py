@@ -159,11 +159,28 @@ def test_platform_managed_media_path_is_a_canonical_attachment():
     }
 
 
-def test_tool_result_staging_file_cannot_become_a_chat_attachment():
+@pytest.mark.parametrize(
+    "path",
+    [
+        "exports/demo.mp4",
+        "briefing.mp3",
+        ".tool_results/session-1/result.mp4",
+    ],
+)
+def test_any_canonical_agent_relative_path_can_become_an_attachment(path):
+    attachment = chat_attachments.attachment_from_workspace_path(path)
+
+    assert attachment["path"] == path
+    assert chat_attachments.normalize_attachment_metadata([attachment]) == [attachment]
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/etc/passwd", "../outside.mp4", "https://example.com/demo.mp4", "C:/demo.mp4"],
+)
+def test_non_agent_relative_attachment_path_is_rejected(path):
     with pytest.raises(ValueError, match="canonical agent file path"):
-        chat_attachments.attachment_from_workspace_path(
-            ".tool_results/session-1/.media/download.partial"
-        )
+        chat_attachments.attachment_from_workspace_path(path)
 
 
 def test_serializer_does_not_create_a_non_tool_media_render_protocol():

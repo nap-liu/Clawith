@@ -225,6 +225,72 @@ async def test_media_kind_is_checked_from_file_bytes(tmp_path, monkeypatch):
     assert payload["actual_kind"] == "audio"
 
 
+@pytest.mark.asyncio
+async def test_send_media_accepts_any_file_under_current_agent_root(
+    tmp_path,
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    workspace = tmp_path / str(agent_id)
+    video = workspace / "exports" / "review" / "demo.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(
+        b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+    )
+    captured = {}
+
+    async def fake_config(_agent_id, _tool_name):
+        return {}
+
+    async def fake_send_to_session(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"type": "platform_media_delivery", "status": "sent"})
+
+    monkeypatch.setattr(agent_tools, "_get_tool_config", fake_config)
+    monkeypatch.setattr(agent_tools, "_send_media_to_session", fake_send_to_session)
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        agent_id,
+        workspace,
+        {
+            "file_path": "exports/review/demo.mp4",
+            "session_id": str(uuid.uuid4()),
+        },
+        media_kind="video",
+        tool_call_id="call-agent-root-file",
+    ))
+
+    assert payload["status"] == "sent"
+    assert captured["file_path"] == video
+    assert captured["workspace_path"] == "exports/review/demo.mp4"
+
+
+@pytest.mark.asyncio
+async def test_send_media_rejects_symlink_that_escapes_current_agent_root(tmp_path):
+    agent_id = uuid.uuid4()
+    workspace = tmp_path / str(agent_id)
+    outside = tmp_path / "outside.mp4"
+    workspace.mkdir(parents=True)
+    outside.write_bytes(
+        b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+    )
+    (workspace / "linked.mp4").symlink_to(outside)
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        agent_id,
+        workspace,
+        {
+            "file_path": "linked.mp4",
+            "session_id": str(uuid.uuid4()),
+        },
+        media_kind="video",
+        tool_call_id="call-symlink-escape",
+    ))
+
+    assert payload["status"] == "failed"
+    assert payload["code"] == "INVALID_FILE_PATH"
+
+
 def test_media_tools_are_fixed_core_tools():
     definitions = [item["function"]["name"] for item in agent_tools.AGENT_TOOLS]
     assert definitions.count("send_media") == 1

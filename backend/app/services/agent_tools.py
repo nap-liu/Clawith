@@ -5009,11 +5009,16 @@ async def _send_channel_media(
                 "type": "media_delivery_result", "version": 1, "status": "failed",
                 "code": "INVALID_FILE_PATH", "media_kind": media_kind,
             }, ensure_ascii=False)
-        file_path = (ws / rel_path).resolve()
+        agent_root = ws.resolve()
+        file_path = (agent_root / rel_path).resolve()
         try:
-            file_path.relative_to(ws.resolve())
+            file_path.relative_to(agent_root)
         except ValueError:
-            file_path = (WORKSPACE_ROOT / str(agent_id) / rel_path).resolve()
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1,
+                "status": "failed", "code": "INVALID_FILE_PATH",
+                "media_kind": media_kind,
+            }, ensure_ascii=False)
         if not file_path.exists() or not file_path.is_file():
             return json.dumps({
                 "type": "media_delivery_result", "version": 1, "status": "failed",

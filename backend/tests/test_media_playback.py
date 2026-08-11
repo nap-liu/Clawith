@@ -65,7 +65,11 @@ def test_storage_entry_version_prefers_object_version():
 
 @pytest.mark.parametrize(
     "path",
-    ["workspace/uploads/demo.mp4", "media/imported/managed-demo.mp4"],
+    [
+        "workspace/uploads/demo.mp4",
+        "media/imported/managed-demo.mp4",
+        "exports/review/demo.mp4",
+    ],
 )
 def test_message_media_reference_requires_an_exact_structured_path(path):
     structured = SimpleNamespace(
