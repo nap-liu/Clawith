@@ -486,10 +486,14 @@ async def test_managed_url_uses_origin_session_result_scope_and_agent_media_stor
 
     async def fake_import(_url, **kwargs):
         captured["import"] = kwargs
+        def close_import():
+            captured["import_closed"] = True
+
         return SimpleNamespace(
             file_path=managed_file,
             workspace_path="media/imported/managed-demo.mp4",
             mime_type="video/mp4",
+            close=close_import,
         )
 
     class Storage:
@@ -532,6 +536,7 @@ async def test_managed_url_uses_origin_session_result_scope_and_agent_media_stor
         "video/mp4",
     )
     assert captured["send"]["workspace_path"] == "media/imported/managed-demo.mp4"
+    assert captured["import_closed"] is True
 
 
 async def _async_value(value):

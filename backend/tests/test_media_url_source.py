@@ -250,6 +250,98 @@ async def test_managed_import_keeps_open_directory_anchor_during_symlink_swap(
 
 
 @pytest.mark.asyncio
+async def test_managed_import_rejects_visible_imported_directory_swap(
+    tmp_path,
+    monkeypatch,
+):
+    agent_root = tmp_path / "agent"
+    outside = tmp_path / "outside"
+    agent_root.mkdir()
+    outside.mkdir()
+    original_client = httpx.AsyncClient
+    original_target = media_url_source._managed_request_target
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=MP4_BYTES, request=request)
+    )
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    async def swap_visible_imported_dir(url):
+        target = await original_target(url)
+        imported = agent_root / "media" / "imported"
+        imported.rename(imported.with_name("imported-anchored"))
+        imported.symlink_to(outside, target_is_directory=True)
+        return target
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(
+        media_url_source,
+        "_managed_request_target",
+        swap_visible_imported_dir,
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    with pytest.raises(media_url_source.MediaUrlError) as exc_info:
+        await media_url_source.import_managed_media_url(
+            "https://media.example/demo.mp4",
+            agent_workspace=agent_root,
+            session_id=SESSION_ID,
+            intent_id="swap-imported",
+            max_bytes=1024,
+            expected_media_kind="video",
+        )
+
+    assert exc_info.value.code == "MEDIA_STORAGE_FAILED"
+    anchored_files = list(
+        (agent_root / "media" / "imported-anchored").iterdir()
+    )
+    assert len(anchored_files) == 1
+    assert anchored_files[0].read_bytes() == MP4_BYTES
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_managed_import_delivery_copy_stays_bound_to_validated_bytes(
+    tmp_path,
+    monkeypatch,
+):
+    original_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, content=MP4_BYTES, request=request)
+    )
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    imported = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4",
+        agent_workspace=tmp_path,
+        session_id=SESSION_ID,
+        intent_id="stable-delivery-copy",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+    delivery_path = imported.file_path
+    (tmp_path / imported.workspace_path).write_bytes(MP4_BYTES + b"ATTACKER")
+
+    assert delivery_path.read_bytes() == MP4_BYTES
+    imported.close()
+    assert delivery_path.exists() is False
+
+
+@pytest.mark.asyncio
 async def test_managed_request_target_reports_empty_dns_as_dns_failure(monkeypatch):
     monkeypatch.setattr(
         media_url_source,
@@ -349,6 +441,51 @@ async def test_managed_url_falls_back_across_validated_public_ips(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_managed_url_cleans_partial_before_fallback_after_read_error(
+    tmp_path,
+    monkeypatch,
+):
+    original_client = httpx.AsyncClient
+    attempted_ips = []
+
+    class InterruptedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield MP4_BYTES[:12]
+            raise httpx.ReadError("stream interrupted")
+
+    def handler(request):
+        attempted_ips.append(request.url.host)
+        if request.url.host == "93.184.216.34":
+            return httpx.Response(200, stream=InterruptedStream(), request=request)
+        return httpx.Response(200, content=MP4_BYTES, request=request)
+
+    transport = httpx.MockTransport(handler)
+
+    def client_factory(**kwargs):
+        return original_client(transport=transport, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(
+        media_url_source,
+        "_resolve_host",
+        lambda *_args: _async_addresses(["93.184.216.34", "93.184.216.35"]),
+    )
+    monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
+
+    imported = await media_url_source.import_managed_media_url(
+        "https://media.example/demo.mp4",
+        agent_workspace=tmp_path,
+        session_id=SESSION_ID,
+        intent_id="read-error-fallback",
+        max_bytes=1024,
+        expected_media_kind="video",
+    )
+
+    assert imported.file_path.read_bytes() == MP4_BYTES
+    assert attempted_ips == ["93.184.216.34", "93.184.216.35"]
+    assert list(_staging_dir(tmp_path).glob("*.partial")) == []
+
+
+@pytest.mark.asyncio
 async def test_managed_import_never_logs_signed_url_or_local_path(tmp_path, monkeypatch):
     original_client = httpx.AsyncClient
     secret = "DO-NOT-LOG-987"
@@ -443,8 +580,9 @@ async def test_concurrent_managed_imports_converge_on_one_atomic_final(tmp_path,
         for _ in range(2)
     ])
 
-    assert first.file_path == second.file_path
+    assert first.workspace_path == second.workspace_path
     assert first.file_path.read_bytes() == MP4_BYTES
+    assert (tmp_path / first.workspace_path).read_bytes() == MP4_BYTES
     assert list(_staging_dir(tmp_path).glob("*.partial")) == []
 
 
@@ -491,9 +629,11 @@ async def test_same_provider_intent_in_different_sessions_does_not_reuse_media(
         expected_media_kind="video",
     )
 
-    assert first.file_path != second.file_path
+    assert first.workspace_path != second.workspace_path
     assert first.file_path.read_bytes().endswith(b"ONE")
     assert second.file_path.read_bytes().endswith(b"TWO")
+    assert (tmp_path / first.workspace_path).read_bytes().endswith(b"ONE")
+    assert (tmp_path / second.workspace_path).read_bytes().endswith(b"TWO")
     assert fetch_count == 2
 
 

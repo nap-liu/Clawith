@@ -7,9 +7,11 @@ import hashlib
 import ipaddress
 import os
 import re
+import shutil
 import socket
+import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from urllib.parse import SplitResult, unquote, urljoin, urlsplit, urlunsplit
 
@@ -39,12 +41,22 @@ class MediaUrlError(Exception):
         self.actual_kind = actual_kind
 
 
-@dataclass(frozen=True)
+@dataclass
 class ManagedMediaImport:
     file_path: Path
     workspace_path: str
     source_url: str
     mime_type: str
+    _delivery_dir: Path | None = field(default=None, repr=False)
+
+    def close(self) -> None:
+        delivery_dir = self._delivery_dir
+        self._delivery_dir = None
+        if delivery_dir is not None:
+            shutil.rmtree(delivery_dir, ignore_errors=True)
+
+    def __del__(self) -> None:
+        self.close()
 
 
 @dataclass(frozen=True)
@@ -308,6 +320,68 @@ def _validated_media_mime_fd(fd: int, name: str, expected_media_kind: str) -> st
     return mime_type
 
 
+def _unlink_partial(paths: _ManagedMediaPaths) -> None:
+    try:
+        os.unlink(paths.partial_name, dir_fd=paths.staging_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _verify_visible_final(paths: _ManagedMediaPaths, final_fd: int) -> None:
+    try:
+        anchored_dir = os.fstat(paths.imported_fd)
+        visible_dir = os.stat(paths.final_path.parent, follow_symlinks=False)
+        anchored_file = os.fstat(final_fd)
+        visible_file = os.stat(paths.final_path, follow_symlinks=False)
+    except OSError as exc:
+        raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
+    if (
+        (anchored_dir.st_dev, anchored_dir.st_ino)
+        != (visible_dir.st_dev, visible_dir.st_ino)
+        or (anchored_file.st_dev, anchored_file.st_ino)
+        != (visible_file.st_dev, visible_file.st_ino)
+    ):
+        raise MediaUrlError("MEDIA_STORAGE_FAILED")
+
+
+def _copy_delivery_file(final_fd: int, final_name: str) -> tuple[Path, Path]:
+    delivery_dir = Path(tempfile.mkdtemp(prefix="clawith-media-delivery-"))
+    delivery_path = delivery_dir / final_name
+    try:
+        read_fd = os.dup(final_fd)
+        with os.fdopen(read_fd, "rb") as source, delivery_path.open("xb") as target:
+            shutil.copyfileobj(source, target)
+    except Exception:
+        shutil.rmtree(delivery_dir, ignore_errors=True)
+        raise
+    return delivery_path, delivery_dir
+
+
+async def _managed_import_result(
+    *,
+    paths: _ManagedMediaPaths,
+    final_fd: int,
+    source_url: str,
+    mime_type: str,
+) -> ManagedMediaImport:
+    _verify_visible_final(paths, final_fd)
+    try:
+        delivery_path, delivery_dir = await asyncio.to_thread(
+            _copy_delivery_file,
+            final_fd,
+            paths.final_name,
+        )
+    except OSError as exc:
+        raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
+    return ManagedMediaImport(
+        file_path=delivery_path,
+        workspace_path=paths.workspace_path,
+        source_url=source_url,
+        mime_type=mime_type,
+        _delivery_dir=delivery_dir,
+    )
+
+
 async def import_managed_media_url(
     raw_url: str,
     *,
@@ -347,11 +421,11 @@ async def import_managed_media_url(
                 paths.final_name,
                 expected_media_kind,
             )
-            return ManagedMediaImport(
-                paths.final_path,
-                paths.workspace_path,
-                current_url,
-                mime_type,
+            return await _managed_import_result(
+                paths=paths,
+                final_fd=existing_fd,
+                source_url=current_url,
+                mime_type=mime_type,
             )
         finally:
             os.close(existing_fd)
@@ -410,6 +484,7 @@ async def import_managed_media_url(
                                     except ValueError:
                                         pass
                                 written = 0
+                                _unlink_partial(paths)
                                 partial_fd = os.open(
                                     paths.partial_name,
                                     os.O_WRONLY
@@ -454,27 +529,28 @@ async def import_managed_media_url(
                                             follow_symlinks=False,
                                         )
                                     except FileExistsError:
-                                        final_fd = os.open(
-                                            paths.final_name,
-                                            os.O_RDONLY | os.O_NOFOLLOW,
-                                            dir_fd=paths.imported_fd,
-                                        )
-                                        try:
-                                            mime_type = _validated_media_mime_fd(
-                                                final_fd,
-                                                paths.final_name,
-                                                expected_media_kind,
-                                            )
-                                        finally:
-                                            os.close(final_fd)
+                                        pass
                                 finally:
                                     os.close(partial_read_fd)
-                                return ManagedMediaImport(
-                                    paths.final_path,
-                                    paths.workspace_path,
-                                    current_url,
-                                    mime_type,
+                                final_fd = os.open(
+                                    paths.final_name,
+                                    os.O_RDONLY | os.O_NOFOLLOW,
+                                    dir_fd=paths.imported_fd,
                                 )
+                                try:
+                                    mime_type = _validated_media_mime_fd(
+                                        final_fd,
+                                        paths.final_name,
+                                        expected_media_kind,
+                                    )
+                                    return await _managed_import_result(
+                                        paths=paths,
+                                        final_fd=final_fd,
+                                        source_url=current_url,
+                                        mime_type=mime_type,
+                                    )
+                                finally:
+                                    os.close(final_fd)
                         except httpx.TransportError as exc:
                             last_transport_error = exc
                             continue
@@ -494,9 +570,7 @@ async def import_managed_media_url(
         raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
     finally:
         try:
-            os.unlink(paths.partial_name, dir_fd=paths.staging_fd)
-        except FileNotFoundError:
-            pass
+            _unlink_partial(paths)
         except OSError:
             pass
         paths.close()

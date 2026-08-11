@@ -5000,6 +5000,7 @@ async def _send_channel_media(
         }, ensure_ascii=False)
 
     file_path: Path | None = None
+    managed_import = None
     source_mode = "workspace"
     if has_file:
         rel_path = _normalize_tool_workspace_rel_path(rel_path)
@@ -5142,57 +5143,69 @@ async def _send_channel_media(
             return json.dumps(_describe_media_delivery_result(payload), ensure_ascii=False)
         file_path = imported.file_path
         rel_path = imported.workspace_path
+        managed_import = imported
         source_mode = "managed_url"
-        try:
-            await get_storage_backend().write_local_file(
-                normalize_storage_key(f"{agent_id}/{rel_path}"),
-                file_path,
-                content_type=imported.mime_type,
+
+    try:
+        if managed_import is not None:
+            try:
+                await get_storage_backend().write_local_file(
+                    normalize_storage_key(f"{agent_id}/{rel_path}"),
+                    file_path,
+                    content_type=managed_import.mime_type,
+                )
+            except Exception:
+                logger.opt(exception=True).error(
+                    "[SessionMedia] Managed import persistence failed"
+                )
+                return json.dumps(_describe_media_delivery_result({
+                    "type": "media_delivery_result", "version": 1,
+                    "status": "failed", "code": "MEDIA_STORAGE_FAILED",
+                    "media_kind": media_kind, "intent_id": tool_call_id or "",
+                    "managed_path": rel_path,
+                }), ensure_ascii=False)
+
+        assert file_path is not None and rel_path is not None
+        if target_session_id:
+            return await _send_media_to_session(
+                agent_id=agent_id,
+                session_id=target_session_id,
+                file_path=file_path,
+                workspace_path=rel_path,
+                media_kind=media_kind,
+                caption=str(arguments.get("message") or ""),
+                cover_path=cover_path,
+                intent_id=tool_call_id or "",
+                origin_session_id=origin_session_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                allow_download=allow_download,
+                source_mode=source_mode,
+                tool_args=arguments,
             )
-        except Exception:
-            logger.opt(exception=True).error("[SessionMedia] Managed import persistence failed")
-            return json.dumps(_describe_media_delivery_result({
-                "type": "media_delivery_result", "version": 1, "status": "failed",
-                "code": "MEDIA_STORAGE_FAILED", "media_kind": media_kind,
-                "intent_id": tool_call_id or "", "managed_path": rel_path,
-            }), ensure_ascii=False)
+        if canonical_user_id:
+            return await _send_media_to_recipient(
+                agent_id=agent_id,
+                file_path=file_path,
+                workspace_path=rel_path,
+                user_id=canonical_user_id,
+                channel=requested_channel,
+                media_kind=media_kind,
+                caption=str(arguments.get("message") or ""),
+                cover_path=cover_path,
+                intent_id=tool_call_id or "",
+                origin_session_id=origin_session_id,
+                origin_turn_anchor_id=origin_turn_anchor_id,
+                allow_download=allow_download,
+                source_mode=source_mode,
+                tool_args=arguments,
+            )
 
-    assert file_path is not None and rel_path is not None
-    if target_session_id:
-        return await _send_media_to_session(
-            agent_id=agent_id,
-            session_id=target_session_id,
-            file_path=file_path,
-            workspace_path=rel_path,
-            media_kind=media_kind,
-            caption=str(arguments.get("message") or ""),
-            cover_path=cover_path,
-            intent_id=tool_call_id or "",
-            origin_session_id=origin_session_id,
-            origin_turn_anchor_id=origin_turn_anchor_id,
-            allow_download=allow_download,
-            source_mode=source_mode,
-            tool_args=arguments,
-        )
-    if canonical_user_id:
-        return await _send_media_to_recipient(
-            agent_id=agent_id,
-            file_path=file_path,
-            workspace_path=rel_path,
-            user_id=canonical_user_id,
-            channel=requested_channel,
-            media_kind=media_kind,
-            caption=str(arguments.get("message") or ""),
-            cover_path=cover_path,
-            intent_id=tool_call_id or "",
-            origin_session_id=origin_session_id,
-            origin_turn_anchor_id=origin_turn_anchor_id,
-            allow_download=allow_download,
-            source_mode=source_mode,
-            tool_args=arguments,
-        )
-
-    raise AssertionError("validated media target was not routed")
+        raise AssertionError("validated media target was not routed")
+    finally:
+        if managed_import is not None:
+            close_import = getattr(managed_import, "close", None)
+            if callable(close_import):
+                close_import()
 
 
 async def _replay_terminal_media_delivery(
