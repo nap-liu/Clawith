@@ -15,17 +15,9 @@ export type DingTalkHostWindow = {
     dd?: DingTalkWebViewSdk;
 };
 
-type DingTalkSdkDocument = Pick<
-    Document,
-    'createElement' | 'head' | 'querySelector'
->;
-
 type DetectDingTalkMiniProgramOptions = {
     targetWindow?: DingTalkHostWindow;
-    targetDocument?: DingTalkSdkDocument;
     userAgent?: string;
-    sdkUrl?: string;
-    loadTimeoutMs?: number;
 };
 
 type OpenDingTalkMiniProgramLinkOptions = DetectDingTalkMiniProgramOptions & {
@@ -41,14 +33,11 @@ type NavigateDingTalkMiniProgramPageOptions = Omit<
     'currentHref' | 'route'
 >;
 
-export const DEFAULT_DINGTALK_WEBVIEW_SDK_URL = 'https://appx/web-view.min.js';
 export const DEFAULT_DINGTALK_WEBVIEW_ROUTE = '/subPackages/webview/index';
 
-const DEFAULT_SDK_LOAD_TIMEOUT_MS = 1500;
 const DEFAULT_NAVIGATE_TIMEOUT_MS = 1500;
 const DEFAULT_DUPLICATE_WINDOW_MS = 500;
 
-let sdkLoadPromise: Promise<void> | null = null;
 let lastOpenUrl = '';
 let lastOpenStartedAt = 0;
 
@@ -56,10 +45,6 @@ function defaultTargetWindow(): DingTalkHostWindow | undefined {
     return typeof window !== 'undefined'
         ? (window as unknown as DingTalkHostWindow)
         : undefined;
-}
-
-function defaultTargetDocument(): DingTalkSdkDocument | undefined {
-    return typeof document !== 'undefined' ? document : undefined;
 }
 
 function defaultUserAgent(): string {
@@ -71,9 +56,9 @@ function hasWebViewNavigationSdk(targetWindow?: DingTalkHostWindow): boolean {
 }
 
 /**
- * DingTalk marks H5 pages hosted by a mini-program web-view with `dd-web`.
- * A plain DingTalk client WebView only carries the broader DingTalk marker and
- * must retain normal browser behavior.
+ * DingTalk marks H5 pages hosted by a mini-program WebView with `dd-web`.
+ * SDK loading is handled separately during HTML parsing and must not decide
+ * whether the business navigation policy is active.
  */
 export function isDingTalkMiniProgramWebViewCandidate(userAgent: string): boolean {
     return /dd-web/i.test(userAgent);
@@ -92,96 +77,13 @@ function normalizeError(error: unknown, fallbackMessage: string): Error {
     return new Error(fallbackMessage);
 }
 
-function loadDingTalkWebViewSdk(
-    targetWindow: DingTalkHostWindow | undefined,
-    targetDocument: DingTalkSdkDocument | undefined,
-    sdkUrl: string,
-    timeoutMs: number,
-): Promise<void> {
-    if (hasWebViewNavigationSdk(targetWindow)) return Promise.resolve();
-    if (!targetDocument) {
-        return Promise.reject(new Error('Cannot load DingTalk WebView SDK without a document'));
-    }
-    if (sdkLoadPromise) return sdkLoadPromise;
-
-    const loadPromise = new Promise<void>((resolve, reject) => {
-        const existing = targetDocument.querySelector<HTMLScriptElement>(
-            'script[data-clawith-dingtalk-webview-sdk]',
-        );
-        const script = existing ?? targetDocument.createElement('script');
-        let settled = false;
-
-        const cleanupListeners = () => {
-            script.removeEventListener('load', onLoad);
-            script.removeEventListener('error', onError);
-        };
-        const removeScript = () => {
-            if (script.parentNode) script.parentNode.removeChild(script);
-        };
-        const finish = (callback: () => void) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            cleanupListeners();
-            callback();
-        };
-        const onLoad = () => finish(() => {
-            if (hasWebViewNavigationSdk(targetWindow)) {
-                resolve();
-            } else {
-                removeScript();
-                reject(new Error('DingTalk WebView SDK loaded without navigateTo'));
-            }
-        });
-        const onError = () => finish(() => {
-            removeScript();
-            reject(new Error('Failed to load DingTalk WebView SDK'));
-        });
-        const timer = setTimeout(
-            () => finish(() => {
-                removeScript();
-                reject(new Error('Timed out loading DingTalk WebView SDK'));
-            }),
-            Math.max(0, timeoutMs),
-        );
-
-        script.addEventListener('load', onLoad, { once: true });
-        script.addEventListener('error', onError, { once: true });
-
-        if (!existing) {
-            script.async = true;
-            script.src = sdkUrl;
-            script.dataset.clawithDingtalkWebviewSdk = '1';
-            targetDocument.head.appendChild(script);
-        }
-    }).catch((error) => {
-        sdkLoadPromise = null;
-        throw error;
-    });
-    sdkLoadPromise = loadPromise;
-
-    return loadPromise;
-}
-
 export async function isDingTalkMiniProgramWebViewRuntime(
     options: DetectDingTalkMiniProgramOptions = {},
 ): Promise<boolean> {
     const userAgent = options.userAgent ?? defaultUserAgent();
     if (!isDingTalkMiniProgramWebViewCandidate(userAgent)) return false;
 
-    const targetWindow = options.targetWindow ?? defaultTargetWindow();
-    try {
-        await loadDingTalkWebViewSdk(
-            targetWindow,
-            options.targetDocument ?? defaultTargetDocument(),
-            options.sdkUrl ?? DEFAULT_DINGTALK_WEBVIEW_SDK_URL,
-            options.loadTimeoutMs ?? DEFAULT_SDK_LOAD_TIMEOUT_MS,
-        );
-    } catch {
-        return false;
-    }
-
-    return hasWebViewNavigationSdk(targetWindow);
+    return hasWebViewNavigationSdk(options.targetWindow ?? defaultTargetWindow());
 }
 
 export function buildDingTalkMiniProgramWebviewRoute(
@@ -242,10 +144,7 @@ export async function navigateDingTalkMiniProgramPage(
     const targetWindow = options.targetWindow ?? defaultTargetWindow();
     const isMiniProgram = await isDingTalkMiniProgramWebViewRuntime({
         targetWindow,
-        targetDocument: options.targetDocument,
         userAgent: options.userAgent,
-        sdkUrl: options.sdkUrl,
-        loadTimeoutMs: options.loadTimeoutMs,
     });
     const sdk = targetWindow?.dd;
     const navigateTo = sdk?.navigateTo;

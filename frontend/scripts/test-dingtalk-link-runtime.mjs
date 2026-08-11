@@ -27,90 +27,25 @@ assert.equal(
     isDingTalkMiniProgramWebViewCandidate('Mozilla/5.0 DingTalk/8.0 dd-web'),
     true,
 );
+assert.equal(isDingTalkMiniProgramWebViewCandidate('Mozilla/5.0 AliApp(AP/10.7.66.8000)'), false);
 
-let directClientSdkLoads = 0;
 assert.equal(await isDingTalkMiniProgramWebViewRuntime({
     targetWindow: {},
-    targetDocument: {
-        querySelector() {
-            return null;
-        },
-        createElement() {
-            directClientSdkLoads += 1;
-            throw new Error('SDK must not load in a direct DingTalk browser');
-        },
-    },
     userAgent: 'Mozilla/5.0 DingTalk/8.0',
 }), false);
-assert.equal(directClientSdkLoads, 0);
-
-const failedScriptListeners = new Map();
-const failedScript = {
-    dataset: {},
-    parentNode: {
-        removeChild() {},
-    },
-    addEventListener(type, listener) {
-        failedScriptListeners.set(type, listener);
-    },
-    removeEventListener(type) {
-        failedScriptListeners.delete(type);
-    },
-};
 assert.equal(await isDingTalkMiniProgramWebViewRuntime({
     targetWindow: {},
-    targetDocument: {
-        querySelector() {
-            return null;
-        },
-        createElement() {
-            return failedScript;
-        },
-        head: {
-            appendChild() {
-                queueMicrotask(() => failedScriptListeners.get('error')?.());
-            },
-        },
-    },
     userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
-    loadTimeoutMs: 50,
 }), false);
 
-const loadedWindow = {};
-const loadedScriptListeners = new Map();
-const loadedScript = {
-    dataset: {},
-    parentNode: null,
-    addEventListener(type, listener) {
-        loadedScriptListeners.set(type, listener);
-    },
-    removeEventListener(type) {
-        loadedScriptListeners.delete(type);
-    },
-};
-const loadedDocument = {
-    querySelector() {
-        return null;
-    },
-    createElement() {
-        return loadedScript;
-    },
-    head: {
-        appendChild(script) {
-            assert.equal(script.src, 'https://appx/web-view.min.js');
-            assert.equal(script.dataset.clawithDingtalkWebviewSdk, '1');
-            loadedWindow.dd = {
-                navigateTo() {},
-            };
-            queueMicrotask(() => loadedScriptListeners.get('load')?.());
-        },
+const loadedWindow = {
+    dd: {
+        navigateTo() {},
     },
 };
 assert.equal(await isDingTalkMiniProgramWebViewRuntime({
     targetWindow: loadedWindow,
-    targetDocument: loadedDocument,
     userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
-    loadTimeoutMs: 50,
 }), true);
 
 const navigateCalls = [];

@@ -13,7 +13,6 @@ export type DetectH5ContainerRuntimeOptions = {
     targetWindow?: DingTalkHostWindow & WeChatRuntimeWindow;
     targetDocument?: Document;
     userAgent?: string;
-    dingtalkSdkLoadTimeoutMs?: number;
     wechatBridgeWaitTimeoutMs?: number;
     wechatEnvTimeoutMs?: number;
 };
@@ -47,9 +46,7 @@ export async function detectH5ContainerRuntime(
     if (isDingTalkMiniProgramWebViewCandidate(userAgent)) {
         const isDingTalkMiniProgram = await isDingTalkMiniProgramWebViewRuntime({
             targetWindow,
-            targetDocument: options.targetDocument,
             userAgent,
-            loadTimeoutMs: options.dingtalkSdkLoadTimeoutMs,
         });
         if (isDingTalkMiniProgram) return 'dingtalk-miniapp-webview';
     }
