@@ -830,10 +830,10 @@ class AioSandboxBackend(BaseSandboxBackend):
           session semantics — the user's ``export``/``cd``-within-script state
           survives to the next call of the *same conversation*. A child bash
           (used 2026-06-11..12) silently dropped every user export.
-        - **No 串台 (group IM safe)**: static launchers in ``.local/bin`` contain
-          no identity. Signed identity contexts are exported as function-local
-          variables only while the current user script runs. A stale launcher
-          without a valid context fails closed.
+        - **No 串台 (group IM safe)**: ordinary CLI launchers contain no identity;
+          ``toolscall`` additionally gets a unique execution-scope directory.
+          Signed contexts are exported as function-local variables only while
+          the current user script runs.
 
         Force-reset cwd AND HOME to the agent root on every call. The shell
         session persists across calls (so exported env vars / background
@@ -887,9 +887,10 @@ class AioSandboxBackend(BaseSandboxBackend):
             f"export NO_COLOR=1"
         )
         wrappers = (inject or {}).get("wrappers") or []
+        platform_wrappers = (inject or {}).get("platform_wrappers") or []
         launchers = prepare_launchers(
-            wrappers, ttl_seconds=context_ttl_seconds
-        ) if wrappers else []
+            [*wrappers, *platform_wrappers], ttl_seconds=context_ttl_seconds
+        ) if wrappers or platform_wrappers else []
         if launchers:
             setup_lines = [build_launcher_write_sh(item) for item in launchers]
             script_lines.extend([
@@ -918,13 +919,43 @@ class AioSandboxBackend(BaseSandboxBackend):
             )
         if launchers:
             user_b64 = base64.b64encode(user_cmd.encode()).decode()
-            local_contexts = "\n  ".join(
-                f"local -x {item['context_env']}={shell_quote(item['context_token'])}"
-                for item in launchers
-            )
+            scope_lines: list[str] = []
+            cleanup_lines: list[str] = []
+            scoped_bindirs: list[str] = []
+            for item in launchers:
+                scope_lines.append(
+                    f"local -x {item['context_env']}={shell_quote(item['context_token'])}"
+                )
+                launcher_relpath = item.get("launcher_relpath")
+                if launcher_relpath:
+                    bindir = launcher_relpath.rsplit("/", 1)[0]
+                    if bindir not in scoped_bindirs:
+                        scoped_bindirs.append(bindir)
+                scope_root = item.get("scope_root_relpath")
+                if scope_root:
+                    cleanup_lines.extend(
+                        [
+                            f'rm -f "$HOME/{scope_root}/bin/toolscall"',
+                            (
+                                f'rmdir "$HOME/{scope_root}/bin" '
+                                f'"$HOME/{scope_root}" 2>/dev/null || true'
+                            ),
+                        ]
+                    )
+            if scoped_bindirs:
+                path_prefix = ":".join(
+                    f"$HOME/{bindir}" for bindir in scoped_bindirs
+                )
+                scope_lines.append(f'local -x PATH="{path_prefix}:$PATH"')
+            local_contexts = "\n  ".join(scope_lines)
+            cleanup = "\n  ".join(cleanup_lines)
+            if cleanup:
+                cleanup = "\n  __aio_user_status=$?\n  " + cleanup + "\n  return $__aio_user_status"
             script_lines.append(
                 "__aio_exec_scope() {\n  " + local_contexts + "\n  "
                 f"source <(echo {user_b64} | base64 -d)\n"
+                + cleanup
+                + "\n"
                 "}\n__aio_exec_scope\n__aio_exec_status=$?\n"
                 "unset -f __aio_exec_scope\nreturn $__aio_exec_status"
             )
@@ -986,11 +1017,13 @@ class AioSandboxBackend(BaseSandboxBackend):
         session_uuid = await self._ensure_jupyter_session(client, anchor, cwd)
 
         wrappers = (inject or {}).get("wrappers") or []
-        if wrappers:
+        platform_wrappers = (inject or {}).get("platform_wrappers") or []
+        all_wrappers = [*wrappers, *platform_wrappers]
+        if all_wrappers:
             from app.services.cli_tools.sandbox_inject import build_python_execution
 
             code = build_python_execution(
-                wrappers, code, ttl_seconds=timeout + 60
+                all_wrappers, code, ttl_seconds=timeout + 60
             )
 
         body, ok = await self._jupyter_exec(client, session_uuid, code, cwd, timeout)

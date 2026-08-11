@@ -2651,6 +2651,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                     _always_names = {a["function"]["name"] for a in _always_tools}
                     if (
                         not _TOOL_NAME_RE.fullmatch(t.name)
+                        or t.name == "toolscall"
                         or t.name in db_tool_names
                         or t.name in _always_names
                     ):
@@ -3399,6 +3400,7 @@ async def execute_tool(
     turn_anchor_id: uuid.UUID | None = None,
     on_output=None,
     skip_autonomy: bool = False,
+    tools_for_llm: list[dict] | None = None,
 ) -> str:
     """Execute a tool call and return the result as a string.
 
@@ -3870,7 +3872,17 @@ async def execute_tool(
             result = await _run_with_temp_workspace(
                 agent_id,
                 _agent_tenant_id,
-                lambda temp_ws: _execute_code(agent_id, temp_ws, arguments, tool_name=tool_name, user_id=user_id, session_id=session_id, on_output=on_output),
+                lambda temp_ws: _execute_code(
+                    agent_id,
+                    temp_ws,
+                    arguments,
+                    tool_name=tool_name,
+                    user_id=user_id,
+                    session_id=session_id,
+                    turn_anchor_id=turn_anchor_id,
+                    tools_for_llm=tools_for_llm,
+                    on_output=on_output,
+                ),
                 sync_back=True,
             )
         elif tool_name == "sql_execute":
@@ -11887,6 +11899,9 @@ async def build_cli_injection(
         state_storage = StateStorage()
         wrappers: list[dict] = []
         for tool in cli_tools:
+            if tool.name == "toolscall":
+                logger.warning("[CLI Inject] skip reserved platform command: toolscall")
+                continue
             at = assignments.get(str(tool.id))
             if not agent_tool_enabled(at):
                 continue
@@ -12142,6 +12157,8 @@ async def _execute_code(
     user_id: Optional[uuid.UUID] = None,
     cli_injection: Optional[dict] = None,
     session_id: Optional[str] = None,
+    turn_anchor_id: uuid.UUID | None = None,
+    tools_for_llm: list[dict] | None = None,
     on_output=None,
 ) -> str:
     """Execute code using the configured sandbox backend.
@@ -12270,9 +12287,41 @@ async def _execute_code(
             # tool) — avoid a second DB round-trip.
             injection = cli_injection
         elif tool_name == "execute_code_aio":
-            # All languages (bash/node/python) get CLI wrappers + identity so
-            # svc is transparently usable everywhere (incl. subprocess).
+            # All languages (bash/node/python) get native CLI wrappers and the
+            # current turn's standard ToolCall bridge in the same PATH.
             injection = await build_cli_injection(agent_id, user_id)
+            if agent_id and user_id and tools_for_llm is not None:
+                from app.services.toolscall.capability import build_toolscall_wrapper
+
+                try:
+                    toolscall_wrapper = await build_toolscall_wrapper(
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        session_id=session_id or "",
+                        turn_anchor_id=turn_anchor_id,
+                        tools_for_llm=tools_for_llm,
+                        aio_base_url=str(getattr(backend, "base_url", "")),
+                        ttl_seconds=timeout + 60,
+                        native_tool_names={
+                            str(wrapper.get("name") or "")
+                            for wrapper in (injection or {}).get("wrappers", [])
+                            if wrapper.get("name")
+                        },
+                    )
+                except Exception:
+                    # Tool composition is an execution convenience. A metadata
+                    # lookup failure must not turn unrelated sandbox code into
+                    # a failed ToolCall; the missing command remains explicit
+                    # if the submitted code actually tries to invoke it.
+                    logger.exception(
+                        "[Toolscall] launcher setup failed; continuing without it"
+                    )
+                    toolscall_wrapper = None
+                if toolscall_wrapper:
+                    injection = injection or {}
+                    injection.setdefault("platform_wrappers", []).append(
+                        toolscall_wrapper
+                    )
 
         if execution_mode == "background":
             payload = await backend.start_background_job(

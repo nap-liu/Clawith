@@ -993,6 +993,7 @@ async def _process_tool_call(
     on_tool_call,
     full_reasoning_content: str,
     allowed_tool_names: set[str],
+    tools_for_llm: list[dict] | None = None,
     on_code_output=None,
     emit_running: bool = True,
     turn_anchor_id: uuid.UUID | None = None,
@@ -1073,6 +1074,7 @@ async def _process_tool_call(
         tool_call_id=str(tc.get("id") or ""),
         turn_anchor_id=turn_anchor_id,
         on_output=_on_output,
+        tools_for_llm=tools_for_llm,
     )
     logger.info(f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}")
     observable_result = _observable_tool_result(tool_name, result)
@@ -1687,6 +1689,7 @@ async def call_llm(
                     on_code_output=on_code_output,
                     full_reasoning_content=full_reasoning_content,
                     allowed_tool_names=allowed_tool_names,
+                    tools_for_llm=tools_for_llm,
                     emit_running=False,
                     turn_anchor_id=turn_anchor_id,
                 )
@@ -2284,6 +2287,7 @@ async def call_agent_llm_with_tools(
                             user_id=agent.creator_id,
                             session_id=session_id,
                             tool_call_id=str(tc.get("id") or ""),
+                            tools_for_llm=tools_for_llm,
                         )
                         logger.info(
                             f"[LLM Timing] tool={tool_name} exec={perf_counter() - _tool_t0:.2f}s agent={agent_id}"

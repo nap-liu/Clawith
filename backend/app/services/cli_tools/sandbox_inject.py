@@ -1,9 +1,10 @@
 """Render identity-safe CLI launchers for aio-sandbox executions.
 
-CLI commands live in the agent's standard ``$HOME/.local/bin`` directory.  A
-launcher is stable across conversations and contains no caller identity.  The
-current caller's resolved environment is carried by a short-lived, signed
-execution context in a process-local environment variable instead.
+Ordinary CLI commands live in the agent's standard ``$HOME/.local/bin``
+directory. Their launchers are stable across conversations and contain no
+caller identity. Platform wrappers may instead request an execution-scoped
+relative path; ``toolscall`` uses that path so concurrent sessions never share
+its current-turn tool schema.
 
 This keeps foreground shells, Jupyter kernels and managed background jobs in
 the same filesystem/PATH namespace without allowing one sender's identity to
@@ -14,6 +15,7 @@ closed with exit code 126.
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import json
 import re
@@ -27,6 +29,7 @@ from app.services.cli_tools.placeholders import PlaceholderContext, resolve
 
 _FUNC_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+_RELATIVE_RUNTIME_PATH_RE = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*$")
 _IDENTITY_ROOTS = ("$user.", "$state.")
 _LOCAL_BIN = "$HOME/.local/bin"
 _MANAGED_MARKER = "# aio-managed-cli-launcher:v1"
@@ -58,6 +61,12 @@ def _validate_env_keys(env: dict[str, str]) -> None:
     for key in env:
         if not _FUNC_NAME_RE.fullmatch(key):
             raise ValueError(f"unsafe env key: {key!r}")
+
+
+def _validate_runtime_relpath(path: str) -> str:
+    if not _RELATIVE_RUNTIME_PATH_RE.fullmatch(path) or ".." in path.split("/"):
+        raise ValueError(f"unsafe runtime relative path: {path!r}")
+    return path
 
 
 def _b64url(data: bytes) -> str:
@@ -157,6 +166,13 @@ def prepare_launchers(
     )
     prepared: list[dict[str, str]] = []
     for wrapper in wrappers:
+        if wrapper.get("kind") == "toolscall":
+            from app.services.toolscall.capability import prepare_toolscall_launcher
+
+            prepared.append(
+                prepare_toolscall_launcher(wrapper, ttl_seconds=ttl_seconds)
+            )
+            continue
         name = wrapper["name"]
         binary_path = str(wrapper["binary_path"])
         env = {str(k): str(v) for k, v in (wrapper.get("env") or {}).items()}
@@ -195,7 +211,7 @@ def prepare_launchers(
 
 
 def build_launcher_write_sh(launcher: dict[str, str]) -> str:
-    """Bash that atomically installs one managed launcher in ``.local/bin``.
+    """Bash that atomically installs one managed launcher.
 
     A non-managed file with the same name is never overwritten.  The setup
     fails before user code runs so command resolution cannot silently fall
@@ -204,15 +220,33 @@ def build_launcher_write_sh(launcher: dict[str, str]) -> str:
     name = launcher["name"]
     _validate_name(name)
     content = launcher["launcher"]
-    encoded = base64.b64encode(content.encode()).decode()
-    target = f'"{_LOCAL_BIN}/{name}"'
-    temp = f'"{_LOCAL_BIN}/.{name}.aio-tmp-$$"'
-    return (
-        f"mkdir -p \"{_LOCAL_BIN}\" && "
+    compression = launcher.get("launcher_compression")
+    if compression == "gzip":
+        encoded = base64.b64encode(gzip.compress(content.encode(), compresslevel=1)).decode()
+        decode = "base64 -d | gzip -d"
+    elif compression is None:
+        encoded = base64.b64encode(content.encode()).decode()
+        decode = "base64 -d"
+    else:
+        raise ValueError(f"unsupported launcher compression: {compression!r}")
+    launcher_relpath = launcher.get("launcher_relpath")
+    if launcher_relpath:
+        launcher_relpath = _validate_runtime_relpath(launcher_relpath)
+        parent_relpath = launcher_relpath.rsplit("/", 1)[0]
+        parent = f"$HOME/{parent_relpath}"
+        target_path = f"$HOME/{launcher_relpath}"
+    else:
+        parent = _LOCAL_BIN
+        target_path = f"{_LOCAL_BIN}/{name}"
+    target = f'"{target_path}"'
+    temp = f'"{parent}/.{name}.aio-tmp-$$"'
+    command = (
+        f"mkdir -p \"{parent}\" && "
         f"if [ -e {target} ] && ! grep -Fqx {_MANAGED_MARKER!r} {target}; then "
-        f"echo 'aio cli: refusing to overwrite unmanaged {_LOCAL_BIN}/{name}' >&2; false; "
-        f"else echo {encoded} | base64 -d > {temp} && chmod 755 {temp} && mv -f {temp} {target}; fi"
+        f"echo 'aio cli: refusing to overwrite unmanaged {target_path}' >&2; false; "
+        f"else echo {encoded} | {decode} > {temp} && chmod 755 {temp} && mv -f {temp} {target}; fi"
     )
+    return command
 
 
 def build_python_execution(
@@ -222,25 +256,38 @@ def build_python_execution(
     launchers = prepare_launchers(wrappers, ttl_seconds=ttl_seconds)
     user_code = base64.b64encode(code.encode()).decode()
     lines = [
-        "import os as _aio_os, base64 as _aio_b64",
-        "_aio_bindir = _aio_os.path.expanduser('~/.local/bin')",
-        "_aio_os.makedirs(_aio_bindir, exist_ok=True)",
-        "_aio_path = _aio_os.environ.get('PATH', '')",
-        "if _aio_bindir not in _aio_path.split(':'):",
-        "    _aio_os.environ['PATH'] = _aio_bindir + ':' + _aio_path",
+        "import os as _aio_os, base64 as _aio_b64, gzip as _aio_gzip",
+        "_aio_default_bindir = _aio_os.path.expanduser('~/.local/bin')",
+        "_aio_os.makedirs(_aio_default_bindir, exist_ok=True)",
     ]
     for launcher in launchers:
         name = launcher["name"]
-        encoded = base64.b64encode(launcher["launcher"].encode()).decode()
+        content = launcher["launcher"].encode()
+        compression = launcher.get("launcher_compression")
+        if compression == "gzip":
+            encoded = base64.b64encode(gzip.compress(content, compresslevel=1)).decode()
+            decoded_expr = f"_aio_gzip.decompress(_aio_b64.b64decode({encoded!r}))"
+        elif compression is None:
+            encoded = base64.b64encode(content).decode()
+            decoded_expr = f"_aio_b64.b64decode({encoded!r})"
+        else:
+            raise ValueError(f"unsupported launcher compression: {compression!r}")
+        launcher_relpath = launcher.get("launcher_relpath")
+        if launcher_relpath:
+            launcher_relpath = _validate_runtime_relpath(launcher_relpath)
+            target_expr = f"_aio_os.path.expanduser('~/{launcher_relpath}')"
+        else:
+            target_expr = f"_aio_os.path.join(_aio_default_bindir, {name!r})"
         lines.extend(
             [
-                f"_aio_target = _aio_os.path.join(_aio_bindir, {name!r})",
+                f"_aio_target = {target_expr}",
+                "_aio_os.makedirs(_aio_os.path.dirname(_aio_target), exist_ok=True)",
                 "if _aio_os.path.exists(_aio_target):",
                 "    with open(_aio_target, 'r', encoding='utf-8', errors='replace') as _aio_f:",
                 f"        if {_MANAGED_MARKER!r} not in _aio_f.read().splitlines():",
                 "            raise RuntimeError('aio cli: refusing to overwrite unmanaged ' + _aio_target)",
                 "_aio_temp = _aio_target + '.aio-tmp-' + str(_aio_os.getpid())",
-                f"with open(_aio_temp, 'wb') as _aio_f: _aio_f.write(_aio_b64.b64decode({encoded!r}))",
+                f"with open(_aio_temp, 'wb') as _aio_f: _aio_f.write({decoded_expr})",
                 "_aio_os.chmod(_aio_temp, 0o755)",
                 "_aio_os.replace(_aio_temp, _aio_target)",
             ]
@@ -248,6 +295,21 @@ def build_python_execution(
     lines.append("_aio_previous = {}")
     lines.append("_aio_missing = object()")
     lines.append("try:")
+    lines.append("    _aio_previous['PATH'] = _aio_os.environ.get('PATH', _aio_missing)")
+    bindirs: list[str] = []
+    for launcher in launchers:
+        launcher_relpath = launcher.get("launcher_relpath")
+        if launcher_relpath:
+            bindir = launcher_relpath.rsplit("/", 1)[0]
+            if bindir not in bindirs:
+                bindirs.append(bindir)
+    path_prefixes = [f"_aio_os.path.expanduser('~/{path}')" for path in bindirs]
+    path_prefixes.append("_aio_default_bindir")
+    lines.append(
+        "    _aio_os.environ['PATH'] = ':'.join(["
+        + ", ".join(path_prefixes)
+        + ", _aio_os.environ.get('PATH', '')])"
+    )
     for launcher in launchers:
         key = launcher["context_env"]
         token = launcher["context_token"]
@@ -260,4 +322,19 @@ def build_python_execution(
     lines.append("    for _aio_key, _aio_value in _aio_previous.items():")
     lines.append("        if _aio_value is _aio_missing: _aio_os.environ.pop(_aio_key, None)")
     lines.append("        else: _aio_os.environ[_aio_key] = _aio_value")
+    for launcher in launchers:
+        scope_root = launcher.get("scope_root_relpath")
+        if scope_root:
+            scope_root = _validate_runtime_relpath(scope_root)
+            lines.extend(
+                [
+                    f"    _aio_scope_root = _aio_os.path.expanduser('~/{scope_root}')",
+                    "    for _aio_leaf in ('bin/toolscall',):",
+                    "        try: _aio_os.unlink(_aio_os.path.join(_aio_scope_root, _aio_leaf))",
+                    "        except FileNotFoundError: pass",
+                    "    for _aio_dir in ('bin', ''):",
+                    "        try: _aio_os.rmdir(_aio_os.path.join(_aio_scope_root, _aio_dir))",
+                    "        except OSError: pass",
+                ]
+            )
     return "\n".join(lines)

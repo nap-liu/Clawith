@@ -1,4 +1,7 @@
 FROM enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.9.3
+# jq is part of the platform shell contract used by toolscall pipelines. Fail
+# the image build if an upstream base ever drops it.
+RUN command -v jq >/dev/null && jq --version
 # Guard the lifecycle patch against silent upstream drift. If the base tag is
 # ever republished with a different OpenHands shell implementation, fail the
 # build and rebase the patch deliberately.

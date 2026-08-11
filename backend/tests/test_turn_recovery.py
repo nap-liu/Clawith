@@ -735,8 +735,8 @@ async def test_resume_turn_continues_after_completed_tool_call_tail(monkeypatch)
     assert len(replies) == 1
 
 
-async def test_resume_turn_executes_unfinished_running_tool_call_before_continuing(monkeypatch):
-    """Crash after a running tool marker should finish that tool before LLM continuation."""
+async def test_resume_turn_executes_unfinished_code_without_new_tool_snapshot(monkeypatch):
+    """Recovery runs code but cannot widen its original, unavailable tool scope."""
     from app.services import turn_recovery
     from app.services.chat_history import persist_incoming_user_message
 
@@ -749,7 +749,7 @@ async def test_resume_turn_executes_unfinished_running_tool_call_before_continui
             agent_id=agent_id,
             user_id=user_id,
             conversation_id=conv,
-            content="read the file",
+            content="run the code",
         )
         anchor_id = anchor.id
         anchor.created_at = datetime.now(timezone.utc) - timedelta(seconds=2)
@@ -760,9 +760,13 @@ async def test_resume_turn_executes_unfinished_running_tool_call_before_continui
                 role="tool_call",
                 content=json.dumps(
                     {
-                        "name": "read_file",
+                        "name": "execute_code_aio",
                         "call_id": call_id,
-                        "args": {"path": "a.txt"},
+                        "args": {
+                            "language": "bash",
+                            "code": "echo recovered",
+                            "execution_mode": "foreground",
+                        },
                         "status": "running",
                         "result": "",
                         "turn_anchor_id": str(anchor_id),
@@ -779,7 +783,7 @@ async def test_resume_turn_executes_unfinished_running_tool_call_before_continui
 
     async def fake_execute_tool(name, args, **kwargs):
         executed.append((name, args, kwargs))
-        return "file body"
+        return "recovered\n"
 
     captured = {}
 
@@ -802,22 +806,29 @@ async def test_resume_turn_executes_unfinished_running_tool_call_before_continui
     assert result is True
     assert executed == [
         (
-            "read_file",
-            {"path": "a.txt"},
-                {
-                    "agent_id": agent_id,
-                    "user_id": user_id,
-                    "session_id": conv,
-                    "tool_call_id": call_id,
-                    "turn_anchor_id": anchor_id,
-                    "on_output": None,
-                },
+            "execute_code_aio",
+            {
+                "language": "bash",
+                "code": "echo recovered",
+                "execution_mode": "foreground",
+            },
+            {
+                "agent_id": agent_id,
+                "user_id": user_id,
+                "session_id": conv,
+                "tool_call_id": call_id,
+                "turn_anchor_id": anchor_id,
+                "on_output": None,
+            },
         )
     ]
     assert [msg["role"] for msg in captured["history"]] == ["user", "assistant", "tool"]
-    assert captured["history"][1]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert (
+        captured["history"][1]["tool_calls"][0]["function"]["name"]
+        == "execute_code_aio"
+    )
     assert captured["history"][1]["tool_calls"][0]["id"] == call_id
-    assert captured["history"][2]["content"] == "file body"
+    assert captured["history"][2]["content"] == "recovered\n"
 
     async with async_session() as db:
         payloads = [
@@ -832,7 +843,7 @@ async def test_resume_turn_executes_unfinished_running_tool_call_before_continui
         ]
     assert [payload["status"] for payload in payloads] == ["running", "done"]
     assert payloads[1]["call_id"] == call_id
-    assert payloads[1]["result"] == "file body"
+    assert payloads[1]["result"] == "recovered\n"
     async with async_session() as db:
         replies = (
             await db.execute(

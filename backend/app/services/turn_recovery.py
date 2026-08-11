@@ -109,6 +109,10 @@ async def _complete_unfinished_tool_calls(db, anchor: ChatMessage, *, ctx_size: 
             args = payload.get("arguments")
         if args is None:
             args = {}
+        # The original turn snapshot is not persisted. Recovery must not load a
+        # new list: that could grant an old code block tools enabled only after
+        # its turn began. Without the exact snapshot, execute_code_aio runs but
+        # receives no toolscall launcher.
         raw_result = await execute_tool(
             name,
             args,

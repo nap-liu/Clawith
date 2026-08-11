@@ -12,7 +12,6 @@ Strategy:
     * returns None for non-CLI / error for missing command / error for unavailable tool
 """
 import uuid
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -47,6 +46,7 @@ def _make_mock_backend(result_sentinel=""):
     """Return a mock backend whose execute() returns a _FakeResult and
     whose _format_result() returns the given string."""
     backend = MagicMock()
+    backend.base_url = "http://aio-sandbox:8080"
     fake_result = _FakeResult()
     backend.execute = AsyncMock(return_value=fake_result)
     backend._format_result = MagicMock(return_value=result_sentinel)
@@ -169,6 +169,113 @@ async def test_execute_code_aio_python_receives_inject(tmp_path):
     assert call_kwargs.get("inject") == _INJECTION_DICT, (
         f"python must receive inject dict, got {call_kwargs.get('inject')!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_code_aio_adds_toolscall_from_current_turn_snapshot(tmp_path):
+    """The bridge scope comes from the caller's exact current-turn tool list."""
+    from app.services.agent_tools import _execute_code
+
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    mock_backend = _make_mock_backend()
+    cli_injection = {"wrappers": [{"name": "native-tool", "binary_path": "/x"}]}
+    platform_wrapper = {
+        "kind": "toolscall",
+        "name": "toolscall",
+        "standard": {"sample": {}},
+        "native": ["native-tool"],
+    }
+    turn_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "sample",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    build_toolscall = AsyncMock(return_value=platform_wrapper)
+
+    with (
+        patch(
+            "app.services.agent_tools.build_cli_injection",
+            new=AsyncMock(return_value=cli_injection),
+        ),
+        patch(
+            "app.services.toolscall.capability.build_toolscall_wrapper",
+            new=build_toolscall,
+        ),
+        patch(
+            "app.services.sandbox.registry.get_sandbox_backend",
+            return_value=mock_backend,
+        ),
+        patch("app.config.get_sandbox_config", return_value=_FakeSandboxConfig()),
+        patch(
+            "app.services.agent_tools._get_tool_config",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        await _execute_code(
+            agent_id,
+            tmp_path,
+            {"language": "bash", "code": "toolscall sample"},
+            tool_name="execute_code_aio",
+            user_id=user_id,
+            session_id="session-1",
+            tools_for_llm=turn_tools,
+        )
+
+    injected = mock_backend.execute.call_args.kwargs["inject"]
+    assert injected == {
+        "wrappers": [{"name": "native-tool", "binary_path": "/x"}],
+        "platform_wrappers": [platform_wrapper],
+    }
+    assert build_toolscall.await_args.kwargs["tools_for_llm"] is turn_tools
+    assert build_toolscall.await_args.kwargs["aio_base_url"] == "http://aio-sandbox:8080"
+    assert build_toolscall.await_args.kwargs["ttl_seconds"] == 90
+    assert build_toolscall.await_args.kwargs["native_tool_names"] == {"native-tool"}
+
+
+@pytest.mark.asyncio
+async def test_toolscall_setup_failure_does_not_break_unrelated_aio_code(tmp_path):
+    """A composition metadata failure must not fail ordinary sandbox execution."""
+    from app.services.agent_tools import _execute_code
+
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    mock_backend = _make_mock_backend("ordinary output")
+
+    with (
+        patch(
+            "app.services.agent_tools.build_cli_injection",
+            new=AsyncMock(return_value=_INJECTION_DICT),
+        ),
+        patch(
+            "app.services.toolscall.capability.build_toolscall_wrapper",
+            new=AsyncMock(side_effect=RuntimeError("metadata unavailable")),
+        ),
+        patch(
+            "app.services.sandbox.registry.get_sandbox_backend",
+            return_value=mock_backend,
+        ),
+        patch("app.config.get_sandbox_config", return_value=_FakeSandboxConfig()),
+        patch(
+            "app.services.agent_tools._get_tool_config",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        result = await _execute_code(
+            agent_id,
+            tmp_path,
+            {"language": "bash", "code": "echo ordinary"},
+            tool_name="execute_code_aio",
+            user_id=user_id,
+            tools_for_llm=[],
+        )
+
+    assert result == "ordinary output"
+    assert mock_backend.execute.call_args.kwargs["inject"] == _INJECTION_DICT
 
 
 @pytest.mark.asyncio

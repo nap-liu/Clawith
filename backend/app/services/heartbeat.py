@@ -411,6 +411,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                             tool_result = await execute_tool(
                                 tool_name, args, agent_id, agent_creator_id,
                                 tool_call_id=tc["id"],
+                                tools_for_llm=tools_for_llm,
                             )
                             plaza_posts_made += 1
                     elif tool_name == "plaza_add_comment":
@@ -420,12 +421,14 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                             tool_result = await execute_tool(
                                 tool_name, args, agent_id, agent_creator_id,
                                 tool_call_id=tc["id"],
+                                tools_for_llm=tools_for_llm,
                             )
                             plaza_comments_made += 1
                     else:
                         tool_result = await execute_tool(
                             tool_name, args, agent_id, agent_creator_id,
                             tool_call_id=tc["id"],
+                            tools_for_llm=tools_for_llm,
                         )
 
                     llm_messages.append(LLMMessage(
@@ -786,6 +789,7 @@ async def run_agent_oneshot(
                     tool_result = await execute_tool(
                         tool_name, args, agent_id, agent_creator_id,
                         tool_call_id=tc["id"],
+                        tools_for_llm=tools_for_llm,
                     )
 
                     llm_messages.append(LLMMessage(
