@@ -1,23 +1,23 @@
-"""Safe URL validation and workspace-local managed media imports."""
+"""Safe URL validation and agent-local managed media imports."""
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import hashlib
 import ipaddress
 import os
-from pathlib import Path, PurePosixPath
 import re
 import socket
 import uuid
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from urllib.parse import SplitResult, unquote, urljoin, urlsplit, urlunsplit
 
 import aiofiles
 import httpx
 
 from app.services.chat_attachments import MEDIA_PROBE_CHUNK_BYTES, sniff_media_mime_bytes
-
+from app.services.tool_result_paths import tool_result_session_dir
 
 MAX_MEDIA_URL_LENGTH = 4096
 MAX_MEDIA_REDIRECTS = 3
@@ -179,22 +179,29 @@ async def _managed_request_target(raw_url: str) -> _ManagedRequestTarget:
     )
 
 
-def _workspace_paths(agent_workspace: Path, intent_id: str, filename: str) -> tuple[Path, Path, str]:
+def _managed_media_paths(
+    agent_workspace: Path,
+    session_id: str | None,
+    intent_id: str,
+    filename: str,
+) -> tuple[Path, Path, str]:
     agent_root = agent_workspace.resolve()
-    workspace_entry = agent_workspace / "workspace"
-    if workspace_entry.is_symlink():
-        raise MediaUrlError("MEDIA_STORAGE_FAILED")
-    workspace_root = workspace_entry.resolve()
-    staging_dir = workspace_root / ".media-staging"
-    media_dir = workspace_root / "media"
+    result_session_dir = agent_workspace / Path(tool_result_session_dir(session_id))
+    staging_dir = result_session_dir / ".media"
+    media_dir = agent_workspace / "media"
     imported_dir = media_dir / "imported"
-    guarded_dirs = (workspace_entry, staging_dir, media_dir, imported_dir)
+    guarded_dirs = (
+        agent_workspace / ".tool_results",
+        result_session_dir,
+        staging_dir,
+        media_dir,
+        imported_dir,
+    )
     try:
-        workspace_root.relative_to(agent_root)
         for directory in guarded_dirs:
             if directory.is_symlink():
-                raise ValueError("workspace media directory is a symlink")
-            directory.resolve().relative_to(workspace_root)
+                raise ValueError("managed media directory is a symlink")
+            directory.resolve().relative_to(agent_root)
     except (OSError, ValueError) as exc:
         raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
     try:
@@ -203,18 +210,18 @@ def _workspace_paths(agent_workspace: Path, intent_id: str, filename: str) -> tu
         # Re-check after creation so a raced path swap cannot silently escape.
         for directory in guarded_dirs:
             if directory.is_symlink():
-                raise ValueError("workspace media directory became a symlink")
-            directory.resolve().relative_to(workspace_root)
+                raise ValueError("managed media directory became a symlink")
+            directory.resolve().relative_to(agent_root)
     except (OSError, ValueError) as exc:
         raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
     key = _intent_key(intent_id)
     partial_path = (staging_dir / f"{key}.{uuid.uuid4().hex}.partial").resolve()
     final_path = (imported_dir / f"{key}-{filename}").resolve()
     try:
-        partial_path.relative_to(workspace_root)
-        final_path.relative_to(workspace_root)
+        partial_path.relative_to(agent_root)
+        final_path.relative_to(agent_root)
         if partial_path.is_symlink() or final_path.is_symlink():
-            raise ValueError("workspace media file is a symlink")
+            raise ValueError("managed media file is a symlink")
         workspace_path = final_path.relative_to(agent_root).as_posix()
     except (OSError, ValueError) as exc:
         raise MediaUrlError("MEDIA_STORAGE_FAILED") from exc
@@ -248,16 +255,18 @@ async def import_managed_media_url(
     raw_url: str,
     *,
     agent_workspace: Path,
+    session_id: str | None,
     intent_id: str,
     max_bytes: int,
     expected_media_kind: str,
 ) -> ManagedMediaImport:
-    """Stream a public URL into this Agent's workspace with atomic completion."""
+    """Stream a public URL into this Agent's managed media store atomically."""
     current_url = str(raw_url or "").strip()
     _validated_url_parts(current_url, external=False)
     filename = _safe_filename(current_url)
-    partial_path, final_path, workspace_path = _workspace_paths(
+    partial_path, final_path, workspace_path = _managed_media_paths(
         agent_workspace,
+        session_id,
         intent_id,
         filename,
     )

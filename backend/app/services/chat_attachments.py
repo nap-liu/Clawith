@@ -39,7 +39,7 @@ def _clean_workspace_path(raw_path: Any) -> str | None:
     candidate = PurePosixPath(path)
     if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
         return None
-    if not path.startswith(("workspace/", "skills/")):
+    if not path.startswith(("workspace/", "skills/", "media/")):
         return None
     return candidate.as_posix()
 
@@ -175,7 +175,7 @@ def attachment_from_workspace_path(
 ) -> dict[str, Any]:
     path = _clean_workspace_path(workspace_path)
     if path is None:
-        raise ValueError("attachment path must be a canonical agent workspace path")
+        raise ValueError("attachment path must be a canonical agent file path")
     name = _safe_legacy_name(display_name or PurePosixPath(path).name)
     if name is None:
         raise ValueError("attachment display name is invalid")

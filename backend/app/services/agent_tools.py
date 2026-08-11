@@ -5113,6 +5113,7 @@ async def _send_channel_media(
             imported = await import_managed_media_url(
                 media_url,
                 agent_workspace=_agent_workspace_root(agent_id),
+                session_id=origin_session_id or target_session_id or None,
                 intent_id=tool_call_id or "",
                 max_bytes=MEDIA_TOOL_MAX_FILE_BYTES,
                 expected_media_kind=media_kind,

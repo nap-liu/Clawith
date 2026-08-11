@@ -63,8 +63,11 @@ def test_storage_entry_version_prefers_object_version():
     assert _storage_entry_version_token(entry) == "version-value"
 
 
-def test_message_media_reference_requires_an_exact_structured_path():
-    path = "workspace/uploads/demo.mp4"
+@pytest.mark.parametrize(
+    "path",
+    ["workspace/uploads/demo.mp4", "media/imported/managed-demo.mp4"],
+)
+def test_message_media_reference_requires_an_exact_structured_path(path):
     structured = SimpleNamespace(
         message_meta={"attachments": [{"path": path}]},
         content="",
@@ -72,12 +75,16 @@ def test_message_media_reference_requires_an_exact_structured_path():
     tool_result = SimpleNamespace(
         message_meta={},
         role="tool_call",
-        content='{"name":"send_channel_file","status":"done","result":"{\\"type\\":\\"platform_file_delivery\\",\\"path\\":\\"workspace/uploads/demo.mp4\\"}"}',
+        content=(
+            '{"name":"send_media","status":"done","result":"'
+            f'{{\\"type\\":\\"platform_media_delivery\\",\\"path\\":\\"{path}\\"}}'
+            '"}'
+        ),
     )
     unrelated = SimpleNamespace(
         message_meta={},
         role="user",
-        content='{"message":"workspace/uploads/demo.mp4.bak"}',
+        content=f'{{"message":"{path}.bak"}}',
     )
 
     assert _message_references_media_path(structured, path)

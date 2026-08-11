@@ -8,12 +8,16 @@ from loguru import logger
 from app.core.logging_config import intercept_standard_logging
 from app.services import media_url_source
 
-
 MP4_BYTES = b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+SESSION_ID = "session-managed"
+
+
+def _staging_dir(agent_root, session_id=SESSION_ID):
+    return agent_root / ".tool_results" / session_id / ".media"
 
 
 @pytest.mark.asyncio
-async def test_managed_url_streams_inside_agent_workspace_and_finishes_atomically(tmp_path, monkeypatch):
+async def test_managed_url_streams_into_agent_media_store_and_finishes_atomically(tmp_path, monkeypatch):
     original_client = httpx.AsyncClient
     transport = httpx.MockTransport(lambda request: httpx.Response(
         200,
@@ -36,15 +40,16 @@ async def test_managed_url_streams_inside_agent_workspace_and_finishes_atomicall
     imported = await media_url_source.import_managed_media_url(
         "https://media.example/demo.mp4",
         agent_workspace=tmp_path,
+        session_id=SESSION_ID,
         intent_id="call-managed",
         max_bytes=1024,
         expected_media_kind="video",
     )
 
     assert imported.file_path.read_bytes() == MP4_BYTES
-    assert imported.workspace_path.startswith("workspace/media/imported/")
+    assert imported.workspace_path.startswith("media/imported/")
     assert imported.mime_type == "video/mp4"
-    assert list((tmp_path / "workspace" / ".media-staging").glob("*.partial")) == []
+    assert list(_staging_dir(tmp_path).glob("*.partial")) == []
 
 
 @pytest.mark.asyncio
@@ -70,6 +75,7 @@ async def test_managed_url_rejects_wrong_media_bytes_before_final_move(tmp_path,
         await media_url_source.import_managed_media_url(
             "https://media.example/fake.mp4",
             agent_workspace=tmp_path,
+            session_id=SESSION_ID,
             intent_id="call-mismatch",
             max_bytes=1024,
             expected_media_kind="video",
@@ -77,8 +83,8 @@ async def test_managed_url_rejects_wrong_media_bytes_before_final_move(tmp_path,
 
     assert exc_info.value.code == "MEDIA_KIND_MISMATCH"
     assert exc_info.value.actual_kind == "audio"
-    assert list((tmp_path / "workspace" / ".media-staging").glob("*.partial")) == []
-    assert list((tmp_path / "workspace" / "media" / "imported").iterdir()) == []
+    assert list(_staging_dir(tmp_path).glob("*.partial")) == []
+    assert list((tmp_path / "media" / "imported").iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -126,38 +132,51 @@ async def test_malformed_ipv6_url_returns_structured_validation_error(external):
 
 
 @pytest.mark.asyncio
-async def test_managed_import_rejects_malformed_url_before_workspace_write(tmp_path):
+async def test_managed_import_rejects_malformed_url_before_agent_storage_write(tmp_path):
     with pytest.raises(media_url_source.MediaUrlError) as exc_info:
         await media_url_source.import_managed_media_url(
             "https://[bad/a.mp4",
             agent_workspace=tmp_path,
+            session_id=SESSION_ID,
             intent_id="malformed-url",
             max_bytes=1024,
             expected_media_kind="video",
         )
 
     assert exc_info.value.code == "INVALID_MEDIA_URL"
-    assert not (tmp_path / "workspace").exists()
+    assert not (tmp_path / ".tool_results").exists()
+    assert not (tmp_path / "media").exists()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("symlink_location", ["workspace", "staging", "imported"])
-async def test_managed_import_rejects_workspace_directory_symlink_escape(
+@pytest.mark.parametrize(
+    "symlink_location",
+    ["tool_results", "session", "staging", "media", "imported"],
+)
+async def test_managed_import_rejects_agent_directory_symlink_escape(
     tmp_path,
     symlink_location,
 ):
     agent_root = tmp_path / "agent"
     outside = tmp_path / f"outside-{symlink_location}"
     agent_root.mkdir()
-    workspace = agent_root / "workspace"
-    if symlink_location == "workspace":
-        workspace.symlink_to(outside, target_is_directory=True)
+    tool_results = agent_root / ".tool_results"
+    if symlink_location == "tool_results":
+        tool_results.symlink_to(outside, target_is_directory=True)
+    elif symlink_location == "session":
+        tool_results.mkdir()
+        (tool_results / SESSION_ID).symlink_to(outside, target_is_directory=True)
     elif symlink_location == "staging":
-        workspace.mkdir()
-        (workspace / ".media-staging").symlink_to(outside, target_is_directory=True)
-    else:
-        (workspace / "media").mkdir(parents=True)
-        (workspace / "media" / "imported").symlink_to(
+        (tool_results / SESSION_ID).mkdir(parents=True)
+        (tool_results / SESSION_ID / ".media").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+    elif symlink_location == "media":
+        (agent_root / "media").symlink_to(outside, target_is_directory=True)
+    elif symlink_location == "imported":
+        (agent_root / "media").mkdir()
+        (agent_root / "media" / "imported").symlink_to(
             outside,
             target_is_directory=True,
         )
@@ -166,6 +185,7 @@ async def test_managed_import_rejects_workspace_directory_symlink_escape(
         await media_url_source.import_managed_media_url(
             "https://media.example/demo.mp4",
             agent_workspace=agent_root,
+            session_id=SESSION_ID,
             intent_id=f"symlink-{symlink_location}",
             max_bytes=1024,
             expected_media_kind="video",
@@ -224,6 +244,7 @@ async def test_managed_redirect_uses_fresh_client_for_each_hostname(tmp_path, mo
     imported = await media_url_source.import_managed_media_url(
         "https://media.example/demo.mp4",
         agent_workspace=tmp_path,
+        session_id=SESSION_ID,
         intent_id="redirect-hosts",
         max_bytes=1024,
         expected_media_kind="video",
@@ -263,6 +284,7 @@ async def test_managed_url_falls_back_across_validated_public_ips(tmp_path, monk
     imported = await media_url_source.import_managed_media_url(
         "https://media.example/demo.mp4",
         agent_workspace=tmp_path,
+        session_id=SESSION_ID,
         intent_id="dual-stack",
         max_bytes=1024,
         expected_media_kind="video",
@@ -300,6 +322,7 @@ async def test_managed_import_never_logs_signed_url_or_local_path(tmp_path, monk
         imported = await media_url_source.import_managed_media_url(
             signed_url,
             agent_workspace=tmp_path,
+            session_id=SESSION_ID,
             intent_id="logging-redaction",
             max_bytes=1024,
             expected_media_kind="video",
@@ -358,6 +381,7 @@ async def test_concurrent_managed_imports_converge_on_one_atomic_final(tmp_path,
         media_url_source.import_managed_media_url(
             "https://media.example/demo.mp4",
             agent_workspace=tmp_path,
+            session_id=SESSION_ID,
             intent_id="same-intent",
             max_bytes=1024,
             expected_media_kind="video",
@@ -367,7 +391,7 @@ async def test_concurrent_managed_imports_converge_on_one_atomic_final(tmp_path,
 
     assert first.file_path == second.file_path
     assert first.file_path.read_bytes() == MP4_BYTES
-    assert list((tmp_path / "workspace" / ".media-staging").glob("*.partial")) == []
+    assert list(_staging_dir(tmp_path).glob("*.partial")) == []
 
 
 async def _async_addresses(value):

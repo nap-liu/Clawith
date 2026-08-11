@@ -143,6 +143,29 @@ def test_serializer_exposes_structured_agent_media_attachments():
     assert result["attachments"] == [attachment]
 
 
+def test_platform_managed_media_path_is_a_canonical_attachment():
+    attachment = chat_attachments.attachment_from_workspace_path(
+        "media/imported/managed-demo.mp4",
+        mime_type="video/mp4",
+        size_bytes=42,
+    )
+
+    assert attachment == {
+        "display_name": "managed-demo.mp4",
+        "path": "media/imported/managed-demo.mp4",
+        "kind": "video",
+        "mime_type": "video/mp4",
+        "size_bytes": 42,
+    }
+
+
+def test_tool_result_staging_file_cannot_become_a_chat_attachment():
+    with pytest.raises(ValueError, match="canonical agent file path"):
+        chat_attachments.attachment_from_workspace_path(
+            ".tool_results/session-1/.media/download.partial"
+        )
+
+
 def test_serializer_does_not_create_a_non_tool_media_render_protocol():
     attachment = chat_attachments.attachment_from_workspace_path(
         "workspace/demo.mp4", mime_type="video/mp4"

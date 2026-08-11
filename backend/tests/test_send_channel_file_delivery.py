@@ -1,5 +1,6 @@
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -460,6 +461,74 @@ async def test_managed_url_invalid_target_is_rejected_before_download(tmp_path, 
 
     assert payload["status"] == "failed"
     assert payload["code"] == "SESSION_NOT_FOUND_OR_FORBIDDEN"
+
+
+@pytest.mark.asyncio
+async def test_managed_url_uses_origin_session_result_scope_and_agent_media_storage(
+    tmp_path,
+    monkeypatch,
+):
+    captured = {}
+    agent_id = uuid.uuid4()
+    origin_session_id = str(uuid.uuid4())
+    target_session_id = str(uuid.uuid4())
+    managed_file = tmp_path / "media" / "imported" / "managed-demo.mp4"
+    managed_file.parent.mkdir(parents=True)
+    managed_file.write_bytes(
+        b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+    )
+
+    async def no_replay(**_kwargs):
+        return None
+
+    async def valid_target(**_kwargs):
+        return None
+
+    async def fake_import(_url, **kwargs):
+        captured["import"] = kwargs
+        return SimpleNamespace(
+            file_path=managed_file,
+            workspace_path="media/imported/managed-demo.mp4",
+            mime_type="video/mp4",
+        )
+
+    class Storage:
+        async def write_local_file(self, key, path, *, content_type=None):
+            captured["storage"] = (key, path, content_type)
+
+    async def fake_send(**kwargs):
+        captured["send"] = kwargs
+        return json.dumps({"type": "platform_media_delivery", "status": "sent"})
+
+    monkeypatch.setattr(agent_tools, "_replay_terminal_media_delivery", no_replay)
+    monkeypatch.setattr(agent_tools, "_preflight_managed_media_target", valid_target)
+    monkeypatch.setattr(agent_tools, "import_managed_media_url", fake_import)
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(agent_tools, "_get_tool_config", lambda *_args: _async_value({}))
+    monkeypatch.setattr(agent_tools, "_send_media_to_session", fake_send)
+    monkeypatch.setattr(agent_tools, "_agent_workspace_root", lambda _agent_id: tmp_path)
+
+    payload = json.loads(await agent_tools._send_channel_media(
+        agent_id,
+        tmp_path,
+        {
+            "url": "https://media.example/demo.mp4",
+            "url_mode": "managed",
+            "session_id": target_session_id,
+        },
+        media_kind="video",
+        tool_call_id="call-managed-layout",
+        origin_session_id=origin_session_id,
+    ))
+
+    assert payload["status"] == "sent"
+    assert captured["import"]["session_id"] == origin_session_id
+    assert captured["storage"] == (
+        f"{agent_id}/media/imported/managed-demo.mp4",
+        managed_file,
+        "video/mp4",
+    )
+    assert captured["send"]["workspace_path"] == "media/imported/managed-demo.mp4"
 
 
 async def _async_value(value):

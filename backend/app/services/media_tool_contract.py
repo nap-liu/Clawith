@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-
 SEND_MEDIA_DESCRIPTION = (
     "Send one audio or video source to the current conversation, an exact existing "
     "person/group Session, or a directly resolved person. Use exactly one source: "
-    "file_path for an Agent-owned workspace file, or url plus url_mode for a third-party "
+    "file_path for an Agent-owned file, or url plus url_mode for a third-party "
     "URL. url_mode='external' accepts HTTPS only, publishes the URL without downloading "
     "it, and is "
     "available only when the resolved destination can render a third-party media URL; "
     "url_mode='managed' accepts HTTP or HTTPS and downloads the media into this Agent's "
-    "workspace before delivery "
+    "platform-managed media store before delivery "
     "so history uses platform-managed playback. The tool contract is always available "
     "even when the resolved IM channel returns unsupported. Audio/video is rendered as "
     "a dedicated tool-call card."
@@ -24,14 +23,14 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
             "type": "string",
             "enum": ["audio", "video"],
             "description": (
-                "Required media kind. It must match the actual managed/workspace file; "
+                "Required media kind. It must match the actual managed or Agent-owned file; "
                 "external URLs are rendered using this declared kind."
             ),
         },
         "file_path": {
             "type": "string",
             "description": (
-                "Agent-owned workspace-relative file path, for example "
+                "Agent-owned path relative to the Agent root, for example "
                 "workspace/media/briefing.mp3. Use either file_path or url, never both."
             ),
         },
@@ -50,7 +49,7 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
                 "Required with url. external requires HTTPS, publishes the third-party "
                 "URL without downloading, and does not guarantee future availability. "
                 "managed accepts HTTP or HTTPS and imports the media into "
-                "workspace/media/imported before delivery."
+                "media/imported before delivery."
             ),
         },
         "cover_image_path": {
