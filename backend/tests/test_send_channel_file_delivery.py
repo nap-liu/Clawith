@@ -7,6 +7,7 @@ import pytest
 from app.services import agent_tools
 from app.services.llm import caller as llm_caller
 from app.services.media_tool_contract import SEND_MEDIA_PARAMETERS_SCHEMA
+from app.services.storage_runtime.local import LocalStorageBackend
 from app.services.tool_seeder import BUILTIN_TOOLS
 
 
@@ -289,6 +290,50 @@ async def test_send_media_rejects_symlink_that_escapes_current_agent_root(tmp_pa
 
     assert payload["status"] == "failed"
     assert payload["code"] == "INVALID_FILE_PATH"
+
+
+@pytest.mark.asyncio
+async def test_send_media_runtime_does_not_materialize_another_agent_symlink(
+    tmp_path,
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    other_agent_id = uuid.uuid4()
+    storage_root = tmp_path / "storage"
+    agent_root = storage_root / str(agent_id)
+    other_media = storage_root / str(other_agent_id) / "private" / "secret.mp4"
+    agent_root.mkdir(parents=True)
+    other_media.parent.mkdir(parents=True)
+    other_media.write_bytes(
+        b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
+    )
+    (agent_root / "linked.mp4").symlink_to(other_media)
+    storage = LocalStorageBackend(str(storage_root))
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    async def run_send_media(temp_workspace):
+        return await agent_tools._send_channel_media(
+            agent_id,
+            temp_workspace,
+            {
+                "file_path": "linked.mp4",
+                "session_id": str(uuid.uuid4()),
+            },
+            media_kind="video",
+            tool_call_id="call-cross-agent-symlink",
+        )
+
+    result = await agent_tools._run_with_temp_workspace(
+        agent_id,
+        None,
+        run_send_media,
+        paths=["linked.mp4"],
+        source_paths=["linked.mp4"],
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "failed"
+    assert payload["code"] == "MEDIA_NOT_FOUND"
 
 
 def test_media_tools_are_fixed_core_tools():

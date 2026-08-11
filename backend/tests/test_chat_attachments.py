@@ -285,3 +285,20 @@ async def test_client_attachment_validation_preserves_duplicates_and_checks_stor
 
     assert len(result) == 2
     assert len(checked) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["private/secret.mp4", ".tool_results/session-1/result.mp4"],
+)
+async def test_client_attachment_validation_keeps_the_inbound_path_allowlist(
+    path,
+):
+    attachment = chat_attachments.attachment_from_workspace_path(path)
+
+    with pytest.raises(ValueError, match="client attachment paths are not allowed"):
+        await chat_attachments.validate_client_attachments(
+            uuid.uuid4(),
+            [attachment],
+        )

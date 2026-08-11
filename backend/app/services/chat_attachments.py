@@ -30,6 +30,7 @@ _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 _AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".amr", ".m4a", ".aac"}
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 MEDIA_PROBE_CHUNK_BYTES = 2 * 1024 * 1024
+_CLIENT_ATTACHMENT_PATH_PREFIXES = ("workspace/", "skills/", "media/")
 
 
 def _clean_workspace_path(raw_path: Any) -> str | None:
@@ -334,6 +335,11 @@ async def validate_client_attachments(agent_id: Any, raw_attachments: Any) -> li
     normalized = normalize_attachment_metadata(raw_attachments)
     if len(normalized) != len(raw_attachments):
         raise ValueError("one or more attachments are invalid")
+    if any(
+        not item["path"].startswith(_CLIENT_ATTACHMENT_PATH_PREFIXES)
+        for item in normalized
+    ):
+        raise ValueError("one or more client attachment paths are not allowed")
     storage = get_storage_backend()
     for item in normalized:
         key = agent_storage_key(agent_id, item["path"])
