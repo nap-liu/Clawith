@@ -25,7 +25,6 @@ type DetectWeChatMiniProgramOptions = {
     targetDocument?: Document;
     bridgeWaitTimeoutMs?: number;
     envTimeoutMs?: number;
-    jssdkUrl?: string;
 };
 
 type OpenWeChatMiniProgramLinkOptions = {
@@ -43,14 +42,12 @@ type NavigateWeChatMiniProgramPageOptions = Omit<
     'currentHref' | 'route'
 >;
 
-const DEFAULT_JSSDK_URL = 'https://res.wx.qq.com/open/js/jweixin-1.3.2.js';
 const DEFAULT_BRIDGE_WAIT_TIMEOUT_MS = 800;
 const DEFAULT_ENV_TIMEOUT_MS = 800;
 const DEFAULT_DUPLICATE_WINDOW_MS = 500;
 const DEFAULT_NAVIGATE_TIMEOUT_MS = 1500;
 export const DEFAULT_WECHAT_WEBVIEW_ROUTE = '/subPackages/webview/index';
 
-let jssdkLoadPromise: Promise<void> | null = null;
 let lastOpenUrl = '';
 let lastOpenStartedAt = 0;
 
@@ -101,57 +98,6 @@ function waitForMiniProgramEnvironmentMarker(
     });
 }
 
-function loadWechatJssdk(
-    targetWindow: WeChatHostWindow | undefined,
-    targetDocument: Document | undefined,
-    jssdkUrl: string,
-): Promise<void> {
-    if (hasMiniProgramSdk(targetWindow)) return Promise.resolve();
-    if (!targetDocument) {
-        return Promise.reject(new Error('Cannot load WeChat JSSDK without a document'));
-    }
-    if (jssdkLoadPromise) return jssdkLoadPromise;
-
-    const loadPromise = new Promise<void>((resolve, reject) => {
-        const existing = targetDocument.querySelector<HTMLScriptElement>(
-            'script[data-clawith-wechat-jssdk]',
-        );
-        const script = existing ?? targetDocument.createElement('script');
-
-        const removeScript = () => {
-            if (script.parentNode) script.parentNode.removeChild(script);
-        };
-        const onLoad = () => {
-            if (hasMiniProgramSdk(targetWindow)) {
-                resolve();
-            } else {
-                removeScript();
-                reject(new Error('WeChat JSSDK loaded without miniProgram APIs'));
-            }
-        };
-        const onError = () => {
-            removeScript();
-            reject(new Error('Failed to load WeChat JSSDK'));
-        };
-
-        script.addEventListener('load', onLoad, { once: true });
-        script.addEventListener('error', onError, { once: true });
-
-        if (!existing) {
-            script.async = true;
-            script.src = jssdkUrl;
-            script.dataset.clawithWechatJssdk = '1';
-            targetDocument.head.appendChild(script);
-        }
-    }).catch((error) => {
-        jssdkLoadPromise = null;
-        throw error;
-    });
-    jssdkLoadPromise = loadPromise;
-
-    return loadPromise;
-}
-
 function verifyMiniProgramEnvironment(
     targetWindow: WeChatHostWindow | undefined,
     timeoutMs: number,
@@ -189,16 +135,9 @@ export async function isWechatMiniProgramWebViewRuntime(
     );
     if (!markerMatched) return false;
 
-    try {
-        await loadWechatJssdk(
-            targetWindow,
-            targetDocument,
-            options.jssdkUrl ?? DEFAULT_JSSDK_URL,
-        );
-    } catch {
-        // The platform marker is authoritative. Keep the mini-program policy
-        // active even when the optional SDK enhancement fails to load, so a
-        // cross-origin link cannot bypass the allowlist through native fallback.
+    if (!hasMiniProgramSdk(targetWindow)) {
+        // The platform marker remains authoritative if the parser-loaded SDK
+        // failed, so cross-origin links cannot bypass the mini-program policy.
         return true;
     }
 

@@ -48,6 +48,16 @@ assertLinkAction(
     { type: 'dingtalk-miniapp-navigate', route: '/pages/order/detail?id=123' },
 );
 assertLinkAction(
+    resolveH5LinkAction('miniprogram://navigate-to/pages/transit/index?mode=1010000451', {
+        currentHref: current,
+        runtime: 'dingtalk-miniapp-webview',
+    }),
+    {
+        type: 'dingtalk-miniapp-navigate',
+        route: '/pages/transit/index?mode=1010000451',
+    },
+);
+assertLinkAction(
     resolveH5LinkAction('miniprogram://navigate-to/pages/order/detail?id=123', {
         currentHref: current,
         runtime: 'standard',

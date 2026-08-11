@@ -27,90 +27,44 @@ assert.equal(
     isDingTalkMiniProgramWebViewCandidate('Mozilla/5.0 DingTalk/8.0 dd-web'),
     true,
 );
+assert.equal(isDingTalkMiniProgramWebViewCandidate('Mozilla/5.0 AliApp(AP/10.7.66.8000)'), false);
+const dingtalkAndroidMiniProgramUserAgent = [
+    'Mozilla/5.0 (Linux; Android 13)',
+    'Nebula AliApp(DingTalk/8.3.35)',
+    'com.alibaba.android.rimet MiniProgram NebulaX/1.0.0',
+].join(' ');
+assert.equal(
+    isDingTalkMiniProgramWebViewCandidate(dingtalkAndroidMiniProgramUserAgent),
+    true,
+);
+assert.equal(
+    isDingTalkMiniProgramWebViewCandidate(
+        'Mozilla/5.0 AliApp(DingTalk/8.3.35) com.alibaba.android.rimet',
+    ),
+    false,
+);
 
-let directClientSdkLoads = 0;
 assert.equal(await isDingTalkMiniProgramWebViewRuntime({
     targetWindow: {},
-    targetDocument: {
-        querySelector() {
-            return null;
-        },
-        createElement() {
-            directClientSdkLoads += 1;
-            throw new Error('SDK must not load in a direct DingTalk browser');
-        },
-    },
     userAgent: 'Mozilla/5.0 DingTalk/8.0',
 }), false);
-assert.equal(directClientSdkLoads, 0);
-
-const failedScriptListeners = new Map();
-const failedScript = {
-    dataset: {},
-    parentNode: {
-        removeChild() {},
-    },
-    addEventListener(type, listener) {
-        failedScriptListeners.set(type, listener);
-    },
-    removeEventListener(type) {
-        failedScriptListeners.delete(type);
-    },
-};
 assert.equal(await isDingTalkMiniProgramWebViewRuntime({
     targetWindow: {},
-    targetDocument: {
-        querySelector() {
-            return null;
-        },
-        createElement() {
-            return failedScript;
-        },
-        head: {
-            appendChild() {
-                queueMicrotask(() => failedScriptListeners.get('error')?.());
-            },
-        },
-    },
     userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
-    loadTimeoutMs: 50,
 }), false);
 
-const loadedWindow = {};
-const loadedScriptListeners = new Map();
-const loadedScript = {
-    dataset: {},
-    parentNode: null,
-    addEventListener(type, listener) {
-        loadedScriptListeners.set(type, listener);
-    },
-    removeEventListener(type) {
-        loadedScriptListeners.delete(type);
-    },
-};
-const loadedDocument = {
-    querySelector() {
-        return null;
-    },
-    createElement() {
-        return loadedScript;
-    },
-    head: {
-        appendChild(script) {
-            assert.equal(script.src, 'https://appx/web-view.min.js');
-            assert.equal(script.dataset.clawithDingtalkWebviewSdk, '1');
-            loadedWindow.dd = {
-                navigateTo() {},
-            };
-            queueMicrotask(() => loadedScriptListeners.get('load')?.());
-        },
+const loadedWindow = {
+    dd: {
+        navigateTo() {},
     },
 };
 assert.equal(await isDingTalkMiniProgramWebViewRuntime({
     targetWindow: loadedWindow,
-    targetDocument: loadedDocument,
     userAgent: 'Mozilla/5.0 DingTalk/8.0 dd-web',
-    loadTimeoutMs: 50,
+}), true);
+assert.equal(await isDingTalkMiniProgramWebViewRuntime({
+    targetWindow: loadedWindow,
+    userAgent: dingtalkAndroidMiniProgramUserAgent,
 }), true);
 
 const navigateCalls = [];
@@ -147,6 +101,21 @@ await navigateDingTalkMiniProgramPage('/pages/order/detail?id=123', {
     navigateTimeoutMs: 50,
 });
 assert.deepEqual(directPageCalls, ['/pages/order/detail?id=123']);
+const androidTransitCalls = [];
+await navigateDingTalkMiniProgramPage('/pages/transit/index?mode=1010000451', {
+    targetWindow: {
+        dd: {
+            navigateTo(options) {
+                androidTransitCalls.push(options.url);
+                options.success?.();
+            },
+        },
+    },
+    userAgent: dingtalkAndroidMiniProgramUserAgent,
+    duplicateWindowMs: 0,
+    navigateTimeoutMs: 50,
+});
+assert.deepEqual(androidTransitCalls, ['/pages/transit/index?mode=1010000451']);
 await assert.rejects(
     navigateDingTalkMiniProgramPage('//evil.example/page', {
         targetWindow: loadedWindow,

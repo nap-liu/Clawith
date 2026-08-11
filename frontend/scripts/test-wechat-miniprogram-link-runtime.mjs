@@ -19,38 +19,15 @@ assert.equal(
     '/subPackages/webview/index?url=https%3A%2F%2Fdocs.example.com%2Fa%3Fname%3D%E4%B8%AD%E6%96%87%23part',
 );
 
-let directWechatSdkLoads = 0;
 const directWechatDocument = {
     addEventListener() {},
     removeEventListener() {},
-    querySelector() {
-        return null;
-    },
-    createElement() {
-        directWechatSdkLoads += 1;
-        throw new Error('JSSDK must not load in a direct WeChat browser');
-    },
 };
 assert.equal(await isWechatMiniProgramWebViewRuntime({
     targetWindow: {},
     targetDocument: directWechatDocument,
     bridgeWaitTimeoutMs: 0,
 }), false);
-assert.equal(directWechatSdkLoads, 0);
-
-const failedWechatScriptListeners = new Map();
-const failedWechatScript = {
-    dataset: {},
-    parentNode: {
-        removeChild() {},
-    },
-    addEventListener(type, listener) {
-        failedWechatScriptListeners.set(type, listener);
-    },
-    removeEventListener(type) {
-        failedWechatScriptListeners.delete(type);
-    },
-};
 assert.equal(await isWechatMiniProgramWebViewRuntime({
     targetWindow: {
         __wxjs_environment: 'miniprogram',
@@ -58,17 +35,6 @@ assert.equal(await isWechatMiniProgramWebViewRuntime({
     targetDocument: {
         addEventListener() {},
         removeEventListener() {},
-        querySelector() {
-            return null;
-        },
-        createElement() {
-            return failedWechatScript;
-        },
-        head: {
-            appendChild() {
-                queueMicrotask(() => failedWechatScriptListeners.get('error')?.());
-            },
-        },
     },
     envTimeoutMs: 50,
 }), true);

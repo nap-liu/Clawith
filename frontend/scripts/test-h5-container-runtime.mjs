@@ -30,6 +30,19 @@ assert.equal(await detectH5ContainerRuntime({
 }), 'dingtalk-miniapp-webview');
 
 assert.equal(await detectH5ContainerRuntime({
+    targetWindow: {
+        dd: {
+            navigateTo() {},
+        },
+    },
+    userAgent: [
+        'Mozilla/5.0 (Linux; Android 13)',
+        'Nebula AliApp(DingTalk/8.3.35)',
+        'com.alibaba.android.rimet MiniProgram NebulaX/1.0.0',
+    ].join(' '),
+}), 'dingtalk-miniapp-webview');
+
+assert.equal(await detectH5ContainerRuntime({
     targetWindow: {},
     userAgent: 'Mozilla/5.0 Chrome/150.0 Safari/537.36',
 }), 'standard');
@@ -60,19 +73,6 @@ assert.equal(await detectH5ContainerRuntime({
     wechatEnvTimeoutMs: 50,
 }), 'wechat-miniapp-webview');
 
-const failedWechatScriptListeners = new Map();
-const failedWechatScript = {
-    dataset: {},
-    parentNode: {
-        removeChild() {},
-    },
-    addEventListener(type, listener) {
-        failedWechatScriptListeners.set(type, listener);
-    },
-    removeEventListener(type) {
-        failedWechatScriptListeners.delete(type);
-    },
-};
 assert.equal(await detectH5ContainerRuntime({
     targetWindow: {
         __wxjs_environment: 'miniprogram',
@@ -80,17 +80,6 @@ assert.equal(await detectH5ContainerRuntime({
     targetDocument: {
         addEventListener() {},
         removeEventListener() {},
-        querySelector() {
-            return null;
-        },
-        createElement() {
-            return failedWechatScript;
-        },
-        head: {
-            appendChild() {
-                queueMicrotask(() => failedWechatScriptListeners.get('error')?.());
-            },
-        },
     },
     userAgent: 'Mozilla/5.0 MicroMessenger/8.0 miniProgram',
 }), 'wechat-miniapp-webview');
