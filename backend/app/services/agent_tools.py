@@ -2785,15 +2785,14 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 if t.name == "execute_code_aio":
                     from app.services.toolscall.capability import (
                         TOOLSCALL_USAGE_DESCRIPTION,
+                        toolscall_enabled_for_agent,
                     )
 
-                    # This is an Agent-level rollout switch. The platform seed
-                    # defaults it off; only an explicit per-Agent override may
-                    # advertise the capability in that Agent's tool schema.
-                    toolscall_enabled = (
-                        (at.config or {}).get("toolscall_enabled") is True
-                        if at
-                        else False
+                    # This is an Agent-level switch. Missing configuration uses
+                    # the platform's enabled-by-default policy, while an
+                    # explicit false remains a per-Agent opt-out.
+                    toolscall_enabled = toolscall_enabled_for_agent(
+                        at.config if at else None
                     )
                     if toolscall_enabled:
                         description = (
@@ -12443,11 +12442,13 @@ async def _execute_code(
             injection = cli_injection
         elif tool_name == "execute_code_aio":
             # All languages (bash/node/python) get native CLI wrappers. The
-            # current turn's ToolCall bridge is an explicit per-Agent opt-in.
+            # current turn's ToolCall bridge follows the Agent-level switch.
             injection = await build_cli_injection(agent_id, user_id)
-            toolscall_enabled = (
-                (tool_config or {}).get("toolscall_enabled") is True
+            from app.services.toolscall.capability import (
+                toolscall_enabled_for_agent,
             )
+
+            toolscall_enabled = toolscall_enabled_for_agent(tool_config)
             if (
                 toolscall_enabled
                 and agent_id

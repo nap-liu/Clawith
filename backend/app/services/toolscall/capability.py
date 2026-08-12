@@ -49,6 +49,14 @@ TOOLSCALL_USAGE_DESCRIPTION = (
 ToolscallUnavailable = ToolscallRuntimeUnavailable
 
 
+def toolscall_enabled_for_agent(config: dict[str, Any] | None) -> bool:
+    """Return the Agent-level switch, defaulting missing config to enabled."""
+    values = config or {}
+    if "toolscall_enabled" not in values:
+        return True
+    return values["toolscall_enabled"] is True
+
+
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 

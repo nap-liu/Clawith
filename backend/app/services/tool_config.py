@@ -36,8 +36,8 @@ def merge_tool_config_layers(
     """Merge config while keeping ``agent_only`` fields Agent-scoped.
 
     A company/global value for an Agent-only field must never become a runtime
-    default. This lets capability rollouts remain opt-in even if a stale or
-    direct API write placed the same key in a broader config layer.
+    override. Agent-only defaults and explicit overrides are resolved by the
+    capability that owns the field.
     """
     agent_only_keys = {
         str(field.get("key"))
