@@ -129,6 +129,7 @@ def normalize_managed_media_headers(raw_headers: object) -> dict[str, str]:
 
 def _managed_request_headers(
     custom_headers: dict[str, str],
+    host_header: str,
 ) -> dict[str, str]:
     headers = dict(_BROWSER_REQUEST_HEADERS)
     for name, value in custom_headers.items():
@@ -139,27 +140,19 @@ def _managed_request_headers(
         if existing is not None:
             headers.pop(existing)
         headers[name] = value
-    return headers
-
-
-def _finalize_managed_request_headers(
-    headers: httpx.Headers,
-    host_header: str,
-) -> None:
-    """Remove caller and client defaults that must not reach the origin."""
-    for name in list(headers.keys()):
-        lowered = name.lower()
-        if (
-            lowered in MANAGED_MEDIA_BLOCKED_HEADERS
-            or any(
-                lowered.startswith(prefix)
-                for prefix in MANAGED_MEDIA_BLOCKED_HEADER_PREFIXES
-            )
-        ):
-            del headers[name]
+    headers = {
+        name: value
+        for name, value in headers.items()
+        if name.lower() not in MANAGED_MEDIA_BLOCKED_HEADERS
+        and not any(
+            name.lower().startswith(prefix)
+            for prefix in MANAGED_MEDIA_BLOCKED_HEADER_PREFIXES
+        )
+    }
     # Host is always reconstructed from the validated request target. Caller
     # input cannot alter DNS pinning, redirect validation, or TLS identity.
     headers["Host"] = host_header
+    return headers
 
 
 def _raw_header_pairs(headers: httpx.Headers) -> list[list[str]]:
@@ -574,12 +567,11 @@ async def import_managed_media_url(
                         request = client.build_request(
                             "GET",
                             connect_url,
-                            headers=_managed_request_headers(custom_headers),
+                            headers=_managed_request_headers(
+                                custom_headers,
+                                target.host_header,
+                            ),
                             extensions={"sni_hostname": target.sni_hostname},
-                        )
-                        _finalize_managed_request_headers(
-                            request.headers,
-                            target.host_header,
                         )
                         request_started = time.perf_counter()
                         request_log = {
