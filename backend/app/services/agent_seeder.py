@@ -607,6 +607,12 @@ async def _seed_okr_triggers(db, agent_id: uuid.UUID) -> None:
     """
     from app.services.focus_service import ensure_focus_item
 
+    agent = await db.get(Agent, agent_id)
+    if agent is None:
+        logger.warning(f"[AgentSeeder] Cannot seed triggers: Agent {agent_id} is missing")
+        return
+    creator_id = agent.creator_id
+
     system_focus_ref = await ensure_focus_item(
         agent_id,
         focus_ref="system:okr_reports",
@@ -682,12 +688,21 @@ async def _seed_okr_triggers(db, agent_id: uuid.UUID) -> None:
                 AgentTrigger.name == t["name"],
             )
         )
-        if existing.scalar_one_or_none():
+        existing_trigger = existing.scalar_one_or_none()
+        if existing_trigger:
+            existing_trigger.created_by_user_id = (
+                existing_trigger.created_by_user_id or creator_id
+            )
+            existing_trigger.execution_user_id = (
+                existing_trigger.execution_user_id or creator_id
+            )
             logger.info(f"[AgentSeeder] Trigger '{t['name']}' already exists, skipping")
             continue
 
         trigger = AgentTrigger(
             agent_id=agent_id,
+            created_by_user_id=creator_id,
+            execution_user_id=creator_id,
             name=t["name"],
             type=t["type"],
             config=t["config"],

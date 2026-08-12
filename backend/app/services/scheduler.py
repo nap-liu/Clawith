@@ -6,13 +6,12 @@ and executes them by calling the LLM with the schedule's instruction.
 """
 
 import asyncio
-import json
 import uuid
 from datetime import datetime, timezone
 
 from croniter import croniter
 from loguru import logger
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 
 def compute_next_run(cron_expr: str, after: datetime | None = None) -> datetime | None:
@@ -26,7 +25,12 @@ def compute_next_run(cron_expr: str, after: datetime | None = None) -> datetime 
         return None
 
 
-async def _execute_schedule(schedule_id: uuid.UUID, agent_id: uuid.UUID, instruction: str):
+async def _execute_schedule(
+    schedule_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    instruction: str,
+    execution_user_id: uuid.UUID | None = None,
+):
     """Execute a single schedule by calling the LLM with the instruction."""
     try:
         from app.database import async_session
@@ -65,6 +69,7 @@ async def _execute_schedule(schedule_id: uuid.UUID, agent_id: uuid.UUID, instruc
                 user_prompt=user_prompt,
                 max_rounds=50,
                 session_id=str(schedule_id),
+                execution_user_id=execution_user_id,
             )
 
             # Log activity
@@ -93,7 +98,7 @@ async def _tick():
         async with async_session() as db:
             result = await db.execute(
                 select(AgentSchedule).where(
-                    AgentSchedule.is_enabled == True,
+                    AgentSchedule.is_enabled.is_(True),
                     AgentSchedule.next_run_at <= now,
                 )
             )
@@ -118,7 +123,12 @@ async def _tick():
 
                 # Fire execution in background (don't block ticker)
                 asyncio.create_task(
-                    _execute_schedule(sched.id, sched.agent_id, sched.instruction)
+                    _execute_schedule(
+                        sched.id,
+                        sched.agent_id,
+                        sched.instruction,
+                        sched.execution_user_id,
+                    )
                 )
                 logger.info(f"Triggered schedule '{sched.name}' (next: {next_run})")
 

@@ -10,8 +10,10 @@ from sqlalchemy import and_, or_, select, update
 
 from app.config import get_settings
 from app.database import async_session
+from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
+from app.models.user import User
 
 settings = get_settings()
 
@@ -83,8 +85,9 @@ async def claim_pending_trigger_executions(
     sources = sources or ["webhook", "cron", "once", "interval", "poll", "on_message"]
     async with async_session() as db:
         result = await db.execute(
-            select(TriggerExecution, AgentTrigger)
+            select(TriggerExecution, AgentTrigger, Agent)
             .join(AgentTrigger, AgentTrigger.id == TriggerExecution.trigger_id)
+            .join(Agent, Agent.id == TriggerExecution.agent_id)
             .where(
                 TriggerExecution.source.in_(sources),
                 or_(
@@ -116,7 +119,40 @@ async def claim_pending_trigger_executions(
             .limit(limit)
         )
         rows = result.all()
-        for execution, trigger in rows:
+        origin_ids: set[uuid.UUID] = set()
+        for execution, trigger, _agent in rows:
+            payload = execution.payload if isinstance(execution.payload, dict) else {}
+            if (
+                execution.execution_user_id is None
+                and trigger.type == "on_message"
+                and payload.get("_origin_session_id")
+            ):
+                try:
+                    origin_ids.add(uuid.UUID(str(payload.get("_origin_user_id"))))
+                except (TypeError, ValueError, AttributeError):
+                    pass
+        origin_users = {}
+        if origin_ids:
+            users = (
+                await db.execute(select(User).where(User.id.in_(origin_ids)))
+            ).scalars().all()
+            origin_users = {user.id: user for user in users}
+
+        for execution, trigger, agent in rows:
+            if execution.execution_user_id is None:
+                payload = execution.payload if isinstance(execution.payload, dict) else {}
+                origin_id = None
+                if trigger.type == "on_message" and payload.get("_origin_session_id"):
+                    try:
+                        candidate = uuid.UUID(str(payload.get("_origin_user_id")))
+                    except (TypeError, ValueError, AttributeError):
+                        candidate = None
+                    origin = origin_users.get(candidate)
+                    if origin and origin.tenant_id == agent.tenant_id:
+                        origin_id = origin.id
+                execution.execution_user_id = (
+                    origin_id or trigger.execution_user_id or agent.creator_id
+                )
             # Transient marker consumed by dispatch before the objects are
             # detached.  Retries must not increment fire_count a second time.
             execution._is_first_claim = execution.started_at is None
@@ -171,6 +207,8 @@ def build_execution_runtime_trigger(trigger: AgentTrigger, execution: TriggerExe
         **(trigger.config or {}),
         "_execution_id": str(execution.id),
     }
+    if execution.execution_user_id:
+        runtime_cfg["_execution_user_id"] = str(execution.execution_user_id)
     if execution.payload:
         runtime_cfg.update(execution.payload)
     if execution.payload_text:
@@ -178,6 +216,8 @@ def build_execution_runtime_trigger(trigger: AgentTrigger, execution: TriggerExe
     return AgentTrigger(
         id=trigger.id,
         agent_id=trigger.agent_id,
+        created_by_user_id=trigger.created_by_user_id,
+        execution_user_id=execution.execution_user_id or trigger.execution_user_id,
         name=trigger.name,
         type=trigger.type,
         config=runtime_cfg,

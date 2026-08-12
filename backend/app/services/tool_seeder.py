@@ -102,6 +102,54 @@ def _global_builtin_config(tool_data: dict) -> dict:
 BUILTIN_TOOLS = [
     REQUEST_CONFIRMATION_TOOL_SEED,
     {
+        "name": "set_execution_user",
+        "display_name": "调整后台任务执行人",
+        "description": (
+            "调整指定后台任务的执行人。用于在需要时将后续执行交由另一位有权限的用户；"
+            "已经开始的执行不受影响。"
+        ),
+        "category": "general",
+        "icon": "🔐",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "resource_type": {
+                    "type": "string",
+                    "enum": ["trigger", "task", "schedule"],
+                },
+                "resource_id": {
+                    "type": "string",
+                    "description": "Exact UUID of the target background resource.",
+                },
+                "execution_user_id": {
+                    "type": "string",
+                    "description": "Exact canonical user_id to use for future execution.",
+                },
+                "expected_execution_user_id": {
+                    "type": ["string", "null"],
+                    "description": "调整前读取到的当前执行人 ID；当前未设置时传 null。",
+                },
+                "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 500,
+                    "description": "Human-approved reason stored in the audit trail.",
+                },
+            },
+            "required": [
+                "resource_type",
+                "resource_id",
+                "execution_user_id",
+                "expected_execution_user_id",
+                "reason",
+            ],
+            "additionalProperties": False,
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
         "name": "manage_scene",
         "display_name": "场景配置",
         "description": (
@@ -843,7 +891,7 @@ BUILTIN_TOOLS = [
     {
         "name": "list_triggers",
         "display_name": "List Triggers",
-        "description": "List all your active triggers with name, type, config, reason, fire count, and status.",
+        "description": "List all your triggers, including each trigger's creator and execution user IDs.",
         "category": "aware",
         "icon": "📋",
         "is_default": True,
@@ -2157,7 +2205,7 @@ BUILTIN_TOOLS = [
     {
         "name": "list_sessions",
         "display_name": "List Sessions",
-        "description": "List the conversation sessions you (this agent) take part in — your chats with people, your agent-to-agent (A2A) threads, and your own trigger reflections. Read-only. Results are automatically scoped by who is talking to you: an admin partner can list every user's sessions with you; a regular user only sees their own; in unattended (A2A/trigger) turns only your autonomous-side sessions are visible. You can never see another agent's sessions.",
+        "description": "List the conversation sessions you (this agent) take part in — your chats with people, group chats, agent-to-agent (A2A) threads, and your own trigger reflections. Read-only. Supports exact or fuzzy counterpart/group filtering. Results are automatically scoped by who is talking to you: an admin partner can list every user's sessions with you; a regular user only sees their own; in unattended (A2A/trigger) turns only your autonomous-side sessions are visible. You can never see another agent's sessions.",
         "category": "discovery",
         "icon": "🗂️",
         "is_default": True,
@@ -2166,10 +2214,18 @@ BUILTIN_TOOLS = [
             "properties": {
                 "channel": {"type": "string", "description": "Optional channel filter, e.g. 'web', 'feishu', 'agent' (A2A), 'trigger'. Omit or 'all' for every permitted channel."},
                 "query": {"type": "string", "description": "Optional case-insensitive substring to match against session title / group name."},
+                "counterpart": {"type": "string", "description": "Optional conversation-person filter. Matches a P2P person's display name/login/exact user_id, an A2A peer Agent, or a real human sender in a group."},
+                "counterpart_match": {"type": "string", "enum": ["exact", "fuzzy"], "description": "How counterpart is matched. Default fuzzy; exact is case-insensitive and also accepts canonical IDs."},
+                "is_group": {"type": "boolean", "description": "Optional exact session-kind filter: true for group chats, false for non-group sessions."},
+                "group": {"type": "string", "description": "Optional group-chat filter over group name, title, external conversation ID, or exact session UUID."},
+                "group_match": {"type": "string", "enum": ["exact", "fuzzy"], "description": "How group is matched. Default fuzzy; exact is case-insensitive and also accepts the exact session UUID."},
                 "limit": {"type": "integer", "description": "Max sessions to return (default 20, max 50)."},
                 "offset": {"type": "integer", "description": "Pagination offset (default 0)."},
                 "since": {"type": "string", "description": "Optional ISO8601 lower bound on last activity, e.g. '2026-06-01'."},
                 "until": {"type": "string", "description": "Optional ISO8601 upper bound on last activity."},
+                "scene": {"type": "string", "description": "Optional exact scene_key filter. Matches the active session scene or any recorded turn snapshot."},
+                "raw": {"type": "boolean", "description": "Return unabridged ChatSession rows as JSON with cursor pagination. Default false keeps the legacy summary format."},
+                "cursor": {"type": "string", "description": "Opaque next_cursor from a previous raw response. Used only when raw=true."},
             },
             "required": [],
         },
@@ -4686,31 +4742,36 @@ async def seed_builtin_tools():
 
 
     async with async_session() as db:
-        # Legacy rename: older environments persisted this tool as
-        # `send_web_message`. Rename or merge it in-place so agents keep the
-        # same assignment after the first startup on the new version.
-        old_name = "send_web_message"
-        new_name = "send_platform_message"
-        old_result = await db.execute(select(Tool).where(Tool.name == old_name))
-        old_tool = old_result.scalar_one_or_none()
-        new_result = await db.execute(select(Tool).where(Tool.name == new_name))
-        new_tool = new_result.scalar_one_or_none()
-        if old_tool and not new_tool:
-            old_tool.name = new_name
-            logger.info(f"[ToolSeeder] Renamed builtin tool: {old_name} -> {new_name}")
-        elif old_tool and new_tool:
-            old_assignments = await db.execute(select(AgentTool).where(AgentTool.tool_id == old_tool.id))
-            for assignment in old_assignments.scalars().all():
-                existing_assignment = await db.execute(
-                    select(AgentTool).where(
-                        AgentTool.agent_id == assignment.agent_id,
-                        AgentTool.tool_id == new_tool.id,
-                    )
+        # Rename or merge persisted builtin tools in place so existing Agent
+        # assignments survive a public tool-name cleanup.
+        for old_name, new_name in (
+            ("send_web_message", "send_platform_message"),
+            ("reassign_background_execution_user", "set_execution_user"),
+        ):
+            old_tool = (
+                await db.execute(select(Tool).where(Tool.name == old_name))
+            ).scalar_one_or_none()
+            new_tool = (
+                await db.execute(select(Tool).where(Tool.name == new_name))
+            ).scalar_one_or_none()
+            if old_tool and not new_tool:
+                old_tool.name = new_name
+                logger.info(f"[ToolSeeder] Renamed builtin tool: {old_name} -> {new_name}")
+            elif old_tool and new_tool:
+                old_assignments = await db.execute(
+                    select(AgentTool).where(AgentTool.tool_id == old_tool.id)
                 )
-                if not existing_assignment.scalar_one_or_none():
-                    assignment.tool_id = new_tool.id
-            await db.delete(old_tool)
-            logger.info(f"[ToolSeeder] Merged legacy builtin tool into {new_name}")
+                for assignment in old_assignments.scalars().all():
+                    existing_assignment = await db.execute(
+                        select(AgentTool).where(
+                            AgentTool.agent_id == assignment.agent_id,
+                            AgentTool.tool_id == new_tool.id,
+                        )
+                    )
+                    if not existing_assignment.scalar_one_or_none():
+                        assignment.tool_id = new_tool.id
+                await db.delete(old_tool)
+                logger.info(f"[ToolSeeder] Merged legacy builtin tool into {new_name}")
 
         new_tool_ids = []
         required_tool_ids = set()

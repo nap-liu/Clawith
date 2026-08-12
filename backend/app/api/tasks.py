@@ -24,14 +24,20 @@ def _target_error(exc: Exception) -> HTTPException:
 
 
 async def _enrich_task_out(task: Task, db: AsyncSession) -> TaskOut:
-    """Convert Task to TaskOut with creator_username populated."""
+    """Convert Task to TaskOut with human-readable identity labels populated."""
     await db.refresh(task)
     out = TaskOut.model_validate(task)
-    if task.created_by:
-        user_result = await db.execute(select(User).where(User.id == task.created_by))
-        user = user_result.scalar_one_or_none()
-        if user:
-            out.creator_username = user.username
+    user_ids = {user_id for user_id in (task.created_by, task.execution_user_id) if user_id}
+    if user_ids:
+        users_result = await db.execute(select(User).where(User.id.in_(user_ids)))
+        users = {user.id: user for user in users_result.scalars().all()}
+        creator = users.get(task.created_by)
+        execution_user = users.get(task.execution_user_id)
+        if creator:
+            out.creator_username = creator.username
+            out.creator_display_name = creator.display_name
+        if execution_user:
+            out.execution_user_display_name = execution_user.display_name
     return out
 
 
@@ -54,16 +60,27 @@ async def list_tasks(
     query = query.order_by(Task.created_at.desc())
     result = await db.execute(query)
     tasks_list = result.scalars().all()
-    # Batch-load creator usernames
-    creator_ids = {t.created_by for t in tasks_list if t.created_by}
-    creator_map = {}
-    if creator_ids:
-        users_result = await db.execute(select(User).where(User.id.in_(creator_ids)))
-        creator_map = {u.id: u.username for u in users_result.scalars().all()}
+    # Batch-load labels for both the immutable creator and the future execution user.
+    user_ids = {
+        user_id
+        for task in tasks_list
+        for user_id in (task.created_by, task.execution_user_id)
+        if user_id
+    }
+    user_map = {}
+    if user_ids:
+        users_result = await db.execute(select(User).where(User.id.in_(user_ids)))
+        user_map = {u.id: u for u in users_result.scalars().all()}
     out_list = []
     for t in tasks_list:
         t_out = TaskOut.model_validate(t)
-        t_out.creator_username = creator_map.get(t.created_by)
+        creator = user_map.get(t.created_by)
+        execution_user = user_map.get(t.execution_user_id)
+        if creator:
+            t_out.creator_username = creator.username
+            t_out.creator_display_name = creator.display_name
+        if execution_user:
+            t_out.execution_user_display_name = execution_user.display_name
         out_list.append(t_out)
     return out_list
 
@@ -98,6 +115,7 @@ async def create_task(
         priority=data.priority,
         due_date=data.due_date,
         created_by=current_user.id,
+        execution_user_id=current_user.id,
         supervision_target_user_id=data.supervision_target_user_id,
         supervision_target_agent_id=data.supervision_target_agent_id,
         supervision_target_name=(
@@ -120,7 +138,7 @@ async def create_task(
     if data.type == "todo":
         import asyncio
         from app.services.task_executor import execute_task
-        asyncio.create_task(execute_task(task.id, agent_id))
+        asyncio.create_task(execute_task(task.id, agent_id, task.execution_user_id))
 
     return task_out
 
@@ -142,6 +160,51 @@ async def update_task(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
     changes = data.model_dump(exclude_unset=True)
+    if "execution_user_id" in changes:
+        if changes["execution_user_id"] is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="execution_user_id cannot be null",
+            )
+        if "expected_execution_user_id" not in changes:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="expected_execution_user_id is required",
+            )
+        from app.services.execution_identity import (
+            ExecutionIdentityConflict,
+            ExecutionIdentityError,
+            ExecutionIdentityPermissionError,
+            reassign_background_execution_user,
+        )
+
+        try:
+            await reassign_background_execution_user(
+                db,
+                actor_user_id=current_user.id,
+                agent_id=agent_id,
+                resource_type="task",
+                resource_id=task_id,
+                execution_user_id=changes["execution_user_id"],
+                expected_execution_user_id=changes.get("expected_execution_user_id"),
+                expected_provided=True,
+            )
+        except ExecutionIdentityConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ExecutionIdentityPermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ExecutionIdentityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            ) from exc
+        changes.pop("execution_user_id")
+        changes.pop("expected_execution_user_id", None)
+    elif "expected_execution_user_id" in changes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="expected_execution_user_id requires execution_user_id",
+        )
     if (
         changes.get("supervision_target_user_id") is not None
         and "supervision_target_agent_id" not in changes
@@ -261,6 +324,6 @@ async def trigger_task(
 
     import asyncio
     from app.services.task_executor import execute_task
-    asyncio.create_task(execute_task(task.id, agent_id))
+    asyncio.create_task(execute_task(task.id, agent_id, task.execution_user_id))
 
     return {"status": "triggered", "task_id": str(task_id)}

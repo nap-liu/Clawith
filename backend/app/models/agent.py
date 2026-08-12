@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -74,19 +74,19 @@ class Agent(Base):
     )
 
     # Token usage control
-    max_tokens_per_day: Mapped[int | None] = mapped_column(Integer)
-    max_tokens_per_month: Mapped[int | None] = mapped_column(Integer)
-    tokens_used_today: Mapped[int] = mapped_column(Integer, default=0)
-    tokens_used_month: Mapped[int] = mapped_column(Integer, default=0)
+    max_tokens_per_day: Mapped[int | None] = mapped_column(BigInteger)
+    max_tokens_per_month: Mapped[int | None] = mapped_column(BigInteger)
+    tokens_used_today: Mapped[int] = mapped_column(BigInteger, default=0)
+    tokens_used_month: Mapped[int] = mapped_column(BigInteger, default=0)
     last_daily_reset: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_monthly_reset: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    tokens_used_total: Mapped[int] = mapped_column(Integer, default=0)
-    cache_read_tokens_today: Mapped[int] = mapped_column(Integer, default=0)
-    cache_read_tokens_month: Mapped[int] = mapped_column(Integer, default=0)
-    cache_read_tokens_total: Mapped[int] = mapped_column(Integer, default=0)
-    cache_creation_tokens_today: Mapped[int] = mapped_column(Integer, default=0)
-    cache_creation_tokens_month: Mapped[int] = mapped_column(Integer, default=0)
-    cache_creation_tokens_total: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_used_total: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_read_tokens_today: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_read_tokens_month: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_read_tokens_total: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_creation_tokens_today: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_creation_tokens_month: Mapped[int] = mapped_column(BigInteger, default=0)
+    cache_creation_tokens_total: Mapped[int] = mapped_column(BigInteger, default=0)
     context_window_size: Mapped[int] = mapped_column(Integer, default=100)
     max_tool_rounds: Mapped[int] = mapped_column(Integer, default=50)
 

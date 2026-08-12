@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from app.config import Settings
 from app.database import async_session, engine
 from app.models.agent import Agent
+from app.models.chat_session import ChatSession  # noqa: F401 - register FK target
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
@@ -381,6 +382,8 @@ async def _seed_persisted_cron() -> tuple[AgentTrigger, dict[str, uuid.UUID]]:
             config={"expr": "0 18 * * *"},
             created_at=datetime(2026, 7, 22, 1, 39, 44, tzinfo=timezone.utc),
         )
+        trigger.created_by_user_id = user.id
+        trigger.execution_user_id = user.id
         db.add(trigger)
         await db.commit()
         await db.refresh(trigger)
@@ -442,7 +445,10 @@ async def test_concurrent_enqueue_uses_schedule_for_record_key_and_context():
         assert execution.idempotency_key.endswith("2026-07-22T10:00:00+00:00")
         assert execution.payload["_scheduled_for"] == "2026-07-22T10:00:00+00:00"
         assert execution.payload["_scheduled_timezone"] == "Asia/Shanghai"
+        assert execution.execution_user_id == ids["user"]
         runtime_trigger = build_execution_runtime_trigger(trigger, execution)
+        assert runtime_trigger.execution_user_id == ids["user"]
+        assert runtime_trigger.config["_execution_user_id"] == str(ids["user"])
         assert runtime_trigger.config["_scheduled_for"] == "2026-07-22T10:00:00+00:00"
         assert "Schedule timing" in format_cron_timing_context(
             runtime_trigger.config,

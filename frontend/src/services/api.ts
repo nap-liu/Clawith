@@ -439,7 +439,7 @@ export const taskApi = {
     create: (agentId: string, data: any) =>
         request<Task>(`/agents/${agentId}/tasks/`, { method: 'POST', body: JSON.stringify(data) }),
 
-    update: (agentId: string, taskId: string, data: Partial<Task>) =>
+    update: (agentId: string, taskId: string, data: Partial<Task> & { expected_execution_user_id?: string | null }) =>
         request<Task>(`/agents/${agentId}/tasks/${taskId}`, { method: 'PATCH', body: JSON.stringify(data) }),
 
     getLogs: (agentId: string, taskId: string) =>

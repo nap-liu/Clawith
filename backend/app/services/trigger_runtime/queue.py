@@ -56,6 +56,7 @@ async def enqueue_trigger_execution(
     execution = TriggerExecution(
         trigger_id=trigger.id,
         agent_id=trigger.agent_id,
+        execution_user_id=trigger.execution_user_id,
         source=source,
         status="pending",
         idempotency_key=idempotency_key[:255],

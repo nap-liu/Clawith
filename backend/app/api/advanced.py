@@ -53,7 +53,12 @@ async def delegate_task(
     await check_agent_access(db, current_user, agent_id)
     try:
         result = await collaboration_service.delegate_task(
-            db, agent_id, data.to_agent_id, data.task_title, data.task_description
+            db,
+            agent_id,
+            data.to_agent_id,
+            data.task_title,
+            data.task_description,
+            execution_user_id=current_user.id,
         )
         return result
     except ValueError as e:

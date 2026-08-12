@@ -177,7 +177,7 @@ async def enqueue_due_trigger(
         )
 
 
-InvocationKey = tuple[uuid.UUID, str]
+InvocationKey = tuple[uuid.UUID, uuid.UUID | None, str]
 
 
 async def claim_ready_trigger_invocations(
@@ -198,7 +198,7 @@ async def claim_ready_trigger_invocations(
     for execution, trigger in claimed_executions:
         runtime_trigger = build_execution_runtime_trigger(trigger, execution)
         bucket = str(execution.id) if trigger.type == "on_message" else "reflection"
-        key = (trigger.agent_id, bucket)
+        key = (trigger.agent_id, execution.execution_user_id, bucket)
         fired_by_invocation.setdefault(key, []).append(runtime_trigger)
         force_invoke.add(key)
 

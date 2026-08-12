@@ -11,7 +11,9 @@ like the existing chat_sessions tests.
 
 from __future__ import annotations
 
+import base64
 import uuid
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -86,7 +88,16 @@ async def _seed_agent(creator_id, tenant_id=None, access_mode: str = "company", 
 
 
 async def _seed_session(
-    agent_id, user_id, *, channel: str = "web", peer=None, group: bool = False, title: str = "t"
+    agent_id,
+    user_id,
+    *,
+    channel: str = "web",
+    peer=None,
+    group: bool = False,
+    title: str = "t",
+    im_config: dict | None = None,
+    group_name: str | None = None,
+    external_conv_id: str | None = None,
 ) -> ChatSession:
     async with async_session() as db:
         s = ChatSession(
@@ -96,6 +107,9 @@ async def _seed_session(
             peer_agent_id=peer,
             is_group=group,
             title=title,
+            group_name=group_name,
+            external_conv_id=external_conv_id,
+            im_config=im_config or {},
             last_message_at=datetime.now(timezone.utc),
         )
         db.add(s)
@@ -127,7 +141,16 @@ async def _seed_legacy_malformed_session(
         return s
 
 
-async def _seed_message(agent_id, user_id, conv_id, role, content, *, created_at=None) -> uuid.UUID:
+async def _seed_message(
+    agent_id,
+    user_id,
+    conv_id,
+    role,
+    content,
+    *,
+    created_at=None,
+    message_meta: dict | None = None,
+) -> uuid.UUID:
     async with async_session() as db:
         m = ChatMessage(
             agent_id=agent_id,
@@ -136,6 +159,7 @@ async def _seed_message(agent_id, user_id, conv_id, role, content, *, created_at
             content=content,
             conversation_id=str(conv_id),
             created_at=created_at or datetime.now(timezone.utc),
+            message_meta=message_meta or {},
         )
         db.add(m)
         await db.commit()
@@ -318,6 +342,21 @@ def test_render_messages_truncates_and_caps():
     assert "before=" in out                 # older-page cursor hint
 
 
+def test_message_cursor_round_trip_is_unchanged():
+    message = type(
+        "Message",
+        (),
+        {
+            "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "id": uuid.uuid4(),
+        },
+    )()
+    assert sq.decode_cursor(sq.encode_cursor(message)) == (
+        message.created_at,
+        message.id,
+    )
+
+
 # ── Task 4 + 7: handlers + permission matrix (security regressions) ─────────
 
 from app.services.session_query import DENIAL_MSG  # noqa: E402
@@ -360,6 +399,223 @@ async def test_admin_list_sees_all_including_a2a_and_trigger():
     out = await handle_list_sessions(agent.id, admin.id, str(admin_web.id), {"limit": 50})
     for s in (admin_web, member_web, a2a, trig):
         assert str(s.id) in out
+
+
+async def test_list_sessions_scene_matches_active_and_historical_snapshots():
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id)
+    agent = await _seed_agent(admin.id, tenant_id=t.id, access_mode="company")
+    active = await _seed_session(
+        agent.id,
+        admin.id,
+        title="Active scene",
+        im_config={"scene_key": "warranty"},
+    )
+    historical = await _seed_session(agent.id, admin.id, title="Historical scene")
+    unrelated = await _seed_session(agent.id, admin.id, title="Other scene")
+    await _seed_message(
+        agent.id,
+        admin.id,
+        historical.id,
+        "user",
+        "scene turn",
+        message_meta={"scene_key": "warranty", "scene_revision": 1},
+    )
+
+    out = await handle_list_sessions(
+        agent.id,
+        admin.id,
+        str(active.id),
+        {"scene": "warranty", "limit": 50},
+    )
+
+    assert str(active.id) in out
+    assert str(historical.id) in out
+    assert str(unrelated.id) not in out
+
+
+async def test_list_sessions_filters_counterpart_exact_and_fuzzy_for_people_and_a2a():
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id, name="Viewer")
+    alice = await _seed_user(tenant_id=t.id, name="Alice Zhang")
+    bob = await _seed_user(tenant_id=t.id, name="Bob")
+    agent = await _seed_agent(admin.id, tenant_id=t.id, access_mode="company")
+    peer = await _seed_agent(admin.id, tenant_id=t.id, name="Finance Copilot")
+    ctx = await _seed_session(agent.id, admin.id, title="ctx")
+    alice_chat = await _seed_session(agent.id, alice.id, title="alice")
+    bob_chat = await _seed_session(agent.id, bob.id, title="bob")
+    peer_chat = await _seed_session(agent.id, None, channel="agent", peer=peer.id, title="peer")
+
+    fuzzy = await handle_list_sessions(
+        agent.id,
+        admin.id,
+        str(ctx.id),
+        {"counterpart": "lice zh", "counterpart_match": "fuzzy", "limit": 50},
+    )
+    assert str(alice_chat.id) in fuzzy
+    assert str(bob_chat.id) not in fuzzy
+
+    exact_id = await handle_list_sessions(
+        agent.id,
+        admin.id,
+        str(ctx.id),
+        {"counterpart": str(alice.id), "counterpart_match": "exact", "limit": 50},
+    )
+    assert str(alice_chat.id) in exact_id
+    assert str(bob_chat.id) not in exact_id
+
+    a2a = await handle_list_sessions(
+        agent.id,
+        admin.id,
+        str(ctx.id),
+        {"counterpart": "Finance Copilot", "counterpart_match": "exact", "limit": 50},
+    )
+    assert str(peer_chat.id) in a2a
+
+
+async def test_list_sessions_filters_group_and_group_sender_in_summary_and_raw():
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id, name="Viewer")
+    alice = await _seed_user(tenant_id=t.id, name="Alice Zhang")
+    agent = await _seed_agent(admin.id, tenant_id=t.id, access_mode="company")
+    ctx = await _seed_session(agent.id, admin.id, title="ctx")
+    target = await _seed_session(
+        agent.id,
+        None,
+        channel="feishu",
+        group=True,
+        title="Quarterly Planning",
+        group_name="North Region Leaders",
+        external_conv_id="oc_north_leaders",
+    )
+    unrelated = await _seed_session(
+        agent.id,
+        None,
+        channel="feishu",
+        group=True,
+        title="Engineering",
+        group_name="Platform Team",
+        external_conv_id="oc_platform",
+    )
+    await _seed_message(agent.id, alice.id, target.id, "user", "hello")
+
+    group_result = await handle_list_sessions(
+        agent.id,
+        admin.id,
+        str(ctx.id),
+        {"is_group": True, "group": "north region", "group_match": "fuzzy", "limit": 50},
+    )
+    assert str(target.id) in group_result
+    assert str(unrelated.id) not in group_result
+
+    sender_result = json.loads(
+        await handle_list_sessions(
+            agent.id,
+            admin.id,
+            str(ctx.id),
+            {
+                "raw": True,
+                "counterpart": "Alice Zhang",
+                "counterpart_match": "exact",
+                "is_group": True,
+                "limit": 50,
+            },
+        )
+    )
+    assert [item["id"] for item in sender_result["items"]] == [str(target.id)]
+
+
+async def test_list_sessions_rejects_invalid_match_mode_without_querying():
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id)
+    agent = await _seed_agent(admin.id, tenant_id=t.id)
+    ctx = await _seed_session(agent.id, admin.id)
+    out = await handle_list_sessions(
+        agent.id,
+        admin.id,
+        str(ctx.id),
+        {"counterpart": "A", "counterpart_match": "regex"},
+    )
+    assert out == "❌ counterpart_match 仅支持 exact 或 fuzzy"
+
+
+async def test_list_sessions_raw_cursor_pages_every_session_once():
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id)
+    agent = await _seed_agent(admin.id, tenant_id=t.id, access_mode="company")
+    sessions = [
+        await _seed_session(agent.id, admin.id, title=f"Raw {index}")
+        for index in range(3)
+    ]
+
+    first = json.loads(
+        await handle_list_sessions(
+            agent.id,
+            admin.id,
+            str(sessions[0].id),
+            {"raw": True, "limit": 2},
+        )
+    )
+    assert first["page"]["has_more"] is True
+    assert first["page"]["next_cursor"]
+    assert all("im_config" in item and "external_conv_id" in item for item in first["items"])
+
+    second = json.loads(
+        await handle_list_sessions(
+            agent.id,
+            admin.id,
+            str(sessions[0].id),
+            {
+                "raw": True,
+                "limit": 2,
+                "cursor": first["page"]["next_cursor"],
+            },
+        )
+    )
+    returned = [item["id"] for item in first["items"] + second["items"]]
+    expected = {str(session.id) for session in sessions}
+    assert expected.issubset(set(returned))
+    assert len(returned) == len(set(returned))
+
+
+async def test_list_sessions_raw_cursor_is_bound_to_filter_set():
+    t = await _seed_tenant()
+    admin = await _seed_user(role="platform_admin", tenant_id=t.id)
+    agent = await _seed_agent(admin.id, tenant_id=t.id, access_mode="company")
+    sessions = [
+        await _seed_session(agent.id, admin.id, title=f"Bound {index}")
+        for index in range(3)
+    ]
+    first = json.loads(
+        await handle_list_sessions(
+            agent.id,
+            admin.id,
+            str(sessions[0].id),
+            {"raw": True, "query": "Bound", "limit": 1},
+        )
+    )
+    reused = await handle_list_sessions(
+        agent.id,
+        admin.id,
+        str(sessions[0].id),
+        {
+            "raw": True,
+            "query": "Different",
+            "limit": 1,
+            "cursor": first["page"]["next_cursor"],
+        },
+    )
+    assert reused == "❌ 无效 cursor"
+
+
+def test_session_cursor_rejects_naive_timestamps():
+    payload = {
+        "snapshot_at": "2026-01-01T00:00:00",
+        "created_at": "2026-01-01T00:00:00",
+        "id": str(uuid.uuid4()),
+    }
+    raw = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    assert sq.decode_session_cursor(raw) is None
 
 
 async def test_autonomous_context_excludes_human_archive_even_for_admin_creator():
@@ -485,6 +741,17 @@ def test_builtin_tools_seeded():
     assert by_name["read_session_messages"]["parameters_schema"]["required"] == ["session_id"]
     assert by_name["search_sessions"]["parameters_schema"]["required"] == ["query"]
     assert "source channel" in by_name["search_sessions"]["description"]
+    list_properties = by_name["list_sessions"]["parameters_schema"]["properties"]
+    assert {
+        "scene",
+        "raw",
+        "cursor",
+        "counterpart",
+        "counterpart_match",
+        "is_group",
+        "group",
+        "group_match",
+    } <= set(list_properties)
 
 
 # ── Task 6: dispatch routing ───────────────────────────────────────────────

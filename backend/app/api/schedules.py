@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
-from app.core.security import get_current_user, require_role
+from app.core.security import get_current_user
 from app.database import get_db
 from app.models.schedule import AgentSchedule
 from app.models.user import User
@@ -30,6 +30,8 @@ class ScheduleUpdate(BaseModel):
     instruction: str | None = None
     cron_expr: str | None = None
     is_enabled: bool | None = None
+    execution_user_id: uuid.UUID | None = None
+    expected_execution_user_id: uuid.UUID | None = None
 
 
 class ScheduleOut(BaseModel):
@@ -43,7 +45,11 @@ class ScheduleOut(BaseModel):
     next_run_at: datetime | None = None
     run_count: int
     created_by: uuid.UUID | None = None
+    created_by_user_id: uuid.UUID | None = None
+    execution_user_id: uuid.UUID | None = None
     creator_username: str | None = None
+    creator_display_name: str | None = None
+    execution_user_display_name: str | None = None
     created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
@@ -63,16 +69,26 @@ async def list_schedules(
         .order_by(AgentSchedule.created_at.desc())
     )
     schedules = result.scalars().all()
-    # Batch-load creator usernames
-    creator_ids = {s.created_by for s in schedules if s.created_by}
-    creator_map = {}
-    if creator_ids:
-        users_result = await db.execute(select(User).where(User.id.in_(creator_ids)))
-        creator_map = {u.id: u.username for u in users_result.scalars().all()}
+    user_ids = {
+        user_id
+        for schedule in schedules
+        for user_id in (schedule.created_by, schedule.execution_user_id)
+        if user_id
+    }
+    user_map = {}
+    if user_ids:
+        users_result = await db.execute(select(User).where(User.id.in_(user_ids)))
+        user_map = {u.id: u for u in users_result.scalars().all()}
     out_list = []
     for s in schedules:
         s_out = ScheduleOut.model_validate(s)
-        s_out.creator_username = creator_map.get(s.created_by)
+        creator = user_map.get(s.created_by)
+        execution_user = user_map.get(s.execution_user_id)
+        if creator:
+            s_out.creator_username = creator.username
+            s_out.creator_display_name = creator.display_name
+        if execution_user:
+            s_out.execution_user_display_name = execution_user.display_name
         out_list.append(s_out)
     return out_list
 
@@ -102,6 +118,7 @@ async def create_schedule(
         is_enabled=data.is_enabled,
         next_run_at=next_run if data.is_enabled else None,
         created_by=current_user.id,
+        execution_user_id=current_user.id,
     )
     db.add(sched)
     await db.flush()
@@ -118,8 +135,6 @@ async def update_schedule(
 ):
     """Update a schedule."""
     agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can manage schedules")
 
     result = await db.execute(
         select(AgentSchedule).where(AgentSchedule.id == schedule_id, AgentSchedule.agent_id == agent_id)
@@ -129,6 +144,45 @@ async def update_schedule(
         raise HTTPException(status_code=404, detail="Schedule not found")
 
     updates = data.model_dump(exclude_unset=True)
+    non_identity_fields = set(updates) - {
+        "execution_user_id",
+        "expected_execution_user_id",
+    }
+    if non_identity_fields and not is_agent_creator(current_user, agent):
+        raise HTTPException(status_code=403, detail="Only creator can manage schedules")
+    if "execution_user_id" in updates:
+        if updates["execution_user_id"] is None:
+            raise HTTPException(status_code=422, detail="execution_user_id cannot be null")
+        if "expected_execution_user_id" not in updates:
+            raise HTTPException(status_code=422, detail="expected_execution_user_id is required")
+        from app.services.execution_identity import (
+            ExecutionIdentityConflict,
+            ExecutionIdentityError,
+            ExecutionIdentityPermissionError,
+            reassign_background_execution_user,
+        )
+
+        try:
+            await reassign_background_execution_user(
+                db,
+                actor_user_id=current_user.id,
+                agent_id=agent_id,
+                resource_type="schedule",
+                resource_id=schedule_id,
+                execution_user_id=updates["execution_user_id"],
+                expected_execution_user_id=updates.get("expected_execution_user_id"),
+                expected_provided=True,
+            )
+        except ExecutionIdentityConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ExecutionIdentityPermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ExecutionIdentityError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        updates.pop("execution_user_id")
+        updates.pop("expected_execution_user_id", None)
+    elif "expected_execution_user_id" in updates:
+        raise HTTPException(status_code=422, detail="expected_execution_user_id requires execution_user_id")
     for field, value in updates.items():
         setattr(sched, field, value)
 
@@ -188,7 +242,14 @@ async def trigger_schedule(
     # Fire in background
     import asyncio
     from app.services.scheduler import _execute_schedule
-    asyncio.create_task(_execute_schedule(sched.id, sched.agent_id, sched.instruction))
+    asyncio.create_task(
+        _execute_schedule(
+            sched.id,
+            sched.agent_id,
+            sched.instruction,
+            sched.execution_user_id,
+        )
+    )
 
     # Update tracking
     sched.last_run_at = datetime.now(timezone.utc)
@@ -232,4 +293,3 @@ async def get_schedule_history(
         if len(history) >= 20:
             break
     return history
-

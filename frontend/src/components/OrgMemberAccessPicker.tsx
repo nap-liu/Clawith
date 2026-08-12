@@ -76,6 +76,7 @@ type Props = {
     agentId: string;
     directoryBaseUrl?: string;
     membersOnly?: boolean;
+    singleSelect?: boolean;
     users: AgentAccessUser[];
     departments: AgentAccessDepartment[];
     onClose: () => void;
@@ -109,6 +110,7 @@ export default function OrgMemberAccessPicker({
     agentId,
     directoryBaseUrl,
     membersOnly = false,
+    singleSelect = false,
     users,
     departments,
     onClose,
@@ -117,8 +119,8 @@ export default function OrgMemberAccessPicker({
     const { i18n } = useTranslation();
     const isChinese = i18n.language?.startsWith('zh');
     const labels = isChinese ? {
-        title: '选择可访问成员',
-        subtitle: '新增成员默认获得“使用”权限',
+        title: singleSelect ? '选择执行人' : '选择可访问成员',
+        subtitle: singleSelect ? '选择后续后台执行所使用的用户权限' : '新增成员默认获得“使用”权限',
         search: '搜索姓名、拼音或部门路径...',
         organization: '组织架构',
         myDepartment: '我的部门',
@@ -127,8 +129,8 @@ export default function OrgMemberAccessPicker({
         grantDepartment: '授权整个部门节点',
         grantDepartmentHint: '包含所有下级部门，人员入职、离职或调岗后自动生效',
         selectedDepartments: '已选部门',
-        selectedMembers: '已选成员',
-        individualMembers: '单独选择成员',
+        selectedMembers: singleSelect ? '已选执行人' : '已选成员',
+        individualMembers: singleSelect ? '选择成员' : '单独选择成员',
         selectDirect: '选择本部门直属成员',
         selectPage: '选择当前页成员',
         selected: '已选成员',
@@ -138,7 +140,7 @@ export default function OrgMemberAccessPicker({
         use: '使用',
         manage: '管理',
         cancel: '取消',
-        save: '保存设置',
+        save: singleSelect ? '确认选择' : '保存设置',
         saving: '保存中...',
         noDepartments: '没有匹配的部门',
         noMembers: '没有匹配的成员',
@@ -148,8 +150,8 @@ export default function OrgMemberAccessPicker({
         businessMembers: '名业务成员',
         page: '页',
     } : {
-        title: 'Choose Members',
-        subtitle: 'New members receive Use access by default',
+        title: singleSelect ? 'Choose execution user' : 'Choose Members',
+        subtitle: singleSelect ? 'Choose whose permissions future background runs use' : 'New members receive Use access by default',
         search: 'Search by name, transliteration, or department...',
         organization: 'Organization',
         myDepartment: 'My department',
@@ -158,8 +160,8 @@ export default function OrgMemberAccessPicker({
         grantDepartment: 'Grant this department node',
         grantDepartmentHint: 'Includes all descendant departments and follows future organization changes',
         selectedDepartments: 'Selected departments',
-        selectedMembers: 'Selected members',
-        individualMembers: 'Select individual members',
+        selectedMembers: singleSelect ? 'Selected execution user' : 'Selected members',
+        individualMembers: singleSelect ? 'Choose a member' : 'Select individual members',
         selectDirect: 'Select direct members',
         selectPage: 'Select this page',
         selected: 'Selected',
@@ -169,7 +171,7 @@ export default function OrgMemberAccessPicker({
         use: 'Use',
         manage: 'Manage',
         cancel: 'Cancel',
-        save: 'Save',
+        save: singleSelect ? 'Confirm selection' : 'Save',
         saving: 'Saving...',
         noDepartments: 'No matching departments',
         noMembers: 'No matching members',
@@ -305,9 +307,11 @@ export default function OrgMemberAccessPicker({
             includeDescendants,
             debouncedMemberSearch,
             page,
+            singleSelect,
         ],
         queryFn: () => {
             const params = new URLSearchParams({ page: String(page), page_size: String(PAGE_SIZE) });
+            if (singleSelect) params.set('execution_assignable', 'true');
             if (debouncedMemberSearch) {
                 params.set('search', debouncedMemberSearch);
             } else if (selectedDepartmentId) {
@@ -318,7 +322,7 @@ export default function OrgMemberAccessPicker({
                 `${directoryUrl}/members?${params}`,
             );
         },
-        enabled: open && (!!debouncedMemberSearch || !!selectedDepartmentId),
+        enabled: open && (singleSelect || !!debouncedMemberSearch || !!selectedDepartmentId),
         staleTime: 15_000,
     });
 
@@ -343,6 +347,19 @@ export default function OrgMemberAccessPicker({
     const addMember = (member: DirectoryMember) => {
         if (requiredIds.has(member.id)) return;
         setDraftUsers(current => {
+            if (singleSelect) {
+                if (current.has(member.id)) return current;
+                return new Map([[member.id, {
+                    id: member.id,
+                    name: member.name,
+                    nickname: member.nickname || undefined,
+                    email: member.email || undefined,
+                    title: member.title,
+                    avatar_url: member.avatar_url,
+                    department_path: member.department_path,
+                    access_level: 'use',
+                }]]);
+            }
             const next = new Map(current);
             if (next.has(member.id)) next.delete(member.id);
             else {
@@ -456,29 +473,29 @@ export default function OrgMemberAccessPicker({
             const selected = selectedDepartmentId === id;
             return (
                 <div key={id}>
-                    <div className={`org-access-picker__tree-row${selected ? ' is-selected' : ''}`} style={{ paddingLeft: `${depth * 14}px` }}>
+                    <button
+                        type="button"
+                        className={`org-access-picker__tree-row${selected ? ' is-selected' : ''}`}
+                        style={{ paddingLeft: `${depth * 14}px` }}
+                        title={department.path}
+                        aria-expanded={department.has_children ? expanded : undefined}
+                        onClick={() => {
+                            selectDepartment(department);
+                            if (department.has_children) void toggleExpanded(department);
+                        }}
+                    >
                         {department.has_children ? (
-                            <button
-                                type="button"
-                                className="org-access-picker__icon-button"
-                                aria-label={expanded ? 'Collapse department' : 'Expand department'}
-                                onClick={() => void toggleExpanded(department)}
-                            >
+                            <span className="org-access-picker__tree-chevron" aria-hidden="true">
                                 {expanded ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
-                            </button>
+                            </span>
                         ) : <span className="org-access-picker__tree-spacer" />}
-                        <button
-                            type="button"
-                            className="org-access-picker__tree-name"
-                            onClick={() => selectDepartment(department)}
-                            title={department.path}
-                        >
+                        <span className="org-access-picker__tree-name">
                             <span>{department.name}</span>
                             {department.direct_member_count > 0 && (
                                 <span className="org-access-picker__count">{department.direct_member_count}</span>
                             )}
-                        </button>
-                    </div>
+                        </span>
+                    </button>
                     {expanded && renderTree(id, depth + 1)}
                 </div>
             );
@@ -585,7 +602,7 @@ export default function OrgMemberAccessPicker({
                                 </div>
                                 <strong>{memberData?.total ?? 0} {isChinese ? '人' : 'members'}</strong>
                             </div>
-                            {!debouncedMemberSearch && selectedDepartmentId && (
+                            {!singleSelect && !debouncedMemberSearch && selectedDepartmentId && (
                                 <label className="org-access-picker__descendants-toggle">
                                     <input
                                         type="checkbox"
@@ -611,7 +628,7 @@ export default function OrgMemberAccessPicker({
                             </label>
                         )}
                         <div className="org-access-picker__subsection-title">{labels.individualMembers}</div>
-                        {!debouncedMemberSearch && !includeDescendants && !!memberData?.items.length && (
+                        {!singleSelect && !debouncedMemberSearch && !includeDescendants && !!memberData?.items.length && (
                             <button type="button" className="org-access-picker__select-direct" onClick={selectVisibleDirectMembers}>
                                 <IconCheck size={14} /> {memberData.has_more ? labels.selectPage : labels.selectDirect}
                             </button>
@@ -625,7 +642,8 @@ export default function OrgMemberAccessPicker({
                                         return (
                                             <label key={member.id} className={`org-access-picker__member-row${selected ? ' is-selected' : ''}${required ? ' is-required' : ''}`}>
                                                 <input
-                                                    type="checkbox"
+                                                    type={singleSelect ? 'radio' : 'checkbox'}
+                                                    name={singleSelect ? 'org-member-single-selection' : undefined}
                                                     checked={selected}
                                                     disabled={required}
                                                     onChange={() => addMember(member)}
@@ -712,7 +730,14 @@ export default function OrgMemberAccessPicker({
                     </div>
                     <div>
                         <button type="button" className="btn btn-secondary" onClick={onClose} disabled={saving}>{labels.cancel}</button>
-                        <button type="button" className="btn btn-primary" onClick={() => void handleSave()} disabled={saving}>{saving ? labels.saving : labels.save}</button>
+                        <button
+                            type="button"
+                            className="btn btn-primary"
+                            onClick={() => void handleSave()}
+                            disabled={saving || (singleSelect && selectedCount !== 1)}
+                        >
+                            {saving ? labels.saving : labels.save}
+                        </button>
                     </div>
                 </footer>
             </section>

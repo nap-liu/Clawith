@@ -42,7 +42,8 @@ def _fmt_schedule(s: AgentSchedule) -> str:
     return (
         f"  id={s.id} name={s.name!r} cron={s.cron_expr!r} enabled={s.is_enabled}"
         f" instruction={s.instruction[:60]!r} last_run={s.last_run_at} next_run={s.next_run_at}"
-        f" run_count={s.run_count}"
+        f" run_count={s.run_count} created_by_user_id={s.created_by}"
+        f" execution_user_id={s.execution_user_id}"
     )
 
 
@@ -149,6 +150,7 @@ async def set_agent_schedule_impl(
                 is_enabled=is_enabled,
                 next_run_at=next_run if is_enabled else None,
                 created_by=pc.user.id,
+                execution_user_id=pc.user.id,
             )
             db.add(sched)
             await db.flush()
@@ -246,7 +248,14 @@ async def run_agent_schedule_impl(
         # Fire in background — same mechanism as REST trigger_schedule
         import asyncio
         from app.services.scheduler import _execute_schedule
-        asyncio.create_task(_execute_schedule(sched.id, sched.agent_id, sched.instruction))
+        asyncio.create_task(
+            _execute_schedule(
+                sched.id,
+                sched.agent_id,
+                sched.instruction,
+                sched.execution_user_id,
+            )
+        )
 
         # Update tracking
         sched.last_run_at = datetime.now(timezone.utc)
@@ -263,7 +272,7 @@ async def list_agent_schedules(ctx: Context, agent: str) -> str:
     """List all cron schedules for an agent (creator/admin only).
     agent: agent id or name.
     Returns each schedule's id, name, cron_expr, is_enabled, instruction, last_run_at, next_run_at,
-    and run_count. Requires write-scope PAT."""
+    run_count, created_by_user_id, and execution_user_id. Requires write-scope PAT."""
     return await list_agent_schedules_impl(ctx, agent)
 
 

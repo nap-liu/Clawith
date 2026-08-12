@@ -876,7 +876,7 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
                 return existing_final.content
 
             owner_user_id = origin.user_id
-            configured_user = cfg.get("_origin_user_id")
+            configured_user = cfg.get("_execution_user_id") or cfg.get("_origin_user_id")
             if configured_user:
                 try:
                     owner_user_id = uuid.UUID(str(configured_user))
@@ -1111,6 +1111,25 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
         lease_heartbeat_task = asyncio.create_task(_lease_heartbeat())
 
     try:
+        configured_execution_users = {
+            trigger.execution_user_id for trigger in triggers if trigger.execution_user_id
+        }
+        if len(configured_execution_users) > 1:
+            raise RuntimeError("A trigger invocation cannot mix execution users")
+        configured_execution_user_id = next(iter(configured_execution_users), None)
+        async with async_session() as identity_db:
+            identity_agent = await identity_db.get(Agent, agent_id)
+            if identity_agent is None:
+                raise RuntimeError("Agent is unavailable")
+            from app.services.execution_identity import resolve_execution_user_id
+
+            execution_user_id = await resolve_execution_user_id(
+                identity_db,
+                identity_agent,
+                configured_execution_user_id,
+                legacy_user_id=identity_agent.creator_id,
+            )
+
         if (
             len(triggers) == 1
             and triggers[0].type == "on_message"
@@ -1121,6 +1140,9 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             origin_conversation_id = uuid.UUID(str((triggers[0].config or {})["_origin_session_id"]))
             await _link_invocation_executions(execution_ids, origin_conversation_id)
             conversation_id = origin_conversation_id
+            trigger_config = dict(triggers[0].config or {})
+            trigger_config["_execution_user_id"] = str(execution_user_id)
+            triggers[0].config = trigger_config
             await _resume_origin_session_for_on_message(agent_id, triggers[0])
             return
 
@@ -1345,7 +1367,7 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
             agent_name=agent.name,
             role_description=agent.role_description or "",
             agent_id=agent_id,
-            user_id=agent.creator_id,
+            user_id=execution_user_id,
             session_id=str(session_id),
             on_chunk=on_chunk,
             on_tool_call=on_tool_call,
@@ -1707,7 +1729,7 @@ async def _tick():
     # Invoke each independent execution.  on_message buckets are force-invoked
     # and are serialized by their exact origin session in the invocation path.
     for invocation_key, agent_triggers in fired_by_invocation.items():
-        agent_id, _bucket = invocation_key
+        agent_id, _execution_user_id, _bucket = invocation_key
         last = _last_invoke.get(invocation_key)
         if invocation_key not in force_invoke and last and (now - last).total_seconds() < DEDUP_WINDOW:
             continue  # Skip — invoked too recently

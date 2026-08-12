@@ -155,7 +155,14 @@ async def _sync_okr_report_triggers(db, settings: OKRSettings) -> None:
         return
 
     from app.models.trigger import AgentTrigger
+    from app.models.agent import Agent
     from app.services.focus_service import ensure_focus_item
+
+    okr_agent = await db.get(Agent, settings.okr_agent_id)
+    if okr_agent is None:
+        logger.warning("[OKR] Cannot sync report triggers: OKR Agent is missing")
+        return
+    creator_id = okr_agent.creator_id
 
     system_focus_ref = await ensure_focus_item(
         settings.okr_agent_id,
@@ -194,6 +201,8 @@ async def _sync_okr_report_triggers(db, settings: OKRSettings) -> None:
         if trigger is None:
             trigger = AgentTrigger(
                 agent_id=settings.okr_agent_id,
+                created_by_user_id=creator_id,
+                execution_user_id=creator_id,
                 name=name,
                 type="cron",
                 config=config,
@@ -206,6 +215,8 @@ async def _sync_okr_report_triggers(db, settings: OKRSettings) -> None:
             db.add(trigger)
             triggers[name] = trigger
             return trigger
+        trigger.created_by_user_id = trigger.created_by_user_id or creator_id
+        trigger.execution_user_id = trigger.execution_user_id or creator_id
         trigger.config = config
         trigger.reason = reason
         trigger.is_enabled = is_enabled

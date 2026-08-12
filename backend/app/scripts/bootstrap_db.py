@@ -27,6 +27,7 @@ import app.models.onboarding  # noqa: F401
 import app.models.okr  # noqa: F401
 import app.models.org  # noqa: F401
 import app.models.participant  # noqa: F401
+import app.models.personal_access_token  # noqa: F401
 import app.models.plaza  # noqa: F401
 import app.models.schedule  # noqa: F401
 import app.models.skill  # noqa: F401
@@ -70,18 +71,26 @@ PATCHES = [
     "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS source_channel VARCHAR(20) NOT NULL DEFAULT 'web'",
     "ALTER TABLE agents ADD COLUMN IF NOT EXISTS last_daily_reset TIMESTAMPTZ",
     "ALTER TABLE agents ADD COLUMN IF NOT EXISTS last_monthly_reset TIMESTAMPTZ",
-    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS tokens_used_total INTEGER DEFAULT 0",
-    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_read_tokens_today INTEGER DEFAULT 0",
-    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_read_tokens_month INTEGER DEFAULT 0",
-    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_read_tokens_total INTEGER DEFAULT 0",
-    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_creation_tokens_today INTEGER DEFAULT 0",
-    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_creation_tokens_month INTEGER DEFAULT 0",
-    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_creation_tokens_total INTEGER DEFAULT 0",
-    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS input_tokens INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS output_tokens INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS cache_read_tokens INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS cache_creation_tokens INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS estimated_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS tokens_used_total BIGINT DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_read_tokens_today BIGINT DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_read_tokens_month BIGINT DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_read_tokens_total BIGINT DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_creation_tokens_today BIGINT DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_creation_tokens_month BIGINT DEFAULT 0",
+    "ALTER TABLE agents ADD COLUMN IF NOT EXISTS cache_creation_tokens_total BIGINT DEFAULT 0",
+    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS input_tokens BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS output_tokens BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS cache_read_tokens BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS cache_creation_tokens BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE daily_token_usage ADD COLUMN IF NOT EXISTS estimated_tokens BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS created_by_user_id UUID REFERENCES users(id)",
+    "ALTER TABLE agent_triggers ADD COLUMN IF NOT EXISTS execution_user_id UUID REFERENCES users(id)",
+    # Large history table: keep startup bootstrap metadata-only. Alembic adds
+    # the FK and builds its index with the online migration path.
+    "ALTER TABLE trigger_executions ADD COLUMN IF NOT EXISTS execution_user_id UUID",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS execution_user_id UUID REFERENCES users(id)",
+    "ALTER TABLE task_logs ADD COLUMN IF NOT EXISTS execution_user_id UUID REFERENCES users(id)",
+    "ALTER TABLE agent_schedules ADD COLUMN IF NOT EXISTS execution_user_id UUID REFERENCES users(id)",
     "ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type VARCHAR(20) NOT NULL DEFAULT 'native'",
     "ALTER TABLE agents ADD COLUMN IF NOT EXISTS api_key_hash VARCHAR(128)",
     "ALTER TABLE agents ADD COLUMN IF NOT EXISTS openclaw_last_seen TIMESTAMPTZ",

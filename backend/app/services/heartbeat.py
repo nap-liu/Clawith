@@ -624,7 +624,7 @@ async def run_agent_oneshot(
         # ── Phase 1: Read agent + model config (short DB transaction) ──────────
         agent_name = ""
         agent_role = ""
-        agent_creator_id = None
+        execution_user_id = None
         model_provider = ""
         model_api_key = ""
         model_model = ""
@@ -657,7 +657,14 @@ async def run_agent_oneshot(
 
             agent_name = agent.name
             agent_role = agent.role_description or ""
-            agent_creator_id = agent.creator_id
+            from app.services.execution_identity import resolve_execution_user_id
+
+            execution_user_id = await resolve_execution_user_id(
+                db,
+                agent,
+                triggered_by_user_id,
+                legacy_user_id=agent.creator_id,
+            )
             model_provider = model.provider
             model_api_key = get_model_api_key(model)
             model_model = model.model
@@ -787,7 +794,7 @@ async def run_agent_oneshot(
 
                     logger.info(f"[Oneshot:{agent_name}] Tool call: {tool_name}({list(args.keys())})")
                     tool_result = await execute_tool(
-                        tool_name, args, agent_id, agent_creator_id,
+                        tool_name, args, agent_id, execution_user_id,
                         tool_call_id=tc["id"],
                         tools_for_llm=tools_for_llm,
                     )

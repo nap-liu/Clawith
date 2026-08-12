@@ -398,7 +398,11 @@ class TaskOut(BaseModel):
     priority: str
     assignee: str
     created_by: uuid.UUID
+    created_by_user_id: uuid.UUID
+    execution_user_id: uuid.UUID | None = None
     creator_username: str | None = None
+    creator_display_name: str | None = None
+    execution_user_display_name: str | None = None
     due_date: datetime | None = None
     supervision_target_user_id: uuid.UUID | None = None
     supervision_target_agent_id: uuid.UUID | None = None
@@ -423,6 +427,8 @@ class TaskUpdate(BaseModel):
     supervision_target_agent_id: uuid.UUID | None = None
     supervision_channel: str | None = None
     remind_schedule: str | None = None
+    execution_user_id: uuid.UUID | None = None
+    expected_execution_user_id: uuid.UUID | None = None
 
     model_config = {"extra": "forbid"}
 

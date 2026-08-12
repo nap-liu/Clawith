@@ -1803,6 +1803,7 @@ class WebSocketChatHandler:
                     agent_id=self.agent_id,
                     title=task_title,
                     created_by=self.user_id,
+                    execution_user_id=self.user_id,
                     status="pending",
                     priority="medium",
                 )
@@ -1811,7 +1812,7 @@ class WebSocketChatHandler:
                 await db.refresh(task)
                 logger.info(f"[WS] Task created: {task.id}")
                 task_id = task.id
-            asyncio.create_task(execute_task(task_id, self.agent_id))
+            asyncio.create_task(execute_task(task_id, self.agent_id, self.user_id))
             assistant_response += f"\n\n📋 Task synced to task board: [{task_title}]"
         except Exception as te:
             logger.error(f"[WS] Task creation failed: {te}")

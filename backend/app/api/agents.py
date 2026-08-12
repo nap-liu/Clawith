@@ -13,14 +13,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 
 from app.config import get_settings
-from app.core.permissions import build_visible_agents_query, check_agent_access, is_agent_creator
+from app.core.permissions import (
+    build_agent_accessible_user_ids_query,
+    build_visible_agents_query,
+    check_agent_access,
+    is_agent_creator,
+)
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent, AgentPermission
 from app.models.org import OrgDepartment, OrgMember
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
-from app.models.user import User
+from app.models.user import Identity, User
 from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.org_directory import (
@@ -118,24 +123,39 @@ async def _lazy_reset_token_counters(agent: Agent, db: AsyncSession) -> bool:
     """
     from datetime import datetime, timezone as tz
     now = datetime.now(tz.utc)
-    changed = False
+    from sqlalchemy import or_, update
 
-    last_daily = agent.last_daily_reset
-    if last_daily is None or last_daily.date() < now.date():
-        agent.tokens_used_today = 0
-        agent.cache_read_tokens_today = 0
-        agent.cache_creation_tokens_today = 0
-        agent.last_daily_reset = now
-        changed = True
-
-    last_monthly = agent.last_monthly_reset
-    if last_monthly is None or (last_monthly.year, last_monthly.month) < (now.year, now.month):
-        agent.tokens_used_month = 0
-        agent.cache_read_tokens_month = 0
-        agent.cache_creation_tokens_month = 0
-        agent.last_monthly_reset = now
-        changed = True
-
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = day_start.replace(day=1)
+    daily = await db.execute(
+        update(Agent)
+        .where(
+            Agent.id == agent.id,
+            or_(Agent.last_daily_reset.is_(None), Agent.last_daily_reset < day_start),
+        )
+        .values(
+            tokens_used_today=0,
+            cache_read_tokens_today=0,
+            cache_creation_tokens_today=0,
+            last_daily_reset=now,
+        )
+    )
+    monthly = await db.execute(
+        update(Agent)
+        .where(
+            Agent.id == agent.id,
+            or_(Agent.last_monthly_reset.is_(None), Agent.last_monthly_reset < month_start),
+        )
+        .values(
+            tokens_used_month=0,
+            cache_read_tokens_month=0,
+            cache_creation_tokens_month=0,
+            last_monthly_reset=now,
+        )
+    )
+    changed = bool(daily.rowcount or monthly.rowcount)
+    if changed:
+        await db.refresh(agent)
     return changed
 
 
@@ -843,6 +863,7 @@ async def get_agent_permission_members(
     agent_id: uuid.UUID,
     department_id: uuid.UUID | None = None,
     include_descendants: bool = False,
+    execution_assignable: bool = False,
     search: str | None = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
@@ -855,6 +876,105 @@ async def get_agent_permission_members(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can change permissions")
     if not agent.tenant_id:
         return {"items": [], "page": page, "page_size": page_size, "total": 0, "has_more": False}
+
+    if execution_assignable:
+        accessible_user_ids = build_agent_accessible_user_ids_query(agent).subquery()
+        candidate_filters = [
+            User.tenant_id == agent.tenant_id,
+            User.is_active == True,  # noqa: E712
+            or_(
+                User.id.in_(select(accessible_user_ids.c.id)),
+                User.role == "platform_admin",
+                Identity.is_platform_admin == True,  # noqa: E712
+            ),
+        ]
+        normalized_search = (search or "").strip()
+        if normalized_search:
+            pattern = f"%{normalized_search}%"
+            candidate_filters.append(
+                or_(
+                    User.display_name.ilike(pattern),
+                    User.identity.has(
+                        or_(Identity.email.ilike(pattern), Identity.username.ilike(pattern))
+                    ),
+                )
+            )
+        elif department_id:
+            department_result = await db.execute(
+                select(OrgDepartment).where(
+                    OrgDepartment.id == department_id,
+                    OrgDepartment.tenant_id == agent.tenant_id,
+                    OrgDepartment.status == "active",
+                )
+            )
+            department = department_result.scalar_one_or_none()
+            if not department:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+            department_ids = [department.id]
+            if include_descendants:
+                subtree = department_subtree_cte(
+                    tenant_id=agent.tenant_id,
+                    department_id=department.id,
+                    name="execution_picker_department_subtree",
+                )
+                department_ids = select(subtree.c.department_id)
+            department_user_ids = select(OrgMember.user_id).where(
+                OrgMember.tenant_id == agent.tenant_id,
+                OrgMember.status == "active",
+                OrgMember.department_id.in_(department_ids),
+                OrgMember.user_id.is_not(None),
+            )
+            candidate_filters.append(User.id.in_(department_user_ids))
+
+        candidate_query = select(User).outerjoin(Identity, Identity.id == User.identity_id).where(*candidate_filters)
+        count_result = await db.execute(
+            select(func.count()).select_from(candidate_query.subquery())
+        )
+        total = int(count_result.scalar_one() or 0)
+        candidates_result = await db.execute(
+            candidate_query
+            .options(selectinload(User.identity))
+            .order_by(User.display_name.asc(), User.id.asc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        candidates = candidates_result.scalars().all()
+
+        profile_map: dict[uuid.UUID, OrgMember] = {}
+        if candidates:
+            profile_result = await db.execute(
+                select(OrgMember)
+                .where(
+                    OrgMember.tenant_id == agent.tenant_id,
+                    OrgMember.status == "active",
+                    OrgMember.user_id.in_([candidate.id for candidate in candidates]),
+                )
+                .order_by(OrgMember.user_id.asc(), OrgMember.id.asc())
+            )
+            for profile in profile_result.scalars().all():
+                if profile.user_id and profile.user_id not in profile_map:
+                    profile_map[profile.user_id] = profile
+
+        return {
+            "items": [
+                {
+                    "id": str(candidate.id),
+                    "member_id": str(profile.id) if (profile := profile_map.get(candidate.id)) else None,
+                    "name": candidate.display_name,
+                    "nickname": profile.nickname if profile else None,
+                    "department_id": str(profile.department_id) if profile and profile.department_id else None,
+                    "department_path": (profile.department_path or "") if profile else "",
+                    "title": (profile.title or candidate.title or "") if profile else (candidate.title or ""),
+                    "avatar_url": (profile.avatar_url if profile else None) or candidate.avatar_url,
+                    "email": candidate.email,
+                }
+                for candidate in candidates
+            ],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "has_more": page * page_size < total,
+        }
 
     filters = [
         OrgMember.tenant_id == agent.tenant_id,

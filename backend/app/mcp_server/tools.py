@@ -306,7 +306,12 @@ async def list_sessions(  # noqa: D401
 
         where = or_(*preds)
         rows, total = await sq.fetch_sessions(
-            db, where, channel=channel, limit=min(limit, 50), offset=offset
+            db,
+            where,
+            agent_id=agent_list[0].id,
+            channel=channel,
+            limit=min(limit, 50),
+            offset=offset,
         )
         counts = await sq.count_messages_per_session(db, [r.id for r in rows])
 

@@ -329,6 +329,37 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "set_execution_user",
+            "description": (
+                "调整指定后台任务的执行人。用于在需要时将后续执行交由另一位有权限的用户；"
+                "已经开始的执行不受影响。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "resource_type": {
+                        "type": "string",
+                        "enum": ["trigger", "task", "schedule"],
+                    },
+                    "resource_id": {"type": "string"},
+                    "execution_user_id": {"type": "string"},
+                    "expected_execution_user_id": {"type": ["string", "null"]},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+                },
+                "required": [
+                    "resource_type",
+                    "resource_id",
+                    "execution_user_id",
+                    "expected_execution_user_id",
+                    "reason",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_files",
             "description": "List files and folders in a directory within my workspace. Every displayed path is the canonical virtual path reported by storage; copy it exactly when calling another file tool. Use this before writing new workspace documents so you can inspect the current folder structure, reuse existing topical subfolders when appropriate, and avoid dumping files directly into the workspace root unless there is a clear reason. Can also list enterprise_info/ for shared company information.",
             "parameters": {
@@ -668,7 +699,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_triggers",
-            "description": "List all your active triggers. Shows name, type, config, reason, fire count, and status.",
+            "description": "List all your triggers, including each trigger's creator and execution user IDs.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -3687,6 +3718,17 @@ async def execute_tool(
         elif tool_name == "list_sessions":
             from app.services.tools.session_introspection import handle_list_sessions
             return await handle_list_sessions(agent_id, user_id, session_id, arguments)
+        elif tool_name == "set_execution_user":
+            from app.services.execution_identity import (
+                handle_reassign_background_execution_user,
+            )
+            return await handle_reassign_background_execution_user(
+                agent_id,
+                user_id,
+                session_id,
+                turn_anchor_id,
+                arguments,
+            )
         elif tool_name == "read_session_messages":
             from app.services.tools.session_introspection import handle_read_session_messages
             return await handle_read_session_messages(agent_id, user_id, session_id, arguments)
@@ -8861,6 +8903,7 @@ async def _manage_tasks(
                 type=task_type,
                 priority=args.get("priority", "medium"),
                 created_by=user_id,
+                execution_user_id=user_id,
                 status="pending",
                 supervision_target_user_id=target_user_id,
                 supervision_target_agent_id=target_agent_id,
@@ -8878,7 +8921,7 @@ async def _manage_tasks(
                 # Trigger auto-execution for todo tasks
                 import asyncio
                 from app.services.task_executor import execute_task
-                asyncio.create_task(execute_task(task.id, agent_id))
+                asyncio.create_task(execute_task(task.id, agent_id, task.execution_user_id))
                 await _sync_tasks_to_file(agent_id, ws)
                 return f"✅ Task created: {title} — auto-execution started"
             else:
@@ -10738,6 +10781,7 @@ async def _create_on_message_trigger(
     """Programmatically create an on_message trigger for an agent."""
     from app.models.trigger import AgentTrigger
 
+    creator_user_id = uuid.UUID(origin_user_id) if origin_user_id else None
     focus_ref = await ensure_focus_item(
         agent_id,
         focus_ref=focus_ref,
@@ -10884,6 +10928,8 @@ async def _create_on_message_trigger(
         else:
             trigger = AgentTrigger(
                 agent_id=agent_id,
+                created_by_user_id=creator_user_id,
+                execution_user_id=creator_user_id,
                 name=trigger_name,
                 type="on_message",
                 config=config,
@@ -13117,6 +13163,8 @@ async def _handle_set_trigger(
             else:
                 trigger = AgentTrigger(
                     agent_id=agent_id,
+                    created_by_user_id=user_id,
+                    execution_user_id=user_id,
                     name=name,
                     type=ttype,
                     config=config,
@@ -13373,7 +13421,6 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
     """List all active triggers for the agent."""
     from app.models.trigger import AgentTrigger
     from app.models.agent import Agent as AgentModel
-    from app.models.tenant import Tenant as TenantModel
     from app.core.domain import resolve_base_url
 
     try:
@@ -13401,8 +13448,8 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
         lines = [
             f"on_message: {active_onmessage} active / {total_onmessage} total",
             "",
-            "| Name | Type | Config | Webhook URL | Reason | Status | Fires |",
-            "|------|------|--------|-------------|--------|--------|-------|",
+            "| ID | Name | Type | Config | Webhook URL | Reason | Status | Fires | Created By | Execution User |",
+            "|----|------|------|--------|-------------|--------|--------|-------|------------|----------------|",
         ]
         for t in triggers:
             status = "✅ active" if t.is_enabled else "⏸ disabled"
@@ -13417,7 +13464,11 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
                 config_str = str(public_config)[:50]
                 webhook_url = "-"
             reason_str = t.reason[:40] if t.reason else ""
-            lines.append(f"| {t.name} | {t.type} | {config_str} | {webhook_url} | {reason_str} | {status} | {t.fire_count} |")
+            lines.append(
+                f"| {t.id} | {t.name} | {t.type} | {config_str} | {webhook_url} | "
+                f"{reason_str} | {status} | {t.fire_count} | {t.created_by_user_id} | "
+                f"{t.execution_user_id} |"
+            )
 
         return "\n".join(lines)
 

@@ -16,7 +16,7 @@ export const AGENT_DETAIL_TABS = [
 export type AgentDetailTab = typeof AGENT_DETAIL_TABS[number];
 
 export const AGENT_DETAIL_SETTINGS_TABS = AGENT_DETAIL_TABS.filter(
-    (tab) => !['aware', 'workspace', 'chat'].includes(tab),
+    (tab) => !['workspace', 'chat'].includes(tab),
 ) as AgentDetailTab[];
 
 export function isAgentDetailTab(value: string | null | undefined): value is AgentDetailTab {

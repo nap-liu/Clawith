@@ -13,6 +13,7 @@ Signature contract: ``(agent_id, user_id, ctx_session_id, arguments) -> str``
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime
 
@@ -55,19 +56,113 @@ async def handle_list_sessions(agent_id, user_id, ctx_session_id, arguments) -> 
         agent = await _load_agent(db, agent_id)
         if not agent:
             return sq.DENIAL_MSG
-        _scope, where = await sq.resolve_scope(db, agent, ctx_session_id, user_id)
+        scope, where = await sq.resolve_scope(db, agent, ctx_session_id, user_id)
         if where is None:
             return fmt.empty_list("会话")
 
+        scene = (arguments.get("scene") or "").strip() or None
+        if scene:
+            try:
+                from app.schemas.scene import validate_scene_key
+
+                scene = validate_scene_key(scene)
+            except ValueError as exc:
+                return f"❌ 无效 scene: {exc}"
+
+        counterpart = (arguments.get("counterpart") or "").strip() or None
+        group = (arguments.get("group") or "").strip() or None
+        counterpart_match = arguments.get("counterpart_match") or "fuzzy"
+        group_match = arguments.get("group_match") or "fuzzy"
+        if counterpart_match not in {"exact", "fuzzy"}:
+            return "❌ counterpart_match 仅支持 exact 或 fuzzy"
+        if group_match not in {"exact", "fuzzy"}:
+            return "❌ group_match 仅支持 exact 或 fuzzy"
+        is_group = arguments.get("is_group")
+        if is_group is not None and not isinstance(is_group, bool):
+            return "❌ is_group 必须是布尔值"
+
         limit = _clamp(arguments.get("limit"), default=20, lo=1, hi=50)
+        raw = arguments.get("raw") is True
+        if raw:
+            filter_fingerprint = sq.session_filter_fingerprint(
+                agent_id=agent.id,
+                scope=scope,
+                viewer_id=user_id,
+                channel=arguments.get("channel") or None,
+                query=(arguments.get("query") or "").strip() or None,
+                since=arguments.get("since") or None,
+                until=arguments.get("until") or None,
+                scene=scene,
+                counterpart=counterpart,
+                counterpart_match=counterpart_match,
+                is_group=is_group,
+                group=group,
+                group_match=group_match,
+            )
+            cursor_value = arguments.get("cursor")
+            cursor = sq.decode_session_cursor(
+                cursor_value,
+                expected_filter_fingerprint=filter_fingerprint,
+            )
+            if cursor_value and cursor is None:
+                return "❌ 无效 cursor"
+            sessions, total, snapshot_at, next_cursor = await sq.fetch_sessions_raw(
+                db,
+                where,
+                agent_id=agent.id,
+                channel=arguments.get("channel"),
+                title_query=(arguments.get("query") or "").strip() or None,
+                since=_parse_dt(arguments.get("since")),
+                until=_parse_dt(arguments.get("until")),
+                scene=scene,
+                counterpart=counterpart,
+                counterpart_match=counterpart_match,
+                is_group=is_group,
+                group=group,
+                group_match=group_match,
+                limit=limit,
+                cursor=cursor,
+                filter_fingerprint=filter_fingerprint,
+            )
+            items = []
+            for session in sessions:
+                items.append(
+                    {
+                        column.name: getattr(session, column.name)
+                        for column in ChatSession.__table__.columns
+                    }
+                )
+            return json.dumps(
+                {
+                    "items": items,
+                    "page": {
+                        "limit": limit,
+                        "total": total,
+                        "has_more": next_cursor is not None,
+                        "next_cursor": next_cursor,
+                        "snapshot_at": snapshot_at.isoformat(),
+                    },
+                },
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            )
+
         offset = _clamp(arguments.get("offset"), default=0, lo=0, hi=1_000_000)
         sessions, total = await sq.fetch_sessions(
             db,
             where,
+            agent_id=agent.id,
             channel=arguments.get("channel"),
             title_query=(arguments.get("query") or "").strip() or None,
             since=_parse_dt(arguments.get("since")),
             until=_parse_dt(arguments.get("until")),
+            scene=scene,
+            counterpart=counterpart,
+            counterpart_match=counterpart_match,
+            is_group=is_group,
+            group=group,
+            group_match=group_match,
             limit=limit,
             offset=offset,
         )

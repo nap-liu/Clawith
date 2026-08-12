@@ -43,6 +43,9 @@ class Task(Base):
     )
     assignee: Mapped[str] = mapped_column(String(50), default="self")  # "self" or user_id
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    execution_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True
+    )
     due_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Supervision specific fields
@@ -50,7 +53,7 @@ class Task(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )
     supervision_target_agent_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agents.id")
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="SET NULL")
     )
     # Display snapshot only. Never use this value to resolve or authorize a target.
     supervision_target_name: Mapped[str | None] = mapped_column(String(100))
@@ -62,6 +65,11 @@ class Task(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    @property
+    def created_by_user_id(self) -> uuid.UUID:
+        """Canonical response alias; keep legacy ``created_by`` unchanged."""
+        return self.created_by
 
     # Relationships
     agent: Mapped["Agent"] = relationship(back_populates="tasks", foreign_keys=[agent_id])
@@ -77,6 +85,9 @@ class TaskLog(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tasks.id"), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    execution_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     task: Mapped["Task"] = relationship(back_populates="logs")

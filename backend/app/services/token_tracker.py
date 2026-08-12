@@ -4,6 +4,7 @@ Provides a single function to record token consumption against an Agent,
 used by web chat, heartbeat, triggers, and A2A communication.
 """
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 
@@ -185,66 +186,169 @@ async def record_token_usage(
         cache_creation_tokens=cache_creation_tokens,
         estimated_tokens=estimated_tokens,
     )
-    if usage.total_tokens <= 0:
+    persisted_values = {
+        "total_tokens": usage.total_tokens,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_creation_tokens": usage.cache_creation_tokens,
+        "estimated_tokens": usage.estimated_tokens,
+    }
+    if any(not isinstance(value, int) or value < 0 for value in persisted_values.values()):
+        logger.warning(
+            "Rejected invalid token usage agent_id={} usage={}",
+            agent_id,
+            persisted_values,
+        )
+        return
+    if usage.total_tokens == 0:
         return
 
-    try:
-        from app.database import async_session
-        from app.models.agent import Agent
-        from sqlalchemy import select
+    for attempt in range(3):
+        try:
+            await _record_token_usage_once(agent_id, usage)
+            return
+        except Exception as exc:
+            sqlstate = _sqlstate(exc)
+            retryable = sqlstate in {"40001", "40P01"}
+            logger.warning(
+                "Token usage persistence failed agent_id={} total_tokens={} "
+                "sqlstate={} attempt={} retryable={} error={}",
+                agent_id,
+                usage.total_tokens,
+                sqlstate,
+                attempt + 1,
+                retryable,
+                str(exc)[:300],
+            )
+            if not retryable or attempt == 2:
+                return
+            await asyncio.sleep(0.05 * (attempt + 1))
 
-        async with async_session() as db:
-            result = await db.execute(select(Agent).where(Agent.id == agent_id))
-            agent = result.scalar_one_or_none()
-            if agent:
-                agent.tokens_used_today = (agent.tokens_used_today or 0) + usage.total_tokens
-                agent.tokens_used_month = (agent.tokens_used_month or 0) + usage.total_tokens
-                agent.tokens_used_total = (agent.tokens_used_total or 0) + usage.total_tokens
-                agent.cache_read_tokens_today = (agent.cache_read_tokens_today or 0) + usage.cache_read_tokens
-                agent.cache_read_tokens_month = (agent.cache_read_tokens_month or 0) + usage.cache_read_tokens
-                agent.cache_read_tokens_total = (agent.cache_read_tokens_total or 0) + usage.cache_read_tokens
-                agent.cache_creation_tokens_today = (
-                    agent.cache_creation_tokens_today or 0
-                ) + usage.cache_creation_tokens
-                agent.cache_creation_tokens_month = (
-                    agent.cache_creation_tokens_month or 0
-                ) + usage.cache_creation_tokens
-                agent.cache_creation_tokens_total = (
-                    agent.cache_creation_tokens_total or 0
-                ) + usage.cache_creation_tokens
 
-                from datetime import datetime, timezone
-                from sqlalchemy.dialects.postgresql import insert
-                from app.models.activity_log import DailyTokenUsage
+def _sqlstate(exc: Exception) -> str | None:
+    current = exc
+    for _ in range(4):
+        value = getattr(current, "sqlstate", None) or getattr(current, "pgcode", None)
+        if value:
+            return str(value)
+        current = getattr(current, "orig", None) or getattr(current, "__cause__", None)
+        if current is None:
+            break
+    return None
 
-                today_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-                stmt = insert(DailyTokenUsage).values(
-                    tenant_id=agent.tenant_id,
-                    agent_id=agent.id,
-                    date=today_date,
-                    tokens_used=usage.total_tokens,
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cache_read_tokens=usage.cache_read_tokens,
-                    cache_creation_tokens=usage.cache_creation_tokens,
-                    estimated_tokens=usage.estimated_tokens,
-                ).on_conflict_do_update(
-                    index_elements=["agent_id", "date"],
-                    set_=dict(
-                        tokens_used=DailyTokenUsage.tokens_used + usage.total_tokens,
-                        input_tokens=DailyTokenUsage.input_tokens + usage.input_tokens,
-                        output_tokens=DailyTokenUsage.output_tokens + usage.output_tokens,
-                        cache_read_tokens=DailyTokenUsage.cache_read_tokens + usage.cache_read_tokens,
-                        cache_creation_tokens=DailyTokenUsage.cache_creation_tokens + usage.cache_creation_tokens,
-                        estimated_tokens=DailyTokenUsage.estimated_tokens + usage.estimated_tokens,
-                    )
-                )
-                await db.execute(stmt)
 
-                await db.commit()
-                logger.debug(
-                    f"Recorded {usage.total_tokens:,} tokens for agent {agent.name} "
-                    f"(cache_read={usage.cache_read_tokens:,})"
-                )
-    except Exception as e:
-        logger.warning(f"Failed to record token usage for agent {agent_id}: {e}")
+async def _record_token_usage_once(agent_id: uuid.UUID, usage: TokenUsage) -> None:
+    """Atomically update agent and daily counters in one transaction."""
+    from datetime import datetime, timezone
+
+    from sqlalchemy import case, func, or_, update
+    from sqlalchemy.dialects.postgresql import insert
+
+    from app.database import async_session
+    from app.models.activity_log import DailyTokenUsage
+    from app.models.agent import Agent
+
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = day_start.replace(day=1)
+    daily_reset = or_(Agent.last_daily_reset.is_(None), Agent.last_daily_reset < day_start)
+    monthly_reset = or_(
+        Agent.last_monthly_reset.is_(None), Agent.last_monthly_reset < month_start
+    )
+
+    def increment(column, delta: int):
+        return func.coalesce(column, 0) + delta
+
+    async with async_session() as db:
+        result = await db.execute(
+            update(Agent)
+            .where(Agent.id == agent_id)
+            .values(
+                tokens_used_today=case(
+                    (daily_reset, usage.total_tokens),
+                    else_=increment(Agent.tokens_used_today, usage.total_tokens),
+                ),
+                cache_read_tokens_today=case(
+                    (daily_reset, usage.cache_read_tokens),
+                    else_=increment(Agent.cache_read_tokens_today, usage.cache_read_tokens),
+                ),
+                cache_creation_tokens_today=case(
+                    (daily_reset, usage.cache_creation_tokens),
+                    else_=increment(
+                        Agent.cache_creation_tokens_today,
+                        usage.cache_creation_tokens,
+                    ),
+                ),
+                last_daily_reset=case(
+                    (daily_reset, now), else_=Agent.last_daily_reset
+                ),
+                tokens_used_month=case(
+                    (monthly_reset, usage.total_tokens),
+                    else_=increment(Agent.tokens_used_month, usage.total_tokens),
+                ),
+                cache_read_tokens_month=case(
+                    (monthly_reset, usage.cache_read_tokens),
+                    else_=increment(Agent.cache_read_tokens_month, usage.cache_read_tokens),
+                ),
+                cache_creation_tokens_month=case(
+                    (monthly_reset, usage.cache_creation_tokens),
+                    else_=increment(
+                        Agent.cache_creation_tokens_month,
+                        usage.cache_creation_tokens,
+                    ),
+                ),
+                last_monthly_reset=case(
+                    (monthly_reset, now), else_=Agent.last_monthly_reset
+                ),
+                tokens_used_total=increment(Agent.tokens_used_total, usage.total_tokens),
+                cache_read_tokens_total=increment(
+                    Agent.cache_read_tokens_total, usage.cache_read_tokens
+                ),
+                cache_creation_tokens_total=increment(
+                    Agent.cache_creation_tokens_total, usage.cache_creation_tokens
+                ),
+            )
+            .returning(Agent.tenant_id, Agent.name)
+        )
+        agent_row = result.one_or_none()
+        if agent_row is None:
+            await db.rollback()
+            return
+
+        stmt = insert(DailyTokenUsage).values(
+            tenant_id=agent_row.tenant_id,
+            agent_id=agent_id,
+            date=day_start,
+            tokens_used=usage.total_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_creation_tokens=usage.cache_creation_tokens,
+            estimated_tokens=usage.estimated_tokens,
+        ).on_conflict_do_update(
+            index_elements=["agent_id", "date"],
+            set_={
+                "tokens_used": DailyTokenUsage.tokens_used + usage.total_tokens,
+                "input_tokens": DailyTokenUsage.input_tokens + usage.input_tokens,
+                "output_tokens": DailyTokenUsage.output_tokens + usage.output_tokens,
+                "cache_read_tokens": (
+                    DailyTokenUsage.cache_read_tokens + usage.cache_read_tokens
+                ),
+                "cache_creation_tokens": (
+                    DailyTokenUsage.cache_creation_tokens + usage.cache_creation_tokens
+                ),
+                "estimated_tokens": (
+                    DailyTokenUsage.estimated_tokens + usage.estimated_tokens
+                ),
+                "updated_at": now,
+            },
+        )
+        await db.execute(stmt)
+        await db.commit()
+        logger.debug(
+            "Recorded {:,} tokens for agent {} (cache_read={:,})",
+            usage.total_tokens,
+            agent_row.name,
+            usage.cache_read_tokens,
+        )

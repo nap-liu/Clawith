@@ -108,7 +108,14 @@ def is_company_visible_agent(agent: Agent) -> bool:
 
 
 def _is_admin(user: User) -> bool:
-    return user.role in ("platform_admin", "org_admin")
+    return is_platform_admin_user(user) or user.role == "org_admin"
+
+
+def is_platform_admin_user(user: User) -> bool:
+    """Single role/Identity interpretation for platform administrator status."""
+    return user.role == "platform_admin" or bool(
+        getattr(getattr(user, "identity", None), "is_platform_admin", False)
+    )
 
 
 def current_agent_tenant_matches(user: User, agent: Agent) -> bool:
@@ -258,7 +265,7 @@ async def get_agent_access_level_for_user_id(
     access_mode = getattr(agent, "access_mode", None) or "company"
     # platform_admin manages everything in the tenant including others' private agents.
     # org_admin only manages non-private agents — preserves v1.9.3 privacy guarantee.
-    if user.role == "platform_admin":
+    if is_platform_admin_user(user):
         return "manage"
     if user.role == "org_admin" and access_mode != "private":
         return "manage"
@@ -602,7 +609,7 @@ async def check_agent_access(db: AsyncSession, user: User, agent_id: uuid.UUID) 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
     # Platform admins are the only role with intentional cross-tenant access.
-    if user.role == "platform_admin":
+    if is_platform_admin_user(user):
         return agent, "manage"
 
     # Tenant isolation applies to every tenant-scoped role, including org admins.

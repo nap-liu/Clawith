@@ -1070,26 +1070,23 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     if task_title:
                         try:
                             from app.models.task import Task as TaskModel
-                            from app.models.agent import Agent as AgentModel
                             from app.services.task_executor import execute_task
                             import asyncio as _asyncio
-
-                            # Find the agent's creator to use as task creator
-                            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                            agent_obj_task = agent_r.scalar_one_or_none()
-                            creator_id_task = agent_obj_task.creator_id if agent_obj_task else agent_id
 
                             task_obj = TaskModel(
                                 agent_id=agent_id,
                                 title=task_title,
-                                created_by=creator_id_task,
+                                created_by=platform_user_id,
+                                execution_user_id=platform_user_id,
                                 status="pending",
                                 priority="medium",
                             )
                             db.add(task_obj)
                             await db.commit()
                             await db.refresh(task_obj)
-                            _asyncio.create_task(execute_task(task_obj.id, agent_id))
+                            _asyncio.create_task(
+                                execute_task(task_obj.id, agent_id, task_obj.execution_user_id)
+                            )
                             reply_text += f"\n\n📋 已同步创建任务到任务面板：【{task_title}】"
                             logger.info(f"[Feishu] Created task: {task_title}")
                         except Exception as e:

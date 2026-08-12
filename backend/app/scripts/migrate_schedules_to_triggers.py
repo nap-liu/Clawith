@@ -46,6 +46,8 @@ async def migrate():
 
             trigger = AgentTrigger(
                 agent_id=s.agent_id,
+                created_by_user_id=s.created_by,
+                execution_user_id=s.execution_user_id or s.created_by,
                 name=f"migrated_{s.name[:80]}",
                 type="cron",
                 config={"expr": s.cron_expr},

@@ -24,7 +24,8 @@ class CollaborationService:
 
     async def delegate_task(
         self, db: AsyncSession, from_agent_id: uuid.UUID,
-        to_agent_id: uuid.UUID, task_title: str, task_description: str
+        to_agent_id: uuid.UUID, task_title: str, task_description: str,
+        execution_user_id: uuid.UUID | None = None,
     ) -> dict:
         """Agent A delegates a task to Agent B."""
         from app.models.task import Task
@@ -41,13 +42,15 @@ class CollaborationService:
             raise ValueError(f"Target agent '{to_agent.name}' is not running")
 
         # Create task for target agent
+        creator_user_id = execution_user_id or from_agent.creator_id
         task = Task(
             agent_id=to_agent_id,
             title=f"[委托自 {from_agent.name}] {task_title}",
             description=task_description,
             type="todo",
             priority="medium",
-            created_by=from_agent.creator_id,
+            created_by=creator_user_id,
+            execution_user_id=creator_user_id,
             assignee="self",
         )
         db.add(task)

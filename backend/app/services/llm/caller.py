@@ -2056,6 +2056,7 @@ async def call_agent_llm_with_tools(
     user_prompt: str,
     max_rounds: int = 50,
     session_id: str = "",
+    execution_user_id: uuid.UUID | None = None,
 ) -> str:
     """Call agent LLM with tool-calling loop (for background services)."""
     from app.models.agent import Agent
@@ -2066,6 +2067,18 @@ async def call_agent_llm_with_tools(
     agent: Agent | None = agent_result.scalar_one_or_none()
     if not agent:
         return "⚠️ Agent not found"
+
+    if execution_user_id is None:
+        # Rolling-upgrade compatibility for legacy background call sites.
+        execution_user_id = agent.creator_id
+    else:
+        from app.services.execution_identity import resolve_execution_user_id
+
+        execution_user_id = await resolve_execution_user_id(
+            db,
+            agent,
+            execution_user_id,
+        )
 
     # Load models
     primary_model: LLMModel | None = None
@@ -2199,9 +2212,8 @@ async def call_agent_llm_with_tools(
                             conversation_id=session_id,
                             chat_session_id=None,
                             source_channel="web",
-                            # Background tool loops have no live requester; bind the
-                            # confirmation to the agent creator who owns the approval.
-                            user_id=agent.creator_id,
+                            # Bind background confirmation to the configured executor.
+                            user_id=execution_user_id,
                             intro_text=response.content,
                             title=conf_call.title,
                             summary=conf_call.summary,
@@ -2284,7 +2296,7 @@ async def call_agent_llm_with_tools(
                             tool_name,
                             args,
                             agent_id=agent_id,
-                            user_id=agent.creator_id,
+                            user_id=execution_user_id,
                             session_id=session_id,
                             tool_call_id=str(tc.get("id") or ""),
                             tools_for_llm=tools_for_llm,

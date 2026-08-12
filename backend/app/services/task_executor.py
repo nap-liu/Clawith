@@ -4,8 +4,6 @@ Uses the same agent context (soul, memory, skills, relationships, tools)
 as the chat dialog. Supports tool-calling loop for autonomous execution.
 """
 
-import asyncio
-import json
 import uuid
 from datetime import datetime, timezone
 
@@ -15,13 +13,16 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import async_session
 from app.models.agent import Agent
-from app.models.llm import LLMModel
 from app.models.task import Task, TaskLog
 
 settings = get_settings()
 
 
-async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
+async def execute_task(
+    task_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    execution_user_id: uuid.UUID | None = None,
+) -> None:
     """Execute a task using the agent's configured LLM with full context.
 
     Uses the same context as chat dialog: build_agent_context for system prompt,
@@ -32,6 +33,7 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
       - supervision tasks: pending → doing → pending (stays active, just logs result)
     """
     logger.info(f"[TaskExec] Starting task {task_id} for agent {agent_id}")
+    task_run_id: uuid.UUID | None = None
 
     # Step 1: Mark as doing
     async with async_session() as db:
@@ -42,11 +44,30 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
             return
 
         task.status = "doing"
-        db.add(TaskLog(task_id=task_id, content="🤖 开始执行任务..."))
+        task_execution_user_id = execution_user_id or task.execution_user_id
+        task_run = TaskLog(
+            task_id=task_id,
+            content="🤖 开始执行任务...",
+            execution_user_id=task_execution_user_id,
+        )
+        db.add(task_run)
+        await db.flush()
+        task_run_id = task_run.id
         await db.commit()
         task_title = task.title
         task_description = task.description or ""
         task_type = task.type  # 'todo' or 'supervision'
+
+    # Reload the durable run snapshot after releasing the transition
+    # transaction. This is the source of truth if an administrator reassigns
+    # future task runs while this run is already active.
+    async with async_session() as db:
+        snapshot = await db.scalar(
+            select(TaskLog.execution_user_id)
+            .where(TaskLog.id == task_run_id)
+        )
+        if snapshot is not None:
+            task_execution_user_id = snapshot
 
     # Step 2: Load agent
     async with async_session() as db:
@@ -66,7 +87,11 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
         # the model to re-resolve a display name or choose an unrelated target.
         from app.services.supervision_reminder import _send_supervision_reminder
 
-        await _send_supervision_reminder(task, agent_name)
+        await _send_supervision_reminder(
+            task,
+            agent_name,
+            execution_user_id=task_execution_user_id,
+        )
         await _restore_supervision_status(task_id)
         return
 
@@ -111,6 +136,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
                 user_prompt=user_prompt,
                 max_rounds=50,
                 session_id=str(task_id),
+            execution_user_id=task_execution_user_id,
             )
             
         logger.info(f"[TaskExec] LLM reply: {reply[:80]}")

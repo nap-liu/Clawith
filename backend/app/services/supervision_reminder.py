@@ -9,14 +9,15 @@ Runs as a background task inside the FastAPI process.
 """
 
 import asyncio
-from datetime import datetime, timezone, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import select
 
 from app.database import async_session
-from app.models.task import Task, TaskLog
 from app.models.agent import Agent
+from app.models.task import Task, TaskLog
 
 # Schedule JSON format:
 # {"freq": "daily"|"weekly", "interval": N, "time": "HH:MM", "weekdays": [0-6]}
@@ -98,7 +99,11 @@ def _is_reminder_due(remind_schedule: str, last_reminded_at: datetime | None, no
     return elapsed >= min_interval
 
 
-async def _send_supervision_reminder(task: Task, agent_name: str):
+async def _send_supervision_reminder(
+    task: Task,
+    agent_name: str,
+    execution_user_id: uuid.UUID | None = None,
+):
     """Send one reminder through the canonical delivery paths.
 
     The task must already contain exactly one frozen canonical target ID. A
@@ -106,6 +111,7 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
     """
     try:
         from app.models.activity_log import AgentActivityLog
+        from app.services.execution_identity import resolve_execution_user_id
         from app.services.agent_tools import _send_channel_message, _send_message_to_agent
         from app.services.recipient_resolver import RecipientResolutionError
         from app.services.supervision_targets import resolve_supervision_target
@@ -142,6 +148,15 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
         reminder_msg += "\n请及时处理，谢谢！"
 
         async with async_session() as db:
+            agent = await db.get(Agent, task.agent_id)
+            if agent is None:
+                raise RuntimeError("Supervision task agent no longer exists")
+            execution_user_id = await resolve_execution_user_id(
+                db,
+                agent,
+                execution_user_id or task.execution_user_id,
+                legacy_user_id=task.created_by,
+            )
             try:
                 target = await resolve_supervision_target(
                     db,
@@ -186,7 +201,7 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                     "message": reminder_msg,
                     "msg_type": "consult",
                 },
-                user_id=task.created_by,
+                user_id=execution_user_id,
                 origin_session_id=str(task.id),
             )
             send_method = "agent"
@@ -198,7 +213,7 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                     "message": reminder_msg,
                     "channel": target.channel,
                 },
-                origin_user_id=task.created_by,
+                origin_user_id=execution_user_id,
             )
             send_method = target.channel or "channel"
 

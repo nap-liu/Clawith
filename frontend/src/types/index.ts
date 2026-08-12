@@ -69,6 +69,8 @@ export interface Task {
     priority: 'low' | 'medium' | 'high' | 'urgent';
     assignee: string;
     created_by: string;
+    created_by_user_id: string;
+    execution_user_id?: string;
     creator_username?: string;
     due_date?: string;
     supervision_target_user_id?: string;

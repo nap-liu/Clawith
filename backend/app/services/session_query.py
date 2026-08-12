@@ -25,6 +25,9 @@ Key invariants enforced structurally here:
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import uuid
 from datetime import datetime
 
@@ -36,7 +39,7 @@ from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.participant import Participant
-from app.models.user import User
+from app.models.user import Identity, User
 
 # Every IM/web channel where a real human is the conversation partner. Anything
 # not in this set (``agent``, ``trigger``) is a non-human / unattended turn.
@@ -86,6 +89,46 @@ def decode_cursor(value: str | None):
         return None
 
 
+def encode_session_cursor(
+    session: ChatSession,
+    snapshot_at: datetime,
+    filter_fingerprint: str | None = None,
+) -> str:
+    payload = {
+        "snapshot_at": snapshot_at.isoformat(),
+        "created_at": session.created_at.isoformat(),
+        "id": str(session.id),
+        "filter": filter_fingerprint,
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_session_cursor(
+    value: str | None,
+    *,
+    expected_filter_fingerprint: str | None = None,
+):
+    """Decode an opaque raw-session cursor; malformed input fails closed."""
+    if not value:
+        return None
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode())
+        snapshot_at = datetime.fromisoformat(payload["snapshot_at"])
+        created_at = datetime.fromisoformat(payload["created_at"])
+        if snapshot_at.tzinfo is None or created_at.tzinfo is None:
+            return None
+        if (
+            expected_filter_fingerprint is not None
+            and payload.get("filter") != expected_filter_fingerprint
+        ):
+            return None
+        return (snapshot_at, created_at, uuid.UUID(payload["id"]))
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
 def _as_uuid(value) -> uuid.UUID | None:
     """Best-effort str/UUID -> UUID. Returns None on anything unparseable so
     callers degrade to 'no match' rather than raising on attacker-controlled input."""
@@ -97,6 +140,12 @@ def _as_uuid(value) -> uuid.UUID | None:
         return uuid.UUID(str(value))
     except (ValueError, AttributeError, TypeError):
         return None
+
+
+def session_filter_fingerprint(**values) -> str:
+    """Bind an opaque raw cursor to its exact scope and filter set."""
+    canonical = json.dumps(values, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:24]
 
 
 def build_owned_sessions_predicate(agent_id: uuid.UUID):
@@ -360,19 +409,152 @@ def _escape_like(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
 
 
-async def fetch_sessions(
-    db: AsyncSession,
-    where,
+def _scene_session_predicate(scene_key: str, snapshot_at: datetime | None = None):
+    """Current IM scene or any immutable per-turn scene snapshot."""
+    message_conds = [
+        ChatMessage.conversation_id == cast(ChatSession.id, String),
+        ChatMessage.message_meta["scene_key"].as_string() == scene_key,
+    ]
+    if snapshot_at is not None:
+        message_conds.append(ChatMessage.created_at <= snapshot_at)
+    message_scene = exists().where(and_(*message_conds))
+    return or_(
+        ChatSession.im_config["scene_key"].as_string() == scene_key,
+        message_scene,
+    )
+
+
+def _text_match(column, term: str, match_mode: str):
+    """Case-insensitive literal exact/fuzzy matching with LIKE metachar escaping."""
+    pattern = _escape_like(term)
+    if match_mode == "fuzzy":
+        pattern = f"%{pattern}%"
+    return column.ilike(pattern, escape="\\")
+
+
+def _user_identity_match(user_id_column, term: str, match_mode: str):
+    """Match one canonical User by UUID, display name, or login identity fields."""
+    exact_id = _as_uuid(term) if match_mode == "exact" else None
+    user_fields = [_text_match(User.display_name, term, match_mode)]
+    if exact_id is not None:
+        user_fields.append(User.id == exact_id)
+    identity_match = exists().where(
+        Identity.id == User.identity_id,
+        or_(
+            _text_match(Identity.username, term, match_mode),
+            _text_match(Identity.email, term, match_mode),
+            _text_match(Identity.phone, term, match_mode),
+        ),
+    )
+    return exists().where(
+        User.id == user_id_column,
+        or_(*user_fields, identity_match),
+    )
+
+
+def _counterpart_session_predicate(
+    agent_id: uuid.UUID,
+    term: str,
+    match_mode: str,
+):
+    """Match the actual other party without weakening the caller's session scope.
+
+    P2P rows use ``ChatSession.user_id``; A2A rows resolve the side opposite the
+    current Agent; group rows match canonical human senders from immutable
+    messages. Legacy Participant display names remain searchable as a fallback.
+    """
+    exact_id = _as_uuid(term) if match_mode == "exact" else None
+    # SQLAlchemy cannot use a Python conditional for correlated columns, so the
+    # two normalized A2A directions are expressed explicitly.
+    a2a_agent_match = exists().where(
+        or_(
+            and_(
+                ChatSession.agent_id == agent_id,
+                Agent.id == ChatSession.peer_agent_id,
+            ),
+            and_(
+                ChatSession.peer_agent_id == agent_id,
+                Agent.id == ChatSession.agent_id,
+            ),
+        ),
+        _text_match(Agent.name, term, match_mode),
+    )
+    if exact_id is not None:
+        a2a_agent_match = exists().where(
+            or_(
+                and_(
+                    ChatSession.agent_id == agent_id,
+                    Agent.id == ChatSession.peer_agent_id,
+                ),
+                and_(
+                    ChatSession.peer_agent_id == agent_id,
+                    Agent.id == ChatSession.agent_id,
+                ),
+            ),
+            or_(Agent.id == exact_id, _text_match(Agent.name, term, match_mode)),
+        )
+
+    group_sender_user_id = ChatMessage.sender_user_id
+    legacy_group_sender_user_id = ChatMessage.user_id
+    group_user_match = exists().where(
+        ChatMessage.conversation_id == cast(ChatSession.id, String),
+        ChatMessage.role == "user",
+        or_(
+            _user_identity_match(group_sender_user_id, term, match_mode),
+            and_(
+                group_sender_user_id.is_(None),
+                _user_identity_match(legacy_group_sender_user_id, term, match_mode),
+            ),
+        ),
+    )
+    participant_fields = [_text_match(Participant.display_name, term, match_mode)]
+    if exact_id is not None:
+        participant_fields.append(Participant.ref_id == exact_id)
+    legacy_participant_match = exists().where(
+        Participant.id == ChatSession.participant_id,
+        or_(*participant_fields),
+    )
+    return or_(
+        and_(
+            ChatSession.source_channel.notin_(["agent", "trigger"]),
+            ChatSession.is_group.is_(False),
+            _user_identity_match(ChatSession.user_id, term, match_mode),
+        ),
+        and_(ChatSession.source_channel == "agent", a2a_agent_match),
+        and_(ChatSession.is_group.is_(True), group_user_match),
+        legacy_participant_match,
+    )
+
+
+def _group_session_predicate(term: str, match_mode: str):
+    fields = [
+        _text_match(ChatSession.group_name, term, match_mode),
+        _text_match(ChatSession.title, term, match_mode),
+        _text_match(ChatSession.external_conv_id, term, match_mode),
+    ]
+    exact_id = _as_uuid(term) if match_mode == "exact" else None
+    if exact_id is not None:
+        fields.append(ChatSession.id == exact_id)
+    return and_(ChatSession.is_group.is_(True), or_(*fields))
+
+
+def _append_session_filters(
+    conds: list,
     *,
-    channel: str | None = None,
-    title_query: str | None = None,
-    since=None,
-    until=None,
-    limit: int = 20,
-    offset: int = 0,
-) -> tuple[list[ChatSession], int]:
-    """Return ``(rows, total)`` for the list tool, ordered like the REST UI."""
-    conds = [where]
+    agent_id: uuid.UUID,
+    channel: str | None,
+    title_query: str | None,
+    since,
+    until,
+    scene: str | None,
+    counterpart: str | None,
+    counterpart_match: str,
+    is_group: bool | None,
+    group: str | None,
+    group_match: str,
+    snapshot_at: datetime | None = None,
+) -> None:
+    """Single filter path shared by summary and raw pagination."""
     if channel and channel != "all":
         conds.append(ChatSession.source_channel == channel)
     if title_query:
@@ -387,6 +569,51 @@ async def fetch_sessions(
         conds.append(ChatSession.last_message_at >= since)
     if until is not None:
         conds.append(ChatSession.last_message_at <= until)
+    if scene:
+        conds.append(_scene_session_predicate(scene, snapshot_at))
+    if counterpart:
+        conds.append(_counterpart_session_predicate(agent_id, counterpart, counterpart_match))
+    if is_group is not None:
+        conds.append(ChatSession.is_group.is_(is_group))
+    if group:
+        conds.append(_group_session_predicate(group, group_match))
+
+
+async def fetch_sessions(
+    db: AsyncSession,
+    where,
+    *,
+    agent_id: uuid.UUID,
+    channel: str | None = None,
+    title_query: str | None = None,
+    since=None,
+    until=None,
+    scene: str | None = None,
+    counterpart: str | None = None,
+    counterpart_match: str = "fuzzy",
+    is_group: bool | None = None,
+    group: str | None = None,
+    group_match: str = "fuzzy",
+    limit: int = 20,
+    offset: int = 0,
+) -> tuple[list[ChatSession], int]:
+    """Return ``(rows, total)`` for the list tool, ordered like the REST UI."""
+    conds = [where]
+    _append_session_filters(
+        conds,
+        agent_id=agent_id,
+        channel=channel,
+        title_query=title_query,
+        since=since,
+        until=until,
+        scene=scene,
+        counterpart=counterpart,
+        counterpart_match=counterpart_match,
+        is_group=is_group,
+        group=group,
+        group_match=group_match,
+        snapshot_at=None,
+    )
 
     from sqlalchemy import func
 
@@ -406,6 +633,88 @@ async def fetch_sessions(
         )
     ).scalars().all()
     return list(rows), int(total)
+
+
+async def fetch_sessions_raw(
+    db: AsyncSession,
+    where,
+    *,
+    agent_id: uuid.UUID,
+    channel: str | None = None,
+    title_query: str | None = None,
+    since=None,
+    until=None,
+    scene: str | None = None,
+    counterpart: str | None = None,
+    counterpart_match: str = "fuzzy",
+    is_group: bool | None = None,
+    group: str | None = None,
+    group_match: str = "fuzzy",
+    limit: int = 20,
+    cursor=None,
+    now: datetime | None = None,
+    filter_fingerprint: str | None = None,
+) -> tuple[list[ChatSession], int, datetime, str | None]:
+    """Return a stable, creation-ordered raw page with an opaque keyset cursor."""
+    from datetime import timezone
+    from sqlalchemy import func
+
+    if cursor is None:
+        snapshot_at = now or datetime.now(timezone.utc)
+        before_created_at = None
+        before_id = None
+    else:
+        snapshot_at, before_created_at, before_id = cursor
+
+    conds = [where, ChatSession.created_at <= snapshot_at]
+    _append_session_filters(
+        conds,
+        agent_id=agent_id,
+        channel=channel,
+        title_query=title_query,
+        since=since,
+        until=until,
+        scene=scene,
+        counterpart=counterpart,
+        counterpart_match=counterpart_match,
+        is_group=is_group,
+        group=group,
+        group_match=group_match,
+        snapshot_at=snapshot_at,
+    )
+    total = (
+        await db.execute(select(func.count()).select_from(ChatSession).where(*conds))
+    ).scalar_one()
+    page_conds = list(conds)
+    if before_created_at is not None:
+        page_conds.append(
+            or_(
+                ChatSession.created_at < before_created_at,
+                and_(
+                    ChatSession.created_at == before_created_at,
+                    ChatSession.id < before_id,
+                ),
+            )
+        )
+
+    rows = list(
+        (
+            await db.execute(
+                select(ChatSession)
+                .where(*page_conds)
+                .order_by(ChatSession.created_at.desc(), ChatSession.id.desc())
+                .limit(limit + 1)
+            )
+        ).scalars().all()
+    )
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = (
+        encode_session_cursor(page[-1], snapshot_at, filter_fingerprint)
+        if has_more and page
+        else None
+    )
+    return page, int(total), snapshot_at, next_cursor
 
 
 async def count_messages_per_session(db: AsyncSession, session_ids: list) -> dict:

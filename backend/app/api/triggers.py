@@ -11,6 +11,7 @@ from app.core.permissions import check_agent_access
 from app.database import async_session
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
+from app.models.user import User
 
 router = APIRouter(prefix="/api/agents", tags=["triggers"])
 
@@ -30,6 +31,10 @@ class TriggerResponse(BaseModel):
     last_fired_at: str | None = None
     created_at: str | None = None
     expires_at: str | None = None
+    created_by_user_id: str | None = None
+    creator_display_name: str | None = None
+    execution_user_id: str | None = None
+    execution_user_display_name: str | None = None
 
 
 class TriggerUpdate(BaseModel):
@@ -39,6 +44,8 @@ class TriggerUpdate(BaseModel):
     max_fires: int | None = None
     cooldown_seconds: int | None = None
     expires_at: str | None = None
+    execution_user_id: uuid.UUID | None = None
+    expected_execution_user_id: uuid.UUID | None = None
 
 
 class TriggerExecutionResponse(BaseModel):
@@ -52,6 +59,7 @@ class TriggerExecutionResponse(BaseModel):
     started_at: str | None = None
     finished_at: str | None = None
     last_error: str | None = None
+    execution_user_id: str | None = None
 
 
 _PRIVATE_CONFIG_PARTS = ("token", "secret", "password", "api_key", "webhook_queue")
@@ -72,6 +80,18 @@ def _public_config(value):
     if isinstance(value, list):
         return [_public_config(item) for item in value]
     return value
+
+
+def _member_visible_config(trigger_type: str, value: object) -> dict:
+    """Expose only display-safe scheduling fields to non-managing viewers."""
+    if not isinstance(value, dict):
+        return {}
+    safe_keys = {
+        "cron": ("expr",),
+        "once": ("at",),
+        "interval": ("minutes",),
+    }.get(trigger_type, ())
+    return {key: value[key] for key in safe_keys if key in value}
 
 
 def _contains_private_config(value) -> bool:
@@ -117,20 +137,34 @@ async def _require_manage(db, user, agent_id: uuid.UUID) -> None:
 async def list_agent_triggers(agent_id: uuid.UUID, user=Depends(get_current_user)):
     """List all triggers for an agent."""
     async with async_session() as db:
-        await _require_manage(db, user, agent_id)
+        _agent, access_level = await check_agent_access(db, user, agent_id)
         result = await db.execute(
             select(AgentTrigger)
             .where(AgentTrigger.agent_id == agent_id)
             .order_by(AgentTrigger.created_at.desc())
         )
         triggers = result.scalars().all()
+        user_ids = {
+            user_id
+            for trigger in triggers
+            for user_id in (trigger.created_by_user_id, trigger.execution_user_id)
+            if user_id
+        }
+        user_names: dict[uuid.UUID, str] = {}
+        if user_ids:
+            users_result = await db.execute(select(User).where(User.id.in_(user_ids)))
+            user_names = {item.id: item.display_name for item in users_result.scalars().all()}
 
     return [
         TriggerResponse(
             id=str(t.id),
             name=t.name,
             type=t.type,
-            config=_public_config(t.config or {}),
+            config=(
+                _public_config(t.config or {})
+                if access_level == "manage"
+                else _member_visible_config(t.type, t.config or {})
+            ),
             reason=t.reason or "",
             focus_ref=t.focus_ref,
             is_enabled=t.is_enabled,
@@ -141,6 +175,10 @@ async def list_agent_triggers(agent_id: uuid.UUID, user=Depends(get_current_user
             last_fired_at=t.last_fired_at.isoformat() if t.last_fired_at else None,
             created_at=t.created_at.isoformat() if t.created_at else None,
             expires_at=t.expires_at.isoformat() if t.expires_at else None,
+            created_by_user_id=str(t.created_by_user_id) if t.created_by_user_id else None,
+            creator_display_name=user_names.get(t.created_by_user_id),
+            execution_user_id=str(t.execution_user_id) if t.execution_user_id else None,
+            execution_user_display_name=user_names.get(t.execution_user_id),
         )
         for t in triggers
     ]
@@ -180,6 +218,9 @@ async def list_trigger_executions(
             started_at=execution.started_at.isoformat() if execution.started_at else None,
             finished_at=execution.finished_at.isoformat() if execution.finished_at else None,
             last_error=execution.last_error,
+            execution_user_id=(
+                str(execution.execution_user_id) if execution.execution_user_id else None
+            ),
         )
         for execution, trigger_name in rows
     ]
@@ -206,8 +247,47 @@ async def update_trigger(
             raise HTTPException(404, "Trigger not found")
 
         changed_fields = body.model_fields_set
-        if trigger.is_system and changed_fields - {"is_enabled"}:
-            raise HTTPException(403, "System triggers can only be enabled or disabled")
+        if trigger.is_system and changed_fields - {
+            "is_enabled",
+            "execution_user_id",
+            "expected_execution_user_id",
+        }:
+            raise HTTPException(
+                403,
+                "System triggers can only be enabled/disabled or reassigned by an Agent manager",
+            )
+
+        if "execution_user_id" in changed_fields:
+            if body.execution_user_id is None:
+                raise HTTPException(422, "execution_user_id cannot be null")
+            if "expected_execution_user_id" not in changed_fields:
+                raise HTTPException(422, "expected_execution_user_id is required")
+            from app.services.execution_identity import (
+                ExecutionIdentityConflict,
+                ExecutionIdentityError,
+                ExecutionIdentityPermissionError,
+                reassign_background_execution_user,
+            )
+
+            try:
+                await reassign_background_execution_user(
+                    db,
+                    actor_user_id=user.id,
+                    agent_id=agent_id,
+                    resource_type="trigger",
+                    resource_id=trigger_id,
+                    execution_user_id=body.execution_user_id,
+                    expected_execution_user_id=body.expected_execution_user_id,
+                    expected_provided=True,
+                )
+            except ExecutionIdentityConflict as exc:
+                raise HTTPException(409, str(exc)) from exc
+            except ExecutionIdentityPermissionError as exc:
+                raise HTTPException(403, str(exc)) from exc
+            except ExecutionIdentityError as exc:
+                raise HTTPException(422, str(exc)) from exc
+        elif "expected_execution_user_id" in changed_fields:
+            raise HTTPException(422, "expected_execution_user_id requires execution_user_id")
 
         if body.config is not None:
             if _contains_private_config(body.config):

@@ -190,8 +190,15 @@
 .org-access-picker__tree-row {
     display: flex;
     align-items: center;
+    width: 100%;
     min-width: 0;
+    padding: 0;
+    color: var(--text-secondary);
+    text-align: left;
+    background: transparent;
+    border: 0;
     border-radius: 6px;
+    cursor: pointer;
 }
 
 .org-access-picker__tree-row:hover,
@@ -204,6 +211,15 @@
     flex: 0 0 22px;
 }
 
+.org-access-picker__tree-chevron {
+    display: inline-flex;
+    width: 22px;
+    flex: 0 0 22px;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-tertiary);
+}
+
 .org-access-picker__tree-name {
     display: flex;
     min-width: 0;
@@ -211,11 +227,10 @@
     align-items: center;
     gap: 6px;
     padding: 6px 5px;
-    color: var(--text-secondary);
+    color: inherit;
     text-align: left;
     background: transparent;
     border: 0;
-    cursor: pointer;
 }
 
 .org-access-picker__tree-name > span:first-child {

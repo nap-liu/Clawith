@@ -66,6 +66,7 @@ import {
     IconBuilding,
     IconCheck,
     IconClock,
+    IconChevronDown,
     IconDna,
     IconDownload,
     IconEye,
@@ -137,6 +138,78 @@ type FocusItem = {
     synthetic?: boolean;
     system?: boolean;
 };
+
+type ExecutionUserOption = {
+    id: string;
+    display_name?: string | null;
+    username?: string | null;
+    email?: string | null;
+};
+
+type ExecutionIdentityRailProps = {
+    creatorId?: string | null;
+    creatorName?: string | null;
+    executionUserId?: string | null;
+    executionUserName?: string | null;
+    users: ExecutionUserOption[];
+    canReassign: boolean;
+    isPending: boolean;
+    isZh: boolean;
+    onChoose: () => void;
+};
+
+const shortIdentity = (userId?: string | null) => userId ? userId.slice(0, 8) : '—';
+
+function ExecutionIdentityRail({
+    creatorId,
+    creatorName,
+    executionUserId,
+    executionUserName,
+    users,
+    canReassign,
+    isPending,
+    isZh,
+    onChoose,
+}: ExecutionIdentityRailProps) {
+    const effectiveExecutionUserId = executionUserId || creatorId || '';
+    const labelFor = (userId?: string | null, preferredName?: string | null) => {
+        if (preferredName) return preferredName;
+        const user = users.find((item) => item.id === userId);
+        return user?.display_name || user?.username || user?.email || shortIdentity(userId);
+    };
+    const creatorLabel = labelFor(creatorId, creatorName);
+    const executionLabel = labelFor(effectiveExecutionUserId, executionUserName);
+
+    return (
+        <div className="execution-identity-rail" onClick={(event) => event.stopPropagation()}>
+            <span className="execution-identity-person" title={creatorId || undefined}>
+                <span className="execution-identity-label">{isZh ? '创建人' : 'Created by'}</span>
+                <span className="execution-identity-value">{creatorLabel}</span>
+            </span>
+            <span className="execution-identity-arrow" aria-hidden="true">→</span>
+            <span className="execution-identity-person">
+                <span className="execution-identity-label">{isZh ? '执行人' : 'Runs as'}</span>
+                {canReassign ? (
+                    <button
+                        type="button"
+                        className="execution-identity-picker-trigger"
+                        aria-label={isZh ? '执行人' : 'Execution user'}
+                        title={isZh ? '选择后续后台执行所使用的用户权限' : 'Choose the user for future background runs'}
+                        disabled={isPending || !effectiveExecutionUserId}
+                        onClick={onChoose}
+                    >
+                        <span>{executionLabel}</span>
+                        <IconChevronDown size={13} stroke={1.8} aria-hidden="true" />
+                    </button>
+                ) : (
+                    <span className="execution-identity-value" title={effectiveExecutionUserId || undefined}>
+                        {executionLabel}
+                    </span>
+                )}
+            </span>
+        </div>
+    );
+}
 
 function focusItemFromApi(item: FocusApiItem): FocusItem {
     const done = item.status === 'completed';
@@ -1424,6 +1497,7 @@ export default function AgentDetailPage() {
         return true;
     }, [navigate]);
     const queryClient = useQueryClient();
+    const currentUser = useAuthStore((s) => s.user);
     const [sceneConfigDirty, setSceneConfigDirty] = useState(false);
     const {
         activeTab,
@@ -1492,6 +1566,54 @@ export default function AgentDetailPage() {
         queryFn: () => triggerApi.list(id!),
         enabled: !!id && awareDataActive,
         refetchInterval: awareDataActive ? 5000 : false,
+    });
+    const isPlatformAdmin = currentUser?.role === 'platform_admin'
+        || !!(currentUser as any)?.is_platform_admin;
+    const canReassignExecutionUser = (
+        isPlatformAdmin || currentUser?.role === 'org_admin'
+    ) && (agent as any)?.access_level === 'manage';
+    const { data: executionUsers = [] } = useQuery({
+        queryKey: ['background-execution-users', currentUser?.tenant_id],
+        queryFn: () => enterpriseApi.listMembers(),
+        enabled: !!id && awareDataActive && canReassignExecutionUser,
+        staleTime: 60_000,
+    });
+    const [executionUserPickerTarget, setExecutionUserPickerTarget] = useState<{
+        resourceType: 'trigger' | 'task' | 'schedule';
+        resourceId: string;
+        executionUserId: string;
+        expectedExecutionUserId: string | null;
+    } | null>(null);
+    const reassignExecutionUser = useMutation({
+        mutationFn: ({ resourceType, resourceId, executionUserId, expectedExecutionUserId }: {
+            resourceType: 'trigger' | 'task' | 'schedule';
+            resourceId: string;
+            executionUserId: string;
+            expectedExecutionUserId: string | null;
+        }) => {
+            const update = {
+                execution_user_id: executionUserId,
+                expected_execution_user_id: expectedExecutionUserId,
+            };
+            if (resourceType === 'trigger') return triggerApi.update(id!, resourceId, update);
+            if (resourceType === 'task') return taskApi.update(id!, resourceId, update);
+            return scheduleApi.update(id!, resourceId, update);
+        },
+        onSuccess: (_data, variables) => {
+            const queryKey = variables.resourceType === 'trigger'
+                ? ['triggers', id]
+                : variables.resourceType === 'task'
+                    ? ['tasks', id]
+                    : ['schedules', id];
+            queryClient.invalidateQueries({ queryKey });
+            toast.success(i18n.language?.startsWith('zh') ? '执行人已更新' : 'Execution user updated');
+        },
+        onError: (err: any) => {
+            toast.error(
+                i18n.language?.startsWith('zh') ? '更新执行人失败' : 'Failed to update execution user',
+                { details: String(err?.detail || err?.message || err) },
+            );
+        },
     });
 
     // ── Aware tab data: structured Focus ──
@@ -1666,7 +1788,6 @@ export default function AgentDetailPage() {
     const [agentExpired, setAgentExpired] = useState(false);
     // Websocket chat state (for 'me' conversation)
     const token = useAuthStore((s) => s.token);
-    const currentUser = useAuthStore((s) => s.user);
     const isAgentOwner =
         currentUser?.id != null &&
         (agent as any)?.creator_id != null &&
@@ -3618,10 +3739,18 @@ export default function AgentDetailPage() {
     const [agentUrlInput, setAgentUrlInput] = useState('');
     const [agentUrlImporting, setAgentUrlImporting] = useState(false);
 
+    const { data: backgroundTasks = [] } = useQuery({
+        queryKey: ['tasks', id],
+        queryFn: () => taskApi.list(id!),
+        enabled: !!id && awareDataActive,
+        staleTime: 15_000,
+    });
+
     const { data: schedules = [] } = useQuery({
         queryKey: ['schedules', id],
         queryFn: () => scheduleApi.list(id!),
-        enabled: !!id && (activeTab as string) === 'tasks',
+        enabled: !!id && awareDataActive,
+        staleTime: 15_000,
     });
 
     // Schedule form state
@@ -4479,8 +4608,8 @@ export default function AgentDetailPage() {
                                 </button>
                                 {(agent as any)?.agent_type !== 'openclaw' && (
                                     <button
-                                        className={`btn btn-ghost agent-top-action ${livePanelVisible && sidePanelTab === 'aware' ? 'active' : ''}`}
-                                        onClick={() => togglePreviewPanel('aware')}
+                                        className={`btn btn-ghost agent-top-action ${(isSettingsRoute && location.hash === '#aware') || (livePanelVisible && sidePanelTab === 'aware') ? 'active' : ''}`}
+                                        onClick={() => isChatRoute ? togglePreviewPanel('aware') : setActiveTab('aware')}
                                     >
                                         <IconBrain size={16} stroke={1.7} />
                                         <span>{t('agent.tabs.aware')}</span>
@@ -4511,7 +4640,7 @@ export default function AgentDetailPage() {
                 {/* Tabs */}
                 {activeTab !== 'chat' && <div className="tabs">
                     {AGENT_DETAIL_TABS.filter(tab => {
-                        if (['aware', 'workspace', 'chat'].includes(tab)) return false;
+                        if (['workspace', 'chat'].includes(tab)) return false;
                         if (tab === 'scenes' && (!canManage || !agent?.scene_config_enabled)) return false;
                         // 'use' access keeps the existing tab bar unchanged; settings remains available via its own entry.
                         if ((agent as any)?.access_level === 'use') {
@@ -4967,6 +5096,22 @@ export default function AgentDetailPage() {
                                                         <span style={{ fontSize: '10px', color: trig.is_enabled ? 'var(--accent-primary)' : 'var(--success, #10b981)' }}>
                                                             {trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed')}
                                                         </span>
+                                                        <ExecutionIdentityRail
+                                                            creatorId={trig.created_by_user_id}
+                                                            creatorName={trig.creator_display_name}
+                                                            executionUserId={trig.execution_user_id}
+                                                            executionUserName={trig.execution_user_display_name}
+                                                            users={executionUsers}
+                                                            canReassign={canReassignExecutionUser}
+                                                            isPending={reassignExecutionUser.isPending}
+                                                            isZh={!!isZh}
+                                                            onChoose={() => setExecutionUserPickerTarget({
+                                                                resourceType: 'trigger',
+                                                                resourceId: trig.id,
+                                                                executionUserId: trig.execution_user_id || trig.created_by_user_id,
+                                                                expectedExecutionUserId: trig.execution_user_id || null,
+                                                            })}
+                                                        />
                                                         <div style={{ display: 'flex', gap: '4px' }}>
                                                             {canManage && !trig.is_system && <button className="btn btn-ghost" style={{ padding: '2px 6px', fontSize: '11px', color: 'var(--error)' }}
                                                                 onClick={async (e) => {
@@ -5111,6 +5256,131 @@ export default function AgentDetailPage() {
                                     </div>
                                 )}
                             </div>
+
+                            {/* ── Background execution identities ── */}
+                            <div className="card background-resource-card" style={{ marginBottom: '16px', padding: '16px' }}>
+                                <div className="background-resource-header">
+                                    <div>
+                                        <h4 style={{ margin: 0, fontSize: '14px', fontWeight: 600 }}>
+                                            {isZh ? '后台任务身份' : 'Background task identities'}
+                                        </h4>
+                                        <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                            {isZh ? '查看任务的创建人，以及后续执行所使用的用户权限' : 'See who created each task and whose permissions future runs use'}
+                                        </span>
+                                    </div>
+                                    <span className="background-resource-count">
+                                        {backgroundTasks.length + schedules.length}
+                                    </span>
+                                </div>
+
+                                {backgroundTasks.length === 0 && schedules.length === 0 ? (
+                                    <div className="background-resource-empty">
+                                        {isZh ? '暂无任务或计划任务' : 'No tasks or schedules'}
+                                    </div>
+                                ) : (
+                                    <div className="background-resource-list">
+                                        {(backgroundTasks as any[]).map((task) => (
+                                            <div key={`task-${task.id}`} className="background-resource-row">
+                                                <div className="background-resource-main">
+                                                    <div className="background-resource-title-row">
+                                                        <span className="background-resource-kind">{isZh ? '任务' : 'Task'}</span>
+                                                        <span className="background-resource-title">{task.title}</span>
+                                                    </div>
+                                                    <div className="background-resource-meta">
+                                                        <span>{task.status}</span>
+                                                        <span>{task.priority}</span>
+                                                        <span>{task.type}</span>
+                                                    </div>
+                                                </div>
+                                                <ExecutionIdentityRail
+                                                    creatorId={task.created_by_user_id || task.created_by}
+                                                    creatorName={task.creator_display_name || task.creator_username}
+                                                    executionUserId={task.execution_user_id}
+                                                    executionUserName={task.execution_user_display_name}
+                                                    users={executionUsers}
+                                                    canReassign={canReassignExecutionUser}
+                                                    isPending={reassignExecutionUser.isPending}
+                                                    isZh={!!isZh}
+                                                    onChoose={() => setExecutionUserPickerTarget({
+                                                        resourceType: 'task',
+                                                        resourceId: task.id,
+                                                        executionUserId: task.execution_user_id || task.created_by_user_id || task.created_by,
+                                                        expectedExecutionUserId: task.execution_user_id || null,
+                                                    })}
+                                                />
+                                            </div>
+                                        ))}
+                                        {(schedules as any[]).map((schedule) => (
+                                            <div key={`schedule-${schedule.id}`} className="background-resource-row">
+                                                <div className="background-resource-main">
+                                                    <div className="background-resource-title-row">
+                                                        <span className="background-resource-kind schedule">{isZh ? '计划' : 'Schedule'}</span>
+                                                        <span className="background-resource-title">{schedule.name}</span>
+                                                    </div>
+                                                    <div className="background-resource-meta">
+                                                        <span>{schedule.is_enabled ? (isZh ? '已启用' : 'Enabled') : (isZh ? '已停用' : 'Disabled')}</span>
+                                                        <span className="background-resource-cron">{schedule.cron_expr}</span>
+                                                        {schedule.next_run_at && (
+                                                            <span>{isZh ? '下次' : 'Next'} {new Date(schedule.next_run_at).toLocaleString()}</span>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                <ExecutionIdentityRail
+                                                    creatorId={schedule.created_by_user_id || schedule.created_by}
+                                                    creatorName={schedule.creator_display_name || schedule.creator_username}
+                                                    executionUserId={schedule.execution_user_id}
+                                                    executionUserName={schedule.execution_user_display_name}
+                                                    users={executionUsers}
+                                                    canReassign={canReassignExecutionUser}
+                                                    isPending={reassignExecutionUser.isPending}
+                                                    isZh={!!isZh}
+                                                    onChoose={() => setExecutionUserPickerTarget({
+                                                        resourceType: 'schedule',
+                                                        resourceId: schedule.id,
+                                                        executionUserId: schedule.execution_user_id || schedule.created_by_user_id || schedule.created_by,
+                                                        expectedExecutionUserId: schedule.execution_user_id || null,
+                                                    })}
+                                                />
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+
+                            {executionUserPickerTarget && (() => {
+                                const currentUserOption = (executionUsers as ExecutionUserOption[]).find(
+                                    (user) => user.id === executionUserPickerTarget.executionUserId,
+                                );
+                                return (
+                                    <OrgMemberAccessPicker
+                                        open
+                                        agentId={id!}
+                                        membersOnly
+                                        singleSelect
+                                        users={[{
+                                            id: executionUserPickerTarget.executionUserId,
+                                            name: currentUserOption?.display_name
+                                                || currentUserOption?.username
+                                                || currentUserOption?.email
+                                                || shortIdentity(executionUserPickerTarget.executionUserId),
+                                            email: currentUserOption?.email || undefined,
+                                            access_level: 'use',
+                                        }]}
+                                        departments={[]}
+                                        onClose={() => setExecutionUserPickerTarget(null)}
+                                        onSave={async (users) => {
+                                            const nextUser = users[0];
+                                            if (!nextUser || nextUser.id === executionUserPickerTarget.executionUserId) return;
+                                            await reassignExecutionUser.mutateAsync({
+                                                resourceType: executionUserPickerTarget.resourceType,
+                                                resourceId: executionUserPickerTarget.resourceId,
+                                                executionUserId: nextUser.id,
+                                                expectedExecutionUserId: executionUserPickerTarget.expectedExecutionUserId,
+                                            });
+                                        }}
+                                    />
+                                );
+                            })()}
 
                             {reflectionSessions.length > 0 && (() => {
                                 const totalPages = Math.ceil(reflectionSessions.length / REFLECTIONS_PAGE_SIZE);
