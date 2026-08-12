@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import json
 import os
 import re
 import shutil
 import socket
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -17,14 +19,30 @@ from urllib.parse import SplitResult, unquote, urljoin, urlsplit, urlunsplit
 
 import aiofiles
 import httpx
+from loguru import logger
 
 from app.services.chat_attachments import MEDIA_PROBE_CHUNK_BYTES, sniff_media_mime_bytes
+from app.services.media_tool_contract import (
+    MANAGED_MEDIA_BLOCKED_HEADER_PREFIXES,
+    MANAGED_MEDIA_BLOCKED_HEADERS,
+)
 from app.services.tool_result_paths import tool_result_session_dir
 
 MAX_MEDIA_URL_LENGTH = 4096
 MAX_MEDIA_REDIRECTS = 3
 MEDIA_URL_TOTAL_TIMEOUT_SECONDS = 120
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
+_HTTP_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_HTTP_HEADER_VALUE_RE = re.compile(r"^[\t\x20-\x7e]*$")
+_BROWSER_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
 
 
 class MediaUrlError(Exception):
@@ -86,6 +104,69 @@ class _ManagedMediaPaths:
             except OSError:
                 pass
             setattr(self, attribute, -1)
+
+
+def normalize_managed_media_headers(raw_headers: object) -> dict[str, str]:
+    """Validate managed-download headers with a denylist and preserve the rest."""
+    if raw_headers is None:
+        return {}
+    if not isinstance(raw_headers, dict):
+        raise MediaUrlError("INVALID_MEDIA_HEADERS")
+    normalized: dict[str, str] = {}
+    for raw_name, raw_value in raw_headers.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            raise MediaUrlError("INVALID_MEDIA_HEADERS")
+        name = raw_name
+        lowered = name.lower()
+        if (
+            not name
+            or not _HTTP_HEADER_NAME_RE.fullmatch(name)
+            or lowered in MANAGED_MEDIA_BLOCKED_HEADERS
+            or any(
+                lowered.startswith(prefix)
+                for prefix in MANAGED_MEDIA_BLOCKED_HEADER_PREFIXES
+            )
+            or not _HTTP_HEADER_VALUE_RE.fullmatch(raw_value)
+        ):
+            raise MediaUrlError("INVALID_MEDIA_HEADERS")
+        normalized[name] = raw_value
+    return normalized
+
+
+def _managed_request_headers(
+    custom_headers: dict[str, str],
+    host_header: str,
+) -> dict[str, str]:
+    headers = dict(_BROWSER_REQUEST_HEADERS)
+    for name, value in custom_headers.items():
+        existing = next(
+            (candidate for candidate in headers if candidate.lower() == name.lower()),
+            None,
+        )
+        if existing is not None:
+            headers.pop(existing)
+        headers[name] = value
+    headers["Host"] = host_header
+    return headers
+
+
+def _raw_header_pairs(headers: httpx.Headers) -> list[list[str]]:
+    return [
+        [name.decode("ascii"), value.decode("latin-1")]
+        for name, value in headers.raw
+    ]
+
+
+def _log_managed_http_event(event: str, **details: object) -> None:
+    logger.info(
+        "[ManagedMediaHTTP] {}",
+        json.dumps(
+            {"event": event, **details},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
 
 
 def _safe_filename(url: str) -> str:
@@ -417,10 +498,12 @@ async def import_managed_media_url(
     max_bytes: int,
     expected_media_kind: str,
     operation_scope: str | None = None,
+    request_headers: dict[str, str] | None = None,
 ) -> ManagedMediaImport:
     """Stream a public URL into this Agent's managed media store atomically."""
     current_url = str(raw_url or "").strip()
     _validated_url_parts(current_url, external=False)
+    custom_headers = normalize_managed_media_headers(request_headers)
     filename = _safe_filename(current_url)
     paths = _managed_media_paths(
         agent_workspace,
@@ -467,7 +550,7 @@ async def import_managed_media_url(
                 current_url = target.canonical_url
                 redirect_url: str | None = None
                 last_transport_error: httpx.TransportError | None = None
-                for connect_url in target.connect_urls:
+                for connect_index, connect_url in enumerate(target.connect_urls):
                     # A fresh client per candidate IP prevents TLS connection
                     # reuse across redirect hostnames that resolve to the same IP.
                     async with httpx.AsyncClient(
@@ -476,18 +559,44 @@ async def import_managed_media_url(
                         trust_env=False,
                         verify=True,
                     ) as client:
+                        request = client.build_request(
+                            "GET",
+                            connect_url,
+                            headers=_managed_request_headers(
+                                custom_headers,
+                                target.host_header,
+                            ),
+                            extensions={"sni_hostname": target.sni_hostname},
+                        )
+                        request_started = time.perf_counter()
+                        request_log = {
+                            "method": request.method,
+                            "url": current_url,
+                            "request_url": str(request.url),
+                            "connect_ip": urlsplit(connect_url).hostname or "",
+                            "sni_hostname": target.sni_hostname,
+                            "headers": _raw_header_pairs(request.headers),
+                            "body": "",
+                            "redirect_index": redirect_index,
+                            "connect_index": connect_index,
+                        }
+                        _log_managed_http_event(
+                            "managed_media_http_request",
+                            **request_log,
+                        )
                         try:
-                            response_context = client.stream(
-                                "GET",
-                                connect_url,
-                                headers={
-                                    "Accept": "audio/*,video/*,application/octet-stream",
-                                    "User-Agent": "Clawith-send_media/1.0",
-                                    "Host": target.host_header,
-                                },
-                                extensions={"sni_hostname": target.sni_hostname},
+                            response = await client.send(request, stream=True)
+                            _log_managed_http_event(
+                                "managed_media_http_response",
+                                **request_log,
+                                status_code=response.status_code,
+                                response_headers=_raw_header_pairs(response.headers),
+                                elapsed_ms=round(
+                                    (time.perf_counter() - request_started) * 1000,
+                                    3,
+                                ),
                             )
-                            async with response_context as response:
+                            try:
                                 if response.status_code in {301, 302, 303, 307, 308}:
                                     if redirect_index >= MAX_MEDIA_REDIRECTS:
                                         raise MediaUrlError("MEDIA_URL_TOO_MANY_REDIRECTS")
@@ -582,7 +691,19 @@ async def import_managed_media_url(
                                     )
                                 finally:
                                     os.close(final_fd)
+                            finally:
+                                await response.aclose()
                         except httpx.TransportError as exc:
+                            _log_managed_http_event(
+                                "managed_media_http_error",
+                                **request_log,
+                                error_type=type(exc).__name__,
+                                error=str(exc),
+                                elapsed_ms=round(
+                                    (time.perf_counter() - request_started) * 1000,
+                                    3,
+                                ),
+                            )
                             last_transport_error = exc
                             continue
                 if redirect_url is not None:

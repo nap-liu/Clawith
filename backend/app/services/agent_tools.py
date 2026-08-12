@@ -90,6 +90,7 @@ from app.services.media_tool_contract import (
 from app.services.media_url_source import (
     MediaUrlError,
     import_managed_media_url,
+    normalize_managed_media_headers,
     validate_media_url,
 )
 from app.services.sandbox_mcp_host import SandboxMcpHost
@@ -5125,6 +5126,8 @@ async def _send_channel_media(
     rel_path = raw_rel_path.strip() if isinstance(raw_rel_path, str) else ""
     media_url = raw_url.strip() if isinstance(raw_url, str) else ""
     url_mode = str(arguments.get("url_mode") or "").strip().lower()
+    has_headers = "headers" in arguments
+    managed_headers: dict[str, str] = {}
     has_file = bool(rel_path)
     has_url = bool(media_url)
     if has_file == has_url:
@@ -5142,6 +5145,22 @@ async def _send_channel_media(
             "type": "media_delivery_result", "version": 1, "status": "failed",
             "code": "INVALID_URL_MODE", "media_kind": media_kind,
         }, ensure_ascii=False)
+    if has_headers and not (has_url and url_mode == "managed"):
+        return json.dumps({
+            "type": "media_delivery_result", "version": 1, "status": "failed",
+            "code": "INVALID_MEDIA_HEADERS", "media_kind": media_kind,
+        }, ensure_ascii=False)
+    if has_headers:
+        try:
+            managed_headers = normalize_managed_media_headers(
+                arguments.get("headers")
+            )
+        except MediaUrlError as exc:
+            return json.dumps({
+                "type": "media_delivery_result", "version": 1,
+                "status": "failed", "code": exc.code,
+                "media_kind": media_kind,
+            }, ensure_ascii=False)
 
     canonical_user_id = str(arguments.get("user_id") or "").strip()
     requested_session_id = str(arguments.get("session_id") or "").strip()
@@ -5301,6 +5320,7 @@ async def _send_channel_media(
                     )
                     or f"outbound-untracked:{agent_id}:{uuid.uuid4().hex}"
                 ),
+                request_headers=managed_headers,
             )
         except MediaUrlError as exc:
             payload = {
@@ -5658,6 +5678,9 @@ _MEDIA_DELIVERY_MESSAGES = {
     "COVER_NOT_ALLOWED_FOR_AUDIO": "音频不支持封面参数。",
     "INVALID_MEDIA_SOURCE": "必须且只能提供一个媒体来源：file_path，或 url 与 url_mode。",
     "INVALID_URL_MODE": "使用 url 时，url_mode 必须是 external 或 managed。",
+    "INVALID_MEDIA_HEADERS": (
+        "headers 只支持 managed URL，且请求头名称、值必须合法并且不在黑名单中。"
+    ),
     "INVALID_MEDIA_URL": "媒体 URL 无效；external 仅支持 HTTPS，managed 支持 HTTP(S)。",
     "MEDIA_URL_FORBIDDEN_TARGET": "媒体 URL 指向内网、本机或其他受保护地址，平台拒绝访问。",
     "MEDIA_URL_DNS_FAILED": "媒体 URL 的域名无法解析。",

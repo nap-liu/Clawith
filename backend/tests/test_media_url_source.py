@@ -1,12 +1,10 @@
 import asyncio
-import logging
 import threading
 
 import httpx
 import pytest
 from loguru import logger
 
-from app.core.logging_config import intercept_standard_logging
 from app.services import media_url_source
 
 MP4_BYTES = b"\x00\x00\x00\x18ftypmp42hdlr\x00\x00\x00\x00\x00\x00\x00\x00vide"
@@ -220,6 +218,45 @@ async def test_external_url_rejects_zero_port():
         )
 
     assert exc_info.value.code == "INVALID_MEDIA_URL"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Host": "other.example"},
+        {"content-length": "123"},
+        {"Accept-Encoding": "identity"},
+        {"Range": "bytes=0-99"},
+        {"X-Forwarded-For": "127.0.0.1"},
+        {"X-Clawith-Trace": "internal"},
+        {"X-Clawith": "internal"},
+        {"X-Agent-ID": "agent"},
+        {"X-Session-ID": "session"},
+        {"X-Tenant-ID": "tenant"},
+        {"X-Custom": "line-one\r\nInjected: true"},
+        {"X-Custom": "nul\x00value"},
+        {"X-Custom": "control\x01value"},
+        {"X-Custom": "中文"},
+        {"Bad Header": "value"},
+        {"X-Number": 123},
+    ],
+)
+def test_managed_headers_reject_transport_routing_and_platform_fields(headers):
+    with pytest.raises(media_url_source.MediaUrlError) as exc_info:
+        media_url_source.normalize_managed_media_headers(headers)
+
+    assert exc_info.value.code == "INVALID_MEDIA_HEADERS"
+
+
+def test_managed_headers_preserve_non_blocked_names_and_values():
+    headers = {
+        "Authorization": "Bearer exact-token",
+        "Cookie": "media_session=exact-cookie",
+        "X-Custom-Media": "  exact value  ",
+        "user-agent": "Custom Browser/1.0",
+    }
+
+    assert media_url_source.normalize_managed_media_headers(headers) == headers
 
 
 @pytest.mark.asyncio
@@ -566,10 +603,10 @@ async def test_managed_request_target_reports_empty_dns_as_dns_failure(monkeypat
 async def test_managed_redirect_uses_fresh_client_for_each_hostname(tmp_path, monkeypatch):
     original_client = httpx.AsyncClient
     client_count = 0
-    seen_hosts = []
+    seen_requests = []
 
     def handler(request):
-        seen_hosts.append(request.headers["host"])
+        seen_requests.append(request)
         if request.headers["host"] == "media.example":
             return httpx.Response(
                 302,
@@ -599,11 +636,26 @@ async def test_managed_redirect_uses_fresh_client_for_each_hostname(tmp_path, mo
         intent_id="redirect-hosts",
         max_bytes=1024,
         expected_media_kind="video",
+        request_headers={
+            "Authorization": "Bearer redirect-token",
+            "X-Custom-Media": "transparent",
+        },
     )
 
     assert imported.file_path.read_bytes() == MP4_BYTES
     assert client_count == 2
-    assert seen_hosts == ["media.example", "cdn.example"]
+    assert [request.headers["host"] for request in seen_requests] == [
+        "media.example",
+        "cdn.example",
+    ]
+    assert [request.headers["authorization"] for request in seen_requests] == [
+        "Bearer redirect-token",
+        "Bearer redirect-token",
+    ]
+    assert [request.headers["x-custom-media"] for request in seen_requests] == [
+        "transparent",
+        "transparent",
+    ]
 
 
 @pytest.mark.asyncio
@@ -691,15 +743,24 @@ async def test_managed_url_cleans_partial_before_fallback_after_read_error(
 
 
 @pytest.mark.asyncio
-async def test_managed_import_never_logs_signed_url_or_local_path(tmp_path, monkeypatch):
+async def test_managed_import_logs_exact_request_and_response(tmp_path, monkeypatch):
     original_client = httpx.AsyncClient
-    secret = "DO-NOT-LOG-987"
+    secret = "SIGNED-URL-987"
+    authorization = "Bearer AUTH-HEADER-654"
+    cookie = "media_session=COOKIE-321"
     signed_url = f"https://media.example/demo.mp4?token={secret}"
-    transport = httpx.MockTransport(lambda request: httpx.Response(
-        200,
-        content=MP4_BYTES,
-        request=request,
-    ))
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"X-Origin-Debug": "response-header-value"},
+            content=MP4_BYTES,
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
 
     def client_factory(**kwargs):
         return original_client(transport=transport, timeout=kwargs.get("timeout"))
@@ -711,7 +772,6 @@ async def test_managed_import_never_logs_signed_url_or_local_path(tmp_path, monk
     )
     monkeypatch.setattr(media_url_source.httpx, "AsyncClient", client_factory)
 
-    intercept_standard_logging()
     captured = []
     sink_id = logger.add(lambda message: captured.append(str(message)), level="INFO")
     try:
@@ -719,20 +779,35 @@ async def test_managed_import_never_logs_signed_url_or_local_path(tmp_path, monk
             signed_url,
             agent_workspace=tmp_path,
             session_id=SESSION_ID,
-            intent_id="logging-redaction",
+            intent_id="logging-complete",
             max_bytes=1024,
             expected_media_kind="video",
+            request_headers={
+                "Authorization": authorization,
+                "Cookie": cookie,
+                "X-Business-Trace": "business-trace-123",
+            },
         )
-        logging.getLogger("httpx").warning("managed media transport warning")
     finally:
         logger.remove(sink_id)
 
     combined = "".join(captured)
     assert imported.file_path.is_file()
-    assert "managed media transport warning" in combined
-    assert secret not in combined
-    assert signed_url not in combined
+    assert signed_url in combined
+    assert authorization in combined
+    assert cookie in combined
+    assert '"body":""' in combined
+    assert '"status_code":200' in combined
+    assert "response-header-value" in combined
     assert str(tmp_path) not in combined
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.headers["authorization"] == authorization
+    assert request.headers["cookie"] == cookie
+    assert request.headers["x-business-trace"] == "business-trace-123"
+    assert request.headers["user-agent"].startswith("Mozilla/5.0")
+    assert "Clawith" not in request.headers["user-agent"]
+    assert not any(name.lower().startswith("x-clawith-") for name in request.headers)
 
 
 @pytest.mark.asyncio

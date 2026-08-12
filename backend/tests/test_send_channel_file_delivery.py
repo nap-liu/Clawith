@@ -362,6 +362,11 @@ def test_media_tools_are_fixed_core_tools():
     }
     assert media_schema == SEND_MEDIA_PARAMETERS_SCHEMA
     assert set(media_schema["properties"]["url_mode"]["enum"]) == {"external", "managed"}
+    headers_schema = media_schema["properties"]["headers"]
+    assert headers_schema["additionalProperties"] == {"type": "string"}
+    assert "managed" in headers_schema["description"]
+    assert "Host" in headers_schema["description"]
+    assert "X-Clawith-*" in headers_schema["description"]
     seeded = next(tool for tool in BUILTIN_TOOLS if tool["name"] == "send_media")
     assert seeded["parameters_schema"] == media_schema
     assert seeded["config"] == {"allow_download": False}
@@ -474,6 +479,12 @@ def test_media_tool_schemas_are_canonical_across_dynamic_tool_states():
         ({"file_path": "workspace/a.mp3", "url": "https://example.com/a.mp3"}, "INVALID_MEDIA_SOURCE"),
         ({"url": "https://example.com/a.mp3"}, "INVALID_URL_MODE"),
         ({"url": "https://example.com/a.mp3", "url_mode": "copy"}, "INVALID_URL_MODE"),
+        ({"file_path": "workspace/a.mp3", "headers": {}}, "INVALID_MEDIA_HEADERS"),
+        ({
+            "url": "https://example.com/a.mp3",
+            "url_mode": "external",
+            "headers": {"Authorization": "Bearer demo"},
+        }, "INVALID_MEDIA_HEADERS"),
     ],
 )
 async def test_send_media_requires_one_explicit_source(tmp_path, arguments, expected_code):
@@ -653,6 +664,10 @@ async def test_managed_url_uses_origin_session_result_scope_and_agent_media_stor
         {
             "url": "https://media.example/demo.mp4",
             "url_mode": "managed",
+            "headers": {
+                "Authorization": "Bearer media-token",
+                "X-Media-Tenant": "tenant-a",
+            },
             "session_id": target_session_id,
         },
         media_kind="video",
@@ -665,6 +680,10 @@ async def test_managed_url_uses_origin_session_result_scope_and_agent_media_stor
     assert captured["import"]["operation_scope"] == (
         f"outbound:{agent_id}:{origin_session_id}:unanchored:call-managed-layout"
     )
+    assert captured["import"]["request_headers"] == {
+        "Authorization": "Bearer media-token",
+        "X-Media-Tenant": "tenant-a",
+    }
     assert captured["storage"] == (
         f"{agent_id}/media/imported/managed-demo.mp4",
         managed_file,

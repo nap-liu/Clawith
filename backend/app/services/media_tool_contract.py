@@ -4,6 +4,51 @@ from __future__ import annotations
 
 MAX_MEDIA_DISPLAY_TITLE_LENGTH = 160
 
+MANAGED_MEDIA_BLOCKED_HEADERS = frozenset({
+    "accept-encoding",
+    "cf-connecting-ip",
+    "client-ip",
+    "connection",
+    "content-length",
+    "forwarded",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "range",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "true-client-ip",
+    "upgrade",
+    "via",
+    "x-agent",
+    "x-clawith",
+    "x-forwarded",
+    "x-original-url",
+    "x-real-ip",
+    "x-rewrite-url",
+    "x-session",
+    "x-tenant",
+})
+MANAGED_MEDIA_BLOCKED_HEADER_PREFIXES = (
+    "x-agent-",
+    "x-clawith-",
+    "x-forwarded-",
+    "x-session-",
+    "x-tenant-",
+)
+MANAGED_MEDIA_BLOCKED_HEADERS_DISPLAY = (
+    "Host, Content-Length, Transfer-Encoding, Connection, Keep-Alive, TE, "
+    "Trailer, Upgrade, Accept-Encoding, Range, Proxy-Authorization, "
+    "Proxy-Authenticate, Proxy-Connection, Forwarded, Via, X-Forwarded-*, "
+    "X-Real-IP, Client-IP, "
+    "True-Client-IP, CF-Connecting-IP, X-Original-URL, X-Rewrite-URL, "
+    "X-Clawith/X-Clawith-*, X-Agent/X-Agent-*, X-Session/X-Session-* and "
+    "X-Tenant/X-Tenant-*"
+)
+
 
 def normalize_media_display_title(value: object) -> str:
     """Return one safe, compact card title without changing file identity."""
@@ -62,6 +107,18 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
                 "URL without downloading, and does not guarantee future availability. "
                 "managed accepts HTTP or HTTPS and imports the media into "
                 "media/imported before delivery."
+            ),
+        },
+        "headers": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": (
+                "Optional HTTP request headers for url_mode='managed' only. Header "
+                "names and values not on the blacklist are sent unchanged and override "
+                "the browser-style defaults. Blocked, case-insensitively: "
+                f"{MANAGED_MEDIA_BLOCKED_HEADERS_DISPLAY}. Header names must be valid "
+                "HTTP tokens; values must contain only printable ASCII characters or "
+                "tabs."
             ),
         },
         "cover_image_path": {
