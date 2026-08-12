@@ -250,26 +250,33 @@ def test_managed_headers_preserve_non_blocked_names_and_values():
 
 
 def test_managed_headers_filter_blocked_fields_after_merging():
-    headers = media_url_source._managed_request_headers(
-        {
-            "Host": "untrusted.example",
-            "Accept-Encoding": "identity",
-            "X-Forwarded-For": "127.0.0.1",
-            "X-Clawith-Trace": "internal",
-            "X-Agent-ID": "agent",
-            "Authorization": "Bearer exact-token",
-            "User-Agent": "Neutral Client/1.0",
-        },
-        "media.example",
-    )
+    with httpx.Client() as client:
+        request = client.build_request(
+            "GET",
+            "https://192.0.2.1/media.mp4",
+            headers=media_url_source._managed_request_headers({
+                "Host": "untrusted.example",
+                "Accept-Encoding": "identity",
+                "X-Forwarded-For": "127.0.0.1",
+                "X-Clawith-Trace": "internal",
+                "X-Agent-ID": "agent",
+                "Authorization": "Bearer exact-token",
+                "User-Agent": "Neutral Client/1.0",
+            }),
+        )
+        media_url_source._finalize_managed_request_headers(
+            request.headers,
+            "media.example",
+        )
 
-    assert headers["Host"] == "media.example"
-    assert headers["Authorization"] == "Bearer exact-token"
-    assert headers["User-Agent"] == "Neutral Client/1.0"
-    assert "Accept-Encoding" not in headers
-    assert "X-Forwarded-For" not in headers
-    assert "X-Clawith-Trace" not in headers
-    assert "X-Agent-ID" not in headers
+    assert request.headers["Host"] == "media.example"
+    assert request.headers["Authorization"] == "Bearer exact-token"
+    assert request.headers["User-Agent"] == "Neutral Client/1.0"
+    assert "Accept-Encoding" not in request.headers
+    assert "Connection" not in request.headers
+    assert "X-Forwarded-For" not in request.headers
+    assert "X-Clawith-Trace" not in request.headers
+    assert "X-Agent-ID" not in request.headers
 
 
 @pytest.mark.asyncio
@@ -822,7 +829,8 @@ async def test_managed_import_logs_exact_request_and_response(tmp_path, monkeypa
     assert request.headers["cookie"] == cookie
     assert request.headers["x-business-trace"] == "business-trace-123"
     assert request.headers["host"] == "media.example"
-    assert request.headers.get("accept-encoding") != "identity"
+    assert "accept-encoding" not in request.headers
+    assert "connection" not in request.headers
     assert "x-clawith-trace" not in request.headers
     assert request.headers["user-agent"].startswith("Mozilla/5.0")
     assert "Clawith" not in request.headers["user-agent"]
