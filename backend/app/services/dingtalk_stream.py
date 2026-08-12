@@ -25,7 +25,11 @@ from app.database import async_session
 from app.models.agent import Agent
 from app.models.channel_config import ChannelConfig
 from app.models.tenant import Tenant
-from app.services.channel_dispatch import ChannelReactions, run_channel_message
+from app.services.channel_dispatch import (
+    ChannelReactions,
+    channel_session_lock_key,
+    run_channel_message,
+)
 from app.services.dingtalk_credentials import dingtalk_credential_fingerprint
 from app.services.dingtalk_token import dingtalk_token_manager
 from app.services.storage import store_agent_upload
@@ -503,14 +507,19 @@ async def _send_dingtalk_native_video(
 # ─── Stream Manager ─────────────────────────────────────
 
 
-def _dingtalk_lock_key(conversation_type: str, conversation_id: str, sender_staff_id: str) -> str:
+def _dingtalk_lock_key(
+    agent_id: uuid.UUID,
+    conversation_type: str,
+    conversation_id: str,
+    sender_staff_id: str,
+) -> str:
     """构造与 DB 会话一一对应的 per-session 锁 key(与 dingtalk.py 的 conv_id 同构)。"""
     conv_id = (
         f"dingtalk_group_{conversation_id}"
         if conversation_type == "2"
         else f"dingtalk_p2p_{sender_staff_id}"
     )
-    return f"dingtalk:{conv_id}"
+    return channel_session_lock_key(agent_id, "dingtalk", conv_id)
 
 
 def _make_dingtalk_reactions(app_key: str, app_secret: str, message_id: str, conversation_id: str) -> ChannelReactions:
@@ -750,7 +759,12 @@ class DingTalkStreamManager:
                         from app.services.channel_commands import is_channel_command
 
                         if main_loop and main_loop.is_running():
-                            lock_key = _dingtalk_lock_key(conversation_type, conversation_id, sender_staff_id)
+                            lock_key = _dingtalk_lock_key(
+                                agent_id,
+                                conversation_type,
+                                conversation_id,
+                                sender_staff_id,
+                            )
                             is_cmd = is_channel_command(user_text)
                             reactions = _make_dingtalk_reactions(
                                 app_key, app_secret, message_id, conversation_id
@@ -795,7 +809,12 @@ class DingTalkStreamManager:
                     else:
                         # Non-text message: process media in the main loop
                         if main_loop and main_loop.is_running():
-                            lock_key = _dingtalk_lock_key(conversation_type, conversation_id, sender_staff_id)
+                            lock_key = _dingtalk_lock_key(
+                                agent_id,
+                                conversation_type,
+                                conversation_id,
+                                sender_staff_id,
+                            )
                             reactions = _make_dingtalk_reactions(
                                 app_key, app_secret, message_id, conversation_id
                             )

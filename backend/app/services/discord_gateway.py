@@ -19,7 +19,11 @@ from sqlalchemy import select
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
 from app.services.channel_commands import is_channel_command
-from app.services.channel_dispatch import ChannelReactions, run_channel_message
+from app.services.channel_dispatch import (
+    ChannelReactions,
+    channel_session_lock_key,
+    run_channel_message,
+)
 
 try:
     import discord
@@ -115,7 +119,7 @@ class DiscordGatewayManager:
                 if message.guild is None
                 else f"discord_{channel_id_om}_{sender_id_om}"
             )
-            lock_key = f"discord:{conv_id_om}"
+            lock_key = channel_session_lock_key(agent_id, "discord", conv_id_om)
 
             # Early-return for channel commands (/new, /reset):
             # archive the session and reply inline — no LLM, no lock needed.

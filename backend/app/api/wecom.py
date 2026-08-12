@@ -554,14 +554,18 @@ async def _process_wecom_text(
 ):
     """Process an incoming WeCom text message and reply."""
     from app.services.channel_commands import is_channel_command, handle_channel_command
-    from app.services.channel_dispatch import ChannelReactions, run_channel_message
+    from app.services.channel_dispatch import (
+        ChannelReactions,
+        channel_session_lock_key,
+        run_channel_message,
+    )
 
     # conv_id 与 find_or_create_channel_session 传入的 external_conv_id 完全一致:
     #   群聊 → wecom_group_{chat_id}  (不含 from_user,避免不同成员开多会话)
     #   P2P  → wecom_p2p_{from_user}
     _is_group = bool(chat_id)
     conv_id = f"wecom_group_{chat_id}" if _is_group else f"wecom_p2p_{from_user}"
-    lock_key = f"wecom:{conv_id}"
+    lock_key = channel_session_lock_key(agent_id, "wecom", conv_id)
 
     # Early-return for channel commands (/new, /reset):
     # archive the session and send a canned reply — no LLM, no lock needed.

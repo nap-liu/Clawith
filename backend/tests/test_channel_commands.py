@@ -89,6 +89,21 @@ class FakeDB:
         self.flushes += 1
 
 
+def test_channel_turn_lock_key_falls_back_to_route_before_session_exists():
+    agent_id = uuid.uuid4()
+
+    assert channel_commands._channel_turn_lock_key(
+        None,
+        agent_id=agent_id,
+        source_channel="teams",
+        external_conv_id="conversation-1",
+    ) == channel_commands.channel_session_lock_key(
+        agent_id,
+        "teams",
+        "conversation-1",
+    )
+
+
 @pytest.mark.asyncio
 async def test_handle_channel_command_scopes_lookup_by_source_channel():
     """Regression test for review concern #2.
@@ -156,7 +171,7 @@ async def test_handle_channel_command_does_not_preempt_session_creation():
 
 
 @pytest.mark.asyncio
-async def test_handle_channel_command_archives_old_session():
+async def test_handle_channel_command_archives_old_session(monkeypatch):
     """When a session for the same (agent_id, external_conv_id, source_channel)
     exists, /reset must archive it by renaming its external_conv_id, so the
     next user message creates a fresh one.
@@ -165,8 +180,21 @@ async def test_handle_channel_command_archives_old_session():
     user_id = uuid.uuid4()
 
     # Existing session to be archived.
-    old_session = SimpleNamespace(external_conv_id="feishu_p2p_ou_zzz")
+    old_session = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        source_channel="feishu",
+        external_conv_id="feishu_p2p_ou_zzz",
+    )
     db = FakeDB(lookup_result=old_session)
+    cancelled_keys: list[str] = []
+    expected_lock_key = channel_commands.chat_session_lock_key(old_session)
+
+    async def fake_cancel(lock_key: str) -> bool:
+        cancelled_keys.append(lock_key)
+        return True
+
+    monkeypatch.setattr(channel_commands, "cancel_running_turn", fake_cancel)
 
     result = await channel_commands.handle_channel_command(
         db=db,
@@ -178,6 +206,7 @@ async def test_handle_channel_command_archives_old_session():
     )
 
     assert result["action"] == "new_session"
+    assert cancelled_keys == [expected_lock_key]
     # Old session got its external_conv_id renamed to the archived form.
     assert old_session.external_conv_id.startswith("feishu_p2p_ou_zzz__archived_")
     # No new session pre-created (deferred to next user message).
@@ -262,6 +291,9 @@ async def test_status_reports_current_agent_model_session_and_token_usage(monkey
     agent_id = uuid.uuid4()
     session = SimpleNamespace(
         id=uuid.uuid4(),
+        agent_id=agent_id,
+        source_channel="dingtalk",
+        external_conv_id="dingtalk_group_1",
         im_config={"model_id": str(uuid.uuid4()), "scene_key": "warranty"},
         is_group=True,
         context_terminated_reason=None,
@@ -435,13 +467,19 @@ async def test_thinking_toggle_requires_agent_manage_permission(monkeypatch):
 async def test_stop_command_cancels_running_turn_without_deleting_history(monkeypatch):
     agent_id = uuid.uuid4()
     calls: list[str] = []
+    session = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        source_channel="dingtalk",
+        external_conv_id="dingtalk_p2p_staff_1",
+    )
 
     async def fake_cancel(lock_key: str) -> bool:
         calls.append(lock_key)
         return True
 
     monkeypatch.setattr(channel_commands, "cancel_running_turn", fake_cancel)
-    db = FakeDB()
+    db = FakeDB(lookup_result=session)
 
     result = await channel_commands.handle_channel_command(
         db=db,
@@ -453,29 +491,40 @@ async def test_stop_command_cancels_running_turn_without_deleting_history(monkey
     )
 
     assert result["action"] == "stop_turn"
-    assert calls == ["dingtalk:dingtalk_p2p_staff_1"]
-    assert db.executed == []
+    assert calls == [channel_commands.chat_session_lock_key(session)]
+    assert len(db.executed) == 1
     assert "已请求停止" in result["message"]
 
 
 @pytest.mark.asyncio
 async def test_stop_command_reports_when_no_turn_is_running(monkeypatch):
+    calls: list[str] = []
+
     async def fake_cancel(lock_key: str) -> bool:
+        calls.append(lock_key)
         return False
 
     monkeypatch.setattr(channel_commands, "cancel_running_turn", fake_cancel)
     db = FakeDB()
 
+    agent_id = uuid.uuid4()
     result = await channel_commands.handle_channel_command(
         db=db,
         command="/stop",
-        agent_id=uuid.uuid4(),
+        agent_id=agent_id,
         user_id=uuid.uuid4(),
         external_conv_id="slack_D123",
         source_channel="slack",
     )
 
     assert result["action"] == "stop_turn"
+    assert calls == [
+        channel_commands.channel_session_lock_key(
+            agent_id,
+            "slack",
+            "slack_D123",
+        )
+    ]
     assert "没有正在执行" in result["message"]
 
 

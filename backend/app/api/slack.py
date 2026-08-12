@@ -452,9 +452,13 @@ async def slack_event_webhook(
         user_text += "\n" + " ".join(f"[file:{p.split('/')[-1]}]" for p in _file_user_messages)
 
     # 同一 Slack 会话的多轮消息串行化（防止并发入队导致工具调用历史交错）
-    from app.services.channel_dispatch import ChannelReactions, run_channel_message
+    from app.services.channel_dispatch import (
+        ChannelReactions,
+        channel_session_lock_key,
+        run_channel_message,
+    )
 
-    lock_key = f"slack:{conv_id}"
+    lock_key = channel_session_lock_key(agent_id, "slack", conv_id)
 
     async def _work() -> str:
         # 正常消息轮次：写入用户行 → LLM → 持久化回复 → 发送

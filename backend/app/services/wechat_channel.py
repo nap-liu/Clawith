@@ -20,7 +20,11 @@ from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
 from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.services.channel_commands import is_channel_command
-from app.services.channel_dispatch import ChannelReactions, run_channel_message
+from app.services.channel_dispatch import (
+    ChannelReactions,
+    channel_session_lock_key,
+    run_channel_message,
+)
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
 from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
@@ -208,7 +212,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
     # 提前计算 conv_id，供 lock_key 使用（与 find_or_create_channel_session 调用保持一致）
     conv_key = str(msg.get("session_id") or from_user_id).strip()
     conv_id = f"wechat_{conv_key}"
-    lock_key = f"wechat:{conv_id}"
+    lock_key = channel_session_lock_key(agent_id, "wechat", conv_id)
 
     # Early-return for channel commands (/new, /reset):
     # archive the session and send a canned reply — no LLM, no lock needed.

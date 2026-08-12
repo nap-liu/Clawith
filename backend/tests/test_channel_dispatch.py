@@ -5,10 +5,12 @@
 """
 
 import asyncio
+import uuid
 
 import pytest
 
 import app.services.channel_dispatch as cd
+from app.models.chat_session import ChatSession
 
 
 def test_channel_reactions_defaults_all_none():
@@ -197,6 +199,73 @@ async def test_different_keys_run_concurrently():
     # 不同 key 并发 → 两个 start 都先于两个 end
     assert order[:2] == ["A-start", "B-start"] or order[:2] == ["B-start", "A-start"]
     assert set(order[2:]) == {"A-end", "B-end"}
+
+
+async def test_same_external_conversation_on_different_agents_runs_concurrently():
+    """One provider user may talk to different agents at the same time."""
+    external_conv_id = "dingtalk_p2p_staff_1"
+    key_a = cd.channel_session_lock_key(uuid.uuid4(), "dingtalk", external_conv_id)
+    key_b = cd.channel_session_lock_key(uuid.uuid4(), "dingtalk", external_conv_id)
+    both_started = asyncio.Event()
+    started = 0
+
+    async def work(tag: str) -> str:
+        nonlocal started
+        started += 1
+        if started == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.5)
+        return tag
+
+    result = await asyncio.gather(
+        cd.run_channel_message(
+            key_a,
+            is_command=False,
+            reactions=cd.ChannelReactions(),
+            work=lambda: work("A"),
+        ),
+        cd.run_channel_message(
+            key_b,
+            is_command=False,
+            reactions=cd.ChannelReactions(),
+            work=lambda: work("B"),
+        ),
+    )
+
+    assert result == ["A", "B"]
+
+
+def test_durable_channel_session_uses_same_key_as_channel_adapter():
+    """Every execution entry for one external session must share one lock."""
+    agent_id = uuid.uuid4()
+    session = ChatSession(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        title="one conversation",
+        source_channel="dingtalk",
+        external_conv_id="dingtalk_p2p_staff_1",
+    )
+
+    assert cd.chat_session_lock_key(session) == cd.channel_session_lock_key(
+        agent_id,
+        "dingtalk",
+        "dingtalk_p2p_staff_1",
+    )
+
+
+def test_internal_session_uses_durable_uuid_as_lock_key():
+    session_id = uuid.uuid4()
+    session = ChatSession(
+        id=session_id,
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        title="web conversation",
+        source_channel="web",
+        external_conv_id=None,
+    )
+
+    assert cd.chat_session_lock_key(session) == str(session_id)
 
 
 async def test_cancel_running_turn_cancels_registered_work():

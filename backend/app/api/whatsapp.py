@@ -264,7 +264,11 @@ async def whatsapp_event_webhook(
                 from app.models.audit import ChatMessage
                 from app.services.channel_session import find_or_create_channel_session
                 from app.services.channel_user_service import channel_user_service
-                from app.services.channel_dispatch import ChannelReactions, run_channel_message
+                from app.services.channel_dispatch import (
+                    ChannelReactions,
+                    channel_session_lock_key,
+                    run_channel_message,
+                )
                 from app.services.channel_commands import is_channel_command, handle_channel_command
 
                 agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
@@ -283,7 +287,11 @@ async def whatsapp_event_webhook(
                 conv_id = f"whatsapp_{sender_phone}"
 
                 # 同一 WhatsApp 号码（会话）的多轮消息串行化；不同号码各自独立
-                lock_key = f"whatsapp:{conv_id}"
+                lock_key = channel_session_lock_key(
+                    agent_id,
+                    "whatsapp",
+                    conv_id,
+                )
 
                 # Early-return for channel commands (/new, /reset):
                 # archive the session and send a canned reply — no LLM, no lock needed.

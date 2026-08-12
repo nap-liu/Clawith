@@ -12,7 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.permissions import user_can_manage_agent_id
 from app.models.agent import Agent
 from app.models.chat_session import ChatSession
-from app.services.channel_dispatch import cancel_running_turn, has_running_turn
+from app.services.channel_dispatch import (
+    cancel_running_turn,
+    channel_session_lock_key,
+    chat_session_lock_key,
+    has_running_turn,
+)
 from app.services.im_thinking_output import (
     THINKING_OFF,
     THINKING_ON,
@@ -57,10 +62,6 @@ def is_channel_command(text: str) -> bool:
     return command in {"/scene", "/model"}
 
 
-def _lock_key(source_channel: str, external_conv_id: str) -> str:
-    return f"{source_channel}:{external_conv_id}"
-
-
 async def _load_channel_session(
     db: AsyncSession,
     *,
@@ -83,6 +84,19 @@ async def _load_channel_session(
 async def _load_agent(db: AsyncSession, *, agent_id: uuid.UUID) -> Agent | None:
     result = await db.execute(select(Agent).where(Agent.id == agent_id))
     return result.scalar_one_or_none()
+
+
+def _channel_turn_lock_key(
+    session: ChatSession | None,
+    *,
+    agent_id: uuid.UUID,
+    source_channel: str,
+    external_conv_id: str,
+) -> str:
+    """Use the durable session key, or its route key before first persistence."""
+    if session is not None:
+        return chat_session_lock_key(session)
+    return channel_session_lock_key(agent_id, source_channel, external_conv_id)
 
 
 def _help_message() -> str:
@@ -163,7 +177,19 @@ async def handle_channel_command(
         return {"action": "help", "message": _help_message()}
 
     if parsed_cmd == "/stop":
-        cancelled = await cancel_running_turn(_lock_key(source_channel, external_conv_id))
+        session = await _load_channel_session(
+            db,
+            agent_id=agent_id,
+            external_conv_id=external_conv_id,
+            source_channel=source_channel,
+        )
+        lock_key = _channel_turn_lock_key(
+            session,
+            agent_id=agent_id,
+            source_channel=source_channel,
+            external_conv_id=external_conv_id,
+        )
+        cancelled = await cancel_running_turn(lock_key)
         return {
             "action": "stop_turn",
             "message": "已请求停止当前工作。" if cancelled else "当前没有正在执行的工作。",
@@ -206,7 +232,13 @@ async def handle_channel_command(
         else:
             model_status = f"{resolved.primary_model.model}（默认模型）"
 
-        turn_running = await has_running_turn(_lock_key(source_channel, external_conv_id))
+        lock_key = _channel_turn_lock_key(
+            session,
+            agent_id=agent_id,
+            source_channel=source_channel,
+            external_conv_id=external_conv_id,
+        )
+        turn_running = await has_running_turn(lock_key)
         runtime_labels = {
             "creating": "创建中",
             "running": "运行中",
@@ -553,6 +585,9 @@ async def handle_channel_command(
             }
 
     if cmd in ("/new", "/reset"):
+        # Commands bypass the turn lock. Stop the old active session before
+        # archiving its route so a late reply cannot arrive after the reset and
+        # the next message can start on a fresh session immediately.
         # Find current session. Scope by source_channel as well so we never
         # accidentally archive a session from a different channel that happens
         # to share the same external_conv_id (defensive against future changes
@@ -563,6 +598,14 @@ async def handle_channel_command(
             external_conv_id=external_conv_id,
             source_channel=source_channel,
         )
+
+        lock_key = _channel_turn_lock_key(
+            old_session,
+            agent_id=agent_id,
+            source_channel=source_channel,
+            external_conv_id=external_conv_id,
+        )
+        await cancel_running_turn(lock_key)
 
         cleared_scene_key = ""
         if old_session:

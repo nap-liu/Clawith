@@ -22,7 +22,11 @@ from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 # Re-exported here for backwards compatibility (older code does
 # `from app.api.feishu import _call_agent_llm`); new code imports it directly.
 from app.services.channel_llm import _call_agent_llm  # noqa: F401
-from app.services.channel_dispatch import ChannelReactions, run_channel_message
+from app.services.channel_dispatch import (
+    ChannelReactions,
+    channel_session_lock_key,
+    run_channel_message,
+)
 from app.services.channel_commands import is_channel_command, handle_channel_command
 from app.services.chat_attachments import attachment_from_workspace_path
 from app.services.feishu_service import feishu_service
@@ -711,10 +715,8 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
             )
             session_conv_id = str(_sess.id)
 
-            # Per-session lock key is 1-to-1 with the DB session:
-            #   group → "feishu:feishu_group_{chat_id}"
-            #   P2P   → "feishu:feishu_p2p_{user_id_or_open_id}"
-            lock_key = f"feishu:{conv_id}"
+            # Match the DB session identity, including this agent/bot.
+            lock_key = channel_session_lock_key(agent_id, "feishu", conv_id)
 
             # Feishu has no emoji "thinking" reaction (unlike DingTalk), so the
             # boundary hooks (on_consume / on_complete / on_error) stay None.
@@ -1351,7 +1353,7 @@ async def _handle_feishu_file(
         sender_name_file = extra_info.get("name", "") if extra_info else ""
 
     # Per-session lock key (same formula as text path, 1-to-1 with DB session)
-    lock_key = f"feishu:{conv_id}"
+    lock_key = channel_session_lock_key(agent_id, "feishu", conv_id)
 
     # For images: call LLM so vision models can actually see the image.
     # _work covers user-row write → LLM → reply persistence (full turn, inside lock).

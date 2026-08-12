@@ -463,10 +463,18 @@ async def teams_event_webhook(
         _is_group_teams = (_conv_type in ("groupChat", "channel"))
 
         # 同一 Teams 会话的多轮消息串行化（防止并发入队导致工具调用历史交错）
-        from app.services.channel_dispatch import ChannelReactions, run_channel_message
+        from app.services.channel_dispatch import (
+            ChannelReactions,
+            channel_session_lock_key,
+            run_channel_message,
+        )
         from app.services.channel_commands import is_channel_command, handle_channel_command
 
-        lock_key = f"teams:{conversation_id}"
+        lock_key = channel_session_lock_key(
+            agent_id,
+            "microsoft_teams",
+            conversation_id,
+        )
 
         # Early-return for channel commands (/new, /reset):
         # archive the session and send a canned reply — no LLM, no lock needed.

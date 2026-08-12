@@ -15,6 +15,7 @@ from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.channel_config import ChannelConfigPublic as ChannelConfigOut
 from app.services.channel_commands import is_channel_command
+from app.services.channel_dispatch import channel_session_lock_key
 
 router = APIRouter(tags=["discord"])
 
@@ -284,7 +285,10 @@ async def discord_interaction_webhook(
             from app.models.agent import Agent as AgentModel
             from app.services.channel_llm import _call_agent_llm
             from app.services.channel_session import find_or_create_channel_session
-            from app.services.channel_dispatch import ChannelReactions, run_channel_message
+            from app.services.channel_dispatch import (
+                ChannelReactions,
+                run_channel_message,
+            )
             from app.services.channel_commands import handle_channel_command
             from app.services.im_thinking_output import BufferedIMThinkingSender, resolve_im_thinking_enabled
             from app.database import async_session
@@ -467,7 +471,7 @@ async def discord_interaction_webhook(
                 await run_channel_message(lock_key, is_command=False, reactions=ChannelReactions(), work=_work)
 
         # 提前计算 lock_key 和指令标志，供 handle_in_background 内使用
-        lock_key = f"discord:{conv_id}"
+        lock_key = channel_session_lock_key(agent_id, "discord", conv_id)
         is_cmd = is_channel_command(user_text)
 
         asyncio.create_task(handle_in_background())

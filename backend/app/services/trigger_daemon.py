@@ -794,7 +794,11 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
     """
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
-    from app.services.channel_dispatch import ChannelReactions, run_channel_message
+    from app.services.channel_dispatch import (
+        ChannelReactions,
+        chat_session_lock_key,
+        run_channel_message,
+    )
     from app.services.channel_llm import _call_agent_llm
     from app.services.chat_history import (
         load_recoverable_history_for_turn,
@@ -1058,8 +1062,14 @@ async def _resume_origin_session_for_on_message(agent_id: uuid.UUID, trigger: Ag
             ) from exc
         return reply
 
+    async with async_session() as db:
+        origin_session = await db.get(ChatSession, origin_id)
+        if origin_session is None:
+            raise RuntimeError("on_message origin session no longer exists")
+        lock_key = chat_session_lock_key(origin_session)
+
     await run_channel_message(
-        str(origin_id),
+        lock_key,
         is_command=False,
         reactions=ChannelReactions(),
         work=_work_and_deliver,

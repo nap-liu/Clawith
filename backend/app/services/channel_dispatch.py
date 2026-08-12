@@ -19,11 +19,16 @@ import hashlib
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 from loguru import logger
 from sqlalchemy import text
 
 from app.database import async_session
+
+if TYPE_CHECKING:
+    from app.models.chat_session import ChatSession
 
 Hook0 = Callable[[], Awaitable[None]]
 
@@ -47,8 +52,9 @@ class ChannelReactions:
     on_chunk: Callable[[str], Awaitable[None]] | None = None
 
 
-# Process-wide per-session locks. Keyed by ``f"{channel}:{external_conv_id}"`` so
-# every message that resolves to the SAME chat session serializes on one lock.
+# Process-wide per-session locks. Channel adapters use
+# ``channel_session_lock_key`` so two agents never share a lock merely because
+# the provider reports the same external conversation/user id.
 # Independent from compactor._session_locks (see module docstring).
 _session_locks: dict[str, asyncio.Lock] = {}
 _session_locks_guard = asyncio.Lock()
@@ -56,6 +62,36 @@ _running_turns: dict[str, set[asyncio.Task]] = {}
 _running_turns_guard = asyncio.Lock()
 _send_locks: dict[str, asyncio.Lock] = {}
 _send_locks_guard = asyncio.Lock()
+
+
+def channel_session_lock_key(
+    agent_id: UUID | str,
+    source_channel: str,
+    external_conv_id: str,
+) -> str:
+    """Return the lock identity of one agent's active external-channel session.
+
+    ``ChatSession`` uses the same three fields as its durable uniqueness
+    boundary. Provider ids are only unique within one bot/agent, so omitting
+    ``agent_id`` incorrectly serializes the same person across every agent.
+    """
+    return f"channel-session:{source_channel}:{agent_id}:{external_conv_id}"
+
+
+def chat_session_lock_key(session: "ChatSession") -> str:
+    """Return the canonical turn-lock key for one durable chat session.
+
+    External-channel sessions use their database uniqueness boundary so an
+    adapter can derive the same key before it enters the turn. First-party and
+    internal sessions have no external route, so their durable UUID is the key.
+    """
+    if session.external_conv_id:
+        return channel_session_lock_key(
+            session.agent_id,
+            session.source_channel,
+            session.external_conv_id,
+        )
+    return str(session.id)
 
 
 async def _get_session_lock(lock_key: str) -> asyncio.Lock:

@@ -982,8 +982,8 @@ async def test_reenter_loop_marks_turn_completed_after_final_reply(monkeypatch):
 
 async def test_dingtalk_group_confirmation_followup_uses_unified_origin_delivery(monkeypatch):
     """A DingTalk group card continuation reaches the persisted group target."""
+    from app.services import channel_dispatch, turn_runtime
     from app.services import confirmation_service as cs
-    from app.services import turn_runtime
 
     agent_id, user_id = await _make_agent()
     external_conv_id = f"dingtalk_group_open-conversation-{uuid.uuid4().hex}"
@@ -1008,6 +1008,7 @@ async def test_dingtalk_group_confirmation_followup_uses_unified_origin_delivery
         await db.commit()
 
     captured = {}
+    lock_keys = []
 
     async def fake_group_send(**kwargs):
         captured.update(kwargs)
@@ -1016,7 +1017,8 @@ async def test_dingtalk_group_confirmation_followup_uses_unified_origin_delivery
     async def fake_call_agent_llm(*_args, **_kwargs):
         return "卡片处理完成"
 
-    async def fake_run_channel_message(_conversation_id, *, work, **_kwargs):
+    async def fake_run_channel_message(lock_key, *, work, **_kwargs):
+        lock_keys.append(lock_key)
         return await work()
 
     monkeypatch.setattr(turn_runtime, "_send_dingtalk_group_markdown", fake_group_send)
@@ -1031,6 +1033,13 @@ async def test_dingtalk_group_confirmation_followup_uses_unified_origin_delivery
         "open_conversation_id": external_conv_id.removeprefix("dingtalk_group_"),
         "message": "卡片处理完成",
     }
+    assert lock_keys == [
+        channel_dispatch.channel_session_lock_key(
+            agent_id,
+            "dingtalk",
+            external_conv_id,
+        )
+    ]
 
 
 @pytest.mark.parametrize("source_channel", ["web", "miniprogram", "wechat_miniprogram"])

@@ -541,7 +541,12 @@ async def _reenter_loop(
     request_confirmation tool result) WITHOUT injecting a user message. Per-session lock via
     run_channel_message; persists + delivers the follow-up reply to the originating channel."""
     from app.models.agent import Agent as AgentModel, DEFAULT_CONTEXT_WINDOW_SIZE
-    from app.services.channel_dispatch import ChannelReactions, run_channel_message
+    from app.models.chat_session import ChatSession
+    from app.services.channel_dispatch import (
+        ChannelReactions,
+        chat_session_lock_key,
+        run_channel_message,
+    )
     from app.services.channel_llm import _call_agent_llm
     from app.services.chat_history import (
         load_history_for_llm,
@@ -604,8 +609,17 @@ async def _reenter_loop(
                 )
         return reply
 
+    async with async_session() as db:
+        session = await db.get(ChatSession, uuid.UUID(str(conversation_id)))
+        if session is not None and session.agent_id != agent_id:
+            raise RuntimeError("Confirmation session changed owner")
+        # Legacy confirmation rows can outlive a deleted/missing ChatSession.
+        # Preserve their UUID lock identity; durable sessions use the same
+        # canonical external-session key as ordinary channel messages.
+        lock_key = chat_session_lock_key(session) if session is not None else str(conversation_id)
+
     await run_channel_message(
-        str(conversation_id),
+        lock_key,
         is_command=False,
         reactions=ChannelReactions(),
         work=_work,

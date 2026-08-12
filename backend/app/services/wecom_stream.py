@@ -157,10 +157,14 @@ class WeComStreamManager:
                     #   群聊 → wecom_group_{chat_id}  (不含 sender_id,避免不同成员开多会话)
                     #   P2P  → wecom_p2p_{sender_id}
                     conv_id = _build_wecom_conv_id(sender_id, chat_id, chat_type)
-                    lock_key = f"wecom:{conv_id}"
-
                     from app.services.channel_commands import is_channel_command, handle_channel_command
-                    from app.services.channel_dispatch import ChannelReactions, run_channel_message
+                    from app.services.channel_dispatch import (
+                        ChannelReactions,
+                        channel_session_lock_key,
+                        run_channel_message,
+                    )
+
+                    lock_key = channel_session_lock_key(agent_id, "wecom", conv_id)
 
                     # Early-return for channel commands (/new, /reset):
                     # archive the session and reply inline — no LLM, no lock needed.
