@@ -397,14 +397,14 @@ async def test_cli_tool_is_standalone_function_not_folded(llm_tools_session):
 
 
 @pytest.mark.asyncio
-async def test_toolscall_prompt_is_visible_only_for_explicit_agent_opt_in(
+async def test_toolscall_prompt_defaults_on_and_respects_explicit_agent_opt_out(
     llm_tools_session,
 ):
     from app.models.tool import AgentTool, Tool
     from app.services.agent_tools import get_agent_tools_for_llm
 
-    opted_in_agent = _uuid.uuid4()
-    default_off_agent = _uuid.uuid4()
+    default_on_agent = _uuid.uuid4()
+    opted_out_agent = _uuid.uuid4()
 
     async with llm_tools_session() as s:
         aio_tool = Tool(
@@ -418,14 +418,14 @@ async def test_toolscall_prompt_is_visible_only_for_explicit_agent_opt_in(
             enabled=True,
             is_default=True,
             parameters_schema={"type": "object", "properties": {}},
-            # Even a broader true value must not advertise the capability.
-            config={"toolscall_enabled": True},
+            # A broader false value cannot disable an Agent-only default.
+            config={"toolscall_enabled": False},
             config_schema={
                 "fields": [
                     {
                         "key": "toolscall_enabled",
                         "type": "checkbox",
-                        "default": False,
+                        "default": True,
                         "agent_only": True,
                     }
                 ]
@@ -436,23 +436,23 @@ async def test_toolscall_prompt_is_visible_only_for_explicit_agent_opt_in(
         s.add_all(
             [
                 AgentTool(
-                    agent_id=opted_in_agent,
-                    tool_id=aio_tool.id,
-                    enabled=True,
-                    config={"toolscall_enabled": True},
-                ),
-                AgentTool(
-                    agent_id=default_off_agent,
+                    agent_id=default_on_agent,
                     tool_id=aio_tool.id,
                     enabled=True,
                     config={},
+                ),
+                AgentTool(
+                    agent_id=opted_out_agent,
+                    tool_id=aio_tool.id,
+                    enabled=True,
+                    config={"toolscall_enabled": False},
                 ),
             ]
         )
         await s.commit()
 
-    enabled_tools = await get_agent_tools_for_llm(opted_in_agent)
-    disabled_tools = await get_agent_tools_for_llm(default_off_agent)
+    enabled_tools = await get_agent_tools_for_llm(default_on_agent)
+    disabled_tools = await get_agent_tools_for_llm(opted_out_agent)
     enabled_description = next(
         item["function"]["description"]
         for item in enabled_tools

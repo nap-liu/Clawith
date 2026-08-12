@@ -1775,7 +1775,7 @@ BUILTIN_TOOLS = [
             "required": ["execution_mode"],
         },
         "config": {
-            "toolscall_enabled": False,
+            "toolscall_enabled": True,
             "sandbox_type": "aio_sandbox",
             "api_url": "http://aio-sandbox:8080",
             "api_key": "",
@@ -1790,7 +1790,7 @@ BUILTIN_TOOLS = [
                     "key": "toolscall_enabled",
                     "label": "Enable toolscall",
                     "type": "checkbox",
-                    "default": False,
+                    "default": True,
                     "agent_only": True,
                     "help_text": (
                         "Allow this Agent to call its current-turn builtin, MCP, "

@@ -213,7 +213,7 @@ async def test_execute_code_aio_adds_toolscall_from_current_turn_snapshot(tmp_pa
         patch("app.config.get_sandbox_config", return_value=_FakeSandboxConfig()),
         patch(
             "app.services.agent_tools._get_tool_config",
-            new=AsyncMock(return_value={"toolscall_enabled": True}),
+            new=AsyncMock(return_value={}),
         ),
     ):
         await _execute_code(

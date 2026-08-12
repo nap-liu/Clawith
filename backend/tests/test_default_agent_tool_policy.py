@@ -12,6 +12,7 @@ from app.services.tool_seeder import (
     builtin_tool_enabled,
     should_sync_builtin_default,
 )
+from app.services.toolscall.capability import toolscall_enabled_for_agent
 from scripts.refresh_default_agent_tools import POLICY, plan_assignment_changes
 
 
@@ -26,20 +27,24 @@ def test_requested_builtin_default_flags_are_canonical():
     assert REQUEST_CONFIRMATION_TOOL_SEED["is_default"] is True
 
 
-def test_toolscall_is_agent_scoped_and_defaults_off():
+def test_toolscall_is_agent_scoped_and_defaults_on():
     seed = _seed("execute_code_aio")
-    assert seed["config"]["toolscall_enabled"] is False
+    assert seed["config"]["toolscall_enabled"] is True
     field = next(
         item
         for item in seed["config_schema"]["fields"]
         if item["key"] == "toolscall_enabled"
     )
     assert field["type"] == "checkbox"
-    assert field["default"] is False
+    assert field["default"] is True
     assert field["agent_only"] is True
+    assert toolscall_enabled_for_agent({}) is True
+    assert toolscall_enabled_for_agent(None) is True
+    assert toolscall_enabled_for_agent({"toolscall_enabled": True}) is True
+    assert toolscall_enabled_for_agent({"toolscall_enabled": False}) is False
 
 
-def test_agent_only_toolscall_flag_cannot_be_enabled_by_broader_config():
+def test_agent_only_toolscall_flag_cannot_be_overridden_by_broader_config():
     schema = {
         "fields": [
             {"key": "toolscall_enabled", "type": "checkbox", "agent_only": True},
@@ -48,21 +53,22 @@ def test_agent_only_toolscall_flag_cannot_be_enabled_by_broader_config():
     }
 
     inherited = merge_tool_config_layers(
-        {"toolscall_enabled": True, "max_timeout": 300},
-        {"toolscall_enabled": True, "max_timeout": 120},
+        {"toolscall_enabled": False, "max_timeout": 300},
+        {"toolscall_enabled": False, "max_timeout": 120},
         {},
         schema,
     )
     assert "toolscall_enabled" not in inherited
     assert inherited["max_timeout"] == 120
+    assert toolscall_enabled_for_agent(inherited) is True
 
-    opted_in = merge_tool_config_layers(
-        {"toolscall_enabled": False},
-        {},
+    opted_out = merge_tool_config_layers(
         {"toolscall_enabled": True},
+        {},
+        {"toolscall_enabled": False},
         schema,
     )
-    assert opted_in["toolscall_enabled"] is True
+    assert toolscall_enabled_for_agent(opted_out) is False
 
 
 def test_requested_builtin_flags_are_synced_to_existing_databases():
