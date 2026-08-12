@@ -223,16 +223,6 @@ async def test_external_url_rejects_zero_port():
 @pytest.mark.parametrize(
     "headers",
     [
-        {"Host": "other.example"},
-        {"content-length": "123"},
-        {"Accept-Encoding": "identity"},
-        {"Range": "bytes=0-99"},
-        {"X-Forwarded-For": "127.0.0.1"},
-        {"X-Clawith-Trace": "internal"},
-        {"X-Clawith": "internal"},
-        {"X-Agent-ID": "agent"},
-        {"X-Session-ID": "session"},
-        {"X-Tenant-ID": "tenant"},
         {"X-Custom": "line-one\r\nInjected: true"},
         {"X-Custom": "nul\x00value"},
         {"X-Custom": "control\x01value"},
@@ -241,7 +231,7 @@ async def test_external_url_rejects_zero_port():
         {"X-Number": 123},
     ],
 )
-def test_managed_headers_reject_transport_routing_and_platform_fields(headers):
+def test_managed_headers_reject_invalid_names_and_values(headers):
     with pytest.raises(media_url_source.MediaUrlError) as exc_info:
         media_url_source.normalize_managed_media_headers(headers)
 
@@ -257,6 +247,29 @@ def test_managed_headers_preserve_non_blocked_names_and_values():
     }
 
     assert media_url_source.normalize_managed_media_headers(headers) == headers
+
+
+def test_managed_headers_filter_blocked_fields_after_merging():
+    headers = media_url_source._managed_request_headers(
+        {
+            "Host": "untrusted.example",
+            "Accept-Encoding": "identity",
+            "X-Forwarded-For": "127.0.0.1",
+            "X-Clawith-Trace": "internal",
+            "X-Agent-ID": "agent",
+            "Authorization": "Bearer exact-token",
+            "User-Agent": "Neutral Client/1.0",
+        },
+        "media.example",
+    )
+
+    assert headers["Host"] == "media.example"
+    assert headers["Authorization"] == "Bearer exact-token"
+    assert headers["User-Agent"] == "Neutral Client/1.0"
+    assert "Accept-Encoding" not in headers
+    assert "X-Forwarded-For" not in headers
+    assert "X-Clawith-Trace" not in headers
+    assert "X-Agent-ID" not in headers
 
 
 @pytest.mark.asyncio
@@ -786,6 +799,9 @@ async def test_managed_import_logs_exact_request_and_response(tmp_path, monkeypa
                 "Authorization": authorization,
                 "Cookie": cookie,
                 "X-Business-Trace": "business-trace-123",
+                "Host": "untrusted.example",
+                "Accept-Encoding": "identity",
+                "X-Clawith-Trace": "internal",
             },
         )
     finally:
@@ -805,6 +821,9 @@ async def test_managed_import_logs_exact_request_and_response(tmp_path, monkeypa
     assert request.headers["authorization"] == authorization
     assert request.headers["cookie"] == cookie
     assert request.headers["x-business-trace"] == "business-trace-123"
+    assert request.headers["host"] == "media.example"
+    assert request.headers.get("accept-encoding") != "identity"
+    assert "x-clawith-trace" not in request.headers
     assert request.headers["user-agent"].startswith("Mozilla/5.0")
     assert "Clawith" not in request.headers["user-agent"]
     assert not any(name.lower().startswith("x-clawith-") for name in request.headers)

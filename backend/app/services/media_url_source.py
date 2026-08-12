@@ -107,7 +107,7 @@ class _ManagedMediaPaths:
 
 
 def normalize_managed_media_headers(raw_headers: object) -> dict[str, str]:
-    """Validate managed-download headers with a denylist and preserve the rest."""
+    """Validate managed-download header syntax and preserve caller input."""
     if raw_headers is None:
         return {}
     if not isinstance(raw_headers, dict):
@@ -117,15 +117,9 @@ def normalize_managed_media_headers(raw_headers: object) -> dict[str, str]:
         if not isinstance(raw_name, str) or not isinstance(raw_value, str):
             raise MediaUrlError("INVALID_MEDIA_HEADERS")
         name = raw_name
-        lowered = name.lower()
         if (
             not name
             or not _HTTP_HEADER_NAME_RE.fullmatch(name)
-            or lowered in MANAGED_MEDIA_BLOCKED_HEADERS
-            or any(
-                lowered.startswith(prefix)
-                for prefix in MANAGED_MEDIA_BLOCKED_HEADER_PREFIXES
-            )
             or not _HTTP_HEADER_VALUE_RE.fullmatch(raw_value)
         ):
             raise MediaUrlError("INVALID_MEDIA_HEADERS")
@@ -146,6 +140,17 @@ def _managed_request_headers(
         if existing is not None:
             headers.pop(existing)
         headers[name] = value
+    headers = {
+        name: value
+        for name, value in headers.items()
+        if name.lower() not in MANAGED_MEDIA_BLOCKED_HEADERS
+        and not any(
+            name.lower().startswith(prefix)
+            for prefix in MANAGED_MEDIA_BLOCKED_HEADER_PREFIXES
+        )
+    }
+    # Host is always reconstructed from the validated request target. Caller
+    # input cannot alter DNS pinning, redirect validation, or TLS identity.
     headers["Host"] = host_header
     return headers
 

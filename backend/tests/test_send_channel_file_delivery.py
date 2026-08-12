@@ -8,6 +8,7 @@ from app.services import agent_tools
 from app.services.llm import caller as llm_caller
 from app.services.media_tool_contract import (
     MAX_MEDIA_DISPLAY_TITLE_LENGTH,
+    SEND_MEDIA_DESCRIPTION,
     SEND_MEDIA_PARAMETERS_SCHEMA,
     normalize_media_display_title,
 )
@@ -356,8 +357,8 @@ def test_media_tools_are_fixed_core_tools():
         "type": "string",
         "maxLength": MAX_MEDIA_DISPLAY_TITLE_LENGTH,
         "description": (
-            "Optional concise display title for the Web/H5 media card. This does "
-            "not rename the file and is not delivered as an IM caption."
+            "Optional concise display title for the media card. This does not rename "
+            "the file and is not delivered as message text."
         ),
     }
     assert media_schema == SEND_MEDIA_PARAMETERS_SCHEMA
@@ -365,8 +366,12 @@ def test_media_tools_are_fixed_core_tools():
     headers_schema = media_schema["properties"]["headers"]
     assert headers_schema["additionalProperties"] == {"type": "string"}
     assert "managed" in headers_schema["description"]
-    assert "Host" in headers_schema["description"]
-    assert "X-Clawith-*" in headers_schema["description"]
+    assert "Authorization" in headers_schema["description"]
+    assert "silently" in headers_schema["description"]
+    assert "redirects" in headers_schema["description"]
+    assert "Clawith" not in headers_schema["description"]
+    assert "Agent" not in SEND_MEDIA_DESCRIPTION
+    assert "platform" not in SEND_MEDIA_DESCRIPTION
     seeded = next(tool for tool in BUILTIN_TOOLS if tool["name"] == "send_media")
     assert seeded["parameters_schema"] == media_schema
     assert seeded["config"] == {"allow_download": False}
@@ -375,7 +380,7 @@ def test_media_tools_are_fixed_core_tools():
         "label": "Allow media download",
         "type": "boolean",
         "default": False,
-        "description": "Show the download action on send_media cards in both Web and H5 chat.",
+        "description": "Show the download action on send_media cards in supported chat clients.",
     }]
 
 

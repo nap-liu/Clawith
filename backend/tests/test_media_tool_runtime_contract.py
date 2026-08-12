@@ -61,6 +61,6 @@ async def test_seeded_send_media_accepts_any_agent_root_relative_path():
 
     file_path = runtime["parameters"]["properties"]["file_path"]
     cover_path = runtime["parameters"]["properties"]["cover_image_path"]
-    assert "Any existing file path relative to the current Agent root" in file_path["description"]
+    assert "relative to the caller's workspace" in file_path["description"]
     assert "exports/briefing.mp3" in file_path["description"]
-    assert "relative to the current Agent root" in cover_path["description"]
+    assert "relative to the caller's workspace" in cover_path["description"]

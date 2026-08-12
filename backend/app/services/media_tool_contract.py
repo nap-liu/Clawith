@@ -39,17 +39,6 @@ MANAGED_MEDIA_BLOCKED_HEADER_PREFIXES = (
     "x-session-",
     "x-tenant-",
 )
-MANAGED_MEDIA_BLOCKED_HEADERS_DISPLAY = (
-    "Host, Content-Length, Transfer-Encoding, Connection, Keep-Alive, TE, "
-    "Trailer, Upgrade, Accept-Encoding, Range, Proxy-Authorization, "
-    "Proxy-Authenticate, Proxy-Connection, Forwarded, Via, X-Forwarded-*, "
-    "X-Real-IP, Client-IP, "
-    "True-Client-IP, CF-Connecting-IP, X-Original-URL, X-Rewrite-URL, "
-    "X-Clawith/X-Clawith-*, X-Agent/X-Agent-*, X-Session/X-Session-* and "
-    "X-Tenant/X-Tenant-*"
-)
-
-
 def normalize_media_display_title(value: object) -> str:
     """Return one safe, compact card title without changing file identity."""
     if not isinstance(value, str):
@@ -59,18 +48,14 @@ def normalize_media_display_title(value: object) -> str:
 
 
 SEND_MEDIA_DESCRIPTION = (
-    "Send one audio or video source to the current conversation, an exact existing "
-    "person/group Session, or a directly resolved person. Use exactly one source: "
-    "file_path for an Agent-owned file, or url plus url_mode for a third-party "
-    "URL. url_mode='external' accepts HTTPS only, publishes the URL without downloading "
-    "it, and is "
-    "available only when the resolved destination can render a third-party media URL; "
-    "url_mode='managed' accepts HTTP or HTTPS and downloads the media into this Agent's "
-    "platform-managed media store before delivery "
-    "so history uses platform-managed playback. The tool contract is always available "
-    "even when the resolved IM channel returns unsupported. Audio/video is rendered as "
-    "a dedicated tool-call card. An optional title customizes the Web/H5 card label "
-    "without renaming the source file or acting as a caption."
+    "Send one audio or video item to the current conversation, an existing session, "
+    "or a specified user. Choose exactly one source: file_path for a file in the caller's "
+    "workspace, or url together with url_mode. external mode forwards an HTTPS URL "
+    "without downloading it and works only when the destination supports remote media. "
+    "managed mode downloads an HTTP or HTTPS URL, validates the media, stores a managed "
+    "copy, and then delivers that copy. Optional headers apply only to managed downloads. "
+    "The media item is sent separately from the optional message text, and title changes "
+    "only its display label."
 )
 
 SEND_MEDIA_PARAMETERS_SCHEMA = {
@@ -80,66 +65,68 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
             "type": "string",
             "enum": ["audio", "video"],
             "description": (
-                "Required media kind. It must match the actual managed or Agent-owned file; "
-                "external URLs are rendered using this declared kind."
+                "Required media kind. It must match a workspace file or managed download. "
+                "For external URLs, the destination renders the declared kind."
             ),
         },
         "file_path": {
             "type": "string",
             "description": (
-                "Any existing file path relative to the current Agent root, for example "
+                "An existing file path relative to the caller's workspace, for example "
                 "exports/briefing.mp3. Use either file_path or url, never both."
             ),
         },
         "url": {
             "type": "string",
             "description": (
-                "Third-party media URL. external mode requires HTTPS; managed mode "
+                "Remote media URL. external mode requires HTTPS; managed mode "
                 "accepts HTTP or HTTPS. Use with url_mode and omit file_path. "
-                "The full URL may be persisted in the standard tool-call record."
+                "The full URL is retained in the tool-call record."
             ),
         },
         "url_mode": {
             "type": "string",
             "enum": ["external", "managed"],
             "description": (
-                "Required with url. external requires HTTPS, publishes the third-party "
+                "Required with url. external requires HTTPS, sends the remote "
                 "URL without downloading, and does not guarantee future availability. "
-                "managed accepts HTTP or HTTPS and imports the media into "
-                "media/imported before delivery."
+                "managed accepts HTTP or HTTPS, validates the response, and stores a copy "
+                "before delivery."
             ),
         },
         "headers": {
             "type": "object",
             "additionalProperties": {"type": "string"},
             "description": (
-                "Optional HTTP request headers for url_mode='managed' only. Header "
-                "names and values not on the blacklist are sent unchanged and override "
-                "the browser-style defaults. Blocked, case-insensitively: "
-                f"{MANAGED_MEDIA_BLOCKED_HEADERS_DISPLAY}. Header names must be valid "
-                "HTTP tokens; values must contain only printable ASCII characters or "
-                "tabs."
+                "Optional HTTP request headers for url_mode='managed' only, expressed as "
+                "a JSON object of string names and values. Authorization, Cookie, Referer, "
+                "Origin, User-Agent, Accept, and custom headers are supported. Supplied "
+                "headers override browser-style defaults and are reused for redirects. "
+                "After merging, transport-controlled routing, framing, proxy, client-IP, "
+                "download-control, and service-reserved identity headers are silently "
+                "removed; all other valid headers are sent unchanged. Names must be valid "
+                "HTTP tokens, and values may contain printable ASCII characters or tabs."
             ),
         },
         "cover_image_path": {
             "type": "string",
             "description": (
-                "Video only. Optional image path relative to the current Agent root. "
-                "An Agent cover wins; required channels generate a fallback when omitted."
+                "Video only. Optional image path relative to the caller's workspace. "
+                "When omitted, destinations that require a cover generate a fallback."
             ),
         },
         "session_id": {
             "type": "string",
             "description": (
-                "Exact existing person-or-group ChatSession UUID from list_sessions or "
+                "Exact existing person-or-group session UUID from list_sessions or "
                 "search_sessions. Omit for the current conversation or when using user_id."
             ),
         },
         "user_id": {
             "type": "string",
             "description": (
-                "Canonical natural-person user UUID from search_contacts or Relationships. "
-                "Omit for current-conversation or exact-session delivery."
+                "Canonical user UUID from search_contacts. Omit for current-conversation "
+                "or exact-session delivery."
             ),
         },
         "channel": {
@@ -163,7 +150,7 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
         "message": {
             "type": "string",
             "description": (
-                "Optional caption/business text delivered as a separate ordinary message "
+                "Optional text delivered as a separate ordinary message "
                 "after the standalone media message."
             ),
         },
@@ -171,8 +158,8 @@ SEND_MEDIA_PARAMETERS_SCHEMA = {
             "type": "string",
             "maxLength": MAX_MEDIA_DISPLAY_TITLE_LENGTH,
             "description": (
-                "Optional concise display title for the Web/H5 media card. This does "
-                "not rename the file and is not delivered as an IM caption."
+                "Optional concise display title for the media card. This does not rename "
+                "the file and is not delivered as message text."
             ),
         },
     },
@@ -199,7 +186,7 @@ SEND_MEDIA_CONFIG_SCHEMA = {
             "label": "Allow media download",
             "type": "boolean",
             "default": False,
-            "description": "Show the download action on send_media cards in both Web and H5 chat.",
+            "description": "Show the download action on send_media cards in supported chat clients.",
         }
     ]
 }
