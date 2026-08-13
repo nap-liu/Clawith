@@ -3426,7 +3426,8 @@ BUILTIN_TOOLS = [
             "same URL and preserves its current permissions unless access_mode is explicitly supplied. Non-public pages "
             "receive the platform watermark automatically. Automatic SSO is opt-in only: append auto_login=1 to the Page URL only "
             "when the user explicitly requests automatic login; optionally add sso=<provider_type>, otherwise "
-            "the first enabled SSO provider is used. Always give the user both the Page URL and Management URL exactly as returned."
+            "the first enabled SSO provider is used. The result includes the publication actor and exact publication time. "
+            "Always give the user both the Page URL and Management URL exactly as returned."
         ),
         "category": "pages",
         "icon": "🌐",
@@ -3474,7 +3475,7 @@ BUILTIN_TOOLS = [
     {
         "name": "list_published_pages",
         "display_name": "List Published Pages",
-        "description": "List pages published by this Agent, including Page URL, Management URL, access mode, views, and pending access-request count. Use list_page_access_requests when request details or statuses are needed.",
+        "description": "List pages published by this Agent, including Page URL, Management URL, creator and creation time, most recent publisher and publication time, access mode, views, and pending access-request count. Historical pages explicitly report when their most recent publication actor or time was not recorded. Use list_page_access_requests when request details or statuses are needed.",
         "category": "pages",
         "icon": "📋",
         "is_default": True,

@@ -434,8 +434,33 @@ def _member_dict(row) -> dict:
     }
 
 
+async def _page_actor_map(db: AsyncSession, pages: list[PublishedPage]) -> dict[uuid.UUID, dict]:
+    user_ids = {
+        user_id
+        for page in pages
+        for user_id in (page.user_id, page.last_published_by_user_id)
+        if user_id is not None
+    }
+    if not user_ids:
+        return {}
+    rows = (await db.execute(
+        select(User, Identity)
+        .outerjoin(Identity, Identity.id == User.identity_id)
+        .where(User.id.in_(user_ids))
+    )).all()
+    return {
+        user.id: {
+            "id": str(user.id),
+            "display_name": user.display_name,
+            "email": identity.email if identity else None,
+        }
+        for user, identity in rows
+    }
+
+
 async def _page_detail(db: AsyncSession, page: PublishedPage) -> dict:
     agent_name = await db.scalar(select(Agent.name).where(Agent.id == page.agent_id))
+    actors = await _page_actor_map(db, [page])
     access_rows = (await db.execute(
         select(User, Identity, PublishedPageAccess)
         .join(PublishedPageAccess, PublishedPageAccess.user_id == User.id)
@@ -457,12 +482,16 @@ async def _page_detail(db: AsyncSession, page: PublishedPage) -> dict:
         "view_count": page.view_count, "url": f"/p/{page.short_id}",
         "created_at": page.created_at.isoformat() if page.created_at else None,
         "updated_at": page.updated_at.isoformat() if page.updated_at else None,
+        "created_by": actors.get(page.user_id),
+        "last_published_by": actors.get(page.last_published_by_user_id),
+        "last_published_at": page.last_published_at.isoformat() if page.last_published_at else None,
         "access_users": [_member_dict(row) for row in access_rows],
         "visitor_count": int(authenticated_visitor_count or 0) + int(anonymous_visitor_count or 0),
     }
 
 
 async def _page_summaries(db: AsyncSession, rows: list[tuple[PublishedPage, str]]) -> list[dict]:
+    actors = await _page_actor_map(db, [page for page, _agent_name in rows])
     page_ids = [page.id for page, _agent_name in rows]
     visitors_by_page: dict[uuid.UUID, list[dict]] = {page_id: [] for page_id in page_ids}
     visitor_counts: dict[uuid.UUID, int] = {}
@@ -532,6 +561,9 @@ async def _page_summaries(db: AsyncSession, rows: list[tuple[PublishedPage, str]
             "url": f"/p/{page.short_id}",
             "created_at": page.created_at.isoformat() if page.created_at else None,
             "updated_at": page.updated_at.isoformat() if page.updated_at else None,
+            "created_by": actors.get(page.user_id),
+            "last_published_by": actors.get(page.last_published_by_user_id),
+            "last_published_at": page.last_published_at.isoformat() if page.last_published_at else None,
             "visitor_count": visitor_counts.get(page.id, 0) + anonymous_visitor_counts.get(page.id, 0),
             "pending_request_count": pending_request_counts.get(page.id, 0),
             "visitors": visitors,

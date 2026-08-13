@@ -18,6 +18,7 @@ import {
 
 import OrgMemberAccessPicker, { type AgentAccessUser } from '../components/OrgMemberAccessPicker';
 import ConfirmModal from '../components/ConfirmModal';
+import PublishedPageAttribution, { type PublishedPageActor } from '../components/PublishedPageAttribution';
 import PublishedPageFilters, { type PublishedPageAgentOption } from '../components/PublishedPageFilters';
 import { useToast } from '../components/Toast/ToastProvider';
 import { fetchJson } from '../services/api';
@@ -52,6 +53,9 @@ type PublishedPage = {
     view_count: number;
     url: string;
     created_at?: string;
+    created_by?: PublishedPageActor | null;
+    last_published_by?: PublishedPageActor | null;
+    last_published_at?: string | null;
     visitor_count: number;
     pending_request_count: number;
     visitors: Visitor[];
@@ -275,6 +279,12 @@ export default function PublishedPages() {
                                 <div style={{ minWidth: 0 }}>
                                     <div style={{ fontWeight: 600, fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{publishedPage.title || publishedPage.source_path}</div>
                                     <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{publishedPage.agent_name} · {publishedPage.source_path}</div>
+                                    <PublishedPageAttribution
+                                        createdBy={publishedPage.created_by}
+                                        createdAt={publishedPage.created_at}
+                                        lastPublishedBy={publishedPage.last_published_by}
+                                        lastPublishedAt={publishedPage.last_published_at}
+                                    />
                                 </div>
                                 <div className="published-pages-row__url" style={{ minWidth: 0, display: 'flex', alignItems: 'center', gap: 6 }}>
                                     <a
@@ -330,6 +340,13 @@ export default function PublishedPages() {
                         <button type="button" aria-label="复制发布地址" title="复制发布地址" onClick={() => void copyPageUrl(selected.url)} style={{ border: 0, background: 'transparent', color: 'var(--text-secondary)', padding: 3, cursor: 'pointer', display: 'inline-flex' }}><IconCopy size={15} /></button>
                         <a href={absolutePageUrl(selected.url)} target="_blank" rel="noreferrer" aria-label="打开发布页面" title="打开发布页面" style={{ color: 'var(--text-secondary)', display: 'inline-flex' }}><IconExternalLink size={15} /></a>
                     </div>
+                    <PublishedPageAttribution
+                        createdBy={selected.created_by}
+                        createdAt={selected.created_at}
+                        lastPublishedBy={selected.last_published_by}
+                        lastPublishedAt={selected.last_published_at}
+                        variant="detail"
+                    />
                     <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
                         <button type="button" className="btn btn-danger btn-sm" onClick={() => setShowDeleteConfirm(true)}>
                             <IconTrash size={14} /> 删除发布地址

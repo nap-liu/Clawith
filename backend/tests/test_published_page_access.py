@@ -65,8 +65,10 @@ async def _make_restricted_page():
         agent = Agent(name="Publisher", role_description="", creator_id=owner.id, tenant_id=tenant.id, agent_type="native")
         db.add(agent)
         await db.flush()
+        published_at = datetime.now(timezone.utc)
         page = PublishedPage(
             short_id=f"p{uuid.uuid4().hex[:7]}", agent_id=agent.id, user_id=owner.id, tenant_id=tenant.id,
+            last_published_by_user_id=owner.id, last_published_at=published_at,
             source_path="out/protected.html", title="Protected", access_mode="restricted",
         )
         db.add(page)
@@ -143,6 +145,9 @@ async def test_protected_page_uses_frontend_access_route_and_returns_after_appro
         ))
         assert visitor is not None
         assert visitor.view_count == 1
+        page = await db.get(PublishedPage, page_id)
+        assert page.last_published_by_user_id == _owner_id
+        assert page.last_published_at is not None
 
 
 async def test_access_request_is_idempotent_and_notifies_publisher():
@@ -390,6 +395,10 @@ async def test_cross_tenant_user_cannot_create_page_session():
 
 async def test_only_page_managers_can_update_access_and_resolve_requests():
     short_id, page_id, _agent_id, owner_id, viewer_id = await _make_restricted_page()
+    async with async_session() as db:
+        original_page = await db.get(PublishedPage, page_id)
+        original_last_publisher = original_page.last_published_by_user_id
+        original_last_published_at = original_page.last_published_at
     owner_token = create_access_token(str(owner_id), "member")
     viewer_token = create_access_token(str(viewer_id), "member")
     transport = httpx.ASGITransport(app=app)
@@ -432,6 +441,11 @@ async def test_only_page_managers_can_update_access_and_resolve_requests():
         )
         assert bridge.status_code == 200
         assert bridge.json()["allowed"] is True
+
+    async with async_session() as db:
+        unchanged_page = await db.get(PublishedPage, page_id)
+        assert unchanged_page.last_published_by_user_id == original_last_publisher
+        assert unchanged_page.last_published_at == original_last_published_at
 
 
 async def test_page_manager_can_delete_published_address_without_deleting_source_file():
@@ -509,6 +523,9 @@ async def test_page_list_returns_summary_and_detail_is_loaded_separately():
         assert "access_users" not in summary
         assert "visitor_count" in summary
         assert summary["pending_request_count"] == 0
+        assert summary["created_by"]["display_name"] == "Owner"
+        assert summary["last_published_by"]["display_name"] == "Owner"
+        assert summary["last_published_at"] is not None
 
         detail = await client.get(
             f"/api/pages/{page_id}/detail", headers={"Authorization": f"Bearer {token}"},
@@ -517,6 +534,9 @@ async def test_page_list_returns_summary_and_detail_is_loaded_separately():
         assert "access_users" in detail.json()
         assert "visitors" not in detail.json()
         assert detail.json()["visitor_count"] == 1
+        assert detail.json()["created_by"]["id"] == str(owner_id)
+        assert detail.json()["last_published_by"]["id"] == str(owner_id)
+        assert detail.json()["last_published_at"] is not None
 
         visitors = await client.get(
             f"/api/pages/{page_id}/visitors?page=1&page_size=1",
@@ -526,6 +546,28 @@ async def test_page_list_returns_summary_and_detail_is_loaded_separately():
         assert visitors.json()["total"] == 1
         assert visitors.json()["items"][0]["id"] == str(viewer_id)
         assert visitors.json()["items"][0]["view_count"] == 3
+
+
+async def test_historical_page_reports_unrecorded_last_publication():
+    _short_id, page_id, agent_id, owner_id, _viewer_id = await _make_restricted_page()
+    async with async_session() as db:
+        page = await db.get(PublishedPage, page_id)
+        page.last_published_by_user_id = None
+        page.last_published_at = None
+        await db.commit()
+
+    token = create_access_token(str(owner_id), "member")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        pages = await client.get("/api/pages/mine", headers={"Authorization": f"Bearer {token}"})
+        summary = next(item for item in pages.json()["items"] if item["id"] == str(page_id))
+        assert summary["created_by"]["id"] == str(owner_id)
+        assert summary["last_published_by"] is None
+        assert summary["last_published_at"] is None
+
+    agent_view = await _list_published_pages(agent_id)
+    assert "Last published by: historical data not recorded" in agent_view
+    assert "Last published at: historical data not recorded" in agent_view
 
 
 async def test_page_list_filters_multiple_agents_and_fuzzy_searches_title_or_path():
@@ -631,6 +673,8 @@ async def test_publish_tool_defaults_new_pages_to_authenticated_and_preserves_ex
     assert "Access: authenticated." in first
     assert "Platform watermark: enabled automatically." in first
     assert "Page URL:" in first and "Management URL:" in first
+    assert "Published by: Default Owner" in first
+    assert "Published at:" in first
     async with async_session() as db:
         published = await db.scalar(select(PublishedPage).where(
             PublishedPage.agent_id == agent_id,
@@ -638,6 +682,9 @@ async def test_publish_tool_defaults_new_pages_to_authenticated_and_preserves_ex
         ))
         assert published is not None
         assert published.access_mode == "authenticated"
+        assert published.user_id == owner_id
+        assert published.last_published_by_user_id == owner_id
+        assert published.last_published_at is not None
         published.access_mode = "public"
         await db.commit()
 
@@ -649,6 +696,73 @@ async def test_publish_tool_defaults_new_pages_to_authenticated_and_preserves_ex
             PublishedPage.source_path == source_path,
         ))
         assert published.access_mode == "public"
+
+
+async def test_republish_preserves_creator_and_records_latest_user():
+    async with async_session() as db:
+        tenant = Tenant(name="Publish Actor Test", slug=f"actor-{uuid.uuid4().hex[:8]}", im_provider="web_only")
+        db.add(tenant)
+        await db.flush()
+        creator = await _make_user(db, tenant.id, "Creator")
+        updater = await _make_user(db, tenant.id, "Updater")
+        agent = Agent(
+            name="Actor Publisher", role_description="", creator_id=creator.id,
+            tenant_id=tenant.id, agent_type="native",
+        )
+        db.add(agent)
+        await db.commit()
+        agent_id, creator_id, updater_id = agent.id, creator.id, updater.id
+
+    source_path = f"workspace/actor-{uuid.uuid4().hex[:8]}.html"
+    source = pathlib.Path(settings.AGENT_DATA_DIR) / str(agent_id) / source_path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("<title>Actor attribution</title><p>first</p>", encoding="utf-8")
+
+    await _publish_page(agent_id, creator_id, source.parent, {"path": source_path})
+    async with async_session() as db:
+        first_publication = await db.scalar(select(PublishedPage).where(
+            PublishedPage.agent_id == agent_id,
+            PublishedPage.source_path == source_path,
+        ))
+        first_published_at = first_publication.last_published_at
+        assert first_published_at is not None
+    source.write_text("<title>Actor attribution</title><p>second</p>", encoding="utf-8")
+    result = await _publish_page(agent_id, updater_id, source.parent, {"path": source_path})
+    assert result.startswith("Updated in place")
+
+    async with async_session() as db:
+        page = await db.scalar(select(PublishedPage).where(
+            PublishedPage.agent_id == agent_id,
+            PublishedPage.source_path == source_path,
+        ))
+        assert page is not None
+        assert page.user_id == creator_id
+        assert page.last_published_by_user_id == updater_id
+        assert page.last_published_at is not None
+        assert page.last_published_at > first_published_at
+        page_id = page.id
+
+    token = create_access_token(str(creator_id), "member")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        pages = await client.get("/api/pages/mine", headers={"Authorization": f"Bearer {token}"})
+        summary = next(item for item in pages.json()["items"] if item["id"] == str(page_id))
+        assert summary["created_by"]["id"] == str(creator_id)
+        assert summary["last_published_by"]["id"] == str(updater_id)
+        assert summary["last_published_at"] is not None
+
+        detail = await client.get(
+            f"/api/pages/{page_id}/detail",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert detail.json()["created_by"]["id"] == str(creator_id)
+        assert detail.json()["last_published_by"]["id"] == str(updater_id)
+        assert detail.json()["last_published_at"] == summary["last_published_at"]
+
+    agent_view = await _list_published_pages(agent_id)
+    assert "Created by: Creator" in agent_view
+    assert "Last published by: Updater" in agent_view
+    assert f"Last published at: {summary['last_published_at']}" in agent_view
 
 
 async def test_agent_can_list_real_access_request_statuses_with_pagination():
@@ -693,12 +807,16 @@ async def test_publish_tool_contract_is_self_contained_and_consistent():
         "use public only when the user explicitly wants",
         "search_page_viewers",
         "preserves its current permissions",
+        "publication actor and exact publication time",
         "Page URL and Management URL",
     ):
         assert required_guidance in runtime_publish["description"]
         assert required_guidance in seeded_publish["description"]
     assert any(item["function"]["name"] == "list_page_access_requests" for item in AGENT_TOOLS)
     assert any(item["name"] == "list_page_access_requests" for item in BUILTIN_TOOLS)
+    runtime_list = next(item["function"] for item in AGENT_TOOLS if item["function"]["name"] == "list_published_pages")
+    for expected_metadata in ("creator", "creation time", "most recent publisher", "publication time"):
+        assert expected_metadata in runtime_list["description"]
     runtime_page_tools = {
         item["function"]["name"]: item["function"]
         for item in AGENT_TOOLS

@@ -2076,7 +2076,8 @@ AGENT_TOOLS = [
                 "permissions unless access_mode is explicitly supplied. Non-public pages receive the platform "
                 "watermark automatically. Automatic SSO is opt-in only: append auto_login=1 to the Page URL only "
                 "when the user explicitly requests automatic login; optionally add sso=<provider_type>, otherwise "
-                "the first enabled SSO provider is used. Always give the user both the Page URL and Management URL exactly as returned."
+                "the first enabled SSO provider is used. The result includes the publication actor and exact publication time. "
+                "Always give the user both the Page URL and Management URL exactly as returned."
             ),
             "parameters": {
                 "type": "object",
@@ -2130,7 +2131,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_published_pages",
-            "description": "List pages published by this Agent, including Page URL, Management URL, access mode, views, and pending access-request count. Use list_page_access_requests when request details or statuses are needed.",
+            "description": "List pages published by this Agent, including Page URL, Management URL, creator and creation time, most recent publisher and publication time, access mode, views, and pending access-request count. Historical pages explicitly report when their most recent publication actor or time was not recorded. Use list_page_access_requests when request details or statuses are needed.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -16245,10 +16246,17 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     # short_ids. So reuse an existing page for this (agent_id, source_path);
     # only mint a new id when the file was never published before.
     from app.models.published_page import PublishedPage
+    from app.models.user import User
     reused = False
     page_id: uuid.UUID | None = None
+    publication_actor_label = f"unknown user (user_id: {user_id})"
+    publication_time: datetime | None = None
     try:
         async with async_session() as db:
+            actor = await db.get(User, user_id)
+            if actor is not None:
+                publication_actor_label = f"{actor.display_name} (user_id: {actor.id})"
+            publication_time = datetime.now(timezone.utc)
             existing = (
                 await db.execute(
                     select(PublishedPage)
@@ -16264,13 +16272,13 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
                 short_id = existing.short_id
                 page_id = existing.id
                 reused = True
+                existing.last_published_by_user_id = user_id
+                existing.last_published_at = publication_time
                 if title and existing.title != title:
                     existing.title = title  # refresh title; same link
                 if "access_mode" in arguments:
-                    from app.models.user import User
                     from app.services.published_page_access import can_manage_page
 
-                    actor = await db.get(User, user_id)
                     if actor is None or not await can_manage_page(db, existing, actor):
                         return "Permission denied: only the page publisher or Agent creator can change page access"
                     if existing.tenant_id is None:
@@ -16297,6 +16305,8 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
                         short_id=short_id,
                         agent_id=agent_id,
                         user_id=user_id,
+                        last_published_by_user_id=user_id,
+                        last_published_at=publication_time,
                         tenant_id=tenant_id,
                         source_path=path,
                         title=title,
@@ -16343,6 +16353,8 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
         f"Page URL: {url}\n"
         f"Management URL: {management_url}\n"
         f"Title: {title}\n\n"
+        f"Published by: {publication_actor_label}\n"
+        f"Published at: {publication_time.isoformat() if publication_time else 'not recorded'}\n\n"
         f"Access: {effective_access_mode}.\n"
         f"Platform watermark: {'disabled for public access' if effective_access_mode == 'public' else 'enabled automatically'}.\n"
         "Automatic SSO: off by default; append ?auto_login=1 only when explicitly requested, "
@@ -16355,6 +16367,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
 async def _list_published_pages(agent_id: uuid.UUID) -> str:
     """List all published pages for this agent."""
     from app.models.published_page import PublishedPage, PublishedPageAccess
+    from app.models.user import User
     public_base = await _resolve_public_base_url()
 
     try:
@@ -16379,6 +16392,23 @@ async def _list_published_pages(agent_id: uuid.UUID) -> str:
             )
             pages = result.all()
 
+            actor_ids = {
+                actor_id
+                for published_page, _pending_count in pages
+                for actor_id in (
+                    published_page.user_id,
+                    published_page.last_published_by_user_id,
+                )
+                if actor_id is not None
+            }
+            actor_rows = []
+            if actor_ids:
+                actor_rows = (await db.scalars(select(User).where(User.id.in_(actor_ids)))).all()
+            actors = {
+                user.id: f"{user.display_name} (user_id: {user.id})"
+                for user in actor_rows
+            }
+
         if not pages:
             return "No published pages yet."
 
@@ -16393,6 +16423,16 @@ async def _list_published_pages(agent_id: uuid.UUID) -> str:
             lines.append(f"  URL: {url}")
             lines.append(f"  Management: {page_management_url}")
             lines.append(f"  Source: {p.source_path}")
+            lines.append(f"  Created by: {actors.get(p.user_id, 'unknown user')}")
+            lines.append(f"  Created at: {p.created_at.isoformat() if p.created_at else 'not recorded'}")
+            lines.append(
+                "  Last published by: "
+                f"{actors.get(p.last_published_by_user_id, 'historical data not recorded')}"
+            )
+            lines.append(
+                "  Last published at: "
+                f"{p.last_published_at.isoformat() if p.last_published_at else 'historical data not recorded'}"
+            )
             lines.append(f"  Views: {p.view_count}")
             lines.append(f"  Access: {p.access_mode}")
             lines.append(f"  Pending access requests: {int(pending_count or 0)}")
