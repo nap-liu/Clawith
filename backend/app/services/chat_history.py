@@ -506,6 +506,66 @@ async def persist_incoming_user_message(
     return row
 
 
+async def mark_latest_incomplete_turn_cancelled(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    conversation_id: str,
+    reason: str,
+) -> uuid.UUID | None:
+    """Persist the control-plane cancellation of the current conversation turn.
+
+    ``/stop`` and ``/new`` cancel the in-process coroutine immediately, while
+    startup recovery infers interrupted turns from durable chat rows. Marking
+    the latest unanswered user anchor keeps those two views consistent.
+    """
+    anchor = (
+        await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.conversation_id == conversation_id,
+                ChatMessage.role == "user",
+                ChatMessage.compacted_into.is_(None),
+            )
+            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if anchor is None:
+        return None
+
+    completed = (
+        await db.execute(
+            select(ChatMessage.id)
+            .where(
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.conversation_id == conversation_id,
+                ChatMessage.role == "assistant",
+                ChatMessage.message_meta["turn_anchor_id"].as_string()
+                == str(anchor.id),
+                ChatMessage.message_meta["turn_status"].as_string()
+                == "completed",
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if completed is not None:
+        return None
+
+    meta = dict(anchor.message_meta or {})
+    meta.update(
+        {
+            "turn_status": "cancelled",
+            "cancel_reason": reason,
+            "cancelled_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    anchor.message_meta = meta
+    await db.flush()
+    return anchor.id
+
+
 def build_external_event_key(
     *,
     agent_id: uuid.UUID,

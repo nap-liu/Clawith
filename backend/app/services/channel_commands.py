@@ -18,6 +18,7 @@ from app.services.channel_dispatch import (
     chat_session_lock_key,
     has_running_turn,
 )
+from app.services.chat_history import mark_latest_incomplete_turn_cancelled
 from app.services.im_thinking_output import (
     THINKING_OFF,
     THINKING_ON,
@@ -190,6 +191,13 @@ async def handle_channel_command(
             external_conv_id=external_conv_id,
         )
         cancelled = await cancel_running_turn(lock_key)
+        if cancelled and session is not None:
+            await mark_latest_incomplete_turn_cancelled(
+                db,
+                agent_id=agent_id,
+                conversation_id=str(session.id),
+                reason="stop",
+            )
         return {
             "action": "stop_turn",
             "message": "已请求停止当前工作。" if cancelled else "当前没有正在执行的工作。",
@@ -612,6 +620,12 @@ async def handle_channel_command(
             from app.services.scene_service import SCENE_SESSION_CONFIG_KEY
 
             cleared_scene_key = str((getattr(old_session, "im_config", None) or {}).get(SCENE_SESSION_CONFIG_KEY) or "")
+            await mark_latest_incomplete_turn_cancelled(
+                db,
+                agent_id=agent_id,
+                conversation_id=str(old_session.id),
+                reason="new",
+            )
             # Rename old external_conv_id so find_or_create will make a new one
             now = datetime.now(UTC)
             old_session.external_conv_id = f"{external_conv_id}__archived_{now.strftime('%Y%m%d_%H%M%S')}"

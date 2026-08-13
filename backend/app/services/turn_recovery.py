@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -11,22 +12,23 @@ from loguru import logger
 from sqlalchemy import func, select, text
 
 from app.database import async_session
-from app.models.agent import Agent, DEFAULT_CONTEXT_WINDOW_SIZE
+from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE, Agent
 from app.models.audit import ChatMessage
+from app.models.chat_session import ChatSession
 from app.services.channel_llm import _call_agent_llm
 from app.services.chat_history import (
-    load_recoverable_messages_for_turn,
     load_recoverable_history_for_turn,
-    persist_tool_call_row,
+    load_recoverable_messages_for_turn,
     persist_assistant_reply_row,
+    persist_tool_call_row,
 )
-from app.services.turn_runtime import deliver_recovered_reply_to_origin
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.llm.tool_output_store import finalize_tool_output
-
+from app.services.turn_runtime import deliver_recovered_reply_to_origin
 
 RECOVERY_ADVISORY_LOCK_KEY = 2026070801
 DEFAULT_RECOVERY_MAX_AGE_HOURS = 2.0
+
 
 @dataclass
 class RecoveryStats:
@@ -34,6 +36,13 @@ class RecoveryStats:
     resumed: int = 0
     skipped: int = 0
     failed: int = 0
+
+
+@dataclass(frozen=True)
+class _RecoveryOrigin:
+    session_found: bool
+    source_channel: str | None
+    external_conv_id: str | None
 
 
 def _recovery_max_age_hours() -> float:
@@ -68,11 +77,24 @@ def _tool_call_key(row: ChatMessage, payload: dict) -> str:
 
 def _unfinished_tool_call_rows(
     rows: list[ChatMessage],
+    *,
+    turn_anchor_id: uuid.UUID,
 ) -> list[tuple[ChatMessage, dict, str]]:
+    anchor_idx = next(
+        (idx for idx, row in enumerate(rows) if row.id == turn_anchor_id),
+        None,
+    )
+    if anchor_idx is None:
+        return []
+
     done_keys: set[str] = set()
     candidates: list[tuple[ChatMessage, dict, str]] = []
-    for row in rows:
+    for row in rows[anchor_idx + 1 :]:
         if getattr(row, "role", None) != "tool_call":
+            continue
+        meta = row.message_meta if isinstance(row.message_meta, dict) else {}
+        row_anchor_id = str(meta.get("turn_anchor_id") or "")
+        if row_anchor_id and row_anchor_id != str(turn_anchor_id):
             continue
         payload = _tool_payload(row)
         if not payload:
@@ -90,7 +112,13 @@ def _unfinished_tool_call_rows(
     return [(row, payload, key) for row, payload, key in candidates if key not in done_keys]
 
 
-async def _complete_unfinished_tool_calls(db, anchor: ChatMessage, *, ctx_size: int) -> int:
+async def _complete_unfinished_tool_calls(
+    db,
+    anchor: ChatMessage,
+    *,
+    ctx_size: int,
+    expected_origin: _RecoveryOrigin,
+) -> int:
     rows = await load_recoverable_messages_for_turn(
         db,
         agent_id=anchor.agent_id,
@@ -98,9 +126,11 @@ async def _complete_unfinished_tool_calls(db, anchor: ChatMessage, *, ctx_size: 
         turn_anchor_id=anchor.id,
         ctx_size=ctx_size,
     )
-    unfinished = _unfinished_tool_call_rows(rows)
+    unfinished = _unfinished_tool_call_rows(rows, turn_anchor_id=anchor.id)
     completed = 0
     for _row, payload, key in unfinished:
+        if not await _recovery_origin_matches(anchor, expected_origin):
+            return completed
         name = str(payload.get("name") or payload.get("tool_name") or "")
         if not name:
             continue
@@ -145,10 +175,51 @@ async def _complete_unfinished_tool_calls(db, anchor: ChatMessage, *, ctx_size: 
                     "result": llm_view,
                     "reasoning_content": payload.get("reasoning_content"),
                 },
+                turn_anchor_id=anchor.id,
             )
             await done_db.commit()
         completed += 1
     return completed
+
+
+def _turn_status(row: ChatMessage) -> str:
+    meta = row.message_meta if isinstance(row.message_meta, dict) else {}
+    return str(meta.get("turn_status") or "")
+
+
+async def _load_recovery_origin(db, anchor: ChatMessage) -> _RecoveryOrigin | None:
+    """Load the cancellation and session-generation boundary for a turn."""
+    fresh_anchor = await db.get(ChatMessage, anchor.id)
+    if fresh_anchor is None or _turn_status(fresh_anchor) == "cancelled":
+        return None
+
+    try:
+        session_id = uuid.UUID(str(anchor.conversation_id))
+    except (TypeError, ValueError):
+        session_id = None
+    session = await db.get(ChatSession, session_id) if session_id else None
+    if session is None:
+        return _RecoveryOrigin(False, None, None)
+    external_conv_id = session.external_conv_id
+    if external_conv_id and "__archived_" in external_conv_id:
+        return None
+    return _RecoveryOrigin(
+        True,
+        session.source_channel,
+        external_conv_id,
+    )
+
+
+async def _load_fresh_recovery_origin(anchor: ChatMessage) -> _RecoveryOrigin | None:
+    async with async_session() as db:
+        return await _load_recovery_origin(db, anchor)
+
+
+async def _recovery_origin_matches(
+    anchor: ChatMessage,
+    expected: _RecoveryOrigin,
+) -> bool:
+    return await _load_fresh_recovery_origin(anchor) == expected
 
 
 async def _load_recoverable_anchors(db, *, limit: int) -> list[ChatMessage]:
@@ -182,6 +253,8 @@ async def _load_recoverable_anchors(db, *, limit: int) -> list[ChatMessage]:
             continue
         anchor = await _find_turn_anchor_for_latest(db, latest_row)
         if anchor is None:
+            continue
+        if await _load_recovery_origin(db, anchor) is None:
             continue
         anchors.append(anchor)
         if len(anchors) >= limit:
@@ -285,6 +358,10 @@ async def startup_turn_resume_once(*, limit: int = 50) -> RecoveryStats:
 async def resume_turn(anchor: ChatMessage) -> bool:
     """Resume one inferred incomplete user turn via the normal channel LLM path."""
 
+    expected_origin = await _load_fresh_recovery_origin(anchor)
+    if expected_origin is None:
+        return False
+
     async with async_session() as db:
         agent = (await db.execute(select(Agent).where(Agent.id == anchor.agent_id))).scalar_one_or_none()
         if agent is None or getattr(agent, "agent_type", None) == "openclaw":
@@ -292,7 +369,14 @@ async def resume_turn(anchor: ChatMessage) -> bool:
         ctx_size = (agent.context_window_size if agent else None) or DEFAULT_CONTEXT_WINDOW_SIZE
         if await _tail_has_pending_confirmation(db, anchor, ctx_size=ctx_size):
             return False
-        await _complete_unfinished_tool_calls(db, anchor, ctx_size=ctx_size)
+        await _complete_unfinished_tool_calls(
+            db,
+            anchor,
+            ctx_size=ctx_size,
+            expected_origin=expected_origin,
+        )
+        if not await _recovery_origin_matches(anchor, expected_origin):
+            return False
         history = await load_recoverable_history_for_turn(
             db,
             agent_id=anchor.agent_id,
@@ -322,6 +406,8 @@ async def resume_turn(anchor: ChatMessage) -> bool:
         )
 
     if reply and reply.strip():
+        if not await _recovery_origin_matches(anchor, expected_origin):
+            return False
         async with async_session() as db:
             await persist_assistant_reply_row(
                 db,
@@ -332,11 +418,20 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                 turn_anchor_id=anchor.id,
             )
             await db.commit()
-        delivered = await deliver_recovered_reply_to_origin(
-            agent_id=anchor.agent_id,
-            conversation_id=anchor.conversation_id,
-            reply=reply,
-        )
+        delivery_kwargs = {
+            "agent_id": anchor.agent_id,
+            "conversation_id": anchor.conversation_id,
+            "reply": reply,
+        }
+        if expected_origin.session_found:
+            delivery_kwargs.update(
+                {
+                    "expected_source_channel": expected_origin.source_channel,
+                    "expected_external_conv_id": expected_origin.external_conv_id,
+                    "validate_external_conv_id": True,
+                }
+            )
+        delivered = await deliver_recovered_reply_to_origin(**delivery_kwargs)
         if not delivered:
             logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")
             return False

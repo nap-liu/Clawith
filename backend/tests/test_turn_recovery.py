@@ -12,16 +12,15 @@ from sqlalchemy import delete, select
 
 from app.database import async_session, engine
 from app.models.agent import Agent
+from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.models.chat_session import ChatSession
 from app.models.identity import IdentityProvider
 from app.models.llm import LLMModel
 from app.models.org import OrgMember
+from app.models.participant import Participant  # noqa: F401
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
-from app.models.audit import ChatMessage
-from app.models.participant import Participant  # noqa: F401
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -286,6 +285,80 @@ async def test_startup_scan_recovers_recent_unanswered_user_without_turn_marker(
     assert rows[-1].content == "markerless recovered"
 
 
+async def test_startup_scan_skips_cancelled_turn(monkeypatch):
+    """A durable /stop marker must survive restart and suppress recovery."""
+    from app.services import turn_recovery
+    from app.services.chat_history import mark_latest_incomplete_turn_cancelled
+
+    agent_id, user_id = await _make_agent_with_model()
+    conv = f"cancelled_{uuid.uuid4().hex}"
+    anchor_id = await _make_user_anchor(agent_id, user_id, conv=conv, content="stop this")
+
+    async with async_session() as db:
+        marked_id = await mark_latest_incomplete_turn_cancelled(
+            db,
+            agent_id=agent_id,
+            conversation_id=conv,
+            reason="stop",
+        )
+        await db.commit()
+
+    assert marked_id == anchor_id
+
+    async def fail_if_resumed(_anchor):
+        raise AssertionError("cancelled turns must not be resumed after restart")
+
+    monkeypatch.setattr(turn_recovery, "resume_turn", fail_if_resumed)
+
+    stats = await turn_recovery.startup_turn_resume_once(limit=10)
+
+    assert stats.scanned == 0
+    assert stats.resumed == 0
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+    assert anchor.message_meta["turn_status"] == "cancelled"
+    assert anchor.message_meta["cancel_reason"] == "stop"
+
+
+async def test_startup_scan_skips_archived_channel_session(monkeypatch):
+    """A /new generation boundary must make the old session unrecoverable."""
+    from app.services import turn_recovery
+
+    agent_id, user_id = await _make_agent_with_model()
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            title="DingTalk archived",
+            source_channel="dingtalk",
+            external_conv_id=f"dingtalk_group_old__archived_{uuid.uuid4().hex[:8]}",
+        )
+        db.add(session)
+        await db.flush()
+        conv = str(session.id)
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                conversation_id=conv,
+                role="user",
+                content="old generation",
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            )
+        )
+        await db.commit()
+
+    async def fail_if_resumed(_anchor):
+        raise AssertionError("archived sessions must not be resumed after restart")
+
+    monkeypatch.setattr(turn_recovery, "resume_turn", fail_if_resumed)
+
+    stats = await turn_recovery.startup_turn_resume_once(limit=10)
+
+    assert stats.scanned == 0
+    assert stats.resumed == 0
+
+
 async def test_startup_scan_uses_latest_message_save_time_without_markers(monkeypatch):
     """Only sessions whose latest saved message is recent and incomplete are resumed."""
     from app.services import turn_recovery
@@ -543,8 +616,8 @@ async def test_resume_turn_delivers_dingtalk_reply_to_origin_runtime(monkeypatch
 
     delivered = []
 
-    async def fake_deliver(*, agent_id, conversation_id, reply):
-        delivered.append((agent_id, conversation_id, reply))
+    async def fake_deliver(**kwargs):
+        delivered.append(kwargs)
         return True
 
     monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_call_agent_llm)
@@ -557,10 +630,72 @@ async def test_resume_turn_delivers_dingtalk_reply_to_origin_runtime(monkeypatch
 
     assert result is True
     assert len(delivered) == 1
-    delivered_agent_id, delivered_conv, delivered_reply = delivered[0]
-    assert delivered_agent_id == agent_id
-    assert delivered_conv == conv
-    assert delivered_reply == "dingtalk resumed reply"
+    assert delivered[0] == {
+        "agent_id": agent_id,
+        "conversation_id": conv,
+        "reply": "dingtalk resumed reply",
+        "expected_source_channel": "dingtalk",
+        "expected_external_conv_id": "dingtalk_p2p_staff-1",
+        "validate_external_conv_id": True,
+    }
+
+
+async def test_resume_turn_drops_reply_when_session_is_archived_during_recovery(monkeypatch):
+    """A concurrent /new must win over an in-flight restart recovery."""
+    from app.services import turn_recovery
+    from app.services.chat_history import persist_incoming_user_message
+
+    agent_id, user_id = await _make_agent_with_model(context_window_size=1)
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            title="DingTalk",
+            source_channel="dingtalk",
+            external_conv_id="dingtalk_group_generation-1",
+        )
+        db.add(session)
+        await db.flush()
+        session_id = session.id
+        conv = str(session_id)
+        anchor = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conv,
+            content="must not cross /new",
+        )
+        anchor_id = anchor.id
+        await db.commit()
+
+    async def fake_call_agent_llm(*_args, **_kwargs):
+        async with async_session() as db:
+            session = await db.get(ChatSession, session_id)
+            session.external_conv_id = "dingtalk_group_generation-1__archived_test"
+            await db.commit()
+        return "stale recovered reply"
+
+    async def fail_if_delivered(**_kwargs):
+        raise AssertionError("stale recovery reply must not reach the archived route")
+
+    monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_call_agent_llm)
+    monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", fail_if_delivered)
+
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+
+    assert await turn_recovery.resume_turn(anchor) is False
+    async with async_session() as db:
+        reply = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == conv,
+                    ChatMessage.role == "assistant",
+                    ChatMessage.content == "stale recovered reply",
+                )
+            )
+        ).scalar_one_or_none()
+    assert reply is None
 
 
 async def test_deliver_recovered_reply_routes_dingtalk_from_chat_session(monkeypatch):
@@ -855,6 +990,108 @@ async def test_resume_turn_executes_unfinished_code_without_new_tool_snapshot(mo
             )
         ).scalars().all()
     assert len(replies) == 1
+
+
+async def test_resume_turn_replays_only_tools_after_current_anchor(monkeypatch):
+    """Restart must not replay unfinished tools belonging to an older turn."""
+    from app.services import turn_recovery
+    from app.services.chat_history import persist_incoming_user_message
+
+    agent_id, user_id = await _make_agent_with_model(context_window_size=4)
+    conv = f"current_anchor_{uuid.uuid4().hex}"
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        old_anchor = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conv,
+            content="old interrupted turn",
+        )
+        old_anchor.created_at = now - timedelta(seconds=4)
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="tool_call",
+                content=json.dumps(
+                    {
+                        "name": "read_file",
+                        "call_id": "old_call",
+                        "args": {"path": "old.txt"},
+                        "status": "running",
+                        "result": "",
+                    }
+                ),
+                conversation_id=conv,
+                message_meta={"turn_anchor_id": str(old_anchor.id)},
+                created_at=now - timedelta(seconds=3),
+            )
+        )
+        current_anchor = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conv,
+            content="current interrupted turn",
+        )
+        current_anchor_id = current_anchor.id
+        current_anchor.created_at = now - timedelta(seconds=2)
+        db.add(
+            ChatMessage(
+                agent_id=agent_id,
+                user_id=user_id,
+                role="tool_call",
+                content=json.dumps(
+                    {
+                        "name": "read_file",
+                        "call_id": "current_call",
+                        "args": {"path": "current.txt"},
+                        "status": "running",
+                        "result": "",
+                    }
+                ),
+                conversation_id=conv,
+                message_meta={"turn_anchor_id": str(current_anchor_id)},
+                created_at=now - timedelta(seconds=1),
+            )
+        )
+        await db.commit()
+
+    executed: list[str] = []
+
+    async def fake_execute_tool(_name, args, **_kwargs):
+        executed.append(args["path"])
+        return f"read {args['path']}"
+
+    async def fake_call_agent_llm(*_args, **_kwargs):
+        return "current turn recovered"
+
+    async def fake_deliver(**_kwargs):
+        return True
+
+    monkeypatch.setattr(turn_recovery, "execute_tool", fake_execute_tool, raising=False)
+    monkeypatch.setattr(turn_recovery, "_call_agent_llm", fake_call_agent_llm)
+    monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", fake_deliver)
+
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, current_anchor_id)
+
+    assert await turn_recovery.resume_turn(anchor) is True
+    assert executed == ["current.txt"]
+
+    async with async_session() as db:
+        tool_rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == conv, ChatMessage.role == "tool_call")
+                .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+            )
+        ).scalars().all()
+    done_rows = [row for row in tool_rows if json.loads(row.content)["status"] == "done"]
+    assert len(done_rows) == 1
+    assert json.loads(done_rows[0].content)["call_id"] == "current_call"
+    assert done_rows[0].message_meta["turn_anchor_id"] == str(current_anchor_id)
 
 
 async def test_resume_turn_reexecutes_running_tool_without_synthetic_recovery_message(monkeypatch):

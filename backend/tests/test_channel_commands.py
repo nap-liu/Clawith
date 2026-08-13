@@ -188,13 +188,22 @@ async def test_handle_channel_command_archives_old_session(monkeypatch):
     )
     db = FakeDB(lookup_result=old_session)
     cancelled_keys: list[str] = []
+    cancelled_turns: list[tuple[uuid.UUID, str, str]] = []
     expected_lock_key = channel_commands.chat_session_lock_key(old_session)
 
     async def fake_cancel(lock_key: str) -> bool:
         cancelled_keys.append(lock_key)
         return True
 
+    async def fake_mark_cancelled(_db, *, agent_id, conversation_id, reason):
+        cancelled_turns.append((agent_id, conversation_id, reason))
+
     monkeypatch.setattr(channel_commands, "cancel_running_turn", fake_cancel)
+    monkeypatch.setattr(
+        channel_commands,
+        "mark_latest_incomplete_turn_cancelled",
+        fake_mark_cancelled,
+    )
 
     result = await channel_commands.handle_channel_command(
         db=db,
@@ -207,6 +216,7 @@ async def test_handle_channel_command_archives_old_session(monkeypatch):
 
     assert result["action"] == "new_session"
     assert cancelled_keys == [expected_lock_key]
+    assert cancelled_turns == [(agent_id, str(old_session.id), "new")]
     # Old session got its external_conv_id renamed to the archived form.
     assert old_session.external_conv_id.startswith("feishu_p2p_ou_zzz__archived_")
     # No new session pre-created (deferred to next user message).
@@ -467,6 +477,7 @@ async def test_thinking_toggle_requires_agent_manage_permission(monkeypatch):
 async def test_stop_command_cancels_running_turn_without_deleting_history(monkeypatch):
     agent_id = uuid.uuid4()
     calls: list[str] = []
+    cancelled_turns: list[tuple[uuid.UUID, str, str]] = []
     session = SimpleNamespace(
         id=uuid.uuid4(),
         agent_id=agent_id,
@@ -478,7 +489,15 @@ async def test_stop_command_cancels_running_turn_without_deleting_history(monkey
         calls.append(lock_key)
         return True
 
+    async def fake_mark_cancelled(_db, *, agent_id, conversation_id, reason):
+        cancelled_turns.append((agent_id, conversation_id, reason))
+
     monkeypatch.setattr(channel_commands, "cancel_running_turn", fake_cancel)
+    monkeypatch.setattr(
+        channel_commands,
+        "mark_latest_incomplete_turn_cancelled",
+        fake_mark_cancelled,
+    )
     db = FakeDB(lookup_result=session)
 
     result = await channel_commands.handle_channel_command(
@@ -492,6 +511,7 @@ async def test_stop_command_cancels_running_turn_without_deleting_history(monkey
 
     assert result["action"] == "stop_turn"
     assert calls == [channel_commands.chat_session_lock_key(session)]
+    assert cancelled_turns == [(agent_id, str(session.id), "stop")]
     assert len(db.executed) == 1
     assert "已请求停止" in result["message"]
 
