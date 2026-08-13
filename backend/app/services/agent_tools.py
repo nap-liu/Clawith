@@ -12404,7 +12404,7 @@ async def _execute_code(
     execution_mode = str(
         arguments.get("execution_mode") or "foreground"
     ).strip().lower()
-    language = arguments.get("language", "python")
+    language = arguments.get("language")
     code = arguments.get("code", "")
     if action == "execute" and code:
         code, canonicalized_uploads = _canonicalize_execute_code_upload_paths(ws, code)
@@ -12419,6 +12419,8 @@ async def _execute_code(
         return f"❌ Unsupported execute_code_aio action: {action}"
     if action != "execute" and tool_name != "execute_code_aio":
         return "❌ Background Job management is available only in execute_code_aio"
+    if action == "execute" and not language:
+        return "❌ language is required: python, bash, or node"
     if action == "execute" and not code.strip():
         return "❌ No code provided"
     if action == "execute" and language not in ("python", "bash", "node"):
