@@ -191,16 +191,18 @@ async def handle_channel_command(
             external_conv_id=external_conv_id,
         )
         cancelled = await cancel_running_turn(lock_key)
-        if cancelled and session is not None:
-            await mark_latest_incomplete_turn_cancelled(
+        cancelled_anchor_id = None
+        if session is not None:
+            cancelled_anchor_id = await mark_latest_incomplete_turn_cancelled(
                 db,
                 agent_id=agent_id,
                 conversation_id=str(session.id),
                 reason="stop",
             )
+        stopped = cancelled or cancelled_anchor_id is not None
         return {
             "action": "stop_turn",
-            "message": "已请求停止当前工作。" if cancelled else "当前没有正在执行的工作。",
+            "message": "已请求停止当前工作。" if stopped else "当前没有正在执行的工作。",
         }
 
     if parsed_cmd == "/status":
@@ -605,6 +607,7 @@ async def handle_channel_command(
             agent_id=agent_id,
             external_conv_id=external_conv_id,
             source_channel=source_channel,
+            for_update=True,
         )
 
         lock_key = _channel_turn_lock_key(

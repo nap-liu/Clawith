@@ -519,6 +519,28 @@ async def mark_latest_incomplete_turn_cancelled(
     startup recovery infers interrupted turns from durable chat rows. Marking
     the latest unanswered user anchor keeps those two views consistent.
     """
+    latest = (
+        await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.conversation_id == conversation_id,
+                ChatMessage.compacted_into.is_(None),
+            )
+            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if latest is None or latest.role == "assistant":
+        return None
+    latest_meta = latest.message_meta if isinstance(latest.message_meta, dict) else {}
+    if (
+        latest_meta.get("consumed_by_onmessage")
+        or latest_meta.get("kind") == "on_message_event"
+    ):
+        # TriggerExecution owns these event turns and its lease/reclaim path;
+        # channel startup recovery and /stop must not claim their anchors.
+        return None
     anchor = (
         await db.execute(
             select(ChatMessage)
@@ -530,9 +552,40 @@ async def mark_latest_incomplete_turn_cancelled(
             )
             .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
             .limit(1)
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if anchor is None:
+        return None
+
+    latest_anchor_tool = (
+        await db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.conversation_id == conversation_id,
+                ChatMessage.role == "tool_call",
+                ChatMessage.compacted_into.is_(None),
+                ChatMessage.message_meta["turn_anchor_id"].as_string()
+                == str(anchor.id),
+            )
+            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    latest_tool_payload = (
+        _parse_tool_call_payload(latest_anchor_tool.content)
+        if latest_anchor_tool is not None
+        else None
+    )
+    if (
+        latest_tool_payload
+        and latest_tool_payload.get("name") == "request_confirmation"
+        and latest_tool_payload.get("status") == "pending"
+    ):
+        # A confirmation card is deliberately suspended, not running. /stop
+        # must leave it resolvable instead of creating a cancelled anchor that
+        # the confirmation lifecycle does not consume.
         return None
 
     completed = (

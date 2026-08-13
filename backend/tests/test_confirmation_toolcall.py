@@ -65,8 +65,9 @@ async def test_persist_pending_confirmation_writes_pending_toolcall_row():
     """Suspending a confirmation persists a `request_confirmation` tool_call row with
     status='pending' and an empty result, and returns the row id so the card delivery
     (web event / DingTalk outTrackId) can reference it for later resolution."""
-    from app.services.chat_history import persist_pending_confirmation
     from sqlalchemy import select
+
+    from app.services.chat_history import persist_pending_confirmation
 
     agent_id, user_id = await _make_agent()
     conv = str(uuid.uuid4())
@@ -978,6 +979,51 @@ async def test_reenter_loop_marks_turn_completed_after_final_reply(monkeypatch):
             )
         ).scalars().all()
     assert len(replies) == 1
+
+
+async def test_reenter_loop_skips_cancelled_confirmation_turn(monkeypatch):
+    """A /stop in the pending-to-reenter window prevents continuation."""
+    from app.services import confirmation_service as cs
+
+    agent_id, user_id = await _make_agent()
+    conv = str(uuid.uuid4())
+    anchor_id = await _make_turn_anchor(agent_id, user_id, conv)
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+        anchor.message_meta = {
+            **(anchor.message_meta or {}),
+            "turn_status": "cancelled",
+            "cancel_reason": "stop",
+        }
+        await db.commit()
+
+    async def fail_if_llm_called(*_args, **_kwargs):
+        raise AssertionError("cancelled confirmation continuation must not call the LLM")
+
+    async def fake_run_channel_message(_lock_key, *, work, **_kwargs):
+        return await work()
+
+    monkeypatch.setattr("app.services.channel_llm._call_agent_llm", fail_if_llm_called)
+    monkeypatch.setattr(
+        "app.services.channel_dispatch.run_channel_message",
+        fake_run_channel_message,
+    )
+    delivery = AsyncMock()
+    monkeypatch.setattr(cs, "deliver_reply_to_origin", delivery)
+
+    await cs._reenter_loop(agent_id, conv, user_id, turn_anchor_id=anchor_id)
+
+    delivery.assert_not_awaited()
+    async with async_session() as db:
+        replies = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == conv,
+                    ChatMessage.role == "assistant",
+                )
+            )
+        ).scalars().all()
+    assert replies == []
 
 
 async def test_dingtalk_group_confirmation_followup_uses_unified_origin_delivery(monkeypatch):

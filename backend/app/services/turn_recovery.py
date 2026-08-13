@@ -187,17 +187,29 @@ def _turn_status(row: ChatMessage) -> str:
     return str(meta.get("turn_status") or "")
 
 
-async def _load_recovery_origin(db, anchor: ChatMessage) -> _RecoveryOrigin | None:
+async def _load_recovery_origin(
+    db,
+    anchor: ChatMessage,
+    *,
+    for_update: bool = False,
+) -> _RecoveryOrigin | None:
     """Load the cancellation and session-generation boundary for a turn."""
-    fresh_anchor = await db.get(ChatMessage, anchor.id)
-    if fresh_anchor is None or _turn_status(fresh_anchor) == "cancelled":
-        return None
-
     try:
         session_id = uuid.UUID(str(anchor.conversation_id))
     except (TypeError, ValueError):
         session_id = None
-    session = await db.get(ChatSession, session_id) if session_id else None
+    session = (
+        await db.get(ChatSession, session_id, with_for_update=for_update)
+        if session_id
+        else None
+    )
+    fresh_anchor = await db.get(
+        ChatMessage,
+        anchor.id,
+        with_for_update=for_update,
+    )
+    if fresh_anchor is None or _turn_status(fresh_anchor) == "cancelled":
+        return None
     if session is None:
         return _RecoveryOrigin(False, None, None)
     external_conv_id = session.external_conv_id
@@ -220,6 +232,38 @@ async def _recovery_origin_matches(
     expected: _RecoveryOrigin,
 ) -> bool:
     return await _load_fresh_recovery_origin(anchor) == expected
+
+
+async def _deliver_recovered_reply(
+    anchor: ChatMessage,
+    *,
+    expected_origin: _RecoveryOrigin,
+    reply: str,
+) -> bool:
+    """Validate the turn generation and deliver while its rows stay locked."""
+    async with async_session() as db:
+        current_origin = await _load_recovery_origin(
+            db,
+            anchor,
+            for_update=True,
+        )
+        if current_origin != expected_origin:
+            return False
+
+        delivery_kwargs = {
+            "agent_id": anchor.agent_id,
+            "conversation_id": anchor.conversation_id,
+            "reply": reply,
+        }
+        if expected_origin.session_found:
+            delivery_kwargs.update(
+                {
+                    "expected_source_channel": expected_origin.source_channel,
+                    "expected_external_conv_id": expected_origin.external_conv_id,
+                    "validate_external_conv_id": True,
+                }
+            )
+        return await deliver_recovered_reply_to_origin(**delivery_kwargs)
 
 
 async def _load_recoverable_anchors(db, *, limit: int) -> list[ChatMessage]:
@@ -418,20 +462,11 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                 turn_anchor_id=anchor.id,
             )
             await db.commit()
-        delivery_kwargs = {
-            "agent_id": anchor.agent_id,
-            "conversation_id": anchor.conversation_id,
-            "reply": reply,
-        }
-        if expected_origin.session_found:
-            delivery_kwargs.update(
-                {
-                    "expected_source_channel": expected_origin.source_channel,
-                    "expected_external_conv_id": expected_origin.external_conv_id,
-                    "validate_external_conv_id": True,
-                }
-            )
-        delivered = await deliver_recovered_reply_to_origin(**delivery_kwargs)
+        delivered = await _deliver_recovered_reply(
+            anchor,
+            expected_origin=expected_origin,
+            reply=reply,
+        )
         if not delivered:
             logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")
             return False

@@ -320,6 +320,168 @@ async def test_startup_scan_skips_cancelled_turn(monkeypatch):
     assert anchor.message_meta["cancel_reason"] == "stop"
 
 
+async def test_stop_command_cancels_recovery_without_local_running_task(monkeypatch):
+    """A startup-recovered turn is stoppable even though it is not in _running_turns."""
+    from app.services import channel_commands, turn_recovery
+    from app.services.chat_history import persist_incoming_user_message
+
+    agent_id, user_id = await _make_agent_with_model()
+    external_conv_id = f"dingtalk_group_stop_recovery_{uuid.uuid4().hex[:8]}"
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            title="DingTalk recovering",
+            source_channel="dingtalk",
+            external_conv_id=external_conv_id,
+        )
+        db.add(session)
+        await db.flush()
+        conv = str(session.id)
+        anchor = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conv,
+            content="recovering turn",
+        )
+        anchor_id = anchor.id
+        await db.commit()
+
+    async def no_local_task(_lock_key: str) -> bool:
+        return False
+
+    monkeypatch.setattr(channel_commands, "cancel_running_turn", no_local_task)
+    async with async_session() as db:
+        result = await channel_commands.handle_channel_command(
+            db=db,
+            command="/stop",
+            agent_id=agent_id,
+            user_id=user_id,
+            external_conv_id=external_conv_id,
+            source_channel="dingtalk",
+        )
+        await db.commit()
+
+    assert "已请求停止" in result["message"]
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+    assert anchor.message_meta["turn_status"] == "cancelled"
+    assert await turn_recovery.resume_turn(anchor) is False
+
+
+async def test_stop_command_leaves_pending_confirmation_suspended(monkeypatch):
+    """A pending confirmation is waiting for input, not a running recovery turn."""
+    from app.services import channel_commands
+    from app.services.chat_history import (
+        persist_incoming_user_message,
+        persist_pending_confirmation_row,
+    )
+
+    agent_id, user_id = await _make_agent_with_model()
+    external_conv_id = f"dingtalk_group_pending_{uuid.uuid4().hex[:8]}"
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            title="DingTalk pending confirmation",
+            source_channel="dingtalk",
+            external_conv_id=external_conv_id,
+        )
+        db.add(session)
+        await db.flush()
+        conv = str(session.id)
+        anchor = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conv,
+            content="ask before action",
+        )
+        anchor_id = anchor.id
+        pending_id = await persist_pending_confirmation_row(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conv,
+            name="request_confirmation",
+            args={"title": "确认", "summary": "是否继续"},
+            turn_anchor_id=anchor_id,
+        )
+        await db.commit()
+
+    async def no_local_task(_lock_key: str) -> bool:
+        return False
+
+    monkeypatch.setattr(channel_commands, "cancel_running_turn", no_local_task)
+    async with async_session() as db:
+        result = await channel_commands.handle_channel_command(
+            db=db,
+            command="/stop",
+            agent_id=agent_id,
+            user_id=user_id,
+            external_conv_id=external_conv_id,
+            source_channel="dingtalk",
+        )
+        await db.commit()
+
+    assert "没有正在执行" in result["message"]
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+        pending = await db.get(ChatMessage, pending_id)
+    assert anchor.message_meta.get("turn_status") != "cancelled"
+    assert json.loads(pending.content)["status"] == "pending"
+
+
+async def test_stop_command_leaves_onmessage_owned_turn_unchanged(monkeypatch):
+    """TriggerExecution-owned event turns are outside channel recovery ownership."""
+    from app.services import channel_commands
+    from app.services.chat_history import persist_incoming_user_message
+
+    agent_id, user_id = await _make_agent_with_model()
+    external_conv_id = f"dingtalk_group_onmessage_{uuid.uuid4().hex[:8]}"
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            title="DingTalk on_message",
+            source_channel="dingtalk",
+            external_conv_id=external_conv_id,
+        )
+        db.add(session)
+        await db.flush()
+        anchor = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=str(session.id),
+            content="owned by trigger execution",
+            message_meta={"consumed_by_onmessage": True},
+        )
+        anchor_id = anchor.id
+        await db.commit()
+
+    async def no_local_task(_lock_key: str) -> bool:
+        return False
+
+    monkeypatch.setattr(channel_commands, "cancel_running_turn", no_local_task)
+    async with async_session() as db:
+        result = await channel_commands.handle_channel_command(
+            db=db,
+            command="/stop",
+            agent_id=agent_id,
+            user_id=user_id,
+            external_conv_id=external_conv_id,
+            source_channel="dingtalk",
+        )
+        await db.commit()
+
+    assert "没有正在执行" in result["message"]
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+    assert anchor.message_meta.get("turn_status") != "cancelled"
+
+
 async def test_startup_scan_skips_archived_channel_session(monkeypatch):
     """A /new generation boundary must make the old session unrecoverable."""
     from app.services import turn_recovery
@@ -696,6 +858,92 @@ async def test_resume_turn_drops_reply_when_session_is_archived_during_recovery(
             )
         ).scalar_one_or_none()
     assert reply is None
+
+
+async def test_new_waits_for_locked_recovery_delivery(monkeypatch):
+    """The route generation cannot change between final validation and send."""
+    from app.services import channel_commands, turn_recovery
+    from app.services.chat_history import persist_incoming_user_message
+
+    agent_id, user_id = await _make_agent_with_model(context_window_size=1)
+    external_conv_id = f"dingtalk_group_locked_{uuid.uuid4().hex[:8]}"
+    async with async_session() as db:
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            title="DingTalk locked delivery",
+            source_channel="dingtalk",
+            external_conv_id=external_conv_id,
+        )
+        db.add(session)
+        await db.flush()
+        conv = str(session.id)
+        anchor = await persist_incoming_user_message(
+            db,
+            agent_id=agent_id,
+            user_id=user_id,
+            conversation_id=conv,
+            content="lock delivery generation",
+        )
+        anchor_id = anchor.id
+        await db.commit()
+
+    async with async_session() as db:
+        anchor = await db.get(ChatMessage, anchor_id)
+    expected_origin = await turn_recovery._load_fresh_recovery_origin(anchor)
+    assert expected_origin is not None
+
+    delivery_entered = asyncio.Event()
+    allow_delivery = asyncio.Event()
+    delivery_finished = asyncio.Event()
+
+    async def fake_deliver(**_kwargs):
+        delivery_entered.set()
+        await allow_delivery.wait()
+        delivery_finished.set()
+        return True
+
+    async def no_local_task(_lock_key: str) -> bool:
+        return False
+
+    monkeypatch.setattr(turn_recovery, "deliver_recovered_reply_to_origin", fake_deliver)
+    monkeypatch.setattr(channel_commands, "cancel_running_turn", no_local_task)
+
+    delivery_task = asyncio.create_task(
+        turn_recovery._deliver_recovered_reply(
+            anchor,
+            expected_origin=expected_origin,
+            reply="serialized reply",
+        )
+    )
+    await asyncio.wait_for(delivery_entered.wait(), timeout=2)
+
+    async def archive_session():
+        async with async_session() as db:
+            result = await channel_commands.handle_channel_command(
+                db=db,
+                command="/new",
+                agent_id=agent_id,
+                user_id=user_id,
+                external_conv_id=external_conv_id,
+                source_channel="dingtalk",
+            )
+            await db.commit()
+            return result
+
+    archive_task = asyncio.create_task(archive_session())
+    await asyncio.sleep(0.05)
+    assert archive_task.done() is False
+
+    allow_delivery.set()
+    assert await asyncio.wait_for(delivery_task, timeout=2) is True
+    assert delivery_finished.is_set()
+    result = await asyncio.wait_for(archive_task, timeout=2)
+    assert result["action"] == "new_session"
+
+    async with async_session() as db:
+        session = await db.get(ChatSession, uuid.UUID(conv))
+    assert "__archived_" in session.external_conv_id
 
 
 async def test_deliver_recovered_reply_routes_dingtalk_from_chat_session(monkeypatch):

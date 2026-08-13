@@ -549,6 +549,44 @@ async def test_stop_command_reports_when_no_turn_is_running(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stop_marks_recoverable_turn_without_local_running_task(monkeypatch):
+    agent_id = uuid.uuid4()
+    session = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        source_channel="dingtalk",
+        external_conv_id="dingtalk_group_recovering",
+    )
+    marked: list[tuple[uuid.UUID, str, str]] = []
+
+    async def fake_cancel(_lock_key: str) -> bool:
+        return False
+
+    async def fake_mark(_db, *, agent_id, conversation_id, reason):
+        marked.append((agent_id, conversation_id, reason))
+        return uuid.uuid4()
+
+    monkeypatch.setattr(channel_commands, "cancel_running_turn", fake_cancel)
+    monkeypatch.setattr(
+        channel_commands,
+        "mark_latest_incomplete_turn_cancelled",
+        fake_mark,
+    )
+
+    result = await channel_commands.handle_channel_command(
+        db=FakeDB(lookup_result=session),
+        command="/stop",
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        external_conv_id=session.external_conv_id,
+        source_channel="dingtalk",
+    )
+
+    assert marked == [(agent_id, str(session.id), "stop")]
+    assert "已请求停止" in result["message"]
+
+
+@pytest.mark.asyncio
 async def test_scene_command_activates_published_scene_on_existing_session(monkeypatch):
     from app.services import scene_service
 

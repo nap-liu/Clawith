@@ -26,13 +26,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
+from app.services.channel_dispatch import run_channel_send
 from app.services.llm.confirmation_tool import REQUEST_CONFIRMATION_TOOL_NAME
 from app.services.turn_runtime import (
     _deliver_dingtalk_unlocked,
     deliver_reply_to_origin,
     load_turn_runtime,
 )
-from app.services.channel_dispatch import run_channel_send
 
 logger = logging.getLogger(__name__)
 
@@ -540,7 +540,8 @@ async def _reenter_loop(
     """Resume the agent's LLM loop from existing history (which now ends with the filled
     request_confirmation tool result) WITHOUT injecting a user message. Per-session lock via
     run_channel_message; persists + delivers the follow-up reply to the originating channel."""
-    from app.models.agent import Agent as AgentModel, DEFAULT_CONTEXT_WINDOW_SIZE
+    from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
+    from app.models.agent import Agent as AgentModel
     from app.models.chat_session import ChatSession
     from app.services.channel_dispatch import (
         ChannelReactions,
@@ -556,6 +557,21 @@ async def _reenter_loop(
 
     async def _work() -> str:
         async with async_session() as db:
+            if turn_anchor_id is not None:
+                from app.models.audit import ChatMessage
+
+                anchor = await db.get(ChatMessage, turn_anchor_id)
+                anchor_meta = (
+                    anchor.message_meta
+                    if anchor is not None and isinstance(anchor.message_meta, dict)
+                    else {}
+                )
+                if anchor_meta.get("turn_status") == "cancelled":
+                    logger.info(
+                        "Confirmation continuation skipped for cancelled turn %s",
+                        turn_anchor_id,
+                    )
+                    return ""
             agent_obj = (
                 await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             ).scalar_one_or_none()
