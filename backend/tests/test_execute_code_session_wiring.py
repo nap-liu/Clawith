@@ -57,6 +57,23 @@ def _patches(mock_backend):
 
 
 @pytest.mark.asyncio
+async def test_execute_code_missing_language_stops_before_sandbox(tmp_path):
+    from app.services.agent_tools import _execute_code
+
+    with patch("app.config.get_sandbox_config") as get_sandbox_config:
+        result = await _execute_code(
+            uuid.uuid4(),
+            tmp_path,
+            {"code": "cat workspace/processed_chats.json"},
+            tool_name="execute_code_aio",
+            session_id="conv-missing-language",
+        )
+
+    assert result == "❌ language is required: python, bash, or node"
+    get_sandbox_config.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_execute_code_threads_session_id_as_conversation_id(tmp_path):
     from app.services.agent_tools import _execute_code
 
