@@ -21,7 +21,7 @@
   --font-mono:  'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 
   position: relative;
-  min-height: 100dvh;
+  min-height: 100vh;
   background: var(--bg);
   color: var(--ink);
   font-family: var(--font-sans);
@@ -144,7 +144,7 @@
 .atlas-frame-body {
   position: relative;
   z-index: 10;
-  min-height: 100dvh;
+  min-height: 100vh;
 }
 
 .atlas-frame-bottom {
@@ -571,7 +571,7 @@
   z-index: 10;
   display: grid;
   grid-template-columns: 1fr 1fr;
-  min-height: 100dvh;
+  min-height: 100vh;
 }
 
 .atlas-screen-plate {
@@ -615,7 +615,7 @@
 .atlas-screen-center {
   position: relative;
   z-index: 10;
-  min-height: 100dvh;
+  min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;

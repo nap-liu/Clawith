@@ -30,6 +30,10 @@ export default defineConfig({
         },
     },
     build: {
+        // Keep the production bundle parseable by older Chromium-based WebViews.
+        // Vite's default target is intentionally modern and leaves syntax such as
+        // optional chaining and nullish coalescing in the generated chunks.
+        target: 'es2015',
         rollupOptions: {
             output: {
                 manualChunks: {

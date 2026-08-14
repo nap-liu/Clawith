@@ -317,7 +317,7 @@ body {
   background: var(--bg-primary);
   color: var(--text-primary);
   line-height: 1.5;
-  min-height: 100dvh;
+  min-height: 100vh;
 }
 
 a {
@@ -388,7 +388,7 @@ select:focus {
 
 .app-layout {
   display: flex;
-  min-height: calc(100dvh - var(--notification-bar-height));
+  min-height: calc(100vh - var(--notification-bar-height));
 }
 
 .app-layout.sidebar-collapsed {
@@ -405,8 +405,8 @@ select:focus {
   top: var(--notification-bar-height);
   left: 0;
   bottom: 0;
-  height: calc(100dvh - var(--notification-bar-height));
-  max-height: calc(100dvh - var(--notification-bar-height));
+  height: calc(100vh - var(--notification-bar-height));
+  max-height: calc(100vh - var(--notification-bar-height));
   z-index: 10;
   transition: width var(--transition-default);
   /* Allow account language submenu to extend to the right; vertical scroll stays in .sidebar-scrollable */
@@ -1545,7 +1545,7 @@ select:focus {
 .main-content {
   margin-left: var(--sidebar-width);
   flex: 1;
-  min-height: calc(100dvh - var(--notification-bar-height));
+  min-height: calc(100vh - var(--notification-bar-height));
   padding: var(--space-8);
   width: calc(100vw - var(--sidebar-width));
   max-width: calc(100vw - var(--sidebar-width));
@@ -1560,7 +1560,7 @@ select:focus {
    can scroll independently. Without this, .main-content grows with content
    (min-height: 100vh) and overflow-y: auto on .chat-messages never fires. */
 .main-content.chat-page {
-  height: calc(100dvh - var(--notification-bar-height));
+  height: calc(100vh - var(--notification-bar-height));
   min-height: 0;
   overflow: hidden;
   display: flex;
@@ -2277,7 +2277,7 @@ select:focus {
 /* Login page — premium split-screen */
 .login-page {
   display: flex;
-  min-height: calc(100dvh - var(--notification-bar-height));
+  min-height: calc(100vh - var(--notification-bar-height));
   background: #f8f8f6;
   color: #111114;
 }
@@ -2290,7 +2290,7 @@ select:focus {
   align-items: center;
   justify-content: center;
   overflow: hidden;
-  min-height: calc(100dvh - var(--notification-bar-height));
+  min-height: calc(100vh - var(--notification-bar-height));
   background: #f8f8f6;
 }
 
@@ -2733,7 +2733,7 @@ select:focus {
 
 /* ─── Company Setup Page ───────────────────────────── */
 .company-setup-page {
-  min-height: calc(100dvh - var(--notification-bar-height));
+  min-height: calc(100vh - var(--notification-bar-height));
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3227,7 +3227,7 @@ select:focus {
 
 /* ─── Founding Onboarding ───────────────────────────── */
 .onboarding-page {
-  min-height: calc(100dvh - var(--notification-bar-height));
+  min-height: calc(100vh - var(--notification-bar-height));
   position: relative;
   overflow: hidden;
 }
@@ -3295,7 +3295,7 @@ select:focus {
 }
 
 .assistant-stage {
-  min-height: 100dvh;
+  min-height: 100vh;
   display: grid;
   grid-template-columns: 44% 56%;
 }
@@ -3477,7 +3477,7 @@ select:focus {
 }
 
 .opening-stage--minimal {
-  min-height: 100dvh;
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
   align-items: center;
