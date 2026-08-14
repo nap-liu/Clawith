@@ -96,6 +96,15 @@ small additional grace period for cleanup and error delivery. Runtime MCP
 registration also uses a unique entry per tool invocation, so concurrent calls
 to the same installed server cannot deregister each other's configuration.
 
+### 7. Jupyter hard timeout and kernel recovery (`jupyter_hard_timeout.patch`)
+
+The upstream Jupyter timeout stopped waiting for output but left the submitted
+cell running in the persistent kernel. Clawith now uses one absolute execution
+deadline, interrupts the active cell at expiry, and resets only that Jupyter
+session when it does not return to idle within two seconds. The API reports a
+structured `HardTimeout`; unrelated Agent sessions and managed background jobs
+remain untouched.
+
 ## Build
 
 ### Local (Mac / development):

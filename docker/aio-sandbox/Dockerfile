@@ -6,6 +6,8 @@ RUN echo "28dec0a9b8b53cd603ffc8468eb8d45b477d62aa6d23505cc3a026b219a6b9f4  /opt
     | sha256sum -c -
 RUN echo "2319d2f771361250f4c101b920ceb82e7929507459b779579f7cbc1c3a1c4dae  /opt/python3.12/lib/python3.12/site-packages/app/api/v1/shell.py" \
     | sha256sum -c -
+RUN echo "7212c4c1c7bdef0fdd3ade4ef3b8d40943f3cbc23047df4742b233924a33d5c0  /opt/python3.12/lib/python3.12/site-packages/app/services/jupyter.py" \
+    | sha256sum -c -
 # Patch 1+2+6: stdio unpack fix, config hot-reload, and a server-side
 # per-request deadline that encloses the complete MCP stdio session lifecycle.
 # Cancellation exits stdio_client's context manager so a stuck child process is
@@ -29,4 +31,12 @@ COPY mcp.py /opt/python3.12/lib/python3.12/site-packages/app/api/v1/mcp.py
 # attached to the pane's Linux process session, including resistant children.
 COPY bash.py /opt/python3.12/lib/python3.12/site-packages/vendors/openhands/runtime/utils/bash.py
 COPY shell.py /opt/python3.12/lib/python3.12/site-packages/app/api/v1/shell.py
+# Patch 7: make the Jupyter timeout an absolute execution deadline. Interrupt
+# the active cell when it expires and reset only that kernel when it does not
+# return to idle within the grace period.
+COPY jupyter_hard_timeout.patch /tmp/jupyter_hard_timeout.patch
+RUN patch --batch --forward \
+      /opt/python3.12/lib/python3.12/site-packages/app/services/jupyter.py \
+      /tmp/jupyter_hard_timeout.patch \
+    && rm /tmp/jupyter_hard_timeout.patch
 COPY tests/ /opt/clawith-tests/

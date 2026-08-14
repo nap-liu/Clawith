@@ -1,0 +1,97 @@
+--- jupyter.py
++++ jupyter.py
+@@ -79,3 +79,29 @@
++    def interrupt_and_wait(self, msg_id: str, timeout: float = 2.0) -> bool:
++        """Interrupt the active cell and wait briefly for this execution to idle."""
++        try:
++            self.kernel_manager.interrupt_kernel()
++        except Exception as e:
++            logger.warning(
++                f'Failed to interrupt kernel session {self.session_id}: {e}'
++            )
++            return False
++
++        deadline = time.monotonic() + timeout
++        while True:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                return False
++            try:
++                msg = self.kernel_client.get_iopub_msg(timeout=remaining)
++            except Exception:
++                return False
++            if (
++                msg.get('parent_header', {}).get('msg_id') == msg_id
++                and msg.get('msg_type') == 'status'
++                and msg.get('content', {}).get('execution_state') == 'idle'
++            ):
++                return True
++
+     def cleanup(self):
+         try:
+             self.kernel_client.stop_channels()
+@@ -491,3 +517,28 @@
+-                result = await asyncio.get_event_loop().run_in_executor(
++                loop = asyncio.get_event_loop()
++                result = await loop.run_in_executor(
+                     None, self._execute_code_sync, session.kernel_client, code, timeout
+                 )
++                if result.get('status') == 'timeout':
++                    interrupted = await loop.run_in_executor(
++                        None,
++                        session.interrupt_and_wait,
++                        result.get('msg_id'),
++                        2.0,
++                    )
++                    recovery = 'interrupted'
++                    if not interrupted:
++                        recovery = 'reset'
++                        if self.sessions.get(session.session_id) is session:
++                            self.sessions.pop(session.session_id, None)
++                        await loop.run_in_executor(None, session.cleanup)
++                    result.setdefault('outputs', []).append(
++                        {
++                            'output_type': 'error',
++                            'ename': 'HardTimeout',
++                            'evalue': (
++                                f'hard_timeout after {timeout}s; '
++                                f'kernel {recovery}'
++                            ),
++                            'traceback': [],
++                        }
++                    )
+@@ -570,7 +621,12 @@
++            deadline = time.monotonic() + timeout
+             # Get execution results
+             while True:
+                 try:
+-                    msg = kernel_client.get_iopub_msg(timeout=timeout)
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0:
++                        status = 'timeout'
++                        break
++                    msg = kernel_client.get_iopub_msg(timeout=remaining)
+                     msg_type = msg['msg_type']
+                     content = msg['content']
+                     parent_msg_id = msg.get('parent_header', {}).get('msg_id')
+@@ -626,4 +682,7 @@
+                 except Exception as e:
+-                    if 'timeout' in str(e).lower():
++                    if (
++                        time.monotonic() >= deadline
++                        or 'timeout' in str(e).lower()
++                    ):
+                         status = 'timeout'
+                         break
+@@ -643,5 +702,6 @@
+-            reply = JupyterService._get_shell_reply(kernel_client, msg_id, timeout=5)
+-            if reply and reply['msg_type'] == 'execute_reply':
+-                status = reply['content']['status']
+-                if execution_count is None:
+-                    execution_count = reply['content'].get('execution_count')
++            if status != 'timeout':
++                reply = JupyterService._get_shell_reply(kernel_client, msg_id, timeout=5)
++                if reply and reply['msg_type'] == 'execute_reply':
++                    status = reply['content']['status']
++                    if execution_count is None:
++                        execution_count = reply['content'].get('execution_count')

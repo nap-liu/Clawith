@@ -1067,6 +1067,7 @@ class AioSandboxBackend(BaseSandboxBackend):
                     stderr_parts.append(f"{ename}: {evalue}".strip(": "))
 
         status = data.get("status", "ok")
+        is_timeout = status == "timeout"
         has_error_output = any(
             out.get("output_type") == "error"
             for out in data.get("outputs", []) or []
@@ -1099,7 +1100,7 @@ class AioSandboxBackend(BaseSandboxBackend):
             success=ok_run,
             stdout=("".join(stdout_parts))[:_STDOUT_LIMIT],
             stderr=("".join(stderr_parts))[:_STDERR_LIMIT],
-            exit_code=0 if ok_run else 1,
+            exit_code=0 if ok_run else (124 if is_timeout else 1),
             duration_ms=0,
             error=error_msg,
         )
