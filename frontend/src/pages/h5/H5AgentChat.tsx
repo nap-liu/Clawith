@@ -24,6 +24,10 @@ import ChatToolCallRenderer from '../../components/ChatToolCallRenderer';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
 import ConversationScrollToBottomButton from '../../features/conversation/ConversationScrollToBottomButton';
 import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
+import {
+    createConversationHistoryPageParams,
+    resolveConversationHistoryHasMore,
+} from '../../features/conversation/historyPagination';
 import { useToast } from '../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../stores';
 import {
@@ -115,7 +119,7 @@ type H5SessionSummary = {
 };
 
 const VIRTUALIZE_ENTRY_THRESHOLD = 40;
-const H5_HISTORY_PAGE_SIZE = 100;
+const H5_SESSION_PAGE_SIZE = 50;
 const STREAM_BATCH_DELAY_MS = 40;
 const QUICK_ACTIONS_MENU_CLOSE_MS = 180;
 
@@ -397,6 +401,8 @@ export default function H5AgentChat() {
     const [sessionsPanelOpen, setSessionsPanelOpen] = useState(false);
     const [sessions, setSessions] = useState<H5SessionSummary[]>([]);
     const [sessionsLoading, setSessionsLoading] = useState(false);
+    const [sessionsLoadingMore, setSessionsLoadingMore] = useState(false);
+    const [sessionsHasMore, setSessionsHasMore] = useState(false);
     const [sessionsError, setSessionsError] = useState('');
     const [llmModels, setLlmModels] = useState<ChatModelOption[]>([]);
     const [tenantDefaultModelId, setTenantDefaultModelId] = useState<string | null>(null);
@@ -437,7 +443,10 @@ export default function H5AgentChat() {
     const hiddenTerminalEventRef = useRef(false);
     const hiddenDroppedEventRef = useRef(false);
     const unmountedRef = useRef(false);
-    const messagesScrollerRef = useRef<HTMLElement | null>(null);
+    const messagesScrollerRef = useRef<HTMLDivElement | null>(null);
+    const sessionsScrollerRef = useRef<HTMLDivElement | null>(null);
+    const sessionsRequestGenerationRef = useRef(0);
+    const sessionsLoadingMoreRef = useRef(false);
     const quickActionsRef = useRef<HTMLDivElement | null>(null);
     const quickActionsMenuCloseTimerRef = useRef<number | null>(null);
     const messageDispatchLockedRef = useRef(false);
@@ -970,12 +979,10 @@ export default function H5AgentChat() {
                 let responseHasMore: string | null = null;
                 let overlapFound = startsNewPagination || currentMessages.length === 0;
                 let before: string | null = null;
-                let lastPageRowCount = 0;
 
                 do {
-                    const params = new URLSearchParams({ limit: String(H5_HISTORY_PAGE_SIZE) });
-                    if (before) params.set('before', before);
-                    const response = await fetch(`/api/agents/${agentId}/sessions/${nextSessionId}/messages?${params}`, {
+                    const params = createConversationHistoryPageParams(before);
+                    const response = await fetch(`/api/agents/${agentId}/sessions/${nextSessionId}/message-turns?${params}`, {
                         headers: { Authorization: `Bearer ${token}` },
                         signal: controller.signal,
                     });
@@ -992,7 +999,6 @@ export default function H5AgentChat() {
                     collectedRows = [...safePageRows, ...collectedRows];
                     responseCursor = pageCursor;
                     responseHasMore = pageHasMore;
-                    lastPageRowCount = safePageRows.length;
 
                     if (!startsNewPagination && safePageRows.length > 0) {
                         const normalizedPage = safePageRows
@@ -1000,9 +1006,7 @@ export default function H5AgentChat() {
                             .filter(Boolean) as H5ChatMessage[];
                         overlapFound = latestHistoryWindowOverlaps(currentMessages, normalizedPage);
                     }
-                    const hasMore = pageHasMore !== null
-                        ? pageHasMore === 'true'
-                        : safePageRows.length === H5_HISTORY_PAGE_SIZE;
+                    const hasMore = resolveConversationHistoryHasMore(pageHasMore);
                     if (overlapFound || !hasMore || !pageCursor || pageCursor === before) break;
                     before = pageCursor;
                 } while (true);
@@ -1023,9 +1027,10 @@ export default function H5AgentChat() {
                         ? `${oldestRow.created_at}${oldestRow.id ? `|${oldestRow.id}` : ''}`
                         : null);
                     historyOldestCursorRef.current = oldestCursor;
-                    setHistoryHasMore(responseHasMore !== null
-                        ? responseHasMore === 'true'
-                        : Boolean(oldestCursor && lastPageRowCount === H5_HISTORY_PAGE_SIZE));
+                    setHistoryHasMore(Boolean(
+                        oldestCursor
+                        && resolveConversationHistoryHasMore(responseHasMore)
+                    ));
                 }
                 historyLoadedSessionRef.current = nextSessionId;
                 return true;
@@ -1062,11 +1067,8 @@ export default function H5AgentChat() {
         let anchorRestoreScheduled = false;
 
         try {
-            const params = new URLSearchParams({
-                limit: String(H5_HISTORY_PAGE_SIZE),
-                before,
-            });
-            const response = await fetch(`/api/agents/${agentId}/sessions/${activeSessionId}/messages?${params}`, {
+            const params = createConversationHistoryPageParams(before);
+            const response = await fetch(`/api/agents/${agentId}/sessions/${activeSessionId}/message-turns?${params}`, {
                 headers: { Authorization: `Bearer ${token}` },
                 signal: controller.signal,
             });
@@ -1109,13 +1111,11 @@ export default function H5AgentChat() {
                 ? `${oldestRow.created_at}${oldestRow.id ? `|${oldestRow.id}` : ''}`
                 : null);
             historyOldestCursorRef.current = nextCursor;
-            setHistoryHasMore(responseHasMore !== null
-                ? responseHasMore === 'true'
-                : Boolean(
-                    nextCursor
-                    && nextCursor !== before
-                    && rows.length === H5_HISTORY_PAGE_SIZE
-                ));
+            setHistoryHasMore(Boolean(
+                nextCursor
+                && nextCursor !== before
+                && resolveConversationHistoryHasMore(responseHasMore)
+            ));
 
             anchorRestoreScheduled = true;
             window.requestAnimationFrame(() => {
@@ -1190,22 +1190,74 @@ export default function H5AgentChat() {
 
     const loadSessions = useCallback(async () => {
         if (!agentId) return;
+        const generation = ++sessionsRequestGenerationRef.current;
+        sessionsLoadingMoreRef.current = false;
         setSessionsLoading(true);
+        setSessionsLoadingMore(false);
         setSessionsError('');
         try {
             const rows = await chatSessionApi.list(agentId, {
                 scope: 'mine',
-                limit: 50,
+                limit: H5_SESSION_PAGE_SIZE + 1,
                 offset: 0,
             });
-            const next = rows.map(normalizeH5SessionSummary).filter(Boolean) as H5SessionSummary[];
+            if (generation !== sessionsRequestGenerationRef.current) return;
+            const pageRows = rows.slice(0, H5_SESSION_PAGE_SIZE);
+            const next = pageRows.map(normalizeH5SessionSummary).filter(Boolean) as H5SessionSummary[];
             setSessions(next);
+            setSessionsHasMore(rows.length > H5_SESSION_PAGE_SIZE);
         } catch (error: any) {
+            if (generation !== sessionsRequestGenerationRef.current) return;
             setSessionsError(error?.message || '无法加载历史会话');
         } finally {
-            setSessionsLoading(false);
+            if (generation === sessionsRequestGenerationRef.current) setSessionsLoading(false);
         }
     }, [agentId]);
+
+    const loadMoreSessions = useCallback(async () => {
+        if (
+            !agentId
+            || sessionsLoading
+            || sessionsLoadingMoreRef.current
+            || !sessionsHasMore
+        ) return;
+
+        const generation = sessionsRequestGenerationRef.current;
+        const offset = sessions.length;
+        sessionsLoadingMoreRef.current = true;
+        setSessionsLoadingMore(true);
+        setSessionsError('');
+        try {
+            const rows = await chatSessionApi.list(agentId, {
+                scope: 'mine',
+                limit: H5_SESSION_PAGE_SIZE + 1,
+                offset,
+            });
+            if (generation !== sessionsRequestGenerationRef.current) return;
+            const pageRows = rows.slice(0, H5_SESSION_PAGE_SIZE);
+            const next = pageRows.map(normalizeH5SessionSummary).filter(Boolean) as H5SessionSummary[];
+            setSessions((current) => {
+                const knownIds = new Set(current.map((item) => item.id));
+                return [...current, ...next.filter((item) => !knownIds.has(item.id))];
+            });
+            setSessionsHasMore(rows.length > H5_SESSION_PAGE_SIZE);
+        } catch (error: any) {
+            if (generation === sessionsRequestGenerationRef.current) {
+                setSessionsError(error?.message || '无法加载更多历史会话');
+            }
+        } finally {
+            if (generation === sessionsRequestGenerationRef.current) {
+                sessionsLoadingMoreRef.current = false;
+                setSessionsLoadingMore(false);
+            }
+        }
+    }, [agentId, sessions.length, sessionsHasMore, sessionsLoading]);
+
+    const handleSessionsScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+        const scroller = event.currentTarget;
+        const distanceToBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+        if (distanceToBottom <= 120) void loadMoreSessions();
+    }, [loadMoreSessions]);
 
     const scheduleReconnect = useCallback(() => {
         if (
@@ -2431,7 +2483,7 @@ export default function H5AgentChat() {
                             type="button"
                             className="h5-chat__icon-button"
                             onClick={loadSessions}
-                            disabled={sessionsLoading}
+                            disabled={sessionsLoading || sessionsLoadingMore}
                             aria-label="刷新历史会话"
                             title="刷新历史会话"
                         >
@@ -2443,13 +2495,17 @@ export default function H5AgentChat() {
                         <div className="h5-chat__session-warning">当前回复进行中，请先终止后再切换会话</div>
                     ) : null}
 
-                    <div className="h5-chat__session-list">
+                    <div
+                        ref={sessionsScrollerRef}
+                        className="h5-chat__session-list"
+                        onScroll={handleSessionsScroll}
+                    >
                         {sessionsLoading && sessions.length === 0 ? (
                             <div className="h5-chat__session-state">
                                 <IconLoader2 size={20} className="h5-chat__spin" />
                                 <span>加载中</span>
                             </div>
-                        ) : sessionsError ? (
+                        ) : sessionsError && sessions.length === 0 ? (
                             <div className="h5-chat__session-state h5-chat__session-state--error">
                                 <IconAlertTriangle size={20} />
                                 <span>{sessionsError}</span>
@@ -2484,6 +2540,17 @@ export default function H5AgentChat() {
                                 );
                             })
                         )}
+                        {sessions.length > 0 && sessionsLoadingMore ? (
+                            <div className="h5-chat__session-load-more" role="status">
+                                <IconLoader2 size={16} className="h5-chat__spin" />
+                                <span>正在加载更早会话…</span>
+                            </div>
+                        ) : null}
+                        {sessions.length > 0 && sessionsError ? (
+                            <div className="h5-chat__session-load-more h5-chat__session-load-more--error">
+                                {sessionsError}
+                            </div>
+                        ) : null}
                     </div>
                 </section>
             ) : null}
@@ -2503,10 +2570,10 @@ export default function H5AgentChat() {
                     {historyLoadingOlder ? (
                         <div className="h5-chat__history-loading" role="status">正在加载更早消息…</div>
                     ) : null}
-                    <section
+                    <div
                         ref={messagesScrollerRef}
                         data-conversation-scroller="h5"
-                        className={`h5-chat__messages${virtualizeMessages ? ' h5-chat__messages--virtual' : ''}`}
+                        className="h5-chat__messages-viewport"
                         aria-live="polite"
                         aria-label="会话消息"
                         tabIndex={0}
@@ -2517,41 +2584,43 @@ export default function H5AgentChat() {
                         onContextMenuCapture={preventProtectedContentAction}
                         onDragStartCapture={preventProtectedImageDrag}
                     >
-                        {virtualizeMessages ? (
-                            <div
-                                className="h5-chat__virtual-spacer"
-                                style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
-                            >
-                                {rowVirtualizer.getVirtualItems().map((virtualItem) => {
-                                    const entry = conversationEntries[virtualItem.index];
-                                    return (
-                                        <div
-                                            key={virtualItem.key}
-                                            ref={rowVirtualizer.measureElement}
-                                            data-index={virtualItem.index}
-                                            className="h5-chat__virtual-row"
-                                            style={{ transform: `translateY(${virtualItem.start}px)` }}
-                                        >
-                                            {entry ? renderConversationEntry(entry) : renderWaitingMessage()}
+                        <section className={`h5-chat__messages${virtualizeMessages ? ' h5-chat__messages--virtual' : ''}`}>
+                            {virtualizeMessages ? (
+                                <div
+                                    className="h5-chat__virtual-spacer"
+                                    style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
+                                >
+                                    {rowVirtualizer.getVirtualItems().map((virtualItem) => {
+                                        const entry = conversationEntries[virtualItem.index];
+                                        return (
+                                            <div
+                                                key={virtualItem.key}
+                                                ref={rowVirtualizer.measureElement}
+                                                data-index={virtualItem.index}
+                                                className="h5-chat__virtual-row"
+                                                style={{ transform: `translateY(${virtualItem.start}px)` }}
+                                            >
+                                                {entry ? renderConversationEntry(entry) : renderWaitingMessage()}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            ) : (
+                                <div className="h5-chat__flow-content">
+                                    {conversationEntries.map((entry) => (
+                                        <div key={entry.key} className="h5-chat__flow-row">
+                                            {renderConversationEntry(entry)}
                                         </div>
-                                    );
-                                })}
-                            </div>
-                        ) : (
-                            <div className="h5-chat__flow-content">
-                                {conversationEntries.map((entry) => (
-                                    <div key={entry.key} className="h5-chat__flow-row">
-                                        {renderConversationEntry(entry)}
-                                    </div>
-                                ))}
-                                {isWaiting ? (
-                                    <div className="h5-chat__flow-row">
-                                        {renderWaitingMessage()}
-                                    </div>
-                                ) : null}
-                            </div>
-                        )}
-                    </section>
+                                    ))}
+                                    {isWaiting ? (
+                                        <div className="h5-chat__flow-row">
+                                            {renderWaitingMessage()}
+                                        </div>
+                                    ) : null}
+                                </div>
+                            )}
+                        </section>
+                    </div>
                     {showScrollToBottom ? (
                         <ConversationScrollToBottomButton
                             variant="h5"

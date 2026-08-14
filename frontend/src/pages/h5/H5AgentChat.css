@@ -261,6 +261,20 @@ body.h5-chat-active #root {
     color: var(--error);
 }
 
+.h5-chat__session-load-more {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    color: var(--text-tertiary);
+    font-size: 12px;
+}
+
+.h5-chat__session-load-more--error {
+    color: var(--error);
+}
+
 .h5-chat__session-item {
     width: 100%;
     min-height: 68px;
@@ -402,7 +416,7 @@ body.h5-chat-active #root {
     position: relative;
     flex: 1 1 auto;
     min-height: 0;
-    display: flex;
+    overflow: hidden;
 }
 
 .h5-chat__messages-shell > .conversation-scroll-bottom {
@@ -425,19 +439,29 @@ body.h5-chat-active #root {
     pointer-events: none;
 }
 
-.h5-chat__messages {
-    flex: 1 1 auto;
-    width: 100%;
-    min-height: 0;
+.h5-chat__messages-viewport {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
     overflow-y: auto;
     padding: 14px var(--h5-edge-padding-right) calc(18px + var(--h5-safe-area-bottom)) var(--h5-edge-padding-left);
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    scroll-padding-bottom: calc(18px + var(--h5-safe-area-bottom));
+}
+
+.h5-chat__messages {
+    width: 100%;
+    min-height: 100%;
     display: flex;
     flex-direction: column;
     gap: 10px;
-    overscroll-behavior: contain;
-    -webkit-overflow-scrolling: touch;
     -webkit-user-select: none;
     user-select: none;
+    /* Kept on the content node for older embedded stylesheets; the dedicated
+       viewport above is the only element that owns scrolling. */
     scroll-padding-bottom: calc(18px + var(--h5-safe-area-bottom));
 }
 
@@ -483,6 +507,7 @@ body.h5-chat-active #root {
 
 .h5-chat__message {
     max-width: 88%;
+    min-width: 0;
     display: flex;
 }
 
@@ -791,6 +816,9 @@ body.h5-chat-active #root {
 }
 
 .h5-chat__markdown {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
     color: inherit;
 }
 

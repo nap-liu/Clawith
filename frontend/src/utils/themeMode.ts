@@ -2,6 +2,7 @@ export type ThemeMode = 'system' | 'light' | 'dark';
 export type ResolvedTheme = 'light' | 'dark';
 
 export const SYSTEM_THEME_QUERY = '(prefers-color-scheme: dark)';
+export const DOCUMENT_THEME_CHANGE_EVENT = 'clawith:theme-change';
 export const THEME_META_COLORS: Record<ResolvedTheme, string> = {
     light: '#f8f8f7',
     dark: '#0a0a0f',
@@ -71,6 +72,22 @@ export function applyDocumentTheme(
 
     const themeColor = targetDocument.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
     themeColor?.setAttribute('content', THEME_META_COLORS[resolvedTheme]);
+
+    const targetWindow = targetDocument.defaultView;
+    if (targetWindow) {
+        try {
+            const detail = { theme: resolvedTheme, mode };
+            if (typeof targetWindow.CustomEvent === 'function') {
+                targetWindow.dispatchEvent(new targetWindow.CustomEvent(DOCUMENT_THEME_CHANGE_EVENT, { detail }));
+            } else {
+                const event = targetDocument.createEvent('CustomEvent');
+                event.initCustomEvent(DOCUMENT_THEME_CHANGE_EVENT, false, false, detail);
+                targetWindow.dispatchEvent(event);
+            }
+        } catch {
+            // Theme application must not fail when CustomEvent is unavailable in an old WebView.
+        }
+    }
 }
 
 type ThemeControllerOptions = {

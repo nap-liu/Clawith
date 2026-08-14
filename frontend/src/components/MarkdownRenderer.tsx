@@ -157,7 +157,7 @@ function markdownToHtml(md: string, imagePolicy: MarkdownImagePolicy): string {
         if (inBlockquote) { html += '</blockquote>'; inBlockquote = false; }
     };
     const flushTable = () => {
-        if (inTable) { html += '</tbody></table>'; inTable = false; tableHeader = false; }
+        if (inTable) { html += '</tbody></table></div>'; inTable = false; tableHeader = false; }
     };
 
     for (let i = 0; i < lines.length; i++) {
@@ -229,7 +229,7 @@ function markdownToHtml(md: string, imagePolicy: MarkdownImagePolicy): string {
                 continue;
             }
             if (!inTable) {
-                html += '<table style="border-collapse:collapse;margin:8px 0;font-size:13px;width:100%"><thead>';
+                html += '<div class="markdown-table-scroll"><table class="markdown-table" style="border-collapse:collapse;font-size:13px"><thead>';
                 inTable = true;
                 tableHeader = false;
                 // This is the header row
@@ -352,7 +352,7 @@ export const MarkdownRenderer = React.memo(function MarkdownRenderer({
     return (
         <>
             <div
-                className={className}
+                className={`markdown-renderer${className ? ` ${className}` : ''}`}
                 style={{ lineHeight: 1.6, fontSize: 'inherit', ...style, wordBreak: 'break-word' }}
                 onClick={handleContainerClick}
                 dangerouslySetInnerHTML={{ __html: html }}

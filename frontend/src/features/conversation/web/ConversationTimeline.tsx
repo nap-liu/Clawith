@@ -234,7 +234,7 @@ function MessageItem({ agentId, msg, view, unavailable, onDownload, onUnavailabl
         <div className={`chat-msg-row${view.isLeft ? '' : ' chat-msg-row--user'}`}>
             <div className={`chat-msg-avatar${view.isLeft ? '' : ' chat-msg-avatar--user'}`} style={view.hideAvatar ? { visibility: 'hidden' } : undefined}>{avatar}</div>
             <div className="chat-msg-col">
-                <div className={view.isLeft ? '' : 'chat-msg-user-line'}>
+                <div className="chat-msg-content-line">
                     <div className={`chat-msg-bubble${view.isLeft ? '' : ' chat-msg-bubble--user'}${msg._streaming && !msg.content && !msg.thinking ? ' chat-msg-bubble--thinking' : ''}`}>
                         {showSender && <div className="chat-msg-sender">{sender}</div>}
                         {(previews.length > 0 || inlinePreviews.length > 0) && <div className="conversation-image-list">{renderPreviews(previews.length ? previews : inlinePreviews)}</div>}

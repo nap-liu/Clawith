@@ -22,6 +22,10 @@ import ConversationScrollToBottomButton from '../../features/conversation/Conver
 import ConversationTimeline from '../../features/conversation/web/ConversationTimeline';
 import { buildConversationEntries, getConversationScrollAnchor } from '../../features/conversation/core/chatTimeline';
 import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
+import {
+    createConversationHistoryPageParams,
+    resolveConversationHistoryHasMore,
+} from '../../features/conversation/historyPagination';
 import OrgMemberAccessPicker, {
     type AgentAccessDepartment,
     type AgentAccessUser,
@@ -1785,7 +1789,6 @@ export default function AgentDetailPage() {
     const [historyOldestTs, setHistoryOldestTs] = useState<string | null>(null);
     const [historyHasMore, setHistoryHasMore] = useState(true);
     const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
-    const HISTORY_PAGE_SIZE = 100;
     const [sessionsLoading, setSessionsLoading] = useState(false);
     const [allSessionsLoading, setAllSessionsLoading] = useState(false);
     const [agentExpired, setAgentExpired] = useState(false);
@@ -2101,12 +2104,10 @@ export default function AgentDetailPage() {
             let responseHasMore: string | null = null;
             let overlapFound = !preserveLoadedHistory || currentLoadedMessages.length === 0;
             let before: string | null = null;
-            let lastPageRowCount = 0;
 
             do {
-                const params = new URLSearchParams({ limit: String(HISTORY_PAGE_SIZE) });
-                if (before) params.set('before', before);
-                const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?${params}`, {
+                const params = createConversationHistoryPageParams(before);
+                const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/message-turns?${params}`, {
                     headers: { Authorization: `Bearer ${tkn}` },
                     signal: controller.signal,
                 });
@@ -2121,25 +2122,20 @@ export default function AgentDetailPage() {
                 collectedRows = [...safePageRows, ...collectedRows];
                 responseCursor = pageCursor;
                 responseHasMore = pageHasMore;
-                lastPageRowCount = safePageRows.length;
                 if (preserveLoadedHistory && safePageRows.length > 0) {
                     overlapFound = latestHistoryWindowOverlaps(
                         currentLoadedMessages as any,
                         parseHistoryRows(safePageRows) as any,
                     );
                 }
-                const hasMore = pageHasMore !== null
-                    ? pageHasMore === 'true'
-                    : safePageRows.length === HISTORY_PAGE_SIZE;
+                const hasMore = resolveConversationHistoryHasMore(pageHasMore);
                 if (overlapFound || !hasMore || !pageCursor || pageCursor === before) break;
                 before = pageCursor;
             } while (true);
 
             const preParsed = parseHistoryRows(collectedRows);
             if (!preserveLoadedHistory || !overlapFound) {
-                setHistoryHasMore(responseHasMore !== null
-                    ? responseHasMore === 'true'
-                    : lastPageRowCount === HISTORY_PAGE_SIZE);
+                setHistoryHasMore(resolveConversationHistoryHasMore(responseHasMore));
                 // Backend returns the page oldest-first. Pagination metadata is
                 // based on raw DB rows and remains valid even when rendering
                 // merges or splits tool messages.
@@ -3679,7 +3675,8 @@ export default function AgentDetailPage() {
         setHistoryLoadingMore(true);
         try {
             const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}&before=${encodeURIComponent(historyOldestTs)}`, {
+            const params = createConversationHistoryPageParams(historyOldestTs);
+            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/message-turns?${params}`, {
                 headers: { Authorization: `Bearer ${tkn}` },
                 signal: controller.signal,
             });
@@ -3728,13 +3725,11 @@ export default function AgentDetailPage() {
                 ? `${msgs[0].created_at}${msgs[0].id ? `|${msgs[0].id}` : ''}`
                 : null);
             setHistoryOldestTs(nextOldestTs);
-            setHistoryHasMore(responseHasMore !== null
-                ? responseHasMore === 'true'
-                : Boolean(
-                    nextOldestTs
-                    && nextOldestTs !== historyOldestTs
-                    && msgs.length === HISTORY_PAGE_SIZE
-                ));
+            setHistoryHasMore(Boolean(
+                nextOldestTs
+                && nextOldestTs !== historyOldestTs
+                && resolveConversationHistoryHasMore(responseHasMore)
+            ));
             // Restore scroll position after new messages are prepended
             requestAnimationFrame(() => {
                 if (el) {

@@ -618,22 +618,21 @@ async def delete_session(
     return None
 
 
-@router.get("/{agent_id}/sessions/{session_id}/messages")
-async def get_session_messages(
+async def _get_session_messages_page(
     agent_id: uuid.UUID,
     session_id: uuid.UUID,
-    limit: int = Query(20, ge=1, le=500, description="Number of messages to return"),
-    before: str = Query(None, description="Cursor: ISO timestamp, optionally followed by |message UUID"),
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    response: Response = None,
+    limit: int,
+    turn_limit: int | None,
+    before: str | None,
+    current_user: User,
+    db: AsyncSession,
+    response: Response | None,
 ):
-    """Get chat messages for a specific session."""
     _, session, _ = await _load_accessible_session(db, current_user, agent_id, session_id)
 
     # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
     # Optimized: use a single query with ORDER BY and LIMIT instead of subquery
-    from sqlalchemy import desc
+    from sqlalchemy import asc, desc
     query = (
         select(ChatMessage)
         .where(
@@ -649,10 +648,8 @@ async def get_session_messages(
             ),
         )
         # id tiebreak: own-transaction tool_call/assistant rows can share a
-        # created_at microsecond; keep the render order deterministic. Fetched
-        # desc + reversed below, so the page is the newest `limit` rows.
+        # created_at microsecond; keep the render order deterministic.
         .order_by(desc(ChatMessage.created_at), desc(ChatMessage.id))
-        .limit(limit + 1)
     )
     # Keep accepting the legacy timestamp-only cursor, while newer clients add
     # the message UUID so rows sharing a timestamp cannot be skipped at a page boundary.
@@ -674,10 +671,52 @@ async def get_session_messages(
                 status_code=400,
                 detail="Invalid `before` cursor. Use ISO 8601 or <ISO 8601>|<message UUID>.",
             )
-    msgs_result = await db.execute(query)
-    newest_first = list(msgs_result.scalars().all())
-    has_more = len(newest_first) > limit
-    messages = list(reversed(newest_first[:limit]))
+    if turn_limit is not None:
+        # A persisted user row is the durable turn anchor. Resolve the oldest
+        # anchor in this page first, then fetch every row through the current
+        # cursor. Tool-heavy turns are therefore returned whole with two
+        # bounded, indexed queries instead of a raw message-row cutoff.
+        anchors_result = await db.execute(
+            query.where(ChatMessage.role == "user").limit(turn_limit)
+        )
+        anchors = list(anchors_result.scalars().all())
+        if anchors:
+            oldest_anchor = anchors[-1]
+            at_or_after_anchor = or_(
+                ChatMessage.created_at > oldest_anchor.created_at,
+                and_(
+                    ChatMessage.created_at == oldest_anchor.created_at,
+                    ChatMessage.id >= oldest_anchor.id,
+                ),
+            )
+            messages_result = await db.execute(
+                query
+                .where(at_or_after_anchor)
+                .order_by(None)
+                .order_by(asc(ChatMessage.created_at), asc(ChatMessage.id))
+            )
+            messages = list(messages_result.scalars().all())
+            older_than_anchor = or_(
+                ChatMessage.created_at < oldest_anchor.created_at,
+                and_(
+                    ChatMessage.created_at == oldest_anchor.created_at,
+                    ChatMessage.id < oldest_anchor.id,
+                ),
+            )
+            older_result = await db.execute(query.where(older_than_anchor).limit(1))
+            has_more = older_result.scalar_one_or_none() is not None
+        else:
+            # Assistant-first greetings and legacy unanchored rows are not LLM
+            # turns. Preserve the old bounded row behavior for that small tail.
+            msgs_result = await db.execute(query.limit(limit + 1))
+            newest_first = list(msgs_result.scalars().all())
+            has_more = len(newest_first) > limit
+            messages = list(reversed(newest_first[:limit]))
+    else:
+        msgs_result = await db.execute(query.limit(limit + 1))
+        newest_first = list(msgs_result.scalars().all())
+        has_more = len(newest_first) > limit
+        messages = list(reversed(newest_first[:limit]))
     oldest_raw_message = messages[0] if messages else None
     next_cursor = (
         f"{oldest_raw_message.created_at.isoformat()}|{oldest_raw_message.id}"
@@ -843,6 +882,52 @@ async def get_session_messages(
     # message above (the frontend renders that specific tool as the card).
 
     return out
+
+
+@router.get("/{agent_id}/sessions/{session_id}/messages")
+async def get_session_messages(
+    agent_id: uuid.UUID,
+    session_id: uuid.UUID,
+    limit: int = Query(20, ge=1, le=500, description="Number of messages to return"),
+    before: str = Query(None, description="Cursor: ISO timestamp, optionally followed by |message UUID"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    response: Response = None,
+):
+    """Legacy row-count pagination. Kept unchanged for existing clients."""
+    return await _get_session_messages_page(
+        agent_id=agent_id,
+        session_id=session_id,
+        limit=limit,
+        turn_limit=None,
+        before=before,
+        current_user=current_user,
+        db=db,
+        response=response,
+    )
+
+
+@router.get("/{agent_id}/sessions/{session_id}/message-turns")
+async def get_session_message_turns(
+    agent_id: uuid.UUID,
+    session_id: uuid.UUID,
+    turn_limit: int = Query(20, ge=1, le=100, description="Number of complete turns to return"),
+    before: str = Query(None, description="Cursor: ISO timestamp, optionally followed by |message UUID"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    response: Response = None,
+):
+    """Turn-boundary pagination for current PC and H5 clients."""
+    return await _get_session_messages_page(
+        agent_id=agent_id,
+        session_id=session_id,
+        limit=100,
+        turn_limit=turn_limit,
+        before=before,
+        current_user=current_user,
+        db=db,
+        response=response,
+    )
 
 
 import re

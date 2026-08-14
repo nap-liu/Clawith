@@ -6440,6 +6440,44 @@ select:focus {
   margin: 0 auto;
 }
 
+.markdown-renderer {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.markdown-table-scroll {
+  display: block;
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  margin: 8px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  border-radius: 8px;
+}
+
+.markdown-table-scroll > .markdown-table {
+  width: max-content;
+  min-width: 100%;
+  max-width: none;
+  margin: 0;
+  table-layout: auto;
+}
+
+.markdown-table-scroll > .markdown-table th,
+.markdown-table-scroll > .markdown-table td {
+  box-sizing: border-box;
+  min-width: 112px;
+  max-width: 420px;
+  vertical-align: top;
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
 .markdown-image-wrap {
   position: relative;
   display: inline-flex;
@@ -7054,6 +7092,7 @@ select:focus {
 
 .chat-msg-col {
   max-width: 72%;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -7063,13 +7102,16 @@ select:focus {
   align-items: flex-end;
 }
 
-.chat-msg-user-line {
+.chat-msg-content-line {
   max-width: 100%;
+  min-width: 0;
   display: block;
 }
 
 .chat-msg-bubble {
+  box-sizing: border-box;
   max-width: 100%;
+  min-width: 0;
   padding: 8px 12px;
   border-radius: 12px;
   font-size: 13px;

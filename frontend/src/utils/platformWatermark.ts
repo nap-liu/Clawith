@@ -1,3 +1,5 @@
+import { DOCUMENT_THEME_CHANGE_EVENT } from './themeMode';
+
 export type PlatformWatermarkTheme = 'light' | 'dark';
 
 export type PlatformWatermarkIdentity = {
@@ -18,6 +20,7 @@ type PlatformWatermarkInstallOptions = {
 };
 
 const WATERMARK_ATTRIBUTE = 'data-platform-watermark';
+const WATERMARK_HOST_ID = 'clawith-platform-watermark-host';
 const MAX_NAME_CHARACTERS = 24;
 const MAX_DEVICE_PIXEL_RATIO = 3;
 const MOBILE_VIEWPORT_MAX_WIDTH = 600;
@@ -32,26 +35,34 @@ const WATERMARK_FONT_FAMILY = [
     'sans-serif',
 ].join(',');
 
-const CRITICAL_STYLE: Readonly<Record<string, string>> = {
-    position: 'fixed',
-    inset: '0px',
-    margin: '0px',
-    padding: '0px',
-    border: '0px',
-    display: 'block',
-    visibility: 'visible',
-    opacity: '1',
-    'pointer-events': 'none',
-    'user-select': 'none',
-    '-webkit-user-select': 'none',
-    'z-index': '2147483647',
-    overflow: 'hidden',
-    transform: 'none',
-    filter: 'none',
-    'background-color': 'transparent',
-    'background-repeat': 'repeat',
-    'background-position': '0px 0px',
-};
+const WATERMARK_HOST_STYLE = [
+    'all:initial!important',
+    'position:fixed!important',
+    'top:0!important',
+    'right:0!important',
+    'bottom:0!important',
+    'left:0!important',
+    'display:block!important',
+    'pointer-events:none!important',
+    'user-select:none!important',
+    '-webkit-user-select:none!important',
+    'z-index:2147483647!important',
+    'overflow:hidden!important',
+    'contain:strict!important',
+].join(';');
+
+const WATERMARK_LAYER_STYLE = [
+    'position:absolute!important',
+    'top:0!important',
+    'right:0!important',
+    'bottom:0!important',
+    'left:0!important',
+    'display:block!important',
+    'pointer-events:none!important',
+    'background-color:transparent!important',
+    'background-repeat:repeat!important',
+    'background-position:0 0!important',
+].join(';');
 
 function firstNonEmptyString(...values: Array<string | null | undefined>) {
     for (const value of values) {
@@ -204,34 +215,6 @@ export function createPlatformWatermarkTile(
     }
 }
 
-function setImportantStyle(element: HTMLElement, property: string, value: string) {
-    element.style.setProperty(property, value, 'important');
-}
-
-function applyCanonicalStyle(element: HTMLElement, tile: PlatformWatermarkTile) {
-    element.removeAttribute('class');
-    element.setAttribute(WATERMARK_ATTRIBUTE, 'true');
-    element.setAttribute('aria-hidden', 'true');
-    for (const [property, value] of Object.entries(CRITICAL_STYLE)) {
-        setImportantStyle(element, property, value);
-    }
-    setImportantStyle(element, 'background-image', `url("${tile.dataUrl}")`);
-    setImportantStyle(element, 'background-size', `${tile.width}px ${tile.height}px`);
-}
-
-function hasStyleDrifted(element: HTMLElement, tile: PlatformWatermarkTile) {
-    if (element.getAttribute(WATERMARK_ATTRIBUTE) !== 'true') return true;
-    if (element.hasAttribute('class')) return true;
-    for (const [property, value] of Object.entries(CRITICAL_STYLE)) {
-        if (element.style.getPropertyValue(property) !== value) return true;
-        if (element.style.getPropertyPriority(property) !== 'important') return true;
-    }
-    if (!element.style.getPropertyValue('background-image').includes(tile.dataUrl)) return true;
-    if (element.style.getPropertyPriority('background-image') !== 'important') return true;
-    if (element.style.getPropertyValue('background-size') !== `${tile.width}px ${tile.height}px`) return true;
-    return element.style.getPropertyPriority('background-size') !== 'important';
-}
-
 export function installPlatformWatermark(
     text: string,
     {
@@ -240,52 +223,55 @@ export function installPlatformWatermark(
     }: PlatformWatermarkInstallOptions = {},
 ) {
     const body = targetDocument.body;
-    const root = targetDocument.documentElement;
-    const element = targetDocument.createElement('div');
-    let currentTile: PlatformWatermarkTile;
+    const staleHost = targetDocument.getElementById(WATERMARK_HOST_ID);
+    staleHost?.parentNode?.removeChild(staleHost);
+
+    const host = targetDocument.createElement('div');
+    host.id = WATERMARK_HOST_ID;
+    host.setAttribute(WATERMARK_ATTRIBUTE, 'true');
+    host.setAttribute('aria-hidden', 'true');
+    host.style.cssText = WATERMARK_HOST_STYLE;
+
+    const renderRoot = typeof host.attachShadow === 'function'
+        ? host.attachShadow({ mode: 'closed' })
+        : host;
+    const layer = targetDocument.createElement('div');
+    layer.setAttribute('part', 'layer');
+    layer.style.cssText = WATERMARK_LAYER_STYLE;
+    renderRoot.appendChild(layer);
+
+    let currentTheme: PlatformWatermarkTheme | null = null;
+    let currentLayoutKey = '';
     let resizeFrame: number | null = null;
 
-    const render = () => {
-        currentTile = createPlatformWatermarkTile(
+    const getLayoutKey = () => {
+        const viewport = targetWindow.innerWidth <= MOBILE_VIEWPORT_MAX_WIDTH ? 'narrow' : 'wide';
+        const pixelRatio = Math.min(MAX_DEVICE_PIXEL_RATIO, Math.max(1, targetWindow.devicePixelRatio || 1));
+        return `${viewport}:${pixelRatio}`;
+    };
+
+    const render = (nextTheme = resolvePlatformWatermarkTheme(targetDocument)) => {
+        const nextLayoutKey = getLayoutKey();
+        if (nextTheme === currentTheme && nextLayoutKey === currentLayoutKey) return;
+        const tile = createPlatformWatermarkTile(
             text,
-            resolvePlatformWatermarkTheme(targetDocument),
+            nextTheme,
             targetDocument,
             targetWindow,
         );
-        applyCanonicalStyle(element, currentTile);
+        layer.style.setProperty('background-image', `url("${tile.dataUrl}")`, 'important');
+        layer.style.setProperty('background-size', `${tile.width}px ${tile.height}px`, 'important');
+        currentTheme = nextTheme;
+        currentLayoutKey = nextLayoutKey;
     };
 
     render();
-    body.querySelectorAll<HTMLElement>(`[${WATERMARK_ATTRIBUTE}]`).forEach((staleElement) => {
-        staleElement.remove();
-    });
-    body.appendChild(element);
+    body.appendChild(host);
 
-    const Observer = (targetWindow as Window & typeof globalThis).MutationObserver;
-    const themeObserver = Observer
-        ? new Observer(() => render())
-        : null;
-    themeObserver?.observe(root, {
-        attributes: true,
-        attributeFilter: ['data-theme'],
-    });
-
-    const bodyObserver = Observer
-        ? new Observer(() => {
-            if (element.parentNode !== body) body.appendChild(element);
-        })
-        : null;
-    bodyObserver?.observe(body, { childList: true });
-
-    const elementObserver = Observer
-        ? new Observer(() => {
-            if (hasStyleDrifted(element, currentTile)) applyCanonicalStyle(element, currentTile);
-        })
-        : null;
-    elementObserver?.observe(element, {
-        attributes: true,
-        attributeFilter: ['style', 'class', WATERMARK_ATTRIBUTE],
-    });
+    const handleThemeChange = (event: Event) => {
+        const detail = (event as CustomEvent<{ theme?: PlatformWatermarkTheme }>).detail;
+        render(detail?.theme === 'dark' ? 'dark' : 'light');
+    };
 
     const handleResize = () => {
         if (resizeFrame != null) targetWindow.cancelAnimationFrame(resizeFrame);
@@ -294,14 +280,13 @@ export function installPlatformWatermark(
             render();
         });
     };
+    targetWindow.addEventListener(DOCUMENT_THEME_CHANGE_EVENT, handleThemeChange);
     targetWindow.addEventListener('resize', handleResize);
 
     return () => {
-        themeObserver?.disconnect();
-        bodyObserver?.disconnect();
-        elementObserver?.disconnect();
+        targetWindow.removeEventListener(DOCUMENT_THEME_CHANGE_EVENT, handleThemeChange);
         targetWindow.removeEventListener('resize', handleResize);
         if (resizeFrame != null) targetWindow.cancelAnimationFrame(resizeFrame);
-        element.remove();
+        if (host.parentNode) host.parentNode.removeChild(host);
     };
 }
