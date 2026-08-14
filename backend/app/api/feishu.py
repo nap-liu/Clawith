@@ -445,6 +445,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
         msg_type = message.get("message_type", "text")
         chat_type = message.get("chat_type", "p2p")  # p2p or group
         chat_id = message.get("chat_id", "")
+        normalized_attachments = []
 
         logger.info(f"[Feishu] Received {msg_type} message, chat_type={chat_type}, open_id={sender_open_id!r}, user_id_from_event={sender_user_id_from_event!r}")
 
@@ -480,10 +481,9 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                 if _line_parts:
                     _text_parts.append("".join(_line_parts))
             _extracted_text = "\n".join(_text_parts).strip()
-            # Download images and embed as base64 for vision-capable models
-            _image_markers = []
+            # Download images into the agent workspace. The shared LLM caller
+            # decides whether the actual model attempt receives image blocks.
             if _post_image_keys:
-                import base64 as _b64
                 _msg_id = message.get("message_id", "")
                 for _ik in _post_image_keys:
                     try:
@@ -497,21 +497,24 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                             content_type="image/jpeg",
                         )
                         logger.info(f"[Feishu] Saved post image to {_workspace_path} ({len(_img_bytes)} bytes)")
-                        # Embed as base64 marker for vision models
-                        _b64_data = _b64.b64encode(_img_bytes).decode("ascii")
-                        _image_markers.append(f"[image_data:data:image/jpeg;base64,{_b64_data}]")
+                        normalized_attachments.append(
+                            attachment_from_workspace_path(
+                                _workspace_path,
+                                mime_type="image/jpeg",
+                                size_bytes=len(_img_bytes),
+                            )
+                        )
                     except Exception as _dl_err:
                         logger.error(f"[Feishu] Failed to download post image {_ik}: {_dl_err}")
-            # Build final text with embedded images
-            if not _extracted_text and _image_markers:
+            if not _extracted_text and normalized_attachments:
                 _extracted_text = "[用户发送了图片，请看图片内容]"
-            _final_content = _extracted_text
-            if _image_markers:
-                _final_content += "\n" + "\n".join(_image_markers)
             # Rewrite as text message so existing handler processes it
-            message["content"] = _json_post.dumps({"text": _final_content})
+            message["content"] = _json_post.dumps({"text": _extracted_text})
             msg_type = "text"
-            logger.info(f"[Feishu] Normalized post → text='{_extracted_text[:100]}', images={len(_image_markers)}")
+            logger.info(
+                f"[Feishu] Normalized post → text='{_extracted_text[:100]}', "
+                f"images={len(normalized_attachments)}"
+            )
 
         if msg_type in ("file", "image"):
             # Do not acknowledge the provider before the durable ingest/match
@@ -738,7 +741,8 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     channel_config_id=config.id,
                     actor_ref=sender_user_id_feishu or sender_open_id,
                     message_meta={
-                        "actor_ref_type": "user_id" if sender_user_id_feishu else "open_id"
+                        "actor_ref_type": "user_id" if sender_user_id_feishu else "open_id",
+                        "attachments": normalized_attachments,
                     },
                 )
                 _sess.last_message_at = _dt.now(_tz.utc)
@@ -1392,10 +1396,7 @@ async def _handle_feishu_file(
                 )
                 session_conv_id_img = str(_sess_img.id)
 
-                import base64 as _b64_img
-                _b64_data = _b64_img.b64encode(file_bytes).decode("ascii")
-                _image_marker = f"[image_data:data:image/jpeg;base64,{_b64_data}]"
-                user_msg_content_img = f"[用户发送了图片]\n{_image_marker}"
+                user_msg_content_img = "[用户发送了图片]"
                 from app.services.chat_history import ingest_incoming_chat_message
 
                 _image_ingested = await ingest_incoming_chat_message(

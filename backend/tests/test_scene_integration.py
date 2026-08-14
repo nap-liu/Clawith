@@ -422,7 +422,7 @@ async def test_fixed_scene_welcome_is_persisted_with_first_real_user_message():
         "attachments": [],
     }
     assert rows[1].role == "user"
-    assert rows[1].content == "[file:photo.png]\n我要报修"
+    assert rows[1].content == "我要报修"
     assert rows[1].message_meta["scene_key"] == "warranty"
     assert rows[1].message_meta["scene_revision"] == 3
     assert rows[1].message_meta["attachments"] == [{
@@ -433,7 +433,15 @@ async def test_fixed_scene_welcome_is_persisted_with_first_real_user_message():
     assert rows[1].message_meta["display_content"] == "我要报修"
     assert build_llm_messages_from_rows(rows) == [
         {"role": "assistant", "content": "欢迎使用报修服务"},
-        {"role": "user", "content": "[file:photo.png]\n我要报修"},
+        {
+            "role": "user",
+            "content": "我要报修",
+            "attachments": [{
+                "display_name": "photo.png",
+                "path": "workspace/uploads/photo.png",
+                "kind": "image",
+            }],
+        },
     ]
 
 

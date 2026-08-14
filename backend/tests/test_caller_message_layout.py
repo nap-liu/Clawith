@@ -71,6 +71,7 @@ class _FakeModel:
     max_output_tokens = None
     request_timeout = 30.0
     id = "model-x"
+    supports_vision = False
 
 
 def test_unattended_turn_without_user_message_still_receives_context():
@@ -250,6 +251,51 @@ async def test_message_layout_and_tool_sort(monkeypatch):
     tool_names = [t["function"]["name"] for t in call["tools"]]
     assert tool_names == sorted(tool_names)
     assert tool_names == ["grep", "read_file", "write_file"]
+
+
+@pytest.mark.asyncio
+async def test_text_model_dispatch_contains_image_path_without_image_payload(monkeypatch):
+    fake_client = _FakeClient()
+    monkeypatch.setattr("app.services.llm.caller.create_llm_client", lambda **kwargs: fake_client)
+    monkeypatch.setattr("app.services.llm.caller.get_max_tokens", lambda *args, **kwargs: 1024)
+    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda model: "fake-key")
+    monkeypatch.setattr(
+        "app.services.llm.caller._get_agent_config",
+        AsyncMock(return_value=(50, None)),
+    )
+    monkeypatch.setattr(
+        "app.services.agent_context.build_agent_context",
+        AsyncMock(return_value=("STATIC", "DYNAMIC")),
+    )
+    monkeypatch.setattr("app.services.llm.caller.record_token_usage", AsyncMock(return_value=None))
+
+    result = await call_llm(
+        model=_FakeModel(),
+        messages=[{
+            "role": "user",
+            "content": "请处理",
+            "attachments": [{
+                "display_name": "screen.png",
+                "path": "workspace/uploads/screen.png",
+                "kind": "image",
+                "mime_type": "image/png",
+            }],
+        }],
+        agent_name="TestAgent",
+        role_description="",
+        agent_id="agent-x",
+        skip_tools=True,
+    )
+
+    assert result == "ok-final"
+    sent = fake_client.stream_calls[0]["messages"]
+    user_content = sent[-1].content
+    assert isinstance(user_content, str)
+    assert "文件名：screen.png" in user_content
+    assert "路径：workspace/uploads/screen.png" in user_content
+    assert "请处理" in user_content
+    assert "image_url" not in user_content
+    assert "base64" not in user_content
 
 
 @pytest.mark.asyncio

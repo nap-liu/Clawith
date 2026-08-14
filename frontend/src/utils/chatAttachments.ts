@@ -284,19 +284,12 @@ export function resolveEffectiveChatModelId({
     return firstEnabled?.id || null;
 }
 
-export function modelSupportsVision(models: ChatModelOption[], modelId?: string | null) {
-    if (!modelId) return false;
-    return models.some((model) => model.id === modelId && model.supports_vision === true);
-}
-
 export function buildChatAttachmentPayload({
     input,
     attachments,
-    supportsVision,
 }: {
     input: string;
     attachments: ChatAttachedFile[];
-    supportsVision: boolean;
 }): ChatAttachmentPayload {
     let userMsg = input.trim();
     let contentForLLM = userMsg;
@@ -308,28 +301,18 @@ export function buildChatAttachmentPayload({
 
         attachments.forEach((file) => {
             filesDisplay += `[Attachment: ${file.name}] `;
-            if (file.imageUrl && supportsVision) {
-                filesPrompt += `[image_data:${file.imageUrl}]\n`;
-            } else if (file.imageUrl) {
-                filesPrompt += `[图片文件已上传: ${file.name}，保存在 ${file.path || ''}]\n`;
-            } else {
-                const wsPath = file.path || '';
-                const fileLoc = wsPath
-                    ? `\nCanonical virtual path: ${wsPath}\nUse this exact same path with read_file, read_document, and execute_code.\n`
-                    : '';
+            if (!file.imageUrl) {
                 if (file.source === 'workspace_auto') {
-                    filesPrompt += `[Workspace reference: ${file.name}]${fileLoc}\nUse read_file or read_document if you need the file contents.\n\n`;
+                    filesPrompt += `[Workspace reference: ${file.name}]\nUse read_file or read_document if you need the file contents.\n\n`;
                 } else {
-                    filesPrompt += `[File: ${file.name}]${fileLoc}\n${file.text}\n\n`;
+                    filesPrompt += `[File: ${file.name}]\n${file.text}\n\n`;
                 }
             }
         });
 
-        if (supportsVision && attachments.some((file) => file.imageUrl)) {
-            contentForLLM = userMsg ? `${filesPrompt}\n${userMsg}` : `${filesPrompt}\n请分析这些文件`;
-        } else {
-            contentForLLM = userMsg ? `${filesPrompt}\nQuestion: ${userMsg}` : `Please analyze these files:\n\n${filesPrompt}`;
-        }
+        contentForLLM = userMsg
+            ? `${filesPrompt}${filesPrompt ? '\n' : ''}${userMsg}`
+            : `${filesPrompt}${filesPrompt ? '\n' : ''}请分析这些文件`;
 
         displayFiles = filesDisplay.trim();
         userMsg = userMsg ? `${displayFiles}\n${userMsg}` : displayFiles;

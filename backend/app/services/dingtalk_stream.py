@@ -5,7 +5,6 @@ Uses the dingtalk-stream SDK to receive bot messages via persistent connections.
 """
 
 import asyncio
-import base64
 import json
 import tempfile
 import threading
@@ -101,15 +100,13 @@ async def _process_media_message(
     """Process a DingTalk message and extract text + media info.
 
     Returns:
-        (user_text, image_base64_list, saved_file_paths)
-        - user_text: text content for the LLM (may include markers)
-        - image_base64_list: list of base64-encoded image data URIs, or None
+        (user_text, saved_file_paths)
+        - user_text: text content for the LLM
         - saved_file_paths: list of saved file paths, or None
     """
     msgtype = msg_data.get("msgtype", "text")
     logger.info(f"[DingTalk] Processing message type: {msgtype}")
 
-    image_base64_list: List[str] = []
     saved_file_paths: List[str] = []
 
     if msgtype == "text":
@@ -141,12 +138,8 @@ async def _process_media_message(
         )
         logger.info(f"[DingTalk] Saved image to {workspace_path} ({len(file_bytes)} bytes)")
 
-        # Base64 encode for LLM vision
-        b64_data = base64.b64encode(file_bytes).decode("ascii")
-        image_marker = f"[image_data:data:image/jpeg;base64,{b64_data}]"
         return (
-            f"[用户发送了图片]\n{image_marker}",
-            [f"data:image/jpeg;base64,{b64_data}"],
+            "[用户发送了图片]",
             [workspace_path],
         )
 
@@ -174,10 +167,6 @@ async def _process_media_message(
                         )
                         logger.info(f"[DingTalk] Saved rich text image to {workspace_path}")
 
-                        b64_data = base64.b64encode(file_bytes).decode("ascii")
-                        image_marker = f"[image_data:data:image/jpeg;base64,{b64_data}]"
-                        text_parts.append(image_marker)
-                        image_base64_list.append(f"data:image/jpeg;base64,{b64_data}")
                         saved_file_paths.append(workspace_path)
 
         combined_text = "\n".join(text_parts).strip()
@@ -186,7 +175,6 @@ async def _process_media_message(
 
         return (
             combined_text,
-            image_base64_list if image_base64_list else None,
             saved_file_paths if saved_file_paths else None,
         )
 
@@ -913,7 +901,7 @@ class DingTalkStreamManager:
                     )
                     return
 
-                user_text, image_base64_list, saved_file_paths = await _process_media_message(
+                user_text, saved_file_paths = await _process_media_message(
                     msg_data=msg_data,
                     app_key=app_key,
                     app_secret=app_secret,
@@ -932,7 +920,6 @@ class DingTalkStreamManager:
                     conversation_type=conversation_type,
                     session_webhook=session_webhook,
                     session_webhook_expires_at_ms=session_webhook_expires_at_ms,
-                    image_base64_list=image_base64_list,
                     saved_file_paths=saved_file_paths,
                     sender_nick=sender_nick,
                     message_id=message_id,

@@ -45,7 +45,6 @@ import {
     buildPreviewImagesFromAttachments,
     downloadChatAttachment,
     extractChatImageDataMarkers,
-    modelSupportsVision,
     normalizeChatAttachmentFields,
     resolveEffectiveChatModelId,
     splitAttachmentFileNames,
@@ -1480,11 +1479,6 @@ export default function H5AgentChat() {
         models: llmModels,
     }), [agent?.primary_model_id, llmModels, tenantDefaultModelId]);
 
-    const effectiveModelSupportsVision = useMemo(
-        () => modelSupportsVision(llmModels, effectiveModelId),
-        [effectiveModelId, llmModels],
-    );
-
     const handleOnboardingStart = useCallback(() => {
         setIsWaiting(true);
         setIsStreaming(false);
@@ -1542,7 +1536,6 @@ export default function H5AgentChat() {
         const payload = buildChatAttachmentPayload({
             input: content,
             attachments: files,
-            supportsVision: effectiveModelSupportsVision || files.some((file) => !!file.imageUrl),
         });
         const messageId = makeId();
         resumeAutoFollowRef.current();
@@ -1571,7 +1564,7 @@ export default function H5AgentChat() {
             attachments: payload.attachments,
             model_id: effectiveModelId,
         }));
-    }, [confirmationPending, effectiveModelId, effectiveModelSupportsVision, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
+    }, [confirmationPending, effectiveModelId, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
 
     const sendMessage = useCallback(
         () => dispatchMessage(input, attachedFiles, true),

@@ -97,6 +97,6 @@ async def test_seeded_file_tool_guidance_reaches_llm_runtime():
         assert runtime_by_name[name]["description"] == seeded_by_name[name]["description"]
         assert runtime_by_name[name]["parameters"] == seeded_by_name[name]["parameters_schema"]
 
-    assert "canonical virtual path" in runtime_by_name["list_files"]["description"]
+    assert "copy each displayed path exactly" in runtime_by_name["list_files"]["description"].lower()
     assert "accepts any file type" in runtime_by_name["read_file"]["description"]
     assert "matched exactly" in runtime_by_name["read_document"]["description"]

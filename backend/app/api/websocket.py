@@ -648,13 +648,11 @@ class WebSocketChatHandler:
         """Translates historical ChatMessages to LLM inputs via the shared
         row→message builder — the SAME mapping the IM channels use (tool_call
         rows expand to the assistant(tool_calls)+tool(result) pair; web replays
-        model thinking) — then re-hydrates historical images for multi-turn
-        vision context."""
+        model thinking). Image attachments stay structured until the actual
+        model attempt is known."""
         from app.services.chat_history import build_llm_messages_from_rows
-        from app.services.image_context import rehydrate_image_messages
 
         conversation: list[dict] = build_llm_messages_from_rows(self.history_messages, include_thinking=True)
-        conversation = rehydrate_image_messages(conversation, self.agent_id, max_images=3)
         return conversation
 
     async def message_loop(self):
@@ -810,7 +808,6 @@ class WebSocketChatHandler:
                         conversation_id=self.conv_id,
                         turn_anchor_id=turn_anchor_id,
                         ctx_size=self.ctx_size,
-                        rehydrate_images_max=3,
                         include_thinking=True,
                     )
                 if refreshed_prefix is None:
@@ -837,7 +834,30 @@ class WebSocketChatHandler:
 
             # Add the real user message after any assistant-first greeting so
             # the in-memory context matches durable history ordering.
-            self.conversation.append({"role": "user", "content": content})
+            from app.services.chat_attachments import (
+                normalize_chat_message_attachments,
+                strip_image_data_markers,
+            )
+
+            current_source = content
+            if validated_attachments is None and file_name and "[image_data:" in content:
+                current_source = f"[file:{file_name}]\n{content}"
+            if validated_attachments is not None:
+                # Structured attachment metadata is already validated. Keep the
+                # current-turn document extraction text, while ensuring legacy
+                # image transport data can never reach the model adapter.
+                current_content = strip_image_data_markers(current_source)
+                current_attachments = validated_attachments
+            else:
+                current_content, current_attachments = normalize_chat_message_attachments(
+                    current_source,
+                    {},
+                    self.source_channel,
+                )
+            current_message = {"role": "user", "content": current_content}
+            if current_attachments:
+                current_message["attachments"] = current_attachments
+            self.conversation.append(current_message)
 
             # OpenClaw routing check
             if self.agent_type == "openclaw":
@@ -1058,9 +1078,14 @@ class WebSocketChatHandler:
         bool,
     ]:
         """Saves user message to the database and updates session title/time."""
+        from app.services.chat_attachments import strip_image_data_markers
+
         has_image_marker = "[image_data:" in content
-        if has_image_marker:
-            saved_content = f"[file:{file_name}]\n{content}" if file_name else content
+        if attachments is not None:
+            saved_content = display_content if display_content else strip_image_data_markers(content)
+        elif has_image_marker:
+            clean_content = strip_image_data_markers(content)
+            saved_content = f"[file:{file_name}]\n{clean_content}" if file_name else clean_content
         else:
             saved_content = display_content if display_content else content
             if file_name:
@@ -1524,7 +1549,6 @@ class WebSocketChatHandler:
                                 conversation_id=self.conv_id,
                                 turn_anchor_id=turn_anchor_id,
                                 ctx_size=self.ctx_size,
-                                rehydrate_images_max=3,
                                 include_thinking=True,
                             )
                         if prefix is None:
@@ -1590,7 +1614,6 @@ class WebSocketChatHandler:
                     on_tool_call=tool_call_to_ws,
                     on_tool_delta=tool_delta_to_ws,
                     on_thinking=thinking_to_ws,
-                    supports_vision=getattr(effective_llm_model, "supports_vision", False),
                     on_failover=_on_failover,
                     skip_tools=skip_tools_for_greeting,
                     on_code_output=code_output_to_ws,

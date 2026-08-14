@@ -3492,7 +3492,6 @@ export default function AgentDetailPage() {
         const attachmentPayload = buildChatAttachmentPayload({
             input: chatInput.trim(),
             attachments: attachedFiles,
-            supportsVision,
         });
 
         const payload: PendingChatMessage = {
@@ -3844,9 +3843,6 @@ export default function AgentDetailPage() {
         || enabledLlmModels[0]?.id
         || null;
 
-    const supportsVision = !!effectiveChatModelId && llmModels.some(
-        (m: any) => m.id === effectiveChatModelId && m.supports_vision
-    );
     const enabledModelCount = enabledLlmModels.length;
     const effectiveModelReady = !!effectiveChatModelId && enabledLlmModels.some((m: any) => m.id === effectiveChatModelId);
 

@@ -256,9 +256,14 @@ def _consume_slack_trailing_file_markers(content: str) -> tuple[list[str], str]:
 
 
 def _strip_display_protocol(content: str) -> str:
-    clean = _IMAGE_DATA_RE.sub("", content or "")
+    clean = strip_image_data_markers(content)
     clean = _ATTACHMENT_DISPLAY_RE.sub("", clean)
     return clean.strip()
+
+
+def strip_image_data_markers(content: str) -> str:
+    """Remove legacy inline image transport data without changing user text."""
+    return _IMAGE_DATA_RE.sub("", content or "").strip()
 
 
 def _legacy_names_for_source(raw_names: list[str], source_channel: str) -> list[str]:

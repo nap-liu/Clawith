@@ -140,7 +140,6 @@ async def handle_read_image(agent_id: uuid.UUID, arguments: dict) -> str:
             # handle_read_image's entry, so the vision model cannot call
             # itself through AGENT_TOOLS even though it sees the catalogue.
             agent_id=None,
-            supports_vision=True,
         )
     except Exception as e:
         logger.warning(f"[read_image] upstream call_llm failed: {e}")

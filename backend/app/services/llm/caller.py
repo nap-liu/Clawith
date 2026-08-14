@@ -1165,7 +1165,6 @@ async def call_llm(
     on_tool_delta=None,
     on_thinking=None,
     on_usage=None,
-    supports_vision=False,
     max_tool_rounds_override: int | None = None,
     skip_tools: bool = False,
     is_group: bool = False,
@@ -1178,6 +1177,7 @@ async def call_llm(
     context_recovery=None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
+    supports_vision = bool(getattr(model, "supports_vision", False))
     # Get agent config for tool rounds
     _max_tool_rounds, _token_limit_msg = await _get_agent_config(agent_id)
     if _token_limit_msg:
@@ -1242,9 +1242,16 @@ async def call_llm(
     # the byte-stable static prompt.  Per-turn context (memory, current user,
     # channel, time, triggers) is attached to the current user message at the
     # tail, preserving the cacheable system + historical prefix.
-    def _assemble_api_messages(source_messages: list[dict]) -> list[LLMMessage]:
+    async def _assemble_api_messages(source_messages: list[dict]) -> list[LLMMessage]:
+        from app.services.image_context import prepare_messages_for_model
+
+        prepared_messages = await prepare_messages_for_model(
+            source_messages,
+            agent_id=agent_id,
+            supports_vision=supports_vision,
+        )
         assembled = [LLMMessage(role="system", content=static_prompt)]
-        for msg in source_messages:
+        for msg in prepared_messages:
             assembled.append(
                 LLMMessage(
                     role=msg.get("role", "user"),
@@ -1256,7 +1263,7 @@ async def call_llm(
         assembled = _convert_messages_for_vision(assembled, supports_vision)
         return _attach_turn_context(assembled, dynamic_prompt)
 
-    api_messages = _assemble_api_messages(messages)
+    api_messages = await _assemble_api_messages(messages)
 
     # Create the unified LLM client
     try:
@@ -1372,7 +1379,7 @@ async def call_llm(
         ):
             recovered_messages = await context_recovery(model, dispatch_budget)
             if recovered_messages is not None:
-                api_messages = _assemble_api_messages(recovered_messages)
+                api_messages = await _assemble_api_messages(recovered_messages)
                 dispatch_messages = list(api_messages)
                 dispatch_budget = measure_dispatch(
                     model=model,
@@ -1749,7 +1756,6 @@ async def call_llm_with_failover(
     on_usage=None,
     on_tool_call=None,
     on_tool_delta=None,
-    supports_vision=False,
     on_failover=None,
     skip_tools: bool = False,
     is_group: bool = False,
@@ -1856,7 +1862,6 @@ async def call_llm_with_failover(
         on_tool_delta=_wrapped_on_tool_delta,
         on_thinking=_wrapped_on_thinking,
         on_usage=on_usage,
-        supports_vision=supports_vision,
         skip_tools=skip_tools,
         is_group=is_group,
         on_code_output=on_code_output,
@@ -1941,7 +1946,6 @@ async def call_llm_with_failover(
         on_tool_delta=_fallback_on_tool_delta,
         on_thinking=_fallback_on_thinking,
         on_usage=on_usage,
-        supports_vision=getattr(fallback_model, "supports_vision", False),
         skip_tools=skip_tools,
         is_group=is_group,
         on_code_output=on_code_output,
@@ -1983,7 +1987,6 @@ async def call_agent_llm(
     session_id: str = "",
     on_chunk=None,
     on_thinking=None,
-    supports_vision: bool = False,
 ) -> str:
     """Call the agent's LLM with automatic failover support."""
     from app.models.agent import Agent
@@ -2039,7 +2042,6 @@ async def call_agent_llm(
             session_id=session_id,
             on_chunk=on_chunk,
             on_thinking=on_thinking,
-            supports_vision=supports_vision or getattr(primary_model, "supports_vision", False),
             turn_anchor_id=None,
         )
         return reply

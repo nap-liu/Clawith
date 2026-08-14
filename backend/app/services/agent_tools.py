@@ -362,7 +362,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and folders in a directory within my workspace. Every displayed path is the canonical virtual path reported by storage; copy it exactly when calling another file tool. Use this before writing new workspace documents so you can inspect the current folder structure, reuse existing topical subfolders when appropriate, and avoid dumping files directly into the workspace root unless there is a clear reason. Can also list enterprise_info/ for shared company information.",
+            "description": "List files and folders in a directory within my workspace. Copy each displayed path exactly when calling another file tool. Use this before writing new workspace documents so you can inspect the current folder structure, reuse existing topical subfolders when appropriate, and avoid dumping files directly into the workspace root unless there is a clear reason. Can also list enterprise_info/ for shared company information.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -378,7 +378,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the requested workspace file as UTF-8 text. The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. This tool accepts any file type but does not parse document formats; binary content may be unreadable as text. Can read soul.md for personality, memory/memory.md for memory, skills/ for skill files, and enterprise_info/ for shared company info. Focus is not stored in files; use list_focus_items and upsert_focus_item for Focus. Use offset and limit for ordinary text pagination, but note that line limits do not bound characters when HTML, JSON, or generated data is stored on one long line. For large or data-heavy files, use execute_code_aio to inspect and process the original path directly, write the result to a file, and print only a bounded summary, validation result, and output path.",
+            "description": "Read the requested workspace file as UTF-8 text. The path is matched exactly and is never corrected to a similar filename, so copy the path from the attachment context or list_files output. This tool accepts any file type but does not parse document formats; binary content may be unreadable as text. Can read soul.md for personality, memory/memory.md for memory, skills/ for skill files, and enterprise_info/ for shared company info. Focus is not stored in files; use list_focus_items and upsert_focus_item for Focus. Use offset and limit for ordinary text pagination, but note that line limits do not bound characters when HTML, JSON, or generated data is stored on one long line. For large or data-heavy files, use execute_code_aio to inspect and process the original path directly, write the result to a file, and print only a bounded summary, validation result, and output path.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1158,7 +1158,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_document",
-            "description": "Extract text from an office document (PDF, Word, Excel, PPT). The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. Storage, materialization, size-limit, timeout, and parser failures are reported as distinct results.",
+            "description": "Extract text from an office document (PDF, Word, Excel, PPT). The path is matched exactly and is never corrected to a similar filename, so copy the path from the attachment context or list_files output. Storage, materialization, size-limit, timeout, and parser failures are reported as distinct results.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -7480,7 +7480,7 @@ async def _resolve_storage_source_path(
     first and only performed tolerant filename matching inside the resulting
     temporary directory.  A miss therefore materialized nothing, making the
     fallback unreachable.  Resolve against the storage directory first so all
-    file tools share the same canonical virtual path.
+    file tools share the same workspace path.
     """
     storage = get_storage_backend()
     storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
@@ -11617,7 +11617,6 @@ async def _send_message_to_agent(
                 agent_id=target.id, user_id=owner_id, session_id=session_id,
                 on_tool_call=_a2a_persist,
                 on_thinking=_a2a_on_thinking,
-                supports_vision=getattr(target_model, "supports_vision", False),
                 turn_anchor_id=outbound_a2a_message.id,
                 context_recovery=_a2a_context_recovery,
             )

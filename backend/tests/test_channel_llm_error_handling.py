@@ -252,6 +252,53 @@ async def test_scene_context_is_forwarded_to_shared_llm_caller(monkeypatch):
     assert captured["channel_context"] == scene_context
 
 
+async def test_current_channel_attachment_keeps_live_text_and_uses_structured_path(monkeypatch):
+    agent, model = _make_agent_and_model()
+    anchor_id = uuid.uuid4()
+    session_id = str(uuid.uuid4())
+    db = _make_db(agent, model)
+    db.get = AsyncMock(return_value=SimpleNamespace(
+        agent_id=agent.id,
+        conversation_id=session_id,
+        message_meta={
+            "source_channel": "feishu",
+            "display_content": "",
+            "attachments": [{
+                "display_name": "photo.png",
+                "path": "workspace/uploads/photo.png",
+                "kind": "image",
+            }],
+        },
+    ))
+    captured = {}
+
+    async def fake_llm(*_args, **kwargs):
+        captured.update(kwargs)
+        return "已处理"
+
+    _patch_llm(monkeypatch, fake_llm)
+
+    reply = await channel_llm._call_agent_llm(
+        db,
+        agent.id,
+        "<sender>张三</sender>\n请看图[image_data:data:image/png;base64,bGVnYWN5]",
+        session_id=session_id,
+        user_id=agent.id,
+        turn_anchor_id=anchor_id,
+    )
+
+    assert reply == "已处理"
+    assert captured["messages"][-1] == {
+        "role": "user",
+        "content": "<sender>张三</sender>\n请看图",
+        "attachments": [{
+            "display_name": "photo.png",
+            "path": "workspace/uploads/photo.png",
+            "kind": "image",
+        }],
+    }
+
+
 async def test_context_limit_uses_short_im_reset_message(monkeypatch):
     agent, model = _make_agent_and_model()
 

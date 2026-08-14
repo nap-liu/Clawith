@@ -215,7 +215,38 @@ async def _call_agent_llm(
         normalized_history = _normalize_history_messages(history)
         messages.extend(strip_leading_orphan_tool_messages(normalized_history))
     if not continue_turn:
-        messages.append({"role": "user", "content": user_text})
+        current_message: dict = {"role": "user", "content": user_text}
+        get_row = getattr(db, "get", None)
+        if turn_anchor_id is not None and callable(get_row):
+            from app.models.audit import ChatMessage
+            from app.services.chat_attachments import (
+                normalize_attachment_metadata,
+                normalize_chat_message_attachments,
+                strip_image_data_markers,
+            )
+
+            anchor = await get_row(ChatMessage, turn_anchor_id)
+            if (
+                anchor is not None
+                and anchor.agent_id == history_agent_id
+                and anchor.conversation_id == str(session_id)
+            ):
+                meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
+                if "attachments" in meta:
+                    # Keep sender attribution and extracted document text from
+                    # the live turn; the persisted display text is UI-only.
+                    content = strip_image_data_markers(user_text)
+                    attachments = normalize_attachment_metadata(meta.get("attachments"))
+                else:
+                    content, attachments = normalize_chat_message_attachments(
+                        user_text,
+                        meta,
+                        meta.get("source_channel"),
+                    )
+                current_message["content"] = content
+                if attachments:
+                    current_message["attachments"] = attachments
+        messages.append(current_message)
 
     # Exact first-dispatch recovery. Only a fresh, durably anchored user turn
     # is eligible; confirmation/startup continuations retain their in-memory
@@ -254,7 +285,6 @@ async def _call_agent_llm(
                     turn_anchor_id=turn_anchor_id,
                     ctx_size=ctx_size,
                     is_group=is_group,
-                    rehydrate_images_max=3,
                 )
             if prefix is None:
                 logger.warning(
@@ -353,7 +383,6 @@ async def _call_agent_llm(
             on_thinking=_on_thinking_bridged,
             on_usage=_collect_usage,
             on_tool_call=_on_tool_call_persisted,
-            supports_vision=getattr(model, "supports_vision", False),
             is_group=is_group,
             channel_context=scene_channel_context,
             turn_anchor_id=turn_anchor_id,

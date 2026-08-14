@@ -377,7 +377,6 @@ async def process_dingtalk_message(
     conversation_type: str,
     session_webhook: str,
     session_webhook_expires_at_ms: int | str | None = None,
-    image_base64_list: list[str] | None = None,
     saved_file_paths: list[str] | None = None,
     sender_nick: str = "",
     message_id: str = "",
@@ -388,7 +387,6 @@ async def process_dingtalk_message(
     """Process an incoming DingTalk bot message and reply via session webhook.
 
     Args:
-        image_base64_list: List of base64-encoded image data URIs for vision LLM.
         saved_file_paths: List of local file paths where media files were saved.
     """
     import httpx
@@ -802,14 +800,14 @@ async def process_dingtalk_message(
                 sess = locked_session
         session_conv_id = str(sess.id)
 
-        # Load history (with vision rehydration so multi-turn LLM keeps prior images visible)
+        # Load provider-neutral history; the shared caller materializes images
+        # only after the concrete model attempt is resolved.
         from app.services.chat_history import load_history_for_llm
         history = await load_history_for_llm(
             db,
             agent_id=agent_id,
             conversation_id=session_conv_id,
             ctx_size=ctx_size,
-            rehydrate_images_max=3,
             is_group=(conversation_type == "2"),
         )
 
@@ -878,7 +876,6 @@ async def process_dingtalk_message(
                 conversation_id=session_conv_id,
                 turn_anchor_id=ingested.message.id,
                 ctx_size=ctx_size,
-                rehydrate_images_max=3,
                 is_group=(conversation_type == "2"),
             )
             if refreshed_prefix is None:
@@ -1124,7 +1121,7 @@ async def process_dingtalk_message(
             if _cvs_token is not None:
                 _cvs.reset(_cvs_token)
 
-        has_media = bool(image_base64_list or saved_file_paths)
+        has_media = bool(saved_file_paths)
         logger.info(
             f"[DingTalk] LLM reply ({('media' if has_media else 'text')} input): "
             f"{reply_text[:100]}"

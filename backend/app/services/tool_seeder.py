@@ -403,7 +403,7 @@ BUILTIN_TOOLS = [
     {
         "name": "list_files",
         "display_name": "List Files",
-        "description": "List files and folders in a directory within the workspace. Every displayed path is the canonical virtual path reported by storage; copy it exactly when calling another file tool. Use this before writing new workspace documents so you can inspect the current folder structure, reuse existing topical subfolders when appropriate, and avoid dumping files directly into the workspace root unless there is a clear reason. Can also list enterprise_info/ for shared company information.",
+        "description": "List files and folders in a directory within the workspace. Copy each displayed path exactly when calling another file tool. Use this before writing new workspace documents so you can inspect the current folder structure, reuse existing topical subfolders when appropriate, and avoid dumping files directly into the workspace root unless there is a clear reason. Can also list enterprise_info/ for shared company information.",
         "category": "file",
         "icon": "📁",
         "is_default": True,
@@ -419,7 +419,7 @@ BUILTIN_TOOLS = [
     {
         "name": "read_file",
         "display_name": "Read File",
-        "description": "Read the requested workspace file as UTF-8 text. The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. This tool accepts any file type but does not parse document formats; binary content may be unreadable as text. Can read soul.md, memory/memory.md, skills/, and enterprise_info/. Focus is stored in system tools, not focus.md. Use offset and limit for ordinary text pagination, but note that line limits do not bound characters when HTML, JSON, or generated data is stored on one long line. For large or data-heavy files, use execute_code_aio to inspect and process the original path directly, write the result to a file, and print only a bounded summary, validation result, and output path.",
+        "description": "Read the requested workspace file as UTF-8 text. The path is matched exactly and is never corrected to a similar filename, so copy the path from the attachment context or list_files output. This tool accepts any file type but does not parse document formats; binary content may be unreadable as text. Can read soul.md, memory/memory.md, skills/, and enterprise_info/. Focus is stored in system tools, not focus.md. Use offset and limit for ordinary text pagination, but note that line limits do not bound characters when HTML, JSON, or generated data is stored on one long line. For large or data-heavy files, use execute_code_aio to inspect and process the original path directly, write the result to a file, and print only a bounded summary, validation result, and output path.",
         "category": "file",
         "icon": "📄",
         "is_default": True,
@@ -609,7 +609,7 @@ BUILTIN_TOOLS = [
     {
         "name": "read_document",
         "display_name": "Read Document",
-        "description": "Extract text from an office document (PDF, Word, Excel, PPT). The path is matched exactly and is never corrected to a similar filename, so copy the canonical virtual path from the attachment context or list_files output. Storage, materialization, size-limit, timeout, and parser failures are reported as distinct results.",
+        "description": "Extract text from an office document (PDF, Word, Excel, PPT). The path is matched exactly and is never corrected to a similar filename, so copy the path from the attachment context or list_files output. Storage, materialization, size-limit, timeout, and parser failures are reported as distinct results.",
         "category": "file",
         "icon": "📑",
         "is_default": True,

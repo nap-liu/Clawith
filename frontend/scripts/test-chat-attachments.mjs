@@ -34,7 +34,6 @@ const {
     extractChatImageDataMarkers,
     getChatAttachmentIconKind,
     isPreviewableImageName,
-    modelSupportsVision,
     normalizeChatAttachmentFields,
     resolveEffectiveChatModelId,
     splitAttachmentFileNames,
@@ -62,7 +61,6 @@ const {
 {
     const payload = buildChatAttachmentPayload({
         input: '总结一下',
-        supportsVision: false,
         attachments: [{
             name: 'report.pdf',
             text: 'PDF extracted text',
@@ -74,16 +72,14 @@ const {
     assert.equal(payload.fileName, 'report.pdf');
     assert.equal(payload.imageUrl, undefined);
     assert.equal(payload.contentForLLM.includes('[File: report.pdf]'), true);
-    assert.equal(payload.contentForLLM.includes('Canonical virtual path: workspace/uploads/report.pdf'), true);
-    assert.equal(payload.contentForLLM.includes('Use this exact same path with read_file, read_document, and execute_code.'), true);
+    assert.equal(payload.contentForLLM.includes('workspace/uploads/report.pdf'), false);
     assert.equal(payload.contentForLLM.includes('relative path: "uploads/report.pdf"'), false);
-    assert.equal(payload.contentForLLM.includes('Question: 总结一下'), true);
+    assert.equal(payload.contentForLLM.endsWith('总结一下'), true);
 }
 
 {
     const payload = buildChatAttachmentPayload({
         input: '',
-        supportsVision: false,
         attachments: [{
             name: 'diagram.png',
             text: '[图片文件: diagram.png，需要视觉模型分析]',
@@ -95,13 +91,13 @@ const {
     assert.equal(payload.userMsg, '[Attachment: diagram.png]');
     assert.equal(payload.fileName, 'diagram.png');
     assert.equal(payload.imageUrl, 'data:image/png;base64,abc');
-    assert.equal(payload.contentForLLM.includes('[图片文件已上传: diagram.png'), true);
+    assert.equal(payload.contentForLLM, '请分析这些文件');
+    assert.equal(payload.contentForLLM.includes('base64'), false);
 }
 
 {
     const payload = buildChatAttachmentPayload({
         input: '看这张图',
-        supportsVision: true,
         attachments: [{
             name: 'diagram.png',
             text: '',
@@ -109,7 +105,7 @@ const {
         }],
     });
 
-    assert.equal(payload.contentForLLM, '[image_data:data:image/png;base64,abc]\n\n看这张图');
+    assert.equal(payload.contentForLLM, '看这张图');
 }
 
 {
@@ -133,7 +129,6 @@ const {
     const images = buildPreviewImagesFromAttachments(attachments);
     const payload = buildChatAttachmentPayload({
         input: '比较一下',
-        supportsVision: true,
         attachments,
     });
     assert.equal(images.length, 2);
@@ -221,8 +216,6 @@ const {
         tenantDefaultModelId: '',
         models,
     }), 'text-model');
-    assert.equal(modelSupportsVision(models, 'vision-model'), true);
-    assert.equal(modelSupportsVision(models, 'text-model'), false);
 }
 
 console.log('chat attachment tests passed');

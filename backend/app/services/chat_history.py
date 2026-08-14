@@ -3,7 +3,7 @@
 Before this module, every channel handler (websocket / feishu / dingtalk /
 wecom / discord / teams / slack) carried its own history query and row slice.
 The duplication made it hard to evolve history-handling (complete-turn
-protection, compaction, image rehydration, …) without touching seven files at
+protection, compaction, attachment handling, …) without touching seven files at
 once.
 
 The module exposes two layers:
@@ -16,8 +16,7 @@ The module exposes two layers:
   that need raw access (websocket splits ``tool_call`` rows into
   assistant + tool pairs) call this and shape themselves.
 * ``load_history_for_llm`` — convenience wrapper that produces the
-  ``[{"role", "content"}]`` shape used by the IM channels. Optional
-  vision rehydration through ``rehydrate_images_max``.
+  provider-neutral message shape used by the IM channels.
 
 The summary is reconstructed at load time from ``chat_compactions``;
 it is **not** persisted to ``chat_messages`` (the chat UI shows the
@@ -41,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction
 from app.models.user import User
+from app.services.chat_attachments import normalize_chat_message_attachments
 from app.services.sender_attribution import wrap_with_sender
 
 if TYPE_CHECKING:
@@ -430,6 +430,40 @@ def expand_tool_call_row(msg: Any) -> list[dict[str, Any]]:
     return [asst, tool_msg]
 
 
+def build_llm_message_from_row(
+    message: Any,
+    *,
+    wrap_user_names: bool = False,
+    name_map: dict | None = None,
+    include_thinking: bool = False,
+) -> dict[str, Any]:
+    """Build one provider-neutral message with structured attachment metadata."""
+    content = message.content
+    attachments: list[dict[str, Any]] = []
+    if message.role == "user":
+        meta = getattr(message, "message_meta", None)
+        source_channel = meta.get("source_channel") if isinstance(meta, dict) else None
+        content, attachments = normalize_chat_message_attachments(
+            message.content,
+            meta,
+            source_channel,
+        )
+        sender_user_id = getattr(message, "sender_user_id", None) or getattr(message, "user_id", None)
+        if wrap_user_names and sender_user_id is not None:
+            content = wrap_with_sender(
+                content,
+                sender_user_id,
+                (name_map or {}).get(sender_user_id),
+            )
+
+    entry: dict[str, Any] = {"role": message.role, "content": content}
+    if attachments:
+        entry["attachments"] = attachments
+    if include_thinking and getattr(message, "thinking", None):
+        entry["thinking"] = message.thinking
+    return entry
+
+
 def build_llm_messages_from_rows(
     rows: list[Any],
     *,
@@ -453,19 +487,14 @@ def build_llm_messages_from_rows(
         if m.role == "tool_call":
             out.extend(expand_tool_call_row(m))
             continue
-        sender_user_id = getattr(m, "sender_user_id", None) or getattr(m, "user_id", None)
-        if wrap_user_names and m.role == "user" and sender_user_id is not None:
-            content = wrap_with_sender(
-                m.content,
-                sender_user_id,
-                (name_map or {}).get(sender_user_id),
+        out.append(
+            build_llm_message_from_row(
+                m,
+                wrap_user_names=wrap_user_names,
+                name_map=name_map,
+                include_thinking=include_thinking,
             )
-        else:
-            content = m.content
-        entry: dict[str, Any] = {"role": m.role, "content": content}
-        if include_thinking and getattr(m, "thinking", None):
-            entry["thinking"] = m.thinking
-        out.append(entry)
+        )
     return out
 
 
@@ -1337,7 +1366,6 @@ async def load_history_for_llm(
     agent_id: uuid.UUID,
     conversation_id: str,
     ctx_size: int,
-    rehydrate_images_max: int | None = None,
     is_group: bool = False,
 ) -> list[dict[str, Any]]:
     """Return ``[{"role", "content"}]`` history ready to feed an LLM call.
@@ -1352,10 +1380,6 @@ async def load_history_for_llm(
             ``feishu_p2p_<open_id>``, ``dingtalk_p2p_<staff_id>``, web
             ``conversation_id`` UUID).
         ctx_size: Retained for caller compatibility; no row-level cut is made.
-        rehydrate_images_max: When set, post-process with
-            ``image_context.rehydrate_image_messages`` so vision models
-            still see prior image uploads. Only the most recent ``N``
-            images are inlined to keep request size sane.
     """
     rows = await load_messages_for_session(
         db,
@@ -1389,13 +1413,6 @@ async def load_history_for_llm(
     rows = _trim_incomplete_user_turn_tail_rows(rows)
     history = build_llm_messages_from_rows(rows, wrap_user_names=wrap_users, name_map=name_map)
 
-    if rehydrate_images_max is not None:
-        # Lazy import: image_context pulls in vision deps that not all
-        # deployments need. Only loaded when a vision-capable channel asks.
-        from app.services.image_context import rehydrate_image_messages
-
-        history = rehydrate_image_messages(history, agent_id, max_images=rehydrate_images_max)
-
     return history
 
 
@@ -1406,7 +1423,6 @@ async def load_history_prefix_before_anchor(
     conversation_id: str,
     turn_anchor_id: uuid.UUID,
     ctx_size: int,
-    rehydrate_images_max: int | None = None,
     is_group: bool = False,
     include_thinking: bool = False,
 ) -> list[dict[str, Any]] | None:
@@ -1457,14 +1473,6 @@ async def load_history_prefix_before_anchor(
         name_map=name_map,
         include_thinking=include_thinking,
     )
-    if rehydrate_images_max is not None:
-        from app.services.image_context import rehydrate_image_messages
-
-        history = rehydrate_image_messages(
-            history,
-            agent_id,
-            max_images=rehydrate_images_max,
-        )
     return history
 
 
@@ -1475,7 +1483,6 @@ async def load_recoverable_history_for_turn(
     conversation_id: str,
     turn_anchor_id: uuid.UUID,
     ctx_size: int,
-    rehydrate_images_max: int | None = None,
     is_group: bool = False,
 ) -> list[dict[str, Any]]:
     """Return LLM-ready history for startup recovery of an interrupted turn."""
@@ -1504,10 +1511,5 @@ async def load_recoverable_history_for_turn(
             wrap_users = False
 
     history = build_llm_messages_from_rows(rows, wrap_user_names=wrap_users, name_map=name_map)
-
-    if rehydrate_images_max is not None:
-        from app.services.image_context import rehydrate_image_messages
-
-        history = rehydrate_image_messages(history, agent_id, max_images=rehydrate_images_max)
 
     return history
