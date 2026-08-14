@@ -58,7 +58,10 @@ import {
 import { createClientId } from '../../utils/clientId';
 import {
     applyAssistantDoneMessage,
+    applyAssistantStreamMessage,
+    latestHistoryWindowOverlaps,
     normalizeChatTimelineMessages,
+    reconcileLatestHistoryWindow,
 } from '../../features/conversation/core/chatTimeline';
 import { parseChatSessionId, writeChatSessionIdToHref } from '../../utils/chatUrlParams';
 import {
@@ -1782,7 +1785,7 @@ export default function AgentDetailPage() {
     const [historyOldestTs, setHistoryOldestTs] = useState<string | null>(null);
     const [historyHasMore, setHistoryHasMore] = useState(true);
     const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
-    const HISTORY_PAGE_SIZE = 500;
+    const HISTORY_PAGE_SIZE = 100;
     const [sessionsLoading, setSessionsLoading] = useState(false);
     const [allSessionsLoading, setAllSessionsLoading] = useState(false);
     const [agentExpired, setAgentExpired] = useState(false);
@@ -1814,7 +1817,15 @@ export default function AgentDetailPage() {
     const activeReadOnlyRef = useRef<boolean>(false);
     const currentAgentIdRef = useRef<string | undefined>(id);
     const sessionMsgAbortRef = useRef<AbortController | null>(null);
+    const historyMoreAbortRef = useRef<AbortController | null>(null);
     const sessionLoadSeqRef = useRef(0);
+    const pcPageSuspendedRef = useRef(false);
+    const pcHiddenDroppedEventRef = useRef(false);
+    const pcRecoveryPollingNeededRef = useRef(false);
+    const pcRecoveryPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const startPcRecoveryPollingRef = useRef<(session: any, scope: 'mine' | 'all') => void>(() => undefined);
+    const cancelPcAutoFollowRef = useRef<() => void>(() => undefined);
+    const [pcPageActive, setPcPageActive] = useState(() => !document.hidden);
 
     const buildSessionRuntimeKey = (agentId: string, sessionId: string) => `${agentId}:${sessionId}`;
 
@@ -2014,20 +2025,39 @@ export default function AgentDetailPage() {
         return [];
     };
 
-    const selectSession = async (rawSess: any, scopeOverride: 'mine' | 'all' = chatScope) => {
+    const selectSession = async (
+        rawSess: any,
+        scopeOverride: 'mine' | 'all' = chatScope,
+        options: { preserveLoadedHistory?: boolean } = {},
+    ) => {
         const sess = normalizeChatSession(rawSess);
         const targetAgentId = id;
         if (!targetAgentId) return;
+        const preserveLoadedHistory = Boolean(
+            options.preserveLoadedHistory
+            && String(activeSessionIdRef.current || '') === String(sess.id),
+        );
+        if (!preserveLoadedHistory) {
+            pcRecoveryPollingNeededRef.current = false;
+            if (pcRecoveryPollTimerRef.current) {
+                clearTimeout(pcRecoveryPollTimerRef.current);
+                pcRecoveryPollTimerRef.current = null;
+            }
+        }
+        discardChatStreamBatch();
+        discardMonitorStreamBatch();
         const runtimeKey = buildSessionRuntimeKey(targetAgentId, String(sess.id));
         const runtimeState = sessionUiStateRef.current[runtimeKey] || { isWaiting: false, isStreaming: false, isStopping: false };
         const writable = isWritableSession(sess, scopeOverride);
         activeSessionIdRef.current = sess.id;
-        setChatMessages([]);
-        setHistoryMsgs([]);
-        setHistoryOldestTs(null);
-        setHistoryHasMore(true);
+        if (!preserveLoadedHistory) {
+            setChatMessages([]);
+            setHistoryMsgs([]);
+            setHistoryOldestTs(null);
+            setHistoryHasMore(true);
+            historyAutoLoadCursorRef.current = null;
+        }
         setHistoryLoadingMore(false);
-        historyAutoLoadCursorRef.current = null;
         setIsStreaming(runtimeState.isStreaming);
         setIsWaiting(runtimeState.isWaiting);
         setIsStopping(runtimeState.isStopping);
@@ -2039,21 +2069,14 @@ export default function AgentDetailPage() {
 
         // Abort any pending message load and increment sequence
         sessionMsgAbortRef.current?.abort();
+        historyMoreAbortRef.current?.abort();
+        historyMoreAbortRef.current = null;
         const controller = new AbortController();
         sessionMsgAbortRef.current = controller;
         const loadSeq = ++sessionLoadSeqRef.current;
         try {
             const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}`, {
-                headers: { Authorization: `Bearer ${tkn}` },
-                signal: controller.signal,
-            });
-            if (!res.ok) return;
-            const msgs = await res.json();
-            if (controller.signal.aborted || loadSeq !== sessionLoadSeqRef.current) return;
-            if (currentAgentIdRef.current !== targetAgentId) return;
-            if (activeSessionIdRef.current !== sess.id) return;
-            const preParsed = msgs.map((m: any) => parseChatMsg({
+            const parseHistoryRows = (rows: any[]) => rows.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
                 ...(Object.prototype.hasOwnProperty.call(m, 'display_content') && { display_content: m.display_content || '' }),
                 ...(Object.prototype.hasOwnProperty.call(m, 'attachments') && { attachments: m.attachments || [] }),
@@ -2070,15 +2093,69 @@ export default function AgentDetailPage() {
                 ...(m.sender_user_id && { sender_user_id: m.sender_user_id }),
                 ...(m.sender_agent_id && { sender_agent_id: m.sender_agent_id }),
             }));
-            setHistoryHasMore(msgs.length > 0);
-            // Backend returns the page oldest-first, so msgs[0] is the oldest
-            // loaded row — seed the cursor for the next (older) page.
-            setHistoryOldestTs(msgs.length ? msgs[0].created_at : null);
+            const currentLoadedMessages = writable
+                ? chatMessagesSnapshotRef.current
+                : historyMsgsSnapshotRef.current;
+            let collectedRows: any[] = [];
+            let responseCursor: string | null = null;
+            let responseHasMore: string | null = null;
+            let overlapFound = !preserveLoadedHistory || currentLoadedMessages.length === 0;
+            let before: string | null = null;
+            let lastPageRowCount = 0;
+
+            do {
+                const params = new URLSearchParams({ limit: String(HISTORY_PAGE_SIZE) });
+                if (before) params.set('before', before);
+                const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?${params}`, {
+                    headers: { Authorization: `Bearer ${tkn}` },
+                    signal: controller.signal,
+                });
+                if (!res.ok) return;
+                const pageCursor = res.headers.get('X-Message-Next-Cursor');
+                const pageHasMore = res.headers.get('X-Message-Has-More');
+                const pageRows = await res.json();
+                if (controller.signal.aborted || loadSeq !== sessionLoadSeqRef.current) return;
+                if (currentAgentIdRef.current !== targetAgentId) return;
+                if (activeSessionIdRef.current !== sess.id) return;
+                const safePageRows = Array.isArray(pageRows) ? pageRows : [];
+                collectedRows = [...safePageRows, ...collectedRows];
+                responseCursor = pageCursor;
+                responseHasMore = pageHasMore;
+                lastPageRowCount = safePageRows.length;
+                if (preserveLoadedHistory && safePageRows.length > 0) {
+                    overlapFound = latestHistoryWindowOverlaps(
+                        currentLoadedMessages as any,
+                        parseHistoryRows(safePageRows) as any,
+                    );
+                }
+                const hasMore = pageHasMore !== null
+                    ? pageHasMore === 'true'
+                    : safePageRows.length === HISTORY_PAGE_SIZE;
+                if (overlapFound || !hasMore || !pageCursor || pageCursor === before) break;
+                before = pageCursor;
+            } while (true);
+
+            const preParsed = parseHistoryRows(collectedRows);
+            if (!preserveLoadedHistory || !overlapFound) {
+                setHistoryHasMore(responseHasMore !== null
+                    ? responseHasMore === 'true'
+                    : lastPageRowCount === HISTORY_PAGE_SIZE);
+                // Backend returns the page oldest-first. Pagination metadata is
+                // based on raw DB rows and remains valid even when rendering
+                // merges or splits tool messages.
+                setHistoryOldestTs(responseCursor || (collectedRows.length && collectedRows[0].created_at
+                    ? `${collectedRows[0].created_at}${collectedRows[0].id ? `|${collectedRows[0].id}` : ''}`
+                    : null));
+            }
 
             if (writable) {
-                setChatMessages(preParsed);
+                setChatMessages((prev) => preserveLoadedHistory
+                    ? reconcileLatestHistoryWindow(prev as any, preParsed as any) as ChatMsg[]
+                    : preParsed);
             } else {
-                setHistoryMsgs(preParsed);
+                setHistoryMsgs((prev) => preserveLoadedHistory
+                    ? reconcileLatestHistoryWindow(prev as any, preParsed as any) as any
+                    : preParsed);
             }
             // The backend marks the session as read when the current user opens it. Mirror that
             // immediately in local state so unread badges clear without waiting for the next poll.
@@ -2186,8 +2263,51 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error('保存失败', { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; display_content?: string; attachments?: ChatMessageAttachment[]; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; confirmationToolCalls?: ChatMsg[]; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; display_content?: string; attachments?: ChatMessageAttachment[]; id?: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; streaming?: boolean; _streaming?: boolean; imageUrl?: string; previewImages?: ChatPreviewImage[]; timestamp?: string; sender_name?: string; sender_user_id?: string; sender_agent_id?: string; confirmationToolCalls?: ChatMsg[]; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
+    const chatMessagesSnapshotRef = useRef<ChatMsg[]>(chatMessages);
+    const historyMsgsSnapshotRef = useRef<any[]>(historyMsgs);
+    chatMessagesSnapshotRef.current = chatMessages;
+    historyMsgsSnapshotRef.current = historyMsgs;
+    const chatStreamBatchRef = useRef<Array<{
+        type: 'thinking' | 'chunk';
+        content: string;
+        messageId?: string;
+    }>>([]);
+    const chatStreamBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const flushChatStreamBatch = useCallback(() => {
+        if (chatStreamBatchTimerRef.current) {
+            clearTimeout(chatStreamBatchTimerRef.current);
+            chatStreamBatchTimerRef.current = null;
+        }
+        const batch = chatStreamBatchRef.current;
+        if (batch.length === 0) return;
+        chatStreamBatchRef.current = [];
+        setChatMessages((prev) => batch.reduce(
+            (next, event) => applyAssistantStreamMessage(next as any, event, createClientId) as ChatMsg[],
+            prev,
+        ));
+    }, []);
+    const discardChatStreamBatch = useCallback(() => {
+        if (chatStreamBatchTimerRef.current) clearTimeout(chatStreamBatchTimerRef.current);
+        chatStreamBatchTimerRef.current = null;
+        chatStreamBatchRef.current = [];
+    }, []);
+    const enqueueChatStreamEvent = useCallback((event: {
+        type: 'thinking' | 'chunk';
+        content: string;
+        messageId?: string;
+    }) => {
+        const last = chatStreamBatchRef.current[chatStreamBatchRef.current.length - 1];
+        if (last && last.type === event.type && last.messageId === event.messageId) {
+            last.content += event.content;
+        } else {
+            chatStreamBatchRef.current.push({ ...event });
+        }
+        if (!chatStreamBatchTimerRef.current) {
+            chatStreamBatchTimerRef.current = setTimeout(flushChatStreamBatch, 40);
+        }
+    }, [flushChatStreamBatch]);
     const confirmationPending = chatMessages.some(isPendingConfirmationToolCall);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -2582,6 +2702,44 @@ export default function AgentDetailPage() {
         return prev;
     };
 
+    const applyMonitorEventRef = useRef(applyMonitorEvent);
+    applyMonitorEventRef.current = applyMonitorEvent;
+    const monitorStreamBatchRef = useRef<any[]>([]);
+    const monitorStreamBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const flushMonitorStreamBatch = useCallback(() => {
+        if (monitorStreamBatchTimerRef.current) {
+            clearTimeout(monitorStreamBatchTimerRef.current);
+            monitorStreamBatchTimerRef.current = null;
+        }
+        const batch = monitorStreamBatchRef.current;
+        if (batch.length === 0) return;
+        monitorStreamBatchRef.current = [];
+        setHistoryMsgs((prev) => batch.reduce(
+            (next, event) => applyMonitorEventRef.current(next, event),
+            prev,
+        ));
+    }, []);
+    const discardMonitorStreamBatch = useCallback(() => {
+        if (monitorStreamBatchTimerRef.current) clearTimeout(monitorStreamBatchTimerRef.current);
+        monitorStreamBatchTimerRef.current = null;
+        monitorStreamBatchRef.current = [];
+    }, []);
+    const enqueueMonitorStreamEvent = useCallback((event: any) => {
+        const last = monitorStreamBatchRef.current[monitorStreamBatchRef.current.length - 1];
+        if (
+            last
+            && last.type === event.type
+            && String(last.message_id || '') === String(event.message_id || '')
+        ) {
+            last.content = `${last.content || ''}${event.content || ''}`;
+        } else {
+            monitorStreamBatchRef.current.push({ ...event });
+        }
+        if (!monitorStreamBatchTimerRef.current) {
+            monitorStreamBatchTimerRef.current = setTimeout(flushMonitorStreamBatch, 40);
+        }
+    }, [flushMonitorStreamBatch]);
+
 
     useEffect(() => {
         currentAgentIdRef.current = id;
@@ -2591,6 +2749,7 @@ export default function AgentDetailPage() {
     // Existing background sockets keep running and will be cleaned up on unmount.
     useEffect(() => {
         sessionMsgAbortRef.current?.abort();
+        historyMoreAbortRef.current?.abort();
         activeSessionIdRef.current = null;
         setActiveSession(null);
         setChatMessages([]);
@@ -2621,6 +2780,7 @@ export default function AgentDetailPage() {
         setAllSessions([]);
         setChatScope('mine');
         sessionMsgAbortRef.current?.abort();
+        historyMoreAbortRef.current?.abort();
         activeSessionIdRef.current = null;
         setActiveSession(null);
         setChatMessages([]);
@@ -2774,6 +2934,12 @@ export default function AgentDetailPage() {
             }
         };
         ws.onclose = (e) => {
+            const runtimeBeforeClose = sessionUiStateRef.current[key];
+            const turnWasActive = Boolean(runtimeBeforeClose
+                && (runtimeBeforeClose.isWaiting || runtimeBeforeClose.isStreaming || runtimeBeforeClose.isStopping));
+            if (turnWasActive) {
+                pcRecoveryPollingNeededRef.current = true;
+            }
             if ((ws as any)._stableTimer) {
                 clearTimeout((ws as any)._stableTimer);
                 (ws as any)._stableTimer = null;
@@ -2795,6 +2961,9 @@ export default function AgentDetailPage() {
                 setIsStreaming(false);
                 setIsStopping(false);
                 setOnboardingKickoffRequest(null);
+                if (turnWasActive && !pcPageSuspendedRef.current) {
+                    startPcRecoveryPollingRef.current(sess, activeReadOnlyRef.current ? 'all' : 'mine');
+                }
             }
             if (e.code === 4003 || e.code === 4002) {
                 reconnectDisabledRef.current[key] = true;
@@ -2814,6 +2983,39 @@ export default function AgentDetailPage() {
         ws.onmessage = (e) => {
             const d = JSON.parse(e.data);
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
+            const isTerminalEvent = ['done', 'error', 'quota_exceeded', 'confirmation_required'].includes(d.type);
+            if (isTerminalEvent && pcPageSuspendedRef.current && isActiveRuntime) {
+                // The terminal frame may precede durable persistence. Resume
+                // reconciliation therefore keeps a short polling window alive.
+                pcRecoveryPollingNeededRef.current = true;
+            } else if (isTerminalEvent) {
+                pcRecoveryPollingNeededRef.current = false;
+                if (pcRecoveryPollTimerRef.current) {
+                    clearTimeout(pcRecoveryPollTimerRef.current);
+                    pcRecoveryPollTimerRef.current = null;
+                }
+            }
+            if (pcPageSuspendedRef.current && isActiveRuntime) {
+                pcHiddenDroppedEventRef.current = true;
+                if (isTerminalEvent) {
+                    const currentRuntime = sessionUiStateRef.current[key] || {
+                        isWaiting: false,
+                        isStreaming: false,
+                        isStopping: false,
+                    };
+                    sessionUiStateRef.current[key] = {
+                        ...currentRuntime,
+                        isWaiting: false,
+                        isStreaming: false,
+                        isStopping: false,
+                    };
+                }
+                return;
+            }
+            if (d.type !== 'thinking' && d.type !== 'chunk') {
+                flushChatStreamBatch();
+                flushMonitorStreamBatch();
+            }
             if (d.type === 'connected' && d.session_id) {
                 (ws as any)._serverConnected = true;
                 const request: OnboardingKickoffRequest = {
@@ -2892,7 +3094,8 @@ export default function AgentDetailPage() {
             // session updates live instead of only on reload.
             if (activeReadOnlyRef.current) {
                 if (['channel_user_message', 'assistant_message_committed', 'thinking', 'chunk', 'tool_call', 'done'].includes(d.type)) {
-                    setHistoryMsgs(prev => applyMonitorEvent(prev, d));
+                    if (d.type === 'thinking' || d.type === 'chunk') enqueueMonitorStreamEvent(d);
+                    else setHistoryMsgs(prev => applyMonitorEvent(prev, d));
                     if (d.type === 'done') {
                         const sid = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                         if (sid) clearUnreadForSession(sid);
@@ -2924,12 +3127,10 @@ export default function AgentDetailPage() {
                     toolStatus: 'running',
                 });
             } else if (d.type === 'thinking') {
-                setChatMessages(prev => {
-                    const last = prev[prev.length - 1];
-                    if (last && last.role === 'assistant' && (last as any)._streaming) {
-                        return [...prev.slice(0, -1), { ...last, thinking: (last.thinking || '') + d.content } as any];
-                    }
-                    return [...prev, { role: 'assistant', content: '', thinking: d.content, _streaming: true } as any];
+                enqueueChatStreamEvent({
+                    type: 'thinking',
+                    content: d.content || '',
+                    messageId: d.message_id ? String(d.message_id) : undefined,
                 });
             } else if (d.type === 'workspace_draft') {
                 if (WORKSPACE_TOOLS.has(d.name)) {
@@ -3123,10 +3324,10 @@ export default function AgentDetailPage() {
                 const cuSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                 if (cuSessionId) clearUnreadForSession(cuSessionId);
             } else if (d.type === 'chunk') {
-                setChatMessages(prev => {
-                    const last = prev[prev.length - 1];
-                    if (last && last.role === 'assistant' && (last as any)._streaming) return [...prev.slice(0, -1), { ...last, content: last.content + d.content } as any];
-                    return [...prev, { role: 'assistant', content: d.content, _streaming: true } as any];
+                enqueueChatStreamEvent({
+                    type: 'chunk',
+                    content: d.content || '',
+                    messageId: d.message_id ? String(d.message_id) : undefined,
                 });
             } else if (d.type === 'done') {
                 setChatMessages(prev => applyAssistantDoneMessage(prev, {
@@ -3234,6 +3435,7 @@ export default function AgentDetailPage() {
 
     useEffect(() => {
         if (!id || !token || activeTab !== 'chat') return;
+        if (document.hidden || pcPageSuspendedRef.current) return;
         if (!activeSession) {
             syncActiveSocketState(null, id);
             return;
@@ -3248,27 +3450,106 @@ export default function AgentDetailPage() {
         syncActiveSocketState(activeSession, id);
     }, [id, token, activeTab, activeSession?.id, chatScope, canViewAllAgentChatSessions]);
 
-    // Resume the active session's socket the instant the tab is foregrounded.
-    // scheduleReconnect deliberately no-ops while hidden (storm prevention), so
-    // a tab that dropped in the background needs this kick to reconnect promptly
-    // instead of waiting out a backoff timer.
+    // Suspend the active PC chat while covered. WebViews can otherwise queue a
+    // large burst of socket frames and React work, then replay it on foreground.
+    // On resume, reload the latest page and reconnect once so missed final output
+    // is reconciled from durable history instead of relying on frame replay.
     useEffect(() => {
-        const onVisibility = () => {
-            if (document.hidden) return;
+        const cancelRecoveryPolling = () => {
+            if (pcRecoveryPollTimerRef.current) clearTimeout(pcRecoveryPollTimerRef.current);
+            pcRecoveryPollTimerRef.current = null;
+        };
+        const startRecoveryPolling = (session: any, scope: 'mine' | 'all') => {
+            cancelRecoveryPolling();
+            const delays = [1000, 2000, 4000, 8000, 16000, 30000];
+            let attempt = 0;
+            const poll = () => {
+                if (
+                    !pcRecoveryPollingNeededRef.current
+                    || pcPageSuspendedRef.current
+                    || document.hidden
+                    || String(activeSessionIdRef.current || '') !== String(session.id)
+                ) return;
+                void selectSession(session, scope, { preserveLoadedHistory: true }).finally(() => {
+                    if (!pcRecoveryPollingNeededRef.current || attempt >= delays.length) return;
+                    pcRecoveryPollTimerRef.current = setTimeout(poll, delays[attempt++]);
+                });
+            };
+            pcRecoveryPollTimerRef.current = setTimeout(poll, delays[attempt++]);
+        };
+        startPcRecoveryPollingRef.current = startRecoveryPolling;
+        const suspend = () => {
+            if (pcPageSuspendedRef.current) return;
+            pcPageSuspendedRef.current = true;
+            setPcPageActive(false);
+            discardChatStreamBatch();
+            discardMonitorStreamBatch();
+            cancelPcAutoFollowRef.current();
+            sessionMsgAbortRef.current?.abort();
+            historyMoreAbortRef.current?.abort();
+            cancelRecoveryPolling();
+            if (!id || !activeSession) return;
+            const key = buildSessionRuntimeKey(id, String(activeSession.id));
+            const runtime = sessionUiStateRef.current[key];
+            const ws = wsMapRef.current[key];
+            const turnWasActive = !!runtime
+                && (runtime.isWaiting || runtime.isStreaming || runtime.isStopping);
+            if (turnWasActive) pcRecoveryPollingNeededRef.current = true;
+            reconnectDisabledRef.current[key] = true;
+            clearReconnectTimer(key);
+            if (wsMapRef.current[key] === ws) delete wsMapRef.current[key];
+            if (wsRef.current === ws) wsRef.current = null;
+            if (ws && ws.readyState < WebSocket.CLOSING) ws.close(1000, 'page hidden');
+            setSessionUiState(key, { isWaiting: false, isStreaming: false, isStopping: false });
+            setWsConnected(false);
+            setIsWaiting(false);
+            setIsStreaming(false);
+            setIsStopping(false);
+            setOnboardingKickoffRequest(null);
+        };
+        const resume = () => {
+            if (!pcPageSuspendedRef.current || document.hidden) return;
+            pcPageSuspendedRef.current = false;
+            setPcPageActive(true);
             if (!id || !token || activeTab !== 'chat') return;
-            // Resume the socket for any visible session, including read-only monitors.
             if (!activeSession) return;
             const key = buildSessionRuntimeKey(id, String(activeSession.id));
             const ws = wsMapRef.current[key];
-            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-            // Foreground resume = a fresh, fast reconnect.
+            const socketHealthy = !!ws
+                && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING);
+            const needsHistorySync = pcHiddenDroppedEventRef.current;
+            pcHiddenDroppedEventRef.current = false;
+            if (socketHealthy) {
+                if (needsHistorySync) void selectSession(activeSession, chatScope, { preserveLoadedHistory: true });
+                if (pcRecoveryPollingNeededRef.current) startRecoveryPolling(activeSession, chatScope);
+                return;
+            }
+            reconnectDisabledRef.current[key] = false;
             reconnectAttemptsRef.current[key] = 0;
             clearReconnectTimer(key);
             ensureSessionSocket(activeSession, id, token);
+            void selectSession(activeSession, chatScope, { preserveLoadedHistory: true });
+            if (pcRecoveryPollingNeededRef.current) startRecoveryPolling(activeSession, chatScope);
         };
+        const onVisibility = () => {
+            if (document.hidden) suspend();
+            else resume();
+        };
+        const onPageHide = () => suspend();
+        const onPageShow = () => resume();
         document.addEventListener('visibilitychange', onVisibility);
-        return () => document.removeEventListener('visibilitychange', onVisibility);
-    }, [id, token, activeTab, activeSession?.id]);
+        window.addEventListener('pagehide', onPageHide);
+        window.addEventListener('pageshow', onPageShow);
+        if (document.hidden || activeTab !== 'chat') suspend();
+        else resume();
+        return () => {
+            document.removeEventListener('visibilitychange', onVisibility);
+            window.removeEventListener('pagehide', onPageHide);
+            window.removeEventListener('pageshow', onPageShow);
+            cancelRecoveryPolling();
+            startPcRecoveryPollingRef.current = () => undefined;
+        };
+    }, [id, token, activeTab, activeSession?.id, chatScope, discardChatStreamBatch, discardMonitorStreamBatch]);
 
     const handleWorkspacePathDeleted = useCallback((path: string) => {
         let removedName = '';
@@ -3310,6 +3591,8 @@ export default function AgentDetailPage() {
     useEffect(() => {
         return () => {
             sessionMsgAbortRef.current?.abort();
+            historyMoreAbortRef.current?.abort();
+            if (pcRecoveryPollTimerRef.current) clearTimeout(pcRecoveryPollTimerRef.current);
             Object.keys(reconnectDisabledRef.current).forEach((key) => { reconnectDisabledRef.current[key] = true; });
             Object.keys(reconnectTimerRef.current).forEach((key) => clearReconnectTimer(key));
             Object.values(wsMapRef.current).forEach((ws) => {
@@ -3317,8 +3600,10 @@ export default function AgentDetailPage() {
             });
             wsMapRef.current = {};
             wsRef.current = null;
+            discardChatStreamBatch();
+            discardMonitorStreamBatch();
         };
-    }, []);
+    }, [discardChatStreamBatch, discardMonitorStreamBatch]);
 
     // Conversation auto-follow is shared with H5. Any explicit user scroll
     // gesture pauses it until the floating button is clicked or a message is sent.
@@ -3336,23 +3621,34 @@ export default function AgentDetailPage() {
     const {
         showScrollToBottom: showScrollBtn,
         resumeAutoFollow: scrollToBottom,
+        cancelPendingAutoFollow: cancelLiveAutoFollow,
         interactionProps: liveAutoFollowInteractionProps,
     } = useConversationAutoFollow({
         scrollerRef: chatContainerRef,
         contentKey: liveScrollAnchor,
         resetKey: activeSession?.id,
-        enabled: activeTab === 'chat' && !!activeSession && isWritableSession(activeSession),
+        enabled: pcPageActive && activeTab === 'chat' && !!activeSession && isWritableSession(activeSession),
     });
     const {
         showScrollToBottom: showHistoryScrollBtn,
         resumeAutoFollow: scrollHistoryToBottom,
+        cancelPendingAutoFollow: cancelHistoryAutoFollow,
         interactionProps: historyAutoFollowInteractionProps,
     } = useConversationAutoFollow({
         scrollerRef: historyContainerRef,
         contentKey: historyScrollAnchor,
         resetKey: activeSession?.id,
-        enabled: activeTab === 'chat' && !!activeSession && !isWritableSession(activeSession),
+        enabled: pcPageActive && activeTab === 'chat' && !!activeSession && !isWritableSession(activeSession),
     });
+    useEffect(() => {
+        cancelPcAutoFollowRef.current = () => {
+            cancelLiveAutoFollow();
+            cancelHistoryAutoFollow();
+        };
+        return () => {
+            cancelPcAutoFollowRef.current = () => undefined;
+        };
+    }, [cancelHistoryAutoFollow, cancelLiveAutoFollow]);
     const scheduleComposerFocus = useCallback(() => {
         let attempts = 0;
         const focusWhenReady = () => {
@@ -3370,7 +3666,7 @@ export default function AgentDetailPage() {
         requestAnimationFrame(focusWhenReady);
     }, [activeTab]);
     const loadMoreHistoryMessages = useCallback(async () => {
-        if (historyLoadingMore || !historyHasMore || !activeSession || !id) return;
+        if (historyLoadingMore || historyMoreAbortRef.current || !historyHasMore || !activeSession || !id) return;
         // Cursor pagination: without a cursor we cannot page older, and an empty
         // `before` would re-fetch the newest page → stop instead of looping.
         if (!historyOldestTs) { setHistoryHasMore(false); return; }
@@ -3378,13 +3674,18 @@ export default function AgentDetailPage() {
         const targetAgentId = id;
         const loadSeq = sessionLoadSeqRef.current;
         const writable = isWritableSession(sess);
+        const controller = new AbortController();
+        historyMoreAbortRef.current = controller;
         setHistoryLoadingMore(true);
         try {
             const tkn = localStorage.getItem('token');
             const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}&before=${encodeURIComponent(historyOldestTs)}`, {
                 headers: { Authorization: `Bearer ${tkn}` },
+                signal: controller.signal,
             });
             if (!res.ok) return;
+            const responseCursor = res.headers.get('X-Message-Next-Cursor');
+            const responseHasMore = res.headers.get('X-Message-Has-More');
             const msgs = await res.json();
             if (loadSeq !== sessionLoadSeqRef.current || currentAgentIdRef.current !== targetAgentId
                 || String(activeSessionIdRef.current) !== String(sess.id)) return;
@@ -3410,15 +3711,30 @@ export default function AgentDetailPage() {
             const oldScrollHeight = el?.scrollHeight ?? 0;
             const oldScrollTop = el?.scrollTop ?? 0;
             const prependPage = (prev: any[]) => {
+                const newerMessageIds = new Set(prev.map(m => m.id).filter(Boolean));
                 const newerToolCalls = new Set(prev.map(m => m.toolCallId).filter(Boolean));
-                return [...preParsed.filter((m: any) => !m.toolCallId || !newerToolCalls.has(m.toolCallId)), ...prev];
+                return [
+                    ...preParsed.filter((m: any) => (
+                        (!m.id || !newerMessageIds.has(m.id))
+                        && (!m.toolCallId || !newerToolCalls.has(m.toolCallId))
+                    )),
+                    ...prev,
+                ];
             };
             if (writable) setChatMessages(prependPage);
             else setHistoryMsgs(prependPage);
             // Advance the cursor to the oldest row of this (older) page.
-            const nextOldestTs = msgs[0]?.created_at ?? null;
+            const nextOldestTs = responseCursor || (msgs[0]?.created_at
+                ? `${msgs[0].created_at}${msgs[0].id ? `|${msgs[0].id}` : ''}`
+                : null);
             setHistoryOldestTs(nextOldestTs);
-            setHistoryHasMore(Boolean(nextOldestTs && nextOldestTs !== historyOldestTs));
+            setHistoryHasMore(responseHasMore !== null
+                ? responseHasMore === 'true'
+                : Boolean(
+                    nextOldestTs
+                    && nextOldestTs !== historyOldestTs
+                    && msgs.length === HISTORY_PAGE_SIZE
+                ));
             // Restore scroll position after new messages are prepended
             requestAnimationFrame(() => {
                 if (el) {
@@ -3427,8 +3743,10 @@ export default function AgentDetailPage() {
                 }
             });
         } catch (err: any) {
+            if (err?.name === 'AbortError') return;
             console.error('Failed to load more history messages:', err);
         } finally {
+            if (historyMoreAbortRef.current === controller) historyMoreAbortRef.current = null;
             if (loadSeq === sessionLoadSeqRef.current) setHistoryLoadingMore(false);
         }
     }, [historyLoadingMore, historyHasMore, activeSession, id, historyOldestTs]);
@@ -5904,6 +6222,7 @@ export default function AgentDetailPage() {
                                                     agentId={id!}
                                                     agentName={(agent as any)?.name || 'Agent'}
                                                     messages={historyMsgs as any}
+                                                    scrollerRef={historyContainerRef}
                                                     provenance={activeSessionExecution}
                                                     unavailableAttachmentKeys={unavailableAttachmentKeys}
                                                     onAttachmentDownload={handleAttachmentDownload}
@@ -5992,6 +6311,7 @@ export default function AgentDetailPage() {
                                                     agentId={id!}
                                                     agentName={(agent as any)?.name || 'Agent'}
                                                     messages={visibleChatMessages as any}
+                                                    scrollerRef={chatContainerRef}
                                                     provenance={activeSessionExecution}
                                                     isRunning={isWaiting || isStreaming || isStopping}
                                                     unavailableAttachmentKeys={unavailableAttachmentKeys}

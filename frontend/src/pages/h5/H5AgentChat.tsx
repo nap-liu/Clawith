@@ -64,11 +64,14 @@ import {
     buildH5ConversationEntries,
     getH5ScrollAnchor,
     hasPendingConfirmation,
+    latestHistoryWindowOverlaps,
     mapHistoryMessage,
     mergeHistoryMessages,
+    reconcileLatestHistoryWindow,
     toolCallMessageFromEvent,
     upsertToolCallMessage,
     type H5AnalysisItem,
+    type H5AssistantStreamMessage,
     type H5ChatMessage,
 } from './chatTimeline';
 import { createClientId } from '../../utils/clientId';
@@ -112,6 +115,8 @@ type H5SessionSummary = {
 };
 
 const VIRTUALIZE_ENTRY_THRESHOLD = 40;
+const H5_HISTORY_PAGE_SIZE = 100;
+const STREAM_BATCH_DELAY_MS = 40;
 const QUICK_ACTIONS_MENU_CLOSE_MS = 180;
 
 const OAUTH_TRANSIENT_PARAMS = [
@@ -381,6 +386,8 @@ export default function H5AgentChat() {
     const [quickActionsMenuClosing, setQuickActionsMenuClosing] = useState(false);
     const [quickActionSearch, setQuickActionSearch] = useState('');
     const [messages, setMessages] = useState<H5ChatMessage[]>([]);
+    const [historyHasMore, setHistoryHasMore] = useState(false);
+    const [historyLoadingOlder, setHistoryLoadingOlder] = useState(false);
     const confirmationPending = useMemo(
         () => hasPendingConfirmation(messages),
         [messages],
@@ -395,6 +402,7 @@ export default function H5AgentChat() {
     const [tenantDefaultModelId, setTenantDefaultModelId] = useState<string | null>(null);
     const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
     const [pageResumeRevision, setPageResumeRevision] = useState(0);
+    const [pageActive, setPageActive] = useState(() => document.visibilityState !== 'hidden');
     const [onboardingKickoffRequest, setOnboardingKickoffRequest] = useState<OnboardingKickoffRequest | null>(null);
     const [isWaiting, setIsWaiting] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
@@ -409,18 +417,25 @@ export default function H5AgentChat() {
     const [unavailableAttachmentKeys, setUnavailableAttachmentKeys] = useState<Set<string>>(() => new Set());
 
     const wsRef = useRef<WebSocket | null>(null);
+    const messagesSnapshotRef = useRef(messages);
+    messagesSnapshotRef.current = messages;
     const sceneManifestRef = useRef<SceneManifest | null>(null);
     const sceneManifestRequestRef = useRef(0);
     const quickActionActivationRef = useRef(false);
     const sessionIdRef = useRef<string | null>(initialSessionId);
     const reconnectTimerRef = useRef<number | null>(null);
     const resumeReconnectTimerRef = useRef<number | null>(null);
+    const recoveryPollTimerRef = useRef<number | null>(null);
+    const recoveryPollingNeededRef = useRef(false);
     const nativeNavigationFallbackTimerRef = useRef<number | null>(null);
     const socketConnectTimerRef = useRef<number | null>(null);
     const reconnectAttemptRef = useRef(0);
     const pageSuspendedRef = useRef(
         typeof document !== 'undefined' && document.visibilityState === 'hidden',
     );
+    const generationActiveRef = useRef(false);
+    const hiddenTerminalEventRef = useRef(false);
+    const hiddenDroppedEventRef = useRef(false);
     const unmountedRef = useRef(false);
     const messagesScrollerRef = useRef<HTMLElement | null>(null);
     const quickActionsRef = useRef<HTMLDivElement | null>(null);
@@ -428,7 +443,64 @@ export default function H5AgentChat() {
     const messageDispatchLockedRef = useRef(false);
     const messageRuntimeBlockedRef = useRef(false);
     const initialHistoryRequestedRef = useRef<string | null>(null);
+    const historyLoadedSessionRef = useRef<string | null>(null);
     const resumeAutoFollowRef = useRef<() => void>(() => undefined);
+    const cancelAutoFollowRef = useRef<() => void>(() => undefined);
+    const historyLoadGenerationRef = useRef(0);
+    const historyLoadRef = useRef<{
+        sessionId: string;
+        controller: AbortController;
+        promise: Promise<boolean>;
+    } | null>(null);
+    const historyPaginationSessionRef = useRef<string | null>(null);
+    const historyOldestCursorRef = useRef<string | null>(null);
+    const olderHistoryLoadRef = useRef<AbortController | null>(null);
+    const streamBatchRef = useRef<H5AssistantStreamMessage[]>([]);
+    const streamBatchTimerRef = useRef<number | null>(null);
+    generationActiveRef.current = isWaiting || isStreaming || isStopping;
+
+    const cancelHistoryLoad = useCallback(() => {
+        historyLoadGenerationRef.current += 1;
+        historyLoadRef.current?.controller.abort();
+        historyLoadRef.current = null;
+        olderHistoryLoadRef.current?.abort();
+        olderHistoryLoadRef.current = null;
+        setHistoryLoadingOlder(false);
+    }, []);
+
+    const discardStreamBatch = useCallback(() => {
+        if (streamBatchTimerRef.current !== null) {
+            window.clearTimeout(streamBatchTimerRef.current);
+            streamBatchTimerRef.current = null;
+        }
+        streamBatchRef.current = [];
+    }, []);
+
+    const flushStreamBatch = useCallback(() => {
+        if (streamBatchTimerRef.current !== null) {
+            window.clearTimeout(streamBatchTimerRef.current);
+            streamBatchTimerRef.current = null;
+        }
+        const batch = streamBatchRef.current;
+        if (batch.length === 0) return;
+        streamBatchRef.current = [];
+        setMessages((prev) => batch.reduce(
+            (next, event) => applyAssistantStreamMessage(next, event, makeId),
+            prev,
+        ));
+    }, []);
+
+    const enqueueStreamEvent = useCallback((event: H5AssistantStreamMessage) => {
+        const last = streamBatchRef.current[streamBatchRef.current.length - 1];
+        if (last && last.type === event.type && last.messageId === event.messageId) {
+            last.content = `${last.content || ''}${event.content || ''}`;
+        } else {
+            streamBatchRef.current.push({ ...event });
+        }
+        if (streamBatchTimerRef.current === null) {
+            streamBatchTimerRef.current = window.setTimeout(flushStreamBatch, STREAM_BATCH_DELAY_MS);
+        }
+    }, [flushStreamBatch]);
 
     useEffect(() => {
         setUnavailableAttachmentKeys(new Set());
@@ -610,14 +682,17 @@ export default function H5AgentChat() {
             unmountedRef.current = true;
             if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
             if (resumeReconnectTimerRef.current) window.clearTimeout(resumeReconnectTimerRef.current);
+            if (recoveryPollTimerRef.current) window.clearTimeout(recoveryPollTimerRef.current);
             if (nativeNavigationFallbackTimerRef.current) {
                 window.clearTimeout(nativeNavigationFallbackTimerRef.current);
             }
             uploadAbortRef.current.forEach((abort) => abort());
             uploadAbortRef.current.clear();
+            cancelHistoryLoad();
+            discardStreamBatch();
             closeCurrentSocket();
         };
-    }, [closeCurrentSocket]);
+    }, [cancelHistoryLoad, closeCurrentSocket, discardStreamBatch]);
 
     useEffect(() => {
         if (!initialSessionId || sessionIdRef.current) return;
@@ -868,43 +943,237 @@ export default function H5AgentChat() {
         };
     }, [agentId, channel, sessions]);
 
-    const loadHistory = useCallback(async (nextSessionId: string) => {
-        if (!agentId || !token) return false;
-        const pages: any[][] = [];
-        let fullyLoaded = true;
-        try {
-            let before = '';
-            while (sessionIdRef.current === nextSessionId) {
-                const params = new URLSearchParams({ limit: '500' });
-                if (before) params.set('before', before);
-                const response = await fetch(`/api/agents/${agentId}/sessions/${nextSessionId}/messages?${params}`, {
-                    headers: { Authorization: `Bearer ${token}` },
-                });
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const rows = await response.json();
-                if (!Array.isArray(rows) || rows.length === 0) break;
-                pages.push(rows);
-                const nextBefore = rows[0]?.created_at || '';
-                if (!nextBefore || nextBefore === before) break;
-                before = nextBefore;
-            }
-        } catch {
-            fullyLoaded = false;
+    const loadHistory = useCallback((nextSessionId: string): Promise<boolean> => {
+        if (!agentId || !token) return Promise.resolve(false);
+        if (historyLoadedSessionRef.current === nextSessionId) return Promise.resolve(true);
+        const current = historyLoadRef.current;
+        if (current?.sessionId === nextSessionId) return current.promise;
+        current?.controller.abort();
+
+        const startsNewPagination = historyPaginationSessionRef.current !== nextSessionId;
+        if (startsNewPagination) {
+            olderHistoryLoadRef.current?.abort();
+            olderHistoryLoadRef.current = null;
+            historyPaginationSessionRef.current = nextSessionId;
+            historyOldestCursorRef.current = null;
+            setHistoryHasMore(false);
+            setHistoryLoadingOlder(false);
         }
-        if (sessionIdRef.current !== nextSessionId) return false;
-        const normalized = pages.reverse().flat().map(normalizeHistoryMessage).filter(Boolean) as H5ChatMessage[];
-        const seenToolCalls = new Set<string>();
-        const history = normalized.reverse().filter((msg) => (
-            !msg.toolCallId || (!seenToolCalls.has(msg.toolCallId) && !!seenToolCalls.add(msg.toolCallId))
-        )).reverse();
-        setMessages((prev) => mergeHistoryMessages(prev, history));
-        return fullyLoaded;
+
+        const controller = new AbortController();
+        const generation = ++historyLoadGenerationRef.current;
+        const promise = (async () => {
+            try {
+                const currentMessages = messagesSnapshotRef.current;
+                let collectedRows: any[] = [];
+                let responseCursor: string | null = null;
+                let responseHasMore: string | null = null;
+                let overlapFound = startsNewPagination || currentMessages.length === 0;
+                let before: string | null = null;
+                let lastPageRowCount = 0;
+
+                do {
+                    const params = new URLSearchParams({ limit: String(H5_HISTORY_PAGE_SIZE) });
+                    if (before) params.set('before', before);
+                    const response = await fetch(`/api/agents/${agentId}/sessions/${nextSessionId}/messages?${params}`, {
+                        headers: { Authorization: `Bearer ${token}` },
+                        signal: controller.signal,
+                    });
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const pageCursor = response.headers.get('X-Message-Next-Cursor');
+                    const pageHasMore = response.headers.get('X-Message-Has-More');
+                    const pageRows = await response.json();
+                    if (
+                        controller.signal.aborted
+                        || generation !== historyLoadGenerationRef.current
+                        || sessionIdRef.current !== nextSessionId
+                    ) return false;
+                    const safePageRows = Array.isArray(pageRows) ? pageRows : [];
+                    collectedRows = [...safePageRows, ...collectedRows];
+                    responseCursor = pageCursor;
+                    responseHasMore = pageHasMore;
+                    lastPageRowCount = safePageRows.length;
+
+                    if (!startsNewPagination && safePageRows.length > 0) {
+                        const normalizedPage = safePageRows
+                            .map(normalizeHistoryMessage)
+                            .filter(Boolean) as H5ChatMessage[];
+                        overlapFound = latestHistoryWindowOverlaps(currentMessages, normalizedPage);
+                    }
+                    const hasMore = pageHasMore !== null
+                        ? pageHasMore === 'true'
+                        : safePageRows.length === H5_HISTORY_PAGE_SIZE;
+                    if (overlapFound || !hasMore || !pageCursor || pageCursor === before) break;
+                    before = pageCursor;
+                } while (true);
+
+                const normalized = collectedRows
+                    .map(normalizeHistoryMessage)
+                    .filter(Boolean) as H5ChatMessage[];
+                const seenToolCalls = new Set<string>();
+                const history = normalized.reverse().filter((msg) => (
+                    !msg.toolCallId || (!seenToolCalls.has(msg.toolCallId) && !!seenToolCalls.add(msg.toolCallId))
+                )).reverse();
+                setMessages((prev) => startsNewPagination
+                    ? mergeHistoryMessages(prev, history)
+                    : reconcileLatestHistoryWindow(prev, history));
+                if (startsNewPagination || !overlapFound || !historyOldestCursorRef.current) {
+                    const oldestRow = collectedRows[0];
+                    const oldestCursor = responseCursor || (oldestRow?.created_at
+                        ? `${oldestRow.created_at}${oldestRow.id ? `|${oldestRow.id}` : ''}`
+                        : null);
+                    historyOldestCursorRef.current = oldestCursor;
+                    setHistoryHasMore(responseHasMore !== null
+                        ? responseHasMore === 'true'
+                        : Boolean(oldestCursor && lastPageRowCount === H5_HISTORY_PAGE_SIZE));
+                }
+                historyLoadedSessionRef.current = nextSessionId;
+                return true;
+            } catch (error: any) {
+                if (error?.name !== 'AbortError') console.warn('Failed to load H5 chat history', error);
+                return false;
+            } finally {
+                if (historyLoadRef.current?.controller === controller) historyLoadRef.current = null;
+            }
+        })();
+        historyLoadRef.current = { sessionId: nextSessionId, controller, promise };
+        return promise;
     }, [agentId, normalizeHistoryMessage, token]);
+
+    const loadOlderHistory = useCallback(async () => {
+        const activeSessionId = sessionIdRef.current;
+        const before = historyOldestCursorRef.current;
+        if (
+            !agentId
+            || !token
+            || !activeSessionId
+            || !before
+            || !historyHasMore
+            || historyLoadingOlder
+            || olderHistoryLoadRef.current
+        ) return;
+
+        const controller = new AbortController();
+        olderHistoryLoadRef.current = controller;
+        setHistoryLoadingOlder(true);
+        const scroller = messagesScrollerRef.current;
+        const previousScrollHeight = scroller?.scrollHeight ?? 0;
+        const previousScrollTop = scroller?.scrollTop ?? 0;
+        let anchorRestoreScheduled = false;
+
+        try {
+            const params = new URLSearchParams({
+                limit: String(H5_HISTORY_PAGE_SIZE),
+                before,
+            });
+            const response = await fetch(`/api/agents/${agentId}/sessions/${activeSessionId}/messages?${params}`, {
+                headers: { Authorization: `Bearer ${token}` },
+                signal: controller.signal,
+            });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const responseCursor = response.headers.get('X-Message-Next-Cursor');
+            const responseHasMore = response.headers.get('X-Message-Has-More');
+            const rows = await response.json();
+            if (
+                controller.signal.aborted
+                || sessionIdRef.current !== activeSessionId
+                || historyPaginationSessionRef.current !== activeSessionId
+            ) return;
+            if (!Array.isArray(rows) || rows.length === 0) {
+                setHistoryHasMore(false);
+                return;
+            }
+
+            const normalized = rows
+                .map(normalizeHistoryMessage)
+                .filter(Boolean) as H5ChatMessage[];
+            const seenToolCalls = new Set<string>();
+            const olderPage = normalized.reverse().filter((msg) => (
+                !msg.toolCallId || (!seenToolCalls.has(msg.toolCallId) && !!seenToolCalls.add(msg.toolCallId))
+            )).reverse();
+            // The stable cursor guarantees this page is strictly older than the
+            // current window. Prepend it directly so distinct messages with the
+            // same role/content remain distinct.
+            setMessages((prev) => {
+                const newerMessageIds = new Set(prev.map((message) => message.id).filter(Boolean));
+                const newerToolCallIds = new Set(prev.map((message) => message.toolCallId).filter(Boolean));
+                const distinctOlderPage = olderPage.filter((message) => (
+                    (!message.id || !newerMessageIds.has(message.id))
+                    && (!message.toolCallId || !newerToolCallIds.has(message.toolCallId))
+                ));
+                return [...distinctOlderPage, ...prev];
+            });
+
+            const oldestRow = rows[0];
+            const nextCursor = responseCursor || (oldestRow?.created_at
+                ? `${oldestRow.created_at}${oldestRow.id ? `|${oldestRow.id}` : ''}`
+                : null);
+            historyOldestCursorRef.current = nextCursor;
+            setHistoryHasMore(responseHasMore !== null
+                ? responseHasMore === 'true'
+                : Boolean(
+                    nextCursor
+                    && nextCursor !== before
+                    && rows.length === H5_HISTORY_PAGE_SIZE
+                ));
+
+            anchorRestoreScheduled = true;
+            window.requestAnimationFrame(() => {
+                window.requestAnimationFrame(() => {
+                    if (scroller && sessionIdRef.current === activeSessionId) {
+                        scroller.scrollTop = previousScrollTop + scroller.scrollHeight - previousScrollHeight;
+                    }
+                    if (olderHistoryLoadRef.current === controller) olderHistoryLoadRef.current = null;
+                    if (!controller.signal.aborted && sessionIdRef.current === activeSessionId) {
+                        setHistoryLoadingOlder(false);
+                    }
+                });
+            });
+        } catch (error: any) {
+            if (error?.name !== 'AbortError') console.warn('Failed to load older H5 chat history', error);
+        } finally {
+            if (!anchorRestoreScheduled) {
+                if (olderHistoryLoadRef.current === controller) olderHistoryLoadRef.current = null;
+                if (!controller.signal.aborted && sessionIdRef.current === activeSessionId) {
+                    setHistoryLoadingOlder(false);
+                }
+            }
+        }
+    }, [agentId, historyHasMore, historyLoadingOlder, normalizeHistoryMessage, token]);
 
     const loadHistoryRef = useRef(loadHistory);
     useEffect(() => {
         loadHistoryRef.current = loadHistory;
     }, [loadHistory]);
+
+    const cancelRecoveryPolling = useCallback(() => {
+        if (recoveryPollTimerRef.current !== null) {
+            window.clearTimeout(recoveryPollTimerRef.current);
+            recoveryPollTimerRef.current = null;
+        }
+    }, []);
+
+    const startRecoveryPolling = useCallback(() => {
+        cancelRecoveryPolling();
+        const delays = [1000, 2000, 4000, 8000, 16000, 30000];
+        let attempt = 0;
+        const poll = () => {
+            const activeSessionId = sessionIdRef.current;
+            if (
+                !recoveryPollingNeededRef.current
+                || pageSuspendedRef.current
+                || unmountedRef.current
+                || document.visibilityState === 'hidden'
+                || !activeSessionId
+            ) return;
+            historyLoadedSessionRef.current = null;
+            void loadHistoryRef.current(activeSessionId).finally(() => {
+                if (!recoveryPollingNeededRef.current || attempt >= delays.length) return;
+                recoveryPollTimerRef.current = window.setTimeout(poll, delays[attempt++]);
+            });
+        };
+        recoveryPollTimerRef.current = window.setTimeout(poll, delays[attempt++]);
+    }, [cancelRecoveryPolling]);
 
     useEffect(() => {
         if (
@@ -957,6 +1226,26 @@ export default function H5AgentChat() {
     }, [agentId, token]);
 
     const handleSocketMessage = useCallback((data: any, socket: WebSocket) => {
+        const isTerminalEvent = ['done', 'error', 'quota_exceeded', 'confirmation_required'].includes(data.type);
+        if (pageSuspendedRef.current) {
+            hiddenDroppedEventRef.current = true;
+            historyLoadedSessionRef.current = null;
+            if (isTerminalEvent) {
+                hiddenTerminalEventRef.current = true;
+                generationActiveRef.current = false;
+                // The terminal frame can arrive just before its durable history
+                // row is committed. Keep doing a short foreground reconciliation
+                // window so resume cannot permanently miss that final row.
+                recoveryPollingNeededRef.current = true;
+            }
+            return;
+        }
+        if (isTerminalEvent) {
+            generationActiveRef.current = false;
+            recoveryPollingNeededRef.current = false;
+            cancelRecoveryPolling();
+        }
+        if (data.type !== 'thinking' && data.type !== 'chunk') flushStreamBatch();
         if (data.type === 'connected' && data.session_id) {
             clearSocketConnectTimer();
             const nextSessionId = String(data.session_id);
@@ -965,6 +1254,7 @@ export default function H5AgentChat() {
             setConnectionStatus('connected');
             void refreshSceneManifest();
             if (data.onboarding_required === true) {
+                generationActiveRef.current = true;
                 setIsWaiting(true);
                 setIsStreaming(false);
             }
@@ -1028,24 +1318,26 @@ export default function H5AgentChat() {
         }
 
         if (data.type === 'thinking') {
+            generationActiveRef.current = true;
             setIsWaiting(false);
             setIsStreaming(true);
-            setMessages((prev) => applyAssistantStreamMessage(prev, {
+            enqueueStreamEvent({
                 type: 'thinking',
                 content: data.content || '',
                 messageId: data.message_id ? String(data.message_id) : undefined,
-            }, makeId));
+            });
             return;
         }
 
         if (data.type === 'chunk') {
+            generationActiveRef.current = true;
             setIsWaiting(false);
             setIsStreaming(true);
-            setMessages((prev) => applyAssistantStreamMessage(prev, {
+            enqueueStreamEvent({
                 type: 'chunk',
                 content: data.content || '',
                 messageId: data.message_id ? String(data.message_id) : undefined,
-            }, makeId));
+            });
             return;
         }
 
@@ -1063,6 +1355,7 @@ export default function H5AgentChat() {
         }
 
         if (data.type === 'tool_call') {
+            generationActiveRef.current = true;
             setIsWaiting(false);
             setIsStreaming(true);
             const toolMsg = toolCallMessageFromEvent(data, makeId, new Date().toISOString());
@@ -1093,7 +1386,7 @@ export default function H5AgentChat() {
                 created_at: new Date().toISOString(),
             }]);
         }
-    }, [clearSocketConnectTimer, loadHistory, normalizeHistoryMessage, refreshSceneManifest]);
+    }, [cancelRecoveryPolling, clearSocketConnectTimer, enqueueStreamEvent, flushStreamBatch, loadHistory, normalizeHistoryMessage, refreshSceneManifest]);
 
     const openSocket = useCallback((requestedSessionId?: string | null) => {
         if (
@@ -1156,14 +1449,20 @@ export default function H5AgentChat() {
 
         ws.onclose = () => {
             if (wsRef.current !== ws) return;
+            const turnWasActive = generationActiveRef.current;
+            if (turnWasActive) {
+                recoveryPollingNeededRef.current = true;
+            }
             clearSocketConnectTimer();
             wsRef.current = null;
+            historyLoadedSessionRef.current = null;
             setConnectionStatus('disconnected');
             setIsWaiting(false);
             setIsStreaming(false);
             setIsStopping(false);
             setOnboardingKickoffRequest(null);
             scheduleReconnect();
+            if (turnWasActive && !pageSuspendedRef.current) startRecoveryPolling();
         };
     }, [
         agentId,
@@ -1173,6 +1472,7 @@ export default function H5AgentChat() {
         handleSocketMessage,
         scheduleReconnect,
         sceneKey,
+        startRecoveryPolling,
         token,
     ]);
 
@@ -1191,6 +1491,11 @@ export default function H5AgentChat() {
     useLayoutEffect(() => installH5PageLifecycle({
         onSuspend: () => {
             pageSuspendedRef.current = true;
+            setPageActive(false);
+            cancelHistoryLoad();
+            discardStreamBatch();
+            cancelAutoFollowRef.current();
+            cancelRecoveryPolling();
             if (reconnectTimerRef.current) {
                 window.clearTimeout(reconnectTimerRef.current);
                 reconnectTimerRef.current = null;
@@ -1203,6 +1508,9 @@ export default function H5AgentChat() {
                 window.clearTimeout(nativeNavigationFallbackTimerRef.current);
                 nativeNavigationFallbackTimerRef.current = null;
             }
+            if (generationActiveRef.current) recoveryPollingNeededRef.current = true;
+            generationActiveRef.current = false;
+            historyLoadedSessionRef.current = null;
             closeCurrentSocket();
             setConnectionStatus('disconnected');
             setIsWaiting(false);
@@ -1212,6 +1520,7 @@ export default function H5AgentChat() {
         },
         onResume: () => {
             pageSuspendedRef.current = false;
+            setPageActive(true);
             setPageResumeRevision((revision) => revision + 1);
             if (nativeNavigationFallbackTimerRef.current) {
                 window.clearTimeout(nativeNavigationFallbackTimerRef.current);
@@ -1225,12 +1534,32 @@ export default function H5AgentChat() {
             if (resumeReconnectTimerRef.current) {
                 window.clearTimeout(resumeReconnectTimerRef.current);
             }
+            const socket = wsRef.current;
+            if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+                if (hiddenDroppedEventRef.current) {
+                    hiddenDroppedEventRef.current = false;
+                    historyLoadedSessionRef.current = null;
+                }
+                if (hiddenTerminalEventRef.current) {
+                    hiddenTerminalEventRef.current = false;
+                    setIsWaiting(false);
+                    setIsStreaming(false);
+                    setIsStopping(false);
+                    setOnboardingKickoffRequest(null);
+                }
+                if (!historyLoadedSessionRef.current && sessionIdRef.current) {
+                    void loadHistoryRef.current(sessionIdRef.current);
+                }
+                if (recoveryPollingNeededRef.current) startRecoveryPolling();
+                return;
+            }
             resumeReconnectTimerRef.current = window.setTimeout(() => {
                 resumeReconnectTimerRef.current = null;
                 openSocketRef.current(sessionIdRef.current);
             }, 50);
+            if (recoveryPollingNeededRef.current) startRecoveryPolling();
         },
-    }), [agent, authStatus, closeCurrentSocket, token]);
+    }), [agent, authStatus, cancelHistoryLoad, cancelRecoveryPolling, closeCurrentSocket, discardStreamBatch, startRecoveryPolling, token]);
 
     const recoverFromNativeNavigation = useCallback(() => {
         if (nativeNavigationFallbackTimerRef.current) {
@@ -1253,6 +1582,9 @@ export default function H5AgentChat() {
             window.clearTimeout(reconnectTimerRef.current);
             reconnectTimerRef.current = null;
         }
+        historyLoadedSessionRef.current = null;
+        cancelHistoryLoad();
+        discardStreamBatch();
         closeCurrentSocket();
         setConnectionStatus('disconnected');
         setIsWaiting(false);
@@ -1268,7 +1600,7 @@ export default function H5AgentChat() {
             nativeNavigationFallbackTimerRef.current = null;
             recoverFromNativeNavigation();
         }, 2000);
-    }, [closeCurrentSocket, recoverFromNativeNavigation]);
+    }, [cancelHistoryLoad, closeCurrentSocket, discardStreamBatch, recoverFromNativeNavigation]);
 
     const clearUploadDrafts = useCallback((abortUploads = false) => {
         if (abortUploads) {
@@ -1306,6 +1638,9 @@ export default function H5AgentChat() {
         setIsStopping(false);
         setUploadError('');
         setAttachedFiles([]);
+        discardStreamBatch();
+        recoveryPollingNeededRef.current = false;
+        cancelRecoveryPolling();
         clearUploadDrafts(true);
         sessionIdRef.current = nextSessionId;
         setSessionId(nextSessionId);
@@ -1318,7 +1653,7 @@ export default function H5AgentChat() {
             openSocket(nextSessionId);
             setIsSwitchingSession(false);
         }, 0);
-    }, [clearUploadDrafts, closeCurrentSocket, isStopping, isStreaming, isWaiting, loadHistory, openSocket]);
+    }, [cancelRecoveryPolling, clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStopping, isStreaming, isWaiting, loadHistory, openSocket]);
 
     const startNewSession = useCallback(async () => {
         if (!agentId || isStartingNew) return;
@@ -1328,6 +1663,9 @@ export default function H5AgentChat() {
         setIsStopping(false);
         setUploadError('');
         setAttachedFiles([]);
+        discardStreamBatch();
+        recoveryPollingNeededRef.current = false;
+        cancelRecoveryPolling();
         clearUploadDrafts(true);
         try {
             const session = await chatSessionApi.create(agentId, { source_channel: channel });
@@ -1364,15 +1702,17 @@ export default function H5AgentChat() {
         } finally {
             setIsStartingNew(false);
         }
-    }, [agentId, channel, clearUploadDrafts, closeCurrentSocket, isStartingNew, openSocket]);
+    }, [agentId, cancelRecoveryPolling, channel, clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStartingNew, openSocket]);
 
     const stopGeneration = useCallback(() => {
         const ws = wsRef.current;
         if (ws?.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({ type: 'abort' }));
+            generationActiveRef.current = true;
             setIsStopping(true);
             return;
         }
+        generationActiveRef.current = false;
         setIsWaiting(false);
         setIsStreaming(false);
         setIsStopping(false);
@@ -1480,6 +1820,7 @@ export default function H5AgentChat() {
     }), [agent?.primary_model_id, llmModels, tenantDefaultModelId]);
 
     const handleOnboardingStart = useCallback(() => {
+        generationActiveRef.current = true;
         setIsWaiting(true);
         setIsStreaming(false);
     }, []);
@@ -1554,6 +1895,7 @@ export default function H5AgentChat() {
             setInput('');
             setAttachedFiles([]);
         }
+        generationActiveRef.current = true;
         setIsWaiting(true);
         setIsStreaming(false);
         ws.send(JSON.stringify({
@@ -1602,7 +1944,6 @@ export default function H5AgentChat() {
     });
     const alignH5ConversationBottom = useCallback((scroller: HTMLElement) => {
         if (virtualizeMessages && virtualItemCount > 0) {
-            rowVirtualizer.measure();
             rowVirtualizer.scrollToIndex(virtualItemCount - 1, { align: 'end' });
         }
         scroller.scrollTop = scroller.scrollHeight;
@@ -1610,29 +1951,37 @@ export default function H5AgentChat() {
     const {
         showScrollToBottom,
         resumeAutoFollow,
+        cancelPendingAutoFollow,
         interactionProps: autoFollowInteractionProps,
     } = useConversationAutoFollow({
         scrollerRef: messagesScrollerRef,
         contentKey: `${scrollAnchor}:${connectionStatus}:${pageResumeRevision}`,
         resetKey: sessionId,
-        enabled: authStatus === 'ready' && !!agent && !agentError,
+        enabled: pageActive && authStatus === 'ready' && !!agent && !agentError,
         alignBottom: alignH5ConversationBottom,
     });
     useEffect(() => {
         resumeAutoFollowRef.current = resumeAutoFollow;
-    }, [resumeAutoFollow]);
+        cancelAutoFollowRef.current = cancelPendingAutoFollow;
+    }, [cancelPendingAutoFollow, resumeAutoFollow]);
+    const handleMessagesScroll = useCallback((event: React.UIEvent<HTMLElement>) => {
+        if (event.currentTarget.scrollTop <= 120) void loadOlderHistory();
+    }, [loadOlderHistory]);
+    useEffect(() => {
+        const scroller = messagesScrollerRef.current;
+        if (
+            !scroller
+            || !historyHasMore
+            || historyLoadingOlder
+            || !historyOldestCursorRef.current
+            || scroller.clientHeight <= 0
+            || scroller.scrollHeight > scroller.clientHeight + 1
+        ) return;
+        void loadOlderHistory();
+    }, [conversationEntries.length, historyHasMore, historyLoadingOlder, loadOlderHistory]);
     const toggleAnalysis = useCallback((key: string) => {
         setAnalysisExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
     }, []);
-
-    useEffect(() => {
-        if (pageResumeRevision === 0) return;
-        const frame = window.requestAnimationFrame(() => {
-            rowVirtualizer.measure();
-            window.dispatchEvent(new Event('resize'));
-        });
-        return () => window.cancelAnimationFrame(frame);
-    }, [pageResumeRevision, rowVirtualizer]);
 
     const renderWaitingMessage = useCallback(() => (
         <article className="h5-chat__message h5-chat__message--assistant">
@@ -2151,6 +2500,9 @@ export default function H5AgentChat() {
                 </section>
             ) : (
                 <div className="h5-chat__messages-shell">
+                    {historyLoadingOlder ? (
+                        <div className="h5-chat__history-loading" role="status">正在加载更早消息…</div>
+                    ) : null}
                     <section
                         ref={messagesScrollerRef}
                         data-conversation-scroller="h5"
@@ -2159,6 +2511,7 @@ export default function H5AgentChat() {
                         aria-label="会话消息"
                         tabIndex={0}
                         {...autoFollowInteractionProps}
+                        onScroll={handleMessagesScroll}
                         onCopyCapture={preventProtectedContentAction}
                         onCutCapture={preventProtectedContentAction}
                         onContextMenuCapture={preventProtectedContentAction}

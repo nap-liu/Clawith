@@ -1,17 +1,17 @@
 body.h5-chat-active {
     position: fixed;
-    top: var(--h5-viewport-offset-top, 0px);
+    top: 0;
     right: 0;
     left: 0;
     width: 100%;
     overflow: hidden;
     background: var(--bg-primary);
-    height: var(--h5-viewport-height, 100vh);
-    min-height: var(--h5-viewport-height, 100vh);
+    height: 100vh;
+    min-height: 100vh;
 }
 
 body.h5-chat-active #root {
-    min-height: var(--h5-viewport-height, 100vh);
+    min-height: 100vh;
 }
 
 .h5-chat {
@@ -33,8 +33,8 @@ body.h5-chat-active #root {
     --h5-composer-padding-right: max(10px, calc(10px + var(--h5-safe-area-right)));
     --h5-composer-safe-bottom: max(9px, calc(9px + var(--h5-safe-area-bottom)));
     position: relative;
-    height: var(--h5-viewport-height, 100vh);
-    min-height: var(--h5-viewport-height, 100vh);
+    height: 100vh;
+    min-height: 100vh;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -407,6 +407,22 @@ body.h5-chat-active #root {
 
 .h5-chat__messages-shell > .conversation-scroll-bottom {
     --conversation-scroll-bottom-offset: 14px;
+}
+
+.h5-chat__history-loading {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    z-index: 3;
+    transform: translateX(-50%);
+    padding: 5px 10px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    color: var(--text-tertiary);
+    box-shadow: var(--shadow-sm);
+    font-size: 12px;
+    pointer-events: none;
 }
 
 .h5-chat__messages {

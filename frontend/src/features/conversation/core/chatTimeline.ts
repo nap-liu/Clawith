@@ -231,7 +231,12 @@ export function applyAssistantStreamMessage(
     if (event.type === 'thinking') {
         if (idx >= 0) {
             const next = [...messages];
-            next[idx] = { ...next[idx], thinking: (next[idx].thinking || '') + content };
+            next[idx] = {
+                ...next[idx],
+                thinking: (next[idx].thinking || '') + content,
+                streaming: true,
+                _streaming: true,
+            };
             return next;
         }
         return [...messages, {
@@ -240,13 +245,19 @@ export function applyAssistantStreamMessage(
             content: '',
             thinking: content,
             streaming: true,
+            _streaming: true,
         }];
     }
 
     if (event.type === 'chunk') {
         if (idx >= 0) {
             const next = [...messages];
-            next[idx] = { ...next[idx], content: next[idx].content + content };
+            next[idx] = {
+                ...next[idx],
+                content: next[idx].content + content,
+                streaming: true,
+                _streaming: true,
+            };
             return next;
         }
         return [...messages, {
@@ -254,6 +265,7 @@ export function applyAssistantStreamMessage(
             role: 'assistant',
             content,
             streaming: true,
+            _streaming: true,
         }];
     }
 
@@ -276,22 +288,59 @@ export function isSameMessage(a: ConversationMessage, b: ConversationMessage) {
 export function mergeHistoryMessages(prev: ConversationMessage[], history: ConversationMessage[]) {
     if (history.length === 0) return prev;
 
+    const mergeKeys = (message: ConversationMessage) => {
+        if (message.role === 'tool_call') {
+            const keys: string[] = [];
+            if (message.toolCallId) keys.push(`tool-call:${message.toolCallId}`);
+            const renderIdentity = getChatToolRenderIdentity(message);
+            if (renderIdentity) keys.push(`tool-render:${renderIdentity}`);
+            return keys;
+        }
+        const keys: string[] = [];
+        if (message.id) keys.push(`message:${message.id}`);
+        keys.push(JSON.stringify([
+            message.role,
+            message.content,
+            message.thinking || '',
+            message.toolCallId || '',
+        ]));
+        return keys;
+    };
+    const historyBuckets = new Map<string, number[]>();
+    history.forEach((message, index) => {
+        mergeKeys(message).forEach((key) => {
+            const bucket = historyBuckets.get(key);
+            if (bucket) bucket.push(index);
+            else historyBuckets.set(key, [index]);
+        });
+    });
+    const bucketOffsets = new Map<string, number>();
     const usedHistoryIndexes = new Set<number>();
+    const assistantContents = history
+        .filter((item) => item.role === 'assistant' && !!item.content)
+        .map((item) => item.content);
     const localOnly: ConversationMessage[] = [];
 
     for (const local of prev) {
-        const historyIndex = history.findIndex((item, index) => (
-            !usedHistoryIndexes.has(index) && isSameMessage(local, item)
-        ));
-        if (historyIndex >= 0) {
-            usedHistoryIndexes.add(historyIndex);
+        let matchedHistoryIndex = -1;
+        for (const key of mergeKeys(local)) {
+            const bucket = historyBuckets.get(key);
+            let offset = bucketOffsets.get(key) || 0;
+            while (bucket && offset < bucket.length && usedHistoryIndexes.has(bucket[offset])) offset += 1;
+            bucketOffsets.set(key, offset);
+            if (bucket && offset < bucket.length) {
+                matchedHistoryIndex = bucket[offset];
+                bucketOffsets.set(key, offset + 1);
+                break;
+            }
+        }
+        if (matchedHistoryIndex >= 0) {
+            usedHistoryIndexes.add(matchedHistoryIndex);
             continue;
         }
 
-        if (local.streaming && history.some((item) => (
-            item.role === 'assistant'
-            && !!item.content
-            && (!local.content || item.content.includes(local.content))
+        if (local.streaming && assistantContents.some((content) => (
+            !local.content || content.includes(local.content)
         ))) {
             continue;
         }
@@ -300,6 +349,72 @@ export function mergeHistoryMessages(prev: ConversationMessage[], history: Conve
     }
 
     return [...history, ...localOnly];
+}
+
+function stableMessageKeys(message: ConversationMessage): string[] {
+    const keys: string[] = [];
+    if (message.id) keys.push(`message:${message.id}`);
+    if (message.toolCallId) keys.push(`tool-call:${message.toolCallId}`);
+    const renderIdentity = getChatToolRenderIdentity(message);
+    if (renderIdentity) keys.push(`tool-render:${renderIdentity}`);
+    return keys;
+}
+
+/**
+ * Reconcile a freshly fetched latest-N window without discarding an already
+ * loaded older prefix. This is used after reconnect/resume; unlike
+ * mergeHistoryMessages(), the fetched history is not the complete timeline.
+ */
+function latestHistoryOverlapIndex(
+    prev: ConversationMessage[],
+    latestWindow: ConversationMessage[],
+) {
+    const latestStableKeys = new Set<string>();
+    latestWindow.forEach((message) => {
+        stableMessageKeys(message).forEach((key) => latestStableKeys.add(key));
+    });
+    let overlapIndex = prev.findIndex((message) => (
+        stableMessageKeys(message).some((key) => latestStableKeys.has(key))
+    ));
+
+    // Optimistic/live rows can have a temporary id that differs from the
+    // durable row. Limit content fallback to the recent tail so an old repeated
+    // message cannot be mistaken for the latest-window overlap boundary.
+    if (overlapIndex < 0) {
+        const fallbackStart = Math.max(0, prev.length - latestWindow.length * 2);
+        const fallbackOffset = prev.slice(fallbackStart).findIndex((message) => (
+            latestWindow.some((candidate) => isSameMessage(message, candidate))
+        ));
+        if (fallbackOffset >= 0) overlapIndex = fallbackStart + fallbackOffset;
+    }
+    return overlapIndex;
+}
+
+export function latestHistoryWindowOverlaps(
+    prev: ConversationMessage[],
+    latestWindow: ConversationMessage[],
+) {
+    return prev.length === 0 || latestWindow.length === 0
+        || latestHistoryOverlapIndex(prev, latestWindow) >= 0;
+}
+
+export function reconcileLatestHistoryWindow(
+    prev: ConversationMessage[],
+    latestWindow: ConversationMessage[],
+) {
+    if (prev.length === 0) return latestWindow;
+    if (latestWindow.length === 0) return prev;
+
+    const overlapIndex = latestHistoryOverlapIndex(prev, latestWindow);
+
+    // No overlap means more than one window may have arrived while the page was
+    // suspended. Reset to the latest complete window instead of creating a
+    // permanent middle gap; callers reset the older-page cursor accordingly.
+    if (overlapIndex < 0) return latestWindow;
+    return [
+        ...prev.slice(0, overlapIndex),
+        ...mergeHistoryMessages(prev.slice(overlapIndex), latestWindow),
+    ];
 }
 
 export function getToolTargetKey(args: any): string {
@@ -470,6 +585,7 @@ export function buildConversationEntries(messages: ConversationMessage[]): Conve
     const grouped: ConversationEntry[] = [];
     let currentGroup: ConversationAnalysisItem[] | null = null;
     let groupStartIndex = 0;
+    let groupStartKey = '';
 
     const flushGroup = () => {
         if (!currentGroup || currentGroup.length === 0) {
@@ -479,10 +595,11 @@ export function buildConversationEntries(messages: ConversationMessage[]): Conve
         grouped.push({
             type: 'analysis_group',
             items: currentGroup,
-            key: `analysis-${groupStartIndex}`,
+            key: `analysis-${groupStartKey || groupStartIndex}`,
             running: currentGroup.some((item) => item.type === 'tool' && item.status === 'running'),
         });
         currentGroup = null;
+        groupStartKey = '';
     };
 
     for (let i = 0; i < messages.length; i += 1) {
@@ -503,6 +620,7 @@ export function buildConversationEntries(messages: ConversationMessage[]): Conve
             if (!currentGroup) {
                 currentGroup = [];
                 groupStartIndex = i;
+                groupStartKey = msg.id || msg.toolCallId || String(i);
             }
             pushThinking(currentGroup, msg.toolThinking);
             currentGroup.push(toolItemFromMessage(msg));
@@ -516,6 +634,7 @@ export function buildConversationEntries(messages: ConversationMessage[]): Conve
                 if (!currentGroup) {
                     currentGroup = [];
                     groupStartIndex = i;
+                    groupStartKey = msg.id || msg.toolCallId || String(i);
                 }
                 pushThinking(currentGroup, msg.thinking);
             }

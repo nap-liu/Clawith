@@ -85,12 +85,41 @@ const {
     getConversationScrollAnchor: getH5ScrollAnchor,
     hasPendingConfirmation,
     isConfirmationToolCall,
+    latestHistoryWindowOverlaps,
     mapHistoryMessage,
     mergeHistoryMessages,
     normalizeChatTimelineMessages,
+    reconcileLatestHistoryWindow,
     toolCallMessageFromEvent,
     upsertToolCallMessage,
 } = module.exports;
+
+{
+    const loaded = [
+        { id: 'older-a', role: 'user', content: 'older' },
+        { id: 'overlap-b', role: 'assistant', content: 'old durable value' },
+    ];
+    const latest = [
+        { id: 'overlap-b', role: 'assistant', content: 'new durable value' },
+        { id: 'new-c', role: 'assistant', content: 'newest' },
+    ];
+    assert.equal(latestHistoryWindowOverlaps(loaded, latest), true);
+    assert.equal(
+        reconcileLatestHistoryWindow(loaded, latest).map((message) => message.id).join(','),
+        'older-a,overlap-b,new-c',
+    );
+    assert.equal(reconcileLatestHistoryWindow(loaded, latest)[1].content, 'new durable value');
+}
+
+{
+    const loaded = [{ id: 'old-window', role: 'user', content: 'old' }];
+    const latest = [{ id: 'latest-window', role: 'assistant', content: 'latest' }];
+    assert.equal(latestHistoryWindowOverlaps(loaded, latest), false);
+    assert.equal(
+        reconcileLatestHistoryWindow(loaded, latest).map((message) => message.id).join(','),
+        'latest-window',
+    );
+}
 
 {
     const mapped = mapHistoryMessage({

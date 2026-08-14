@@ -146,7 +146,10 @@ function OKRSummaryCard() {
     if (!settings?.enabled || objectives.length === 0) return null;
 
     // Flatten all KRs and count statuses
-    const allKRs: any[] = objectives.flatMap((o: any) => o.key_results ?? []);
+    const allKRs: any[] = objectives.reduce(
+        (items: any[], objective: any) => items.concat(objective.key_results ?? []),
+        [],
+    );
     const counts = { on_track: 0, at_risk: 0, behind: 0, completed: 0 };
     for (const kr of allKRs) {
         if (kr.status in counts) counts[kr.status as keyof typeof counts]++;

@@ -145,6 +145,7 @@ export function useConversationAutoFollow({
         pauseAutoFollow,
         resumeAutoFollow,
         requestAutoScroll,
+        cancelPendingAutoFollow: cancelPendingScroll,
         interactionProps: {
             onWheelCapture,
             onTouchStartCapture,

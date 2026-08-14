@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone as tz
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel
 from sqlalchemy import and_, cast, func, or_, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -623,9 +623,10 @@ async def get_session_messages(
     agent_id: uuid.UUID,
     session_id: uuid.UUID,
     limit: int = Query(20, ge=1, le=500, description="Number of messages to return"),
-    before: str = Query(None, description="Cursor: return messages created before this timestamp (ISO format)"),
+    before: str = Query(None, description="Cursor: ISO timestamp, optionally followed by |message UUID"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    response: Response = None,
 ):
     """Get chat messages for a specific session."""
     _, session, _ = await _load_accessible_session(db, current_user, agent_id, session_id)
@@ -651,18 +652,41 @@ async def get_session_messages(
         # created_at microsecond; keep the render order deterministic. Fetched
         # desc + reversed below, so the page is the newest `limit` rows.
         .order_by(desc(ChatMessage.created_at), desc(ChatMessage.id))
-        .limit(limit)
+        .limit(limit + 1)
     )
-    # Apply cursor filter if `before` timestamp is provided
+    # Keep accepting the legacy timestamp-only cursor, while newer clients add
+    # the message UUID so rows sharing a timestamp cannot be skipped at a page boundary.
     if before:
         from datetime import datetime as dt
         try:
-            before_dt = dt.fromisoformat(before.replace('Z', '+00:00'))
-            query = query.where(ChatMessage.created_at < before_dt)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid `before` timestamp format. Use ISO 8601.")
+            before_timestamp, separator, before_message_id = before.partition('|')
+            before_dt = dt.fromisoformat(before_timestamp.replace('Z', '+00:00'))
+            if separator:
+                cursor_id = uuid.UUID(before_message_id)
+                query = query.where(or_(
+                    ChatMessage.created_at < before_dt,
+                    and_(ChatMessage.created_at == before_dt, ChatMessage.id < cursor_id),
+                ))
+            else:
+                query = query.where(ChatMessage.created_at < before_dt)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid `before` cursor. Use ISO 8601 or <ISO 8601>|<message UUID>.",
+            )
     msgs_result = await db.execute(query)
-    messages = list(reversed(msgs_result.scalars().all()))
+    newest_first = list(msgs_result.scalars().all())
+    has_more = len(newest_first) > limit
+    messages = list(reversed(newest_first[:limit]))
+    oldest_raw_message = messages[0] if messages else None
+    next_cursor = (
+        f"{oldest_raw_message.created_at.isoformat()}|{oldest_raw_message.id}"
+        if oldest_raw_message is not None
+        else ""
+    )
+    if response is not None:
+        response.headers["X-Message-Has-More"] = "true" if has_more else "false"
+        response.headers["X-Message-Next-Cursor"] = next_cursor
 
     # Reading your own first-party/channel session should clear its unread state.
     if str(session.user_id) == str(current_user.id) and not session.is_group and session.source_channel not in ("agent", "trigger"):
@@ -791,7 +815,12 @@ async def get_session_messages(
         # For agent sessions, parse inline tool_code blocks from assistant messages
         if session.source_channel == "agent" and m.role == "assistant" and "```tool_code" in (m.content or ""):
             parts = _split_inline_tools(m.content)
-            for part in parts:
+            for part_index, part in enumerate(parts):
+                derived_id = f"{m.id}:inline:{part_index}"
+                part["id"] = derived_id
+                part["created_at"] = m.created_at.isoformat() if m.created_at else None
+                if part.get("role") == "tool_call":
+                    part["toolCallId"] = derived_id
                 if sender_name:
                     part["sender_name"] = sender_name
                 if sender_user_id:

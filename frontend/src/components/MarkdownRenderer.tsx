@@ -125,10 +125,10 @@ function renderInline(text: string, imagePolicy: MarkdownImagePolicy): string {
         .replace(/\*\*\*(.*?)\*\*\*/g, '<strong><em>$1</em></strong>')
         // Bold
         .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-        .replace(/(?<!\w)__(?!\s)(.+?)(?<!\s)__(?!\w)/g, '<strong>$1</strong>')
+        .replace(/(^|[^\w])__(\S|\S.*?\S)__(?!\w)/g, '$1<strong>$2</strong>')
         // Italic
         .replace(/\*(.*?)\*/g, '<em>$1</em>')
-        .replace(/(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)/g, '<em>$1</em>')
+        .replace(/(^|[^\w])_(\S|\S.*?\S)_(?!\w)/g, '$1<em>$2</em>')
         // Strikethrough
         .replace(/~~(.*?)~~/g, '<del>$1</del>');
 

@@ -148,21 +148,22 @@ export function buildMessageAttachments(attachments: ChatAttachedFile[]): ChatMe
 
 function normalizeApiAttachments(raw: unknown): ChatMessageAttachment[] {
     if (!Array.isArray(raw)) return [];
-    return raw.flatMap((item): ChatMessageAttachment[] => {
-        if (!item || typeof item !== 'object') return [];
+    return raw.reduce<ChatMessageAttachment[]>((attachments, item) => {
+        if (!item || typeof item !== 'object') return attachments;
         const value = item as Record<string, unknown>;
         const displayName = String(value.display_name || '').trim();
         const path = String(value.path || '').trim();
         const kind = String(value.kind || '').trim();
-        if (!displayName || !path || !['image', 'file', 'audio', 'video'].includes(kind)) return [];
-        return [{
+        if (!displayName || !path || !['image', 'file', 'audio', 'video'].includes(kind)) return attachments;
+        attachments.push({
             display_name: displayName,
             path,
             kind: kind as ChatMessageAttachment['kind'],
             ...(value.mime_type ? { mime_type: String(value.mime_type) } : {}),
             ...(typeof value.size_bytes === 'number' ? { size_bytes: value.size_bytes } : {}),
-        }];
-    });
+        });
+        return attachments;
+    }, []);
 }
 
 function parseLegacyAttachmentFields(content: string, sourceChannel?: string): { displayContent: string; attachments: ChatMessageAttachment[] } {

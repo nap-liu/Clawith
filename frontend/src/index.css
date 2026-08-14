@@ -8358,3 +8358,22 @@ select:focus {
 .conversation-timeline {
     width: 100%;
 }
+
+.conversation-timeline__virtual-space {
+  position: relative;
+  width: 100%;
+}
+
+.conversation-timeline__virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  box-sizing: border-box;
+  padding-bottom: 8px;
+  will-change: transform;
+}
+
+.conversation-timeline__virtual-row > .chat-msg-row {
+  margin-bottom: 0;
+}

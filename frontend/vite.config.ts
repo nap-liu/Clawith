@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import legacy from '@vitejs/plugin-legacy'
 import path from 'path'
 import fs from 'fs'
 
@@ -21,15 +20,7 @@ const version = `${majorVersion}+${buildTimestamp}`
 const backendPort = process.env.BACKEND_PORT || '8000'
 
 export default defineConfig({
-    plugins: [
-        react(),
-        legacy({
-            // Produce only classic-script SystemJS bundles. This keeps the
-            // production entry usable in WebViews that cannot load ESM.
-            renderModernChunks: false,
-            targets: ['Chrome >= 49', 'Android >= 5', 'iOS >= 10'],
-        }),
-    ],
+    plugins: [react()],
     define: {
         __APP_VERSION__: JSON.stringify(version),
     },
@@ -39,7 +30,10 @@ export default defineConfig({
         },
     },
     build: {
-        modulePreload: false,
+        // Keep the production bundle parseable by older Chromium-based WebViews.
+        // Vite's default target is intentionally modern and leaves syntax such as
+        // optional chaining and nullish coalescing in the generated chunks.
+        target: 'es2015',
         rollupOptions: {
             output: {
                 manualChunks: {

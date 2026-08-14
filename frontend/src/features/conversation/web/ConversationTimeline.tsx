@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import {
     IconAlertTriangle,
     IconBrain,
@@ -51,6 +52,7 @@ export type ConversationTimelineProps = {
     onAttachmentUnavailable?: (key: string) => void;
     onPreviewImages?: (images: ChatPreviewImage[], index: number) => void;
     onToolResolved?: (message: ConversationMessage, result: string) => void;
+    scrollerRef?: React.RefObject<HTMLElement | null>;
     provenance?: {
         source?: string;
         status?: string;
@@ -138,15 +140,24 @@ function describeAnalysis(items: ConversationAnalysisItem[], t: (key: string, op
     return parts.join(', ') || t('agent.chat.ranCommands', { count: tools.length });
 }
 
-function AnalysisCard({ items, running }: { items: ConversationAnalysisItem[]; running: boolean }) {
+function AnalysisCard({
+    items,
+    running,
+    expanded,
+    onToggle,
+}: {
+    items: ConversationAnalysisItem[];
+    running: boolean;
+    expanded: boolean;
+    onToggle: () => void;
+}) {
     const { t } = useTranslation();
-    const [expanded, setExpanded] = useState(false);
     const runningTool = [...items].reverse().find((item) => item.type === 'tool' && item.status === 'running');
     const title = runningTool?.type === 'tool' ? getToolMeta(runningTool).title : describeAnalysis(items, t);
     return (
         <div className={`analysis-trace${expanded ? ' analysis-trace--open' : ''}${running ? ' analysis-trace--running' : ''}`}>
             <div className="analysis-trace-shell">
-                <button className="analysis-trace-header" onClick={() => setExpanded((value) => !value)}>
+                <button className="analysis-trace-header" onClick={onToggle}>
                     <span className="analysis-trace-signal" aria-hidden="true"><span /><span /><span /></span>
                     <span className="analysis-trace-title">{title}</span>
                     <IconChevronDown className="analysis-trace-chevron" size={15} stroke={1.8} />
@@ -249,9 +260,11 @@ export default function ConversationTimeline({
     onAttachmentUnavailable,
     onPreviewImages,
     onToolResolved,
+    scrollerRef,
     provenance,
 }: ConversationTimelineProps) {
     const { t, i18n } = useTranslation();
+    const [expandedAnalysis, setExpandedAnalysis] = useState<Record<string, boolean>>({});
     const entries = useMemo(() => buildConversationEntries(messages), [messages]);
     const provenanceTime = provenance?.finished_at || provenance?.scheduled_at;
     const status = provenance?.status || '';
@@ -264,6 +277,42 @@ export default function ConversationTimeline({
                 : status === 'pending'
                     ? (i18n.language?.startsWith('zh') ? '等待中' : 'Pending')
                     : status;
+    const analysisOwners = new Map<string, Extract<(typeof entries)[number], { type: 'message' }>>();
+    let nextAssistant: Extract<(typeof entries)[number], { type: 'message' }> | undefined;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+        const entry = entries[index];
+        if (entry.type === 'message' && entry.msg.role === 'assistant') nextAssistant = entry;
+        else if (entry.type === 'analysis_group' && nextAssistant) analysisOwners.set(entry.key, nextAssistant);
+    }
+    const virtualizeEntries = Boolean(scrollerRef && entries.length > 40);
+    const rowVirtualizer = useVirtualizer({
+        count: virtualizeEntries ? entries.length : 0,
+        getScrollElement: () => scrollerRef?.current ?? null,
+        estimateSize: (index) => {
+            const entry = entries[index];
+            if (!entry) return 88;
+            if (entry.type === 'analysis_group') return 70;
+            if (entry.type === 'special_render') return 140;
+            return entry.msg.content?.length > 600 ? 180 : 88;
+        },
+        getItemKey: (index) => entries[index]?.key ?? `conversation-entry-${index}`,
+        overscan: 8,
+        enabled: virtualizeEntries,
+    });
+    const renderEntry = (entry: (typeof entries)[number], index: number) => {
+        if (entry.type === 'analysis_group') {
+            const owner = analysisOwners.get(entry.key);
+            const ownerView = owner?.type === 'message' ? viewOf(owner.msg) : { isLeft: true, avatarText: agentName[0] };
+            const running = entry.running || (isRunning && index === entries.length - 1);
+            return <div className={`chat-msg-row chat-msg-row--analysis${ownerView.isLeft ? '' : ' chat-msg-row--user'}`}><div className="chat-msg-avatar">{ownerView.avatarText || agentName[0] || 'A'}</div><AnalysisCard items={entry.items} running={running} expanded={!!expandedAnalysis[entry.key]} onToggle={() => setExpandedAnalysis((current) => ({ ...current, [entry.key]: !current[entry.key] }))} /></div>;
+        }
+        if (entry.type === 'special_render') {
+            return <div className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}><div className="chat-msg-avatar">{agentName[0] || 'A'}</div><ChatToolCallRenderer agentId={agentId} message={entry.msg} t={t} mode="pc" onPreviewImages={onPreviewImages} onResolved={(result) => onToolResolved?.(entry.msg, result)} /></div>;
+        }
+        const previous = entries[index - 1];
+        const view = viewOf(entry.msg);
+        return <MessageItem agentId={agentId} msg={entry.msg} view={{ ...view, hideAvatar: view.hideAvatar || (entry.msg.role === 'assistant' && previous?.type === 'analysis_group') }} unavailable={unavailableAttachmentKeys} onDownload={onAttachmentDownload} onUnavailable={onAttachmentUnavailable} onPreview={onPreviewImages} />;
+    };
     return <div className="conversation-timeline">
         {provenance && (
             <div className={`conversation-provenance conversation-provenance--${status || 'unknown'}`}>
@@ -273,19 +322,29 @@ export default function ConversationTimeline({
                 {provenance.last_error && <span className="conversation-provenance-error">{provenance.last_error}</span>}
             </div>
         )}
-        {entries.map((entry, index) => {
-        if (entry.type === 'analysis_group') {
-            const owner = entries.slice(index + 1).find((candidate) => candidate.type === 'message' && candidate.msg.role === 'assistant');
-            const ownerView = owner?.type === 'message' ? viewOf(owner.msg) : { isLeft: true, avatarText: agentName[0] };
-            const running = entry.running || (isRunning && index === entries.length - 1);
-            return <div key={entry.key} className={`chat-msg-row chat-msg-row--analysis${ownerView.isLeft ? '' : ' chat-msg-row--user'}`}><div className="chat-msg-avatar">{ownerView.avatarText || agentName[0] || 'A'}</div><AnalysisCard items={entry.items} running={running} /></div>;
-        }
-        if (entry.type === 'special_render') {
-            return <div key={entry.key} className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}><div className="chat-msg-avatar">{agentName[0] || 'A'}</div><ChatToolCallRenderer agentId={agentId} message={entry.msg} t={t} mode="pc" onPreviewImages={onPreviewImages} onResolved={(result) => onToolResolved?.(entry.msg, result)} /></div>;
-        }
-        const previous = entries[index - 1];
-        const view = viewOf(entry.msg);
-        return <MessageItem key={entry.key} agentId={agentId} msg={entry.msg} view={{ ...view, hideAvatar: view.hideAvatar || (entry.msg.role === 'assistant' && previous?.type === 'analysis_group') }} unavailable={unavailableAttachmentKeys} onDownload={onAttachmentDownload} onUnavailable={onAttachmentUnavailable} onPreview={onPreviewImages} />;
-        })}
+        {virtualizeEntries ? (
+            <div className="conversation-timeline__virtual-space" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
+                {rowVirtualizer.getVirtualItems().map((virtualItem) => {
+                    const entry = entries[virtualItem.index];
+                    if (!entry) return null;
+                    return (
+                        <div
+                            key={virtualItem.key}
+                            ref={rowVirtualizer.measureElement}
+                            data-index={virtualItem.index}
+                            data-conversation-entry-key={entry.key}
+                            className="conversation-timeline__virtual-row"
+                            style={{ transform: `translateY(${virtualItem.start}px)` }}
+                        >
+                            {renderEntry(entry, virtualItem.index)}
+                        </div>
+                    );
+                })}
+            </div>
+        ) : entries.map((entry, index) => (
+            <div key={entry.key} data-conversation-entry-key={entry.key}>
+                {renderEntry(entry, index)}
+            </div>
+        ))}
     </div>;
 }

@@ -28,23 +28,10 @@ class FakeEventTarget {
 
 const windowTarget = new FakeEventTarget();
 windowTarget.innerHeight = 760;
-windowTarget.visualViewport = new FakeEventTarget();
-windowTarget.visualViewport.height = 720;
-windowTarget.visualViewport.offsetTop = 0;
 
-const styleValues = new Map();
 const documentTarget = new FakeEventTarget();
 documentTarget.visibilityState = 'visible';
-documentTarget.documentElement = {
-    style: {
-        setProperty(name, value) {
-            styleValues.set(name, value);
-        },
-        removeProperty(name) {
-            styleValues.delete(name);
-        },
-    },
-};
+documentTarget.documentElement = {};
 
 const events = [];
 const cleanup = installH5PageLifecycle({
@@ -54,28 +41,18 @@ const cleanup = installH5PageLifecycle({
     onResume: (reason) => events.push(`resume:${reason}`),
 });
 
-assert.equal(styleValues.get('--h5-viewport-height'), '720px');
-assert.equal(styleValues.get('--h5-viewport-offset-top'), '0px');
-
-windowTarget.visualViewport.height = 410;
-windowTarget.visualViewport.offsetTop = 96;
-windowTarget.visualViewport.dispatch('resize');
-assert.equal(styleValues.get('--h5-viewport-height'), '410px');
-assert.equal(styleValues.get('--h5-viewport-offset-top'), '96px');
-
-windowTarget.visualViewport.offsetTop = 112;
-windowTarget.visualViewport.dispatch('scroll');
-assert.equal(styleValues.get('--h5-viewport-offset-top'), '112px');
-
 documentTarget.visibilityState = 'hidden';
 documentTarget.dispatch('visibilitychange');
 windowTarget.dispatch('pagehide');
 assert.deepEqual(events, ['suspend']);
 
-windowTarget.visualViewport.height = 690;
 documentTarget.visibilityState = 'visible';
 documentTarget.dispatch('visibilitychange');
-assert.equal(styleValues.get('--h5-viewport-height'), '690px');
+assert.deepEqual(events, ['suspend', 'resume:visible']);
+
+// A bfcache pageshow commonly follows visibilitychange for the same return.
+// It must not trigger a second reconnect cycle.
+windowTarget.dispatch('pageshow', { persisted: true });
 assert.deepEqual(events, ['suspend', 'resume:visible']);
 
 windowTarget.dispatch('pagehide');
@@ -88,13 +65,14 @@ assert.deepEqual(events, [
 ]);
 
 windowTarget.dispatch('online');
+assert.equal(events.at(-1), 'resume:pageshow');
+
+windowTarget.dispatch('pagehide');
+windowTarget.dispatch('online');
 assert.equal(events.at(-1), 'resume:online');
 
 cleanup();
-assert.equal(styleValues.has('--h5-viewport-height'), false);
-assert.equal(styleValues.has('--h5-viewport-offset-top'), false);
 assert.equal(documentTarget.listeners.get('visibilitychange').size, 0);
-assert.equal(windowTarget.visualViewport.listeners.get('resize').size, 0);
-assert.equal(windowTarget.visualViewport.listeners.get('scroll').size, 0);
+assert.equal(windowTarget.listeners.get('pageshow').size, 0);
 
 console.log('h5 page lifecycle tests passed');

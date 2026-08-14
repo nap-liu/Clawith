@@ -51,6 +51,7 @@ export function scheduleStableConversationBottomScroll({
     environment = browserEnvironment(),
 }: ScheduleStableConversationBottomScrollOptions): () => void {
     let stopped = false;
+    let resizeFrameHandle: number | null = null;
     const frameHandles = new Set<number>();
     const timerHandles = new Set<number>();
 
@@ -80,11 +81,21 @@ export function scheduleStableConversationBottomScroll({
     [80, 240, 600].forEach((delay) => setTimer(align, Math.min(delay, settleMs)));
     // Stay subscribed until the content key changes or the user takes control.
     // This covers late image loads and user-expanded Markdown/tool sections.
-    const disconnectResize = environment.observeResize(resizeTargets, () => requestFrame(align));
+    const disconnectResize = environment.observeResize(resizeTargets, () => {
+        if (resizeFrameHandle !== null) return;
+        const handle = environment.requestFrame(() => {
+            frameHandles.delete(handle);
+            resizeFrameHandle = null;
+            align();
+        });
+        resizeFrameHandle = handle;
+        frameHandles.add(handle);
+    });
 
     return () => {
         if (stopped) return;
         stopped = true;
+        resizeFrameHandle = null;
         frameHandles.forEach((handle) => environment.cancelFrame(handle));
         timerHandles.forEach((handle) => environment.clearTimer(handle));
         frameHandles.clear();
