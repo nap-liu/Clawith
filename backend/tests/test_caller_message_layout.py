@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.services.llm.caller import _attach_turn_context, call_llm, call_llm_with_failover
-from app.services.llm.client import LLMMessage, LLMResponse
+from app.services.llm.client import LLMError, LLMMessage, LLMResponse
 
 
 class _FakeClient:
@@ -72,6 +72,12 @@ class _FakeModel:
     request_timeout = 30.0
     id = "model-x"
     supports_vision = False
+
+
+class _FailingClient(_FakeClient):
+    async def stream(self, messages, tools=None, temperature=None, max_tokens=None, **kwargs):
+        self.stream_calls.append({"messages": list(messages), "tools": tools})
+        raise LLMError("connection timeout")
 
 
 def test_unattended_turn_without_user_message_still_receives_context():
@@ -150,6 +156,89 @@ async def test_failover_reuses_one_frozen_turn_context(monkeypatch):
     assert context_builder.await_count == 1
     assert call_contexts == [built_context, built_context]
     assert call_contexts[0] is call_contexts[1]
+
+
+@pytest.mark.parametrize(
+    ("primary_vision", "fallback_vision"),
+    [(True, False), (False, True)],
+)
+async def test_failover_rebuilds_provider_payload_for_each_model_capability(
+    monkeypatch,
+    primary_vision,
+    fallback_vision,
+):
+    from types import SimpleNamespace
+
+    from app.services import image_context
+
+    class Storage:
+        async def exists(self, _key):
+            return True
+
+        async def is_file(self, _key):
+            return True
+
+        async def stat(self, _key):
+            return SimpleNamespace(size=16)
+
+        async def read_bytes(self, _key):
+            return b"\x89PNG\r\n\x1a\nimage"
+
+    primary_client = _FailingClient()
+    fallback_client = _FakeClient()
+    monkeypatch.setattr(image_context, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(
+        "app.services.llm.caller.create_llm_client",
+        lambda **kwargs: primary_client if kwargs["model"] == "primary" else fallback_client,
+    )
+    monkeypatch.setattr("app.services.llm.caller.get_max_tokens", lambda *args, **kwargs: 1024)
+    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda model: "fake-key")
+    monkeypatch.setattr("app.services.llm.caller._get_agent_config", AsyncMock(return_value=(3, None)))
+    monkeypatch.setattr(
+        "app.services.agent_context.build_agent_context",
+        AsyncMock(return_value=("STATIC", "DYNAMIC")),
+    )
+    monkeypatch.setattr("app.services.llm.caller.record_token_usage", AsyncMock(return_value=None))
+
+    primary = _FakeModel()
+    primary.id = "primary-id"
+    primary.model = "primary"
+    primary.supports_vision = primary_vision
+    fallback = _FakeModel()
+    fallback.id = "fallback-id"
+    fallback.model = "fallback"
+    fallback.supports_vision = fallback_vision
+    result = await call_llm_with_failover(
+        primary_model=primary,
+        fallback_model=fallback,
+        messages=[{
+            "role": "user",
+            "content": "请看图",
+            "attachments": [{
+                "display_name": "screen.png",
+                "path": "workspace/uploads/screen.png",
+                "kind": "image",
+                "mime_type": "image/png",
+            }],
+        }],
+        agent_name="T",
+        role_description="",
+        agent_id="agent-x",
+        skip_tools=True,
+    )
+
+    assert result == "ok-final"
+    primary_content = primary_client.stream_calls[0]["messages"][-1].content
+    fallback_content = fallback_client.stream_calls[0]["messages"][-1].content
+    assert isinstance(primary_content, list) is primary_vision
+    assert isinstance(fallback_content, list) is fallback_vision
+    for content, supports_vision in [
+        (primary_content, primary_vision),
+        (fallback_content, fallback_vision),
+    ]:
+        rendered = str(content)
+        assert "workspace/uploads/screen.png" in rendered
+        assert ("image_url" in rendered) is supports_vision
 
 
 @pytest.mark.asyncio

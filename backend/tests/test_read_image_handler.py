@@ -121,6 +121,41 @@ async def test_upstream_llm_failure_short_circuits(agent_id, tmp_path, jpeg_byte
 
 
 @pytest.mark.asyncio
+async def test_configured_fallback_model_is_forwarded_for_vision_failover(
+    agent_id, tmp_path, jpeg_bytes
+):
+    (tmp_path / "img.jpg").write_bytes(jpeg_bytes)
+    from app.services.tools.read_image.input_loader import DEFAULT_CONFIG
+    import copy
+
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["model_id"] = "00000000-0000-0000-0000-000000000010"
+    config["fallback_model_id"] = "00000000-0000-0000-0000-000000000011"
+    primary = _mock_llm_model(config["model_id"])
+    fallback = _mock_llm_model(config["fallback_model_id"])
+    llm = AsyncMock(
+        side_effect=["[LLM Error] HTTP 503: unavailable", "fallback vision result"]
+    )
+
+    with (
+        patch("app.services.tools.read_image.handler._load_config", AsyncMock(return_value=(config, None))),
+        patch(
+            "app.services.tools.read_image.handler._load_vision_model",
+            AsyncMock(side_effect=[primary, fallback]),
+        ),
+        patch("app.services.tools.read_image.handler._get_workspace", AsyncMock(return_value=tmp_path)),
+        patch("app.services.llm.caller.call_llm", llm),
+    ):
+        result = await handle_read_image(agent_id, {"image_paths": ["img.jpg"]})
+
+    assert "fallback vision result" in result
+    assert llm.await_count == 2
+    assert llm.await_args_list[0].kwargs["model"] is primary
+    assert llm.await_args_list[1].kwargs["model"] is fallback
+    assert all(call.kwargs["skip_tools"] is True for call in llm.await_args_list)
+
+
+@pytest.mark.asyncio
 async def test_multi_success_combined_block_not_duplicated(agent_id, tmp_path, jpeg_bytes):
     """With 3 successful images, the LLM response must appear ONCE under a combined
     header, not duplicated under each image block."""

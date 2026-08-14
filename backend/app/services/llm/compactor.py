@@ -51,9 +51,12 @@ from app.database import async_session
 from app.models.audit import ChatMessage
 from app.models.chat_compaction import ChatCompaction
 from app.models.llm import LLMModel
+from app.services.chat_attachments import (
+    normalize_chat_message_attachments,
+    render_attachment_context,
+)
 from app.services.image_context import IMAGE_DATA_PATTERN
 from app.services.llm.turn_partition import partition_turns
-
 
 # ─── Configuration constants ─────────────────────────────────────────
 
@@ -388,9 +391,46 @@ def serialize_span_for_summary(rows: list[ChatMessage]) -> str:
     """
     chunks: list[str] = []
     for r in rows:
-        body = prefilter_message_content(r.content or "")
+        body = r.content or ""
+        if r.role == "user":
+            raw_meta = getattr(r, "message_meta", None)
+            meta = raw_meta if isinstance(raw_meta, dict) else {}
+            body, attachments = normalize_chat_message_attachments(
+                body,
+                meta,
+                meta.get("source_channel"),
+            )
+            body = render_attachment_context(
+                prefilter_message_content(body),
+                attachments,
+            )
+        else:
+            body = prefilter_message_content(body)
         chunks.append(f"### [{r.role}] @ {r.created_at.isoformat()}\n{body}")
     return "\n\n".join(chunks)
+
+
+def estimate_compactable_span_tokens(rows: list[ChatMessage]) -> int:
+    """Estimate prompt mass removed by compaction, including attachment identity.
+
+    The summary input is deliberately prefiltered, but the savings/futility
+    decision must measure the full rows that compaction removes. Otherwise one
+    large message can never clear the futility floor after prefiltering.
+    """
+    total_chars = 0
+    for row in rows:
+        total_chars += len(str(row.content or ""))
+        if row.role != "user":
+            continue
+        raw_meta = getattr(row, "message_meta", None)
+        meta = raw_meta if isinstance(raw_meta, dict) else {}
+        _, attachments = normalize_chat_message_attachments(
+            row.content or "",
+            meta,
+            meta.get("source_channel"),
+        )
+        total_chars += len(render_attachment_context("", attachments))
+    return int(total_chars / ESTIMATE_CHARS_PER_TOKEN)
 
 
 # ─── Validation gate ─────────────────────────────────────────────────
@@ -405,6 +445,7 @@ _UUID_LIKE_RE = re.compile(r"\b[a-f0-9]{32}\b|\b[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A
 _PATH_RE = re.compile(
     r"(?:^|\s)((?:/|\./|\.\./|[A-Za-z]:\\|workspace/|memory/|skills/)[^\s'\"<>]*?)(?=[\s,;:!?]|$)"
 )
+_ATTACHMENT_PATH_RE = re.compile(r"^路径：(.+)$", re.MULTILINE)
 _URL_RE = re.compile(r"\bhttps?://[^\s'\"<>]*?(?=[\s,;!?]|$)", re.IGNORECASE)
 _SLASH_COMMAND_RE = re.compile(
     r"(?<!\S)/(?:new|reset|help|stop|thinking|think)(?:\s+(?:on|off|status))?(?=[\s,;:!?]|$)",
@@ -420,6 +461,11 @@ def extract_preserved_identifiers(text: str) -> set[str]:
     identifiers = set(_UUID_LIKE_RE.findall(source))
     identifiers.update(_URL_RE.findall(source))
     identifiers.update(match.group(0) for match in _SLASH_COMMAND_RE.finditer(source))
+    identifiers.update(
+        match.group(1).strip()
+        for match in _ATTACHMENT_PATH_RE.finditer(source)
+        if match.group(1).strip()
+    )
 
     for match in _PATH_RE.finditer(source):
         candidate = match.group(1)
@@ -521,7 +567,7 @@ async def _summarize_via_llm(
     tools, no streaming, no agent context — so we instantiate a bare
     LLM client directly.
     """
-    from app.services.llm import create_llm_client, get_model_api_key, LLMMessage
+    from app.services.llm import LLMMessage, create_llm_client, get_model_api_key
     from app.services.llm.caller import measure_dispatch
 
     def _messages(candidate_span: str) -> list[LLMMessage]:
@@ -808,9 +854,8 @@ async def _do_compact(
         # If the span's token mass can't meaningfully dent the prompt,
         # the trigger is being driven by non-compressible prompt parts;
         # skip fast instead of blocking the turn on a useless summary.
-        span_est_tokens = int(
-            sum(len(r.content or "") for r in span_rows) / ESTIMATE_CHARS_PER_TOKEN
-        )
+        span_text = serialize_span_for_summary(span_rows)
+        span_est_tokens = estimate_compactable_span_tokens(span_rows)
         if span_est_tokens < MIN_COMPACTABLE_SPAN_TOKENS:
             logger.info(
                 f"[compactor] skip session={session_id}: span mass ~{span_est_tokens} tokens "
@@ -823,10 +868,7 @@ async def _do_compact(
                 skipped_reason="span_mass_too_small_to_matter",
             )
 
-        # 4. Pre-filter and serialize for the summary LLM
-        span_text = serialize_span_for_summary(span_rows)
-
-        # 5. Summarize
+        # 4. Summarize the exact serialized view used for the futility estimate.
         try:
             summary, summary_usage = await _summarize_via_llm(
                 span_text=span_text,

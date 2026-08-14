@@ -31,6 +31,18 @@ _AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".amr", ".m4a", ".aac"}
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 MEDIA_PROBE_CHUNK_BYTES = 2 * 1024 * 1024
 _CLIENT_ATTACHMENT_PATH_PREFIXES = ("workspace/", "skills/", "media/")
+_LEGACY_FALLBACK_SOURCES = {
+    "web",
+    "miniprogram",
+    "wechat_miniprogram",
+}
+
+_ATTACHMENT_LABELS = {
+    "image": "图片附件",
+    "audio": "音频附件",
+    "video": "视频附件",
+    "file": "文件附件",
+}
 
 
 def _clean_workspace_path(raw_path: Any) -> str | None:
@@ -170,6 +182,35 @@ def sniff_image_kind_bytes(head: bytes) -> str | None:
     return None
 
 
+def sniff_image_mime_bytes(head: bytes) -> str | None:
+    """Return a provider-safe MIME only when image magic bytes agree."""
+    kind = sniff_image_kind_bytes(head)
+    return {
+        "png": "image/png",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }.get(kind)
+
+
+def render_attachment_context(content: str, attachments: list[dict[str, Any]]) -> str:
+    """Render one shared, provider-neutral attachment description."""
+    blocks: list[str] = []
+    for attachment in attachments:
+        label = _ATTACHMENT_LABELS.get(attachment.get("kind"), "文件附件")
+        block = (
+            f"[{label}]\n"
+            f"文件名：{attachment['display_name']}\n"
+            f"路径：{attachment['path']}"
+        )
+        if attachment.get("available") is False:
+            block += "\n状态：当前不可访问"
+        blocks.append(block)
+    if content:
+        blocks.append(content)
+    return "\n\n".join(blocks)
+
+
 def attachment_from_workspace_path(
     workspace_path: str,
     *,
@@ -266,6 +307,11 @@ def strip_image_data_markers(content: str) -> str:
     return _IMAGE_DATA_RE.sub("", content or "").strip()
 
 
+def extract_image_data_markers(content: str) -> list[str]:
+    """Extract exact legacy image transport markers for LLM-only compatibility."""
+    return [match.group(0) for match in _IMAGE_DATA_RE.finditer(content or "")]
+
+
 def _legacy_names_for_source(raw_names: list[str], source_channel: str) -> list[str]:
     if source_channel in {"web", "miniprogram", "wechat_miniprogram"} and len(raw_names) == 1:
         # Historical Web/H5 persisted all attachment names in one comma-joined marker.
@@ -321,6 +367,13 @@ def normalize_chat_message_attachments(
         return parse_legacy_chat_attachments(content, source_channel)
 
     attachments = normalize_attachment_metadata(meta.get("attachments"))
+    source = str(source_channel or "").strip().lower()
+    if (
+        not attachments
+        and "display_content" not in meta
+        and source in _LEGACY_FALLBACK_SOURCES
+    ):
+        return parse_legacy_chat_attachments(content, source)
     if "display_content" in meta:
         return str(meta.get("display_content") or ""), attachments
     legacy_display, legacy_attachments = parse_legacy_chat_attachments(content, source_channel)
@@ -350,4 +403,21 @@ async def validate_client_attachments(agent_id: Any, raw_attachments: Any) -> li
         key = agent_storage_key(agent_id, item["path"])
         if not await storage.exists(key) or not await storage.is_file(key):
             raise ValueError(f"attachment is not available: {item['display_name']}")
+        # Client kind/MIME declarations are hints only. Image payloads are
+        # enabled exclusively by server-observed bytes so a renamed document
+        # cannot be sent to a multimodal provider as an image.
+        head = await storage.read_range(key, 0, 31)
+        image_mime = sniff_image_mime_bytes(head)
+        if image_mime:
+            item["kind"] = "image"
+            item["mime_type"] = image_mime
+        else:
+            item["kind"] = infer_attachment_kind(item["display_name"])
+            if item["kind"] == "image":
+                item["kind"] = "file"
+            guessed = str(mimetypes.guess_type(item["display_name"])[0] or "").lower()
+            if guessed and not guessed.startswith("image/"):
+                item["mime_type"] = guessed
+            else:
+                item.pop("mime_type", None)
     return normalized

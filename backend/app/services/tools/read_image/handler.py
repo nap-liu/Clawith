@@ -92,11 +92,17 @@ async def handle_read_image(agent_id: uuid.UUID, arguments: dict) -> str:
         if tool_cfg is None:
             return "❌ read_image: 工具未启用或未配置"
         effective = merge_config(tool_cfg, agent_cfg)
-        model = await _load_vision_model(db, effective.get("model_id"))
+        primary_model = await _load_vision_model(db, effective.get("model_id"))
+        fallback_id = effective.get("fallback_model_id")
+        fallback_model = await _load_vision_model(db, fallback_id) if fallback_id else None
 
-    if model is None:
+    if primary_model is None and fallback_model is None:
         return "❌ read_image 未配置视觉模型，请联系管理员"
-    if not getattr(model, "supports_vision", False):
+    if primary_model is not None and not getattr(primary_model, "supports_vision", False):
+        primary_model = None
+    if fallback_model is not None and not getattr(fallback_model, "supports_vision", False):
+        fallback_model = None
+    if primary_model is None and fallback_model is None:
         return "❌ read_image: 配置的模型不支持视觉"
 
     workspace = await _get_workspace(agent_id)
@@ -127,20 +133,31 @@ async def handle_read_image(agent_id: uuid.UUID, arguments: dict) -> str:
         },
     ]
 
-    from app.services.llm.caller import call_llm
+    from app.services.llm.caller import call_llm, is_retryable_error
 
     try:
+        active_model = primary_model or fallback_model
+        retry_model = fallback_model if primary_model is not None else None
         text = await call_llm(
-            model=model,
+            model=active_model,
             messages=messages,
             agent_name="read_image",
             role_description="vision OCR",
-            # agent_id=None here skips per-agent token accounting. Recursion
-            # into read_image is blocked by the agent_id=None guard at
-            # handle_read_image's entry, so the vision model cannot call
-            # itself through AGENT_TOOLS even though it sees the catalogue.
+            # agent_id=None skips per-agent token accounting. Tools are also
+            # disabled for this focused vision/OCR call.
             agent_id=None,
+            skip_tools=True,
         )
+        if retry_model is not None and is_retryable_error(text):
+            logger.info(f"[read_image] retrying with fallback model: {retry_model.model}")
+            text = await call_llm(
+                model=retry_model,
+                messages=messages,
+                agent_name="read_image",
+                role_description="vision OCR",
+                agent_id=None,
+                skip_tools=True,
+            )
     except Exception as e:
         logger.warning(f"[read_image] upstream call_llm failed: {e}")
         return f"❌ read_image: 视觉模型调用失败 - {type(e).__name__}: {e}"

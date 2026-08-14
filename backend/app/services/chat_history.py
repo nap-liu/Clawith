@@ -440,14 +440,25 @@ def build_llm_message_from_row(
     """Build one provider-neutral message with structured attachment metadata."""
     content = message.content
     attachments: list[dict[str, Any]] = []
+    has_attachment_protocol = False
     if message.role == "user":
+        from app.services.chat_attachments import extract_image_data_markers
+
         meta = getattr(message, "message_meta", None)
+        has_attachment_protocol = isinstance(meta, dict) and "attachments" in meta
         source_channel = meta.get("source_channel") if isinstance(meta, dict) else None
         content, attachments = normalize_chat_message_attachments(
             message.content,
             meta,
             source_channel,
         )
+        legacy_image_markers = (
+            extract_image_data_markers(message.content)
+            if "attachments" not in (meta if isinstance(meta, dict) else {})
+            else []
+        )
+        if legacy_image_markers:
+            content = "\n".join([content, *legacy_image_markers]).strip()
         sender_user_id = getattr(message, "sender_user_id", None) or getattr(message, "user_id", None)
         if wrap_user_names and sender_user_id is not None:
             content = wrap_with_sender(
@@ -457,7 +468,7 @@ def build_llm_message_from_row(
             )
 
     entry: dict[str, Any] = {"role": message.role, "content": content}
-    if attachments:
+    if attachments or has_attachment_protocol:
         entry["attachments"] = attachments
     if include_thinking and getattr(message, "thinking", None):
         entry["thinking"] = message.thinking

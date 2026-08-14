@@ -732,7 +732,11 @@ async def test_resume_turn_continues_from_recoverable_history_and_marks_complete
     assert captured["continue_turn"] is True
     assert captured["recovery_mode"] is True
     assert captured["turn_anchor_id"] == anchor_id
-    assert captured["history"][-1] == {"role": "user", "content": "interrupted"}
+    assert captured["history"][-1] == {
+        "role": "user",
+        "content": "interrupted",
+        "attachments": [],
+    }
     async with async_session() as db:
         replies = (
             await db.execute(
@@ -1578,7 +1582,11 @@ async def test_resume_turn_does_not_execute_running_tool_call_from_later_turn(mo
     result = await turn_recovery.resume_turn(anchor)
 
     assert result is True
-    assert captured["history"] == [{"role": "user", "content": "old interrupted"}]
+    assert captured["history"] == [{
+        "role": "user",
+        "content": "old interrupted",
+        "attachments": [],
+    }]
 
 
 async def test_resume_turn_skips_existing_assistant_without_redelivery(monkeypatch):

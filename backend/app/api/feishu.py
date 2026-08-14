@@ -28,10 +28,13 @@ from app.services.channel_dispatch import (
     run_channel_message,
 )
 from app.services.channel_commands import is_channel_command, handle_channel_command
-from app.services.chat_attachments import attachment_from_workspace_path
+from app.services.chat_attachments import (
+    attachment_from_workspace_path,
+    normalize_attachment_metadata,
+)
 from app.services.feishu_service import feishu_service
 from app.services.im_thinking_output import resolve_im_thinking_enabled
-from app.services.storage import agent_upload_key, get_storage_backend, store_agent_upload
+from app.services.storage import agent_storage_key, get_storage_backend, store_agent_upload
 
 router = APIRouter(tags=["feishu"])
 
@@ -43,19 +46,6 @@ _USER_RESOLUTION_ERROR_TIP = (
     "抱歉，我暂时无法稳定识别你的飞书账号，已停止本次处理以避免重复创建账号。"
     "请稍后重试，或联系管理员检查飞书 Contact API 权限。"
 )
-
-
-def _storage_mtime(entry) -> float:
-    raw = str(getattr(entry, "modified_at", "") or "")
-    if not raw:
-        return 0.0
-    try:
-        return float(raw)
-    except ValueError:
-        try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return 0.0
 
 
 def _build_card(
@@ -793,39 +783,52 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict, db: AsyncSession
                     llm_user_text = f"[发送者: {sender_name}] {user_text}"
 
                 # ── Inject recent uploaded file context ──────────────────────────
-                # Check the uploads directory for recently modified files (within 30 min).
-                # This is more reliable than scanning DB history, because the file save
-                # to disk always succeeds even if the DB transaction fails. Uses the
-                # storage backend abstraction (local FS or remote object store).
+                # Use only a durable file from this exact session and sender.
+                # Agent-wide directory scans can cross-wire files between users.
                 try:
-                    import time as _time
+                    from datetime import timedelta as _td
+
+                    from app.models.audit import ChatMessage as _ChatMessage
+
                     _storage = get_storage_backend()
-                    _upload_key = agent_upload_key(agent_id, "placeholder").rsplit("/", 1)[0]
                     _recent_file_path = None
                     if "uploads/" not in user_text and "workspace/" not in user_text:
-                        _now = _time.time()
-                        if await _storage.exists(_upload_key) and await _storage.is_dir(_upload_key):
-                            _candidates = sorted(
-                                [e for e in await _storage.list_dir(_upload_key) if not e.is_dir],
-                                key=_storage_mtime,
-                                reverse=True,
+                        _recent_rows = await db.execute(
+                            select(_ChatMessage.message_meta)
+                            .where(
+                                _ChatMessage.agent_id == agent_id,
+                                _ChatMessage.conversation_id == session_conv_id,
+                                _ChatMessage.user_id == platform_user_id,
+                                _ChatMessage.role == "user",
+                                _ChatMessage.created_at >= _dt.now(_tz.utc) - _td(minutes=30),
                             )
-                            for _entry in _candidates:
-                                _mtime = _storage_mtime(_entry)
-                                if _mtime and (_now - _mtime) < 1800:
-                                    _recent_file_path = f"uploads/{_entry.name}"
+                            .order_by(_ChatMessage.created_at.desc())
+                            .limit(20)
+                        )
+                        for _meta in _recent_rows.scalars():
+                            for _attachment in normalize_attachment_metadata(
+                                _meta.get("attachments") if isinstance(_meta, dict) else None
+                            ):
+                                if _attachment.get("kind") != "file":
+                                    continue
+                                _candidate_path = _attachment["path"]
+                                _candidate_key = agent_storage_key(agent_id, _candidate_path)
+                                if (
+                                    await _storage.exists(_candidate_key)
+                                    and await _storage.is_file(_candidate_key)
+                                ):
+                                    _recent_file_path = _candidate_path
                                     break
+                            if _recent_file_path:
+                                break
                     if _recent_file_path:
-                        # _recent_file_path is relative to uploads dir; agent workspace root is
-                        # AGENT_DATA_DIR/{agent_id}/, so the correct relative path is workspace/uploads/
-                        _ws_rel_path = f"workspace/{_recent_file_path}"
                         llm_user_text = (
                             llm_user_text
-                            + f"\n\n[系统提示：用户刚上传了文件，路径为工作区 `{_ws_rel_path}`。"
+                            + f"\n\n[系统提示：用户刚上传了文件，路径为工作区 `{_recent_file_path}`。"
                             f"如果用户的指令涉及这篇文章、这个文件、这份文档等，"
-                            f"请立即调用 read_document(path=\"{_ws_rel_path}\") 读取内容，不要先用 list_files 验证，直接读取即可。]"
+                            f"请立即调用 read_document(path=\"{_recent_file_path}\") 读取内容，不要先用 list_files 验证，直接读取即可。]"
                         )
-                        logger.info(f"[Feishu] Injected recent file hint: {_ws_rel_path}")
+                        logger.info(f"[Feishu] Injected recent file hint: {_recent_file_path}")
                 except Exception as _fe:
                     logger.error(f"[Feishu] File injection error: {_fe}")
 

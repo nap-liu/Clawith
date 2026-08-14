@@ -18,18 +18,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from app.services.llm.caller import measure_dispatch
 from app.services.llm.compactor import (
     UUID_RECALL_THRESHOLD,
+    _summarize_via_llm,
     append_missing_identifiers,
     estimate_prompt_tokens,
     extract_preserved_identifiers,
     prefilter_message_content,
     select_compaction_span,
+    serialize_span_for_summary,
     should_compact,
     validate_summary,
-    _summarize_via_llm,
 )
-from app.services.llm.caller import measure_dispatch
 
 
 def _model(context_window=131072, ratio=0.85, keep=8, summary_max=2000):
@@ -44,6 +45,90 @@ def _model(context_window=131072, ratio=0.85, keep=8, summary_max=2000):
         compact_summary_max_tokens=summary_max,
         base_url=None,
     )
+
+
+def test_summary_serialization_preserves_structured_attachment_identity():
+    row = SimpleNamespace(
+        role="user",
+        content="stored transport envelope",
+        message_meta={
+            "source_channel": "web",
+            "display_content": "请分析这份文件",
+            "attachments": [{
+                "display_name": "report.pdf",
+                "path": "workspace/uploads/report.pdf",
+                "kind": "file",
+                "mime_type": "application/pdf",
+            }],
+        },
+        created_at=datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    serialized = serialize_span_for_summary([row])
+
+    assert "请分析这份文件" in serialized
+    assert "文件名：report.pdf" in serialized
+    assert "路径：workspace/uploads/report.pdf" in serialized
+    assert "base64" not in serialized
+
+
+def test_summary_serialization_never_truncates_attachment_paths_in_long_user_row():
+    paths = [
+        f"workspace/uploads/{index}-{'x' * 850}.png"
+        for index in range(10)
+    ]
+    row = SimpleNamespace(
+        role="user",
+        content="body" * 3000,
+        message_meta={
+            "source_channel": "web",
+            "display_content": "body" * 3000,
+            "attachments": [
+                {
+                    "display_name": f"{index}.png",
+                    "path": path,
+                    "kind": "image",
+                    "mime_type": "image/png",
+                }
+                for index, path in enumerate(paths)
+            ],
+        },
+        created_at=datetime(2026, 8, 14, tzinfo=timezone.utc),
+    )
+
+    serialized = serialize_span_for_summary([row])
+
+    assert all(path in serialized for path in paths)
+
+
+def test_attachment_path_with_spaces_is_mechanically_preserved_from_summary_input():
+    original = """\
+### [user] @ 2026-08-14T00:00:00+00:00
+[文件附件]
+文件名：my report.pdf
+路径：workspace/uploads/my report.pdf
+"""
+    summary = """\
+## Summary of earlier conversation
+
+### Key facts
+- The user uploaded a report for review.
+""" + ("Additional context. " * 20)
+
+    repaired, missing = append_missing_identifiers(
+        summary=summary,
+        original_text=original,
+    )
+
+    assert "workspace/uploads/my report.pdf" in missing
+    assert "- workspace/uploads/my report.pdf" in repaired
+    passed, reason, recall = validate_summary(
+        summary=repaired,
+        original_text=original,
+        max_tokens=2000,
+    )
+    assert passed is True, reason
+    assert recall == 1.0
 
 
 # ─── should_compact ──────────────────────────────────────────────────

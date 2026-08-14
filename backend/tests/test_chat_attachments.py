@@ -81,6 +81,17 @@ def test_explicit_empty_metadata_does_not_interpret_user_written_marker():
     assert display == "[file:not-an-attachment.jpg]\n这是用户正文"
 
 
+def test_transition_web_row_with_empty_metadata_keeps_reserved_legacy_envelope():
+    display, attachments = chat_attachments.normalize_chat_message_attachments(
+        "[file:legacy.jpg]\n请分析",
+        {"attachments": []},
+        "web",
+    )
+
+    assert display == "请分析"
+    assert attachments[0]["path"] == "workspace/uploads/legacy.jpg"
+
+
 def test_slack_trailing_markers_and_web_comma_envelope_are_legacy_compatible():
     slack_display, slack_attachments = chat_attachments.parse_legacy_chat_attachments(
         "正文\n[file:a.png] [file:report.pdf]",
@@ -269,6 +280,9 @@ async def test_client_attachment_validation_preserves_duplicates_and_checks_stor
         async def is_file(self, _key):
             return True
 
+        async def read_range(self, _key, _start, _end):
+            return b"\xff\xd8\xffimage"
+
     monkeypatch.setattr(chat_attachments, "get_storage_backend", lambda: Storage())
     attachment = {
         "display_name": "同名.jpg",
@@ -285,6 +299,33 @@ async def test_client_attachment_validation_preserves_duplicates_and_checks_stor
 
     assert len(result) == 2
     assert len(checked) == 2
+
+
+@pytest.mark.asyncio
+async def test_client_cannot_promote_non_image_bytes_with_kind_or_mime(monkeypatch):
+    class Storage:
+        async def exists(self, _key):
+            return True
+
+        async def is_file(self, _key):
+            return True
+
+        async def read_range(self, _key, _start, _end):
+            return b"plain document bytes"
+
+    monkeypatch.setattr(chat_attachments, "get_storage_backend", lambda: Storage())
+    result = await chat_attachments.validate_client_attachments(
+        uuid.uuid4(),
+        [{
+            "display_name": "notes.txt",
+            "path": "workspace/notes.txt",
+            "kind": "image",
+            "mime_type": "image/png",
+        }],
+    )
+
+    assert result[0]["kind"] == "file"
+    assert result[0]["mime_type"] == "text/plain"
 
 
 @pytest.mark.asyncio

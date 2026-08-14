@@ -6,23 +6,60 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select, text
-from unittest.mock import patch
+
+from app.database import async_session, engine
+from app.models.agent import Agent, AgentPermission, AgentTemplate  # noqa: F401
+from app.models.audit import ChatMessage  # noqa: F401
+from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
+from app.models.participant import Participant  # noqa: F401
+from app.models.tenant import Tenant  # noqa: F401
 
 # Import the full model graph so FK references resolve at table-mapping time.
 from app.models.user import Identity, User  # noqa: F401
-from app.models.agent import Agent, AgentPermission, AgentTemplate  # noqa: F401
-from app.models.tenant import Tenant  # noqa: F401
-from app.models.identity import IdentityProvider, SSOScanSession  # noqa: F401
-from app.models.participant import Participant  # noqa: F401
-from app.models.audit import ChatMessage  # noqa: F401
-from app.database import async_session, engine
-from app.services.chat_history import load_history_for_llm
-
+from app.services.chat_history import build_llm_message_from_row, load_history_for_llm
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_persisted_pathless_legacy_image_reaches_model_adapter():
+    from types import SimpleNamespace
+
+    row = SimpleNamespace(
+        role="user",
+        content="[image_data:data:image/png;base64,bGVnYWN5]\n请看旧图",
+        message_meta={"source_channel": "web"},
+        sender_user_id=None,
+        user_id=None,
+        thinking=None,
+    )
+
+    message = build_llm_message_from_row(row)
+
+    assert "请看旧图" in message["content"]
+    assert "[image_data:data:image/png;base64,bGVnYWN5]" in message["content"]
+
+
+async def test_authoritative_empty_attachments_do_not_restore_user_written_image_marker():
+    from types import SimpleNamespace
+
+    row = SimpleNamespace(
+        role="user",
+        content="[image_data:data:image/png;base64,bGVnYWN5]\n普通文本",
+        message_meta={"source_channel": "feishu", "attachments": []},
+        sender_user_id=None,
+        user_id=None,
+        thinking=None,
+    )
+
+    message = build_llm_message_from_row(row)
+
+    assert message["content"] == "普通文本"
+    assert "image_data" not in message["content"]
+    assert message["attachments"] == []
 
 
 @pytest.fixture(autouse=True)

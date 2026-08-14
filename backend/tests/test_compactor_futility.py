@@ -134,10 +134,10 @@ async def test_savings_reflect_span_mass_not_trigger_prompt(monkeypatch):
     monkeypatch.setattr(compactor, "async_session", _fake_session_factory(db))
     monkeypatch.setattr(compactor, "_load_active_rows", AsyncMock(return_value=rows))
     monkeypatch.setattr(compactor, "_load_active_marker", AsyncMock(return_value=(None, None, None)))
-    monkeypatch.setattr(
-        compactor, "_summarize_via_llm",
-        AsyncMock(return_value=("## Summary of earlier conversation\n- facts", {"completion_tokens": 100})),
+    summary_mock = AsyncMock(
+        return_value=("## Summary of earlier conversation\n- facts", {"completion_tokens": 100})
     )
+    monkeypatch.setattr(compactor, "_summarize_via_llm", summary_mock)
     monkeypatch.setattr(compactor, "validate_summary", lambda **_kw: (True, None, 1.0))
 
     result = await _do_compact(
@@ -152,9 +152,11 @@ async def test_savings_reflect_span_mass_not_trigger_prompt(monkeypatch):
 
     assert result.triggered is True
     assert db.committed is True
-    # savings = span_est (30000/2.5=12000) - summary (100); the old buggy
-    # figure would have been ~199900 (trigger_prompt_tokens - summary).
-    assert "节省约 11900 tokens" in result.progress_notice
+    # Savings use the full compacted row mass (including material discarded
+    # from the summary input), not the unrelated full trigger prompt.
+    assert summary_mock.await_args.kwargs["span_text"]
+    span_est = compactor.estimate_compactable_span_tokens(rows[:6])
+    assert f"节省约 {span_est - 100} tokens" in result.progress_notice
 
 
 @pytest.mark.asyncio
