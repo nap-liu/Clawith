@@ -168,50 +168,115 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
         : -1;
     const content = event.content || '';
     const now = event.now || new Date().toISOString();
-    const afterLastToolIdx = findStreamingAssistantIndexAfterLastTool(
-        messages as unknown as ConversationMessage[],
+    const identifiedMessage = identifiedIdx >= 0 ? messages[identifiedIdx] : undefined;
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (messages[i].role === 'user') {
+            lastUserIdx = i;
+            break;
+        }
+    }
+    const isCurrentTurnStream = (message: T, index: number) => (
+        index > lastUserIdx
+        && message.role === 'assistant'
+        && Boolean(message.streaming || message._streaming)
     );
-    const fallbackStreamingIdx = !content
-        ? findStreamingAssistantIndex(messages as unknown as ConversationMessage[])
-        : -1;
-    const idx = identifiedIdx >= 0
-        ? identifiedIdx
-        : afterLastToolIdx >= 0
-            ? afterLastToolIdx
-            : fallbackStreamingIdx;
+    const streamed = messages.filter(isCurrentTurnStream);
+    const streamedThinking = streamed
+        .map((message) => message.thinking || '')
+        .filter(Boolean)
+        .join('\n\n');
+    const streamedContent = streamed
+        .map((message) => message.content || '')
+        .filter((segment) => segment.trim())
+        .join('\n\n');
 
-    if (idx >= 0) {
-        const previous = messages[idx];
+    // Explicit ids address one committed message (currently onboarding and
+    // server-committed rows). Preserve its full shape and position.
+    if (
+        event.messageId
+        && identifiedMessage
+        && !identifiedMessage.streaming
+        && !identifiedMessage._streaming
+    ) {
         const next = [...messages];
-        next[idx] = {
-            ...previous,
-            content: content || previous.content || '',
+        next[identifiedIdx] = {
+            ...identifiedMessage,
+            content: content || identifiedMessage.content || '',
             streaming: false,
             _streaming: false,
-            created_at: previous.created_at || now,
-            timestamp: previous.timestamp || now,
+            _canonicalDone: true,
+            created_at: identifiedMessage.created_at || now,
+            timestamp: identifiedMessage.timestamp || now,
         };
         return next;
     }
 
-    if (!content) return messages;
-    const last = messages[messages.length - 1];
+    // done.content is the canonical reply for the whole logical turn. Remove
+    // all temporary stream bubbles so A + tool + B becomes one durable A+B
+    // reply, while ordinary non-stream assistant rows (for example a media
+    // caption) remain independent.
+    const next = messages.filter((message, index) => (
+        !isCurrentTurnStream(message, index)
+        && !(identifiedIdx === index && message.role === 'assistant')
+    ));
+    const canonicalContent = content || streamedContent;
+    if (!canonicalContent && !streamedThinking) return next;
+
+    const canonical = {
+        ...(identifiedMessage || {}),
+        id: event.messageId || streamed[0]?.id || makeId(),
+        role: 'assistant',
+        content: canonicalContent,
+        ...(
+            streamedThinking || identifiedMessage?.thinking
+                ? { thinking: streamedThinking || identifiedMessage?.thinking }
+                : {}
+        ),
+        created_at: identifiedMessage?.created_at || streamed[0]?.created_at || now,
+        timestamp: identifiedMessage?.timestamp || streamed[0]?.timestamp || now,
+        streaming: false,
+        _streaming: false,
+        _canonicalDone: true,
+    } as unknown as T;
+
+    // A blank done denotes suspension. Put the normalized streamed intro just
+    // before the pending confirmation card, matching its durable row order.
+    if (!content) {
+        let nextLastUserIdx = -1;
+        for (let i = next.length - 1; i >= 0; i -= 1) {
+            if (next[i].role === 'user') {
+                nextLastUserIdx = i;
+                break;
+            }
+        }
+        const confirmationIdx = next.findIndex((message, index) => (
+            index > nextLastUserIdx
+            && message.role === 'tool_call'
+            && message.toolName === CONFIRMATION_TOOL
+            && normalizeToolStatus(message.toolStatus) === 'running'
+        ));
+        if (confirmationIdx >= 0) {
+            return [
+                ...next.slice(0, confirmationIdx),
+                canonical,
+                ...next.slice(confirmationIdx),
+            ];
+        }
+    }
+
+    const last = next[next.length - 1];
     if (
         !event.messageId
         && last?.role === 'assistant'
         && !last.streaming
         && !last._streaming
+        && last._canonicalDone
         && last.content === content
     ) {
-        return messages;
+        return next;
     }
-    return [...messages, {
-        id: event.messageId || makeId(),
-        role: 'assistant',
-        content,
-        created_at: now,
-        timestamp: now,
-    } as unknown as T];
+    return [...next, canonical];
 }
 
 export function applyAssistantStreamMessage(

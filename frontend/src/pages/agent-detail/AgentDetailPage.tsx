@@ -2668,9 +2668,11 @@ export default function AgentDetailPage() {
             return [...prev, { role: 'assistant', content: d.content, _streaming: true } as any];
         }
         if (d.type === 'done') {
-            const thinking = isStreamingAssistant ? (last as any).thinking : undefined;
-            if (isStreamingAssistant) return [...prev.slice(0, -1), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() } as any)];
-            return [...prev, parseChatMsg({ role: d.role || 'assistant', content: d.content, timestamp: new Date().toISOString() } as any)];
+            return applyAssistantDoneMessage(prev, {
+                content: d.content || '',
+                now: new Date().toISOString(),
+                messageId: d.message_id ? String(d.message_id) : undefined,
+            });
         }
         if (d.type === 'tool_call') {
             const toolMsg = {

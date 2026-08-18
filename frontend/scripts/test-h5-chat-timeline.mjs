@@ -435,6 +435,64 @@ const {
 }
 
 {
+    let messages = [
+        { id: 'u1', role: 'user', content: '查询并发送视频' },
+        { id: 'a1', role: 'assistant', content: '知识库正文 A', streaming: true, _streaming: true },
+        { id: 'lookup', role: 'tool_call', toolName: 'knowledge_search', toolCallId: 'lookup', toolStatus: 'done' },
+        { id: 'a2', role: 'assistant', content: '补充正文 B', streaming: true, _streaming: true },
+        { id: 'media-caption', role: 'assistant', content: '视频说明', streaming: false },
+        { id: 'media', role: 'tool_call', toolName: 'send_media', toolCallId: 'media', toolStatus: 'done' },
+    ];
+
+    messages = applyAssistantDoneMessage(messages, {
+        type: 'done',
+        content: '知识库正文 A\n\n补充正文 B',
+        now: '2026-08-18T00:00:00.000Z',
+    });
+
+    assert.equal(messages.filter((message) => message.role === 'assistant' && message.streaming).length, 0);
+    assert.equal(messages.filter((message) => message.content === '知识库正文 A').length, 0);
+    assert.equal(messages.filter((message) => message.content === '补充正文 B').length, 0);
+    assert.equal(messages.filter((message) => message.content === '知识库正文 A\n\n补充正文 B').length, 1);
+    assert.equal(messages.filter((message) => message.content === '视频说明').length, 1);
+    assert.equal(messages.at(-1).content, '知识库正文 A\n\n补充正文 B');
+}
+
+{
+    const sameText = '已为你发送视频';
+    let messages = [
+        { id: 'u1', role: 'user', content: '发送视频' },
+        { id: 'caption', role: 'assistant', content: sameText },
+        { id: 'media', role: 'tool_call', toolName: 'send_media', toolCallId: 'media', toolStatus: 'done' },
+    ];
+
+    messages = applyAssistantDoneMessage(messages, { type: 'done', content: sameText });
+    messages = applyAssistantDoneMessage(messages, { type: 'done', content: sameText });
+
+    assert.equal(messages.filter((message) => message.content === sameText).length, 2);
+    assert.equal(messages.filter((message) => message._canonicalDone).length, 1);
+}
+
+{
+    let messages = [
+        { id: 'u1', role: 'user', content: '需要确认' },
+        { id: 'a1', role: 'assistant', content: '知识库正文 A', streaming: true, _streaming: true },
+        { id: 'media', role: 'tool_call', toolName: 'send_media', toolCallId: 'media', toolStatus: 'done' },
+        { id: 'caption', role: 'assistant', content: '视频说明' },
+        { id: 'a2', role: 'assistant', content: '补充正文 B', streaming: true, _streaming: true },
+        { id: 'confirm', role: 'tool_call', toolName: 'request_confirmation', toolCallId: 'confirm', toolStatus: 'running' },
+    ];
+
+    messages = applyAssistantDoneMessage(messages, { type: 'done', content: '' });
+
+    assert.equal(messages.filter((message) => message.streaming || message._streaming).length, 0);
+    assert.equal(messages.filter((message) => message.content === '知识库正文 A\n\n补充正文 B').length, 1);
+    assert.equal(messages.filter((message) => message.content === '视频说明').length, 1);
+    assert.equal(messages.at(-2).content, '知识库正文 A\n\n补充正文 B');
+    assert.equal(messages.at(-1).toolName, 'request_confirmation');
+}
+
+{
     const beforeEntries = buildH5ConversationEntries([
         { id: 'u1', role: 'user', content: 'hi' },
         { id: 'a1', role: 'assistant', content: '正在生成', streaming: true },

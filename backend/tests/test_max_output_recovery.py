@@ -125,6 +125,10 @@ def _patch_caller_collaborators(monkeypatch, client, tools=None):
         "app.services.llm.caller.record_token_usage",
         AsyncMock(return_value=None),
     )
+    monkeypatch.setattr(
+        "app.services.llm.caller._persist_tool_call_events_strict",
+        AsyncMock(return_value=True),
+    )
 
 
 # ─── Helper predicate tests ───────────────────────────────────────────────────
@@ -321,8 +325,9 @@ async def test_case_e_recovery_then_tool_call_then_final(monkeypatch, tmp_path):
         agent_id="agent-x", user_id="user-x", session_id="s",
     )
 
-    # Final content comes from round 1, not from the recovered-with-tool-calls round.
-    assert result == "done-after-tool"
+    # The recovered tool-call round was streamed to the user, so it remains
+    # part of the canonical reply together with the terminal round.
+    assert result == "thinking... going to call a tool\n\ndone-after-tool"
     # 3 stream calls: initial + 1 resume + 1 follow-up round
     assert len(client.stream_calls) == 3
 
@@ -402,7 +407,12 @@ async def test_changing_file_failures_remain_visible_to_model_until_it_replies(m
         session_id="s",
     )
 
-    assert result == "I could not find the exact requested path after three different attempts."
+    assert result == (
+        "trying another approach\n\n"
+        "trying another approach\n\n"
+        "trying another approach\n\n"
+        "I could not find the exact requested path after three different attempts."
+    )
     assert len(client.stream_calls) == 4
     final_round_messages: list[LLMMessage] = client.stream_calls[3]["messages"]
     tool_results = [message.content for message in final_round_messages if message.role == "tool"]

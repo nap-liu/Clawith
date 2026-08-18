@@ -124,7 +124,7 @@ async def test_large_read_file_result_is_materialized_before_second_model_round(
 
     responses = [
         LLMResponse(
-            content="",
+            content="reading",
             tool_calls=[
                 {
                     "id": "read-1",
@@ -208,8 +208,105 @@ async def test_large_read_file_result_is_materialized_before_second_model_round(
     finally:
         get_settings.cache_clear()
 
-    assert result == "done"
+    assert result == "reading\n\ndone"
     tool_message = next(msg for msg in client.requests[1] if msg.role == "tool")
     assert PERSISTED_OPEN in tool_message.content
     assert len(tool_message.content) < len(huge)
     assert huge not in tool_message.content
+
+
+async def test_background_tool_round_content_becomes_confirmation_intro(monkeypatch):
+    agent_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    execution_user_id = uuid.uuid4()
+    agent = SimpleNamespace(
+        id=agent_id,
+        name="background-agent",
+        creator_id=execution_user_id,
+        primary_model_id=model_id,
+        fallback_model_id=None,
+    )
+    model = SimpleNamespace(
+        id=model_id,
+        provider="qwen",
+        model="qwen-test",
+        base_url=None,
+        temperature=0.2,
+        max_output_tokens=1_000,
+        request_timeout=30,
+        context_window=1_000_000,
+    )
+    responses = [
+        LLMResponse(
+            content="background answer",
+            tool_calls=[{
+                "id": "lookup-1",
+                "type": "function",
+                "function": {"name": "knowledge_search", "arguments": '{}'},
+            }],
+        ),
+        LLMResponse(
+            content="",
+            tool_calls=[{
+                "id": "confirm-1",
+                "type": "function",
+                "function": {
+                    "name": "request_confirmation",
+                    "arguments": (
+                        '{"title":"Confirm","summary":"Continue?",'
+                        '"buttons":[{"text":"Yes","value":"yes"}]}'
+                    ),
+                },
+            }],
+        ),
+    ]
+
+    class _Client:
+        async def complete(self, **_kwargs):
+            return responses.pop(0)
+
+        async def close(self):
+            return None
+
+    query_results = [_Result(agent), _Result(model)]
+
+    async def _execute_query(*_args, **_kwargs):
+        return query_results.pop(0)
+
+    monkeypatch.setattr(
+        "app.services.llm.session_context_guard.get_session_context_termination",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr("app.services.llm.caller.create_llm_client", lambda **_kwargs: _Client())
+    monkeypatch.setattr("app.services.llm.caller.get_model_api_key", lambda _model: "test-key")
+    monkeypatch.setattr(
+        "app.services.llm.caller.get_agent_tools_for_llm",
+        AsyncMock(return_value=[
+            {"type": "function", "function": {"name": "knowledge_search", "description": "search"}},
+            {"type": "function", "function": {"name": "request_confirmation", "description": "confirm"}},
+        ]),
+    )
+    monkeypatch.setattr(
+        "app.services.llm.caller.execute_tool",
+        AsyncMock(return_value="matched"),
+    )
+    monkeypatch.setattr(
+        "app.services.llm.caller.record_token_usage",
+        AsyncMock(return_value=None),
+    )
+    suspend = AsyncMock(return_value="confirmation-row")
+    monkeypatch.setattr(
+        "app.services.confirmation_service.suspend_for_confirmation",
+        suspend,
+    )
+
+    reply = await call_agent_llm_with_tools(
+        SimpleNamespace(execute=_execute_query),
+        agent_id,
+        "system",
+        "prompt",
+        session_id=str(uuid.uuid4()),
+    )
+
+    assert reply == ""
+    assert suspend.await_args.kwargs["intro_text"] == "background answer"

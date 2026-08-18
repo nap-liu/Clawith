@@ -81,6 +81,10 @@ def _patch_collaborators(monkeypatch, client, tools=None):
     )
     monkeypatch.setattr("app.services.llm.caller.get_agent_tools_for_llm", AsyncMock(return_value=tools or []))
     monkeypatch.setattr("app.services.llm.caller.record_token_usage", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "app.services.llm.caller._persist_tool_call_events_strict",
+        AsyncMock(return_value=True),
+    )
 
 
 @pytest.mark.asyncio
@@ -146,7 +150,7 @@ async def test_tool_round_then_plain_text(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DATA_DIR", str(tmp_path))
     client = _ScriptedClient([
         LLMResponse(
-            content="",
+            content="我先读取文件。",
             tool_calls=[{
                 "id": "call_1",
                 "type": "function",
@@ -172,7 +176,7 @@ async def test_tool_round_then_plain_text(monkeypatch, tmp_path):
         agent_id="agent-x", user_id="user-x", session_id="s",
     )
 
-    assert result == "文件里写着 hello"
+    assert result == "我先读取文件。\n\n文件里写着 hello"
     assert len(client.stream_calls) == 2, "tool round + answer round, nothing more"
 
 
@@ -198,3 +202,64 @@ async def test_content_streams_through_on_chunk(monkeypatch):
 
     assert result == "流式内容"
     assert received == ["流式内容"], "caller must pass on_chunk through — no chunk buffering"
+
+
+@pytest.mark.asyncio
+async def test_tool_round_content_becomes_confirmation_intro(monkeypatch):
+    client = _ScriptedClient([
+        LLMResponse(
+            content="这是知识库完整答案。",
+            tool_calls=[{
+                "id": "lookup-1",
+                "type": "function",
+                "function": {"name": "knowledge_search", "arguments": '{"query":"seal"}'},
+            }],
+            finish_reason="tool_calls",
+        ),
+        LLMResponse(
+            content="",
+            tool_calls=[{
+                "id": "confirm-1",
+                "type": "function",
+                "function": {
+                    "name": "request_confirmation",
+                    "arguments": (
+                        '{"title":"是否解决","summary":"请确认",'
+                        '"buttons":[{"text":"已解决","value":"resolved"}]}'
+                    ),
+                },
+            }],
+            finish_reason="tool_calls",
+        ),
+    ])
+    _patch_collaborators(monkeypatch, client, tools=[
+        {"type": "function", "function": {"name": "knowledge_search", "description": "search"}},
+        {"type": "function", "function": {"name": "request_confirmation", "description": "confirm"}},
+    ])
+
+    async def _fake_tool(tool_name, args, **kwargs):
+        return "matched"
+
+    suspend = AsyncMock(return_value="confirmation-row")
+    monkeypatch.setattr("app.services.llm.caller.execute_tool", _fake_tool)
+    monkeypatch.setattr(
+        "app.services.llm.caller._persist_tool_call_events_strict",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "app.services.confirmation_service.suspend_for_confirmation",
+        suspend,
+    )
+
+    result = await call_llm(
+        model=_FakeModel(),
+        messages=[{"role": "user", "content": "查询后让我确认"}],
+        agent_name="T",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="s",
+    )
+
+    assert result == ""
+    assert suspend.await_args.kwargs["intro_text"] == "这是知识库完整答案。"

@@ -84,6 +84,11 @@ TOOLS_REQUIRING_ARGS = frozenset(
 )
 
 
+def _join_visible_response_segments(*segments: str | None) -> str:
+    """Join model text emitted across the tool rounds of one logical turn."""
+    return "\n\n".join(segment for segment in segments if segment and segment.strip())
+
+
 # ─── P4: max_output_tokens recovery (Claude-Code-aligned) ─────────────────────
 # When a provider truncates the response because the output hit its per-call
 # token cap (`finish_reason == "length"` for OpenAI-compat / Gemini, or
@@ -1319,6 +1324,9 @@ async def call_llm(
 
     # Repeated tool-call guard state: per-signature consecutive-round streaks.
     _repeat_streaks: dict[tuple[str, str], int] = {}
+    # Non-empty model content is user-visible even when the same response also
+    # carries tool calls. Keep it until this logical turn finishes or suspends.
+    visible_response_segments: list[str] = []
     # Tool-calling loop
     for round_i in range(_max_tool_rounds):
         # Dynamic tool-call limit warning.
@@ -1530,13 +1538,19 @@ async def call_llm(
             _log_turn_timing("call_error", round_i + 1)
             return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
 
+        if complete_response_content and complete_response_content.strip():
+            visible_response_segments.append(complete_response_content)
+
         # Plain assistant text (no tool calls) ends the turn — it IS the reply.
         if not response.tool_calls:
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
             await client.close()
             _log_turn_timing("reply", round_i + 1)
-            return complete_response_content or "[LLM returned empty content]"
+            return (
+                _join_visible_response_segments(*visible_response_segments)
+                or "[LLM returned empty content]"
+            )
 
         # Execute tool calls
         logger.info(f"[LLM] Round {round_i + 1}: {len(response.tool_calls)} tool call(s)")
@@ -1560,7 +1574,7 @@ async def call_llm(
                     chat_session_id=None,
                     source_channel="web",
                     user_id=user_id,
-                    intro_text=complete_response_content,
+                    intro_text=_join_visible_response_segments(*visible_response_segments),
                     title=conf_call.title,
                     summary=conf_call.summary,
                     action=conf_call.action,
@@ -1615,7 +1629,10 @@ async def call_llm(
                 await record_token_usage(agent_id, _unsaved_usage)
             await client.close()
             _log_turn_timing("repeat_guard", round_i + 1)
-            return complete_response_content or REPEAT_TOOL_CALL_BREAK_MESSAGE
+            return (
+                _join_visible_response_segments(*visible_response_segments)
+                or REPEAT_TOOL_CALL_BREAK_MESSAGE
+            )
 
         # Remember where this round's appended entries begin. The message-level
         # budget enforcer operates only on items at or beyond this index —
@@ -2122,6 +2139,7 @@ async def call_agent_llm_with_tools(
         _accumulated_usage = TokenUsage()
         _unsaved_usage = TokenUsage()
         tool_executed = False
+        visible_response_segments: list[str] = []
         try:
             client = create_llm_client(
                 provider=model.provider,
@@ -2186,12 +2204,20 @@ async def call_agent_llm_with_tools(
                 _accumulated_usage.add(_usage_this_round)
                 _unsaved_usage.add(_usage_this_round)
 
+                if response.content and response.content.strip():
+                    visible_response_segments.append(response.content)
+
                 # Plain assistant text (no tool calls) ends the turn — it IS the reply.
                 if not response.tool_calls:
                     if agent_id and _unsaved_usage.total_tokens > 0:
                         await record_token_usage(agent_id, _unsaved_usage)
                     await client.close()
-                    return response.content or "[Empty response]", True, tool_executed
+                    return (
+                        _join_visible_response_segments(*visible_response_segments)
+                        or "[Empty response]",
+                        True,
+                        tool_executed,
+                    )
 
                 # Execute tool calls
                 # Sanitize first — invalid tool args become a retry user message
@@ -2216,7 +2242,7 @@ async def call_agent_llm_with_tools(
                             source_channel="web",
                             # Bind background confirmation to the configured executor.
                             user_id=execution_user_id,
-                            intro_text=response.content,
+                            intro_text=_join_visible_response_segments(*visible_response_segments),
                             title=conf_call.title,
                             summary=conf_call.summary,
                             action=conf_call.action,
@@ -2267,7 +2293,12 @@ async def call_agent_llm_with_tools(
                     if agent_id and _unsaved_usage.total_tokens > 0:
                         await record_token_usage(agent_id, _unsaved_usage)
                     await client.close()
-                    return response.content or REPEAT_TOOL_CALL_BREAK_MESSAGE, True, tool_executed
+                    return (
+                        _join_visible_response_segments(*visible_response_segments)
+                        or REPEAT_TOOL_CALL_BREAK_MESSAGE,
+                        True,
+                        tool_executed,
+                    )
 
                 # Add assistant message with tool calls.
                 # NB: tc["function"] is shared by reference with _canonicalize_tc_arguments's
