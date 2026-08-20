@@ -260,6 +260,7 @@ def serialize_market_skill(
     downloads: int = 0,
     publisher_name: str | None = None,
     skill_md: str | None = None,
+    files: list[dict[str, str]] | None = None,
 ) -> dict:
     data = {
         "id": str(skill.id),
@@ -279,6 +280,8 @@ def serialize_market_skill(
     }
     if skill_md is not None:
         data["skill_md"] = skill_md
+    if files is not None:
+        data["files"] = files
     return data
 
 
@@ -316,12 +319,14 @@ async def get_market_skill_detail(
         publisher_name = await db.scalar(select(Agent.name).where(Agent.id == skill.publisher_agent_id))
     if not publisher_name and skill.publisher_user_id:
         publisher_name = await db.scalar(select(User.display_name).where(User.id == skill.publisher_user_id))
-    skill_md = next((item.content for item in skill.files if item.path == "SKILL.md"), "")
+    files = [{"path": item.path, "content": item.content} for item in sorted(skill.files, key=lambda item: item.path)]
+    skill_md = next((item["content"] for item in files if item["path"] == "SKILL.md"), "")
     return serialize_market_skill(
         skill,
         downloads=int(downloads or 0),
         publisher_name=publisher_name,
         skill_md=skill_md,
+        files=files,
     )
 
 

@@ -107,6 +107,13 @@
     "visibility": "Visibility",
     "noFolders": "No folders under this Agent’s skills directory",
     "loadingDocumentation": "Loading documentation…",
+    "preview": {
+      "package": "Skill package",
+      "fileTree": "Skill file tree",
+      "files": "Files",
+      "noFiles": "This Skill package has no files.",
+      "selectFile": "Select a file to preview"
+    },
     "installNote": "Writes to skills/{{folder}}. Reinstalling updates the current version; each Agent is counted once.",
     "publishNote": "Before publishing, Clawith checks root SKILL.md, text format, size, and common secrets. Publishing the same folder again updates its version.",
     "publishing": "Publishing…",

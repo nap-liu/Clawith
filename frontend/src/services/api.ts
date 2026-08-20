@@ -744,6 +744,7 @@ export type MarketSkill = {
     publisher_agent_id?: string | null;
     updated_at?: string | null;
     skill_md?: string;
+    files?: Array<{ path: string; content: string }>;
 };
 
 export type PublishMarketSkillInput = {

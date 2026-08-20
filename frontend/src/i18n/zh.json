@@ -82,6 +82,13 @@
     "visibility": "可见范围",
     "noFolders": "该 Agent 的 skills 下没有文件夹",
     "loadingDocumentation": "正在加载说明…",
+    "preview": {
+      "package": "Skill 文件包",
+      "fileTree": "Skill 文件目录",
+      "files": "文件",
+      "noFiles": "这个 Skill 文件包中没有文件",
+      "selectFile": "选择文件以预览内容"
+    },
     "installNote": "将写入 skills/{{folder}}。重复安装会更新到当前版本，下载量只按 Agent 计一次。",
     "publishNote": "发布前会检查根目录 SKILL.md、文本格式、大小和常见密钥内容。相同文件夹再次发布会更新版本。",
     "publishing": "发布中…",

@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
     IconArchive,
     IconBuilding,
+    IconChevronDown,
     IconChevronRight,
     IconDownload,
+    IconFile,
+    IconFolder,
+    IconFolderOpen,
     IconPackage,
     IconUpload,
     IconWorld,
@@ -13,6 +18,7 @@ import {
 } from '@tabler/icons-react';
 
 import { useDialog } from '../components/Dialog/DialogProvider';
+import MarkdownRenderer from '../components/MarkdownRenderer';
 import { useToast } from '../components/Toast/ToastProvider';
 import SelectDropdown from '../components/SelectDropdown';
 import Button from '../components/ui/Button';
@@ -24,6 +30,206 @@ import type { Agent } from '../types';
 import './SkillMarket.css';
 
 type MarketTab = 'discover' | 'mine';
+type MarketSkillFile = NonNullable<MarketSkill['files']>[number];
+
+type SkillTreeNode = {
+    name: string;
+    path: string;
+    isDirectory: boolean;
+    children: SkillTreeNode[];
+};
+
+function sortSkillTree(nodes: SkillTreeNode[]): SkillTreeNode[] {
+    nodes.sort((left, right) => {
+        if (left.isDirectory !== right.isDirectory) return left.isDirectory ? -1 : 1;
+        return left.name.localeCompare(right.name);
+    });
+    nodes.forEach((node) => sortSkillTree(node.children));
+    return nodes;
+}
+
+function buildSkillTree(files: MarketSkillFile[]): SkillTreeNode[] {
+    const roots: SkillTreeNode[] = [];
+
+    files.forEach((file) => {
+        const parts = file.path.split('/').filter(Boolean);
+        let siblings = roots;
+        let currentPath = '';
+
+        parts.forEach((part, index) => {
+            currentPath = currentPath ? `${currentPath}/${part}` : part;
+            const isDirectory = index < parts.length - 1;
+            let node = siblings.find((candidate) => candidate.name === part && candidate.isDirectory === isDirectory);
+            if (!node) {
+                node = { name: part, path: currentPath, isDirectory, children: [] };
+                siblings.push(node);
+            }
+            siblings = node.children;
+        });
+    });
+
+    return sortSkillTree(roots);
+}
+
+function collectDirectoryPaths(nodes: SkillTreeNode[]): string[] {
+    return nodes.flatMap((node) => (
+        node.isDirectory ? [node.path, ...collectDirectoryPaths(node.children)] : []
+    ));
+}
+
+function SkillPreviewDrawer({
+    detail,
+    loading,
+    onClose,
+}: {
+    detail?: MarketSkill;
+    loading: boolean;
+    onClose: () => void;
+}) {
+    const { t } = useTranslation();
+    const files = useMemo<MarketSkillFile[]>(() => {
+        if (detail?.files?.length) return detail.files;
+        if (detail?.skill_md !== undefined) return [{ path: 'SKILL.md', content: detail.skill_md }];
+        return [];
+    }, [detail?.files, detail?.skill_md]);
+    const tree = useMemo(() => buildSkillTree(files), [files]);
+    const [selectedPath, setSelectedPath] = useState('');
+    const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
+    const selectedFile = files.find((file) => file.path === selectedPath);
+
+    useEffect(() => {
+        if (!detail?.id) return;
+        setSelectedPath(files.find((file) => file.path === 'SKILL.md')?.path || files[0]?.path || '');
+        setExpandedDirs(new Set(collectDirectoryPaths(tree)));
+    }, [detail?.id, files, tree]);
+
+    useEffect(() => {
+        const previousOverflow = document.body.style.overflow;
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') onClose();
+        };
+        document.body.style.overflow = 'hidden';
+        window.addEventListener('keydown', onKeyDown);
+        return () => {
+            document.body.style.overflow = previousOverflow;
+            window.removeEventListener('keydown', onKeyDown);
+        };
+    }, [onClose]);
+
+    const toggleDirectory = (path: string) => {
+        setExpandedDirs((current) => {
+            const next = new Set(current);
+            if (next.has(path)) next.delete(path);
+            else next.add(path);
+            return next;
+        });
+    };
+
+    const renderNodes = (nodes: SkillTreeNode[], depth = 0) => nodes.map((node) => {
+        if (node.isDirectory) {
+            const expanded = expandedDirs.has(node.path);
+            return (
+                <div key={node.path} className="skill-preview-tree-branch">
+                    <Button
+                        type="button"
+                        variant="ghost"
+                        className="skill-preview-tree-row is-directory"
+                        style={{ paddingLeft: `${12 + depth * 14}px` }}
+                        onClick={() => toggleDirectory(node.path)}
+                        aria-expanded={expanded}
+                    >
+                        {expanded ? <IconChevronDown size={14} /> : <IconChevronRight size={14} />}
+                        {expanded ? <IconFolderOpen size={15} /> : <IconFolder size={15} />}
+                        <span>{node.name}</span>
+                    </Button>
+                    {expanded && renderNodes(node.children, depth + 1)}
+                </div>
+            );
+        }
+
+        const selected = node.path === selectedPath;
+        return (
+            <Button
+                key={node.path}
+                type="button"
+                variant="ghost"
+                className={`skill-preview-tree-row is-file${selected ? ' is-selected' : ''}`}
+                style={{ paddingLeft: `${30 + depth * 14}px` }}
+                onClick={() => setSelectedPath(node.path)}
+                aria-pressed={selected}
+                title={node.path}
+            >
+                <IconFile size={14} />
+                <span>{node.name}</span>
+            </Button>
+        );
+    });
+
+    if (typeof document === 'undefined') return null;
+
+    return createPortal(
+        <div className="skill-preview-overlay" onMouseDown={(event) => {
+            if (event.target === event.currentTarget) onClose();
+        }}>
+            <aside
+                className="skill-preview-drawer"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="skill-preview-title"
+            >
+                <header className="skill-preview-header">
+                    <div className="skill-preview-heading">
+                        <span className="skill-preview-kicker">{t('skillMarket.preview.package')}</span>
+                        <h2 id="skill-preview-title">{detail?.name || t('common.loading')}</h2>
+                        <div className="skill-preview-meta">
+                            <span>{detail?.publisher_name || '—'}</span>
+                            <span>{detail?.version ? t('skillMarket.version', { version: detail.version }) : '—'}</span>
+                            <span>{t('skillMarket.installCount', { count: detail?.downloads || 0 })}</span>
+                        </div>
+                    </div>
+                    <Button type="button" variant="ghost" onClick={onClose} aria-label={t('common.close')}>
+                        <IconX size={18} />
+                    </Button>
+                </header>
+
+                <div className="skill-preview-body">
+                    <nav className="skill-preview-tree" aria-label={t('skillMarket.preview.fileTree')}>
+                        <div className="skill-preview-pane-title">
+                            <span>{detail?.folder_name || t('skillMarket.preview.files')}</span>
+                            <span>{files.length}</span>
+                        </div>
+                        <div className="skill-preview-tree-scroll">
+                            {loading ? (
+                                <div className="skill-preview-placeholder">{t('common.loading')}</div>
+                            ) : tree.length ? renderNodes(tree) : (
+                                <div className="skill-preview-placeholder">{t('skillMarket.preview.noFiles')}</div>
+                            )}
+                        </div>
+                    </nav>
+
+                    <section className="skill-preview-content">
+                        <div className="skill-preview-content-head">
+                            <IconFile size={14} />
+                            <span>{selectedFile?.path || t('skillMarket.preview.selectFile')}</span>
+                        </div>
+                        <div className="skill-preview-content-scroll">
+                            {selectedFile ? (
+                                selectedFile.path.toLowerCase().endsWith('.md') ? (
+                                    <MarkdownRenderer content={selectedFile.content} className="skill-preview-markdown" />
+                                ) : (
+                                    <pre className="skill-preview-source"><code>{selectedFile.content}</code></pre>
+                                )
+                            ) : (
+                                <div className="skill-preview-placeholder">{t('skillMarket.preview.selectFile')}</div>
+                            )}
+                        </div>
+                    </section>
+                </div>
+            </aside>
+        </div>,
+        document.body,
+    );
+}
 
 function SkillCard({
     skill,
@@ -131,7 +337,7 @@ export default function SkillMarket() {
         queryFn: skillApi.market.mine,
         enabled: tab === 'mine',
     });
-    const { data: detail } = useQuery({
+    const { data: detail, isLoading: detailLoading } = useQuery({
         queryKey: ['skill-market', 'detail', detailId],
         queryFn: () => skillApi.market.detail(detailId!),
         enabled: Boolean(detailId),
@@ -257,6 +463,7 @@ export default function SkillMarket() {
     const loading = tab === 'discover' ? marketLoading : mineLoading;
 
     return (
+        <>
         <main className="skill-market-page">
             <header className="skill-market-page-head">
                 <div>
@@ -292,24 +499,15 @@ export default function SkillMarket() {
                 )}
             </div>
 
-            {(detailId || installSkill || showPublish) && (
+            {(installSkill || showPublish) && (
                 <section className="skill-market-workbench" aria-live="polite">
                     <div className="skill-market-workbench-head">
                         <div>
-                            <span>{showPublish ? t('skillMarket.publish') : installSkill ? t('skillMarket.install') : t('skillMarket.details')}</span>
-                            <h2>{showPublish ? t('skillMarket.publishFromAgent') : installSkill?.name || detail?.name || t('common.loading')}</h2>
+                            <span>{showPublish ? t('skillMarket.publish') : t('skillMarket.install')}</span>
+                            <h2>{showPublish ? t('skillMarket.publishFromAgent') : installSkill?.name}</h2>
                         </div>
                         <Button type="button" variant="ghost" onClick={closeWorkbench} aria-label={t('common.close')}><IconX size={17} /></Button>
                     </div>
-
-                    {detailId && (
-                        <>
-                            <div className="skill-market-detail-meta">
-                                <span>{detail?.publisher_name || '—'}</span><span>{detail?.version ? t('skillMarket.version', { version: detail.version }) : '—'}</span><span>{t('skillMarket.installCount', { count: detail?.downloads || 0 })}</span>
-                            </div>
-                            <pre className="skill-market-readme">{detail?.skill_md || t('skillMarket.loadingDocumentation')}</pre>
-                        </>
-                    )}
 
                     {installSkill && (
                         <div className="skill-market-form-body">
@@ -394,5 +592,13 @@ export default function SkillMarket() {
                 </div>
             )}
         </main>
+        {detailId && (
+            <SkillPreviewDrawer
+                detail={detail}
+                loading={detailLoading}
+                onClose={() => setDetailId(null)}
+            />
+        )}
+        </>
     );
 }

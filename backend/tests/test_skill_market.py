@@ -18,6 +18,7 @@ from app.services.agent_provisioning import validate_requested_skill_ids
 from app.services.agent_tools import execute_tool
 from app.services.autonomy_service import autonomy_service
 from app.services.skill_market import (
+    get_market_skill_detail,
     install_market_skill,
     list_market_skills,
     publish_agent_skill,
@@ -123,6 +124,9 @@ async def test_market_publish_visibility_permissions_install_and_unique_counts(m
         visible_b = await list_market_skills(db, tenant_id=tenant_b.id, query="market analysis")
         assert any(item["id"] == str(skill_id) for item in visible_a)
         assert all(item["id"] != str(skill_id) for item in visible_b)
+        detail = await get_market_skill_detail(db, skill_id=skill_id, tenant_id=tenant_a.id)
+        assert [item["path"] for item in detail["files"]] == ["SKILL.md", "references/example.md"]
+        assert detail["files"][1]["content"] == "# Example\n"
 
         with pytest.raises(HTTPException) as denied:
             await publish_from_agent(
