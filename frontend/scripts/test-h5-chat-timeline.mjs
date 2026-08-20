@@ -77,6 +77,10 @@ const timelineRequire = (id) => {
 };
 
 const module = compileTsModule(sourcePath, timelineRequire);
+const resumeRecoveryModule = compileTsModule(resolve(
+    __dirname,
+    '../src/features/conversation/core/resumeRecovery.ts',
+));
 
 const {
     applyAssistantDoneMessage,
@@ -93,6 +97,85 @@ const {
     toolCallMessageFromEvent,
     upsertToolCallMessage,
 } = module.exports;
+const {
+    bufferResumeEvent,
+    createResumeEventGate,
+    createOrReuseResumeEventGate,
+    drainResumeEventGate,
+    prepareMessagesForActiveTurnResume,
+    shouldScheduleResumeReconnect,
+} = resumeRecoveryModule.exports;
+
+{
+    const messages = [
+        { id: 'failed-user', role: 'user', content: 'old request' },
+        { id: 'failed-partial', role: 'assistant', content: 'keep old partial', streaming: true },
+        { id: 'active-user', role: 'user', content: 'active request' },
+        { id: 'active-partial', role: 'assistant', content: 'remove active partial', streaming: true },
+        { id: 'active-tool', role: 'tool_call', toolCallId: 'tool-1' },
+        { id: 'active-durable', role: 'assistant', content: 'keep committed output' },
+    ];
+    assert.deepEqual(
+        prepareMessagesForActiveTurnResume(messages).map((message) => message.id),
+        ['failed-user', 'failed-partial', 'active-user', 'active-tool', 'active-durable'],
+        'H5 resume cleanup must affect only transient assistant rows in the active turn',
+    );
+
+    const gate = createResumeEventGate('h5-session', 1);
+    assert.equal(bufferResumeEvent(gate, 'other-session', { type: 'chunk', value: 'wrong' }), false);
+    assert.equal(bufferResumeEvent(gate, 'h5-session', { type: 'chunk', value: 'A' }), true);
+    assert.equal(bufferResumeEvent(gate, 'h5-session', { type: 'tool_call', value: 'tool' }), true);
+    assert.equal(bufferResumeEvent(gate, 'h5-session', { type: 'done', value: 'B' }), true);
+    assert.equal(
+        drainResumeEventGate(gate).map((event) => event.type).join(','),
+        'chunk,tool_call,done',
+        'H5 resume must replay buffered socket events in arrival order',
+    );
+
+    assert.equal(shouldScheduleResumeReconnect({
+        pageSuspended: false,
+        unmounted: false,
+        hidden: false,
+        socketReadyState: null,
+    }), true, 'a deduped reconnect must be rescheduled after a failed coordinator socket');
+    assert.equal(shouldScheduleResumeReconnect({
+        pageSuspended: false,
+        unmounted: false,
+        hidden: false,
+        socketReadyState: 3,
+    }), true, 'a closed socket must be retried after resume reconciliation');
+    assert.equal(shouldScheduleResumeReconnect({
+        pageSuspended: false,
+        unmounted: false,
+        hidden: false,
+        socketReadyState: 0,
+    }), false, 'a connecting socket already has its own timeout and must not be duplicated');
+    assert.equal(shouldScheduleResumeReconnect({
+        pageSuspended: false,
+        unmounted: false,
+        hidden: false,
+        socketReadyState: 1,
+    }), false, 'an open socket must not schedule another reconnect');
+    assert.equal(shouldScheduleResumeReconnect({
+        pageSuspended: true,
+        unmounted: false,
+        hidden: true,
+        socketReadyState: 3,
+    }), false, 'background pages must defer reconnect until foreground resume');
+
+    const activeGate = createResumeEventGate('h5-session', 2);
+    bufferResumeEvent(activeGate, 'h5-session', { type: 'chunk', value: 'must-replay' });
+    const reused = createOrReuseResumeEventGate(activeGate, 'h5-session', 3);
+    assert.equal(reused.gate, activeGate, 'an in-flight reconcile must reuse its existing event gate');
+    assert.equal(reused.displacedEvents.length, 0);
+    const replaced = createOrReuseResumeEventGate(activeGate, 'other-session', 3);
+    assert.equal(replaced.gate.runtimeKey, 'other-session');
+    assert.equal(
+        JSON.stringify(replaced.displacedEvents),
+        JSON.stringify([{ type: 'chunk', value: 'must-replay' }]),
+        'a runtime switch must return buffered events for ordered replay instead of dropping them',
+    );
+}
 
 {
     const loaded = [
@@ -109,6 +192,42 @@ const {
         'older-a,overlap-b,new-c',
     );
     assert.equal(reconcileLatestHistoryWindow(loaded, latest)[1].content, 'new durable value');
+}
+
+{
+    const before = [
+        { id: 'u', role: 'user', content: 'run' },
+        { id: 'stream-before', role: 'assistant', content: 'before tool', streaming: true },
+        { id: 'tool-row', role: 'tool_call', toolCallId: 'tool-row', toolStatus: 'done' },
+        { id: 'stream-after', role: 'assistant', content: 'after tool', streaming: true },
+    ];
+    const durable = [
+        { id: 'u', role: 'user', content: 'run' },
+        { id: 'tool-row', role: 'tool_call', toolCallId: 'tool-row', toolStatus: 'done' },
+    ];
+    assert.equal(
+        reconcileLatestHistoryWindow(before, durable).map((message) => message.id).join(','),
+        'u,stream-before,tool-row,stream-after',
+        'recovery reconciliation must preserve local stream/tool ordering',
+    );
+}
+
+{
+    const before = [
+        { id: 'u', role: 'user', content: 'run' },
+        { id: 'tool-1', role: 'tool_call', toolCallId: 'tool-1', toolStatus: 'done' },
+        { id: 'stream-before-disconnect', role: 'assistant', content: 'visible before disconnect', streaming: true },
+    ];
+    const durable = [
+        { id: 'u', role: 'user', content: 'run' },
+        { id: 'tool-1', role: 'tool_call', toolCallId: 'tool-1', toolStatus: 'done' },
+        { id: 'tool-2', role: 'tool_call', toolCallId: 'tool-2', toolStatus: 'done' },
+    ];
+    assert.equal(
+        reconcileLatestHistoryWindow(before, durable).map((message) => message.id).join(','),
+        'u,tool-1,stream-before-disconnect,tool-2',
+        'a pre-disconnect transient tail must stay before durable rows added during recovery',
+    );
 }
 
 {
@@ -456,6 +575,39 @@ const {
     assert.equal(messages.filter((message) => message.content === '知识库正文 A\n\n补充正文 B').length, 1);
     assert.equal(messages.filter((message) => message.content === '视频说明').length, 1);
     assert.equal(messages.at(-1).content, '知识库正文 A\n\n补充正文 B');
+}
+
+{
+    let messages = [
+        { id: 'u1', role: 'user', content: '运行多个工具' },
+        { id: 'tool-1', role: 'tool_call', toolName: 'run_subagent', toolCallId: 'tool-1', toolStatus: 'done' },
+        { id: 'stale-stream', role: 'assistant', content: '中间轮次的临时正文', thinking: '中间思考', streaming: true, _streaming: true },
+        { id: 'tool-2', role: 'tool_call', toolName: 'run_subagent', toolCallId: 'tool-2', toolStatus: 'done' },
+        {
+            id: 'committed-final',
+            role: 'assistant',
+            content: '最终已提交正文',
+            thinking: '服务端已提交的完整思考',
+            streaming: false,
+            _streaming: false,
+        },
+    ];
+
+    messages = applyAssistantDoneMessage(messages, {
+        type: 'done',
+        content: '最终已提交正文',
+        messageId: 'committed-final',
+        now: '2026-08-20T00:00:00.000Z',
+    });
+
+    assert.equal(messages.some((message) => message.id === 'stale-stream'), false);
+    assert.equal(messages.filter((message) => message.id === 'committed-final').length, 1);
+    assert.equal(messages.at(-1).content, '最终已提交正文');
+    assert.equal(
+        messages.at(-1).thinking,
+        '服务端已提交的完整思考',
+        'durable thinking must not be overwritten by a partial local stream',
+    );
 }
 
 {
