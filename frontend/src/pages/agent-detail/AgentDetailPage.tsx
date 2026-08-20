@@ -10,6 +10,8 @@ import type { FileBrowserApi } from '../../components/FileBrowser';
 import FileBrowser from '../../components/FileBrowser';
 import ChatAttachmentIcon from '../../components/ChatAttachmentIcon';
 import ChatImageLightbox from '../../components/ChatImageLightbox';
+import SessionViewerDrawer from '../../components/SessionViewerDrawer';
+import type { SubagentRunCardData } from '../../components/SubagentRunCard';
 import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
 import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
@@ -1773,6 +1775,9 @@ export default function AgentDetailPage() {
     const [sessions, setSessions] = useState<any[]>([]);
     const [allSessions, setAllSessions] = useState<any[]>([]);
     const [activeSession, setActiveSession] = useState<any | null>(null);
+    const [subagentSessionRun, setSubagentSessionRun] = useState<SubagentRunCardData | null>(null);
+    const openSubagentSession = useCallback((run: SubagentRunCardData) => setSubagentSessionRun(run), []);
+    const closeSubagentSession = useCallback(() => setSubagentSessionRun(null), []);
     const { data: activeSessionExecution = null } = useQuery({
         queryKey: ['session-execution', id, activeSession?.id],
         queryFn: () => chatSessionApi.execution(id!, activeSession.id).catch(() => null),
@@ -1899,7 +1904,7 @@ export default function AgentDetailPage() {
         if (!sess) return false;
         const sc = String(sess.source_channel || 'web').toLowerCase();
         const pt = String(sess.participant_type || 'user').toLowerCase();
-        if (sc === 'agent' || pt === 'agent') return false;
+        if (sc === 'agent' || sc === 'subagent' || pt === 'agent') return false;
         if (sess.is_group) return false;
         if (scopeOverride === 'all') return false;
         const su = sessionUserIdStr(sess);
@@ -2829,11 +2834,12 @@ export default function AgentDetailPage() {
                     if (cancelled || currentAgentIdRef.current !== id) return;
                     const resolvedScope: 'mine' | 'all' = resolvedSession.view_scope === 'all' ? 'all' : 'mine';
                     setChatScope(resolvedScope);
-                    if (resolvedScope === 'mine') {
+                    const isSubagentSession = String(resolvedSession.source_channel || '').toLowerCase() === 'subagent';
+                    if (!isSubagentSession && resolvedScope === 'mine') {
                         setSessions((prev) => prev.some((item: any) => String(item.id) === requestedSessionId)
                             ? prev
                             : [resolvedSession, ...prev]);
-                    } else {
+                    } else if (!isSubagentSession) {
                         setAllSessions((prev) => prev.some((item: any) => String(item.id) === requestedSessionId)
                             ? prev
                             : [resolvedSession, ...prev]);
@@ -4801,6 +4807,7 @@ export default function AgentDetailPage() {
                                                 agentName={agent.name || 'Agent'}
                                                 messages={[]}
                                                 provenance={session.execution}
+                                                onOpenSubagentSession={openSubagentSession}
                                                 viewOf={() => ({ isLeft: true })}
                                             />
                                         ) : msgs.length === 0 ? (
@@ -4823,6 +4830,7 @@ export default function AgentDetailPage() {
                                                 onAttachmentDownload={handleAttachmentDownload}
                                                 onAttachmentUnavailable={markAttachmentUnavailable}
                                                 onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
+                                                onOpenSubagentSession={openSubagentSession}
                                                 onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
                                             />
                                         )}
@@ -5769,6 +5777,7 @@ export default function AgentDetailPage() {
                                                                         agentName={agent.name || 'Agent'}
                                                                         messages={[]}
                                                                         provenance={session.execution}
+                                                                        onOpenSubagentSession={openSubagentSession}
                                                                         viewOf={() => ({ isLeft: true })}
                                                                     />
                                                                 ) : msgs.length === 0 ? (
@@ -5792,6 +5801,7 @@ export default function AgentDetailPage() {
                                                                             onAttachmentDownload={handleAttachmentDownload}
                                                                             onAttachmentUnavailable={markAttachmentUnavailable}
                                                                             onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
+                                                                            onOpenSubagentSession={openSubagentSession}
                                                                             onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
                                                                         />
                                                                     </div>
@@ -6185,6 +6195,8 @@ export default function AgentDetailPage() {
                                         >
                                             {activeSession.source_channel === 'agent' ? (
                                                 <><IconRobot size={13} stroke={1.8} /> Agent Conversation · {activeSession.username || 'Agents'}</>
+                                            ) : activeSession.source_channel === 'subagent' ? (
+                                                <><IconRobot size={13} stroke={1.8} /> Read-only · Subagent</>
                                             ) : (
                                                 <>Read-only · {activeSession.username || 'User'}</>
                                             )}
@@ -6225,6 +6237,7 @@ export default function AgentDetailPage() {
                                                     onAttachmentDownload={handleAttachmentDownload}
                                                     onAttachmentUnavailable={markAttachmentUnavailable}
                                                     onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
+                                                    onOpenSubagentSession={openSubagentSession}
                                                     onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
                                                     viewOf={(m: any) => {
                                                     // Determine if this message is from "this agent" (left) or peer (right).
@@ -6315,6 +6328,7 @@ export default function AgentDetailPage() {
                                                     onAttachmentDownload={handleAttachmentDownload}
                                                     onAttachmentUnavailable={markAttachmentUnavailable}
                                                     onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
+                                                    onOpenSubagentSession={openSubagentSession}
                                                     onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
                                                     viewOf={(m: any) => ({
                                                         isLeft: m.role === 'assistant',
@@ -6822,6 +6836,24 @@ export default function AgentDetailPage() {
                 mode="desktop"
                 onClose={() => setChatImagePreview(null)}
                 onIndexChange={(index) => setChatImagePreview((prev) => prev ? { ...prev, index } : prev)}
+            />
+
+            <SessionViewerDrawer
+                agentId={id!}
+                agentName={(agent as any)?.name || 'Agent'}
+                target={subagentSessionRun?.sessionId ? {
+                    sessionId: subagentSessionRun.sessionId,
+                    agentId: subagentSessionRun.executionAgentId,
+                    title: subagentSessionRun.task,
+                    status: subagentSessionRun.status,
+                    mode: subagentSessionRun.mode,
+                    model: subagentSessionRun.model,
+                } : null}
+                onClose={closeSubagentSession}
+                unavailableAttachmentKeys={unavailableAttachmentKeys}
+                onAttachmentDownload={handleAttachmentDownload}
+                onAttachmentUnavailable={markAttachmentUnavailable}
+                onPreviewImages={(images, index) => setChatImagePreview({ images, index })}
             />
 
             {

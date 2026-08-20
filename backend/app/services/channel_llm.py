@@ -119,6 +119,11 @@ async def _call_agent_llm(
     recovery_mode: bool = False,
     turn_anchor_id: uuid.UUID | None = None,
     storage_agent_id: uuid.UUID | None = None,
+    model_name: str | None = None,
+    prepared_tools: list[dict] | None = None,
+    before_round=None,
+    before_tool_execution=None,
+    broadcast_web: bool = True,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -176,27 +181,44 @@ async def _call_agent_llm(
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
 
-    turn_model_id = await load_turn_model_id(
-        db,
-        agent_id=agent_id,
-        session_id=session_id,
-        turn_anchor_id=turn_anchor_id,
-    )
-    resolved_models = await resolve_runtime_models(
-        db,
-        agent=agent,
-        override_model_id=turn_model_id,
-    )
-    if (
-        turn_model_id
-        and resolved_models.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}
-    ):
-        return (
-            "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，"
-            "或 /model default 恢复默认模型。"
+    if model_name:
+        from app.services.chat_model_selection import (
+            MODEL_STATUS_OK,
+            resolve_tenant_model_by_name,
         )
-    model = resolved_models.primary_model
-    fallback_model = resolved_models.fallback_model
+        from app.services.llm.runtime_model import RuntimeLLMModel
+
+        resolved_named = await resolve_tenant_model_by_name(
+            db,
+            tenant_id=agent.tenant_id,
+            model_name=model_name,
+        )
+        if resolved_named.status != MODEL_STATUS_OK or resolved_named.model is None:
+            return f"⚠️ Subagent 指定模型 {model_name} 已不可用"
+        model = RuntimeLLMModel.from_orm(resolved_named.model)
+        fallback_model = None
+    else:
+        turn_model_id = await load_turn_model_id(
+            db,
+            agent_id=agent_id,
+            session_id=session_id,
+            turn_anchor_id=turn_anchor_id,
+        )
+        resolved_models = await resolve_runtime_models(
+            db,
+            agent=agent,
+            override_model_id=turn_model_id,
+        )
+        if (
+            turn_model_id
+            and resolved_models.override_status not in {MODEL_OVERRIDE_NONE, MODEL_OVERRIDE_OK}
+        ):
+            return (
+                "⚠️ 当前会话选择的模型已不可用，请发送 /model list 重新选择，"
+                "或 /model default 恢复默认模型。"
+            )
+        model = resolved_models.primary_model
+        fallback_model = resolved_models.fallback_model
 
     if not model:
         return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
@@ -314,7 +336,8 @@ async def _call_agent_llm(
     # as the WebSocket chat path). Lazy import avoids a services->api import
     # cycle; best-effort so IM delivery is never affected by a web-side hiccup.
     async def _web_broadcast(payload: dict):
-        await _broadcast_to_web_session(agent_id, session_id, payload)
+        if broadcast_web:
+            await _broadcast_to_web_session(history_agent_id, session_id, payload)
 
     async def _on_chunk_bridged(text: str):
         await _web_broadcast({"type": "chunk", "content": text})
@@ -387,6 +410,9 @@ async def _call_agent_llm(
             channel_context=scene_channel_context,
             turn_anchor_id=turn_anchor_id,
             context_recovery=context_recovery,
+            prepared_tools=prepared_tools,
+            before_round=before_round,
+            before_tool_execution=before_tool_execution,
         )
     finally:
         try:

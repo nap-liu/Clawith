@@ -199,6 +199,7 @@ async def lifespan(fastapi_app: FastAPI):
             import app.models.chat_session   # noqa
             import app.models.trigger        # noqa
             import app.models.trigger_execution  # noqa
+            import app.models.subagent_run  # noqa
             import app.models.focus          # noqa
             import app.models.notification   # noqa
             import app.models.gateway_message # noqa
@@ -345,7 +346,10 @@ async def lifespan(fastapi_app: FastAPI):
             logger.info("[startup] turn recovery disabled (TURN_RECOVERY_ENABLED is not enabled)")
 
         if _role_enabled("all", "worker"):
+            from app.services.subagent_runtime import start_subagent_daemon
+
             task_specs.append(("trigger_daemon", start_trigger_daemon()))
+            task_specs.append(("subagent_daemon", start_subagent_daemon()))
             task_specs.append(("cli_tools_gc", cli_tools_gc_loop()))
         if _role_enabled("all", "connector"):
             task_specs.extend([

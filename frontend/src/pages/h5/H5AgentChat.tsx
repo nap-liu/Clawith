@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { useTranslation } from 'react-i18next';
 import {
     IconAlertTriangle,
     IconArrowLeft,
@@ -21,6 +22,8 @@ import ChatImageLightbox from '../../components/ChatImageLightbox';
 import ChatAttachmentIcon from '../../components/ChatAttachmentIcon';
 import ChatMediaCard from '../../components/ChatMediaCard';
 import ChatToolCallRenderer from '../../components/ChatToolCallRenderer';
+import SessionViewerDrawer from '../../components/SessionViewerDrawer';
+import type { SubagentRunCardData } from '../../components/SubagentRunCard';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
 import ConversationScrollToBottomButton from '../../features/conversation/ConversationScrollToBottomButton';
 import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
@@ -209,16 +212,6 @@ function stringifyDetail(value: any) {
     }
 }
 
-function h5T(key: string, opts?: any) {
-    if (key === 'agent.chat.confirmCardTitle') return '需要确认';
-    if (key === 'agent.chat.confirmWillRun') return '将执行';
-    if (key === 'agent.chat.confirmResolved') return '已处理';
-    if (key === 'common.loading') return '处理中';
-    if (typeof opts === 'string') return opts;
-    if (opts?.defaultValue) return opts.defaultValue;
-    return key;
-}
-
 function formatFileSize(bytes: number) {
     if (!Number.isFinite(bytes) || bytes <= 0) return '';
     if (bytes < 1024) return `${bytes}B`;
@@ -360,6 +353,7 @@ function estimateConversationEntrySize(entry: ReturnType<typeof buildH5Conversat
 }
 
 export default function H5AgentChat() {
+    const { t } = useTranslation();
     const { agentId } = useParams<{ agentId: string }>();
     const [searchParams] = useSearchParams();
     const toast = useToast();
@@ -407,6 +401,7 @@ export default function H5AgentChat() {
     const [llmModels, setLlmModels] = useState<ChatModelOption[]>([]);
     const [tenantDefaultModelId, setTenantDefaultModelId] = useState<string | null>(null);
     const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle');
+    const [isReadOnly, setIsReadOnly] = useState(false);
     const [pageResumeRevision, setPageResumeRevision] = useState(0);
     const [pageActive, setPageActive] = useState(() => document.visibilityState !== 'hidden');
     const [onboardingKickoffRequest, setOnboardingKickoffRequest] = useState<OnboardingKickoffRequest | null>(null);
@@ -420,9 +415,13 @@ export default function H5AgentChat() {
     const [attachedFiles, setAttachedFiles] = useState<ChatAttachedFile[]>([]);
     const [uploadError, setUploadError] = useState('');
     const [imagePreview, setImagePreview] = useState<{ images: ChatPreviewImage[]; index: number } | null>(null);
+    const [subagentSessionRun, setSubagentSessionRun] = useState<SubagentRunCardData | null>(null);
+    const openSubagentSession = useCallback((run: SubagentRunCardData) => setSubagentSessionRun(run), []);
+    const closeSubagentSession = useCallback(() => setSubagentSessionRun(null), []);
     const [unavailableAttachmentKeys, setUnavailableAttachmentKeys] = useState<Set<string>>(() => new Set());
 
     const wsRef = useRef<WebSocket | null>(null);
+    const chatRootRef = useRef<HTMLElement | null>(null);
     const messagesSnapshotRef = useRef(messages);
     messagesSnapshotRef.current = messages;
     const sceneManifestRef = useRef<SceneManifest | null>(null);
@@ -1304,6 +1303,7 @@ export default function H5AgentChat() {
             sessionIdRef.current = nextSessionId;
             setSessionId(nextSessionId);
             setConnectionStatus('connected');
+            setIsReadOnly(data.read_only === true);
             void refreshSceneManifest();
             if (data.onboarding_required === true) {
                 generationActiveRef.current = true;
@@ -1892,6 +1892,7 @@ export default function H5AgentChat() {
     ) => {
         const content = rawContent.trim();
         if (!content && files.length === 0) return;
+        if (isReadOnly) return;
 
         // Session-control commands are control-plane operations, not dialogue.
         // They stay available even while a confirmation card is pending.
@@ -1958,7 +1959,7 @@ export default function H5AgentChat() {
             attachments: payload.attachments,
             model_id: effectiveModelId,
         }));
-    }, [confirmationPending, effectiveModelId, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
+    }, [confirmationPending, effectiveModelId, isReadOnly, isStartingNew, isStreaming, isStopping, isSwitchingSession, isWaiting, openSocket, speech.isActive, startNewSession, uploadDrafts.length]);
 
     const sendMessage = useCallback(
         () => dispatchMessage(input, attachedFiles, true),
@@ -2199,9 +2200,10 @@ export default function H5AgentChat() {
                         <ChatToolCallRenderer
                             agentId={agentId || ''}
                             message={msg}
-                            t={h5T}
+                            t={t}
                             mode="h5"
                             onPreviewImages={(images, index) => setImagePreview({ images, index })}
+                            onOpenSubagentSession={openSubagentSession}
                             onResolved={(resolvedResult) => {
                                 setMessages((prev) => upsertToolCallMessage(prev, {
                                     ...msg,
@@ -2305,6 +2307,7 @@ export default function H5AgentChat() {
         handleAttachmentDownload,
         handleMarkdownLinkClick,
         markAttachmentUnavailable,
+        openSubagentSession,
         toggleAnalysis,
         unavailableAttachmentKeys,
     ]);
@@ -2319,6 +2322,7 @@ export default function H5AgentChat() {
     const isBusy = authStatus === 'checking' || authStatus === 'exchanging' || (authStatus === 'ready' && !agent && !agentError);
     const generationActive = isWaiting || isStreaming || isStopping;
     messageRuntimeBlockedRef.current = generationActive
+        || isReadOnly
         || confirmationPending
         || showBlockingError
         || isBusy
@@ -2332,6 +2336,7 @@ export default function H5AgentChat() {
         }
     }, [generationActive, isStartingNew, isSwitchingSession]);
     const sendDisabled = (!input.trim() && attachedFiles.length === 0)
+        || isReadOnly
         || showBlockingError
         || isBusy
         || generationActive
@@ -2341,6 +2346,7 @@ export default function H5AgentChat() {
         || isSwitchingSession
         || uploadDrafts.length > 0;
     const uploadDisabled = showBlockingError
+        || isReadOnly
         || isBusy
         || generationActive
         || confirmationPending
@@ -2351,6 +2357,7 @@ export default function H5AgentChat() {
         || attachedFiles.length >= 10;
     const agentAvatarUrl = resolveAgentAvatarUrl(agent?.avatar_url, token);
     const quickMessageDisabled = generationActive
+        || isReadOnly
         || confirmationPending
         || showBlockingError
         || isBusy
@@ -2413,6 +2420,7 @@ export default function H5AgentChat() {
 
     return (
         <main
+            ref={chatRootRef}
             className={`h5-chat h5-chat--${resolvedTheme}`}
             data-theme={resolvedTheme}
             data-theme-mode={themeMode}
@@ -2827,10 +2835,10 @@ export default function H5AgentChat() {
                             onSelect={handleInputSelect}
                             onKeyDown={handleInputKeyDown}
                             onPaste={handlePaste}
-                            placeholder={confirmationPending ? '请先完成上方确认' : '输入消息'}
+                            placeholder={isReadOnly ? '只读运行记录' : confirmationPending ? '请先完成上方确认' : '输入消息'}
                             rows={1}
                             onFocus={handleInputSelect}
-                            disabled={showBlockingError || isBusy || isStartingNew || speech.isActive || confirmationPending}
+                            disabled={isReadOnly || showBlockingError || isBusy || isStartingNew || speech.isActive || confirmationPending}
                         />
                         <button
                             type="button"
@@ -2838,6 +2846,7 @@ export default function H5AgentChat() {
                             onPointerDown={speech.status === 'recording' ? undefined : captureSpeechInsertionPoint}
                             onClick={speech.status === 'recording' ? speech.stop : startSpeechInput}
                             disabled={!speech.supported
+                                || isReadOnly
                                 || showBlockingError
                                 || isBusy
                                 || generationActive
@@ -2880,6 +2889,25 @@ export default function H5AgentChat() {
                     )}
                 </div>
             </form>
+            <SessionViewerDrawer
+                agentId={agentId || ''}
+                agentName={agent?.name || 'Agent'}
+                target={subagentSessionRun?.sessionId ? {
+                    sessionId: subagentSessionRun.sessionId,
+                    agentId: subagentSessionRun.executionAgentId,
+                    title: subagentSessionRun.task,
+                    status: subagentSessionRun.status,
+                    mode: subagentSessionRun.mode,
+                    model: subagentSessionRun.model,
+                } : null}
+                routeMode="h5"
+                portalContainer={chatRootRef.current}
+                onClose={closeSubagentSession}
+                unavailableAttachmentKeys={unavailableAttachmentKeys}
+                onAttachmentDownload={handleAttachmentDownload}
+                onAttachmentUnavailable={markAttachmentUnavailable}
+                onPreviewImages={(images, index) => setImagePreview({ images, index })}
+            />
             <ChatImageLightbox
                 open={!!imagePreview}
                 images={imagePreview?.images || []}

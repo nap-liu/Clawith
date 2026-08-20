@@ -523,6 +523,20 @@ body.h5-chat-active #root {
     width: 88%;
 }
 
+.h5-chat__message--special-render {
+    width: 88%;
+    min-width: 0;
+    max-width: 88%;
+    align-self: flex-start;
+}
+
+.h5-chat__special-render {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+}
+
 .h5-chat__file-delivery-card {
     width: 100%;
     min-width: 0;

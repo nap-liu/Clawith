@@ -31,6 +31,7 @@ import app.models.personal_access_token  # noqa: F401
 import app.models.plaza  # noqa: F401
 import app.models.schedule  # noqa: F401
 import app.models.skill  # noqa: F401
+import app.models.subagent_run  # noqa: F401
 import app.models.system_settings  # noqa: F401
 import app.models.task  # noqa: F401
 import app.models.tenant  # noqa: F401
