@@ -95,6 +95,7 @@ async def main():
     # coverage drift vs the app's own startup path).
     import app.models.tenant_setting     # noqa
     import app.models.trigger_execution  # noqa
+    import app.models.subagent_run        # noqa
     import app.models.agent_credential   # noqa
     import app.models.okr                # noqa
     import app.models.onboarding         # noqa

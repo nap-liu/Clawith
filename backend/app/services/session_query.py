@@ -39,6 +39,7 @@ from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.participant import Participant
+from app.models.subagent_run import SubagentRun
 from app.models.user import Identity, User
 
 # Every IM/web channel where a real human is the conversation partner. Anything
@@ -184,12 +185,19 @@ def _own_participated_where(agent_id: uuid.UUID, viewer_id):
             )
         )
     )
+    subagent_owner = exists().where(
+        and_(
+            SubagentRun.id == ChatSession.id,
+            SubagentRun.execution_user_id == viewer_id,
+        )
+    )
     return and_(
         ChatSession.agent_id == agent_id,
         ChatSession.source_channel.notin_(["agent", "trigger"]),
         or_(
             and_(ChatSession.is_group.is_(False), ChatSession.user_id == viewer_id),
             and_(ChatSession.is_group.is_(True), group_member),
+            and_(ChatSession.source_channel == "subagent", subagent_owner),
         ),
     )
 
@@ -221,7 +229,17 @@ def _autonomous_where(agent_id: uuid.UUID, ctx_session_id):
     )
     cu = _as_uuid(ctx_session_id)
     if cu is not None:
-        return or_(base, and_(ChatSession.id == cu, build_owned_sessions_predicate(agent_id)))
+        direct_child = exists().where(
+            and_(
+                SubagentRun.id == ChatSession.id,
+                SubagentRun.parent_session_id == cu,
+            )
+        )
+        return or_(
+            base,
+            and_(ChatSession.id == cu, build_owned_sessions_predicate(agent_id)),
+            and_(direct_child, build_owned_sessions_predicate(agent_id)),
+        )
     return base
 
 

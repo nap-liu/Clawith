@@ -77,8 +77,11 @@ async def list_conversations(
     rows = (
         await db.execute(
             select(ChatSession).where(
-                (ChatSession.agent_id == agent_id)
-                | (ChatSession.peer_agent_id == agent_id)
+                (
+                    (ChatSession.agent_id == agent_id)
+                    | (ChatSession.peer_agent_id == agent_id)
+                ),
+                ChatSession.source_channel != "subagent",
             )
         )
     ).scalars().all()

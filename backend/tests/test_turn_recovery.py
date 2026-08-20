@@ -918,6 +918,7 @@ async def test_new_waits_for_locked_recovery_delivery(monkeypatch):
             anchor,
             expected_origin=expected_origin,
             reply="serialized reply",
+            execution_agent_id=agent_id,
         )
     )
     await asyncio.wait_for(delivery_entered.wait(), timeout=2)

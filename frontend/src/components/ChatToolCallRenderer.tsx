@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import ChatFileDeliveryCard from './ChatFileDeliveryCard';
 import ChatMediaDeliveryErrorCard from './ChatMediaDeliveryErrorCard';
 import ConfirmationCard from './ConfirmationCard';
+import SubagentRunCard, { parseSubagentRunCardData, type SubagentRunCardData } from './SubagentRunCard';
 import { parseFileDeliveryToolResult, parseMediaDeliveryErrorResult } from '../utils/chatFileDelivery';
 import type { ChatFileDelivery, ChatMediaDeliveryError } from '../utils/chatFileDelivery';
 import type { ChatPreviewImage } from '../utils/chatAttachments';
@@ -18,6 +19,7 @@ type ToolCallRendererProps = {
     onResolved: (result: string) => void;
     mode: 'h5' | 'pc';
     onPreviewImages?: (images: ChatPreviewImage[], index: number) => void;
+    onOpenSubagentSession?: (data: SubagentRunCardData) => void;
 };
 
 type ToolCallRendererRegistration = {
@@ -42,6 +44,25 @@ function toolName(context: ToolCallRenderContext): string {
 }
 
 const TOOL_CALL_RENDERERS: ToolCallRendererRegistration[] = [
+    {
+        type: 'run-subagent',
+        resolve: (context) => toolName(context) === 'run_subagent'
+            ? parseSubagentRunCardData(context.message, context.payload)
+            : null,
+        render: ({ agentId, mode, t, onOpenSubagentSession }, _context, data) => (
+            <SubagentRunCard
+                agentId={agentId}
+                mode={mode}
+                data={data as SubagentRunCardData}
+                t={t}
+                onOpenSession={onOpenSubagentSession}
+            />
+        ),
+        identity: (_context, data) => {
+            const run = data as SubagentRunCardData;
+            return [run.sessionId || '', run.status, run.task || '', run.mode || '', run.model || '', String(run.fork)].join('\u0000');
+        },
+    },
     {
         type: 'media-delivery',
         resolve: (context) => {

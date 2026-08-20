@@ -4,15 +4,16 @@ import asyncio
 import json
 import re
 import uuid
-from datetime import datetime, timedelta, timezone as tz
+from datetime import datetime, timedelta
+from datetime import timezone as tz
 from time import perf_counter
 from typing import Any
 
-
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
-from sqlalchemy import select, update
+from sqlalchemy import String, cast, exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.core.logging_config import set_trace_id
 from app.core.permissions import (
@@ -27,6 +28,7 @@ from app.database import async_session
 from app.models.agent import Agent, AgentUserOnboarding
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.subagent_run import SubagentRun
 from app.models.task import Task
 from app.models.user import User
 from app.services.activity_logger import log_activity
@@ -35,8 +37,8 @@ from app.services.auth_code_exchange import validate_platform_login_channel
 from app.services.chat_history import persist_initial_assistant_message_if_pristine
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.confirmation_service import PendingConfirmation
-from app.services.llm.runtime_model import RuntimeLLMModel
 from app.services.llm import call_llm_with_failover
+from app.services.llm.runtime_model import RuntimeLLMModel
 from app.services.onboarding import (
     PHASE_COMPLETED,
     PHASE_GREETED,
@@ -74,6 +76,45 @@ LLM_FAILURE_PREFIXES = (
     "[Error]",
     "[LLM returned empty content]",
 )
+
+
+class SessionTurnBusyError(RuntimeError):
+    """A durable internal wake already owns the next turn in this session."""
+
+
+async def _has_active_subagent_event_turn(
+    db: AsyncSession,
+    conversation_id: str,
+) -> bool:
+    """Return whether an unfinished durable parent wake owns this session.
+
+    The latest row may already be a tool call/result emitted by that wake, so
+    checking only the latest message would allow a Web turn to interleave with
+    an LLM turn that is still running.
+    """
+    anchor = aliased(ChatMessage)
+    final = aliased(ChatMessage)
+    final_exists = exists(
+        select(final.id).where(
+            final.conversation_id == anchor.conversation_id,
+            final.role == "assistant",
+            final.message_meta["turn_anchor_id"].as_string()
+            == cast(anchor.id, String),
+        )
+    )
+    active = (
+        await db.execute(
+            select(anchor.id)
+            .where(
+                anchor.conversation_id == conversation_id,
+                anchor.message_meta["kind"].as_string() == "subagent_event",
+                anchor.message_meta["turn_status"].as_string() == "running",
+                ~final_exists,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return active is not None
 
 
 class ConnectionManager:
@@ -503,6 +544,15 @@ class WebSocketChatHandler:
                 if not _existing:
                     conv_id = None
                 else:
+                    is_subagent_owner = False
+                    if _existing.source_channel == "subagent":
+                        # Subagent sessions are runtime-owned but may be opened
+                        # directly as a standard read-only execution record.
+                        self.read_only = True
+                        run = await db.get(SubagentRun, _existing.id)
+                        is_subagent_owner = bool(
+                            run is not None and run.execution_user_id == user_id
+                        )
                     if hasattr(agent, "tenant_id"):
                         try:
                             await require_tenant_safe_chat_session(
@@ -515,7 +565,12 @@ class WebSocketChatHandler:
                             await self.websocket.close(code=4003)
                             return None
                     self.source_channel = _existing.source_channel or self.source_channel
-                if _existing and _existing.source_channel != "agent" and str(_existing.user_id) != str(user_id):
+                if (
+                    _existing
+                    and _existing.source_channel != "agent"
+                    and str(_existing.user_id) != str(user_id)
+                    and not is_subagent_owner
+                ):
                     # Not the owner. Allow a READ-ONLY monitor connection if the
                     # viewer may see others' sessions (same gate as the REST
                     # session/message APIs: admins + the agent creator) — so any
@@ -750,25 +805,34 @@ class WebSocketChatHandler:
             # Persist the first fixed greeting, if any, in the same transaction
             # as the first real user message. Opening a session alone never
             # writes the greeting to history.
-            (
-                turn_anchor_id,
-                consumed_by_onmessage,
-                persisted_initial_assistant,
-                pending_confirmation,
-                ignored_confirmation,
-            ) = await self._save_user_message(
-                content,
-                display_content,
-                file_name,
-                is_onboarding_trigger,
-                client_message_id=client_message_id,
-                model_id=(
-                    str(effective_llm_model.id)
-                    if effective_llm_model is not None
-                    else None
-                ),
-                attachments=validated_attachments,
-            )
+            try:
+                (
+                    turn_anchor_id,
+                    consumed_by_onmessage,
+                    persisted_initial_assistant,
+                    pending_confirmation,
+                    ignored_confirmation,
+                ) = await self._save_user_message(
+                    content,
+                    display_content,
+                    file_name,
+                    is_onboarding_trigger,
+                    client_message_id=client_message_id,
+                    model_id=(
+                        str(effective_llm_model.id)
+                        if effective_llm_model is not None
+                        else None
+                    ),
+                    attachments=validated_attachments,
+                )
+            except SessionTurnBusyError:
+                await self._safe_send(
+                    {
+                        "type": "error",
+                        "content": "当前会话正在处理 Subagent 消息，请稍后重试。",
+                    }
+                )
+                continue
 
             if turn_anchor_id is not None and client_message_id:
                 await self._safe_send(
@@ -1106,6 +1170,10 @@ class WebSocketChatHandler:
                 _sess = _sess_r.scalar_one_or_none()
                 if _sess is None:
                     raise RuntimeError("chat session no longer exists")
+                if await _has_active_subagent_event_turn(db, self.conv_id):
+                    raise SessionTurnBusyError(
+                        "Subagent parent wake currently owns this session turn"
+                    )
                 initial_assistant = None
                 first_user_created_at = None
                 if self.pending_initial_assistant is not None:

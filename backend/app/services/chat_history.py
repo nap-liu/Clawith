@@ -181,6 +181,7 @@ async def load_messages_for_session(
             and (
                 row.message_meta.get("consumed_by_onmessage")
                 or row.message_meta.get("delivery_claim")
+                or row.message_meta.get("kind") == "subagent_parent_message"
             )
         )
     ]
@@ -236,7 +237,10 @@ async def load_recoverable_messages_for_turn(
         if row.id == turn_anchor_id
         or not (
             isinstance(getattr(row, "message_meta", None), dict)
-            and row.message_meta.get("consumed_by_onmessage")
+            and (
+                row.message_meta.get("consumed_by_onmessage")
+                or row.message_meta.get("kind") == "subagent_parent_message"
+            )
         )
     ]
 
@@ -252,7 +256,20 @@ async def load_recoverable_messages_for_turn(
     tail: list[Any] = []
     for row in active_rows[anchor_idx:]:
         if tail and getattr(row, "role", None) == "user":
-            break
+            # Subagent parent messages are inserted into the currently running
+            # logical turn at an LLM round boundary.  They are separate durable
+            # user rows, but carry the original turn anchor so a crashed worker
+            # can rebuild the exact same multi-round tail instead of truncating
+            # at the first injected message and replaying the task from scratch.
+            meta = (
+                row.message_meta
+                if isinstance(getattr(row, "message_meta", None), dict)
+                else {}
+            )
+            if str(meta.get("subagent_turn_anchor_id") or "") != str(
+                turn_anchor_id
+            ):
+                break
         tail.append(row)
     # Startup recovery must not invent a row boundary either. It cannot safely
     # compact/replay an already-started turn, so retain the full active prefix;
@@ -1230,6 +1247,7 @@ async def persist_assistant_reply_row(
     message_id: uuid.UUID | None = None,
     message_meta: dict[str, Any] | None = None,
     turn_anchor_id: uuid.UUID | None = None,
+    sender_agent_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
     """Persist a non-empty assistant reply in the caller's transaction."""
     if not (content or "").strip():
@@ -1247,6 +1265,7 @@ async def persist_assistant_reply_row(
         id=message_id or uuid.uuid4(),
         agent_id=agent_id,
         user_id=user_id,
+        sender_agent_id=sender_agent_id,
         role="assistant",
         content=content,
         conversation_id=conversation_id,

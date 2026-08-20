@@ -34,6 +34,7 @@ const getCategoryLabels = (t: any): Record<string, string> => ({
     feishu: t('agent.toolCategories.feishu', 'Feishu / Lark'),
     custom: t('agent.toolCategories.custom'),
     general: t('agent.toolCategories.general'),
+    subagent: t('agent.toolCategories.subagent', 'Subagent'),
     agentbay: t('agent.toolCategories.agentbay', 'AgentBay'),
     browser: t('agent.toolCategories.browser', 'Browser'),
 });
@@ -101,13 +102,23 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
 
     const toggleTool = async (toolId: string, enabled: boolean) => {
         const previous = tools;
-        setTools(prev => prev.map(t => t.id === toolId ? { ...t, enabled } : t));
+        const selected = tools.find(tool => tool.id === toolId);
+        const affectedToolIds = new Set(
+            selected?.category === 'subagent'
+                ? tools.filter(tool => tool.category === 'subagent').map(tool => tool.id)
+                : [toolId],
+        );
+        setTools(prev => prev.map(tool => (
+            affectedToolIds.has(tool.id) ? { ...tool, enabled } : tool
+        )));
         try {
             const token = localStorage.getItem('token');
             const response = await fetch(`/api/tools/agents/${agentId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                body: JSON.stringify([{ tool_id: toolId, enabled }]),
+                body: JSON.stringify(
+                    Array.from(affectedToolIds).map(id => ({ tool_id: id, enabled })),
+                ),
             });
             if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || `HTTP ${response.status}`);
             await tmQueryClient.invalidateQueries({ queryKey: ['agent', agentId] });
@@ -280,7 +291,10 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         }
         return {
             label: categoryLabels[groupKey] || groupKey,
-            description: categoryDescriptions[groupKey] || 'Tools in this category',
+            description: categoryDescriptions[groupKey] || t(
+                'agent.tools.categoryFallbackDescription',
+                'Tools in this category',
+            ),
             iconCategory: groupKey,
             configCategory: groupKey,
         };
@@ -294,6 +308,14 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         }, {});
 
     const categoryLabels = getCategoryLabels(t);
+    const localizedToolName = (tool: any) => t(
+        `agent.toolTranslations.${tool.name}.name`,
+        { defaultValue: tool.display_name || tool.name },
+    );
+    const localizedToolDescription = (tool: any) => t(
+        `agent.toolTranslations.${tool.name}.description`,
+        { defaultValue: tool.description || '' },
+    );
     const categoryDescriptions: Record<string, string> = {
         agentbay: 'Browser and cloud computer automation',
         browser: 'Isolated in-sandbox browser: read pages and run multi-step RPA',
@@ -307,6 +329,10 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         okr: 'Objectives, key results, and progress reporting',
         social: 'Social publishing and community workflows',
         discovery: 'Tool and capability discovery',
+        subagent: t(
+            'agent.toolCategoryDescriptions.subagent',
+            'Delegation and multi-round parent-child collaboration',
+        ),
         custom: 'Company-added or MCP tools',
         general: 'General purpose tools',
     };
@@ -432,6 +458,8 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         const hasConfig = tool.config_schema?.fields?.length > 0 || tool.type === 'mcp';
         const hasAgentOverride = tool.agent_config && Object.keys(tool.agent_config).length > 0;
         const isGlobalCategoryConfig = category === 'agentbay' && tool.name === 'agentbay_browser_navigate';
+        const toolDisplayName = localizedToolName(tool);
+        const toolDescription = localizedToolDescription(tool);
         return (
             <div key={tool.id} style={{
                 display: 'grid',
@@ -444,19 +472,19 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
             }}>
                 <div style={{ minWidth: 0 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px', minWidth: 0 }}>
-                        <span style={{ fontWeight: 500, fontSize: '13px', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{tool.display_name}</span>
+                        <span style={{ fontWeight: 500, fontSize: '13px', color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{toolDisplayName}</span>
                         {tool.type === 'mcp' && (
                             <span style={{ fontSize: '10px', background: 'var(--primary)', color: '#fff', borderRadius: '4px', padding: '1px 5px', flexShrink: 0 }}>MCP</span>
                         )}
                         {tool.type === 'builtin' && (
-                            <span style={{ fontSize: '10px', background: 'var(--bg-tertiary)', color: 'var(--text-secondary)', borderRadius: '4px', padding: '1px 5px', flexShrink: 0 }}>Built-in</span>
+                            <span style={{ fontSize: '10px', background: 'var(--bg-tertiary)', color: 'var(--text-secondary)', borderRadius: '4px', padding: '1px 5px', flexShrink: 0 }}>{t('agent.tools.builtin', 'Built-in')}</span>
                         )}
                         {hasAgentOverride && (
                             <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px', flexShrink: 0 }}>{t('enterprise.tools.configured', 'Configured')}</span>
                         )}
                     </div>
                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {tool.description}
+                        {toolDescription}
                         {tool.mcp_server_name && <span> · {tool.mcp_server_name}</span>}
                     </div>
                 </div>
@@ -525,7 +553,7 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                         <ToggleSwitch
                             checked={tool.enabled}
                             onChange={(checked) => void toggleTool(tool.id, checked)}
-                            ariaLabel={`${tool.display_name || tool.name} ${tool.enabled ? t('common.enabled', 'On') : t('common.disabled', 'Off')}`}
+                            ariaLabel={`${toolDisplayName} ${tool.enabled ? t('common.enabled', 'On') : t('common.disabled', 'Off')}`}
                         />
                     ) : (
                         <span style={{ fontSize: '11px', color: tool.enabled ? 'var(--accent-primary)' : 'var(--text-tertiary)', fontWeight: 500 }}>
@@ -632,12 +660,24 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                                         <span style={{ fontSize: '13px', fontWeight: 650, color: 'var(--text-primary)' }}>{label}</span>
                                         <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                            {allCatTools.length} tools · {enabledCount} enabled
-                                            {visibleCount !== allCatTools.length ? ` · ${visibleCount} shown` : ''}
+                                            {t('agent.tools.groupSummary', {
+                                                total: allCatTools.length,
+                                                enabled: enabledCount,
+                                                defaultValue: '{{total}} tools · {{enabled}} enabled',
+                                            })}
+                                            {visibleCount !== allCatTools.length
+                                                ? ` · ${t('agent.tools.groupShown', {
+                                                    count: visibleCount,
+                                                    defaultValue: '{{count}} shown',
+                                                })}`
+                                                : ''}
                                         </span>
                                         {configuredCount > 0 && (
                                             <span style={{ fontSize: '10px', background: 'rgba(99,102,241,0.15)', color: 'var(--accent-color)', borderRadius: '4px', padding: '1px 5px' }}>
-                                                {configuredCount} configured
+                                                {t('agent.tools.groupConfigured', {
+                                                    count: configuredCount,
+                                                    defaultValue: '{{count}} configured',
+                                                })}
                                             </span>
                                         )}
                                     </div>
@@ -698,8 +738,8 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         const category = tool.category || 'general';
         const haystack = [
             tool.name,
-            tool.display_name,
-            tool.description,
+            localizedToolName(tool),
+            localizedToolDescription(tool),
             tool.mcp_server_name,
             category,
             categoryLabels[category],
