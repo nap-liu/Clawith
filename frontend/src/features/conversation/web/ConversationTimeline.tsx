@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
@@ -53,6 +53,7 @@ export type ConversationTimelineProps = {
     onPreviewImages?: (images: ChatPreviewImage[], index: number) => void;
     onToolResolved?: (message: ConversationMessage, result: string) => void;
     scrollerRef?: React.RefObject<HTMLElement | null>;
+    resumeMeasurementKey?: string | number | null;
     provenance?: {
         source?: string;
         status?: string;
@@ -261,6 +262,7 @@ export default function ConversationTimeline({
     onPreviewImages,
     onToolResolved,
     scrollerRef,
+    resumeMeasurementKey,
     provenance,
 }: ConversationTimelineProps) {
     const { t, i18n } = useTranslation();
@@ -299,6 +301,26 @@ export default function ConversationTimeline({
         overscan: 8,
         enabled: virtualizeEntries,
     });
+    useEffect(() => {
+        if (!virtualizeEntries || resumeMeasurementKey == null || document.hidden) return;
+        const measureMountedRows = () => {
+            scrollerRef?.current
+                ?.querySelectorAll<HTMLElement>('.conversation-timeline__virtual-row')
+                .forEach((element) => rowVirtualizer.measureElement(element));
+        };
+        let secondFrame: number | null = null;
+        const firstFrame = window.requestAnimationFrame(() => {
+            measureMountedRows();
+            // The history reconciliation and Markdown layout can commit in the
+            // same foreground transition. A second frame catches that layout
+            // without clearing offscreen measurements or measuring every chunk.
+            secondFrame = window.requestAnimationFrame(measureMountedRows);
+        });
+        return () => {
+            window.cancelAnimationFrame(firstFrame);
+            if (secondFrame != null) window.cancelAnimationFrame(secondFrame);
+        };
+    }, [resumeMeasurementKey, rowVirtualizer, scrollerRef, virtualizeEntries]);
     const renderEntry = (entry: (typeof entries)[number], index: number) => {
         if (entry.type === 'analysis_group') {
             const owner = analysisOwners.get(entry.key);

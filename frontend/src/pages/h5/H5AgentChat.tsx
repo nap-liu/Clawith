@@ -28,6 +28,16 @@ import {
     createConversationHistoryPageParams,
     resolveConversationHistoryHasMore,
 } from '../../features/conversation/historyPagination';
+import {
+    bufferResumeEvent,
+    createOrReuseResumeEventGate,
+    drainResumeEventGate,
+    prepareMessagesForActiveTurnResume,
+    resolveVisibleTerminalRecoveryAction,
+    shouldCompleteRecoveryPolling,
+    shouldScheduleResumeReconnect,
+    type ResumeEventGate,
+} from '../../features/conversation/core/resumeRecovery';
 import { useToast } from '../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../stores';
 import {
@@ -106,6 +116,7 @@ import './H5AgentChat.css';
 
 type AuthStatus = 'checking' | 'exchanging' | 'ready' | 'error';
 type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'disconnected';
+type BufferedH5SocketEvent = { data: any; socket: WebSocket };
 type H5UploadDraft = { id: string; name: string; percent: number; previewUrl?: string; sizeBytes: number };
 type H5SessionSummary = {
     id: string;
@@ -432,6 +443,7 @@ export default function H5AgentChat() {
     const reconnectTimerRef = useRef<number | null>(null);
     const resumeReconnectTimerRef = useRef<number | null>(null);
     const recoveryPollTimerRef = useRef<number | null>(null);
+    const recoveryPollingGenerationRef = useRef(0);
     const recoveryPollingNeededRef = useRef(false);
     const nativeNavigationFallbackTimerRef = useRef<number | null>(null);
     const socketConnectTimerRef = useRef<number | null>(null);
@@ -466,7 +478,55 @@ export default function H5AgentChat() {
     const olderHistoryLoadRef = useRef<AbortController | null>(null);
     const streamBatchRef = useRef<H5AssistantStreamMessage[]>([]);
     const streamBatchTimerRef = useRef<number | null>(null);
+    const resumeEventGateRef = useRef<ResumeEventGate<BufferedH5SocketEvent> | null>(null);
+    const resumeEventGateGenerationRef = useRef(0);
+    const resumeEventConsumerRef = useRef<(event: BufferedH5SocketEvent) => void>(() => undefined);
+    const resumeCleanupNeededRef = useRef(false);
+    const resumeReconcilePromiseRef = useRef<Promise<void> | null>(null);
+    const recoverActiveSessionRef = useRef<() => void>(() => undefined);
+    const scheduleReconnectRef = useRef<() => void>(() => undefined);
     generationActiveRef.current = isWaiting || isStreaming || isStopping;
+
+    const beginResumeEventGate = useCallback((runtimeKey: string) => {
+        const activeGate = resumeEventGateRef.current;
+        const nextGeneration = resumeEventGateGenerationRef.current + 1;
+        const { gate, displacedEvents } = createOrReuseResumeEventGate<BufferedH5SocketEvent>(
+            activeGate,
+            runtimeKey,
+            nextGeneration,
+        );
+        if (gate !== activeGate) resumeEventGateGenerationRef.current = nextGeneration;
+        resumeEventGateRef.current = gate;
+        displacedEvents.forEach((event) => resumeEventConsumerRef.current(event));
+        return gate;
+    }, []);
+
+    const finishResumeEventGate = useCallback((
+        gate: ResumeEventGate<BufferedH5SocketEvent>,
+        replay: boolean,
+    ) => {
+        if (resumeEventGateRef.current !== gate) return;
+        resumeEventGateRef.current = null;
+        const events = drainResumeEventGate(gate);
+        if (replay) events.forEach((event) => resumeEventConsumerRef.current(event));
+    }, []);
+
+    const releaseResumeReconcileOwner = useCallback((
+        owner: Promise<void>,
+        ownerSessionId: string,
+    ) => {
+        if (resumeReconcilePromiseRef.current !== owner) return;
+        resumeReconcilePromiseRef.current = null;
+        if (sessionIdRef.current !== ownerSessionId) return;
+        if (shouldScheduleResumeReconnect({
+            pageSuspended: pageSuspendedRef.current,
+            unmounted: unmountedRef.current,
+            hidden: document.hidden,
+            socketReadyState: wsRef.current?.readyState,
+        })) {
+            scheduleReconnectRef.current();
+        }
+    }, []);
 
     const cancelHistoryLoad = useCallback(() => {
         historyLoadGenerationRef.current += 1;
@@ -691,7 +751,9 @@ export default function H5AgentChat() {
             unmountedRef.current = true;
             if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
             if (resumeReconnectTimerRef.current) window.clearTimeout(resumeReconnectTimerRef.current);
+            recoveryPollingGenerationRef.current += 1;
             if (recoveryPollTimerRef.current) window.clearTimeout(recoveryPollTimerRef.current);
+            recoveryPollTimerRef.current = null;
             if (nativeNavigationFallbackTimerRef.current) {
                 window.clearTimeout(nativeNavigationFallbackTimerRef.current);
             }
@@ -952,7 +1014,10 @@ export default function H5AgentChat() {
         };
     }, [agentId, channel, sessions]);
 
-    const loadHistory = useCallback((nextSessionId: string): Promise<boolean> => {
+    const loadHistory = useCallback((
+        nextSessionId: string,
+        options: { prepareActiveTurnResume?: boolean } = {},
+    ): Promise<boolean> => {
         if (!agentId || !token) return Promise.resolve(false);
         if (historyLoadedSessionRef.current === nextSessionId) return Promise.resolve(true);
         const current = historyLoadRef.current;
@@ -970,6 +1035,7 @@ export default function H5AgentChat() {
         }
 
         const controller = new AbortController();
+        const historyTimeout = window.setTimeout(() => controller.abort(), 10000);
         const generation = ++historyLoadGenerationRef.current;
         const promise = (async () => {
             try {
@@ -1018,9 +1084,14 @@ export default function H5AgentChat() {
                 const history = normalized.reverse().filter((msg) => (
                     !msg.toolCallId || (!seenToolCalls.has(msg.toolCallId) && !!seenToolCalls.add(msg.toolCallId))
                 )).reverse();
-                setMessages((prev) => startsNewPagination
-                    ? mergeHistoryMessages(prev, history)
-                    : reconcileLatestHistoryWindow(prev, history));
+                setMessages((prev) => {
+                    const prepared = options.prepareActiveTurnResume
+                        ? prepareMessagesForActiveTurnResume(prev)
+                        : prev;
+                    return startsNewPagination
+                        ? mergeHistoryMessages(prepared, history)
+                        : reconcileLatestHistoryWindow(prepared, history);
+                });
                 if (startsNewPagination || !overlapFound || !historyOldestCursorRef.current) {
                     const oldestRow = collectedRows[0];
                     const oldestCursor = responseCursor || (oldestRow?.created_at
@@ -1038,6 +1109,7 @@ export default function H5AgentChat() {
                 if (error?.name !== 'AbortError') console.warn('Failed to load H5 chat history', error);
                 return false;
             } finally {
+                window.clearTimeout(historyTimeout);
                 if (historyLoadRef.current?.controller === controller) historyLoadRef.current = null;
             }
         })();
@@ -1147,6 +1219,7 @@ export default function H5AgentChat() {
     }, [loadHistory]);
 
     const cancelRecoveryPolling = useCallback(() => {
+        recoveryPollingGenerationRef.current += 1;
         if (recoveryPollTimerRef.current !== null) {
             window.clearTimeout(recoveryPollTimerRef.current);
             recoveryPollTimerRef.current = null;
@@ -1155,25 +1228,63 @@ export default function H5AgentChat() {
 
     const startRecoveryPolling = useCallback(() => {
         cancelRecoveryPolling();
+        const pollingGeneration = recoveryPollingGenerationRef.current;
         const delays = [1000, 2000, 4000, 8000, 16000, 30000];
         let attempt = 0;
+        let successfulLoads = 0;
         const poll = () => {
             const activeSessionId = sessionIdRef.current;
             if (
-                !recoveryPollingNeededRef.current
+                pollingGeneration !== recoveryPollingGenerationRef.current
+                || !recoveryPollingNeededRef.current
                 || pageSuspendedRef.current
                 || unmountedRef.current
                 || document.visibilityState === 'hidden'
                 || !activeSessionId
             ) return;
+            if (resumeReconcilePromiseRef.current) {
+                if (pollingGeneration !== recoveryPollingGenerationRef.current) return;
+                recoveryPollTimerRef.current = window.setTimeout(poll, 500);
+                return;
+            }
             historyLoadedSessionRef.current = null;
-            void loadHistoryRef.current(activeSessionId).finally(() => {
+            const gate = beginResumeEventGate(activeSessionId);
+            let loadedSuccessfully = false;
+            const promise = loadHistoryRef.current(activeSessionId, {
+                prepareActiveTurnResume: resumeCleanupNeededRef.current,
+            }).then((loaded) => {
+                loadedSuccessfully = loaded;
+                if (loaded) {
+                    successfulLoads += 1;
+                    resumeCleanupNeededRef.current = false;
+                }
+            }).finally(() => {
+                const stillActive = !pageSuspendedRef.current
+                    && !unmountedRef.current
+                    && !document.hidden
+                    && sessionIdRef.current === activeSessionId;
+                finishResumeEventGate(gate, stillActive);
+                releaseResumeReconcileOwner(promise, activeSessionId);
+                if (pollingGeneration !== recoveryPollingGenerationRef.current) return;
+                if (shouldCompleteRecoveryPolling({
+                    pollingGeneration,
+                    currentGeneration: recoveryPollingGenerationRef.current,
+                    loadedSuccessfully,
+                    successfulLoads,
+                    stillActive,
+                    socketReadyState: wsRef.current?.readyState,
+                })) {
+                    recoveryPollingNeededRef.current = false;
+                    recoveryPollTimerRef.current = null;
+                    return;
+                }
                 if (!recoveryPollingNeededRef.current || attempt >= delays.length) return;
                 recoveryPollTimerRef.current = window.setTimeout(poll, delays[attempt++]);
             });
+            resumeReconcilePromiseRef.current = promise;
         };
         recoveryPollTimerRef.current = window.setTimeout(poll, delays[attempt++]);
-    }, [cancelRecoveryPolling]);
+    }, [beginResumeEventGate, cancelRecoveryPolling, finishResumeEventGate, releaseResumeReconcileOwner]);
 
     useEffect(() => {
         if (
@@ -1273,9 +1384,25 @@ export default function H5AgentChat() {
         const delay = Math.min(12000, 900 * 2 ** attempt);
         reconnectTimerRef.current = window.setTimeout(() => {
             reconnectTimerRef.current = null;
-            openSocketRef.current(sessionIdRef.current);
+            const socket = wsRef.current;
+            if (socket && (
+                socket.readyState === WebSocket.OPEN
+                || socket.readyState === WebSocket.CONNECTING
+            )) return;
+            if (recoveryPollingNeededRef.current || resumeCleanupNeededRef.current) {
+                recoverActiveSessionRef.current();
+            } else {
+                openSocketRef.current(sessionIdRef.current);
+            }
         }, delay);
     }, [agentId, token]);
+
+    useEffect(() => {
+        scheduleReconnectRef.current = scheduleReconnect;
+        return () => {
+            scheduleReconnectRef.current = () => undefined;
+        };
+    }, [scheduleReconnect]);
 
     const handleSocketMessage = useCallback((data: any, socket: WebSocket) => {
         const isTerminalEvent = ['done', 'error', 'quota_exceeded', 'confirmation_required'].includes(data.type);
@@ -1294,8 +1421,16 @@ export default function H5AgentChat() {
         }
         if (isTerminalEvent) {
             generationActiveRef.current = false;
-            recoveryPollingNeededRef.current = false;
-            cancelRecoveryPolling();
+            const recoveryAction = resolveVisibleTerminalRecoveryAction({
+                isActiveRuntime: true,
+                recoveryNeeded: recoveryPollingNeededRef.current,
+            });
+            if (recoveryAction === 'continue') {
+                startRecoveryPolling();
+            } else {
+                recoveryPollingNeededRef.current = false;
+                cancelRecoveryPolling();
+            }
         }
         if (data.type !== 'thinking' && data.type !== 'chunk') flushStreamBatch();
         if (data.type === 'connected' && data.session_id) {
@@ -1440,6 +1575,8 @@ export default function H5AgentChat() {
         }
     }, [cancelRecoveryPolling, clearSocketConnectTimer, enqueueStreamEvent, flushStreamBatch, loadHistory, normalizeHistoryMessage, refreshSceneManifest]);
 
+    resumeEventConsumerRef.current = ({ data, socket }) => handleSocketMessage(data, socket);
+
     const openSocket = useCallback((requestedSessionId?: string | null) => {
         if (
             !agentId
@@ -1473,6 +1610,12 @@ export default function H5AgentChat() {
             scheduleReconnect();
             return;
         }
+        let resolveServerConnected: (connected: boolean) => void = () => undefined;
+        (ws as any)._serverConnected = false;
+        (ws as any)._serverConnectedPromise = new Promise<boolean>((resolve) => {
+            resolveServerConnected = resolve;
+        });
+        (ws as any)._runtimeSessionId = effectiveSessionId ? String(effectiveSessionId) : '';
         wsRef.current = ws;
         socketConnectTimerRef.current = window.setTimeout(() => {
             if (wsRef.current !== ws) return;
@@ -1484,22 +1627,37 @@ export default function H5AgentChat() {
         }, 10000);
 
         ws.onopen = () => {
+            if (wsRef.current !== ws) return;
             reconnectAttemptRef.current = 0;
         };
 
         ws.onmessage = (event) => {
+            if (wsRef.current !== ws) return;
             try {
-                handleSocketMessage(JSON.parse(event.data), ws);
+                const data = JSON.parse(event.data);
+                if (data.type === 'connected') {
+                    (ws as any)._serverConnected = true;
+                    if (data.session_id) (ws as any)._runtimeSessionId = String(data.session_id);
+                    resolveServerConnected(true);
+                }
+                const runtimeKey = String((ws as any)._runtimeSessionId || effectiveSessionId || '');
+                if (
+                    data.type !== 'connected'
+                    && bufferResumeEvent(resumeEventGateRef.current, runtimeKey, { data, socket: ws })
+                ) return;
+                handleSocketMessage(data, ws);
             } catch {
                 // Ignore malformed server frames.
             }
         };
 
         ws.onerror = () => {
+            if (wsRef.current !== ws) return;
             setConnectionStatus('disconnected');
         };
 
         ws.onclose = () => {
+            resolveServerConnected(false);
             if (wsRef.current !== ws) return;
             const turnWasActive = generationActiveRef.current;
             if (turnWasActive) {
@@ -1516,6 +1674,7 @@ export default function H5AgentChat() {
             scheduleReconnect();
             if (turnWasActive && !pageSuspendedRef.current) startRecoveryPolling();
         };
+        return ws;
     }, [
         agentId,
         channel,
@@ -1528,10 +1687,97 @@ export default function H5AgentChat() {
         token,
     ]);
 
+    const waitForSocketServerConnection = useCallback(async (socket: WebSocket | undefined) => {
+        if (!socket) return false;
+        if ((socket as any)._serverConnected === true) return true;
+        const connection = (socket as any)._serverConnectedPromise as Promise<boolean> | undefined;
+        if (!connection) return false;
+        let timeout: ReturnType<typeof setTimeout> | null = null;
+        try {
+            return await Promise.race([
+                connection,
+                new Promise<boolean>((resolve) => {
+                    timeout = setTimeout(() => resolve(false), 5000);
+                }),
+            ]);
+        } finally {
+            if (timeout) clearTimeout(timeout);
+        }
+    }, []);
+
     const openSocketRef = useRef(openSocket);
     useEffect(() => {
         openSocketRef.current = openSocket;
     }, [openSocket]);
+
+    const recoverActiveSession = useCallback(() => {
+        if (resumeReconcilePromiseRef.current) return resumeReconcilePromiseRef.current;
+        const activeSessionId = sessionIdRef.current;
+        if (
+            !activeSessionId
+            || pageSuspendedRef.current
+            || unmountedRef.current
+            || document.hidden
+        ) return Promise.resolve();
+
+        cancelRecoveryPolling();
+        hiddenDroppedEventRef.current = false;
+        hiddenTerminalEventRef.current = false;
+        historyLoadedSessionRef.current = null;
+        const gate = beginResumeEventGate(activeSessionId);
+        const promise = (async () => {
+            const existing = wsRef.current;
+            let socket = existing && (
+                existing.readyState === WebSocket.OPEN
+                || existing.readyState === WebSocket.CONNECTING
+            ) ? existing : undefined;
+            if (!socket) {
+                skipNextConnectedHistoryRef.current = activeSessionId;
+                socket = openSocketRef.current(activeSessionId);
+            }
+            await waitForSocketServerConnection(socket);
+            if (
+                pageSuspendedRef.current
+                || unmountedRef.current
+                || document.hidden
+                || sessionIdRef.current !== activeSessionId
+            ) {
+                finishResumeEventGate(gate, false);
+                return;
+            }
+            const loaded = await loadHistoryRef.current(activeSessionId, {
+                prepareActiveTurnResume: resumeCleanupNeededRef.current,
+            });
+            if (loaded) resumeCleanupNeededRef.current = false;
+            const stillActive = !pageSuspendedRef.current
+                && !unmountedRef.current
+                && !document.hidden
+                && sessionIdRef.current === activeSessionId;
+            finishResumeEventGate(gate, stillActive);
+            if (stillActive && recoveryPollingNeededRef.current) startRecoveryPolling();
+        })().finally(() => {
+            // A reconnect timer can fire while either this coordinator or a
+            // recovery poll owns the shared promise. Releasing through one
+            // path guarantees the deduped socket retry is never lost.
+            releaseResumeReconcileOwner(promise, activeSessionId);
+        });
+        resumeReconcilePromiseRef.current = promise;
+        return promise;
+    }, [
+        beginResumeEventGate,
+        cancelRecoveryPolling,
+        finishResumeEventGate,
+        releaseResumeReconcileOwner,
+        startRecoveryPolling,
+        waitForSocketServerConnection,
+    ]);
+
+    useEffect(() => {
+        recoverActiveSessionRef.current = () => { void recoverActiveSession(); };
+        return () => {
+            recoverActiveSessionRef.current = () => undefined;
+        };
+    }, [recoverActiveSession]);
 
     useEffect(() => {
         if (authStatus !== 'ready' || !agent || !token) return;
@@ -1544,6 +1790,8 @@ export default function H5AgentChat() {
         onSuspend: () => {
             pageSuspendedRef.current = true;
             setPageActive(false);
+            const activeGate = resumeEventGateRef.current;
+            if (activeGate) finishResumeEventGate(activeGate, false);
             cancelHistoryLoad();
             discardStreamBatch();
             cancelAutoFollowRef.current();
@@ -1560,7 +1808,10 @@ export default function H5AgentChat() {
                 window.clearTimeout(nativeNavigationFallbackTimerRef.current);
                 nativeNavigationFallbackTimerRef.current = null;
             }
-            if (generationActiveRef.current) recoveryPollingNeededRef.current = true;
+            if (generationActiveRef.current) {
+                recoveryPollingNeededRef.current = true;
+                resumeCleanupNeededRef.current = true;
+            }
             generationActiveRef.current = false;
             historyLoadedSessionRef.current = null;
             closeCurrentSocket();
@@ -1586,32 +1837,25 @@ export default function H5AgentChat() {
             if (resumeReconnectTimerRef.current) {
                 window.clearTimeout(resumeReconnectTimerRef.current);
             }
-            const socket = wsRef.current;
-            if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-                if (hiddenDroppedEventRef.current) {
-                    hiddenDroppedEventRef.current = false;
-                    historyLoadedSessionRef.current = null;
-                }
-                if (hiddenTerminalEventRef.current) {
-                    hiddenTerminalEventRef.current = false;
-                    setIsWaiting(false);
-                    setIsStreaming(false);
-                    setIsStopping(false);
-                    setOnboardingKickoffRequest(null);
-                }
-                if (!historyLoadedSessionRef.current && sessionIdRef.current) {
-                    void loadHistoryRef.current(sessionIdRef.current);
-                }
-                if (recoveryPollingNeededRef.current) startRecoveryPolling();
+            if (!sessionIdRef.current) {
+                openSocketRef.current(null);
                 return;
             }
             resumeReconnectTimerRef.current = window.setTimeout(() => {
                 resumeReconnectTimerRef.current = null;
-                openSocketRef.current(sessionIdRef.current);
+                recoverActiveSessionRef.current();
             }, 50);
-            if (recoveryPollingNeededRef.current) startRecoveryPolling();
         },
-    }), [agent, authStatus, cancelHistoryLoad, cancelRecoveryPolling, closeCurrentSocket, discardStreamBatch, startRecoveryPolling, token]);
+    }), [
+        agent,
+        authStatus,
+        cancelHistoryLoad,
+        cancelRecoveryPolling,
+        closeCurrentSocket,
+        discardStreamBatch,
+        finishResumeEventGate,
+        token,
+    ]);
 
     const recoverFromNativeNavigation = useCallback(() => {
         if (nativeNavigationFallbackTimerRef.current) {
@@ -1626,7 +1870,7 @@ export default function H5AgentChat() {
             || unmountedRef.current
         ) return;
         pageSuspendedRef.current = false;
-        openSocketRef.current(sessionIdRef.current);
+        recoverActiveSessionRef.current();
     }, [agent, authStatus, token]);
 
     const prepareForNativeNavigation = useCallback(() => {
@@ -1672,6 +1916,23 @@ export default function H5AgentChat() {
         loadSessions();
     }, [loadSessions]);
 
+    const resetResumeRecoveryForSessionChange = useCallback(() => {
+        recoveryPollingNeededRef.current = false;
+        resumeCleanupNeededRef.current = false;
+        cancelRecoveryPolling();
+        resumeReconcilePromiseRef.current = null;
+        const gate = resumeEventGateRef.current;
+        if (gate) finishResumeEventGate(gate, false);
+        if (reconnectTimerRef.current) {
+            window.clearTimeout(reconnectTimerRef.current);
+            reconnectTimerRef.current = null;
+        }
+        if (resumeReconnectTimerRef.current) {
+            window.clearTimeout(resumeReconnectTimerRef.current);
+            resumeReconnectTimerRef.current = null;
+        }
+    }, [cancelRecoveryPolling, finishResumeEventGate]);
+
     const activateSession = useCallback(async (nextSessionId: string) => {
         if (!nextSessionId) return;
         if (isWaiting || isStreaming || isStopping) {
@@ -1691,8 +1952,7 @@ export default function H5AgentChat() {
         setUploadError('');
         setAttachedFiles([]);
         discardStreamBatch();
-        recoveryPollingNeededRef.current = false;
-        cancelRecoveryPolling();
+        resetResumeRecoveryForSessionChange();
         clearUploadDrafts(true);
         sessionIdRef.current = nextSessionId;
         setSessionId(nextSessionId);
@@ -1705,7 +1965,7 @@ export default function H5AgentChat() {
             openSocket(nextSessionId);
             setIsSwitchingSession(false);
         }, 0);
-    }, [cancelRecoveryPolling, clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStopping, isStreaming, isWaiting, loadHistory, openSocket]);
+    }, [clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStopping, isStreaming, isWaiting, loadHistory, openSocket, resetResumeRecoveryForSessionChange]);
 
     const startNewSession = useCallback(async () => {
         if (!agentId || isStartingNew) return;
@@ -1716,12 +1976,11 @@ export default function H5AgentChat() {
         setUploadError('');
         setAttachedFiles([]);
         discardStreamBatch();
-        recoveryPollingNeededRef.current = false;
-        cancelRecoveryPolling();
         clearUploadDrafts(true);
         try {
             const session = await chatSessionApi.create(agentId, { source_channel: channel });
             const nextSessionId = String(session.id);
+            resetResumeRecoveryForSessionChange();
             const summary = normalizeH5SessionSummary(session);
             sessionIdRef.current = nextSessionId;
             setSessionId(nextSessionId);
@@ -1754,7 +2013,7 @@ export default function H5AgentChat() {
         } finally {
             setIsStartingNew(false);
         }
-    }, [agentId, cancelRecoveryPolling, channel, clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStartingNew, openSocket]);
+    }, [agentId, channel, clearUploadDrafts, closeCurrentSocket, discardStreamBatch, isStartingNew, openSocket, resetResumeRecoveryForSessionChange]);
 
     const stopGeneration = useCallback(() => {
         const ws = wsRef.current;
@@ -1994,6 +2253,23 @@ export default function H5AgentChat() {
         overscan: 8,
         enabled: virtualizeMessages,
     });
+    useEffect(() => {
+        if (!virtualizeMessages || pageResumeRevision === 0 || document.hidden) return;
+        const measureMountedRows = () => {
+            messagesScrollerRef.current
+                ?.querySelectorAll<HTMLElement>('.h5-chat__virtual-row')
+                .forEach((element) => rowVirtualizer.measureElement(element));
+        };
+        let secondFrame: number | null = null;
+        const firstFrame = window.requestAnimationFrame(() => {
+            measureMountedRows();
+            secondFrame = window.requestAnimationFrame(measureMountedRows);
+        });
+        return () => {
+            window.cancelAnimationFrame(firstFrame);
+            if (secondFrame != null) window.cancelAnimationFrame(secondFrame);
+        };
+    }, [pageResumeRevision, rowVirtualizer, virtualizeMessages]);
     const alignH5ConversationBottom = useCallback((scroller: HTMLElement) => {
         if (virtualizeMessages && virtualItemCount > 0) {
             rowVirtualizer.scrollToIndex(virtualItemCount - 1, { align: 'end' });

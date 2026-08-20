@@ -20,6 +20,16 @@ import ModelSwitcher from '../../components/ModelSwitcher';
 import { getChatToolRenderType } from '../../components/ChatToolCallRenderer';
 import ConversationScrollToBottomButton from '../../features/conversation/ConversationScrollToBottomButton';
 import ConversationTimeline from '../../features/conversation/web/ConversationTimeline';
+import {
+    bufferResumeEvent,
+    createOrReuseResumeEventGate,
+    drainResumeEventGate,
+    prepareMessagesForActiveTurnResume,
+    resolveVisibleTerminalRecoveryAction,
+    shouldCompleteRecoveryPolling,
+    shouldScheduleResumeReconnect,
+    type ResumeEventGate,
+} from '../../features/conversation/core/resumeRecovery';
 import { buildConversationEntries, getConversationScrollAnchor } from '../../features/conversation/core/chatTimeline';
 import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
 import {
@@ -133,6 +143,11 @@ const formatReflectionTitle = (value: string | undefined, isZh: boolean) => {
 };
 const safeDisplayIcon = (icon?: string | null, fallback: React.ReactNode = <IconTools size={18} stroke={1.8} />) =>
     icon && !EMOJI_RE.test(icon) ? icon : fallback;
+
+// React Router unmounts this page while an agent turn can keep running on the
+// server. Keep only the affected runtime keys long enough for the next mount to
+// close the durable-history gap; ordinary completed sessions never enter here.
+const pendingPcRouteRecoveryRuntimeKeys = new Set<string>();
 
 type FocusItem = {
     id: string;
@@ -1826,11 +1841,32 @@ export default function AgentDetailPage() {
     const pcHiddenDroppedEventRef = useRef(false);
     const pcRecoveryPollingNeededRef = useRef(false);
     const pcRecoveryPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const startPcRecoveryPollingRef = useRef<(session: any, scope: 'mine' | 'all') => void>(() => undefined);
+    const pcRecoveryPollingGenerationRef = useRef(0);
+    const startPcRecoveryPollingRef = useRef<(
+        session: any,
+        scope: 'mine' | 'all',
+    ) => void>(() => undefined);
+    type BufferedPcSocketEvent = { data: any; consume: (data: any) => void };
+    const pcResumeEventGateRef = useRef<ResumeEventGate<BufferedPcSocketEvent> | null>(null);
+    const pcResumeGenerationRef = useRef(0);
+    const pcResumeReconcilePromiseRef = useRef<Promise<void> | null>(null);
+    const ensureSessionSocketRef = useRef<(
+        session: any,
+        agentId: string,
+        authToken: string,
+    ) => WebSocket | undefined>(() => undefined);
+    const pcResumeHadActiveTurnRef = useRef(false);
     const cancelPcAutoFollowRef = useRef<() => void>(() => undefined);
     const [pcPageActive, setPcPageActive] = useState(() => !document.hidden);
+    const [pcResumeMeasurementKey, setPcResumeMeasurementKey] = useState<number | null>(null);
 
     const buildSessionRuntimeKey = (agentId: string, sessionId: string) => `${agentId}:${sessionId}`;
+
+    const cancelPcRecoveryPolling = () => {
+        pcRecoveryPollingGenerationRef.current += 1;
+        if (pcRecoveryPollTimerRef.current) clearTimeout(pcRecoveryPollTimerRef.current);
+        pcRecoveryPollTimerRef.current = null;
+    };
 
     const clearReconnectTimer = (key: SessionRuntimeKey) => {
         const timer = reconnectTimerRef.current[key];
@@ -1838,6 +1874,54 @@ export default function AgentDetailPage() {
             clearTimeout(timer);
             reconnectTimerRef.current[key] = null;
         }
+    };
+
+    const beginPcResumeEventGate = (runtimeKey: SessionRuntimeKey) => {
+        const activeGate = pcResumeEventGateRef.current;
+        const nextGeneration = pcResumeGenerationRef.current + 1;
+        const { gate, displacedEvents } = createOrReuseResumeEventGate<BufferedPcSocketEvent>(
+            activeGate,
+            runtimeKey,
+            nextGeneration,
+        );
+        if (gate !== activeGate) pcResumeGenerationRef.current = nextGeneration;
+        pcResumeEventGateRef.current = gate;
+        displacedEvents.forEach(({ data, consume }) => consume(data));
+        return gate;
+    };
+
+    const finishPcResumeEventGate = (
+        gate: ResumeEventGate<BufferedPcSocketEvent>,
+        replay: boolean,
+    ) => {
+        if (pcResumeEventGateRef.current !== gate) return;
+        pcResumeEventGateRef.current = null;
+        const events = drainResumeEventGate(gate);
+        if (!replay) return;
+        events.forEach(({ data, consume }) => consume(data));
+    };
+
+    const releasePcResumeReconcileOwner = (
+        owner: Promise<void>,
+        session: any,
+        ownerAgentId: string,
+        ownerToken: string,
+    ) => {
+        if (pcResumeReconcilePromiseRef.current !== owner) return;
+        pcResumeReconcilePromiseRef.current = null;
+        const runtimeKey = buildSessionRuntimeKey(ownerAgentId, String(session.id));
+        if (
+            String(currentAgentIdRef.current || '') !== ownerAgentId
+            || String(activeSessionIdRef.current || '') !== String(session.id)
+            || !shouldScheduleResumeReconnect({
+                pageSuspended: pcPageSuspendedRef.current,
+                unmounted: false,
+                hidden: document.hidden,
+                socketReadyState: wsMapRef.current[runtimeKey]?.readyState,
+            })
+        ) return;
+        reconnectDisabledRef.current[runtimeKey] = false;
+        ensureSessionSocketRef.current(session, ownerAgentId, ownerToken);
     };
 
     const closeSessionSocket = (key: SessionRuntimeKey, disableReconnect = true) => {
@@ -2031,21 +2115,18 @@ export default function AgentDetailPage() {
     const selectSession = async (
         rawSess: any,
         scopeOverride: 'mine' | 'all' = chatScope,
-        options: { preserveLoadedHistory?: boolean } = {},
+        options: { preserveLoadedHistory?: boolean; prepareWebResume?: boolean } = {},
     ) => {
         const sess = normalizeChatSession(rawSess);
         const targetAgentId = id;
-        if (!targetAgentId) return;
+        if (!targetAgentId) return false;
         const preserveLoadedHistory = Boolean(
             options.preserveLoadedHistory
             && String(activeSessionIdRef.current || '') === String(sess.id),
         );
         if (!preserveLoadedHistory) {
             pcRecoveryPollingNeededRef.current = false;
-            if (pcRecoveryPollTimerRef.current) {
-                clearTimeout(pcRecoveryPollTimerRef.current);
-                pcRecoveryPollTimerRef.current = null;
-            }
+            cancelPcRecoveryPolling();
         }
         discardChatStreamBatch();
         discardMonitorStreamBatch();
@@ -2076,6 +2157,7 @@ export default function AgentDetailPage() {
         historyMoreAbortRef.current = null;
         const controller = new AbortController();
         sessionMsgAbortRef.current = controller;
+        const historyTimeout = window.setTimeout(() => controller.abort(), 10000);
         const loadSeq = ++sessionLoadSeqRef.current;
         try {
             const tkn = localStorage.getItem('token');
@@ -2111,13 +2193,13 @@ export default function AgentDetailPage() {
                     headers: { Authorization: `Bearer ${tkn}` },
                     signal: controller.signal,
                 });
-                if (!res.ok) return;
+                if (!res.ok) return false;
                 const pageCursor = res.headers.get('X-Message-Next-Cursor');
                 const pageHasMore = res.headers.get('X-Message-Has-More');
                 const pageRows = await res.json();
-                if (controller.signal.aborted || loadSeq !== sessionLoadSeqRef.current) return;
-                if (currentAgentIdRef.current !== targetAgentId) return;
-                if (activeSessionIdRef.current !== sess.id) return;
+                if (controller.signal.aborted || loadSeq !== sessionLoadSeqRef.current) return false;
+                if (currentAgentIdRef.current !== targetAgentId) return false;
+                if (activeSessionIdRef.current !== sess.id) return false;
                 const safePageRows = Array.isArray(pageRows) ? pageRows : [];
                 collectedRows = [...safePageRows, ...collectedRows];
                 responseCursor = pageCursor;
@@ -2146,20 +2228,31 @@ export default function AgentDetailPage() {
 
             if (writable) {
                 setChatMessages((prev) => preserveLoadedHistory
-                    ? reconcileLatestHistoryWindow(prev as any, preParsed as any) as ChatMsg[]
+                    ? reconcileLatestHistoryWindow(
+                        (options.prepareWebResume ? prepareMessagesForActiveTurnResume(prev) : prev) as any,
+                        preParsed as any,
+                    ) as ChatMsg[]
                     : preParsed);
             } else {
                 setHistoryMsgs((prev) => preserveLoadedHistory
-                    ? reconcileLatestHistoryWindow(prev as any, preParsed as any) as any
+                    ? reconcileLatestHistoryWindow(
+                        options.prepareWebResume ? prepareMessagesForActiveTurnResume(prev) : prev,
+                        preParsed as any,
+                    ) as any
                     : preParsed);
             }
             // The backend marks the session as read when the current user opens it. Mirror that
             // immediately in local state so unread badges clear without waiting for the next poll.
             clearUnreadForSession(String(sess.id));
             queryClient.invalidateQueries({ queryKey: ['agents'] });
+            return true;
         } catch (err: any) {
-            if (err?.name === 'AbortError') return;
+            if (err?.name === 'AbortError') return false;
             console.error('Failed to load session messages:', err);
+            return false;
+        } finally {
+            window.clearTimeout(historyTimeout);
+            if (sessionMsgAbortRef.current === controller) sessionMsgAbortRef.current = null;
         }
     };
 
@@ -2886,7 +2979,7 @@ export default function AgentDetailPage() {
         const sessionId = String(sess.id);
         const key = buildSessionRuntimeKey(agentId, sessionId);
         const existing = wsMapRef.current[key];
-        if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) return;
+        if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) return existing;
         reconnectDisabledRef.current[key] = false;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const sessionParam = `&session_id=${sessionId}`;
@@ -2912,6 +3005,14 @@ export default function AgentDetailPage() {
 
         const lang = (i18n.language || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
         const ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat/${agentId}?token=${authToken}${sessionParam}&lang=${lang}`);
+        let settleServerConnection: ((connected: boolean) => void) | null = null;
+        (ws as any)._serverConnectedPromise = new Promise<boolean>((resolve) => {
+            settleServerConnection = resolve;
+        });
+        (ws as any)._settleServerConnection = (connected: boolean) => {
+            settleServerConnection?.(connected);
+            settleServerConnection = null;
+        };
         wsMapRef.current[key] = ws;
         ws.onopen = () => {
             // 若本 ws 已被新连接替换(陈旧引用)或已禁用重连，直接关掉它，不要触碰 UI 连接状态。
@@ -2932,26 +3033,27 @@ export default function AgentDetailPage() {
             }
         };
         ws.onclose = (e) => {
-            const runtimeBeforeClose = sessionUiStateRef.current[key];
-            const turnWasActive = Boolean(runtimeBeforeClose
-                && (runtimeBeforeClose.isWaiting || runtimeBeforeClose.isStreaming || runtimeBeforeClose.isStopping));
-            if (turnWasActive) {
-                pcRecoveryPollingNeededRef.current = true;
-            }
+            (ws as any)._settleServerConnection?.(false);
             if ((ws as any)._stableTimer) {
                 clearTimeout((ws as any)._stableTimer);
                 (ws as any)._stableTimer = null;
             }
             const wasCurrent = wsMapRef.current[key] === ws;
-            if (wasCurrent) delete wsMapRef.current[key];
             if (onboardingRequestsRef.current[key]?.socket === ws) {
                 delete onboardingRequestsRef.current[key];
             }
-            setSessionUiState(key, { isWaiting: false, isStreaming: false, isStopping: false });
             // 陈旧连接(已被新连接替换或显式关闭)的 onclose 不应扰动当前 UI 状态，也不应触发重连——
             // 否则活跃连接会被误判为断开，引发无谓的 2s 重连循环。
             if (!wasCurrent) return;
+            delete wsMapRef.current[key];
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
+            const runtimeBeforeClose = sessionUiStateRef.current[key];
+            const turnWasActive = Boolean(runtimeBeforeClose
+                && (runtimeBeforeClose.isWaiting || runtimeBeforeClose.isStreaming || runtimeBeforeClose.isStopping));
+            if (turnWasActive && isActiveRuntime) {
+                pcRecoveryPollingNeededRef.current = true;
+            }
+            setSessionUiState(key, { isWaiting: false, isStreaming: false, isStopping: false });
             if (isActiveRuntime) {
                 wsRef.current = null;
                 setWsConnected(false);
@@ -2973,13 +3075,13 @@ export default function AgentDetailPage() {
             scheduleReconnect();
         };
         ws.onerror = (error) => {
+            if (wsMapRef.current[key] !== ws) return;
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
             if (isActiveRuntime) setWsConnected(false);
             console.warn(`WebSocket error for session ${sessionId}:`, error);
             // Error automatically triggers onclose with abnormal code, which handles reconnect
         };
-        ws.onmessage = (e) => {
-            const d = JSON.parse(e.data);
+        const handleSocketMessage = (d: any) => {
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
             const isTerminalEvent = ['done', 'error', 'quota_exceeded', 'confirmation_required'].includes(d.type);
             if (isTerminalEvent && pcPageSuspendedRef.current && isActiveRuntime) {
@@ -2987,10 +3089,18 @@ export default function AgentDetailPage() {
                 // reconciliation therefore keeps a short polling window alive.
                 pcRecoveryPollingNeededRef.current = true;
             } else if (isTerminalEvent) {
-                pcRecoveryPollingNeededRef.current = false;
-                if (pcRecoveryPollTimerRef.current) {
-                    clearTimeout(pcRecoveryPollTimerRef.current);
-                    pcRecoveryPollTimerRef.current = null;
+                const recoveryAction = resolveVisibleTerminalRecoveryAction({
+                    isActiveRuntime,
+                    recoveryNeeded: pcRecoveryPollingNeededRef.current,
+                });
+                if (recoveryAction === 'continue') {
+                    startPcRecoveryPollingRef.current(
+                        sess,
+                        activeReadOnlyRef.current ? 'all' : 'mine',
+                    );
+                } else if (recoveryAction === 'clear') {
+                    pcRecoveryPollingNeededRef.current = false;
+                    cancelPcRecoveryPolling();
                 }
             }
             if (pcPageSuspendedRef.current && isActiveRuntime) {
@@ -3016,6 +3126,7 @@ export default function AgentDetailPage() {
             }
             if (d.type === 'connected' && d.session_id) {
                 (ws as any)._serverConnected = true;
+                (ws as any)._settleServerConnection?.(true);
                 const request: OnboardingKickoffRequest = {
                     sessionId: String(d.session_id),
                     required: d.onboarding_required === true,
@@ -3403,9 +3514,42 @@ export default function AgentDetailPage() {
                 setChatMessages(prev => [...prev, parseChatMsg({ role: d.role, content: d.content })]);
             }
         };
+        ws.onmessage = (e) => {
+            if (wsMapRef.current[key] !== ws) return;
+            const d = JSON.parse(e.data);
+            if (
+                d.type !== 'connected'
+                && bufferResumeEvent(pcResumeEventGateRef.current, key, {
+                    data: d,
+                    consume: handleSocketMessage,
+                })
+            ) return;
+            handleSocketMessage(d);
+        };
+        return ws;
+    };
+    ensureSessionSocketRef.current = ensureSessionSocket;
+
+    const waitForPcSocketServerConnection = async (socket: WebSocket | undefined) => {
+        if (!socket) return false;
+        if ((socket as any)._serverConnected === true) return true;
+        const connection = (socket as any)._serverConnectedPromise as Promise<boolean> | undefined;
+        if (!connection) return false;
+        let timeout: ReturnType<typeof setTimeout> | null = null;
+        try {
+            return await Promise.race([
+                connection,
+                new Promise<boolean>((resolve) => {
+                    timeout = setTimeout(() => resolve(false), 5000);
+                }),
+            ]);
+        } finally {
+            if (timeout) clearTimeout(timeout);
+        }
     };
 
     const dispatchChatMessage = (socket: WebSocket, runtimeKey: SessionRuntimeKey, payload: PendingChatMessage) => {
+        pendingPcRouteRecoveryRuntimeKeys.delete(runtimeKey);
         setIsWaiting(true);
         setIsStreaming(false);
         setIsStopping(false);
@@ -3453,25 +3597,64 @@ export default function AgentDetailPage() {
     // On resume, reload the latest page and reconnect once so missed final output
     // is reconciled from durable history instead of relying on frame replay.
     useEffect(() => {
-        const cancelRecoveryPolling = () => {
-            if (pcRecoveryPollTimerRef.current) clearTimeout(pcRecoveryPollTimerRef.current);
-            pcRecoveryPollTimerRef.current = null;
-        };
-        const startRecoveryPolling = (session: any, scope: 'mine' | 'all') => {
-            cancelRecoveryPolling();
+        const startRecoveryPolling = (
+            session: any,
+            scope: 'mine' | 'all',
+        ) => {
+            cancelPcRecoveryPolling();
+            const pollingGeneration = pcRecoveryPollingGenerationRef.current;
             const delays = [1000, 2000, 4000, 8000, 16000, 30000];
             let attempt = 0;
+            let successfulLoads = 0;
             const poll = () => {
                 if (
-                    !pcRecoveryPollingNeededRef.current
+                    pollingGeneration !== pcRecoveryPollingGenerationRef.current
+                    || !pcRecoveryPollingNeededRef.current
                     || pcPageSuspendedRef.current
                     || document.hidden
                     || String(activeSessionIdRef.current || '') !== String(session.id)
                 ) return;
-                void selectSession(session, scope, { preserveLoadedHistory: true }).finally(() => {
+                if (pcResumeReconcilePromiseRef.current) {
+                    if (pollingGeneration !== pcRecoveryPollingGenerationRef.current) return;
+                    pcRecoveryPollTimerRef.current = setTimeout(poll, 500);
+                    return;
+                }
+                const runtimeKey = buildSessionRuntimeKey(String(id || ''), String(session.id));
+                const gate = beginPcResumeEventGate(runtimeKey);
+                let loadedSuccessfully = false;
+                const promise = selectSession(session, scope, { preserveLoadedHistory: true }).then((loaded) => {
+                    loadedSuccessfully = loaded === true;
+                    if (loadedSuccessfully) successfulLoads += 1;
+                }).finally(() => {
+                    const stillActive = !pcPageSuspendedRef.current
+                        && !document.hidden
+                        && String(activeSessionIdRef.current || '') === String(session.id);
+                    finishPcResumeEventGate(gate, stillActive);
+                    releasePcResumeReconcileOwner(
+                        promise,
+                        session,
+                        String(id || ''),
+                        String(token || ''),
+                    );
+                    if (stillActive) setPcResumeMeasurementKey((current) => (current ?? 0) + 1);
+                    if (pollingGeneration !== pcRecoveryPollingGenerationRef.current) return;
+                    if (shouldCompleteRecoveryPolling({
+                        pollingGeneration,
+                        currentGeneration: pcRecoveryPollingGenerationRef.current,
+                        loadedSuccessfully,
+                        successfulLoads,
+                        stillActive,
+                        socketReadyState: wsMapRef.current[runtimeKey]?.readyState,
+                    })) {
+                        pendingPcRouteRecoveryRuntimeKeys.delete(runtimeKey);
+                        pcRecoveryPollingNeededRef.current = false;
+                        pcRecoveryPollTimerRef.current = null;
+                        return;
+                    }
                     if (!pcRecoveryPollingNeededRef.current || attempt >= delays.length) return;
                     pcRecoveryPollTimerRef.current = setTimeout(poll, delays[attempt++]);
                 });
+                pcResumeReconcilePromiseRef.current = promise;
             };
             pcRecoveryPollTimerRef.current = setTimeout(poll, delays[attempt++]);
         };
@@ -3485,13 +3668,16 @@ export default function AgentDetailPage() {
             cancelPcAutoFollowRef.current();
             sessionMsgAbortRef.current?.abort();
             historyMoreAbortRef.current?.abort();
-            cancelRecoveryPolling();
+            cancelPcRecoveryPolling();
+            const activeGate = pcResumeEventGateRef.current;
+            if (activeGate) finishPcResumeEventGate(activeGate, false);
             if (!id || !activeSession) return;
             const key = buildSessionRuntimeKey(id, String(activeSession.id));
             const runtime = sessionUiStateRef.current[key];
             const ws = wsMapRef.current[key];
             const turnWasActive = !!runtime
                 && (runtime.isWaiting || runtime.isStreaming || runtime.isStopping);
+            pcResumeHadActiveTurnRef.current = turnWasActive;
             if (turnWasActive) pcRecoveryPollingNeededRef.current = true;
             reconnectDisabledRef.current[key] = true;
             clearReconnectTimer(key);
@@ -3512,22 +3698,44 @@ export default function AgentDetailPage() {
             if (!id || !token || activeTab !== 'chat') return;
             if (!activeSession) return;
             const key = buildSessionRuntimeKey(id, String(activeSession.id));
-            const ws = wsMapRef.current[key];
-            const socketHealthy = !!ws
-                && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING);
-            const needsHistorySync = pcHiddenDroppedEventRef.current;
+            const resumeHadActiveTurn = pcResumeHadActiveTurnRef.current;
+            pcResumeHadActiveTurnRef.current = false;
             pcHiddenDroppedEventRef.current = false;
-            if (socketHealthy) {
-                if (needsHistorySync) void selectSession(activeSession, chatScope, { preserveLoadedHistory: true });
-                if (pcRecoveryPollingNeededRef.current) startRecoveryPolling(activeSession, chatScope);
-                return;
-            }
             reconnectDisabledRef.current[key] = false;
             reconnectAttemptsRef.current[key] = 0;
             clearReconnectTimer(key);
-            ensureSessionSocket(activeSession, id, token);
-            void selectSession(activeSession, chatScope, { preserveLoadedHistory: true });
-            if (pcRecoveryPollingNeededRef.current) startRecoveryPolling(activeSession, chatScope);
+            if (pcResumeReconcilePromiseRef.current) {
+                pcRecoveryPollingNeededRef.current = true;
+                startRecoveryPolling(activeSession, chatScope);
+                return;
+            }
+            const gate = beginPcResumeEventGate(key);
+            const socket = ensureSessionSocket(activeSession, id, token);
+            const promise = (async () => {
+                await waitForPcSocketServerConnection(socket);
+                if (
+                    pcPageSuspendedRef.current
+                    || document.hidden
+                    || String(activeSessionIdRef.current || '') !== String(activeSession.id)
+                ) {
+                    finishPcResumeEventGate(gate, false);
+                    return;
+                }
+                await selectSession(activeSession, chatScope, {
+                    preserveLoadedHistory: true,
+                    prepareWebResume: resumeHadActiveTurn,
+                });
+                const stillActive = !pcPageSuspendedRef.current
+                    && !document.hidden
+                    && String(activeSessionIdRef.current || '') === String(activeSession.id);
+                finishPcResumeEventGate(gate, stillActive);
+                if (!stillActive) return;
+                setPcResumeMeasurementKey((current) => (current ?? 0) + 1);
+                if (pcRecoveryPollingNeededRef.current) startRecoveryPolling(activeSession, chatScope);
+            })().finally(() => {
+                releasePcResumeReconcileOwner(promise, activeSession, id, token);
+            });
+            pcResumeReconcilePromiseRef.current = promise;
         };
         const onVisibility = () => {
             if (document.hidden) suspend();
@@ -3544,10 +3752,18 @@ export default function AgentDetailPage() {
             document.removeEventListener('visibilitychange', onVisibility);
             window.removeEventListener('pagehide', onPageHide);
             window.removeEventListener('pageshow', onPageShow);
-            cancelRecoveryPolling();
+            cancelPcRecoveryPolling();
             startPcRecoveryPollingRef.current = () => undefined;
         };
     }, [id, token, activeTab, activeSession?.id, chatScope, discardChatStreamBatch, discardMonitorStreamBatch]);
+
+    useEffect(() => {
+        if (!id || !activeSession || activeTab !== 'chat' || document.hidden) return;
+        const runtimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
+        if (!pendingPcRouteRecoveryRuntimeKeys.has(runtimeKey)) return;
+        pcRecoveryPollingNeededRef.current = true;
+        startPcRecoveryPollingRef.current(activeSession, chatScope);
+    }, [id, activeTab, activeSession?.id, chatScope]);
 
     const handleWorkspacePathDeleted = useCallback((path: string) => {
         let removedName = '';
@@ -3588,9 +3804,29 @@ export default function AgentDetailPage() {
 
     useEffect(() => {
         return () => {
+            const activeAgentId = String(currentAgentIdRef.current || '');
+            const activeSessionId = String(activeSessionIdRef.current || '');
+            if (activeAgentId && activeSessionId) {
+                const runtimeKey = buildSessionRuntimeKey(activeAgentId, activeSessionId);
+                const runtime = sessionUiStateRef.current[runtimeKey];
+                if (
+                    pcRecoveryPollingNeededRef.current
+                    || runtime?.isWaiting
+                    || runtime?.isStreaming
+                    || runtime?.isStopping
+                ) {
+                    pendingPcRouteRecoveryRuntimeKeys.add(runtimeKey);
+                }
+            }
+            pcPageSuspendedRef.current = true;
+            pcResumeReconcilePromiseRef.current = null;
+            const resumeGate = pcResumeEventGateRef.current;
+            pcResumeEventGateRef.current = null;
+            if (resumeGate) drainResumeEventGate(resumeGate);
+            ensureSessionSocketRef.current = () => undefined;
             sessionMsgAbortRef.current?.abort();
             historyMoreAbortRef.current?.abort();
-            if (pcRecoveryPollTimerRef.current) clearTimeout(pcRecoveryPollTimerRef.current);
+            cancelPcRecoveryPolling();
             Object.keys(reconnectDisabledRef.current).forEach((key) => { reconnectDisabledRef.current[key] = true; });
             Object.keys(reconnectTimerRef.current).forEach((key) => clearReconnectTimer(key));
             Object.values(wsMapRef.current).forEach((ws) => {
@@ -6220,6 +6456,7 @@ export default function AgentDetailPage() {
                                                     agentName={(agent as any)?.name || 'Agent'}
                                                     messages={historyMsgs as any}
                                                     scrollerRef={historyContainerRef}
+                                                    resumeMeasurementKey={pcResumeMeasurementKey}
                                                     provenance={activeSessionExecution}
                                                     unavailableAttachmentKeys={unavailableAttachmentKeys}
                                                     onAttachmentDownload={handleAttachmentDownload}
@@ -6309,6 +6546,7 @@ export default function AgentDetailPage() {
                                                     agentName={(agent as any)?.name || 'Agent'}
                                                     messages={visibleChatMessages as any}
                                                     scrollerRef={chatContainerRef}
+                                                    resumeMeasurementKey={pcResumeMeasurementKey}
                                                     provenance={activeSessionExecution}
                                                     isRunning={isWaiting || isStreaming || isStopping}
                                                     unavailableAttachmentKeys={unavailableAttachmentKeys}
