@@ -3595,10 +3595,13 @@ async def execute_tool(
                     execution_user_id=user_id,
                     parent_session_id=session_id,
                     origin_tool_call_id=tool_call_id,
+                    name=arguments.get("name"),
                     task=arguments.get("task"),
                     mode=arguments.get("mode", "sync"),
                     model=arguments.get("model"),
                     fork=bool(arguments.get("fork", False)),
+                    soul=arguments.get("soul", True) is not False,
+                    memory=arguments.get("memory", True) is not False,
                     turn_anchor_id=turn_anchor_id,
                 )
                 if run.mode == "async":
@@ -3610,6 +3613,8 @@ async def execute_tool(
                             "status": run.status,
                             "mode": run.mode,
                             "model": run.model,
+                            "soul": run.soul,
+                            "memory": run.memory,
                         },
                         ensure_ascii=False,
                     )
@@ -3622,6 +3627,8 @@ async def execute_tool(
                         "status": status,
                         "mode": run.mode,
                         "model": run.model,
+                        "soul": run.soul,
+                        "memory": run.memory,
                         "result": reply,
                         "messages_to_parent": parent_messages,
                     },

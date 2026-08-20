@@ -109,7 +109,7 @@ BUILTIN_TOOLS = [
         "name": "run_subagent",
         "display_name": "Run Subagent",
         "description": (
-            "Delegate a focused task to a child Agent session. sync waits for the final "
+            "Delegate a named, focused task to a child Agent session. sync waits for the final "
             "result and reports any child messages with it; async returns the subagent_id "
             "immediately and supports live multi-round messages in both directions. In "
             "async mode, child messages and completion durably wake this exact session. "
@@ -122,6 +122,12 @@ BUILTIN_TOOLS = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
+                "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 80,
+                    "description": "A concise, meaningful name for this child Agent and its session.",
+                },
                 "task": {"type": "string", "minLength": 1, "maxLength": 12000},
                 "mode": {"type": "string", "enum": ["sync", "async"], "default": "sync"},
                 "model": {
@@ -133,8 +139,18 @@ BUILTIN_TOOLS = [
                     "default": False,
                     "description": "Copy the current compacted, LLM-visible context into the child once.",
                 },
+                "soul": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Load this Agent's soul.md into the child runtime context.",
+                },
+                "memory": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Load Core Memory, the memory guide, and recent Daily Memory into the child runtime context.",
+                },
             },
-            "required": ["task"],
+            "required": ["name", "task"],
         },
         "config": {},
         "config_schema": {"fields": []},

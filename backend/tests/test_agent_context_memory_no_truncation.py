@@ -59,6 +59,7 @@ class _FakeStorage:
 # A memory whose meaningful tail sits well past the old 2000-char cap.
 _TAIL = "RBAC_TAIL_SENTINEL_隐藏rbac模块需显式调用"
 _LONG_MEMORY = "记忆开头：常规说明。\n" + ("正文填充行，用于把内容推过 2000 字符上限。\n" * 200) + "\n## 末尾段\n" + _TAIL + "\n"
+_SOUL_SENTINEL = "SOUL_CONTEXT_SENTINEL"
 
 
 async def test_read_file_safe_none_disables_truncation():
@@ -103,3 +104,35 @@ async def test_build_agent_context_injects_full_memory():
     assert "## Core Memory" in dynamic
     assert _TAIL in dynamic  # tail past the old 2000-char cap reached the context
     assert "...(truncated)" not in dynamic
+
+
+async def test_build_agent_context_can_skip_soul_and_memory_loading():
+    """Subagent context controls omit durable identity and memory contents."""
+    agent_id = uuid.uuid4()
+    soul_key = normalize_storage_key(f"{agent_id}/soul.md")
+    mem_key = normalize_storage_key(f"{agent_id}/memory/memory.md")
+    fake = _FakeStorage(
+        {
+            soul_key: f"# Soul\n{_SOUL_SENTINEL}\n",
+            mem_key: _LONG_MEMORY,
+        }
+    )
+
+    with (
+        patch("app.services.agent_context.get_storage_backend", return_value=fake),
+        patch("app.services.agent_memory.get_storage_backend", return_value=fake),
+        patch("app.services.agent_context._load_skills_index", new_callable=AsyncMock, return_value=""),
+        patch("app.services.timezone_utils.get_agent_timezone", new_callable=AsyncMock, return_value="UTC"),
+    ):
+        static, dynamic = await build_agent_context(
+            agent_id,
+            "TestAgent",
+            include_soul=False,
+            include_memory=False,
+        )
+
+    combined = f"{static}\n{dynamic}"
+    assert _SOUL_SENTINEL not in combined
+    assert _TAIL not in combined
+    assert "## Core Memory" not in combined
+    assert "# Persistent Memory System" not in combined

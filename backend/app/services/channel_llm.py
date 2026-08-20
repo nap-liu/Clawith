@@ -124,6 +124,8 @@ async def _call_agent_llm(
     before_round=None,
     before_tool_execution=None,
     broadcast_web: bool = True,
+    include_soul: bool = True,
+    include_memory: bool = True,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
 
@@ -413,6 +415,8 @@ async def _call_agent_llm(
             prepared_tools=prepared_tools,
             before_round=before_round,
             before_tool_execution=before_tool_execution,
+            include_soul=include_soul,
+            include_memory=include_memory,
         )
     finally:
         try:

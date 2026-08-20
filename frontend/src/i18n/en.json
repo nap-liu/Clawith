@@ -489,6 +489,8 @@
         "async": "Asynchronous"
       },
       "forked": "Forked current context",
+      "soulOff": "Soul disabled",
+      "memoryOff": "Memory disabled",
       "model": "Model",
       "sessionId": "Session ID",
       "status": {
@@ -815,7 +817,7 @@
     "toolTranslations": {
       "run_subagent": {
         "name": "Run Subagent",
-        "description": "Delegate a focused task to an independent child-agent session, synchronously or asynchronously, with optional model selection and context forking."
+        "description": "Name and delegate a focused task to an independent child-agent session, with sync or async execution, model selection, context forking, and optional Soul or memory loading."
       },
       "send_message_to_subagent": {
         "name": "Message Subagent",

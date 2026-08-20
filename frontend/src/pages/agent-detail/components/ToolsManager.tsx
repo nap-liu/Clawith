@@ -22,21 +22,29 @@ import MCPServerEditor from '../../../components/MCPServerEditor';
 import { effectiveEditorRole } from '../../../components/MCPServerEditor/role';
 
 const getCategoryLabels = (t: any): Record<string, string> => ({
-    file: t('agent.toolCategories.file'),
-    task: t('agent.toolCategories.task'),
-    communication: t('agent.toolCategories.communication'),
-    search: t('agent.toolCategories.search'),
+    agentbay: t('agent.toolCategories.agentbay', 'AgentBay'),
+    atlassian: t('agent.toolCategories.atlassian', 'Atlassian'),
     aware: t('agent.toolCategories.aware', 'Aware & Triggers'),
-    social: t('agent.toolCategories.social', 'Social'),
+    browser: t('agent.toolCategories.browser', 'Browser'),
+    business: t('agent.toolCategories.business', 'Business'),
     code: t('agent.toolCategories.code', 'Code & Execution'),
+    communication: t('agent.toolCategories.communication', 'Communication'),
+    database: t('agent.toolCategories.database', 'Database'),
+    deploy: t('agent.toolCategories.deploy', 'Deployment'),
     discovery: t('agent.toolCategories.discovery', 'Discovery'),
+    document: t('agent.toolCategories.document', 'Document Reading'),
     email: t('agent.toolCategories.email', 'Email'),
     feishu: t('agent.toolCategories.feishu', 'Feishu / Lark'),
-    custom: t('agent.toolCategories.custom'),
+    file: t('agent.toolCategories.file'),
     general: t('agent.toolCategories.general'),
+    media: t('agent.toolCategories.media', 'Image Generation'),
+    okr: t('agent.toolCategories.okr', 'OKR'),
+    pages: t('agent.toolCategories.pages', 'Page Publishing'),
+    search: t('agent.toolCategories.search'),
+    social: t('agent.toolCategories.social', 'Social'),
     subagent: t('agent.toolCategories.subagent', 'Subagent'),
-    agentbay: t('agent.toolCategories.agentbay', 'AgentBay'),
-    browser: t('agent.toolCategories.browser', 'Browser'),
+    task: t('agent.toolCategories.task'),
+    custom: t('agent.toolCategories.custom'),
 });
 
 export default function ToolsManager({ agentId, agentName = 'Agent', canManage = false }: { agentId: string; agentName?: string; canManage?: boolean }) {
@@ -316,26 +324,37 @@ export default function ToolsManager({ agentId, agentName = 'Agent', canManage =
         `agent.toolTranslations.${tool.name}.description`,
         { defaultValue: tool.description || '' },
     );
-    const categoryDescriptions: Record<string, string> = {
-        agentbay: 'Browser and cloud computer automation',
-        browser: 'Isolated in-sandbox browser: read pages and run multi-step RPA',
-        file: 'Read, write, convert, and manage workspace files',
-        communication: 'Messages and cross-channel collaboration',
-        search: 'Web and knowledge search tools',
-        code: 'Code execution and development utilities',
+    const categoryDescriptionDefaults: Record<string, string> = {
+        agentbay: 'Browser, cloud desktop, code sandbox, and file transfer tools',
+        atlassian: 'Jira, Confluence, and Compass collaboration tools',
         aware: 'Triggers, reminders, and awareness workflows',
+        browser: 'Isolated in-sandbox browser for reading pages and multi-step automation',
+        business: 'Business processes and business-system operations',
+        code: 'Code execution and development utilities',
+        communication: 'Messages and cross-channel collaboration',
+        database: 'Database query and data operation tools',
+        deploy: 'Application deployment and hosting operations',
+        discovery: 'Tool, session, skill, and capability discovery',
+        document: 'Image and document content reading tools',
         email: 'Email reading and sending tools',
         feishu: 'Feishu / Lark messaging and collaboration',
+        file: 'Read, write, convert, and manage workspace files',
+        general: 'General-purpose platform operations',
+        media: 'Image generation through configured model providers',
         okr: 'Objectives, key results, and progress reporting',
+        pages: 'Publish and manage workspace pages and their access',
+        search: 'Web and knowledge search tools',
         social: 'Social publishing and community workflows',
-        discovery: 'Tool and capability discovery',
-        subagent: t(
-            'agent.toolCategoryDescriptions.subagent',
-            'Delegation and multi-round parent-child collaboration',
-        ),
+        subagent: 'Delegation and multi-round parent-child collaboration',
         custom: 'Company-added or MCP tools',
-        general: 'General purpose tools',
+        task: 'Task planning and management tools',
     };
+    const categoryDescriptions: Record<string, string> = Object.fromEntries(
+        Object.entries(categoryDescriptionDefaults).map(([category, defaultValue]) => [
+            category,
+            t(`agent.toolCategoryDescriptions.${category}`, defaultValue),
+        ]),
+    );
     const renderCategoryIcon = (category: string, size = 15) => {
         const style = { color: 'var(--text-tertiary)' };
         switch (category) {
