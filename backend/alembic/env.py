@@ -34,6 +34,7 @@ from app.models.tenant import Tenant  # noqa: F401
 from app.models.tool import Tool  # noqa: F401
 from app.models.cli_tool_binary import CliToolBinaryVersion  # noqa: F401
 from app.models.trigger import AgentTrigger  # noqa: F401
+from app.models.subagent_run import SubagentRun  # noqa: F401
 from app.models.agent_credential import AgentCredential  # noqa: F401
 from app.models.onboarding import UserTenantOnboarding  # noqa: F401
 from app.models.personal_access_token import PersonalAccessToken  # noqa: F401

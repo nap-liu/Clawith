@@ -479,6 +479,60 @@
       "confirmResolved": "Confirmed",
       "confirmCancelled": "Cancelled"
     },
+    "subagentRun": {
+      "title": "Subagent",
+      "taskFallback": "Delegated task",
+      "viewSession": "View session",
+      "sessionPending": "The child session will appear once it has been created.",
+      "mode": {
+        "sync": "Synchronous",
+        "async": "Asynchronous"
+      },
+      "forked": "Forked current context",
+      "model": "Model",
+      "sessionId": "Session ID",
+      "status": {
+        "queued": "Queued",
+        "running": "Running",
+        "completed": "Completed",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+        "stopped": "Stopped",
+        "unknown": "Unknown"
+      },
+      "drawerTitle": "Subagent session",
+      "readOnly": "Read-only execution record",
+      "loading": "Loading Subagent session...",
+      "loadError": "Could not load this Subagent session.",
+      "retry": "Retry",
+      "empty": "No execution messages yet.",
+      "close": "Close",
+      "liveRefresh": "Updates automatically while the Subagent is running",
+      "openFullSession": "Open full session"
+    },
+    "sessionViewer": {
+      "title": "Session record",
+      "readOnly": "Read-only session view",
+      "loading": "Loading session record...",
+      "loadError": "Could not load this session record.",
+      "retry": "Retry",
+      "empty": "No session messages yet.",
+      "close": "Close",
+      "openFullSession": "Open full session",
+      "participant": "Session participant",
+      "caller": "Caller",
+      "callerAvatar": "C",
+      "status": {
+        "queued": "Queued",
+        "pending": "Pending",
+        "running": "Running",
+        "processing": "Processing",
+        "completed": "Completed",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+        "canceled": "Cancelled"
+      }
+    },
     "activityLog": {
       "title": "Activity Log",
       "noRecords": "No activity records",
@@ -679,6 +733,11 @@
       "setupGuide": "Setup guide",
       "configureCategory": "Configure {{category}}",
       "enableDisableAll": "Enable/Disable all {{category}} tools",
+      "builtin": "Built-in",
+      "categoryFallbackDescription": "Tools in this category",
+      "groupSummary": "{{total}} tools · {{enabled}} enabled",
+      "groupShown": "{{count}} shown",
+      "groupConfigured": "{{count}} configured",
       "alwaysAvailable": "Always available",
       "configurePerAgent": "Configure per-agent settings",
       "removeTool": "Remove from agent",
@@ -739,6 +798,7 @@
       "search": "Search",
       "custom": "Custom",
       "general": "General",
+      "subagent": "Subagent",
       "email": "Email",
       "aware": "Aware & Triggers",
       "social": "Social",
@@ -748,6 +808,27 @@
       "agentbay": "AgentBay",
       "browser": "Browser",
       "okr": "OKR"
+    },
+    "toolCategoryDescriptions": {
+      "subagent": "Delegate tasks to child agents with multi-round, bidirectional collaboration"
+    },
+    "toolTranslations": {
+      "run_subagent": {
+        "name": "Run Subagent",
+        "description": "Delegate a focused task to an independent child-agent session, synchronously or asynchronously, with optional model selection and context forking."
+      },
+      "send_message_to_subagent": {
+        "name": "Message Subagent",
+        "description": "Append a message to a child agent. Running work receives it at the next model round; finished work resumes asynchronously in the same session."
+      },
+      "stop_subagent": {
+        "name": "Stop Subagent",
+        "description": "Stop a queued or running child agent. External tool side effects that have already started are not rolled back."
+      },
+      "send_message_to_parent": {
+        "name": "Message Parent Agent",
+        "description": "Send one or more interim messages from a child agent to its parent session. Async messages wake the parent; sync messages are returned with the final result. Available only in child-agent sessions."
+      }
     },
     "upload": {
       "success": "Upload successful",

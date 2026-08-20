@@ -17,6 +17,7 @@ import {
 import ChatAttachmentIcon from '../../../components/ChatAttachmentIcon';
 import ChatMediaCard from '../../../components/ChatMediaCard';
 import ChatToolCallRenderer from '../../../components/ChatToolCallRenderer';
+import type { SubagentRunCardData } from '../../../components/SubagentRunCard';
 import MarkdownRenderer from '../../../components/MarkdownRenderer';
 import { copyToClipboard } from '../../../utils/clipboard';
 import {
@@ -45,6 +46,7 @@ export type ConversationTimelineProps = {
     agentId: string;
     agentName: string;
     messages: ConversationMessage[];
+    mode?: 'h5' | 'pc';
     viewOf: (message: ConversationMessage) => ConversationMessageView;
     isRunning?: boolean;
     unavailableAttachmentKeys?: ReadonlySet<string>;
@@ -52,6 +54,7 @@ export type ConversationTimelineProps = {
     onAttachmentUnavailable?: (key: string) => void;
     onPreviewImages?: (images: ChatPreviewImage[], index: number) => void;
     onToolResolved?: (message: ConversationMessage, result: string) => void;
+    onOpenSubagentSession?: (data: SubagentRunCardData) => void;
     scrollerRef?: React.RefObject<HTMLElement | null>;
     resumeMeasurementKey?: string | number | null;
     provenance?: {
@@ -254,6 +257,7 @@ export default function ConversationTimeline({
     agentId,
     agentName,
     messages,
+    mode = 'pc',
     viewOf,
     isRunning = false,
     unavailableAttachmentKeys = new Set<string>(),
@@ -261,6 +265,7 @@ export default function ConversationTimeline({
     onAttachmentUnavailable,
     onPreviewImages,
     onToolResolved,
+    onOpenSubagentSession,
     scrollerRef,
     resumeMeasurementKey,
     provenance,
@@ -329,7 +334,7 @@ export default function ConversationTimeline({
             return <div className={`chat-msg-row chat-msg-row--analysis${ownerView.isLeft ? '' : ' chat-msg-row--user'}`}><div className="chat-msg-avatar">{ownerView.avatarText || agentName[0] || 'A'}</div><AnalysisCard items={entry.items} running={running} expanded={!!expandedAnalysis[entry.key]} onToggle={() => setExpandedAnalysis((current) => ({ ...current, [entry.key]: !current[entry.key] }))} /></div>;
         }
         if (entry.type === 'special_render') {
-            return <div className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}><div className="chat-msg-avatar">{agentName[0] || 'A'}</div><ChatToolCallRenderer agentId={agentId} message={entry.msg} t={t} mode="pc" onPreviewImages={onPreviewImages} onResolved={(result) => onToolResolved?.(entry.msg, result)} /></div>;
+            return <div className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}><div className="chat-msg-avatar">{agentName[0] || 'A'}</div><ChatToolCallRenderer agentId={agentId} message={entry.msg} t={t} mode={mode} onPreviewImages={onPreviewImages} onOpenSubagentSession={onOpenSubagentSession} onResolved={(result) => onToolResolved?.(entry.msg, result)} /></div>;
         }
         const previous = entries[index - 1];
         const view = viewOf(entry.msg);

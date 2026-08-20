@@ -14,6 +14,7 @@ Cases:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -107,6 +108,73 @@ async def test_plain_text_ends_turn_after_one_round(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_late_round_message_interrupts_plain_reply_in_same_turn(monkeypatch):
+    client = _ScriptedClient([
+        LLMResponse(content="first answer", finish_reason="stop"),
+        LLMResponse(content="answer after interruption", finish_reason="stop"),
+    ])
+    _patch_collaborators(monkeypatch, client)
+    drain_calls: list[int] = []
+
+    async def _before_round(round_i: int):
+        drain_calls.append(round_i)
+        if round_i == 1:
+            return [{"role": "user", "content": "late parent message"}]
+        return []
+
+    result = await call_llm(
+        model=_FakeModel(),
+        messages=[{"role": "user", "content": "start"}],
+        agent_name="T",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="s",
+        before_round=_before_round,
+    )
+
+    assert result == "first answer\n\nanswer after interruption"
+    assert len(client.stream_calls) == 2
+    second_round = client.stream_calls[1]["messages"]
+    assert [(row.role, row.content) for row in second_round[-2:]] == [
+        ("assistant", "first answer"),
+        ("user", "late parent message"),
+    ]
+    assert drain_calls == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_final_allowed_round_does_not_claim_late_message(monkeypatch):
+    client = _ScriptedClient([
+        LLMResponse(content="final allowed answer", finish_reason="stop"),
+    ])
+    _patch_collaborators(monkeypatch, client)
+    drain_calls: list[int] = []
+
+    async def _before_round(round_i: int):
+        drain_calls.append(round_i)
+        if round_i == 1:
+            return [{"role": "user", "content": "must stay pending"}]
+        return []
+
+    result = await call_llm(
+        model=_FakeModel(),
+        messages=[{"role": "user", "content": "start"}],
+        agent_name="T",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="s",
+        before_round=_before_round,
+        max_tool_rounds_override=1,
+    )
+
+    assert result == "final allowed answer"
+    assert len(client.stream_calls) == 1
+    assert drain_calls == [0]
+
+
+@pytest.mark.asyncio
 async def test_plain_text_reports_normalized_usage_to_callback(monkeypatch):
     client = _ScriptedClient([
         LLMResponse(
@@ -178,6 +246,49 @@ async def test_tool_round_then_plain_text(monkeypatch, tmp_path):
 
     assert result == "我先读取文件。\n\n文件里写着 hello"
     assert len(client.stream_calls) == 2, "tool round + answer round, nothing more"
+
+
+@pytest.mark.asyncio
+async def test_cancel_check_runs_before_tool_side_effect(monkeypatch):
+    client = _ScriptedClient([
+        LLMResponse(
+            content="准备执行。",
+            tool_calls=[{
+                "id": "call_cancelled",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": '{"path": "x"}'},
+            }],
+            finish_reason="tool_calls",
+        ),
+    ])
+    _patch_collaborators(monkeypatch, client, tools=[
+        {"type": "function", "function": {"name": "write_file", "description": "w"}},
+    ])
+    executed = False
+
+    async def _must_not_execute(*_args, **_kwargs):
+        nonlocal executed
+        executed = True
+        raise AssertionError("cancelled subagent must not start a tool side effect")
+
+    async def _cancelled():
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("app.services.llm.caller.execute_tool", _must_not_execute)
+
+    with pytest.raises(asyncio.CancelledError):
+        await call_llm(
+            model=_FakeModel(),
+            messages=[{"role": "user", "content": "write"}],
+            agent_name="T",
+            role_description="",
+            agent_id="agent-x",
+            user_id="user-x",
+            session_id="s",
+            before_tool_execution=_cancelled,
+        )
+
+    assert executed is False
 
 
 @pytest.mark.asyncio

@@ -14,13 +14,24 @@ SimpleNamespace stubs, matching this repo's test convention.
 """
 from __future__ import annotations
 
-from typing import Any, Iterable
-
+from collections.abc import Iterable
+from typing import Any
 
 # Protocol tools whose schemas must remain present for every Agent. Keeping
 # this set here makes the runtime resolver, management APIs, and startup seed
 # agree on one authoritative rule.
 REQUIRED_AGENT_TOOL_NAMES = frozenset({"send_media"})
+
+# One user-facing capability in the tool panel. The four protocol functions
+# remain separate LLM tools, but their per-Agent enabled state moves together.
+SUBAGENT_TOOL_NAMES = frozenset(
+    {
+        "run_subagent",
+        "send_message_to_subagent",
+        "stop_subagent",
+        "send_message_to_parent",
+    }
+)
 
 
 def tool_is_required(tool_name: str) -> bool:

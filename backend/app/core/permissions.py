@@ -214,6 +214,12 @@ async def filter_tenant_safe_chat_sessions(
             return False
         if source_channel == "agent":
             return not is_group and user_id is None and peer_id in valid_ids
+        if source_channel == "subagent":
+            return (
+                not is_group
+                and peer_id is None
+                and (user_id is None or user_id in valid_user_ids)
+            )
         if is_group or source_channel == "trigger":
             return user_id is None and peer_id is None
         return peer_id is None and user_id in valid_user_ids

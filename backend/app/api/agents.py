@@ -25,6 +25,7 @@ from app.models.agent import Agent, AgentPermission
 from app.models.org import OrgDepartment, OrgMember
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.subagent_run import SubagentRun
 from app.models.user import Identity, User
 from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate
 from app.services.access_relationships import ensure_access_granted_platform_relationships
@@ -181,7 +182,7 @@ async def _build_unread_count_by_agent(
             ChatSession.agent_id.in_(agent_ids),
             ChatSession.user_id == current_user.id,
             ChatSession.is_group.is_(False),
-            ChatSession.source_channel.notin_(["agent", "trigger"]),
+            ChatSession.source_channel.notin_(["agent", "trigger", "subagent"]),
             ChatMessage.role.in_(["assistant", "system", "tool_call"]),
             ChatMessage.created_at > func.coalesce(
                 ChatSession.last_read_at_by_user,
@@ -1263,6 +1264,30 @@ async def delete_agent(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="System agents cannot be deleted. Disable the related feature (e.g. OKR) in Company Settings instead.",
+        )
+
+    parent_session = aliased(ChatSession)
+    child_session = aliased(ChatSession)
+    subagent_audit = (
+        await db.execute(
+            select(SubagentRun.id)
+            .join(parent_session, parent_session.id == SubagentRun.parent_session_id)
+            .join(child_session, child_session.id == SubagentRun.id)
+            .where(
+                or_(
+                    parent_session.agent_id == agent_id,
+                    parent_session.peer_agent_id == agent_id,
+                    child_session.agent_id == agent_id,
+                    child_session.peer_agent_id == agent_id,
+                )
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if subagent_audit is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Agents referenced by Subagent audit records cannot be deleted.",
         )
 
     # Stop container and archive files (best effort)

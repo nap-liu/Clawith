@@ -2,34 +2,32 @@
 
 import json
 import uuid
-from loguru import logger
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
+from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import String, cast, select, delete, or_
+from sqlalchemy import String, cast, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.mcp_server import MCPServer
-from app.models.tool import Tool, AgentTool
+from app.models.tool import AgentTool, Tool
 from app.models.user import User
-from app.services.tool_enablement import (
-    REQUIRED_AGENT_TOOL_NAMES,
-    resolved_agent_tool_enabled,
-    tool_is_required,
-)
 from app.services.tool_config import (
-    SENSITIVE_FIELD_KEYS,
-    delete_tenant_tool_config,
     decrypt_sensitive_fields,
     encrypt_sensitive_fields,
     get_sensitive_keys,
-    get_tenant_tool_config,
     get_tool_company_config,
     mask_sensitive_fields,
     meaningful_config,
     set_tenant_tool_config,
+)
+from app.services.tool_enablement import (
+    REQUIRED_AGENT_TOOL_NAMES,
+    SUBAGENT_TOOL_NAMES,
+    resolved_agent_tool_enabled,
+    tool_is_required,
 )
 
 router = APIRouter(prefix="/tools", tags=["tools"])
@@ -437,7 +435,7 @@ async def update_mcp_server(
 
     # NEW: validate prompt placeholders BEFORE writing anything
     if data.system_prompt_block is not None:
-        from app.services.placeholder_engine import detect_used_roots, PROMPT_SAFE_ROOTS
+        from app.services.placeholder_engine import PROMPT_SAFE_ROOTS, detect_used_roots
         used = detect_used_roots(data.system_prompt_block)
         bad = used - PROMPT_SAFE_ROOTS
         if bad:
@@ -676,6 +674,42 @@ async def update_agent_tools(
 
         _reject_required_tool_disable(tool_obj, u.enabled)
         resolved_updates.append((u, tool_obj))
+
+    # Subagent is one panel capability backed by four protocol functions.
+    # Any update to one member atomically applies the same state to all four.
+    subagent_states = {
+        update.enabled
+        for update, tool in resolved_updates
+        if tool.name in SUBAGENT_TOOL_NAMES
+    }
+    if len(subagent_states) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Subagent tools must be enabled or disabled as one group",
+        )
+    if subagent_states:
+        subagent_enabled = next(iter(subagent_states))
+        group_tools = (
+            await db.execute(
+                select(Tool).where(
+                    Tool.name.in_(SUBAGENT_TOOL_NAMES),
+                    _agent_visible_tool_clause(agent_obj.tenant_id, assignments),
+                )
+            )
+        ).scalars().all()
+        if {tool.name for tool in group_tools} != set(SUBAGENT_TOOL_NAMES):
+            raise HTTPException(status_code=409, detail="Subagent tool group is incomplete")
+        resolved_updates = [
+            (update, tool)
+            for update, tool in resolved_updates
+            if tool.name not in SUBAGENT_TOOL_NAMES
+        ] + [
+            (
+                AgentToolUpdate(tool_id=str(tool.id), enabled=subagent_enabled),
+                tool,
+            )
+            for tool in group_tools
+        ]
 
     # Apply only after every requested tool has passed visibility and required
     # capability validation.
@@ -1236,8 +1270,9 @@ async def update_category_config(
 
     # Special logic for Atlassian: trigger sync
     if category == "atlassian":
-        from app.api.atlassian import _sync_atlassian_tools_for_agent
         import asyncio
+
+        from app.api.atlassian import _sync_atlassian_tools_for_agent
         # Need plaintext key for sync
         plaintext_key = data.config.get("api_key") or data.config.get("api_secret") or data.config.get("app_secret")
         asyncio.create_task(_sync_atlassian_tools_for_agent(agent_id, plaintext_key))
