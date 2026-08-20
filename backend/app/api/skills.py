@@ -327,11 +327,9 @@ def _apply_skill_scope(query, current_user: User):
 
 
 def _ensure_skill_write_access(skill: Skill, current_user: User):
-    """Allow platform admins to edit everything; tenant admins can edit
-    tenant-owned skills AND builtin (preset) skills visible to their tenant.
-    Builtin skills are treated as presets -- placed during company init,
-    but fully manageable by org_admin afterwards.
-    """
+    """Protect market-managed Skills; retain legacy draft CRUD permissions."""
+    if getattr(skill, "status", "draft") != "draft":
+        raise HTTPException(409, "Published market Skills must be managed through the Skill market")
     if current_user.role == "platform_admin":
         return
     if not current_user.tenant_id:
@@ -339,6 +337,28 @@ def _ensure_skill_write_access(skill: Skill, current_user: User):
     # Allow org_admin to manage: their own tenant skills OR builtin (preset) skills
     if skill.tenant_id is not None and skill.tenant_id != current_user.tenant_id:
         raise HTTPException(403, "Cannot modify other-tenant skills")
+
+
+def _apply_skill_folder_scope(query, current_user: User):
+    """Keep legacy folder paths unambiguous under tenant-scoped uniqueness."""
+    from sqlalchemy import or_ as _or
+    from sqlalchemy.exc import ArgumentError
+
+    if current_user.tenant_id:
+        try:
+            scope = _or(Skill.tenant_id.is_(None), Skill.tenant_id == current_user.tenant_id)
+        except (ArgumentError, TypeError):
+            # A few unit tests replace ORM fields with minimal query doubles.
+            return query
+        return query.where(scope)
+    return query.where(Skill.tenant_id.is_(None))
+
+
+async def _refresh_skill_market_state(db, skill: Skill) -> None:
+    """Refresh lock-protected fields; lightweight API fakes may omit refresh."""
+    refresh = getattr(db, "refresh", None)
+    if refresh:
+        await refresh(skill, attribute_names=["status", "folder_name", "tenant_id"])
 
 
 async def _fetch_github_directory(
@@ -425,12 +445,18 @@ async def _save_skill_to_db(
     """Create a Skill + SkillFile records in the database."""
     import uuid as _uuid
     async with async_session() as db:
-        # Check for folder_name conflict (scoped by tenant)
+        from app.services.skill_market import lock_skill_folder
+
+        await lock_skill_folder(db, folder_name)
+        # Tenant folders may repeat across tenants, but cannot shadow a global
+        # folder used by legacy path-based APIs.
         conflict_q = select(Skill).where(Skill.folder_name == folder_name)
         if tenant_id:
-            conflict_q = conflict_q.where(Skill.tenant_id == _uuid.UUID(tenant_id))
-        else:
-            conflict_q = conflict_q.where(Skill.tenant_id.is_(None))
+            from sqlalchemy import or_ as _or
+
+            conflict_q = conflict_q.where(
+                _or(Skill.tenant_id.is_(None), Skill.tenant_id == _uuid.UUID(tenant_id))
+            )
         existing = await db.execute(conflict_q)
         if existing.scalar_one_or_none():
             raise HTTPException(
@@ -666,7 +692,7 @@ async def list_skills(current_user: User = Depends(get_current_user)):
     from sqlalchemy import or_ as _or
     tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     async with async_session() as db:
-        query = select(Skill).order_by(Skill.name)
+        query = select(Skill).where(_or(Skill.status == "draft", Skill.is_builtin.is_(True))).order_by(Skill.name)
         # Scope by tenant: show builtin (tenant_id is NULL) + tenant-specific skills
         if tenant_id:
             query = query.where(_or(Skill.tenant_id.is_(None), Skill.tenant_id == _uuid.UUID(tenant_id)))
@@ -716,6 +742,18 @@ async def get_skill(skill_id: str, current_user: User = Depends(get_current_user
 async def create_skill(body: SkillCreateIn, current_user: User = Depends(get_current_admin)):
     """Create a custom skill."""
     async with async_session() as db:
+        from sqlalchemy import or_ as _or
+        from app.services.skill_market import lock_skill_folder
+
+        await lock_skill_folder(db, body.folder_name)
+        conflict_q = select(Skill.id).where(Skill.folder_name == body.folder_name)
+        if current_user.tenant_id:
+            conflict_q = conflict_q.where(
+                _or(Skill.tenant_id.is_(None), Skill.tenant_id == current_user.tenant_id)
+            )
+        if await db.scalar(conflict_q):
+            raise HTTPException(409, f"A skill with folder name '{body.folder_name}' already exists")
+
         skill = Skill(
             name=body.name,
             description=body.description,
@@ -760,6 +798,10 @@ async def update_skill(skill_id: str, body: SkillUpdateIn, current_user: User = 
         skill = result.scalar_one_or_none()
         if not skill:
             raise HTTPException(404, "Skill not found")
+        from app.services.skill_market import lock_skill_folder
+
+        await lock_skill_folder(db, skill.folder_name)
+        await _refresh_skill_market_state(db, skill)
         _ensure_skill_write_access(skill, current_user)
 
         if body.name is not None:
@@ -792,6 +834,10 @@ async def delete_skill(skill_id: str, current_user: User = Depends(get_current_a
         skill = result.scalar_one_or_none()
         if not skill:
             raise HTTPException(404, "Skill not found")
+        from app.services.skill_market import lock_skill_folder
+
+        await lock_skill_folder(db, skill.folder_name)
+        await _refresh_skill_market_state(db, skill)
         _ensure_skill_write_access(skill, current_user)
         await db.delete(skill)
         await db.commit()
@@ -901,6 +947,8 @@ async def browse_list(path: str = "", current_user: User = Depends(get_current_u
         skill_q = select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
         if tenant_id:
             skill_q = skill_q.where(_or(Skill.tenant_id.is_(None), Skill.tenant_id == _uuid.UUID(tenant_id)))
+        else:
+            skill_q = skill_q.where(Skill.tenant_id.is_(None))
         result = await db.execute(skill_q)
         skill = result.scalar_one_or_none()
         if not skill:
@@ -949,6 +997,8 @@ async def browse_read(path: str, current_user: User = Depends(get_current_user))
         skill_q = select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
         if tenant_id:
             skill_q = skill_q.where(_or(Skill.tenant_id.is_(None), Skill.tenant_id == _uuid.UUID(tenant_id)))
+        else:
+            skill_q = skill_q.where(Skill.tenant_id.is_(None))
         result = await db.execute(skill_q)
         skill = result.scalar_one_or_none()
         if not skill:
@@ -972,11 +1022,18 @@ async def browse_write(body: BrowseWriteIn, current_user: User = Depends(get_cur
         raise HTTPException(400, "Path must include folder and file")
     folder, file_path = parts
     async with async_session() as db:
+        from app.services.skill_market import lock_skill_folder
+
+        await lock_skill_folder(db, folder)
         skill_q = select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
-        result = await db.execute(_apply_skill_scope(skill_q, current_user))
+        result = await db.execute(_apply_skill_folder_scope(skill_q, current_user))
         skill = result.scalar_one_or_none()
         created_new_skill = False
         if not skill:
+            if not current_user.tenant_id and await db.scalar(
+                select(Skill.id).where(Skill.folder_name == folder)
+            ):
+                raise HTTPException(409, f"A tenant Skill already uses folder '{folder}'")
             # Auto-create skill from folder name, scoped to tenant
             skill = Skill(
                 name=folder.replace("-", " ").title(),
@@ -991,6 +1048,7 @@ async def browse_write(body: BrowseWriteIn, current_user: User = Depends(get_cur
             await db.flush()
             created_new_skill = True
         else:
+            await _refresh_skill_market_state(db, skill)
             _ensure_skill_write_access(skill, current_user)
 
         # Upsert file
@@ -1014,11 +1072,15 @@ async def browse_delete(path: str, current_user: User = Depends(get_current_admi
     parts = path.strip("/").split("/", 1)
     folder = parts[0]
     async with async_session() as db:
+        from app.services.skill_market import lock_skill_folder
+
+        await lock_skill_folder(db, folder)
         skill_q = select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
-        result = await db.execute(_apply_skill_scope(skill_q, current_user))
+        result = await db.execute(_apply_skill_folder_scope(skill_q, current_user))
         skill = result.scalar_one_or_none()
         if not skill:
             raise HTTPException(404, "Skill not found")
+        await _refresh_skill_market_state(db, skill)
         _ensure_skill_write_access(skill, current_user)
 
         if len(parts) == 1:

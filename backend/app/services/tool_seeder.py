@@ -3550,6 +3550,71 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "search_skill_market",
+        "display_name": "Search Skill Market",
+        "description": (
+            "Search Clawith's first-party Skill market. Use automatically when installed Skills do not clearly cover "
+            "a specialized request. Returns visible company and public Skills with IDs, versions, publishers, and "
+            "unique Agent install counts."
+        ),
+        "category": "discovery",
+        "icon": "🔎",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Short capability query."},
+            },
+            "required": ["query"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "install_skill_from_market",
+        "display_name": "Install Market Skill",
+        "description": (
+            "Install a Clawith market Skill into this Agent by Skill ID. The platform creates an L3 approval before "
+            "changing files, and the approving user must have Agent manage access."
+        ),
+        "category": "discovery",
+        "icon": "📥",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "skill_id": {"type": "string", "description": "Skill UUID returned by search_skill_market."},
+            },
+            "required": ["skill_id"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
+        "name": "publish_skill_to_market",
+        "display_name": "Publish Skill to Market",
+        "description": (
+            "Publish skills/<folder> from this Agent to the company or public Clawith market. The platform creates an "
+            "L3 approval before publication, and the approving user must have Agent manage access."
+        ),
+        "category": "discovery",
+        "icon": "📤",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Agent path such as skills/sales-analysis."},
+                "name": {"type": "string", "description": "Market display name."},
+                "description": {"type": "string", "description": "Short capability description."},
+                "category": {"type": "string", "default": "general"},
+                "visibility": {"type": "string", "enum": ["tenant", "public"], "default": "tenant"},
+            },
+            "required": ["path", "name", "description", "visibility"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "sql_execute",
         "display_name": "SQL Execute",
         "description": (

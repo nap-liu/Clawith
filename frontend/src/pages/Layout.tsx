@@ -33,6 +33,7 @@ import {
     IconCheck,
     IconApps,
     IconFileDescription,
+    IconPackage,
 } from '@tabler/icons-react';
 import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
@@ -1083,6 +1084,12 @@ export default function Layout() {
                                 <IconFileDescription size={14} stroke={1.5} />
                             </span>
                             <span className="sidebar-item-text">{isChinese ? '发布管理' : 'Published content'}</span>
+                        </NavLink>
+                        <NavLink to="/skill-market" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                            <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                                <IconPackage size={14} stroke={1.5} />
+                            </span>
+                            <span className="sidebar-item-text">{t('nav.skillMarket')}</span>
                         </NavLink>
                     </div>
                 </div>

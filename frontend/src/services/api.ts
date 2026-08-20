@@ -704,6 +704,54 @@ export const skillApi = {
         fromUrl: (agentId: string, url: string) =>
             request<any>(`/agents/${agentId}/files/import-from-url`, { method: 'POST', body: JSON.stringify({ url }) }),
     },
+    market: {
+        list: (q = '') => request<MarketSkill[]>(`/skills/market${q ? `?q=${encodeURIComponent(q)}` : ''}`),
+        detail: (skillId: string) => request<MarketSkill>(`/skills/market/${skillId}`),
+        mine: () => request<MarketSkill[]>('/skills/mine'),
+        publish: (agentId: string, data: PublishMarketSkillInput) =>
+            request<MarketSkill>(`/agents/${agentId}/skills/publish`, {
+                method: 'POST',
+                body: JSON.stringify(data),
+            }),
+        install: (agentId: string, skillId: string) =>
+            request<any>(`/agents/${agentId}/skills/install`, {
+                method: 'POST',
+                body: JSON.stringify({ skill_id: skillId }),
+            }),
+        uninstall: (agentId: string, skillId: string) =>
+            request<any>(`/agents/${agentId}/skills/uninstall`, {
+                method: 'POST',
+                body: JSON.stringify({ skill_id: skillId }),
+            }),
+        offline: (skillId: string) =>
+            request<MarketSkill>(`/skills/${skillId}/offline`, { method: 'POST' }),
+    },
+};
+
+export type MarketSkill = {
+    id: string;
+    name: string;
+    description: string;
+    category: string;
+    icon: string;
+    folder_name: string;
+    visibility: 'tenant' | 'public';
+    status: 'draft' | 'published' | 'offline';
+    version: number;
+    downloads: number;
+    publisher_name: string;
+    publisher_user_id?: string | null;
+    publisher_agent_id?: string | null;
+    updated_at?: string | null;
+    skill_md?: string;
+};
+
+export type PublishMarketSkillInput = {
+    path: string;
+    name: string;
+    description: string;
+    category: string;
+    visibility: 'tenant' | 'public';
 };
 
 // ─── Triggers (Aware Engine) ──────────────────────────

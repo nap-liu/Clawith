@@ -28,6 +28,7 @@ const SSOEntry = lazy(() => import('./pages/SSOEntry'));
 const OKR = lazy(() => import('./pages/OKR'));
 const H5AgentChat = lazy(() => import('./pages/h5/H5AgentChat'));
 const PublishedPages = lazy(() => import('./pages/PublishedPages'));
+const SkillMarket = lazy(() => import('./pages/SkillMarket'));
 const PublishedPageAccess = lazy(() => import('./pages/PublishedPageAccess'));
 const PublishedPageViewer = lazy(() => import('./pages/PublishedPageViewer'));
 const PublishedPageUnavailable = lazy(() => import('./pages/PublishedPageUnavailable'));
@@ -316,6 +317,7 @@ export default function App() {
                     <Route path="agents/:id/settings" element={<AgentDetail />} />
                     <Route path="messages" element={<Messages />} />
                     <Route path="published-pages" element={<PublishedPages />} />
+                    <Route path="skill-market" element={<SkillMarket />} />
                     <Route path="enterprise" element={<CompanyAdminRoute><EnterpriseSettings /></CompanyAdminRoute>} />
                     <Route path="okr" element={<OKR />} />
                     <Route path="invitations" element={<InvitationCodes />} />

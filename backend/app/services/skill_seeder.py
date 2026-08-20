@@ -973,12 +973,30 @@ async def seed_skills():
                 logger.warning("[SkillSeeder] mcp-installer/SKILL.md not found in agent_template/skills/")
 
     async with async_session() as db:
+        from app.services.skill_market import lock_skill_folder
+
         for skill_data in BUILTIN_SKILLS:
+            await lock_skill_folder(db, skill_data["folder_name"])
             result = await db.execute(
-                select(Skill).where(Skill.folder_name == skill_data["folder_name"])
+                select(Skill).where(
+                    Skill.tenant_id.is_(None),
+                    Skill.folder_name == skill_data["folder_name"],
+                )
             )
             existing = result.scalar_one_or_none()
             is_default = skill_data.get("is_default", False)
+            if not existing:
+                tenant_conflict = await db.scalar(
+                    select(Skill.id).where(
+                        Skill.tenant_id.is_not(None),
+                        Skill.folder_name == skill_data["folder_name"],
+                    )
+                )
+                if tenant_conflict:
+                    logger.error(
+                        f"[SkillSeeder] Cannot create global Skill {skill_data['folder_name']}: tenant folder exists"
+                    )
+                    continue
             if existing:
                 # Update metadata
                 existing.name = skill_data["name"]
@@ -986,6 +1004,8 @@ async def seed_skills():
                 existing.category = skill_data["category"]
                 existing.icon = skill_data["icon"]
                 existing.is_default = is_default
+                existing.visibility = "public"
+                existing.status = "published"
                 # Sync files — add missing ones
                 from sqlalchemy.orm import selectinload
                 res2 = await db.execute(
@@ -1012,6 +1032,8 @@ async def seed_skills():
                     folder_name=skill_data["folder_name"],
                     is_builtin=True,
                     is_default=is_default,
+                    visibility="public",
+                    status="published",
                 )
                 db.add(skill)
                 await db.flush()

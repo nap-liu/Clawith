@@ -2199,6 +2199,72 @@ AGENT_TOOLS = [
         }
     },
     # ── AgentBay Tools ────────────────────────────────────────────
+    # First-party Skill Market tools
+    {
+        "type": "function",
+        "function": {
+            "name": "search_skill_market",
+            "description": (
+                "Search Clawith's first-party Skill market. When installed Skills do not clearly cover a specialized "
+                "request, use this tool automatically before improvising. Returns visible company and public Skills "
+                "with IDs, versions, publishers, and unique Agent install counts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Short capability query, for example 'Excel sales analysis'.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "install_skill_from_market",
+            "description": (
+                "Install one Clawith market Skill into this Agent by Skill ID. This changes the shared Agent workspace. "
+                "The platform always requires L3 approval before any files are changed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_id": {"type": "string", "description": "Skill UUID returned by search_skill_market."},
+                },
+                "required": ["skill_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "publish_skill_to_market",
+            "description": (
+                "Publish a Skill folder from this Agent to the Clawith market. The path must be skills/<folder>. "
+                "The platform always requires L3 approval before publication."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Agent path such as skills/sales-analysis."},
+                    "name": {"type": "string", "description": "Market display name."},
+                    "description": {"type": "string", "description": "Short capability description."},
+                    "category": {"type": "string", "description": "Simple market category.", "default": "general"},
+                    "visibility": {
+                        "type": "string",
+                        "enum": ["tenant", "public"],
+                        "default": "tenant",
+                        "description": "Company-only or platform-public visibility.",
+                    },
+                },
+                "required": ["path", "name", "description", "visibility"],
+            },
+        },
+    },
+    # AgentBay tools
     {
         "type": "function",
         "function": {
@@ -3206,7 +3272,11 @@ _TOOL_AUTONOMY_MAP = {
     "sql_execute": "sql_execute",
     "execute_code_e2b": "execute_code",
     "execute_code_aio": "execute_code",
+    "install_skill_from_market": "install_skill_from_market",
+    "publish_skill_to_market": "publish_skill_to_market",
 }
+
+_FORCED_L3_TOOLS = {"install_skill_from_market", "publish_skill_to_market"}
 
 
 def _is_enterprise_info_path(path: str | None) -> bool:
@@ -3492,6 +3562,10 @@ async def _execute_tool_direct(
             )
         elif tool_name == "sql_execute":
             return await _sql_execute(arguments)
+        elif tool_name == "install_skill_from_market":
+            return await _install_skill_from_market(agent_id, user_id, arguments)
+        elif tool_name == "publish_skill_to_market":
+            return await _publish_skill_to_market(agent_id, user_id, arguments)
         elif tool_name == "web_search":
             return await _web_search(arguments, agent_id)
         elif tool_name == "jina_search":
@@ -3576,7 +3650,7 @@ async def execute_tool(
     # ── Autonomy boundary check (skipped when a human already approved, e.g. a
     #    confirmation card the user confirmed) ──
     action_type = _TOOL_AUTONOMY_MAP.get(tool_name)
-    if action_type and not skip_autonomy:
+    if action_type and (not skip_autonomy or tool_name in _FORCED_L3_TOOLS):
         try:
             from app.services.autonomy_service import autonomy_service
             from app.models.agent import Agent as AgentModel
@@ -3586,14 +3660,43 @@ async def execute_tool(
                 if _agent:
                     from app.utils.sanitize import sanitize_tool_args as _sanitize_tool_args
                     _sanitized_args = _sanitize_tool_args(arguments) or {}
+                    approval_key = None
+                    if tool_name in _FORCED_L3_TOOLS and tool_call_id:
+                        approval_key = ":".join(
+                            [
+                                "market-tool",
+                                str(agent_id),
+                                action_type,
+                                str(session_id or "no-session"),
+                                str(turn_anchor_id or "no-turn"),
+                                str(tool_call_id),
+                            ]
+                        )
                     result_check = await autonomy_service.check_and_enforce(
-                        _adb, _agent, action_type, {"tool": tool_name, "args": str(_sanitized_args)[:200], "requested_by": str(user_id)}
+                        _adb,
+                        _agent,
+                        action_type,
+                        {
+                            "tool": tool_name,
+                            "args": _sanitized_args,
+                            "requested_by": str(user_id),
+                            "session_id": str(session_id or ""),
+                            "turn_anchor_id": str(turn_anchor_id or ""),
+                            "tool_call_id": str(tool_call_id or ""),
+                        },
+                        forced_level="L3" if tool_name in _FORCED_L3_TOOLS else None,
+                        idempotency_key=approval_key,
                     )
                     await _adb.commit()
                     if not result_check.get("allowed"):
                         level = result_check.get("level", "L3")
                         logger.info(f"[Autonomy] Tool {tool_name} denied, level: {level}")
                         if level == "L3":
+                            approval_status = result_check.get("approval_status")
+                            if approval_status == "approved":
+                                return "✅ This approved market action has already been executed."
+                            if approval_status == "rejected":
+                                return "❌ This market action was rejected and will not be executed."
                             return f"⏳ This action requires approval. An approval request has been sent. Please wait for approval before retrying. (Approval ID: {result_check.get('approval_id', 'N/A')})"
                         return f"❌ Action denied: {result_check.get('message', 'unknown reason')}"
         except Exception as e:
@@ -4267,6 +4370,12 @@ async def execute_tool(
             result = await _search_clawhub(agent_id, arguments)
         elif tool_name == "install_skill":
             result = await _install_skill(agent_id, ws, arguments)
+        elif tool_name == "search_skill_market":
+            result = await _search_skill_market(agent_id, arguments)
+        elif tool_name == "install_skill_from_market":
+            result = await _install_skill_from_market(agent_id, user_id, arguments)
+        elif tool_name == "publish_skill_to_market":
+            result = await _publish_skill_to_market(agent_id, user_id, arguments)
         # ── OKR Tools ──
         elif tool_name == "get_okr":
             result = await _get_okr(agent_id, arguments)
@@ -17125,6 +17234,133 @@ async def _install_skill(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     except Exception as e:
         return f"❌ Install failed: {str(e)[:300]}"
 
+
+
+async def _search_skill_market(agent_id: uuid.UUID, arguments: dict) -> str:
+    """Search the first-party Skill market within the Agent's tenant scope."""
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        return "Missing required argument 'query'"
+
+    from app.services.skill_market import list_market_skills
+
+    try:
+        async with async_session() as db:
+            agent = await db.get(AgentModel, agent_id)
+            if not agent:
+                return "❌ Agent not found"
+            results = await list_market_skills(db, tenant_id=agent.tenant_id, query=query, limit=5)
+    except Exception as exc:
+        return f"❌ Skill market search failed: {str(exc)[:240]}"
+
+    if not results:
+        return f"No market Skills found matching '{query}'."
+
+    lines = [f"Found {len(results)} market Skill(s) matching '{query}':\n"]
+    for item in results:
+        scope = "public" if item["visibility"] == "public" else "company"
+        lines.append(
+            f"• **{item['name']}** (`{item['id']}`) — v{item['version']} · "
+            f"{item['downloads']} Agent installs · {scope} · by {item['publisher_name']}"
+        )
+        if item.get("description"):
+            lines.append(f"  {item['description'][:180]}")
+    lines.append(
+        "\nTo install one, obtain user confirmation and call "
+        'install_skill_from_market(skill_id="<id>").'
+    )
+    return "\n".join(lines)
+
+
+async def _market_tool_actor(db, agent_id: uuid.UUID, user_id: uuid.UUID | None):
+    """Resolve and enforce the human manage authority behind a mutating market tool."""
+    if not user_id:
+        return None, None, "Permission denied: a confirmed human actor is required"
+
+    from app.core.permissions import check_agent_access
+
+    actor = await db.get(UserModel, user_id)
+    if not actor:
+        return None, None, "Permission denied: user not found"
+    try:
+        agent, access_level = await check_agent_access(db, actor, agent_id)
+    except Exception as exc:
+        return None, None, f"Permission denied: {str(exc)[:160]}"
+    if access_level != "manage":
+        return None, None, "Permission denied: Agent manage access required"
+    return actor, agent, None
+
+
+async def _install_skill_from_market(
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    arguments: dict,
+) -> str:
+    raw_skill_id = str(arguments.get("skill_id") or "").strip()
+    try:
+        skill_id = uuid.UUID(raw_skill_id)
+    except ValueError:
+        return "❌ skill_id must be a valid UUID returned by search_skill_market"
+
+    from app.services.skill_market import install_market_skill
+
+    try:
+        async with async_session() as db:
+            actor, agent, error = await _market_tool_actor(db, agent_id, user_id)
+            if error:
+                return error
+            result = await install_market_skill(
+                db,
+                agent=agent,
+                skill_id=skill_id,
+                actor_user_id=actor.id,
+                actor_agent_id=agent_id,
+            )
+        return (
+            f"✅ Installed market Skill '{result['skill_name']}' v{result['installed_version']} "
+            f"to skills/{result['folder_name']} ({result['files_written']} files)."
+        )
+    except Exception as exc:
+        detail = getattr(exc, "detail", str(exc))
+        return f"❌ Market Skill installation failed: {str(detail)[:260]}"
+
+
+async def _publish_skill_to_market(
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    arguments: dict,
+) -> str:
+    path = str(arguments.get("path") or "").strip()
+    name = str(arguments.get("name") or "").strip()
+    description = str(arguments.get("description") or "").strip()
+    category = str(arguments.get("category") or "general").strip()
+    visibility = str(arguments.get("visibility") or "tenant").strip()
+    if not path or not name:
+        return "❌ path and name are required"
+
+    from app.services.skill_market import publish_agent_skill
+
+    try:
+        async with async_session() as db:
+            actor, agent, error = await _market_tool_actor(db, agent_id, user_id)
+            if error:
+                return error
+            skill = await publish_agent_skill(
+                db,
+                agent=agent,
+                actor=actor,
+                path=path,
+                name=name,
+                description=description,
+                category=category,
+                visibility=visibility,
+            )
+            await db.commit()
+        scope = "public market" if skill.visibility == "public" else "company market"
+        return f"✅ Published '{skill.name}' v{skill.version} to the {scope} (Skill ID: {skill.id})."
+    except Exception as exc:
+        detail = getattr(exc, "detail", str(exc))
+        return f"❌ Skill publication failed: {str(detail)[:260]}"
 
 
 # ─── sql_execute memory-safe limits ─────────────────────────────────────
