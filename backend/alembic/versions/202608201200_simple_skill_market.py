@@ -12,7 +12,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "simple_skill_market"
-down_revision: str | Sequence[str] | None = "subagent_runs"
+down_revision: str | Sequence[str] | None = "subagent_context_flags"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
