@@ -9,6 +9,7 @@ import asyncio
 import fcntl
 import ipaddress
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -17,6 +18,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
@@ -28,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import async_session
 from app.models.project import Project, ProjectRepositoryOperation
+from app.services.chat_attachments import sniff_image_mime_bytes, sniff_media_mime_bytes
 
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -38,6 +41,41 @@ _SCP_REMOTE_RE = re.compile(
 )
 _REPO_LOCKS: dict[Path, threading.RLock] = {}
 _REPO_LOCKS_GUARD = threading.Lock()
+PROJECT_FILE_EDIT_LIMIT_BYTES = 1024 * 1024
+PROJECT_FILE_CONTENT_MAX_CHARS = 1024 * 1024
+_TEXT_MIME_BY_SUFFIX = {
+    ".c": "text/x-c",
+    ".cc": "text/x-c++src",
+    ".conf": "text/plain",
+    ".cpp": "text/x-c++src",
+    ".css": "text/css",
+    ".csv": "text/csv",
+    ".env": "text/plain",
+    ".go": "text/x-go",
+    ".h": "text/x-c",
+    ".hpp": "text/x-c++hdr",
+    ".html": "text/html",
+    ".ini": "text/plain",
+    ".java": "text/x-java-source",
+    ".js": "text/javascript",
+    ".json": "application/json",
+    ".jsx": "text/javascript",
+    ".log": "text/plain",
+    ".md": "text/markdown",
+    ".mjs": "text/javascript",
+    ".py": "text/x-python",
+    ".rb": "text/x-ruby",
+    ".rs": "text/x-rust",
+    ".sh": "text/x-shellscript",
+    ".sql": "application/sql",
+    ".toml": "application/toml",
+    ".ts": "text/typescript",
+    ".tsx": "text/typescript-jsx",
+    ".txt": "text/plain",
+    ".xml": "application/xml",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+}
 
 
 @dataclass(slots=True)
@@ -235,7 +273,12 @@ async def validate_project_remote_url(raw_url: str) -> str:
 def _safe_relative_path(repo: Path, raw_path: str) -> tuple[str, Path]:
     """Resolve one user path under a managed repo without following it outside."""
 
-    if not raw_path or "\x00" in raw_path or "\\" in raw_path:
+    if (
+        not raw_path
+        or "\x00" in raw_path
+        or "\\" in raw_path
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw_path)
+    ):
         raise HTTPException(status_code=422, detail="Invalid project file path")
     pure = PurePosixPath(raw_path)
     normalized = pure.as_posix()
@@ -245,7 +288,7 @@ def _safe_relative_path(repo: Path, raw_path: str) -> tuple[str, Path]:
         or any(part in {"", ".", ".."} for part in pure.parts)
     ):
         raise HTTPException(status_code=422, detail="Project file path must be a normalized relative path")
-    if pure.parts[0].lower() == ".git":
+    if any(part.lower() == ".git" for part in pure.parts):
         raise HTTPException(status_code=422, detail="The Git metadata directory cannot be modified")
     target = (repo / normalized).resolve(strict=False)
     if target == repo or repo not in target.parents:
@@ -695,23 +738,110 @@ async def reconcile_project_repository_operations(
         return reconciled
 
 
+def _blob_prefix(repo: Path, object_id: str, limit: int) -> bytes:
+    """Read only a bounded prefix from an immutable Git object."""
+
+    process = subprocess.Popen(  # noqa: S603 - fixed argv, validated object id
+        ["git", "-C", str(repo), "cat-file", "blob", object_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert process.stdout is not None
+        return process.stdout.read(max(0, limit))
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def _mime_and_kind(path: str, sample: bytes) -> tuple[str, str, bool]:
+    suffix = PurePosixPath(path).suffix.lower()
+    sniffed_image = sniff_image_mime_bytes(sample)
+    if sniffed_image:
+        return sniffed_image, "image", False
+    sniffed_media = sniff_media_mime_bytes(sample, path)
+    if sniffed_media:
+        return sniffed_media, sniffed_media.split("/", 1)[0], False
+    mime_type = _TEXT_MIME_BY_SUFFIX.get(suffix)
+    if mime_type is None:
+        mime_type = mimetypes.guess_type(path, strict=False)[0]
+
+    media_kind = (mime_type or "").split("/", 1)[0]
+    if media_kind in {"image", "video", "audio"}:
+        return mime_type or "application/octet-stream", media_kind, False
+
+    known_text = bool(
+        mime_type
+        and (
+            mime_type.startswith("text/")
+            or mime_type
+            in {
+                "application/json",
+                "application/ld+json",
+                "application/sql",
+                "application/toml",
+                "application/xml",
+                "application/yaml",
+                "application/javascript",
+            }
+            or mime_type.endswith(("+json", "+xml"))
+        )
+    )
+    if b"\x00" in sample:
+        return mime_type or "application/octet-stream", "binary", False
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return mime_type or "application/octet-stream", "binary", False
+    if known_text or mime_type is None:
+        return mime_type or "text/plain", "text", True
+    return mime_type, "binary", False
+
+
+def _tree_entry(repo: Path, path: str) -> tuple[str, int]:
+    result = _git(repo, "ls-tree", "-l", "-z", "HEAD", "--", path, check=False)
+    if result.returncode != 0 or not result.stdout:
+        raise HTTPException(status_code=404, detail="Project file is not committed at HEAD")
+    record = result.stdout.rstrip("\x00")
+    metadata, separator, recorded_path = record.partition("\t")
+    parts = metadata.split()
+    if not separator or recorded_path != path or len(parts) != 4 or parts[1] != "blob":
+        raise HTTPException(status_code=404, detail="Project file is not committed at HEAD")
+    object_id = parts[2]
+    try:
+        size = int(parts[3])
+    except ValueError as exc:
+        raise RuntimeError("Git returned an invalid project blob size") from exc
+    return object_id, size
+
+
 def _file_record(repo: Path, path: str, *, preview_limit: int = 4000) -> dict:
-    size_text = _git(repo, "cat-file", "-s", f"HEAD:{path}", check=False).stdout.strip()
-    blob = subprocess.run(
-        ["git", "-C", str(repo), "show", f"HEAD:{path}"],
-        capture_output=True,
-        timeout=30,
-        check=False,
-    ).stdout
-    preview = "" if b"\x00" in blob else blob[:preview_limit].decode("utf-8", errors="replace")
+    object_id, size = _tree_entry(repo, path)
+    sample = _blob_prefix(repo, object_id, max(preview_limit + 1, 8192))
+    mime_type, kind, is_text = _mime_and_kind(path, sample)
+    preview = sample[:preview_limit].decode("utf-8", errors="replace") if is_text else ""
     commit = _git(repo, "log", "-1", "--format=%H", "--", path).stdout.strip()
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
     return {
         "id": path,
         "path": path,
         "name": PurePosixPath(path).name,
-        "size": int(size_text) if size_text.isdigit() else 0,
+        "size": size,
         "commit": commit,
         "commit_hash": commit,
+        "head": head,
+        "object_id": object_id,
+        "mime_type": mime_type,
+        "kind": kind,
+        "is_text": is_text,
+        "is_editable": is_text and size <= PROJECT_FILE_EDIT_LIMIT_BYTES,
         "preview": preview,
         "content_preview": preview,
     }
@@ -728,27 +858,101 @@ async def list_project_files(project: Project) -> list[dict]:
     return await asyncio.to_thread(_list_files, project)
 
 
-def _read_file(project: Project, path: str, max_chars: int) -> dict:
+def _inspect_file(project: Project, path: str) -> dict:
     repo = _repo_for(project)
     with _repo_lock(repo):
         normalized, _target = _safe_relative_path(repo, path)
-        result = subprocess.run(
-            ["git", "-C", str(repo), "show", f"HEAD:{normalized}"],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise HTTPException(status_code=404, detail="Project file is not committed at HEAD")
-        if b"\x00" in result.stdout:
-            raise HTTPException(status_code=422, detail="Binary project files cannot be read as text")
-        content = result.stdout.decode("utf-8", errors="replace")
+        return _file_record(repo, normalized, preview_limit=0)
+
+
+async def inspect_project_file(project: Project, path: str) -> dict:
+    return await asyncio.to_thread(_inspect_file, project, path)
+
+
+def _read_file_content(project: Project, path: str, max_chars: int) -> dict:
+    repo = _repo_for(project)
+    with _repo_lock(repo):
+        normalized, _target = _safe_relative_path(repo, path)
+        metadata = _file_record(repo, normalized, preview_limit=0)
+        if not metadata["is_text"]:
+            return {**metadata, "content": None, "truncated": False, "is_editable": False}
+        # A UTF-8 code point uses at most four bytes. The extra byte lets us
+        # distinguish an exact boundary from a truncated preview.
+        sample = _blob_prefix(repo, metadata["object_id"], max_chars * 4 + 1)
+        try:
+            decoded = sample.decode("utf-8")
+        except UnicodeDecodeError:
+            # The sample may end in the middle of one UTF-8 code point.
+            decoded = sample.decode("utf-8", errors="ignore")
+        content = decoded[:max_chars]
+        truncated = metadata["size"] > len(sample) or len(decoded) > max_chars
         return {
-            "path": normalized,
-            "commit": _git(repo, "rev-parse", "HEAD").stdout.strip(),
-            "content": content[:max_chars],
-            "truncated": len(content) > max_chars,
+            **metadata,
+            "content": content,
+            "truncated": truncated,
+            # Never let a caller overwrite a file from a partial editor buffer.
+            "is_editable": bool(metadata["is_editable"] and not truncated),
         }
+
+
+async def read_project_file_content(project: Project, path: str, max_chars: int = 200_000) -> dict:
+    bounded = min(PROJECT_FILE_CONTENT_MAX_CHARS, max(1, int(max_chars)))
+    return await asyncio.to_thread(_read_file_content, project, path, bounded)
+
+
+def iter_project_file_blob(
+    project: Project,
+    object_id: str,
+    *,
+    start: int,
+    end: int,
+    chunk_size: int = 1024 * 1024,
+) -> Iterator[bytes]:
+    """Yield one immutable HEAD blob range without materializing it in memory."""
+
+    repo = _repo_for(project)
+    remaining = max(0, end - start + 1)
+    process = subprocess.Popen(  # noqa: S603 - fixed argv, object id came from ls-tree
+        ["git", "-C", str(repo), "cat-file", "blob", object_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert process.stdout is not None
+        skipped = 0
+        while skipped < start:
+            chunk = process.stdout.read(min(chunk_size, start - skipped))
+            if not chunk:
+                raise RuntimeError("Git project blob ended before the requested range")
+            skipped += len(chunk)
+        while remaining:
+            chunk = process.stdout.read(min(chunk_size, remaining))
+            if not chunk:
+                raise RuntimeError("Git project blob ended before the requested range")
+            remaining -= len(chunk)
+            yield chunk
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def _read_file(project: Project, path: str, max_chars: int) -> dict:
+    result = _read_file_content(project, path, max_chars)
+    if not result["is_text"]:
+        raise HTTPException(status_code=422, detail="Binary project files cannot be read as text")
+    return {
+        "path": result["path"],
+        "commit": result["head"],
+        "content": result["content"],
+        "truncated": result["truncated"],
+    }
 
 
 async def read_project_file(project: Project, path: str, max_chars: int = 20_000) -> dict:

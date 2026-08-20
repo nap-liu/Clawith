@@ -12,9 +12,9 @@ route; provider identifiers never enter the public contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import uuid
+from dataclasses import dataclass
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,7 +35,6 @@ from app.models.org import (
 )
 from app.models.user import User
 from app.services.channel_user_service import channel_user_service
-
 
 MESSAGE_OUTBOUND_CHANNELS = frozenset(
     {"feishu", "dingtalk", "wecom", "slack", "teams", "wechat"}
@@ -163,6 +162,42 @@ async def resolve_agent_recipient(
             "agent_id does not identify exactly one active digital employee in this tenant",
         )
     target = targets[0]
+    if project_id is not None:
+        from app.models.project import Project, ProjectMemberSnapshot
+
+        project = (
+            await db.execute(
+                select(Project).where(
+                    Project.id == project_id,
+                    Project.tenant_id == source.tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if project is None:
+            raise RecipientResolutionError(
+                "project_not_found",
+                "Project-scoped Agent delivery has no matching project",
+            )
+        member_ids = set(
+            (
+                await db.execute(
+                    select(ProjectMemberSnapshot.agent_id).where(
+                        ProjectMemberSnapshot.project_id == project.id,
+                        ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                        ProjectMemberSnapshot.agent_id.in_([source.id, target.id]),
+                        ProjectMemberSnapshot.is_enabled.is_(True),
+                    )
+                )
+            ).scalars()
+        )
+        if member_ids != {source.id, target.id}:
+            raise RecipientResolutionError(
+                "project_member_inactive",
+                "Project-scoped Agent delivery requires two active project members",
+            )
+        # Project membership is both the grant and the boundary. A global
+        # relationship must never let a departed member bypass this scope.
+        return ResolvedAgentRecipient(source, target, None)
     relationship_result = await db.execute(
         select(AgentAgentRelationship).where(
             AgentAgentRelationship.agent_id == source.id,
@@ -171,32 +206,6 @@ async def resolve_agent_recipient(
     )
     relationship = relationship_result.scalar_one_or_none()
     if relationship is None:
-        if project_id is not None:
-            from app.models.project import Project, ProjectMemberSnapshot
-
-            project = (
-                await db.execute(
-                    select(Project).where(
-                        Project.id == project_id,
-                        Project.tenant_id == source.tenant_id,
-                    )
-                )
-            ).scalar_one_or_none()
-            if project is not None:
-                member_ids = set(
-                    (
-                        await db.execute(
-                            select(ProjectMemberSnapshot.agent_id).where(
-                                ProjectMemberSnapshot.project_id == project.id,
-                                ProjectMemberSnapshot.tenant_id == project.tenant_id,
-                                ProjectMemberSnapshot.agent_id.in_([source.id, target.id]),
-                                ProjectMemberSnapshot.is_enabled.is_(True),
-                            )
-                        )
-                    ).scalars()
-                )
-                if member_ids == {source.id, target.id}:
-                    return ResolvedAgentRecipient(source, target, None)
         raise RecipientResolutionError(
             "recipient_not_related",
             "agent_id does not identify an active related digital employee",

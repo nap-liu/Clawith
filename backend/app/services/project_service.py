@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
 from app.models.agent import Agent
+from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.mcp_server import MCPServer
 from app.models.project import (
@@ -22,6 +23,7 @@ from app.models.project import (
     ProjectWorkItem,
 )
 from app.models.skill import Skill
+from app.models.subagent_run import SubagentRun
 from app.models.user import User
 from app.schemas.project import ProjectCapabilityCreate, ProjectCreate, ProjectMemberCreate
 
@@ -253,7 +255,14 @@ async def add_member(
         )
     ).scalar_one_or_none()
     if existing:
-        raise HTTPException(status_code=409, detail="Agent is already a project member")
+        detail = (
+            "Agent previously left this project; restore the existing member snapshot"
+            if not existing.is_enabled
+            else "Agent is already an active project member"
+        )
+        raise HTTPException(status_code=409, detail=detail)
+    if not data.is_enabled:
+        raise HTTPException(status_code=422, detail="New project members must start active; remove them explicitly later")
     if data.is_leader:
         await db.execute(
             ProjectMemberSnapshot.__table__.update()
@@ -276,6 +285,15 @@ async def add_member(
             "max_tool_rounds": agent.max_tool_rounds,
             "source_agent_status": agent.status,
             "enabled_inherited_capability_ids": [str(value) for value in data.enabled_inherited_capability_ids],
+            "membership": {
+                "state": "active",
+                "generation": 1,
+                "changed_at": datetime.now(timezone.utc).isoformat(),
+                "changed_by_user_id": str(actor_user_id),
+                "changed_by_agent_id": None,
+                "reason": "project_member_added",
+                "history": [],
+            },
         },
     )
     db.add(member)
@@ -290,6 +308,264 @@ async def add_member(
         metadata={"member_id": str(member.id), "is_leader": member.is_leader},
     )
     return member
+
+
+def _membership_config(
+    member: ProjectMemberSnapshot,
+    *,
+    state: str,
+    actor_user_id: uuid.UUID | None,
+    actor_agent_id: uuid.UUID | None,
+    reason: str | None,
+    revoked_subagent_ids: list[uuid.UUID] | None = None,
+) -> dict:
+    """Return a new immutable JSON value for one membership transition."""
+
+    now = datetime.now(timezone.utc).isoformat()
+    config = dict(member.config_snapshot or {})
+    previous = dict(config.get("membership") or {})
+    history = list(previous.get("history") or [])
+    transition = {
+        "state": state,
+        "at": now,
+        "actor_user_id": str(actor_user_id) if actor_user_id else None,
+        "actor_agent_id": str(actor_agent_id) if actor_agent_id else None,
+        "reason": (reason or "").strip() or None,
+    }
+    history.append(transition)
+    membership = {
+        **previous,
+        "state": state,
+        "changed_at": now,
+        "changed_by_user_id": transition["actor_user_id"],
+        "changed_by_agent_id": transition["actor_agent_id"],
+        "reason": transition["reason"],
+        "history": history,
+    }
+    if state == "departed":
+        membership["departed_at"] = now
+        membership["revoked_subagent_ids"] = [str(value) for value in (revoked_subagent_ids or [])]
+    else:
+        membership["restored_at"] = now
+        membership["generation"] = max(1, int(previous.get("generation") or 1)) + 1
+    config["membership"] = membership
+    return config
+
+
+async def deactivate_project_member(
+    db: AsyncSession,
+    project: Project,
+    member: ProjectMemberSnapshot,
+    *,
+    actor_user_id: uuid.UUID | None = None,
+    actor_agent_id: uuid.UUID | None = None,
+    reason: str | None = None,
+) -> list[uuid.UUID]:
+    """Soft-remove a member and revoke every live project execution.
+
+    The snapshot, child sessions, messages, immutable run-member snapshots and
+    audit history remain addressable. Only future authority is removed.
+    """
+
+    if member.project_id != project.id or member.tenant_id != project.tenant_id:
+        raise HTTPException(status_code=404, detail="Project member not found")
+    if member.is_leader:
+        raise HTTPException(status_code=422, detail="Transfer project leadership before removing the Leader")
+    if not member.is_enabled:
+        return []
+
+    all_children = (
+        await db.execute(
+            select(SubagentRun).where(
+                SubagentRun.project_id == project.id,
+                SubagentRun.project_member_id == member.id,
+            )
+        )
+    ).scalars().all()
+    live_children = [row for row in all_children if row.status in {"queued", "running"}]
+    child_ids = [row.id for row in all_children]
+    cancelled_child_ids = [row.id for row in live_children]
+    now = datetime.now(timezone.utc)
+    for child in live_children:
+        child.status = "cancelled"
+        child.lease_owner = None
+        child.lease_expires_at = None
+
+    if child_ids:
+        sessions = (
+            await db.execute(select(ChatSession).where(ChatSession.id.in_(child_ids)))
+        ).scalars().all()
+        for session in sessions:
+            session.im_config = {
+                **dict(session.im_config or {}),
+                "membership_revoked": True,
+                "membership_revoked_at": now.isoformat(),
+                "membership_revoked_reason": "project_member_departed",
+            }
+        inputs = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id.in_([str(value) for value in child_ids]),
+                    ChatMessage.message_meta["kind"].as_string() == "subagent_input",
+                    ChatMessage.message_meta["subagent_input_state"].as_string().in_(["pending", "processing"]),
+                )
+            )
+        ).scalars().all()
+        for row in inputs:
+            metadata = dict(row.message_meta or {})
+            metadata["subagent_input_state"] = "cancelled"
+            metadata["turn_status"] = "cancelled"
+            metadata["cancel_reason"] = "project_member_departed"
+            row.message_meta = metadata
+
+    project_runs = (
+        await db.execute(
+            select(ProjectRun).where(
+                ProjectRun.project_id == project.id,
+                ProjectRun.tenant_id == project.tenant_id,
+                ProjectRun.agent_id == member.agent_id,
+                ProjectRun.status.not_in(TERMINAL_PROJECT_RUN_STATUSES),
+            )
+        )
+    ).scalars().all()
+    for run in project_runs:
+        run.status = "cancelled"
+        run.finished_at = now
+        run.error = "Project member departed before this run completed"
+        run.output = {
+            **dict(run.output or {}),
+            "cancel_reason": "project_member_departed",
+            "project_member_id": str(member.id),
+        }
+
+    member.is_enabled = False
+    member.is_leader = False
+    member.config_snapshot = _membership_config(
+        member,
+        state="departed",
+        actor_user_id=actor_user_id,
+        actor_agent_id=actor_agent_id,
+        reason=reason,
+        revoked_subagent_ids=child_ids,
+    )
+    add_event(
+        db,
+        project,
+        "member.departed",
+        f"Removed {member.name_snapshot} from active project participation",
+        actor_user_id=actor_user_id,
+        actor_agent_id=actor_agent_id,
+        metadata={
+            "member_id": str(member.id),
+            "agent_id": str(member.agent_id),
+            "reason": (reason or "").strip() or None,
+            "revoked_subagent_ids": [str(value) for value in child_ids],
+            "cancelled_subagent_ids": [str(value) for value in cancelled_child_ids],
+            "cancelled_project_run_ids": [str(row.id) for row in project_runs],
+            "snapshot_retained": True,
+        },
+    )
+    await db.flush()
+    return cancelled_child_ids
+
+
+async def restore_project_member(
+    db: AsyncSession,
+    project: Project,
+    member: ProjectMemberSnapshot,
+    *,
+    actor_user_id: uuid.UUID | None = None,
+    actor_agent_id: uuid.UUID | None = None,
+    reason: str | None = None,
+) -> list[uuid.UUID]:
+    """Restore the same member snapshot without reopening revoked sessions."""
+
+    if member.project_id != project.id or member.tenant_id != project.tenant_id:
+        raise HTTPException(status_code=404, detail="Project member not found")
+    if member.is_enabled:
+        return []
+    await _get_project_agent(db, project.tenant_id, member.agent_id)
+
+    member.is_enabled = True
+    member.config_snapshot = _membership_config(
+        member,
+        state="active",
+        actor_user_id=actor_user_id,
+        actor_agent_id=actor_agent_id,
+        reason=reason,
+    )
+    add_event(
+        db,
+        project,
+        "member.restored",
+        f"Restored {member.name_snapshot} to active project participation",
+        actor_user_id=actor_user_id,
+        actor_agent_id=actor_agent_id,
+        metadata={
+            "member_id": str(member.id),
+            "agent_id": str(member.agent_id),
+            "reason": (reason or "").strip() or None,
+            "restored_subagent_ids": [],
+            "old_sessions_remain_read_only": True,
+            "snapshot_reused": True,
+        },
+    )
+    await db.flush()
+    return []
+
+
+async def project_session_access_mode(
+    db: AsyncSession,
+    user: User,
+    session: ChatSession,
+) -> str | None:
+    """Return ``read``/``edit`` for an auditable project Subagent session.
+
+    Historical sessions remain readable after departure. Writing additionally
+    requires an owner/editor ACL and the exact durable member snapshot to still
+    be enabled.
+    """
+
+    if session.source_channel != "subagent" or session.project_id is None or user.tenant_id is None:
+        return None
+    project = await db.get(Project, session.project_id)
+    run = await db.get(SubagentRun, session.id)
+    if (
+        project is None
+        or project.tenant_id != user.tenant_id
+        or run is None
+        or run.project_id != project.id
+        or run.project_member_id is None
+        or session.agent_id is None
+    ):
+        return None
+    member = await db.get(ProjectMemberSnapshot, run.project_member_id)
+    if (
+        member is None
+        or member.project_id != project.id
+        or member.tenant_id != project.tenant_id
+        or member.agent_id != session.agent_id
+    ):
+        return None
+    member_is_writable = member.is_enabled and not bool(
+        dict(session.im_config or {}).get("membership_revoked")
+    )
+    if project.owner_user_id == user.id:
+        human_role = "edit"
+    else:
+        grant = (
+            await db.execute(
+                select(ProjectAccessGrant).where(
+                    ProjectAccessGrant.project_id == project.id,
+                    ProjectAccessGrant.tenant_id == project.tenant_id,
+                    ProjectAccessGrant.user_id == user.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if grant is None:
+            return None
+        human_role = "edit" if grant.role == "edit" else "read"
+    return "edit" if human_role == "edit" and member_is_writable else "read"
 
 
 async def _resolve_capability(
@@ -639,7 +915,7 @@ async def project_summary(db: AsyncSession, project: Project) -> dict:
                 "role_snapshot": member.role_snapshot,
                 "is_leader": member.is_leader,
                 "is_enabled": member.is_enabled,
-                "status": "active" if member.is_enabled else "disabled",
+                "status": "active" if member.is_enabled else "departed",
                 "config_snapshot": member.config_snapshot,
             }
             for member in members
@@ -660,12 +936,57 @@ async def project_summary(db: AsyncSession, project: Project) -> dict:
 
 
 def apply_run_status(run: ProjectRun, status: str) -> None:
+    # A ProjectRun is an append-only execution fact. Retrying creates another
+    # run; it must never move an already terminal row back to a live state.
+    reconcile_project_run_terminal_state(run)
+    if run.status in TERMINAL_PROJECT_RUN_STATUSES:
+        return
     run.status = status
     now = datetime.now(timezone.utc)
     if status == "running" and run.started_at is None:
         run.started_at = now
-    if status in {"succeeded", "failed", "cancelled"}:
+    if status in TERMINAL_PROJECT_RUN_STATUSES:
         run.finished_at = now
+
+
+TERMINAL_PROJECT_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+
+
+def reconcile_project_run_terminal_state(run: ProjectRun) -> bool:
+    """Repair the durable invariant ``finished_at => terminal status``.
+
+    A previous dispatch race could commit ``running`` after the child turn had
+    already written ``finished_at``. The timestamp is the stronger completion
+    fact, so recovery promotes the row to a terminal status and never clears
+    evidence/output. The operation is idempotent and safe in request/daemon
+    recovery paths.
+    """
+
+    if run.finished_at is None or run.status in TERMINAL_PROJECT_RUN_STATUSES:
+        return False
+    run.status = "failed" if (run.error or "").strip() else "succeeded"
+    if run.started_at is None:
+        run.started_at = run.created_at or run.finished_at
+    return True
+
+
+async def reconcile_project_runs(
+    db: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    tenant_id: uuid.UUID | None = None,
+) -> int:
+    """Repair stale non-terminal ProjectRuns for one tenant-scoped project."""
+
+    conditions = [
+        ProjectRun.project_id == project_id,
+        ProjectRun.finished_at.is_not(None),
+        ProjectRun.status.not_in(TERMINAL_PROJECT_RUN_STATUSES),
+    ]
+    if tenant_id is not None:
+        conditions.append(ProjectRun.tenant_id == tenant_id)
+    runs = (await db.execute(select(ProjectRun).where(*conditions))).scalars().all()
+    return sum(reconcile_project_run_terminal_state(run) for run in runs)
 
 
 async def deliver_project_a2a(run_id: uuid.UUID) -> None:
@@ -688,6 +1009,35 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
         project_id = run.project_id
         initiated_by_user_id = run.initiated_by_user_id
         from_agent_id = uuid.UUID(payload["from_agent_id"])
+        to_agent_id = uuid.UUID(payload["to_agent_id"])
+        active_member_ids = set(
+            (
+                await db.execute(
+                    select(ProjectMemberSnapshot.agent_id).where(
+                        ProjectMemberSnapshot.project_id == project.id,
+                        ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                        ProjectMemberSnapshot.agent_id.in_([from_agent_id, to_agent_id]),
+                        ProjectMemberSnapshot.is_enabled.is_(True),
+                    )
+                )
+            ).scalars()
+        )
+        if active_member_ids != {from_agent_id, to_agent_id}:
+            apply_run_status(run, "cancelled")
+            run.error = "Project A2A sender or recipient is no longer an active member"
+            add_event(
+                db,
+                project,
+                "a2a.cancelled",
+                "Cancelled project A2A because a participant left the project",
+                actor_user_id=initiated_by_user_id,
+                from_agent_id=from_agent_id,
+                to_agent_id=to_agent_id,
+                run_id=run.id,
+                metadata={"reason": "project_member_departed"},
+            )
+            await db.commit()
+            return
         mode_map = {"delegate": "task_delegate", "review": "consult"}
         msg_type = mode_map.get(payload.get("mode"), payload.get("mode", "notify"))
         apply_run_status(run, "running")

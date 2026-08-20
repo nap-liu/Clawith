@@ -332,6 +332,7 @@ class WebSocketChatHandler:
         # allowed to see (admins / agent creator). They subscribe to live
         # broadcasts but may never drive a turn — enforced in ``message_loop``.
         self.read_only: bool = False
+        self.project_session_access: str | None = None
         self.history_messages: list[ChatMessage] = []
         self.conversation: list[dict] = []
         self.current_user_text: str = ""
@@ -400,7 +401,28 @@ class WebSocketChatHandler:
                     return False
 
                 logger.info(f"[WS] Checking agent access for {self.agent_id}")
-                agent, _ = await check_agent_access(db, user, self.agent_id)
+                project_session = None
+                if self.session_id_param:
+                    try:
+                        project_session = await db.get(ChatSession, uuid.UUID(self.session_id_param))
+                    except (TypeError, ValueError):
+                        project_session = None
+                if project_session is not None and project_session.agent_id == self.agent_id:
+                    from app.services.project_service import project_session_access_mode
+
+                    self.project_session_access = await project_session_access_mode(db, user, project_session)
+                if self.project_session_access is not None:
+                    agent = await db.get(Agent, self.agent_id)
+                    if (
+                        agent is None
+                        or agent.is_deleted
+                        or agent.tenant_id != user.tenant_id
+                    ):
+                        await self.websocket.send_json({"type": "error", "content": "Session not found"})
+                        await self.websocket.close(code=4003)
+                        return False
+                else:
+                    agent, _ = await check_agent_access(db, user, self.agent_id)
                 require_current_agent_tenant(user, agent)
                 if is_agent_expired(agent):
                     await self.websocket.send_json(
@@ -547,11 +569,17 @@ class WebSocketChatHandler:
                     is_subagent_owner = False
                     if _existing.source_channel == "subagent":
                         # Subagent sessions are runtime-owned but may be opened
-                        # directly as a standard read-only execution record.
-                        self.read_only = True
+                        # directly. Project owner/editors may continue an active
+                        # member's durable work session; historical/departed
+                        # sessions remain visible but read-only.
+                        if self.project_session_access is not None:
+                            self.read_only = self.project_session_access != "edit"
+                        else:
+                            self.read_only = True
                         run = await db.get(SubagentRun, _existing.id)
                         is_subagent_owner = bool(
-                            run is not None and run.execution_user_id == user_id
+                            self.project_session_access is not None
+                            or (run is not None and run.execution_user_id == user_id)
                         )
                     if hasattr(agent, "tenant_id"):
                         try:
@@ -592,6 +620,20 @@ class WebSocketChatHandler:
             conv_id = str(_latest.id)
             logger.info(f"[WS] Selected primary session {conv_id}")
         return conv_id
+
+    async def _project_session_still_writable(self) -> bool:
+        """Revalidate membership and Human ACL for every project work-session Turn."""
+
+        if getattr(self, "project_session_access", None) is None or not self.conv_id or self.user_id is None:
+            return not self.read_only
+        async with async_session() as db:
+            session = await db.get(ChatSession, uuid.UUID(self.conv_id))
+            user = await db.get(User, self.user_id)
+            if session is None or user is None:
+                return False
+            from app.services.project_service import project_session_access_mode
+
+            return await project_session_access_mode(db, user, session) == "edit"
 
     async def _load_scene_manifest(self, db: AsyncSession | None = None) -> None:
         """Load the current scene revision without binding it to the session."""
@@ -745,6 +787,9 @@ class WebSocketChatHandler:
 
             if not content and not is_onboarding_trigger:
                 continue
+
+            if getattr(self, "project_session_access", None) is not None and not await self._project_session_still_writable():
+                self.read_only = True
 
             # Read-only monitor: this viewer is watching a session they do not
             # own (admin/creator with view rights). They receive live broadcasts

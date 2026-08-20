@@ -15,6 +15,24 @@ import type {
 type JsonRecord = Record<string, unknown>;
 type JsonCollection = JsonRecord[] | { items: JsonRecord[]; total?: number };
 
+export type ProjectFileKind = 'text' | 'image' | 'video' | 'audio' | 'binary';
+
+export type ProjectFileContent = {
+    path: string;
+    name: string;
+    commit: string;
+    size: number;
+    mime_type: string;
+    kind: ProjectFileKind;
+    is_text: boolean;
+    is_editable: boolean;
+    content: string | null;
+    truncated: boolean;
+    raw_url: string;
+    download_url: string;
+    ticket_expires_in: number;
+};
+
 const record = (value: unknown): JsonRecord => value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : {};
 const array = (value: unknown): unknown[] => Array.isArray(value) ? value : [];
 const string = (value: unknown, fallback = ''): string => typeof value === 'string' || typeof value === 'number' ? String(value) : fallback;
@@ -226,6 +244,26 @@ export const projectsApi = {
 
     dashboard: (projectId: string) => fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/dashboard`),
     listMembers: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/members`),
+    addMember: (projectId: string, payload: { agent_id: string; is_leader?: boolean; is_enabled?: boolean; enabled_inherited_capability_ids?: string[] }) =>
+        fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/members`, {
+            method: 'POST',
+            body: JSON.stringify({
+                agent_id: payload.agent_id,
+                is_leader: payload.is_leader ?? false,
+                is_enabled: payload.is_enabled ?? true,
+                enabled_inherited_capability_ids: payload.enabled_inherited_capability_ids ?? [],
+            }),
+        }),
+    removeMember: (projectId: string, memberId: string, reason?: string) =>
+        fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}/remove`, {
+            method: 'POST',
+            body: JSON.stringify({ reason: reason || null }),
+        }),
+    restoreMember: (projectId: string, memberId: string, reason?: string) =>
+        fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/members/${encodeURIComponent(memberId)}/restore`, {
+            method: 'POST',
+            body: JSON.stringify({ reason: reason || null }),
+        }),
     listCapabilities: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/capabilities`),
     listWorkItems: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/work-items`),
     createWorkItem: (projectId: string, payload: { title: string; description?: string; assignee_agent_id?: string | null; status?: string; priority?: string; acceptance_criteria?: string[]; dependency_ids?: string[] }) =>
@@ -244,20 +282,39 @@ export const projectsApi = {
             body: JSON.stringify({ confirmation: confirmation || undefined }),
         }),
     async listGroupMessages(projectId: string, sessionId: string): Promise<JsonRecord[]> {
-        const response = await fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages?limit=500`);
+        const [response, projectRuns] = await Promise.all([
+            fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages?limit=500`),
+            fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/runs`).catch(() => []),
+        ]);
+        const currentRunById = new Map<string, JsonRecord>(projectRuns.map(run => [
+            string(run.id || run.run_id),
+            record(run),
+        ] as [string, JsonRecord]));
         return array(response.items).map(item => {
             const message = record(item);
             const metadata = record(message.metadata || message.message_meta);
+            const subagentRuns = array(metadata.subagent_runs).map(item => {
+                const subagentRun = record(item);
+                const current = currentRunById.get(string(subagentRun.project_run_id));
+                return current ? {
+                    ...subagentRun,
+                    status: current.status || subagentRun.status,
+                    error: current.error || subagentRun.error,
+                } : subagentRun;
+            });
+            const liveMetadata = subagentRuns.length ? { ...metadata, subagent_runs: subagentRuns } : metadata;
             return {
                 ...message,
                 display_content: message.display_content ?? message.content ?? '',
                 attachments: array(message.attachments).length ? message.attachments : array(metadata.attachments),
                 sender_name: message.sender_name || metadata.sender_name,
+                metadata: liveMetadata,
+                message_meta: liveMetadata,
             };
         });
     },
     sendGroupMessage: (projectId: string, sessionId: string, payload: { content: string; llm_content?: string; mentions: string[]; attachments: JsonRecord[]; sender_agent_id?: string }) =>
-        fetchJson<{ message?: JsonRecord; awakened_agent_ids?: string[]; subagent_runs?: Array<{ run_id: string; session_id: string; agent_id: string; status: string }> }>(`/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages`, {
+        fetchJson<{ message?: JsonRecord; awakened_agent_ids?: string[]; subagent_runs?: Array<{ project_run_id?: string; run_id: string | null; session_id: string | null; agent_id: string; status: string; error?: string }> }>(`/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages`, {
             method: 'POST',
             body: JSON.stringify({ ...payload, client_message_id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}` }),
         }),
@@ -307,6 +364,10 @@ export const projectsApi = {
     updateSettings: (projectId: string, settings: JsonRecord) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/settings`, { method: 'PATCH', body: JSON.stringify(settings) }),
     listFiles: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/files`),
+    getFileContent: (projectId: string, path: string, maxChars = 200_000) => {
+        const query = new URLSearchParams({ path, max_chars: String(maxChars) });
+        return fetchJson<ProjectFileContent>(`/projects/${encodeURIComponent(projectId)}/files/content?${query}`);
+    },
     writeFile: (projectId: string, payload: { path: string; content: string }) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/files`, { method: 'PUT', body: JSON.stringify(payload) }),
     commitFiles: (projectId: string, payload: { message: string; paths?: string[]; milestone?: boolean }) =>

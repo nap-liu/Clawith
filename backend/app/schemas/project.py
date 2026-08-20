@@ -108,6 +108,10 @@ class ProjectMemberUpdate(BaseModel):
     config_snapshot: dict | None = None
 
 
+class ProjectMemberLifecycleRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
 class ProjectMemberOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

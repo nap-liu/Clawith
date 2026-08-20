@@ -49,6 +49,8 @@ export type ConversationTimelineProps = {
     mode?: 'h5' | 'pc';
     viewOf: (message: ConversationMessage) => ConversationMessageView;
     isRunning?: boolean;
+    /** Optional domain-specific copy for the standard streaming/thinking row. */
+    runningLabel?: string;
     unavailableAttachmentKeys?: ReadonlySet<string>;
     onAttachmentDownload?: (path: string, displayName: string) => void | Promise<void>;
     onAttachmentUnavailable?: (key: string) => void;
@@ -205,7 +207,7 @@ function CopyMessageButton({ text }: { text: string }) {
     return <button className="conversation-copy-button" title="Copy" onClick={() => void copyToClipboard(text).then((ok) => { if (!ok) return; setCopied(true); window.setTimeout(() => setCopied(false), 1500); })}>{copied ? '✓' : '⧉'}</button>;
 }
 
-function MessageItem({ agentId, msg, view, unavailable, onDownload, onUnavailable, onPreview }: {
+function MessageItem({ agentId, msg, view, unavailable, onDownload, onUnavailable, onPreview, runningLabel }: {
     agentId: string;
     msg: ConversationMessage;
     view: ConversationMessageView;
@@ -213,6 +215,7 @@ function MessageItem({ agentId, msg, view, unavailable, onDownload, onUnavailabl
     onDownload?: ConversationTimelineProps['onAttachmentDownload'];
     onUnavailable?: ConversationTimelineProps['onAttachmentUnavailable'];
     onPreview?: ConversationTimelineProps['onPreviewImages'];
+    runningLabel?: string;
 }) {
     const { t, i18n } = useTranslation();
     const previews: ChatPreviewImage[] = msg.previewImages?.length ? msg.previewImages : (msg.imageUrl ? [buildPreviewImage(msg.imageUrl, msg.fileName)] : []);
@@ -244,7 +247,7 @@ function MessageItem({ agentId, msg, view, unavailable, onDownload, onUnavailabl
                         {(previews.length > 0 || inlinePreviews.length > 0) && <div className="conversation-image-list">{renderPreviews(previews.length ? previews : inlinePreviews)}</div>}
                         {media.length > 0 && <div className="conversation-media-list">{media.map((attachment, index) => <ChatMediaCard key={`${attachment.path}-${index}`} agentId={agentId} messageId={msg.id} attachment={attachment} onDownload={() => void onDownload?.(attachment.path, attachment.display_name)} onUnavailable={() => onUnavailable?.(attachment.path)} />)}</div>}
                         {files.length > 0 && <div className="conversation-file-list">{files.map((file, index) => <button key={`${file.path || file.name}-${index}`} className="chat-msg-file-chip" disabled={!file.path || unavailable.has(file.path)} onClick={() => file.path && void onDownload?.(file.path, file.name)}><ChatAttachmentIcon name={file.name} kind={file.kind as ChatMessageAttachment['kind']} mimeType={file.mimeType} size={16} /><span>{file.name}</span></button>)}</div>}
-                        {msg._streaming && !msg.content && !msg.thinking ? <div className="thinking-indicator"><div className="thinking-dots"><span /><span /><span /></div><span>{t('agent.chat.thinking', 'Thinking...')}</span></div> : <MarkdownRenderer content={content} />}
+                        {msg._streaming && !msg.content && !msg.thinking ? <div className="thinking-indicator"><div className="thinking-dots"><span /><span /><span /></div><span>{runningLabel || t('agent.chat.thinking', 'Thinking...')}</span></div> : <MarkdownRenderer content={content} />}
                     </div>
                 </div>
                 {formattedTime && <div className="chat-msg-timestamp">{formattedTime}{content && <CopyMessageButton text={content} />}</div>}
@@ -260,6 +263,7 @@ export default function ConversationTimeline({
     mode = 'pc',
     viewOf,
     isRunning = false,
+    runningLabel,
     unavailableAttachmentKeys = new Set<string>(),
     onAttachmentDownload,
     onAttachmentUnavailable,
@@ -338,7 +342,7 @@ export default function ConversationTimeline({
         }
         const previous = entries[index - 1];
         const view = viewOf(entry.msg);
-        return <MessageItem agentId={agentId} msg={entry.msg} view={{ ...view, hideAvatar: view.hideAvatar || (entry.msg.role === 'assistant' && previous?.type === 'analysis_group') }} unavailable={unavailableAttachmentKeys} onDownload={onAttachmentDownload} onUnavailable={onAttachmentUnavailable} onPreview={onPreviewImages} />;
+        return <MessageItem agentId={agentId} msg={entry.msg} view={{ ...view, hideAvatar: view.hideAvatar || (entry.msg.role === 'assistant' && previous?.type === 'analysis_group') }} unavailable={unavailableAttachmentKeys} onDownload={onAttachmentDownload} onUnavailable={onAttachmentUnavailable} onPreview={onPreviewImages} runningLabel={runningLabel} />;
     };
     return <div className="conversation-timeline">
         {provenance && (

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router-dom';
 import {
@@ -74,6 +74,7 @@ import {
     SnapshotLineageGraph,
     WorkDependencyGraph,
 } from './components/ProjectGraphs';
+import ProjectFileWorkspace from './components/ProjectFileWorkspace';
 import './projectWorkspace.css';
 
 type RecordValue = Record<string, unknown>;
@@ -159,8 +160,9 @@ const dateLabel = (value: unknown): string => {
     const date = new Date(String(value));
     return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date);
 };
+const compactId = (value: string): string => value.length > 12 ? value.slice(0, 8) : value;
 const statusLabel = (status: string): string => ({
-    planning: '规划中', initializing: '初始化中', running: '运行中', queued: '排队中', waiting: '等待中', paused: '已暂停', completed: '已完成', success: '已完成', succeeded: '已完成', cancelled: '已取消', failed: '失败', blocked: '阻塞', review: '待评审', backlog: '待规划', todo: '待处理', doing: '进行中', in_progress: '进行中', done: '已完成',
+    planning: '规划中', initializing: '初始化中', running: '运行中', queued: '排队中', waiting: '等待中', waiting_approval: '待审批', paused: '已暂停', completed: '已完成', success: '已完成', succeeded: '已完成', cancelled: '已取消', failed: '失败', blocked: '阻塞', review: '待评审', backlog: '待规划', todo: '待处理', doing: '进行中', in_progress: '进行中', done: '已完成',
 }[status] || status || '未知');
 
 type ProjectToolDefinition = {
@@ -198,6 +200,7 @@ const stringList = (value: unknown): string[] => Array.isArray(value) ? value.ma
 
 function projectToolResolution(tool: ProjectToolDefinition, member: RecordValue, policies: RecordValue | null) {
     const role = bool(member, 'is_leader') ? 'leader' : 'participant';
+    const lifecycleBlocked = member.is_enabled === false;
     const roleCeiling = role === 'leader' || tool.participant;
     const projectPolicy = obj(obj(policies?.policies).project_tools || obj(policies).project_tools);
     const policyDisabled = new Set([
@@ -215,8 +218,9 @@ function projectToolResolution(tool: ProjectToolDefinition, member: RecordValue,
         roleCeiling,
         policyBlocked,
         snapshotBlocked,
+        lifecycleBlocked,
         memberDisabled: memberDisabled.has(tool.name),
-        effective: roleCeiling && !policyBlocked && !snapshotBlocked && !memberDisabled.has(tool.name),
+        effective: !lifecycleBlocked && roleCeiling && !policyBlocked && !snapshotBlocked && !memberDisabled.has(tool.name),
     };
 }
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : '请求失败，请稍后重试';
@@ -329,17 +333,40 @@ export default function ProjectWorkspacePage() {
     const [selectedCommit, setSelectedCommit] = useState<RecordValue | null>(null);
     const [gitDialog, setGitDialog] = useState<'restore' | 'branch' | null>(null);
     const [sessionTarget, setSessionTarget] = useState<ProjectSessionTarget | null>(null);
+    const refreshingRef = useRef(0);
 
-    const load = useCallback(async () => {
+    const load = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
         if (!projectId) {
             setError('缺少项目 ID，无法加载项目工作台。');
             setLoading(false);
             return;
         }
-        setLoading(true);
-        setError('');
-        setResourceWarnings([]);
+        if (refreshingRef.current > 0 && silent) return;
+        refreshingRef.current += 1;
+        if (!silent) {
+            setLoading(true);
+            setError('');
+            setResourceWarnings([]);
+        }
         try {
+            if (silent) {
+                const dashboard = obj(await projectsApi.dashboard(projectId));
+                const dashboardProject = obj(dashboard.project);
+                const dashboardGit = obj(dashboard.git);
+                const dashboardFiles = Array.isArray(dashboard.files) ? dashboard.files : [];
+                setData((current) => current ? {
+                    ...current,
+                    project: { ...current.project, ...dashboardProject } as ProjectSummary,
+                    workItems: pickCollection(dashboard, 'work_items', 'workItems'),
+                    runs: pickCollection(dashboard, 'runs'),
+                    events: pickCollection(dashboard, 'events', 'audit_events'),
+                    commits: pickCollection(dashboardGit, 'commits').length ? pickCollection(dashboardGit, 'commits') : pickCollection(dashboard, 'commits'),
+                    gitRepository: { ...current.gitRepository, ...dashboardGit },
+                    files: dashboardFiles.map((entry) => typeof entry === 'string' ? { id: entry, path: entry, name: entry.split('/').pop() || entry } : obj(entry)),
+                } : current);
+                setResourceWarnings((current) => current.filter((warning) => warning !== '后台刷新暂时失败'));
+                return;
+            }
             const [project, dashboard] = await Promise.all([
                 projectsApi.get(projectId),
                 projectsApi.dashboard(projectId),
@@ -382,14 +409,37 @@ export default function ProjectWorkspacePage() {
             setSelectedMemberId((current) => current || text(next.members[0] || {}, 'id', 'member_id', 'agent_id'));
             setSelectedCommit((current) => current && next.commits.some(commit => text(commit, 'commit', 'hash', 'commit_hash', 'id') === text(current, 'commit', 'hash', 'commit_hash', 'id')) ? current : next.commits[0] || null);
         } catch (loadError) {
-            setError(errorMessage(loadError));
-            setData(null);
+            if (silent) {
+                setResourceWarnings((current) => current.includes('后台刷新暂时失败') ? current : [...current, '后台刷新暂时失败']);
+            } else {
+                setError(errorMessage(loadError));
+                setData(null);
+            }
         } finally {
-            setLoading(false);
+            refreshingRef.current = Math.max(0, refreshingRef.current - 1);
+            if (!silent) setLoading(false);
         }
     }, [projectId]);
 
     useEffect(() => { void load(); }, [load]);
+    const fastRefresh = Boolean(data && (
+        ['initializing', 'running'].includes(data.project.status)
+        || data.runs.some((run) => ['queued', 'running'].includes(text(run, 'status')))
+    ));
+    useEffect(() => {
+        const refresh = () => {
+            if (document.visibilityState === 'visible') void load({ silent: true });
+        };
+        const intervalId = window.setInterval(refresh, fastRefresh ? 3000 : 12000);
+        const onVisibilityChange = () => {
+            if (document.visibilityState === 'visible') refresh();
+        };
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        return () => {
+            window.clearInterval(intervalId);
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+        };
+    }, [fastRefresh, load]);
     const runAction = useCallback(async (key: string, action: () => Promise<unknown>, success: string) => {
         setBusyAction(key);
         try {
@@ -486,11 +536,11 @@ export default function ProjectWorkspacePage() {
             case 'cockpit': return <Cockpit data={data} onNavigate={setTab} runAction={runAction} busyAction={busyAction} />;
             case 'work': return <WorkBoard projectId={projectId} items={data.workItems} members={data.members} onSelect={(id) => { setSelectedWorkItemId(id); setTab('detail'); }} runAction={runAction} busyAction={busyAction} />;
             case 'group': return <GroupChatPanel projectId={projectId} project={data.project} members={data.members} groupSession={data.groupSession} groupConfig={groupConfig} />;
-            case 'mesh': return <MeshPanel members={data.members} events={data.events} onOpenSession={openSession} />;
-            case 'detail': return <WorkItemDetail projectId={projectId} items={data.workItems} members={data.members} selectedId={selectedWorkItemId} onSelect={setSelectedWorkItemId} onOpenSession={openSession} runAction={runAction} busyAction={busyAction} />;
+            case 'mesh': return <MeshPanel members={data.members} events={data.events} runs={data.runs} onOpenSession={openSession} />;
+            case 'detail': return <WorkItemDetail projectId={projectId} items={data.workItems} members={data.members} runs={data.runs} events={data.events} files={data.files} commits={data.commits} selectedId={selectedWorkItemId} onSelect={setSelectedWorkItemId} onNavigate={setTab} onOpenSession={openSession} runAction={runAction} busyAction={busyAction} />;
             case 'files': return <FilesPanel projectId={projectId} files={data.files} commits={data.commits} runAction={runAction} busyAction={busyAction} />;
             case 'runs': return <RunsPanel projectId={projectId} runs={data.runs} onOpenSession={openSession} runAction={runAction} busyAction={busyAction} />;
-            case 'members': return <MembersPanel projectId={projectId} members={data.members} runs={data.runs} selectedId={selectedMemberId} onSelect={setSelectedMemberId} runAction={runAction} busyAction={busyAction} />;
+            case 'members': return <MembersPanel projectId={projectId} members={data.members} runs={data.runs} selectedId={selectedMemberId} onSelect={setSelectedMemberId} onOpenSession={openSession} runAction={runAction} busyAction={busyAction} />;
             case 'capabilities': return <CapabilitiesPanel projectId={projectId} members={data.members} capabilities={data.capabilities} policies={data.policies} runAction={runAction} busyAction={busyAction} />;
             case 'matrix': return <CapabilityMatrix members={data.members} capabilities={data.capabilities} policies={data.policies} />;
             case 'policies': return <PoliciesPanel projectId={projectId} project={data.project} policies={data.policies} onReload={load} runAction={runAction} busyAction={busyAction} />;
@@ -518,7 +568,7 @@ export default function ProjectWorkspacePage() {
                     })}</section>)}
                     <div className="project-workspace__snapshot-note"><IconBox size={16} /><span><strong>项目隔离已开启</strong><small>成员与能力改动只在本项目生效</small></span></div>
                 </aside>
-                <div className={`project-workspace__content${tab === 'group' ? ' project-workspace__content--chat' : ''}`} key={tab}>{resourceWarnings.length > 0 && <div className="project-workspace__resource-warning" role="status"><IconAlertTriangle size={17} /><div><strong>部分项目资源暂不可用</strong><p>{resourceWarnings.join('；')}</p></div><Button variant="ghost" onClick={() => void load()}><IconRefresh size={15} />重试</Button></div>}{renderContent()}</div>
+                <div className={`project-workspace__content${tab === 'group' ? ' project-workspace__content--chat' : ''}`} key={tab}>{data.project.status === 'planning' && <section className="project-workspace__planning-banner" role="status"><span><IconSparkles size={18} /></span><div><strong>方案仍处于规划阶段</strong><p>继续与 Leader 讨论目标与方案；确认无误后，再由你启动 Leader 自驱执行。</p></div><Button variant="primary" disabled={busyAction === 'kickoff'} onClick={() => void runAction('kickoff', () => projectsApi.confirmKickoff(projectId), '方案已确认，Leader 开始推进项目')}>{busyAction === 'kickoff' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconPlayerPlay size={16} />}确认方案并启动 Leader</Button></section>}{resourceWarnings.length > 0 && <div className="project-workspace__resource-warning" role="status"><IconAlertTriangle size={17} /><div><strong>部分项目资源暂不可用</strong><p>{resourceWarnings.join('；')}</p></div><Button variant="ghost" onClick={() => void load()}><IconRefresh size={15} />重试</Button></div>}{renderContent()}</div>
             </div>
 
             {gitDialog && selectedCommit && <GitActionDialog projectId={projectId} mode={gitDialog} commit={selectedCommit} busy={busyAction} onClose={() => setGitDialog(null)} runAction={runAction} />}
@@ -528,12 +578,16 @@ export default function ProjectWorkspacePage() {
 }
 
 function Cockpit({ data, onNavigate, runAction, busyAction }: { data: WorkspaceData; onNavigate: (tab: WorkspaceTab) => void; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
-    const activeRun = data.runs.find((run) => ['running', 'queued', 'waiting'].includes(text(run, 'status'))) || data.runs[0];
-    const runningItems = data.workItems.filter((item) => ['doing', 'running', 'in_progress', 'review'].includes(text(item, 'status', 'state')));
+    const liveRun = data.runs.find((run) => ['running', 'queued', 'waiting'].includes(text(run, 'status')));
+    const displayedRun = liveRun || data.runs[0];
+    const runningItems = data.workItems.filter((item) => ['doing', 'running', 'in_progress'].includes(text(item, 'status', 'state')));
+    const focusItems = data.workItems.filter((item) => ['doing', 'running', 'in_progress', 'review', 'waiting_approval'].includes(text(item, 'status', 'state')));
     const blockedItems = data.workItems.filter((item) => ['blocked', 'failed'].includes(text(item, 'status', 'state')));
-    const progress = activeRun ? num(activeRun, 'progress', 'progress_percent') : data.project.progress;
-    const pauseOrResume = text(activeRun || {}, 'status') === 'waiting' ? 'running' : 'waiting';
-    const activeRunId = text(activeRun || {}, 'id', 'run_id');
+    const displayedRunStatus = text(displayedRun || {}, 'status');
+    const progress = displayedRunStatus === 'succeeded' ? 100 : displayedRun ? num(displayedRun, 'progress', 'progress_percent') : data.project.progress;
+    const pauseOrResume = text(liveRun || {}, 'status') === 'waiting' ? 'running' : 'waiting';
+    const displayedRunId = text(displayedRun || {}, 'id', 'run_id');
+    const liveRunId = text(liveRun || {}, 'id', 'run_id');
     const memberNameByAgentId = useMemo(
         () => new Map(data.members.map((member) => [
             text(member, 'agent_id'),
@@ -546,13 +600,13 @@ function Cockpit({ data, onNavigate, runAction, busyAction }: { data: WorkspaceD
         || '未委派';
     return <>
         <SectionHeading eyebrow="PROJECT COCKPIT" title="项目驾驶舱" description="Leader 聚焦目标、阻塞与收敛，成员通过 A2A 直接推进工作。" actions={<Button variant="primary" onClick={() => onNavigate('mesh')}><IconMessageCircle size={16} />进入协作中心</Button>} />
-        {activeRun ? <section className="project-workspace__run-hero">
+        {displayedRun ? <section className="project-workspace__run-hero">
             <div className="project-workspace__pulse"><IconBolt size={22} /></div>
-            <div className="project-workspace__run-copy"><div><StatusPill status={text(activeRun, 'status')} /><code>{activeRunId || 'RUN'}</code></div><h3>{text(activeRun, 'name', 'objective', 'title') || data.project.objective}</h3><p>开始于 {dateLabel(activeRun.started_at || activeRun.created_at)} · 分支 <code>{text(activeRun, 'branch', 'git_branch') || '—'}</code></p><ProjectProgressBar value={progress} label="当前 Run 进度" className="project-workspace__progress" /></div>
-            <div className="project-workspace__run-actions"><Button variant="secondary" disabled={!activeRunId || busyAction === 'run-state'} onClick={() => void runAction('run-state', () => projectsApi.patchRun(data.project.id, activeRunId, { status: pauseOrResume }), pauseOrResume === 'waiting' ? '运行已转为等待' : '运行已恢复')}>{busyAction === 'run-state' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : pauseOrResume === 'waiting' ? <IconPlayerPause size={16} /> : <IconPlayerPlay size={16} />}{pauseOrResume === 'waiting' ? '暂停 Run' : '恢复 Run'}</Button></div>
+            <div className="project-workspace__run-copy"><div><StatusPill status={displayedRunStatus} /><code>{displayedRunId || 'RUN'}</code></div><h3>{text(obj(displayedRun.input), 'objective', 'task') || text(displayedRun, 'name', 'objective', 'title') || data.project.objective}</h3><p>开始于 {dateLabel(displayedRun.started_at || displayedRun.created_at)} · 分支 <code>{text(displayedRun, 'branch', 'git_branch') || '—'}</code></p><ProjectProgressBar value={progress} label="当前 Run 进度" className="project-workspace__progress" /></div>
+            <div className="project-workspace__run-actions">{liveRunId ? <Button variant="secondary" disabled={busyAction === 'run-state'} onClick={() => void runAction('run-state', () => projectsApi.patchRun(data.project.id, liveRunId, { status: pauseOrResume }), pauseOrResume === 'waiting' ? '运行已转为等待' : '运行已恢复')}>{busyAction === 'run-state' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : pauseOrResume === 'waiting' ? <IconPlayerPause size={16} /> : <IconPlayerPlay size={16} />}{pauseOrResume === 'waiting' ? '暂停 Run' : '恢复 Run'}</Button> : <Button variant="secondary" onClick={() => onNavigate('runs')}>查看运行历史 <IconArrowRight size={14} /></Button>}</div>
         </section> : <EmptyState icon={<IconBolt size={22} />} title="还没有运行" description="创建 Run 后，这里会展示目标进度、预算与执行健康度。" action={<Button variant="primary" onClick={() => onNavigate('runs')}>创建第一个 Run</Button>} />}
         <div className="project-workspace__metric-strip"><article><span>工作项</span><strong>{data.workItems.length}</strong><small>{runningItems.length} 项正在执行</small></article><article><span>阻塞</span><strong className={blockedItems.length ? 'is-danger' : ''}>{blockedItems.length}</strong><small>{blockedItems.length ? '需要介入' : '当前无阻塞'}</small></article><article><span>协作事件</span><strong>{data.events.length}</strong><small>A2A 与系统事件</small></article><article><span>项目能力</span><strong>{data.capabilities.length}</strong><small>Skill 与 MCP</small></article></div>
-        <div className="project-workspace__two-column"><section className="project-workspace__card"><header><div><span>执行态势</span><h3>正在推进的工作</h3></div><Button variant="ghost" onClick={() => onNavigate('work')}>查看全部 <IconArrowRight size={14} /></Button></header>{runningItems.length ? <div className="project-workspace__compact-list">{runningItems.slice(0, 5).map((item) => <article key={text(item, 'id', 'work_item_id')}><StatusPill status={text(item, 'status', 'state')} /><div><strong>{text(item, 'title', 'name')}</strong><small>{assigneeName(item)} · {dateLabel(item.updated_at)}</small></div><IconChevronRight size={15} /></article>)}</div> : <EmptyState icon={<IconArchive size={22} />} title="没有执行中的工作项" description="待工作项被 Agent 接受后，这里会实时更新。" />}</section><section className="project-workspace__card"><header><div><span>需要关注</span><h3>风险与阻塞</h3></div><ProjectCountBadge className="project-workspace__count">{blockedItems.length}</ProjectCountBadge></header>{blockedItems.length ? <div className="project-workspace__risk-list">{blockedItems.map((item) => <article key={text(item, 'id', 'work_item_id')}><IconAlertTriangle size={18} /><div><strong>{text(item, 'title', 'name')}</strong><p>{text(item, 'blocked_reason', 'error', 'description') || '工作项已停止推进，请查看运行记录。'}</p></div></article>)}</div> : <EmptyState icon={<IconCircleCheck size={22} />} title="没有已知阻塞" description="系统发现风险或 Agent 主动上报后会出现在这里。" />}</section></div>
+        <div className="project-workspace__two-column"><section className="project-workspace__card"><header><div><span>执行态势</span><h3>当前工作</h3></div><Button variant="ghost" onClick={() => onNavigate('work')}>查看全部 <IconArrowRight size={14} /></Button></header>{focusItems.length ? <div className="project-workspace__compact-list">{focusItems.slice(0, 5).map((item) => <article key={text(item, 'id', 'work_item_id')}><StatusPill status={text(item, 'status', 'state')} /><div><strong>{text(item, 'title', 'name')}</strong><small>{assigneeName(item)} · {dateLabel(item.updated_at)}</small></div><IconChevronRight size={15} /></article>)}</div> : <EmptyState icon={<IconArchive size={22} />} title="没有执行中或待评审的工作项" description="待工作项被 Agent 接受后，这里会实时更新。" />}</section><section className="project-workspace__card"><header><div><span>需要关注</span><h3>风险与阻塞</h3></div><ProjectCountBadge className="project-workspace__count">{blockedItems.length}</ProjectCountBadge></header>{blockedItems.length ? <div className="project-workspace__risk-list">{blockedItems.map((item) => <article key={text(item, 'id', 'work_item_id')}><IconAlertTriangle size={18} /><div><strong>{text(item, 'title', 'name')}</strong><p>{text(item, 'blocked_reason', 'error', 'description') || '工作项已停止推进，请查看运行记录。'}</p></div></article>)}</div> : <EmptyState icon={<IconCircleCheck size={22} />} title="没有已知阻塞" description="系统发现风险或 Agent 主动上报后会出现在这里。" />}</section></div>
     </>;
 }
 
@@ -564,7 +618,7 @@ function WorkBoard({ projectId, items, members, onSelect, runAction, busyAction 
     const [assignee, setAssignee] = useState('');
     const [priority, setPriority] = useState('medium');
     const [acceptance, setAcceptance] = useState('');
-    const columns = [{ key: 'todo', label: '待处理' }, { key: 'doing', label: '进行中' }, { key: 'review', label: '待评审' }, { key: 'done', label: '已完成' }];
+    const columns = [{ key: 'todo', label: '待处理' }, { key: 'doing', label: '进行中' }, { key: 'review', label: '待评审' }, { key: 'done', label: '已完成' }] as const;
     const groupFor = (item: RecordValue) => {
         const status = text(item, 'status', 'state');
         if (['completed', 'success', 'done'].includes(status)) return 'done';
@@ -576,13 +630,16 @@ function WorkBoard({ projectId, items, members, onSelect, runAction, busyAction 
         event.preventDefault();
         void runAction('create-work', () => projectsApi.createWorkItem(projectId, { title: title.trim(), description: description.trim(), assignee_agent_id: assignee || null, priority, status: 'todo', acceptance_criteria: acceptance.split('\n').map((line) => line.trim()).filter(Boolean) }), '工作项已创建并持久化').then((ok) => { if (ok) { setShowCreate(false); setTitle(''); setDescription(''); setAcceptance(''); } });
     };
-    const memberOptions = members.map((member) => ({ value: text(member, 'agent_id'), label: text(member, 'name_snapshot', 'agent_name') }));
+    const memberOptions = members
+        .filter((member) => member.is_enabled !== false)
+        .map((member) => ({ value: text(member, 'agent_id'), label: text(member, 'name_snapshot', 'agent_name') }));
     const priorityOptions = [
         { value: 'low', label: '低' },
         { value: 'medium', label: '中' },
         { value: 'high', label: '高' },
         { value: 'urgent', label: '紧急' },
     ];
+    const priorityLabels = new Map(priorityOptions.map((option) => [option.value, option.label]));
     const memberNameByAgentId = new Map(members.map((member) => [text(member, 'agent_id'), text(member, 'name_snapshot', 'agent_name', 'name')]));
     const itemAssignee = (item: RecordValue) => text(item, 'assignee_name', 'owner_name', 'agent_name')
         || memberNameByAgentId.get(text(item, 'assignee_agent_id'))
@@ -590,7 +647,19 @@ function WorkBoard({ projectId, items, members, onSelect, runAction, busyAction 
     const graphItems = items.map((item) => ({ ...item, assignee_name: itemAssignee(item) }));
     return <><SectionHeading eyebrow="OBJECTIVES / WORK GRAPH" title="目标与任务" description="从项目结果拆解到可验收工作项，依赖、委派与证据保持关联。" actions={<><ProjectSegmentedControl value={view} options={[{ value: 'graph', label: '依赖图' }, { value: 'board', label: '看板' }]} onChange={setView} ariaLabel="工作项视图" /><Button variant="primary" onClick={() => setShowCreate((value) => !value)}><IconPlus size={16} />创建工作项</Button></>} />
         {showCreate && <form className="project-workspace__action-panel" onSubmit={submit}><header><div><span>NEW WORK ITEM</span><h3>创建并指派工作项</h3></div><ProjectIconButton aria-label="关闭" onClick={() => setShowCreate(false)}><IconX size={17} /></ProjectIconButton></header><div className="project-workspace__form-grid"><ProjectField className="is-wide" label="标题" labelFor="project-work-title" required><TextInput id="project-work-title" value={title} onChange={(event) => setTitle(event.target.value)} required autoFocus /></ProjectField><ProjectField className="is-wide" label="说明" labelFor="project-work-description"><ProjectTextarea id="project-work-description" value={description} onChange={(event) => setDescription(event.target.value)} rows={3} /></ProjectField><ProjectField label="指派 Agent"><ProjectSelect value={assignee} options={memberOptions} onChange={setAssignee} ariaLabel="指派 Agent" placeholder="暂不指派" /></ProjectField><ProjectField label="优先级"><ProjectSelect value={priority} options={priorityOptions} onChange={setPriority} ariaLabel="工作项优先级" /></ProjectField><ProjectField className="is-wide" label="验收条件（每行一项）" labelFor="project-work-acceptance"><ProjectTextarea id="project-work-acceptance" value={acceptance} onChange={(event) => setAcceptance(event.target.value)} rows={3} /></ProjectField></div><footer><Button type="button" variant="secondary" onClick={() => setShowCreate(false)}>取消</Button><Button type="submit" variant="primary" disabled={!title.trim() || busyAction === 'create-work'}>{busyAction === 'create-work' && <IconLoader2 className="project-workspace__spinner" size={16} />}创建工作项</Button></footer></form>}
-        {items.length ? view === 'graph' ? <div className="project-workspace__graph-panel"><WorkDependencyGraph items={graphItems} selectedWorkItemId={undefined} onWorkItemSelect={(id) => onSelect(id)} /><ProjectGraphLegend /></div> : <div className="project-workspace__kanban">{columns.map((column) => { const list = items.filter((item) => groupFor(item) === column.key); return <section key={column.key}><header><span><i />{column.label}</span><ProjectCountBadge>{list.length}</ProjectCountBadge></header><div>{list.map((item) => { const id = text(item, 'id', 'work_item_id'); return <Button variant="ghost" key={id} onClick={() => onSelect(id)}><div><code>{id}</code>{text(item, 'priority') && <em>{text(item, 'priority')}</em>}</div><h3>{text(item, 'title', 'name') || '未命名工作项'}</h3><p>{listText(item, 'acceptance_criteria') || text(item, 'description') || '尚未设置验收条件'}</p><footer><span>{itemAssignee(item)}</span><time>{dateLabel(item.updated_at)}</time></footer></Button>; })}{!list.length && <div className="project-workspace__column-empty">暂无工作项</div>}</div></section>; })}</div> : <EmptyState icon={<IconChecklist size={22} />} title="目标还没有拆成工作项" description="创建后会进入项目 API，并出现在 Agent 的执行队列。" action={<Button variant="primary" onClick={() => setShowCreate(true)}>创建第一个工作项</Button>} />}</>;
+        {items.length ? view === 'graph' ? <div className="project-workspace__graph-panel"><WorkDependencyGraph items={graphItems} selectedWorkItemId={undefined} onWorkItemSelect={(id) => onSelect(id)} /><ProjectGraphLegend /></div> : <div className="project-workspace__kanban">{columns.map((column) => {
+            const list = items.filter((item) => groupFor(item) === column.key);
+            return <section key={column.key} data-column={column.key}><header><span><i />{column.label}</span><ProjectCountBadge>{list.length}</ProjectCountBadge></header><div>{list.map((item) => {
+                const id = text(item, 'id', 'work_item_id');
+                const itemPriority = text(item, 'priority') || 'medium';
+                return <Button variant="ghost" className="project-workspace__kanban-card" key={id} onClick={() => onSelect(id)}>
+                    <div className="project-workspace__kanban-card-meta"><code title={id}>{compactId(id)}</code><em data-priority={itemPriority}>{priorityLabels.get(itemPriority) || itemPriority}</em></div>
+                    <h3>{text(item, 'title', 'name') || '未命名工作项'}</h3>
+                    <p>{listText(item, 'acceptance_criteria') || text(item, 'description') || '尚未设置验收条件'}</p>
+                    <footer><span title={itemAssignee(item)}>{itemAssignee(item)}</span><time>{dateLabel(item.updated_at)}</time></footer>
+                </Button>;
+            })}{!list.length && <div className="project-workspace__column-empty">暂无工作项</div>}</div></section>;
+        })}</div> : <EmptyState icon={<IconChecklist size={22} />} title="目标还没有拆成工作项" description="创建后会进入项目 API，并出现在 Agent 的执行队列。" action={<Button variant="primary" onClick={() => setShowCreate(true)}>创建第一个工作项</Button>} />}</>;
 }
 
 function GroupChatPanel({ project, groupSession, groupConfig }: { projectId: string; project: ProjectSummary; members: RecordValue[]; groupSession: RecordValue | null; groupConfig: SessionViewerGroupConfig }) {
@@ -615,40 +684,126 @@ function GroupChatPanel({ project, groupSession, groupConfig }: { projectId: str
         ) : <EmptyState icon={<IconMessageCircle size={22} />} title="项目群聊暂不可用" description="项目群会话初始化完成后，会在这里显示共享时间线与输入区。" />;
 }
 
-function MeshPanel({ members, events, onOpenSession }: { members: RecordValue[]; events: RecordValue[]; onOpenSession: OpenSession }) {
+function MeshPanel({ members, events, runs, onOpenSession }: { members: RecordValue[]; events: RecordValue[]; runs: RecordValue[]; onOpenSession: OpenSession }) {
+    const sessionForAgent = (agentId: string) => [...runs, ...events]
+        .filter((entry) => {
+            if (sessionRouteOf(entry)?.kind !== 'session') return false;
+            const records = traceRecords(entry);
+            return [
+                traceValue(records, 'agent_id', 'execution_agent_id', 'subagent_agent_id'),
+                traceValue(records, 'from_agent_id', 'source_agent_id'),
+                traceValue(records, 'to_agent_id', 'target_agent_id'),
+            ].includes(agentId);
+        })
+        .sort((left, right) => new Date(String(right.updated_at || right.created_at || 0)).getTime() - new Date(String(left.updated_at || left.created_at || 0)).getTime())[0];
     return <><SectionHeading eyebrow="A2A DIRECT MESH" title="Agent 协作网络" description="成员可直接唤醒、咨询、委派或请求评审；Leader 不再是消息中转站。" />
-        <section className="project-workspace__mesh-graph">{members.length ? <><A2AMeshGraph members={members} events={events} /><ProjectGraphLegend /></> : <EmptyState icon={<IconUsers size={22} />} title="项目还没有 Agent 成员" description="添加成员后，A2A 直连拓扑会显示在这里。" />}</section>
+        <section className="project-workspace__mesh-graph">{members.length ? <><A2AMeshGraph members={members} events={events} onAgentSelect={(agentId, member) => {
+            const source = sessionForAgent(agentId);
+            onOpenSession(source ? { ...source, agent_id: agentId } : { ...member, agent_id: agentId }, `${text(member, 'name_snapshot', 'agent_name', 'name') || 'Agent'} · 工作会话`);
+        }} /><ProjectGraphLegend /></> : <EmptyState icon={<IconUsers size={22} />} title="项目还没有 Agent 成员" description="添加成员后，A2A 直连拓扑会显示在这里。" />}</section>
         <section className="project-workspace__card project-workspace__timeline"><header><div><span>实时事件</span><h3>A2A 协作流</h3></div></header>{events.length ? events.slice(0, 30).map((event) => <article key={text(event, 'id', 'event_id') || `${text(event, 'created_at')}-${text(event, 'type')}`}><i /><span>{(text(event, 'actor_name', 'from_agent_name') || '系统').slice(0, 1)}</span><div><strong>{text(event, 'actor_name', 'from_agent_name') || '系统'} <em>{text(event, 'type', 'event_type')}</em> {text(event, 'target_name', 'to_agent_name')}</strong><p>{text(event, 'message', 'summary', 'detail') || '事件没有附加说明'}</p><small>{dateLabel(event.created_at)}</small><SessionButton source={event} onOpen={onOpenSession} /></div></article>) : <EmptyState title="还没有协作事件" description="成员直接唤醒或委派后，事件会按因果顺序出现在这里。" />}</section>
     </>;
 }
 
-function WorkItemDetail({ projectId, items, members, selectedId, onSelect, onOpenSession, runAction, busyAction }: { projectId: string; items: RecordValue[]; members: RecordValue[]; selectedId: string; onSelect: (id: string) => void; onOpenSession: OpenSession; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
+type WorkItemDetailTab = 'context' | 'execution' | 'conversation' | 'changes' | 'review';
+
+function WorkItemDetail({ projectId, items, members, runs, events, files, commits, selectedId, onSelect, onNavigate, onOpenSession, runAction, busyAction }: { projectId: string; items: RecordValue[]; members: RecordValue[]; runs: RecordValue[]; events: RecordValue[]; files: RecordValue[]; commits: RecordValue[]; selectedId: string; onSelect: (id: string) => void; onNavigate: (tab: WorkspaceTab) => void; onOpenSession: OpenSession; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
     const item = items.find((entry) => text(entry, 'id', 'work_item_id') === selectedId) || items[0];
+    const [detailTab, setDetailTab] = useState<WorkItemDetailTab>('context');
     const [assignee, setAssignee] = useState('');
     const [status, setStatus] = useState('todo');
     const [priority, setPriority] = useState('medium');
-    useEffect(() => { setAssignee(text(item || {}, 'assignee_agent_id')); setStatus(text(item || {}, 'status') || 'todo'); setPriority(text(item || {}, 'priority') || 'medium'); }, [item]);
+    const [selectedEvidencePath, setSelectedEvidencePath] = useState('');
+    useEffect(() => {
+        setAssignee(text(item || {}, 'assignee_agent_id'));
+        setStatus(text(item || {}, 'status') || 'todo');
+        setPriority(text(item || {}, 'priority') || 'medium');
+        setSelectedEvidencePath('');
+    }, [item]);
     const itemId = text(item || {}, 'id', 'work_item_id');
     const save = () => void runAction('save-work', () => projectsApi.patchWorkItem(projectId, itemId, { assignee_agent_id: assignee || null, status, priority }), '工作项状态与指派已保存');
-    const startRun = () => void runAction('run-work', () => projectsApi.createRun(projectId, { work_item_id: itemId, agent_id: assignee || undefined, input: { objective: text(item || {}, 'title') } }), '工作项运行已创建');
-    const workItemOptions = items.map((entry) => ({ value: text(entry, 'id', 'work_item_id'), label: `${text(entry, 'id', 'work_item_id')} · ${text(entry, 'title', 'name')}` }));
-    const memberOptions = members.map((member) => ({ value: text(member, 'agent_id'), label: text(member, 'name_snapshot', 'agent_name') }));
+    const startRun = () => void runAction('run-work', () => projectsApi.createRun(projectId, { work_item_id: itemId, agent_id: assignee || undefined, input: { objective: text(item || {}, 'title'), task: text(item || {}, 'description') || text(item || {}, 'title') } }), '工作项运行已创建');
+    const workItemOptions = items.map((entry) => {
+        const id = text(entry, 'id', 'work_item_id');
+        return { value: id, label: `${compactId(id)} · ${text(entry, 'title', 'name')}` };
+    });
+    const currentAssigneeId = text(item || {}, 'assignee_agent_id');
+    const memberOptions = members
+        .filter((member) => member.is_enabled !== false || text(member, 'agent_id') === currentAssigneeId)
+        .map((member) => ({
+            value: text(member, 'agent_id'),
+            label: `${text(member, 'name_snapshot', 'agent_name')}${member.is_enabled === false ? ' · 已退出（历史指派）' : ''}`,
+            disabled: member.is_enabled === false,
+        }));
     const statusOptions = [{ value: 'backlog', label: '待规划' }, { value: 'todo', label: '待处理' }, { value: 'in_progress', label: '进行中' }, { value: 'review', label: '待评审' }, { value: 'blocked', label: '阻塞' }, { value: 'done', label: '已完成' }];
     const priorityOptions = [{ value: 'low', label: '低' }, { value: 'medium', label: '中' }, { value: 'high', label: '高' }, { value: 'urgent', label: '紧急' }];
-    return <><SectionHeading eyebrow="WORK ITEM / EVIDENCE" title="工作项详情" description="把目标上下文、执行过程、对话与交付证据收敛到一个可追溯对象。" actions={items.length ? <ProjectSelect ariaLabel="选择工作项" value={itemId} options={workItemOptions} onChange={onSelect} /> : undefined} />{item ? <div className="project-workspace__detail-grid"><section className="project-workspace__card project-workspace__detail-main"><header><div><span>{itemId}</span><h3>{text(item, 'title', 'name')}</h3></div><StatusPill status={text(item, 'status', 'state')} /></header><div className="project-workspace__prose"><h4>为什么要做</h4><p>{text(item, 'description', 'context') || '未提供工作项背景。'}</p><h4>验收条件</h4><p>{listText(item, 'acceptance_criteria') || text(item, 'acceptance') || '尚未设置验收条件。'}</p><h4>执行结果</h4><p>{text(item, 'result', 'output_summary') || 'Agent 尚未提交结果。'}</p></div></section><aside><section className="project-workspace__card project-workspace__control-card"><header><div><span>执行控制</span><h3>指派与状态推进</h3></div></header><ProjectField label="负责人"><ProjectSelect value={assignee} options={memberOptions} onChange={setAssignee} ariaLabel="工作项负责人" placeholder="未指派" /></ProjectField><ProjectField label="状态"><ProjectSelect value={status} options={statusOptions} onChange={setStatus} ariaLabel="工作项状态" /></ProjectField><ProjectField label="优先级"><ProjectSelect value={priority} options={priorityOptions} onChange={setPriority} ariaLabel="工作项优先级" /></ProjectField><footer><Button variant="secondary" onClick={startRun} disabled={!assignee || busyAction === 'run-work'}>{busyAction === 'run-work' && <IconLoader2 className="project-workspace__spinner" size={16} />}创建 Run</Button><Button variant="primary" onClick={save} disabled={busyAction === 'save-work'}>{busyAction === 'save-work' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存</Button></footer></section><section className="project-workspace__card"><header><div><span>追溯锚点</span><h3>关联证据</h3></div></header><dl className="project-workspace__definition-list"><div><dt>依赖</dt><dd>{listText(item, 'dependency_ids') || '无'}</dd></div><div><dt>会话</dt><dd>{sessionIdOf(item) || '—'}<SessionButton source={item} onOpen={onOpenSession} /></dd></div><div><dt>Commit</dt><dd><code>{text(item, 'commit_hash') || '—'}</code></dd></div><div><dt>更新时间</dt><dd>{dateLabel(item.updated_at)}</dd></div></dl></section></aside></div> : <EmptyState icon={<IconChecklist size={22} />} title="没有可查看的工作项" description="项目创建工作项后，可在这里核对上下文、对话、Diff 与验收证据。" />}</>;
+    const memberNameByAgentId = new Map(members.map((member) => [text(member, 'agent_id'), text(member, 'name_snapshot', 'agent_name', 'name') || '未命名 Agent']));
+    const matchesWorkItem = (entry: RecordValue) => {
+        if (!itemId) return false;
+        const records = traceRecords(entry);
+        return traceValue(records, 'work_item_id', 'project_work_item_id', 'task_id') === itemId;
+    };
+    const relatedRuns = runs.filter(matchesWorkItem);
+    const relatedEvents = events.filter(matchesWorkItem);
+    const relatedEventCommitIds = new Set(relatedEvents.map((event) => traceValue(traceRecords(event), 'commit_hash', 'commit', 'hash')).filter(Boolean));
+    const relatedEventPaths = new Set(relatedEvents.map((event) => traceValue(traceRecords(event), 'path', 'file_path')).filter(Boolean));
+    const relatedCommits = commits.filter((commit) => {
+        if (matchesWorkItem(commit)) return true;
+        const commitId = text(commit, 'commit', 'hash', 'commit_hash', 'id');
+        return [...relatedEventCommitIds].some((eventCommitId) => commitId === eventCommitId || commitId.startsWith(eventCommitId) || eventCommitId.startsWith(commitId));
+    });
+    const relatedCommitIds = new Set(relatedCommits.map((commit) => text(commit, 'commit', 'hash', 'commit_hash', 'id')).filter(Boolean));
+    const relatedFiles = files.filter((file) => matchesWorkItem(file) || relatedEventPaths.has(text(file, 'path', 'id', 'name')) || relatedCommitIds.has(text(file, 'commit', 'commit_hash', 'hash')));
+    const sessionSources = [...relatedRuns, ...relatedEvents].filter((entry, index, source) => {
+        const route = sessionRouteOf(entry);
+        return Boolean(route) && source.findIndex((candidate) => sessionIdOf(candidate) === route?.sessionId) === index;
+    });
+    const acceptanceCriteria = Array.isArray(item?.acceptance_criteria)
+        ? (item.acceptance_criteria as unknown[]).map(String).filter(Boolean)
+        : text(item || {}, 'acceptance', 'acceptance_criteria').split('\n').map((entry) => entry.trim()).filter(Boolean);
+    const dependencyIds = Array.isArray(item?.dependency_ids) ? (item.dependency_ids as unknown[]).map(String) : [];
+    const latestRun = relatedRuns[0];
+    const latestCommit = relatedCommits[0];
+    const selectedFile = relatedFiles.find((entry) => text(entry, 'path', 'id') === selectedEvidencePath) || relatedFiles[0];
+    const activeAssigneeName = memberNameByAgentId.get(text(item || {}, 'assignee_agent_id')) || '未指派';
+    const detailTabs = [
+        { value: 'context' as const, label: '上下文与验收' },
+        { value: 'execution' as const, label: '执行记录', count: relatedRuns.length + relatedEvents.length },
+        { value: 'conversation' as const, label: '关联会话', count: sessionSources.length },
+        { value: 'changes' as const, label: '代码与文件变化', count: relatedCommits.length + relatedFiles.length },
+        { value: 'review' as const, label: '评审与审批' },
+    ];
+
+    let detailContent: ReactNode = null;
+    if (item && detailTab === 'context') detailContent = <div className="project-workspace__item-context-grid">
+        <section className="project-workspace__item-copy"><span className="project-workspace__item-kicker">任务说明</span><h3>交付内容</h3><p>{text(item, 'description', 'context') || '未提供工作项背景。'}</p><div className="project-workspace__item-trace-note"><strong>输入与依赖</strong>{dependencyIds.length ? <ul>{dependencyIds.map((id) => {
+            const dependency = items.find((entry) => text(entry, 'id', 'work_item_id') === id);
+            return <li key={id}><code>{compactId(id)}</code><span>{text(dependency || {}, 'title', 'name') || '关联工作项'}</span></li>;
+        })}</ul> : <p>无前置依赖，可直接开始。</p>}</div></section>
+        <section className="project-workspace__item-criteria"><span className="project-workspace__item-kicker">ACCEPTANCE CRITERIA</span><h3>验收条件</h3>{acceptanceCriteria.length ? <ol>{acceptanceCriteria.map((criterion, index) => <li key={`${criterion}-${index}`}><IconCircleCheck size={16} /><span><strong>{criterion}</strong><small>{text(item, 'status') === 'done' ? '工作项已完成，请核对关联证据' : '等待执行结果或评审证据'}</small></span></li>)}</ol> : <ProjectEmptyState title="尚未定义验收条件" description="请先完善验收边界，再启动执行。" />}</section>
+        <aside className="project-workspace__item-control"><span className="project-workspace__item-kicker">执行控制</span><h3>指派与状态推进</h3><ProjectField label="负责人"><ProjectSelect value={assignee} options={memberOptions} onChange={setAssignee} ariaLabel="工作项负责人" placeholder="未指派" /></ProjectField><ProjectField label="状态"><ProjectSelect value={status} options={statusOptions} onChange={setStatus} ariaLabel="工作项状态" /></ProjectField><ProjectField label="优先级"><ProjectSelect value={priority} options={priorityOptions} onChange={setPriority} ariaLabel="工作项优先级" /></ProjectField><footer><Button variant="secondary" onClick={startRun} disabled={busyAction === 'run-work'}>{busyAction === 'run-work' && <IconLoader2 className="project-workspace__spinner" size={16} />}{assignee ? '创建 Run' : '由 Leader 执行'}</Button><Button variant="primary" onClick={save} disabled={busyAction === 'save-work'}>{busyAction === 'save-work' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存</Button></footer></aside>
+    </div>;
+    if (item && detailTab === 'execution') detailContent = relatedRuns.length || relatedEvents.length ? <div className="project-workspace__item-execution">
+        {relatedRuns.map((run) => <article key={text(run, 'id', 'run_id')}><span className="project-workspace__item-event-icon"><IconBolt size={17} /></span><div><header><strong>{text(obj(run.input), 'objective') || '执行工作项'}</strong><StatusPill status={text(run, 'status')} /></header><p>{text(obj(run.output), 'summary', 'result', 'message') || text(run, 'error') || '已冻结本次执行的成员、能力与输入快照。'}</p><footer><code>{compactId(text(run, 'id', 'run_id'))}</code><time>{dateLabel(run.started_at || run.created_at)}</time><SessionButton source={run} onOpen={onOpenSession} /></footer></div></article>)}
+        {relatedEvents.slice(0, 20).map((event) => <article key={text(event, 'id', 'event_id')}><span className="project-workspace__item-event-icon"><IconActivityHeartbeat size={17} /></span><div><header><strong>{statusLabel(text(event, 'event_type', 'type'))}</strong><code>{text(event, 'event_type', 'type') || '项目事件'}</code></header><p>{text(event, 'detail', 'summary', 'message') || '该事件没有附加说明。'}</p><footer><time>{dateLabel(event.created_at)}</time><SessionButton source={event} onOpen={onOpenSession} /></footer></div></article>)}
+    </div> : <ProjectEmptyState icon={<IconHistory size={22} />} title="还没有执行记录" description="当 Agent 接受、运行或更新该工作项时，这里会按时间展示。" />;
+    if (item && detailTab === 'conversation') detailContent = sessionSources.length ? <div className="project-workspace__item-sessions">{sessionSources.map((source) => {
+        const route = sessionRouteOf(source);
+        const records = traceRecords(source);
+        const agentId = traceValue(records, 'agent_id', 'execution_agent_id', 'subagent_agent_id', 'actor_agent_id');
+        return <article key={route?.sessionId}><span><IconMessageCircle size={18} /></span><div><strong>{route?.kind === 'group' ? '项目群聊' : `${memberNameByAgentId.get(agentId) || 'Agent'} 工作会话`}</strong><p>{traceValue(records, 'objective', 'summary', 'message', 'task') || '会话已作为工作项的执行证据保留。'}</p><code>{route?.sessionId}</code></div><Button variant="secondary" onClick={() => onOpenSession(source, `${text(item, 'title')} · 关联会话`)}>打开会话</Button></article>;
+    })}</div> : <ProjectEmptyState icon={<IconMessageCircle size={22} />} title="还没有关联会话" description="该工作项触发 Agent 执行或 A2A 协作后，会话锚点会出现在这里。" />;
+    if (item && detailTab === 'changes') detailContent = relatedFiles.length || relatedCommits.length ? <div className="project-workspace__item-changes"><aside><header><strong>{relatedFiles.length} 个关联文件</strong><span>{relatedCommits.length} 个 Commit</span></header>{relatedFiles.map((file) => {
+        const path = text(file, 'path', 'id', 'name');
+        return <Button variant="ghost" className={text(selectedFile || {}, 'path', 'id', 'name') === path ? 'is-active' : ''} key={path} onClick={() => setSelectedEvidencePath(path)}><IconFile size={15} /><span>{path}</span><code>{compactId(text(file, 'commit_hash', 'commit')) || '已追溯'}</code></Button>;
+    })}{relatedCommits.map((commit) => <Button variant="ghost" key={text(commit, 'commit', 'hash', 'commit_hash', 'id')} onClick={() => onNavigate('git')}><IconBrandGit size={15} /><span>{text(commit, 'message', 'title') || '项目提交'}</span><code>{compactId(text(commit, 'commit', 'hash', 'commit_hash', 'id'))}</code></Button>)}</aside><section><header><code>{text(selectedFile || latestCommit || {}, 'path', 'message', 'title') || '关联变更'}</code><Button variant="ghost" onClick={() => onNavigate(selectedFile ? 'files' : 'git')}>{selectedFile ? '在项目文件中打开' : '查看 Git 历史'} <IconArrowRight size={14} /></Button></header>{selectedFile ? <pre>{text(selectedFile, 'preview', 'content_preview', 'content') || '该文件没有可在线预览的文本内容。'}</pre> : <div className="project-workspace__item-change-summary"><IconBrandGit size={24} /><strong>{text(latestCommit || {}, 'message', 'title') || '关联提交'}</strong><code>{text(latestCommit || {}, 'commit', 'hash', 'commit_hash', 'id')}</code></div>}</section></div> : <ProjectEmptyState icon={<IconCodeDots size={22} />} title="还没有关联的代码或文件变化" description="项目提交包含 Work-Item 追溯信息后，变更会自动归集。" action={<Button variant="secondary" onClick={() => onNavigate('files')}>打开项目文件</Button>} />;
+    if (item && detailTab === 'review') detailContent = <div className="project-workspace__item-review"><section><div className="project-workspace__item-review-summary"><span><IconShieldCheck size={22} /></span><div><span className="project-workspace__item-kicker">VERIFIABLE RESULT</span><h3>验收覆盖</h3><p>{acceptanceCriteria.length} 条验收条件 · {relatedRuns.length} 次执行 · {relatedCommits.length + relatedFiles.length} 项交付证据</p></div><StatusPill status={text(item, 'status')} /></div><div className="project-workspace__item-review-list">{acceptanceCriteria.length ? acceptanceCriteria.map((criterion, index) => <article key={`${criterion}-${index}`}><IconCircleCheck size={17} /><div><strong>{criterion}</strong><p>{relatedRuns.length || relatedCommits.length ? '已有关联运行或版本证据，请人工核对结果。' : '还没有可核对的运行或版本证据。'}</p></div></article>) : <ProjectEmptyState title="无验收条件" description="请先回到上下文完善可验收结果。" />}</div></section><aside><span className="project-workspace__item-kicker">HUMAN GATE</span><h3>人工审批</h3><p>审批只更新该工作项状态，不改写 Git 历史或覆盖运行证据。</p><dl><div><dt>负责人</dt><dd>{activeAssigneeName}</dd></div><div><dt>最近运行</dt><dd>{latestRun ? compactId(text(latestRun, 'id', 'run_id')) : '—'}</dd></div><div><dt>关联 Commit</dt><dd><code>{latestCommit ? compactId(text(latestCommit, 'commit', 'hash', 'commit_hash', 'id')) : '—'}</code></dd></div><div><dt>最后更新</dt><dd>{dateLabel(item.updated_at)}</dd></div></dl><footer><Button variant="secondary" disabled={busyAction === 'review-return'} onClick={() => void runAction('review-return', () => projectsApi.patchWorkItem(projectId, itemId, { status: 'blocked' }), '工作项已退回修改')}>{busyAction === 'review-return' && <IconLoader2 className="project-workspace__spinner" size={16} />}退回修改</Button><Button variant="primary" disabled={busyAction === 'review-approve'} onClick={() => void runAction('review-approve', () => projectsApi.patchWorkItem(projectId, itemId, { status: 'done' }), '工作项已验收通过')}>{busyAction === 'review-approve' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconCircleCheck size={16} />}验收通过</Button></footer></aside></div>;
+
+    return <><SectionHeading eyebrow="WORK ITEM / EVIDENCE" title="工作项详情" description="把目标上下文、执行过程、对话与交付证据收敛到一个可追溯对象。" actions={items.length ? <ProjectSelect ariaLabel="选择工作项" value={itemId} options={workItemOptions} onChange={onSelect} /> : undefined} />{item ? <section className="project-workspace__item-shell"><header className="project-workspace__item-meta"><StatusPill status={text(item, 'status', 'state')} /><div><small>负责人</small><strong>{activeAssigneeName}</strong></div><div><small>优先级</small><strong>{priorityOptions.find((option) => option.value === text(item, 'priority'))?.label || text(item, 'priority') || '中'}</strong></div><div><small>依赖</small><strong>{dependencyIds.length ? `${dependencyIds.length} 项` : '无'}</strong></div><div><small>最近执行</small><code>{latestRun ? compactId(text(latestRun, 'id', 'run_id')) : '—'}</code></div><div><small>更新时间</small><strong>{dateLabel(item.updated_at)}</strong></div></header><div className="project-workspace__item-title"><code>{compactId(itemId)}</code><h3>{text(item, 'title', 'name')}</h3></div><ProjectSegmentedControl className="project-workspace__item-tabs" value={detailTab} options={detailTabs} onChange={setDetailTab} ariaLabel="工作项详情分区" /><div className="project-workspace__item-content">{detailContent}</div></section> : <EmptyState icon={<IconChecklist size={22} />} title="没有可查看的工作项" description="项目创建工作项后，可在这里核对上下文、对话、Diff 与验收证据。" />}</>;
 }
 
 function FilesPanel({ projectId, files, commits, runAction, busyAction }: { projectId: string; files: RecordValue[]; commits: RecordValue[]; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
-    const [selected, setSelected] = useState(() => text(files[0] || {}, 'path', 'id'));
-    const [path, setPath] = useState('');
-    const [content, setContent] = useState('');
-    const [milestoneMessage, setMilestoneMessage] = useState('');
-    const file = selected ? files.find((entry) => text(entry, 'path', 'id') === selected) : undefined;
-    const contentIsTruncated = Boolean(file) && num(file || {}, 'size') > text(file || {}, 'preview', 'content_preview').length;
-    useEffect(() => { if (file) { setPath(text(file, 'path', 'id')); setContent(text(file, 'content', 'preview', 'content_preview')); } }, [file]);
-    const save = (event: FormEvent) => { event.preventDefault(); void runAction('save-file', () => projectsApi.writeFile(projectId, { path: path.trim(), content }), '文件已原子保存并创建 Git 提交'); };
-    const milestone = (event: FormEvent) => { event.preventDefault(); void runAction('milestone', () => projectsApi.commitFiles(projectId, { message: milestoneMessage.trim(), milestone: true }), '项目级里程碑已创建并写入审计').then((ok) => { if (ok) setMilestoneMessage(''); }); };
-    return <><SectionHeading eyebrow="FILES / DELIVERABLES" title="项目文件与交付" description="保存文件会原子写入并创建普通 Git commit；里程碑单独创建可恢复锚点。" actions={<Button variant="secondary" onClick={() => { setSelected(''); setPath(''); setContent(''); }}><IconPlus size={16} />新建文件</Button>} /><div className="project-workspace__files"><aside><header><IconGitBranch size={15} /><span>{text(commits[0] || {}, 'branch') || '项目工作树'}</span></header>{files.map((entry) => { const id = text(entry, 'path', 'id'); return <Button variant="ghost" className={text(file || {}, 'path', 'id') === id && selected !== '' ? 'is-active' : ''} key={id} onClick={() => setSelected(id)}><IconFile size={15} /><span>{text(entry, 'name') || id}</span></Button>; })}{!files.length && <div className="project-workspace__column-empty">暂无文件</div>}</aside><section className="project-workspace__card project-workspace__file-editor"><header><div><span>{selected ? 'EDIT FILE' : 'NEW FILE'}</span><h3>{path || '创建项目文件'}</h3></div><code>{text(file || {}, 'commit_hash', 'commit') || '保存时提交'}</code></header><form onSubmit={save}><ProjectField label="项目内路径" labelFor="project-file-path" required><TextInput id="project-file-path" value={path} onChange={(event) => setPath(event.target.value)} placeholder="docs/deliverable.md" required /></ProjectField><ProjectField label="文件内容" labelFor="project-file-content" error={contentIsTruncated ? '文件超过在线预览上限，为避免截断覆盖，请由 Agent 工作区修改后再提交。' : undefined} required><ProjectTextarea id="project-file-content" value={content} onChange={(event) => setContent(event.target.value)} rows={18} spellCheck={false} required disabled={contentIsTruncated} /></ProjectField><footer><Button type="submit" variant="primary" disabled={!path.trim() || contentIsTruncated || busyAction === 'save-file'}>{busyAction === 'save-file' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存并提交</Button></footer></form></section></div><form className="project-workspace__inline-create project-workspace__milestone" onSubmit={milestone}><ProjectField label="里程碑说明" labelFor="project-milestone-message" required><TextInput id="project-milestone-message" value={milestoneMessage} onChange={(event) => setMilestoneMessage(event.target.value)} placeholder="例如：M1 · 需求与技术方案冻结" required /></ProjectField><Button variant="secondary" type="submit" disabled={!milestoneMessage.trim() || busyAction === 'milestone'}>{busyAction === 'milestone' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconFlag size={16} />}创建里程碑</Button></form></>;
+    return <ProjectFileWorkspace projectId={projectId} files={files} commits={commits} runAction={runAction} busyAction={busyAction} />;
 }
 
 function RunsPanel({ projectId, runs, onOpenSession, runAction, busyAction }: { projectId: string; runs: RecordValue[]; onOpenSession: OpenSession; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
@@ -659,29 +814,197 @@ function RunsPanel({ projectId, runs, onOpenSession, runAction, busyAction }: { 
         {runs.length ? <div className="project-workspace__run-list">{runs.map((run) => { const runId = text(run, 'id', 'run_id'); const runStatus = text(run, 'status'); const input = obj(run.input); const nextStatus = runStatus === 'running' ? 'waiting' : runStatus === 'waiting' || runStatus === 'queued' ? 'running' : ''; return <article key={runId}><div className="project-workspace__run-icon"><IconBolt size={18} /></div><div><div><StatusPill status={runStatus} /><code>{runId}</code></div><h3>{text(input, 'objective') || text(run, 'name', 'objective') || '项目运行'}</h3><p>{dateLabel(run.started_at || run.created_at)} · {text(run, 'trigger_type') || 'manual'}</p></div><div className="project-workspace__run-controls"><SessionButton source={run} onOpen={onOpenSession} />{nextStatus && <Button variant="secondary" disabled={busyAction === `run-${runId}`} onClick={() => void runAction(`run-${runId}`, () => projectsApi.patchRun(projectId, runId, { status: nextStatus }), nextStatus === 'waiting' ? 'Run 已转为等待' : 'Run 已恢复')}>{busyAction === `run-${runId}` ? <IconLoader2 className="project-workspace__spinner" size={15} /> : nextStatus === 'waiting' ? <IconPlayerPause size={15} /> : <IconPlayerPlay size={15} />}{nextStatus === 'waiting' ? '暂停' : '继续'}</Button>}{!['succeeded', 'failed', 'cancelled'].includes(runStatus) && <Button variant="ghost" disabled={busyAction === `finish-${runId}`} onClick={() => void runAction(`finish-${runId}`, () => projectsApi.patchRun(projectId, runId, { status: 'succeeded' }), 'Run 已标记完成')}><IconCircleCheck size={15} />完成</Button>}</div></article>; })}</div> : <EmptyState title="还没有运行记录" description="输入目标并创建首个 Run；创建后会立即持久化并冻结快照。" />}</>;
 }
 
-function MembersPanel({ projectId, members, runs, selectedId, onSelect, runAction, busyAction }: { projectId: string; members: RecordValue[]; runs: RecordValue[]; selectedId: string; onSelect: (id: string) => void; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
-    const member = members.find((entry) => text(entry, 'id', 'member_id', 'agent_id') === selectedId) || members[0];
+function MembersPanel({ projectId, members, runs, selectedId, onSelect, onOpenSession, runAction, busyAction }: { projectId: string; members: RecordValue[]; runs: RecordValue[]; selectedId: string; onSelect: (id: string) => void; onOpenSession: OpenSession; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
+    const activeMembers = useMemo(() => members.filter((entry) => entry.is_enabled !== false), [members]);
+    const departedMembers = members.filter((entry) => entry.is_enabled === false);
+    const member = members.find((entry) => text(entry, 'id', 'member_id', 'agent_id') === selectedId) || activeMembers[0] || departedMembers[0];
     const [config, setConfig] = useState('{}');
     const [configError, setConfigError] = useState('');
-    useEffect(() => { setConfig(JSON.stringify(obj(member?.config_snapshot), null, 2)); setConfigError(''); }, [member]);
+    const [availableAgents, setAvailableAgents] = useState<RecordValue[]>([]);
+    const [agentsLoading, setAgentsLoading] = useState(true);
+    const [agentsError, setAgentsError] = useState('');
+    const [addDialogOpen, setAddDialogOpen] = useState(false);
+    const [removeDialogOpen, setRemoveDialogOpen] = useState(false);
+    const [candidateAgentId, setCandidateAgentId] = useState('');
+
+    useEffect(() => {
+        setConfig(JSON.stringify(obj(member?.config_snapshot), null, 2));
+        setConfigError('');
+    }, [member]);
+
+    useEffect(() => {
+        let mounted = true;
+        setAgentsLoading(true);
+        setAgentsError('');
+        void projectsApi.bootstrapOptions().then((options) => {
+            if (mounted) setAvailableAgents(options.agents.map((agent) => ({ ...agent })));
+        }).catch((error) => {
+            if (mounted) setAgentsError(errorMessage(error));
+        }).finally(() => {
+            if (mounted) setAgentsLoading(false);
+        });
+        return () => { mounted = false; };
+    }, []);
+
     const memberId = text(member || {}, 'id', 'member_id');
     const agentId = text(member || {}, 'agent_id');
+    const memberName = text(member || {}, 'name_snapshot', 'agent_name', 'name') || '项目成员';
+    const departed = member?.is_enabled === false;
+    const memberAgentIds = new Set(members.map((entry) => text(entry, 'agent_id')).filter(Boolean));
+    const candidates = availableAgents.filter((agent) => !memberAgentIds.has(text(agent, 'id', 'agent_id')));
+    const candidateOptions = candidates.map((agent) => ({
+        value: text(agent, 'id', 'agent_id'),
+        label: `${text(agent, 'name', 'agent_name') || '未命名 Agent'} · ${text(agent, 'role_description', 'role') || '项目成员'}`,
+    }));
+    const selectedCandidate = candidates.find((agent) => text(agent, 'id', 'agent_id') === candidateAgentId) || candidates[0];
+    const selectedCandidateId = text(selectedCandidate || {}, 'id', 'agent_id');
+    const memberRuns = runs.filter((run) => {
+        const records = traceRecords(run);
+        return [
+            traceValue(records, 'agent_id', 'execution_agent_id', 'subagent_agent_id'),
+            traceValue(records, 'assignee_agent_id', 'actor_agent_id'),
+        ].includes(agentId);
+    });
+
     const saveSnapshot = () => {
+        if (departed) return;
         let parsed: RecordValue;
-        try { parsed = JSON.parse(config) as RecordValue; setConfigError(''); } catch { setConfigError('配置必须是有效 JSON'); return; }
+        try {
+            parsed = JSON.parse(config) as RecordValue;
+            setConfigError('');
+        } catch {
+            setConfigError('配置必须是有效 JSON');
+            return;
+        }
         void runAction('save-member', () => projectsApi.patchMember(projectId, memberId, { config_snapshot: parsed }), '项目成员快照已更新；源 Agent 未改变');
     };
-    return <><SectionHeading eyebrow="MEMBERS / SNAPSHOTS" title="成员与三层快照" description="源 Agent 保持稳定；项目快照承接项目内配置，每个 Run 再冻结一次执行视图。" />{members.length ? <><div className="project-workspace__member-layout"><div className="project-workspace__member-list">{members.map((entry) => { const id = text(entry, 'id', 'member_id', 'agent_id'); return <Button variant="ghost" key={id} className={text(member || {}, 'id', 'member_id', 'agent_id') === id ? 'is-active' : ''} onClick={() => onSelect(id)}><span>{(text(entry, 'agent_name', 'name_snapshot', 'name') || 'A').slice(0, 1)}</span><div><strong>{text(entry, 'agent_name', 'name_snapshot', 'name')}</strong><small>{bool(entry, 'is_leader') ? 'Leader · ' : ''}{text(entry, 'role_snapshot', 'role') || '项目成员'}</small></div><IconChevronRight size={15} /></Button>; })}</div><div className="project-workspace__snapshot-graph"><SnapshotLineageGraph member={member || null} runs={runs} /><ProjectGraphLegend /></div></div><section className="project-workspace__action-panel project-workspace__member-editor"><header><div><span>PROJECT SNAPSHOT EDITOR</span><h3>编辑 {text(member || {}, 'name_snapshot')} 的项目快照</h3></div>{!bool(member || {}, 'is_leader') && <Button variant="secondary" disabled={busyAction === 'leader'} onClick={() => void runAction('leader', () => projectsApi.setLeader(projectId, agentId), '项目 Leader 已切换')}><IconFlag size={15} />设为 Leader</Button>}</header><ProjectField label="项目内配置 JSON" labelFor="project-member-config" error={configError || undefined}><ProjectTextarea id="project-member-config" value={config} onChange={(event) => setConfig(event.target.value)} rows={7} spellCheck={false} /></ProjectField><footer><ToggleSwitch checked={member?.is_enabled !== false} ariaLabel="启用或停用项目成员" disabled={busyAction === 'toggle-member'} onChange={(checked) => void runAction('toggle-member', () => projectsApi.patchMember(projectId, memberId, { is_enabled: checked }), checked ? '成员已在项目内启用' : '成员已在项目内停用')} /><span className="project-workspace__switch-copy">仅影响当前项目</span><Button variant="primary" onClick={saveSnapshot} disabled={busyAction === 'save-member'}>{busyAction === 'save-member' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存快照</Button></footer></section></> : <EmptyState icon={<IconUsers size={22} />} title="项目还没有成员" description="添加 Agent 并指定 Leader 后，系统会创建项目隔离快照。" />}</>;
+    const addMember = () => {
+        if (!selectedCandidateId) return;
+        void runAction('add-member', () => projectsApi.addMember(projectId, {
+            agent_id: selectedCandidateId,
+            is_leader: false,
+            is_enabled: true,
+        }), 'Agent 已加入项目，并生成项目快照').then((succeeded) => {
+            if (succeeded) {
+                setAddDialogOpen(false);
+                setCandidateAgentId('');
+            }
+        });
+    };
+    const removeMember = () => {
+        if (!memberId || bool(member || {}, 'is_leader')) return;
+        void runAction('remove-member', () => projectsApi.removeMember(projectId, memberId, 'human_removed_from_project'), '成员已退出项目；历史记录保持可追溯').then((succeeded) => {
+            if (succeeded) setRemoveDialogOpen(false);
+        });
+    };
+    const restoreMember = () => {
+        if (!memberId || !departed) return;
+        void runAction('restore-member', () => projectsApi.restoreMember(projectId, memberId, 'human_restored_to_project'), '成员已恢复，可继续参与项目');
+    };
+
+    const renderMemberGroup = (label: string, entries: RecordValue[], historical = false) => entries.length ? <section className="project-workspace__member-group">
+        <header><span>{label}</span><ProjectCountBadge>{entries.length}</ProjectCountBadge></header>
+        {entries.map((entry) => {
+            const id = text(entry, 'id', 'member_id', 'agent_id');
+            const name = text(entry, 'agent_name', 'name_snapshot', 'name') || 'Agent';
+            return <Button variant="ghost" key={id} className={`${text(member || {}, 'id', 'member_id', 'agent_id') === id ? 'is-active' : ''}${historical ? ' is-departed' : ''}`} onClick={() => onSelect(id)}>
+                <span>{name.slice(0, 1)}</span>
+                <div><strong>{name}</strong><small>{bool(entry, 'is_leader') ? 'Leader · ' : ''}{text(entry, 'role_snapshot', 'role') || '项目成员'}</small></div>
+                {historical ? <ProjectStatusBadge tone="neutral">已退出</ProjectStatusBadge> : bool(entry, 'is_leader') ? <ProjectStatusBadge tone="info">Leader</ProjectStatusBadge> : <ProjectStatusBadge tone="success">在岗</ProjectStatusBadge>}
+                <IconChevronRight size={15} />
+            </Button>;
+        })}
+    </section> : null;
+
+    return <>
+        <SectionHeading
+            eyebrow="MEMBERS / SNAPSHOTS"
+            title="成员与三层快照"
+            description="成员可以随项目阶段增减；退出只冻结后续权限，快照、Run 与会话历史永久保留。"
+            actions={<Button variant="primary" onClick={() => setAddDialogOpen(true)}><IconPlus size={16} />添加 Agent</Button>}
+        />
+        {members.length ? <>
+            <div className="project-workspace__member-summary" aria-label="项目成员概览">
+                <article><span>在岗成员</span><strong>{activeMembers.length}</strong><small>可被 @、指派与调用项目能力</small></article>
+                <article><span>历史成员</span><strong>{departedMembers.length}</strong><small>保留快照与执行证据，只读可见</small></article>
+                <article><span>冻结 Run</span><strong>{runs.length}</strong><small>每个 Run 保留当时的成员执行视图</small></article>
+            </div>
+            <div className="project-workspace__member-layout">
+                <div className="project-workspace__member-list">
+                    {renderMemberGroup('在岗', activeMembers)}
+                    {renderMemberGroup('已退出 · 历史记录', departedMembers, true)}
+                </div>
+                <div className="project-workspace__snapshot-graph">
+                    <div className="project-workspace__snapshot-heading">
+                        <div><strong>{memberName}</strong><small>{departed ? '历史快照 · 不再接收新消息或任务' : '当前项目快照 · 仅在本项目生效'}</small></div>
+                        <ProjectStatusBadge tone={departed ? 'neutral' : 'success'}>{departed ? '已退出' : '在岗'}</ProjectStatusBadge>
+                    </div>
+                    <SnapshotLineageGraph member={member || null} runs={memberRuns} />
+                    <ProjectGraphLegend />
+                </div>
+            </div>
+            <section className={`project-workspace__action-panel project-workspace__member-editor${departed ? ' is-readonly' : ''}`}>
+                <header>
+                    <div><span>{departed ? 'HISTORICAL PROJECT SNAPSHOT' : 'PROJECT SNAPSHOT EDITOR'}</span><h3>{departed ? `查看 ${memberName} 的历史快照` : `编辑 ${memberName} 的项目快照`}</h3></div>
+                    <div className="project-workspace__member-actions">
+                        {departed ? <Button variant="secondary" disabled={busyAction === 'restore-member'} onClick={restoreMember}>{busyAction === 'restore-member' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconRestore size={15} />}恢复成员</Button> : !bool(member || {}, 'is_leader') ? <>
+                            <Button variant="secondary" disabled={busyAction === 'leader'} onClick={() => void runAction('leader', () => projectsApi.setLeader(projectId, agentId), '项目 Leader 已切换')}><IconFlag size={15} />设为 Leader</Button>
+                            <Button variant="danger" onClick={() => setRemoveDialogOpen(true)}><IconTrash size={15} />移出项目</Button>
+                        </> : <ProjectStatusBadge tone="info">当前 Leader</ProjectStatusBadge>}
+                    </div>
+                </header>
+                {departed && <div className="project-workspace__member-history-note"><IconArchive size={17} /><div><strong>历史只读</strong><p>该 Agent 不再接收 @、新指派或项目工具调用。恢复前只能查看其快照、Run 与关联会话。</p></div></div>}
+                <ProjectField label="项目内配置 JSON" labelFor="project-member-config" error={configError || undefined} hint={departed ? '退出时的项目快照保持原样。' : '修改只写入项目快照，不影响源 Agent。'}>
+                    <ProjectTextarea id="project-member-config" value={config} onChange={(event) => setConfig(event.target.value)} rows={7} spellCheck={false} disabled={departed} />
+                </ProjectField>
+                <section className="project-workspace__member-run-history">
+                    <header><div><span>RUN / SESSION HISTORY</span><h4>关联执行记录</h4></div><ProjectCountBadge>{memberRuns.length}</ProjectCountBadge></header>
+                    {memberRuns.length ? memberRuns.slice(0, 6).map((run) => {
+                        const runId = text(run, 'id', 'run_id');
+                        const hasSession = Boolean(sessionIdOf(run));
+                        return <article key={runId}>
+                            <StatusPill status={text(run, 'status')} />
+                            <div><strong>{text(obj(run.input), 'objective', 'task') || '项目执行'}</strong><small><code>{compactId(runId)}</code> · {dateLabel(run.started_at || run.created_at)}</small></div>
+                            {hasSession && <Button variant="ghost" onClick={() => onOpenSession(departed ? { ...run, status: 'disabled', member_enabled: false } : run, `${memberName} · ${departed ? '历史只读会话' : '工作会话'}`)}><IconMessageCircle size={14} />{departed ? '历史只读' : '查看会话'}</Button>}
+                        </article>;
+                    }) : <p>该成员尚未产生项目 Run；退出后仍会保留此处的历史记录。</p>}
+                </section>
+                {!departed && <footer><span className="project-workspace__switch-copy">源 Agent 保持稳定，修改只在当前项目生效</span><Button variant="primary" onClick={saveSnapshot} disabled={busyAction === 'save-member'}>{busyAction === 'save-member' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存快照</Button></footer>}
+            </section>
+        </> : <EmptyState icon={<IconUsers size={22} />} title="项目还没有成员" description="先添加一个 Agent，再从在岗成员中指定 Leader。" action={<Button variant="primary" onClick={() => setAddDialogOpen(true)}><IconPlus size={16} />添加 Agent</Button>} />}
+
+        <ProjectDialog open={addDialogOpen} onClose={() => { if (busyAction !== 'add-member') setAddDialogOpen(false); }} ariaLabel="添加项目 Agent" className="project-workspace__member-dialog">
+            <div className="project-workspace__modal">
+                <header><div><span>ADD PROJECT MEMBER</span><h2>添加项目 Agent</h2></div><ProjectIconButton aria-label="关闭" disabled={busyAction === 'add-member'} onClick={() => setAddDialogOpen(false)}><IconX size={18} /></ProjectIconButton></header>
+                <p>从平台现有 Agent 中选择。加入后会生成独立的项目快照，源 Agent 配置保持不变。</p>
+                {agentsError ? <div className="project-workspace__repository-error" role="alert"><IconAlertTriangle size={16} /><span>{agentsError}</span></div> : candidateOptions.length ? <>
+                    <ProjectField label="Agent"><ProjectSelect value={selectedCandidateId} options={candidateOptions} onChange={setCandidateAgentId} ariaLabel="选择要加入项目的 Agent" disabled={agentsLoading || busyAction === 'add-member'} /></ProjectField>
+                    {selectedCandidate && <div className="project-workspace__member-candidate"><span>{(text(selectedCandidate, 'name') || 'A').slice(0, 1)}</span><div><strong>{text(selectedCandidate, 'name') || '未命名 Agent'}</strong><p>{text(selectedCandidate, 'role_description') || '项目成员'}</p><small>{text(selectedCandidate, 'status') || 'idle'} · {num(selectedCandidate, 'skill_count')} Skill · {num(selectedCandidate, 'mcp_count')} MCP</small></div></div>}
+                </> : <ProjectEmptyState icon={agentsLoading ? <IconLoader2 className="project-workspace__spinner" size={20} /> : <IconUsers size={20} />} title={agentsLoading ? '正在读取 Agent' : '没有可添加的 Agent'} description={agentsLoading ? '请稍候…' : '平台中的 Agent 都已加入过该项目；已退出成员请从历史记录中恢复。'} />}
+                <footer><Button variant="secondary" onClick={() => setAddDialogOpen(false)} disabled={busyAction === 'add-member'}>取消</Button><Button variant="primary" onClick={addMember} disabled={!selectedCandidateId || agentsLoading || busyAction === 'add-member'}>{busyAction === 'add-member' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconPlus size={16} />}添加到项目</Button></footer>
+            </div>
+        </ProjectDialog>
+
+        <ProjectDialog open={removeDialogOpen} onClose={() => { if (busyAction !== 'remove-member') setRemoveDialogOpen(false); }} ariaLabel="确认移出项目成员" className="project-workspace__member-dialog">
+            <div className="project-workspace__modal">
+                <header><div><span>MEMBER LIFECYCLE</span><h2>将 {memberName} 移出项目？</h2></div><ProjectIconButton aria-label="关闭" disabled={busyAction === 'remove-member'} onClick={() => setRemoveDialogOpen(false)}><IconX size={18} /></ProjectIconButton></header>
+                <p>移出后该 Agent 将立即停止接收 @、新任务与项目工具调用。历史快照、Run、会话和审计记录仍然可见，也可以稍后恢复。</p>
+                <div className="project-workspace__safe-note"><IconLock size={16} /><span>这是可恢复的成员状态变更，不会删除历史数据。</span></div>
+                <footer><Button variant="secondary" onClick={() => setRemoveDialogOpen(false)} disabled={busyAction === 'remove-member'}>保留成员</Button><Button variant="danger" onClick={removeMember} disabled={busyAction === 'remove-member'}>{busyAction === 'remove-member' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconTrash size={16} />}移出项目</Button></footer>
+            </div>
+        </ProjectDialog>
+    </>;
 }
 
 function ProjectToolsControl({ projectId, members, policies, runAction, busyAction }: { projectId: string; members: RecordValue[]; policies: RecordValue | null; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
-    const [selectedMemberId, setSelectedMemberId] = useState(() => text(members[0] || {}, 'id', 'member_id'));
+    const activeMembers = useMemo(() => members.filter((entry) => entry.is_enabled !== false), [members]);
+    const [selectedMemberId, setSelectedMemberId] = useState(() => text(activeMembers[0] || {}, 'id', 'member_id'));
     useEffect(() => {
-        if (!members.some(member => text(member, 'id', 'member_id') === selectedMemberId)) {
-            setSelectedMemberId(text(members[0] || {}, 'id', 'member_id'));
+        if (!activeMembers.some(member => text(member, 'id', 'member_id') === selectedMemberId)) {
+            setSelectedMemberId(text(activeMembers[0] || {}, 'id', 'member_id'));
         }
-    }, [members, selectedMemberId]);
-    const member = members.find(entry => text(entry, 'id', 'member_id') === selectedMemberId) || members[0];
+    }, [activeMembers, selectedMemberId]);
+    const member = activeMembers.find(entry => text(entry, 'id', 'member_id') === selectedMemberId) || activeMembers[0];
     const memberId = text(member || {}, 'id', 'member_id');
     const memberName = text(member || {}, 'name_snapshot', 'agent_name', 'name') || '项目成员';
     const effectiveCount = member ? PROJECT_TOOL_REGISTRY.filter(tool => projectToolResolution(tool, member, policies).effective).length : 0;
@@ -705,7 +1028,7 @@ function ProjectToolsControl({ projectId, members, policies, runAction, busyActi
         );
     };
     return <section className="project-workspace__project-tools">
-        <header className="project-workspace__subsection-heading"><div><span>PROJECT MANAGEMENT TOOLS</span><h3>项目管理工具</h3><p>运行时工具来自同一原子 registry，并按角色基线、项目策略和成员快照求交集。</p></div>{member && <div className="project-workspace__project-tool-member"><ProjectSelect value={memberId} options={members.map(entry => ({ value: text(entry, 'id', 'member_id'), label: `${text(entry, 'name_snapshot', 'agent_name', 'name')}${bool(entry, 'is_leader') ? ' · Leader' : ''}` }))} onChange={setSelectedMemberId} ariaLabel="选择项目成员" /><ProjectCountBadge>{effectiveCount} / {PROJECT_TOOL_REGISTRY.length}</ProjectCountBadge></div>}</header>
+        <header className="project-workspace__subsection-heading"><div><span>PROJECT MANAGEMENT TOOLS</span><h3>项目管理工具</h3><p>运行时工具来自同一原子 registry，并按角色基线、项目策略和成员快照求交集；已退出成员的工具权限保持冻结。</p></div>{member && <div className="project-workspace__project-tool-member"><ProjectSelect value={memberId} options={activeMembers.map(entry => ({ value: text(entry, 'id', 'member_id'), label: `${text(entry, 'name_snapshot', 'agent_name', 'name')}${bool(entry, 'is_leader') ? ' · Leader' : ''}` }))} onChange={setSelectedMemberId} ariaLabel="选择项目成员" /><ProjectCountBadge>{effectiveCount} / {PROJECT_TOOL_REGISTRY.length}</ProjectCountBadge></div>}</header>
         <div className="project-workspace__tool-baselines"><article><strong>Leader 基线</strong><span>{PROJECT_TOOL_REGISTRY.length} 个 Agent-safe 工具</span><small>包含计划、成员、能力和安全 Git 操作。</small></article><article><strong>参与者基线</strong><span>{PROJECT_TOOL_REGISTRY.filter(tool => tool.participant).length} 个执行工具</span><small>读上下文、工作项、文件，更新本人工作，写文件和定向消息。</small></article></div>
         {member ? <div className="project-workspace__project-tool-grid">{PROJECT_TOOL_REGISTRY.map(tool => {
             const resolution = projectToolResolution(tool, member, policies);
@@ -713,13 +1036,14 @@ function ProjectToolsControl({ projectId, members, policies, runAction, busyActi
             const tone = resolution.effective ? 'success' : resolution.memberDisabled ? 'neutral' : 'warning';
             const actionKey = `project-tool-${memberId}-${tool.name}`;
             return <article key={tool.name} className={resolution.effective ? 'is-effective' : ''}><header><span><IconTool size={16} /></span><div><strong>{tool.label}</strong><code>{tool.name}</code></div><ToggleSwitch checked={resolution.effective} onChange={checked => toggleTool(tool, checked)} ariaLabel={`${resolution.effective ? '关闭' : '启用'} ${tool.label}`} disabled={!resolution.roleCeiling || resolution.policyBlocked || resolution.snapshotBlocked || busyAction === actionKey} /></header><p>{tool.description}</p><footer><ProjectStatusBadge tone={tone}>{blockedLabel}</ProjectStatusBadge><small>{tool.participant ? '参与者基线' : 'Leader 基线'}</small></footer></article>;
-        })}</div> : <ProjectEmptyState icon={<IconUsers size={22} />} title="没有项目成员" description="添加成员后才能配置其项目管理工具。" />}
+        })}</div> : <ProjectEmptyState icon={<IconUsers size={22} />} title="没有在岗成员" description="恢复历史成员或添加新成员后，才能配置项目管理工具。" />}
         <aside className="project-workspace__human-only"><IconLock size={18} /><div><strong>Human-only 操作不进入 Agent 工具集</strong><p>{HUMAN_ONLY_PROJECT_OPERATIONS.join(' · ')}</p></div></aside>
     </section>;
 }
 
 function CapabilitiesPanel({ projectId, members, capabilities, policies, runAction, busyAction }: { projectId: string; members: RecordValue[]; capabilities: RecordValue[]; policies: RecordValue | null; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
     const [filter, setFilter] = useState('all');
+    const departedAgentIds = new Set(members.filter((member) => member.is_enabled === false).map((member) => text(member, 'agent_id')).filter(Boolean));
     const visible = capabilities.filter((cap) => {
         if (filter === 'all') return true;
         if (['skill', 'mcp'].includes(filter)) return text(cap, 'capability_type', 'kind', 'type') === filter;
@@ -728,16 +1052,16 @@ function CapabilitiesPanel({ projectId, members, capabilities, policies, runActi
     });
     return <><SectionHeading eyebrow="CAPABILITY CONTROL" title="项目能力中心" description="项目共享 Skill/MCP 对成员可见；Agent 带入能力可逐项关闭，均不影响源 Agent。" />
         <ProjectSegmentedControl className="project-workspace__filters" value={filter} options={[{ value: 'all', label: '全部' }, { value: 'skill', label: 'Skill' }, { value: 'mcp', label: 'MCP' }, { value: 'project', label: '项目共享' }, { value: 'agent', label: 'Agent 带入' }]} onChange={setFilter} ariaLabel="能力筛选" />
-        {visible.length ? <div className="project-workspace__cap-grid">{visible.map((cap) => { const id = text(cap, 'id', 'binding_id', 'capability_id'); const capabilityType = text(cap, 'capability_type', 'kind', 'type'); const enabled = cap.is_enabled !== false; const scopeCount = Object.keys(obj(cap.scope)).length; return <article key={id}><header><span className={`is-${capabilityType || 'skill'}`}>{capabilityType === 'mcp' ? <IconCodeDots size={17} /> : <IconTool size={17} />}</span><div><strong>{text(cap, 'name', 'capability_name')}</strong><small>{text(cap, 'version') || capabilityType.toUpperCase() || '能力'} · {text(cap, 'source') === 'agent' ? `由 ${text(cap, 'inherited_from_agent_id') || 'Agent'} 带入` : '项目共享'}</small></div><ToggleSwitch checked={enabled} ariaLabel={`${enabled ? '关闭' : '启用'} ${text(cap, 'name', 'capability_name')}`} disabled={busyAction === `cap-${id}`} onChange={(checked) => void runAction(`cap-${id}`, () => projectsApi.patchCapability(projectId, id, { is_enabled: checked }), checked ? '能力已在项目内启用' : '能力已在项目内关闭；源 Agent 不受影响')} /></header><p>{text(cap, 'description') || '没有能力说明。'}</p><footer><span>{scopeCount ? `${scopeCount} 项权限范围` : '未配置权限范围'}</span>{text(cap, 'risk_level') && <em>{text(cap, 'risk_level')} risk</em>}</footer></article>; })}</div> : <EmptyState icon={<IconTool size={22} />} title="没有符合条件的能力" description="添加项目共享 Skill/MCP，或启用成员带入的能力后会出现在这里。" />}
+        {visible.length ? <div className="project-workspace__cap-grid">{visible.map((cap) => { const id = text(cap, 'id', 'binding_id', 'capability_id'); const capabilityType = text(cap, 'capability_type', 'kind', 'type'); const enabled = cap.is_enabled !== false; const scopeCount = Object.keys(obj(cap.scope)).length; const inheritedFromAgentId = text(cap, 'inherited_from_agent_id'); const departedOwner = Boolean(inheritedFromAgentId && departedAgentIds.has(inheritedFromAgentId)); return <article key={id} className={departedOwner ? 'is-readonly' : ''}><header><span className={`is-${capabilityType || 'skill'}`}>{capabilityType === 'mcp' ? <IconCodeDots size={17} /> : <IconTool size={17} />}</span><div><strong>{text(cap, 'name', 'capability_name')}</strong><small>{text(cap, 'version') || capabilityType.toUpperCase() || '能力'} · {text(cap, 'source') === 'agent' ? `由 ${inheritedFromAgentId || 'Agent'} 带入${departedOwner ? ' · 成员已退出' : ''}` : '项目共享'}</small></div><ToggleSwitch checked={departedOwner ? false : enabled} ariaLabel={`${enabled ? '关闭' : '启用'} ${text(cap, 'name', 'capability_name')}`} disabled={departedOwner || busyAction === `cap-${id}`} onChange={(checked) => void runAction(`cap-${id}`, () => projectsApi.patchCapability(projectId, id, { is_enabled: checked }), checked ? '能力已在项目内启用' : '能力已在项目内关闭；源 Agent 不受影响')} /></header><p>{departedOwner ? '成员已退出，带入能力保持冻结；恢复成员后可重新配置。' : text(cap, 'description') || '没有能力说明。'}</p><footer><span>{scopeCount ? `${scopeCount} 项权限范围` : '未配置权限范围'}</span>{departedOwner ? <ProjectStatusBadge tone="neutral">历史只读</ProjectStatusBadge> : text(cap, 'risk_level') && <em>{text(cap, 'risk_level')} risk</em>}</footer></article>; })}</div> : <EmptyState icon={<IconTool size={22} />} title="没有符合条件的能力" description="添加项目共享 Skill/MCP，或启用成员带入的能力后会出现在这里。" />}
         <ProjectToolsControl projectId={projectId} members={members} policies={policies} runAction={runAction} busyAction={busyAction} /></>;
 }
 
 function CapabilityBindingsMatrix({ members, capabilities }: { members: RecordValue[]; capabilities: RecordValue[] }) {
-    return <><SectionHeading eyebrow="EFFECTIVE CAPABILITIES" title="能力矩阵" description="最终能力 = 项目分配 ∩ 成员启用 ∩ 角色策略 ∩ 安全边界；每次解析均写入审计。" />{members.length && capabilities.length ? <div className="project-workspace__matrix-wrap"><ProjectDataTable><ProjectDataTableHead><ProjectDataTableRow><ProjectDataTableHeader>能力</ProjectDataTableHeader><ProjectDataTableHeader>来源</ProjectDataTableHeader>{members.map((member) => <ProjectDataTableHeader key={text(member, 'agent_id', 'id', 'member_id')}>{text(member, 'agent_name', 'name_snapshot', 'name')}</ProjectDataTableHeader>)}</ProjectDataTableRow></ProjectDataTableHead><ProjectDataTableBody>{capabilities.map((cap) => { const assignments = obj(cap.assignments); const inheritedAgentId = text(cap, 'inherited_from_agent_id'); const inherited = Boolean(inheritedAgentId) || ['agent', 'inherited'].includes(text(cap, 'source')); return <ProjectDataTableRow key={text(cap, 'id', 'binding_id', 'capability_id')}><ProjectDataTableCell><strong>{text(cap, 'name', 'capability_name')}</strong><small>{text(cap, 'capability_type', 'kind', 'type')}</small></ProjectDataTableCell><ProjectDataTableCell>{inherited ? 'Agent 带入' : '项目共享'}</ProjectDataTableCell>{members.map((member) => { const id = text(member, 'agent_id', 'id', 'member_id'); const explicitlyAssigned = Object.prototype.hasOwnProperty.call(assignments, id); const enabled = cap.is_enabled !== false; const resolved: 'yes' | 'no' | 'unknown' = !enabled ? 'no' : inheritedAgentId ? (inheritedAgentId === id ? 'yes' : 'no') : explicitlyAssigned ? (assignments[id] === false ? 'no' : 'yes') : 'unknown'; return <ProjectDataTableCell key={id}><span className={`project-workspace__matrix-${resolved}`}>{resolved === 'yes' ? <IconCircleCheck size={17} /> : resolved === 'no' ? <IconX size={16} /> : <IconClock size={16} />}<small>{resolved === 'yes' ? '可用' : resolved === 'no' ? '不可用' : '按策略解析'}</small></span></ProjectDataTableCell>; })}</ProjectDataTableRow>; })}</ProjectDataTableBody></ProjectDataTable></div> : <EmptyState icon={<IconCodeDots size={22} />} title="能力矩阵尚不可计算" description="至少需要一个项目成员和一个能力绑定。" />}</>;
+    return <><SectionHeading eyebrow="EFFECTIVE CAPABILITIES" title="能力矩阵" description="最终能力 = 在岗成员 ∩ 项目分配 ∩ 成员启用 ∩ 角色策略 ∩ 安全边界；每次解析均写入审计。" />{members.length && capabilities.length ? <div className="project-workspace__matrix-wrap"><ProjectDataTable><ProjectDataTableHead><ProjectDataTableRow><ProjectDataTableHeader>能力</ProjectDataTableHeader><ProjectDataTableHeader>来源</ProjectDataTableHeader>{members.map((member) => <ProjectDataTableHeader key={text(member, 'agent_id', 'id', 'member_id')}>{text(member, 'agent_name', 'name_snapshot', 'name')}<small>{member.is_enabled === false ? '已退出 · 历史' : bool(member, 'is_leader') ? 'Leader' : '在岗'}</small></ProjectDataTableHeader>)}</ProjectDataTableRow></ProjectDataTableHead><ProjectDataTableBody>{capabilities.map((cap) => { const assignments = obj(cap.assignments); const inheritedAgentId = text(cap, 'inherited_from_agent_id'); const inherited = Boolean(inheritedAgentId) || ['agent', 'inherited'].includes(text(cap, 'source')); return <ProjectDataTableRow key={text(cap, 'id', 'binding_id', 'capability_id')}><ProjectDataTableCell><strong>{text(cap, 'name', 'capability_name')}</strong><small>{text(cap, 'capability_type', 'kind', 'type')}</small></ProjectDataTableCell><ProjectDataTableCell>{inherited ? 'Agent 带入' : '项目共享'}</ProjectDataTableCell>{members.map((member) => { const id = text(member, 'agent_id', 'id', 'member_id'); const explicitlyAssigned = Object.prototype.hasOwnProperty.call(assignments, id); const enabled = cap.is_enabled !== false; const resolved: 'yes' | 'no' | 'unknown' = member.is_enabled === false || !enabled ? 'no' : inheritedAgentId ? (inheritedAgentId === id ? 'yes' : 'no') : explicitlyAssigned ? (assignments[id] === false ? 'no' : 'yes') : 'unknown'; return <ProjectDataTableCell key={id}><span className={`project-workspace__matrix-${resolved}`}>{resolved === 'yes' ? <IconCircleCheck size={17} /> : resolved === 'no' ? <IconX size={16} /> : <IconClock size={16} />}<small>{member.is_enabled === false ? '历史只读' : resolved === 'yes' ? '可用' : resolved === 'no' ? '不可用' : '按策略解析'}</small></span></ProjectDataTableCell>; })}</ProjectDataTableRow>; })}</ProjectDataTableBody></ProjectDataTable></div> : <EmptyState icon={<IconCodeDots size={22} />} title="能力矩阵尚不可计算" description="至少需要一个项目成员和一个能力绑定。" />}</>;
 }
 
 function ProjectToolsMatrix({ members, policies }: { members: RecordValue[]; policies: RecordValue | null }) {
-    return <section className="project-workspace__project-tool-matrix"><header className="project-workspace__subsection-heading"><div><span>PROJECT TOOL EFFECTIVE MATRIX</span><h3>项目管理工具有效矩阵</h3><p>同一 registry 依次应用角色 ceiling、项目策略和成员关闭项；Human-only 操作不出现在矩阵中。</p></div><ProjectCountBadge>{PROJECT_TOOL_REGISTRY.length} 个原子工具</ProjectCountBadge></header>{members.length ? <div className="project-workspace__matrix-wrap"><ProjectDataTable><ProjectDataTableHead><ProjectDataTableRow><ProjectDataTableHeader>原子工具</ProjectDataTableHeader><ProjectDataTableHeader>角色基线</ProjectDataTableHeader>{members.map(member => <ProjectDataTableHeader key={text(member, 'id', 'member_id', 'agent_id')}>{text(member, 'name_snapshot', 'agent_name', 'name')}<small>{bool(member, 'is_leader') ? 'Leader' : '参与者'}</small></ProjectDataTableHeader>)}</ProjectDataTableRow></ProjectDataTableHead><ProjectDataTableBody>{PROJECT_TOOL_REGISTRY.map(tool => <ProjectDataTableRow key={tool.name}><ProjectDataTableCell><strong>{tool.label}</strong><small>{tool.name}</small></ProjectDataTableCell><ProjectDataTableCell>{tool.participant ? 'Leader / 参与者' : '仅 Leader'}</ProjectDataTableCell>{members.map(member => { const resolution = projectToolResolution(tool, member, policies); const label = resolution.effective ? '有效' : !resolution.roleCeiling ? '超出角色' : resolution.memberDisabled ? '成员关闭' : resolution.policyBlocked ? '策略禁用' : '快照限制'; return <ProjectDataTableCell key={text(member, 'id', 'member_id', 'agent_id')}><span className={resolution.effective ? 'project-workspace__matrix-yes' : resolution.roleCeiling ? 'project-workspace__matrix-unknown' : 'project-workspace__matrix-no'}>{resolution.effective ? <IconCircleCheck size={17} /> : resolution.roleCeiling ? <IconClock size={16} /> : <IconX size={16} />}<small>{label}</small></span></ProjectDataTableCell>; })}</ProjectDataTableRow>)}</ProjectDataTableBody></ProjectDataTable></div> : <ProjectEmptyState icon={<IconUsers size={22} />} title="项目管理工具矩阵尚不可计算" description="至少需要一个项目成员。" />}</section>;
+    return <section className="project-workspace__project-tool-matrix"><header className="project-workspace__subsection-heading"><div><span>PROJECT TOOL EFFECTIVE MATRIX</span><h3>项目管理工具有效矩阵</h3><p>同一 registry 依次应用成员生命周期、角色 ceiling、项目策略和成员关闭项；Human-only 操作不出现在矩阵中。</p></div><ProjectCountBadge>{PROJECT_TOOL_REGISTRY.length} 个原子工具</ProjectCountBadge></header>{members.length ? <div className="project-workspace__matrix-wrap"><ProjectDataTable><ProjectDataTableHead><ProjectDataTableRow><ProjectDataTableHeader>原子工具</ProjectDataTableHeader><ProjectDataTableHeader>角色基线</ProjectDataTableHeader>{members.map(member => <ProjectDataTableHeader key={text(member, 'id', 'member_id', 'agent_id')}>{text(member, 'name_snapshot', 'agent_name', 'name')}<small>{member.is_enabled === false ? '已退出 · 历史' : bool(member, 'is_leader') ? 'Leader' : '参与者'}</small></ProjectDataTableHeader>)}</ProjectDataTableRow></ProjectDataTableHead><ProjectDataTableBody>{PROJECT_TOOL_REGISTRY.map(tool => <ProjectDataTableRow key={tool.name}><ProjectDataTableCell><strong>{tool.label}</strong><small>{tool.name}</small></ProjectDataTableCell><ProjectDataTableCell>{tool.participant ? 'Leader / 参与者' : '仅 Leader'}</ProjectDataTableCell>{members.map(member => { const resolution = projectToolResolution(tool, member, policies); const label = resolution.lifecycleBlocked ? '成员已退出' : resolution.effective ? '有效' : !resolution.roleCeiling ? '超出角色' : resolution.memberDisabled ? '成员关闭' : resolution.policyBlocked ? '策略禁用' : '快照限制'; return <ProjectDataTableCell key={text(member, 'id', 'member_id', 'agent_id')}><span className={resolution.effective ? 'project-workspace__matrix-yes' : resolution.lifecycleBlocked || !resolution.roleCeiling ? 'project-workspace__matrix-no' : 'project-workspace__matrix-unknown'}>{resolution.effective ? <IconCircleCheck size={17} /> : resolution.lifecycleBlocked || !resolution.roleCeiling ? <IconX size={16} /> : <IconClock size={16} />}<small>{label}</small></span></ProjectDataTableCell>; })}</ProjectDataTableRow>)}</ProjectDataTableBody></ProjectDataTable></div> : <ProjectEmptyState icon={<IconUsers size={22} />} title="项目管理工具矩阵尚不可计算" description="至少需要一个项目成员。" />}</section>;
 }
 
 function CapabilityMatrix({ members, capabilities, policies }: { members: RecordValue[]; capabilities: RecordValue[]; policies: RecordValue | null }) {

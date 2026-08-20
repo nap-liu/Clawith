@@ -58,10 +58,5 @@ class SubagentRun(Base):
             "origin_tool_call_id",
             name="uq_subagent_runs_parent_tool_call",
         ),
-        UniqueConstraint(
-            "parent_session_id",
-            "project_member_id",
-            name="uq_subagent_runs_project_group_member",
-        ),
         Index("ix_subagent_runs_status_lease", "status", "lease_expires_at"),
     )

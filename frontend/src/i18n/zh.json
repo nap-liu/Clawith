@@ -23,7 +23,11 @@
         "kickoff": { "confirmed": "确认项目方案并启动", "failed": "项目启动失败" },
         "agent_reply_batch": { "dispatched": "派发 Agent 批量回复" }
       },
-      "member": { "snapshot": { "created": "创建成员快照", "updated": "更新成员快照" } },
+      "member": {
+        "snapshot": { "created": "创建成员快照", "updated": "更新成员快照" },
+        "departed": "成员退出项目",
+        "restored": "恢复项目成员"
+      },
       "leader": { "changed": "变更项目 Leader" },
       "capability": { "bound": "绑定项目能力", "updated": "更新项目能力" },
       "work_item": { "created": "创建工作项", "updated": "更新工作项" },
@@ -567,6 +571,11 @@
       "participant": "会话参与者",
       "caller": "发起方",
       "callerAvatar": "发",
+      "groupConnected": "所有消息由 Leader 处理；@ 可额外唤醒指定 Agent · 已连接项目共享时间线",
+      "groupProcessing": "{{name}} 正在处理本轮消息",
+      "groupProcessingQueued": "{{name}} 正在处理，另有 {{count}} 位 Agent 已进入本轮队列",
+      "groupTurnExpired": "上一轮处理超过 45 分钟，已停止等待；请在运行控制中检查。",
+      "groupTurnNoActiveRun": "本轮没有可继续处理的 Agent 运行，请在运行控制中查看失败原因。",
       "status": {
         "queued": "排队中",
         "pending": "等待中",

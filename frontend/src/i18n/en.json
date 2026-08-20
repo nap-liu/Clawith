@@ -23,7 +23,11 @@
         "kickoff": { "confirmed": "Project plan confirmed and started", "failed": "Project kickoff failed" },
         "agent_reply_batch": { "dispatched": "Agent reply batch dispatched" }
       },
-      "member": { "snapshot": { "created": "Member snapshot created", "updated": "Member snapshot updated" } },
+      "member": {
+        "snapshot": { "created": "Member snapshot created", "updated": "Member snapshot updated" },
+        "departed": "Project member departed",
+        "restored": "Project member restored"
+      },
       "leader": { "changed": "Project Leader changed" },
       "capability": { "bound": "Project capability bound", "updated": "Project capability updated" },
       "work_item": { "created": "Work item created", "updated": "Work item updated" },
@@ -567,6 +571,11 @@
       "participant": "Session participant",
       "caller": "Caller",
       "callerAvatar": "C",
+      "groupConnected": "Every message goes to the Leader; @ additionally wakes selected Agents · Connected to the shared project timeline",
+      "groupProcessing": "{{name}} is handling this turn",
+      "groupProcessingQueued": "{{name}} is handling this turn with {{count}} additional Agent(s) in its explicit queue",
+      "groupTurnExpired": "The previous turn exceeded 45 minutes. Waiting stopped; check Run Control for details.",
+      "groupTurnNoActiveRun": "No Agent run can continue this turn. Check Run Control for the failure reason.",
       "status": {
         "queued": "Queued",
         "pending": "Pending",

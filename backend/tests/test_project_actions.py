@@ -15,6 +15,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
@@ -156,6 +157,7 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
     # default database configured for production.
     monkeypatch.setattr("app.services.subagent_runtime.async_session", session_factory)
     monkeypatch.setattr("app.services.project_runtime_tools.async_session", session_factory)
+    monkeypatch.setattr("app.api.websocket.async_session", session_factory)
 
     tenant = Tenant(name="Project API", slug=f"project-api-{uuid.uuid4().hex[:8]}")
     session.add(tenant)
@@ -452,12 +454,20 @@ async def test_member_and_run_snapshots_are_isolated_and_a2a_bypasses_leader(pro
     assert a2a_response.json()["from_agent_id"] == str(worker_id)
     assert a2a_response.json()["to_agent_id"] == str(reviewer_id)
 
+    # Execution runs are available after the explicit kickoff boundary. This
+    # test focuses on immutable snapshots, so place the fixture in that state
+    # without duplicating the kickoff acceptance test below.
+    stored_project = await env.db.get(Project, uuid.UUID(project_id))
+    assert stored_project is not None
+    stored_project.status = "running"
+    await env.db.commit()
     run_response = await env.client.post(
         f"/api/projects/{project_id}/runs",
         json={"agent_id": str(worker_id), "trigger_type": "manual", "input": {"objective": "Build v1"}},
     )
     assert run_response.status_code == 201, run_response.text
     run_id = run_response.json()["id"]
+    assert run_response.json()["output"]["subagent_session_id"]
 
     frozen_response = await env.client.get(f"/api/projects/{project_id}/runs/{run_id}/member-snapshots")
     assert frozen_response.status_code == 200
@@ -489,6 +499,369 @@ async def test_member_and_run_snapshots_are_isolated_and_a2a_bypasses_leader(pro
     assert {"run.queued", "capability.updated", "member.snapshot.updated"} <= {
         event["event_type"] for event in events
     }
+
+
+async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh_child(
+    project_api: ProjectApiEnv,
+):
+    from app.api.websocket import WebSocketChatHandler
+    from app.models.chat_session import ChatSession
+    from app.models.project import ProjectEvent, ProjectRun
+    from app.models.subagent_run import SubagentRun
+    from app.services.project_runtime_tools import load_project_runtime_scope
+    from app.services.project_service import project_session_access_mode
+
+    env = project_api
+    project = await _create_project(env, name="Member lifecycle")
+    project_id = uuid.UUID(project["id"])
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None
+    stored_project.status = "running"
+    await env.db.commit()
+
+    members = (await env.client.get(f"/api/projects/{project_id}/members")).json()
+    leader = next(row for row in members if row["agent_id"] == str(env.leader_id))
+    worker = next(row for row in members if row["agent_id"] == str(env.worker_id))
+
+    leader_removal = await env.client.post(
+        f"/api/projects/{project_id}/members/{leader['id']}/remove",
+        json={"reason": "cannot remove current leader"},
+    )
+    assert leader_removal.status_code == 422
+
+    first_run_response = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={"agent_id": str(env.worker_id), "trigger_type": "manual", "input": {"objective": "First"}},
+    )
+    assert first_run_response.status_code == 201, first_run_response.text
+    first_run_payload = first_run_response.json()
+    first_child_id = uuid.UUID(first_run_payload["output"]["subagent_session_id"])
+    first_project_run_id = uuid.UUID(first_run_payload["id"])
+    first_child_session = await env.db.get(ChatSession, first_child_id)
+    assert first_child_session is not None
+    owner_user = await env.db.get(User, env.owner_id)
+    assert owner_user is not None
+    assert await project_session_access_mode(env.db, owner_user, first_child_session) == "edit"
+    live_handler = WebSocketChatHandler.__new__(WebSocketChatHandler)
+    live_handler.project_session_access = "edit"
+    live_handler.conv_id = str(first_child_id)
+    live_handler.user_id = env.owner_id
+    live_handler.read_only = False
+    assert await live_handler._project_session_still_writable() is True
+
+    removed = await env.client.post(
+        f"/api/projects/{project_id}/members/{worker['id']}/remove",
+        json={"reason": "staffing change"},
+    )
+    assert removed.status_code == 200, removed.text
+    removed_payload = removed.json()
+    assert removed_payload["id"] == worker["id"]
+    assert removed_payload["is_enabled"] is False
+    assert removed_payload["config_snapshot"]["membership"]["state"] == "departed"
+
+    env.db.expire_all()
+    first_child = await env.db.get(SubagentRun, first_child_id)
+    first_project_run = await env.db.get(ProjectRun, first_project_run_id)
+    first_child_session = await env.db.get(ChatSession, first_child_id)
+    assert first_child is not None and first_child.status == "cancelled"
+    assert first_project_run is not None and first_project_run.status == "cancelled"
+    assert first_child_session is not None
+    assert first_child_session.im_config["membership_revoked"] is True
+    owner_user = await env.db.get(User, env.owner_id)
+    assert owner_user is not None
+    assert await project_session_access_mode(env.db, owner_user, first_child_session) == "read"
+    assert await live_handler._project_session_still_writable() is False
+    with pytest.raises(ValueError, match="active runtime member|permanently read-only"):
+        await load_project_runtime_scope(
+            env.db,
+            session_id=first_child_id,
+            agent_id=env.worker_id,
+            execution_user_id=env.owner_id,
+        )
+
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    mention = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "@Worker continue", "mentions": [str(env.worker_id)]},
+    )
+    assert mention.status_code == 422
+    assigned_run = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={"agent_id": str(env.worker_id), "trigger_type": "manual", "input": {"objective": "Blocked"}},
+    )
+    assert assigned_run.status_code == 422
+    a2a = await env.client.post(
+        f"/api/projects/{project_id}/a2a",
+        json={
+            "from_agent_id": str(env.leader_id),
+            "to_agent_id": str(env.worker_id),
+            "message": "Blocked",
+            "mode": "notify",
+        },
+    )
+    assert a2a.status_code == 422
+
+    duplicate = await env.client.post(
+        f"/api/projects/{project_id}/members",
+        json={"agent_id": str(env.worker_id)},
+    )
+    assert duplicate.status_code == 409
+    assert "restore" in duplicate.json()["detail"].lower()
+
+    restored = await env.client.post(
+        f"/api/projects/{project_id}/members/{worker['id']}/restore",
+        json={"reason": "return to project"},
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["id"] == worker["id"]
+    assert restored.json()["is_enabled"] is True
+    assert restored.json()["config_snapshot"]["membership"]["generation"] == 2
+
+    env.db.expire_all()
+    first_child_session = await env.db.get(ChatSession, first_child_id)
+    assert first_child_session is not None
+    owner_user = await env.db.get(User, env.owner_id)
+    assert owner_user is not None
+    assert await project_session_access_mode(env.db, owner_user, first_child_session) == "read"
+    assert await live_handler._project_session_still_writable() is False
+
+    second_run_response = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={"agent_id": str(env.worker_id), "trigger_type": "manual", "input": {"objective": "Fresh"}},
+    )
+    assert second_run_response.status_code == 201, second_run_response.text
+    second_child_id = uuid.UUID(second_run_response.json()["output"]["subagent_session_id"])
+    assert second_child_id != first_child_id
+    second_child_session = await env.db.get(ChatSession, second_child_id)
+    assert second_child_session is not None
+    assert second_child_session.im_config["project_membership_generation"] == 2
+    owner_user = await env.db.get(User, env.owner_id)
+    assert owner_user is not None
+    assert await project_session_access_mode(env.db, owner_user, second_child_session) == "edit"
+
+    events = (
+        await env.db.execute(
+            select(ProjectEvent).where(ProjectEvent.project_id == project_id)
+        )
+    ).scalars().all()
+    lifecycle_events = [row for row in events if row.event_type in {"member.departed", "member.restored"}]
+    assert [row.event_type for row in lifecycle_events] == ["member.departed", "member.restored"]
+    assert lifecycle_events[0].event_metadata["snapshot_retained"] is True
+    assert lifecycle_events[1].event_metadata["old_sessions_remain_read_only"] is True
+
+
+async def test_project_editor_can_remove_and_restore_participant_but_viewer_cannot(
+    project_api: ProjectApiEnv,
+):
+    from app.models.chat_session import ChatSession
+    from app.services.project_service import project_session_access_mode
+
+    env = project_api
+    project = await _create_project(env, name="Editor membership controls")
+    project_id = project["id"]
+    stored_project = await env.db.get(Project, uuid.UUID(project_id))
+    assert stored_project is not None
+    stored_project.status = "running"
+    await env.db.commit()
+    members = (await env.client.get(f"/api/projects/{project_id}/members")).json()
+    reviewer = next(row for row in members if row["agent_id"] == str(env.reviewer_id))
+    reviewer_run = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={"agent_id": str(env.reviewer_id), "trigger_type": "manual", "input": {"objective": "Review"}},
+    )
+    assert reviewer_run.status_code == 201, reviewer_run.text
+    reviewer_child_id = uuid.UUID(reviewer_run.json()["output"]["subagent_session_id"])
+    reviewer_session = await env.db.get(ChatSession, reviewer_child_id)
+    assert reviewer_session is not None
+
+    grant = await env.client.post(
+        f"/api/projects/{project_id}/access-grants",
+        json={"user_id": str(env.viewer_id), "role": "view"},
+    )
+    assert grant.status_code == 201, grant.text
+    viewer_user = await env.db.get(User, env.viewer_id)
+    assert viewer_user is not None
+    assert await project_session_access_mode(env.db, viewer_user, reviewer_session) == "read"
+    env.authenticate_as(env.viewer_id)
+    forbidden = await env.client.post(
+        f"/api/projects/{project_id}/members/{reviewer['id']}/remove",
+        json={"reason": "viewer cannot"},
+    )
+    assert forbidden.status_code == 404
+
+    env.authenticate_as(env.owner_id)
+    grant_id = grant.json()["id"]
+    grant_row = await env.db.get(ProjectAccessGrant, uuid.UUID(grant_id))
+    assert grant_row is not None
+    grant_row.role = "edit"
+    await env.db.commit()
+    viewer_user = await env.db.get(User, env.viewer_id)
+    reviewer_session = await env.db.get(ChatSession, reviewer_child_id)
+    assert viewer_user is not None and reviewer_session is not None
+    assert await project_session_access_mode(env.db, viewer_user, reviewer_session) == "edit"
+    env.authenticate_as(env.viewer_id)
+    removed = await env.client.post(
+        f"/api/projects/{project_id}/members/{reviewer['id']}/remove",
+        json={"reason": "editor staffing"},
+    )
+    assert removed.status_code == 200, removed.text
+    viewer_user = await env.db.get(User, env.viewer_id)
+    reviewer_session = await env.db.get(ChatSession, reviewer_child_id)
+    assert viewer_user is not None and reviewer_session is not None
+    assert await project_session_access_mode(env.db, viewer_user, reviewer_session) == "read"
+    restored = await env.client.post(
+        f"/api/projects/{project_id}/members/{reviewer['id']}/restore",
+        json={"reason": "editor restore"},
+    )
+    assert restored.status_code == 200, restored.text
+    viewer_user = await env.db.get(User, env.viewer_id)
+    reviewer_session = await env.db.get(ChatSession, reviewer_child_id)
+    assert viewer_user is not None and reviewer_session is not None
+    assert await project_session_access_mode(env.db, viewer_user, reviewer_session) == "read"
+
+
+async def test_manual_run_requires_kickoff_and_dispatches_default_leader(project_api: ProjectApiEnv):
+    from app.models.chat_session import ChatSession
+    from app.models.project import Project, ProjectRun
+    from app.models.subagent_run import SubagentRun
+
+    env = project_api
+    project = await _create_project(env, name="Manual execution contract")
+    project_id = uuid.UUID(project["id"])
+
+    before_kickoff = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={"trigger_type": "manual", "input": {"objective": "Continue delivery"}},
+    )
+    assert before_kickoff.status_code == 409
+
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None
+    stored_project.status = "running"
+    await env.db.commit()
+
+    response = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={"trigger_type": "manual", "input": {"objective": "Continue delivery"}},
+    )
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert payload["agent_id"] == str(env.leader_id)
+    assert payload["status"] in {"queued", "running"}
+    assert payload["input"]["dispatch"]["task"] == "Continue delivery"
+    assert payload["output"]["subagent_session_id"]
+
+    run = await env.db.get(ProjectRun, uuid.UUID(payload["id"]))
+    child = await env.db.get(SubagentRun, uuid.UUID(payload["output"]["subagent_session_id"]))
+    assert child is not None
+    child_session = await env.db.get(ChatSession, child.id)
+    assert child_session is not None
+    assert child_session.agent_id == env.leader_id
+    assert run is not None and run.output["subagent_run_id"] == str(child.id)
+    assert child.project_id == project_id
+
+
+async def test_project_run_reconcile_persists_finished_terminal_state(project_api: ProjectApiEnv):
+    from app.models.project import ProjectRun
+
+    env = project_api
+    project = await _create_project(env, name="Repair stale run")
+    run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=uuid.UUID(project["id"]),
+        initiated_by_user_id=env.owner_id,
+        status="running",
+        trigger_type="manual",
+        finished_at=datetime.now(UTC),
+        output={"result": "Already finished"},
+    )
+    env.db.add(run)
+    await env.db.commit()
+
+    response = await env.client.get(f"/api/projects/{project['id']}/runs")
+    assert response.status_code == 200, response.text
+    repaired_payload = next(item for item in response.json() if item["id"] == str(run.id))
+    assert repaired_payload["status"] == "succeeded"
+
+    # Verify the GET-owned reconciliation committed, rather than merely
+    # changing the request session identity map.
+    async with env.session_factory() as independent_db:
+        persisted = await independent_db.get(ProjectRun, run.id)
+        assert persisted is not None and persisted.status == "succeeded"
+
+
+async def test_dispatch_does_not_regress_child_completed_project_run(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.models.project import Project, ProjectMemberSnapshot, ProjectRun
+    from app.services import subagent_runtime
+
+    env = project_api
+    project = await _create_project(env, name="Fast child completion")
+    project_id = uuid.UUID(project["id"])
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None
+    stored_project.status = "running"
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    leader_member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project_id,
+                ProjectMemberSnapshot.agent_id == env.leader_id,
+            )
+        )
+    ).scalar_one()
+    anchor = ChatMessage(
+        id=uuid.uuid4(),
+        agent_id=uuid.UUID(group["access_agent_id"]),
+        user_id=env.owner_id,
+        sender_user_id=env.owner_id,
+        role="user",
+        content="Complete immediately",
+        conversation_id=group["id"],
+        message_meta={"kind": "project_run_request", "mentions": [str(env.leader_id)]},
+    )
+    run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.leader_id,
+        initiated_by_user_id=env.owner_id,
+        status="queued",
+        trigger_type="manual",
+        input={
+            "dispatch": {
+                "group_session_id": group["id"],
+                "project_member_id": str(leader_member.id),
+                "turn_anchor_id": str(anchor.id),
+                "task": "Complete immediately",
+            }
+        },
+    )
+    env.db.add_all([anchor, run])
+    await env.db.commit()
+    project_run_id = run.id
+    child_id = uuid.uuid4()
+
+    async def complete_before_dispatch_commit(**_kwargs):
+        async with env.session_factory() as race_db:
+            raced = await race_db.get(ProjectRun, project_run_id)
+            assert raced is not None
+            raced.status = "succeeded"
+            raced.finished_at = datetime.now(UTC)
+            raced.output = {"result": "Fast result"}
+            await race_db.commit()
+        return SimpleNamespace(id=child_id, status="completed"), True
+
+    monkeypatch.setattr(subagent_runtime, "create_subagent", complete_before_dispatch_commit)
+    result = await subagent_runtime.dispatch_project_run(project_run_id)
+    assert result["status"] == "succeeded"
+    env.db.expire_all()
+    persisted = await env.db.get(ProjectRun, project_run_id)
+    assert persisted is not None and persisted.status == "succeeded"
+    assert persisted.finished_at is not None
+    assert persisted.output["result"] == "Fast result"
+    assert persisted.output["subagent_session_id"] == str(child_id)
 
 
 async def test_project_a2a_delivery_returns_scoped_session_identifiers(
@@ -955,6 +1328,80 @@ async def test_kickoff_requires_leader_discussion_then_freezes_and_starts(projec
         json={"confirmation": "Do not start twice"},
     )
     assert repeated.status_code == 409
+
+
+async def test_kickoff_accepts_human_leader_discussion_from_project_group(
+    project_api: ProjectApiEnv,
+):
+    from app.models.project import ProjectRun
+
+    env = project_api
+    project = await _create_project(env, name="Group planning source")
+    group = (await env.client.get(f"/api/projects/{project['id']}/group-session")).json()
+    env.db.add_all(
+        [
+            ChatMessage(
+                agent_id=uuid.UUID(group["access_agent_id"]),
+                user_id=env.owner_id,
+                sender_user_id=env.owner_id,
+                role="user",
+                content="Keep the plan small and make every result traceable.",
+                conversation_id=group["id"],
+                message_meta={"kind": "project_group_message", "visible_to_group": True},
+            ),
+            ChatMessage(
+                agent_id=uuid.UUID(group["access_agent_id"]),
+                sender_agent_id=env.leader_id,
+                role="assistant",
+                content="I will deliver in two milestones with Git evidence.",
+                conversation_id=group["id"],
+                message_meta={"kind": "project_subagent_reply", "visible_to_group": True},
+            ),
+            # Participant replies remain in the group audit log but are not
+            # part of the Human/Leader agreement frozen at kickoff.
+            ChatMessage(
+                agent_id=uuid.UUID(group["access_agent_id"]),
+                sender_agent_id=env.worker_id,
+                role="assistant",
+                content="Worker side note",
+                conversation_id=group["id"],
+                message_meta={"kind": "project_subagent_reply", "visible_to_group": True},
+            ),
+        ]
+    )
+    await env.db.commit()
+
+    confirmed = await env.client.post(
+        f"/api/projects/{project['id']}/kickoff/confirm",
+        json={"confirmation": "方案确认，开始执行。"},
+    )
+    assert confirmed.status_code == 202, confirmed.text
+    payload = confirmed.json()
+    assert payload["status"] == "running"
+    assert payload["discussion_source"] == "project_group"
+    assert payload["discussion_session_id"] == group["id"]
+
+    run = await env.db.get(ProjectRun, uuid.UUID(payload["run_id"]))
+    assert run is not None
+    assert run.input["conversation_snapshot"]["source"] == "project_group"
+    assert run.input["conversation_snapshot"]["session_id"] == group["id"]
+    assert run.input["conversation_snapshot"]["message_count"] == 2
+
+    transcript = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project_repo_path(env.tenant_id, uuid.UUID(project["id"]))),
+            "show",
+            f"{payload['transcript_commit']}:docs/kickoff-transcript.md",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "Keep the plan small" in transcript
+    assert "I will deliver in two milestones" in transcript
+    assert "Worker side note" not in transcript
 
 
 async def test_kickoff_outbox_recovers_initializing_project(
@@ -1598,6 +2045,112 @@ async def test_file_commits_restore_branch_and_milestone_preserve_history(projec
     ).scalars().all()
     assert len(db_events) == len(events)
     assert any(event.event_metadata.get("commit") == restore_commit for event in db_events)
+
+
+async def test_project_head_file_preview_media_range_and_acl(project_api: ProjectApiEnv):
+    env = project_api
+    project = await _create_project(env, name="HEAD file previews")
+    project_id = project["id"]
+    repo = project_repo_path(env.tenant_id, uuid.UUID(project_id))
+    (repo / "assets").mkdir()
+    binary = b"\x00\x01\x02\x03\x04\x05\xff\x10"
+    (repo / "assets" / "sample.mp4").write_bytes(binary)
+    (repo / "large.txt").write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "--", "assets/sample.mp4", "large.txt"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "Add preview fixtures"],
+        check=True,
+        capture_output=True,
+    )
+
+    env.authenticate_as(env.viewer_id)
+    hidden = await env.client.get(
+        f"/api/projects/{project_id}/files/content",
+        params={"path": "assets/sample.mp4"},
+    )
+    assert hidden.status_code == 404
+
+    env.authenticate_as(env.owner_id)
+    for unsafe_path in ("../README.md", ".git/config", "nested/.GIT/config", "assets//sample.mp4"):
+        rejected = await env.client.get(
+            f"/api/projects/{project_id}/files/content",
+            params={"path": unsafe_path},
+        )
+        assert rejected.status_code == 422, rejected.text
+
+    listing = (await env.client.get(f"/api/projects/{project_id}/files")).json()
+    media_item = next(item for item in listing if item["path"] == "assets/sample.mp4")
+    assert media_item["kind"] == "video"
+    assert media_item["mime_type"] == "video/mp4"
+    assert media_item["preview"] == ""
+    assert media_item["is_editable"] is False
+    large_item = next(item for item in listing if item["path"] == "large.txt")
+    assert large_item["kind"] == "text"
+    assert large_item["is_editable"] is False
+
+    media = await env.client.get(
+        f"/api/projects/{project_id}/files/content",
+        params={"path": "assets/sample.mp4"},
+    )
+    assert media.status_code == 200, media.text
+    media_payload = media.json()
+    assert media_payload["content"] is None
+    assert media_payload["raw_url"].startswith(f"/api/projects/{project_id}/files/raw?")
+
+    partial = await env.client.get(media_payload["raw_url"], headers={"Range": "bytes=2-5"})
+    assert partial.status_code == 206, partial.text
+    assert partial.content == binary[2:6]
+    assert partial.headers["content-type"] == "video/mp4"
+    assert partial.headers["content-range"] == f"bytes 2-5/{len(binary)}"
+    assert partial.headers["accept-ranges"] == "bytes"
+    assert partial.headers["content-disposition"].startswith("inline;")
+
+    downloaded = await env.client.get(media_payload["download_url"])
+    assert downloaded.status_code == 200
+    assert downloaded.content == binary
+    assert downloaded.headers["content-disposition"].startswith("attachment;")
+    raw_head = await env.client.head(media_payload["raw_url"])
+    assert raw_head.status_code == 200
+    assert raw_head.content == b""
+    assert raw_head.headers["content-length"] == str(len(binary))
+    invalid_range = await env.client.get(media_payload["raw_url"], headers={"Range": "bytes=99-100"})
+    assert invalid_range.status_code == 416
+    assert invalid_range.headers["content-range"] == f"bytes */{len(binary)}"
+
+    large = await env.client.get(
+        f"/api/projects/{project_id}/files/content",
+        params={"path": "large.txt", "max_chars": 64},
+    )
+    assert large.status_code == 200
+    assert large.json()["content"] == "x" * 64
+    assert large.json()["truncated"] is True
+    assert large.json()["is_editable"] is False
+
+    shared = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={"visibility": "shared", "shared_with_user_ids": [str(env.viewer_id)]},
+    )
+    assert shared.status_code == 200
+    env.authenticate_as(env.viewer_id)
+    viewer_content = await env.client.get(
+        f"/api/projects/{project_id}/files/content",
+        params={"path": "assets/sample.mp4"},
+    )
+    assert viewer_content.status_code == 200
+
+    env.authenticate_as(env.owner_id)
+    revoked = await env.client.patch(
+        f"/api/projects/{project_id}",
+        json={"visibility": "private", "shared_with_user_ids": []},
+    )
+    assert revoked.status_code == 200
+    # Raw tickets are re-authorized on every request, not bearer URLs that
+    # outlive revoked project access.
+    old_viewer_raw = await env.client.get(viewer_content.json()["raw_url"])
+    assert old_viewer_raw.status_code == 404
 
 
 async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(

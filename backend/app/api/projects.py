@@ -3,13 +3,17 @@
 import hashlib
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi.responses import Response, StreamingResponse
+from jose import JWTError, jwt
 from loguru import logger
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
@@ -52,6 +56,7 @@ from app.schemas.project import (
     ProjectGroupMessageCreate,
     ProjectKickoffConfirm,
     ProjectMemberCreate,
+    ProjectMemberLifecycleRequest,
     ProjectMemberOut,
     ProjectMemberUpdate,
     ProjectRunCreate,
@@ -72,9 +77,12 @@ from app.services.project_git_service import (
     create_branch,
     delete_git_remote,
     finalize_project_repository_clone,
+    inspect_project_file,
+    iter_project_file_blob,
     list_git_remotes,
     list_project_files,
     put_git_remote,
+    read_project_file_content,
     reconcile_project_repository_operations,
     release_project_repository_clone_lock,
     repository_state,
@@ -89,17 +97,94 @@ from app.services.project_service import (
     add_member,
     apply_run_status,
     create_project,
+    deactivate_project_member,
     deliver_project_a2a,
     ensure_project_group_session,
     ensure_project_leader_session,
     freeze_run_members,
     project_summary,
+    reconcile_project_runs,
     replace_access_grants,
     require_owner,
     require_project,
+    restore_project_member,
 )
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+_PROJECT_FILE_TICKET_TTL_SECONDS = 15 * 60
+
+
+def _create_project_file_ticket(user: User, project: Project, metadata: dict) -> str:
+    settings = get_settings()
+    expires_at = int(datetime.now(timezone.utc).timestamp()) + _PROJECT_FILE_TICKET_TTL_SECONDS
+    return jwt.encode(
+        {
+            "sub": str(user.id),
+            "tenant_id": str(project.tenant_id),
+            "project_id": str(project.id),
+            "path": metadata["path"],
+            "object_id": metadata["object_id"],
+            "purpose": "project_file",
+            "exp": expires_at,
+        },
+        settings.JWT_SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+async def _authorize_project_file_ticket(
+    db: AsyncSession,
+    project_id: uuid.UUID,
+    path: str,
+    ticket: str,
+) -> tuple[User, Project, dict]:
+    settings = get_settings()
+    try:
+        payload = jwt.decode(ticket, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        user_id = uuid.UUID(str(payload.get("sub")))
+    except (JWTError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired project file ticket") from exc
+    if (
+        payload.get("purpose") != "project_file"
+        or payload.get("project_id") != str(project_id)
+        or payload.get("path") != path
+    ):
+        raise HTTPException(status_code=401, detail="Project file ticket does not match this resource")
+    user = (await db.execute(select(User).where(User.id == user_id, User.is_active.is_(True)))).scalar_one_or_none()
+    if user is None or payload.get("tenant_id") != str(user.tenant_id):
+        raise HTTPException(status_code=401, detail="Project file ticket user is unavailable")
+    project = await require_project(db, user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    metadata = await inspect_project_file(project, path)
+    if payload.get("object_id") != metadata["object_id"]:
+        raise HTTPException(status_code=409, detail="Project file changed; refresh its preview URL")
+    return user, project, metadata
+
+
+def _parse_project_file_range(value: str | None, size: int) -> tuple[int, int, bool]:
+    if size <= 0:
+        if value:
+            raise ValueError("range outside empty object")
+        return 0, -1, False
+    if not value:
+        return 0, size - 1, False
+    if not value.startswith("bytes=") or "," in value:
+        raise ValueError("invalid range")
+    start_raw, separator, end_raw = value[6:].strip().partition("-")
+    if not separator:
+        raise ValueError("invalid range")
+    if not start_raw:
+        suffix = int(end_raw)
+        if suffix <= 0:
+            raise ValueError("invalid suffix")
+        return max(0, size - suffix), size - 1, True
+    start = int(start_raw)
+    if start < 0 or start >= size:
+        raise ValueError("range start outside object")
+    end = int(end_raw) if end_raw else size - 1
+    if end < start:
+        raise ValueError("range end before start")
+    return start, min(end, size - 1), True
 
 
 def _tenant_id(user: User) -> uuid.UUID:
@@ -559,6 +644,10 @@ async def get_project_dashboard(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id)
+    # Repair ProjectRuns written by older dispatchers before exposing the
+    # dashboard. This is an idempotent data invariant, not presentation logic.
+    if await reconcile_project_runs(db, project.id, tenant_id=project.tenant_id):
+        await db.commit()
     summary = await project_summary(db, project)
     work_items = (
         (
@@ -857,15 +946,11 @@ async def create_project_member(
     return await add_member(db, project, data, actor_user_id=current_user.id)
 
 
-@router.patch("/{project_id}/members/{member_id}", response_model=ProjectMemberOut)
-async def patch_project_member(
-    project_id: uuid.UUID,
+async def _load_project_member(
+    db: AsyncSession,
+    project: Project,
     member_id: uuid.UUID,
-    data: ProjectMemberUpdate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    project = await require_project(db, current_user, project_id, edit=True)
+) -> ProjectMemberSnapshot:
     member = (
         await db.execute(
             select(ProjectMemberSnapshot).where(
@@ -877,17 +962,108 @@ async def patch_project_member(
     ).scalar_one_or_none()
     if member is None:
         raise HTTPException(status_code=404, detail="Project member not found")
+    return member
+
+
+@router.post("/{project_id}/members/{member_id}/remove", response_model=ProjectMemberOut)
+async def remove_project_member(
+    project_id: uuid.UUID,
+    member_id: uuid.UUID,
+    data: ProjectMemberLifecycleRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-remove a member while retaining every historical project record."""
+
+    from app.services.subagent_runtime import cancel_local_subagent_tasks
+
+    project = await require_project(db, current_user, project_id, edit=True)
+    member = await _load_project_member(db, project, member_id)
+    child_ids = await deactivate_project_member(
+        db,
+        project,
+        member,
+        actor_user_id=current_user.id,
+        reason=data.reason if data else None,
+    )
+    await db.commit()
+    await cancel_local_subagent_tasks(child_ids)
+    await db.refresh(member)
+    return member
+
+
+@router.post("/{project_id}/members/{member_id}/restore", response_model=ProjectMemberOut)
+async def restore_removed_project_member(
+    project_id: uuid.UUID,
+    member_id: uuid.UUID,
+    data: ProjectMemberLifecycleRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Explicitly restore the same project-local member snapshot."""
+
+    project = await require_project(db, current_user, project_id, edit=True)
+    member = await _load_project_member(db, project, member_id)
+    await restore_project_member(
+        db,
+        project,
+        member,
+        actor_user_id=current_user.id,
+        reason=data.reason if data else None,
+    )
+    await db.commit()
+    await db.refresh(member)
+    return member
+
+
+@router.patch("/{project_id}/members/{member_id}", response_model=ProjectMemberOut)
+async def patch_project_member(
+    project_id: uuid.UUID,
+    member_id: uuid.UUID,
+    data: ProjectMemberUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_project(db, current_user, project_id, edit=True)
+    member = await _load_project_member(db, project, member_id)
     updates = data.model_dump(exclude_unset=True)
-    if updates.get("is_leader"):
+    requested_enabled = updates.pop("is_enabled", None)
+    requested_leader = updates.pop("is_leader", None)
+    if requested_enabled is False and requested_leader is True:
+        raise HTTPException(status_code=422, detail="A departed member cannot become project Leader")
+    if "config_snapshot" in updates:
+        member.config_snapshot = updates.pop("config_snapshot")
+    if requested_enabled is False:
+        from app.services.subagent_runtime import cancel_local_subagent_tasks
+
+        child_ids = await deactivate_project_member(
+            db,
+            project,
+            member,
+            actor_user_id=current_user.id,
+            reason="member_patch_disable",
+        )
+        await db.commit()
+        await cancel_local_subagent_tasks(child_ids)
+    elif requested_enabled is True:
+        await restore_project_member(
+            db,
+            project,
+            member,
+            actor_user_id=current_user.id,
+            reason="member_patch_restore",
+        )
+    if requested_leader is False and member.is_leader:
+        raise HTTPException(status_code=422, detail="Assign another enabled Leader instead of clearing leadership")
+    if requested_leader is True:
+        if not member.is_enabled:
+            raise HTTPException(status_code=422, detail="Leader must be an active project member")
         await db.execute(
             ProjectMemberSnapshot.__table__.update()
             .where(ProjectMemberSnapshot.project_id == project.id)
             .values(is_leader=False)
         )
-    for key, value in updates.items():
-        setattr(member, key, value)
-    if member.is_leader and member.is_enabled is False:
-        raise HTTPException(status_code=422, detail="Disable leadership or assign another leader first")
+        member.is_leader = True
     add_event(
         db,
         project,
@@ -1172,6 +1348,8 @@ async def list_project_runs(
     project_id: uuid.UUID, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
 ):
     project = await require_project(db, current_user, project_id)
+    if await reconcile_project_runs(db, project.id, tenant_id=project.tenant_id):
+        await db.commit()
     return (
         (
             await db.execute(
@@ -1192,24 +1370,120 @@ async def create_project_run(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Create one durable, single-Agent execution and dispatch it immediately.
+
+    ``POST /runs`` is an execution command, not a passive history insert. The
+    durable ProjectRun + group anchor are committed as one outbox transaction;
+    the daemon can retry dispatch after a process exit.
+    """
+    from app.services.subagent_runtime import dispatch_project_run
+
     project = await require_project(db, current_user, project_id, edit=True)
-    await _require_member_agent(db, project, data.agent_id)
+    if project.status != "running":
+        raise HTTPException(
+            status_code=409,
+            detail="Confirm project kickoff before creating execution runs",
+        )
+    if data.trigger_type == "a2a":
+        raise HTTPException(status_code=422, detail="Use the project A2A endpoint for Agent-to-Agent delivery")
+    work_item = None
     if data.work_item_id:
-        exists_item = (
+        work_item = (
             await db.execute(
-                select(ProjectWorkItem.id).where(
+                select(ProjectWorkItem).where(
                     ProjectWorkItem.id == data.work_item_id,
                     ProjectWorkItem.project_id == project.id,
                     ProjectWorkItem.tenant_id == project.tenant_id,
                 )
             )
         ).scalar_one_or_none()
-        if exists_item is None:
+        if work_item is None:
             raise HTTPException(status_code=422, detail="Work item is not in this project")
-    run = ProjectRun(
-        tenant_id=project.tenant_id, project_id=project.id, initiated_by_user_id=current_user.id, **data.model_dump()
+
+    requested_agent_id = data.agent_id or (work_item.assignee_agent_id if work_item else None)
+    member_conditions = [
+        ProjectMemberSnapshot.project_id == project.id,
+        ProjectMemberSnapshot.tenant_id == project.tenant_id,
+        ProjectMemberSnapshot.is_enabled.is_(True),
+    ]
+    if requested_agent_id is not None:
+        member_conditions.append(ProjectMemberSnapshot.agent_id == requested_agent_id)
+    else:
+        member_conditions.append(ProjectMemberSnapshot.is_leader.is_(True))
+    member = (
+        await db.execute(
+            select(ProjectMemberSnapshot)
+            .where(*member_conditions)
+            .order_by(ProjectMemberSnapshot.is_leader.desc(), ProjectMemberSnapshot.created_at)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if member is None:
+        if requested_agent_id is not None:
+            raise HTTPException(status_code=422, detail="Agent must be an enabled project member")
+        raise HTTPException(status_code=422, detail="Project needs an enabled Leader for a default run")
+
+    supplied_input = dict(data.input or {})
+    task = str(
+        supplied_input.get("task")
+        or supplied_input.get("objective")
+        or supplied_input.get("message")
+        or ""
+    ).strip()
+    if work_item is not None:
+        criteria = "\n".join(f"- {item}" for item in (work_item.acceptance_criteria or [])) or "- None recorded"
+        work_context = (
+            f"Execute project work item {work_item.id}: {work_item.title}\n\n"
+            f"Description:\n{work_item.description or '(none)'}\n\n"
+            f"Acceptance criteria:\n{criteria}"
+        )
+        task = f"{work_context}\n\nAdditional instruction:\n{task}" if task else work_context
+    if not task:
+        task = "Review the current project state, execute the next safe action, and report traceable progress."
+
+    group_session = await ensure_project_group_session(db, project)
+    anchor = ChatMessage(
+        id=uuid.uuid4(),
+        agent_id=group_session.agent_id,
+        user_id=current_user.id,
+        sender_user_id=current_user.id,
+        role="user",
+        content=task,
+        conversation_id=str(group_session.id),
+        message_meta={
+            "kind": "project_run_request",
+            "project_id": str(project.id),
+            "visible_to_group": True,
+            "mentions": [str(member.agent_id)],
+            "awakened_agent_ids": [],
+            "wake_policy": "single_explicit_or_default_leader",
+            "initiator_user_id": str(current_user.id),
+            "target_agent_id": str(member.agent_id),
+            "attachments": [],
+        },
     )
-    db.add(run)
+    run = ProjectRun(
+        tenant_id=project.tenant_id,
+        project_id=project.id,
+        work_item_id=data.work_item_id,
+        agent_id=member.agent_id,
+        initiated_by_user_id=current_user.id,
+        status="queued",
+        trigger_type=data.trigger_type,
+        input={
+            **supplied_input,
+            "group_session_id": str(group_session.id),
+            "dispatch": {
+                "group_session_id": str(group_session.id),
+                "project_member_id": str(member.id),
+                "turn_anchor_id": str(anchor.id),
+                "task": task,
+            },
+        },
+        output={"group_session_id": str(group_session.id)},
+    )
+    db.add_all([anchor, run])
+    group_session.last_message_at = func.now()
     await db.flush()
     await freeze_run_members(db, project, run)
     add_event(
@@ -1221,8 +1495,19 @@ async def create_project_run(
         actor_agent_id=run.agent_id,
         work_item_id=run.work_item_id,
         run_id=run.id,
+        metadata={
+            "group_session_id": str(group_session.id),
+            "target_agent_id": str(member.agent_id),
+            "dispatch_policy": "single_agent",
+        },
     )
-    await db.flush()
+    # This explicit commit creates the durable outbox boundary before child
+    # creation. A daemon retry owns recovery if the process exits afterward.
+    await db.commit()
+    try:
+        await dispatch_project_run(run.id)
+    except Exception as exc:  # noqa: BLE001 - queued outbox remains retryable
+        logger.warning("Project run dispatch deferred run=%s error=%s", run.id, exc)
     await db.refresh(run)
     return run
 
@@ -1493,6 +1778,10 @@ async def confirm_project_kickoff(
                 "leader_session_id": payload.get("leader_session_id"),
                 "group_session_id": payload.get("group_session_id"),
                 "leader_agent_id": payload.get("leader_agent_id"),
+                "discussion_source": payload.get("discussion_source", "leader_session"),
+                "discussion_session_id": payload.get(
+                    "discussion_session_id", payload.get("leader_session_id")
+                ),
                 "awakened_agent_ids": [payload.get("leader_agent_id")] if dispatch_result.get("subagent_run_id") else [],
                 "subagent_run_id": dispatch_result.get("subagent_run_id"),
                 "subagent_session_id": dispatch_result.get("subagent_session_id"),
@@ -1526,9 +1815,39 @@ async def confirm_project_kickoff(
     ).scalars().all()
     roles = {message.role for message in discussion}
     if "user" not in roles or "assistant" not in roles:
+        # New projects discuss the plan in the canonical project group. Keep
+        # the older dedicated Leader planning session as a compatible source,
+        # then fall back to the auditable Human <-> current Leader subset of
+        # the group timeline. Other Agents' replies are deliberately excluded
+        # from the frozen agreement.
+        group_session = await ensure_project_group_session(db, project)
+        discussion = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id == str(group_session.id),
+                    or_(
+                        and_(ChatMessage.role == "user", ChatMessage.sender_user_id.is_not(None)),
+                        and_(
+                            ChatMessage.role == "assistant",
+                            ChatMessage.sender_agent_id == leader.agent_id,
+                        ),
+                    ),
+                )
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+            )
+        ).scalars().all()
+        roles = {message.role for message in discussion}
+        discussion_source = "project_group"
+        discussion_session_id = group_session.id
+    else:
+        group_session = await ensure_project_group_session(db, project)
+        discussion_source = "leader_session"
+        discussion_session_id = leader_session.id
+    if "user" not in roles or "assistant" not in roles:
         raise HTTPException(
             status_code=422,
-            detail="Kickoff requires at least one User message and one Leader response",
+            detail="Kickoff requires at least one Human message and one Leader response in planning or project chat",
         )
 
     confirmation = (data.confirmation or "I confirm this plan and authorize the Leader to begin execution.").strip()
@@ -1538,7 +1857,6 @@ async def confirm_project_kickoff(
     await reconcile_project_repository_operations(project.id, db=db)
     git_start = await repository_state(project, limit=1)
     transcript_commit = await write_project_file(project, "docs/kickoff-transcript.md", transcript)
-    group_session = await ensure_project_group_session(db, project)
     now = confirmed_at
     kickoff_message = ChatMessage(
         id=uuid.uuid4(),
@@ -1581,6 +1899,8 @@ async def confirm_project_kickoff(
         "transcript_path": "docs/kickoff-transcript.md",
         "transcript_commit": transcript_commit["commit"],
         "transcript_sha256": transcript_sha256,
+        "discussion_source": discussion_source,
+        "discussion_session_id": str(discussion_session_id),
     }
     run = ProjectRun(
         tenant_id=project.tenant_id,
@@ -1593,11 +1913,15 @@ async def confirm_project_kickoff(
             "leader_session_id": str(leader_session.id),
             "group_session_id": str(group_session.id),
             "leader_agent_id": str(leader.agent_id),
+            "discussion_source": discussion_source,
+            "discussion_session_id": str(discussion_session_id),
             "confirmation": confirmation,
             "conversation_snapshot": {
                 "message_count": len(discussion),
                 "message_ids": [str(message.id) for message in discussion],
                 "last_message_at": discussion[-1].created_at.isoformat() if discussion[-1].created_at else None,
+                "source": discussion_source,
+                "session_id": str(discussion_session_id),
                 "transcript_path": "docs/kickoff-transcript.md",
                 "transcript_sha256": transcript_sha256,
             },
@@ -1650,6 +1974,8 @@ async def confirm_project_kickoff(
         "leader_session_id": str(leader_session.id),
         "group_session_id": str(group_session.id),
         "leader_agent_id": str(leader.agent_id),
+        "discussion_source": discussion_source,
+        "discussion_session_id": str(discussion_session_id),
         "awakened_agent_ids": [str(leader.agent_id)] if child_id else [],
         "subagent_run_id": str(child_id) if child_id else None,
         "subagent_session_id": str(child_id) if child_id else None,
@@ -2234,6 +2560,91 @@ async def get_project_files(
     project = await require_project(db, current_user, project_id)
     await reconcile_project_repository_operations(project.id, db=db)
     return await list_project_files(project)
+
+
+@router.get("/{project_id}/files/content")
+async def get_project_file_content(
+    project_id: uuid.UUID,
+    path: str = Query(min_length=1, max_length=1024),
+    max_chars: int = Query(default=200_000, ge=1, le=1024 * 1024),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return HEAD metadata and a bounded text preview plus signed media URLs."""
+
+    project = await require_project(db, current_user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    result = await read_project_file_content(project, path, max_chars=max_chars)
+    ticket = _create_project_file_ticket(current_user, project, result)
+    encoded_path = quote(result["path"], safe="")
+    encoded_ticket = quote(ticket, safe="")
+    raw_url = f"/api/projects/{project.id}/files/raw?path={encoded_path}&ticket={encoded_ticket}"
+    return {
+        **result,
+        "raw_url": raw_url,
+        "download_url": f"{raw_url}&download=true",
+        "ticket_expires_in": _PROJECT_FILE_TICKET_TTL_SECONDS,
+    }
+
+
+@router.api_route("/{project_id}/files/raw", methods=["GET", "HEAD"])
+async def get_project_file_raw(
+    project_id: uuid.UUID,
+    request: Request,
+    path: str = Query(min_length=1, max_length=1024),
+    ticket: str = Query(min_length=1),
+    download: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """Stream one immutable HEAD blob, including RFC single-range requests."""
+
+    _user, project, metadata = await _authorize_project_file_ticket(db, project_id, path, ticket)
+    size = int(metadata["size"])
+    etag = f'"{metadata["object_id"]}"'
+    range_header = request.headers.get("range")
+    if_range = request.headers.get("if-range")
+    if range_header and if_range and if_range.strip() != etag:
+        range_header = None
+    try:
+        start, end, partial = _parse_project_file_range(range_header, size)
+    except (TypeError, ValueError):
+        return Response(
+            status_code=416,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "private, no-store",
+                "Content-Security-Policy": "sandbox; default-src 'none'",
+                "Content-Range": f"bytes */{size}",
+                "Cross-Origin-Resource-Policy": "same-origin",
+                "ETag": etag,
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    content_length = max(0, end - start + 1)
+    disposition = "attachment" if download else "inline"
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-store",
+        "Content-Security-Policy": "sandbox; default-src 'none'",
+        "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(metadata['name'], safe='')}",
+        "Content-Length": str(content_length),
+        "Cross-Origin-Resource-Policy": "same-origin",
+        "ETag": etag,
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    status_code = 206 if partial else 200
+    if request.method == "HEAD" or content_length == 0:
+        return Response(status_code=status_code, media_type=metadata["mime_type"], headers=headers)
+    return StreamingResponse(
+        iter_project_file_blob(project, metadata["object_id"], start=start, end=end),
+        status_code=status_code,
+        media_type=metadata["mime_type"],
+        headers=headers,
+    )
 
 
 @router.put("/{project_id}/files")

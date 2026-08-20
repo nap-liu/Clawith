@@ -95,7 +95,23 @@ async def _load_accessible_session(
     session_id: uuid.UUID,
 ) -> tuple[Agent, ChatSession, Literal["mine", "all"]]:
     """Resolve one session and the web picker scope that can display it."""
-    agent, agent_access = await check_agent_access(db, current_user, agent_id)
+    candidate = await db.get(ChatSession, session_id)
+    project_access: str | None = None
+    if candidate is not None and candidate.agent_id == agent_id:
+        from app.services.project_service import project_session_access_mode
+
+        project_access = await project_session_access_mode(db, current_user, candidate)
+    if project_access is not None:
+        agent = await db.get(Agent, agent_id)
+        if (
+            agent is None
+            or agent.is_deleted
+            or agent.tenant_id != current_user.tenant_id
+        ):
+            raise HTTPException(status_code=404, detail="Session not found")
+        agent_access = "manage" if project_access == "edit" else "read"
+    else:
+        agent, agent_access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
     parent_session = aliased(ChatSession)
     result = await db.execute(
@@ -160,12 +176,12 @@ async def _load_accessible_session(
         is_group_member = member_result.scalar_one_or_none() is not None
 
     is_trigger_manager = agent_access == "manage" and source_channel == "trigger"
-    if not (is_owner or is_privileged or is_group_member or is_trigger_manager):
+    if not (is_owner or is_privileged or is_group_member or is_trigger_manager or project_access is not None):
         raise HTTPException(status_code=403, detail="Not authorized to view this session")
 
     view_scope: Literal["mine", "all"] = (
         "mine"
-        if source_channel not in {"agent", "trigger"} and (is_owner or is_group_member)
+        if source_channel not in {"agent", "trigger"} and (is_owner or is_group_member or project_access is not None)
         else "all"
     )
     return agent, session, view_scope

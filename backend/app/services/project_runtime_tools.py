@@ -25,7 +25,11 @@ from app.services.project_git_service import (
     restore_as_new_commit,
     write_project_file,
 )
-from app.services.project_service import add_event
+from app.services.project_service import (
+    add_event,
+    deactivate_project_member,
+    restore_project_member,
+)
 
 PARTICIPANT_PROJECT_TOOLS = frozenset(
     {
@@ -182,6 +186,8 @@ PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
 
 def effective_project_tool_names(project: Project, member: ProjectMemberSnapshot) -> set[str]:
     """Intersect role baseline, project policy, and member-local projection."""
+    if not member.is_enabled:
+        return set()
     effective = set(PARTICIPANT_PROJECT_TOOLS)
     role = "leader" if member.is_leader else "participant"
     if member.is_leader:
@@ -236,7 +242,6 @@ async def load_project_runtime_scope(
         or run.project_id is None
         or run.project_id != child.project_id
         or run.project_member_id is None
-        or run.execution_user_id != execution_user_id
         or parent is None
         or parent.project_id != child.project_id
     ):
@@ -258,10 +263,22 @@ async def load_project_runtime_scope(
     # never an authority. If its scope anchors are present, they must agree with
     # the relational child/run/member chain before the snapshot can be consumed.
     runtime_config = dict(child.im_config or {})
+    if bool(runtime_config.get("membership_revoked")):
+        raise ValueError("This historical project session was revoked and is permanently read-only")
     config_project_id = _uuid(runtime_config.get("project_id"), "project_id", optional=True)
     config_member_id = _uuid(runtime_config.get("project_member_id"), "project_member_id", optional=True)
     if config_project_id != project.id or config_member_id != member.id:
         raise ValueError("Project Subagent runtime snapshot does not match its durable scope")
+    if run.execution_user_id != execution_user_id:
+        from app.models.user import User
+        from app.services.project_service import project_session_access_mode
+
+        execution_user = await db.get(User, execution_user_id)
+        if execution_user is None or await project_session_access_mode(db, execution_user, child) != "edit":
+            raise ValueError(
+                "Project tools are only available in an authorized project Subagent runtime "
+                "for the project owner or an editor"
+            )
     return project, member, child, run
 
 
@@ -556,20 +573,29 @@ async def execute_project_runtime_tool(
                 raise ValueError("member was not found in the current project")
             if target.is_leader:
                 raise ValueError("Leader enablement and transfer are Human-only operations")
-            target.is_enabled = bool(arguments.get("is_enabled"))
-            add_event(
-                db,
-                attached,
-                "member.enabled.updated",
-                f"{member.name_snapshot} changed {target.name_snapshot} enablement",
-                actor_agent_id=agent_id,
-                metadata={
-                    "target_agent_id": str(target.agent_id),
-                    "is_enabled": target.is_enabled,
-                    "session_id": session_id,
-                },
-            )
+            enabled = bool(arguments.get("is_enabled"))
+            cancelled_child_ids: list[uuid.UUID] = []
+            if enabled:
+                await restore_project_member(
+                    db,
+                    attached,
+                    target,
+                    actor_agent_id=agent_id,
+                    reason="project_leader_tool_restore",
+                )
+            else:
+                cancelled_child_ids = await deactivate_project_member(
+                    db,
+                    attached,
+                    target,
+                    actor_agent_id=agent_id,
+                    reason="project_leader_tool_remove",
+                )
             await db.commit()
+            if cancelled_child_ids:
+                from app.services.subagent_runtime import cancel_local_subagent_tasks
+
+                await cancel_local_subagent_tasks(cancelled_child_ids)
             return json.dumps({"agent_id": str(target.agent_id), "is_enabled": target.is_enabled})
 
         if tool_name == "project_set_capability_enabled":

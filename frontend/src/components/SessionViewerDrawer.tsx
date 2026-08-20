@@ -55,9 +55,99 @@ export type SessionViewerGroupConfig = {
     }) => Promise<{
         message?: Record<string, any>;
         awakened_agent_ids?: string[];
-        subagent_runs?: Array<{ run_id: string; session_id: string; agent_id: string; status: string }>;
+        subagent_runs?: Array<{ project_run_id?: string; run_id: string | null; session_id: string | null; agent_id: string; status: string; error?: string }>;
     }>;
 };
+
+type GroupPendingRun = {
+    projectRunId: string;
+    agentId: string;
+    status: string;
+    createdAt: number;
+    anchorMessageId: string;
+};
+
+type GroupTurnState = {
+    phase: 'active' | 'expired';
+    anchorMessageId: string;
+    agentIds: string[];
+    runCount: number;
+};
+
+const GROUP_RUN_ACTIVE_STATUSES = new Set(['queued', 'pending', 'waiting', 'running', 'processing']);
+const GROUP_PENDING_TIMEOUT_MS = 45 * 60 * 1000;
+
+function groupMessageMetadata(row: unknown): Record<string, any> {
+    if (!row || typeof row !== 'object') return {};
+    const record = row as Record<string, any>;
+    const metadata = record.metadata || record.message_meta;
+    return metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {};
+}
+
+/**
+ * Rebuild the pending group turn from the durable group timeline. ProjectRun
+ * ids are recorded on the Human anchor and echoed by the Agent reply, so this
+ * survives a reload without treating ordinary group messages as a broadcast.
+ */
+export function deriveGroupTurnState(
+    rows: unknown[],
+    now = Date.now(),
+    timeoutMs = GROUP_PENDING_TIMEOUT_MS,
+): GroupTurnState | null {
+    const completedProjectRunIds = new Set<string>();
+    for (const row of rows) {
+        const metadata = groupMessageMetadata(row);
+        const sourceIds = Array.isArray(metadata.source_project_run_ids)
+            ? metadata.source_project_run_ids
+            : Array.isArray(metadata.project_run_ids)
+                ? metadata.project_run_ids
+                : [];
+        sourceIds.forEach((id: unknown) => {
+            const value = String(id || '').trim();
+            if (value) completedProjectRunIds.add(value);
+        });
+    }
+
+    const pending: GroupPendingRun[] = [];
+    const expired: GroupPendingRun[] = [];
+    let latestRunAnchorAt = 0;
+    for (const row of rows) {
+        if (!row || typeof row !== 'object') continue;
+        const record = row as Record<string, any>;
+        const metadata = groupMessageMetadata(record);
+        const subagentRuns = Array.isArray(metadata.subagent_runs) ? metadata.subagent_runs : [];
+        if (!subagentRuns.length) continue;
+        const createdAt = Date.parse(String(record.created_at || '')) || now;
+        const anchorId = String(record.id || '');
+        latestRunAnchorAt = Math.max(latestRunAnchorAt, createdAt);
+        for (const rawRun of subagentRuns) {
+            if (!rawRun || typeof rawRun !== 'object') continue;
+            const run = rawRun as Record<string, any>;
+            const status = String(run.status || '').toLowerCase();
+            const projectRunId = String(run.project_run_id || '').trim();
+            const agentId = String(run.agent_id || '').trim();
+            if (!projectRunId || !agentId || !GROUP_RUN_ACTIVE_STATUSES.has(status) || completedProjectRunIds.has(projectRunId)) continue;
+            const candidate = { projectRunId, agentId, status, createdAt, anchorMessageId: anchorId };
+            if (now - createdAt > timeoutMs) expired.push(candidate);
+            else pending.push(candidate);
+        }
+    }
+
+    // An old timed-out anchor should not keep warning forever once a newer
+    // group turn has reached a reply. Active runs can span several anchors,
+    // but an expiry notice only belongs to the latest durable turn.
+    const source = pending.length
+        ? pending
+        : expired.filter((run) => run.createdAt === latestRunAnchorAt);
+    if (!source.length) return null;
+    const latestSource = source.reduce((latest, run) => run.createdAt >= latest.createdAt ? run : latest);
+    return {
+        phase: pending.length ? 'active' : 'expired',
+        anchorMessageId: latestSource.anchorMessageId,
+        agentIds: Array.from(new Set(source.map((run) => run.agentId))),
+        runCount: source.length,
+    };
+}
 
 type SessionViewerDrawerProps = {
     agentId: string;
@@ -103,6 +193,7 @@ export default function SessionViewerDrawer({
     const [uploads, setUploads] = useState<Array<{ id: string; name: string; percent: number }>>([]);
     const [connected, setConnected] = useState(false);
     const [sending, setSending] = useState(false);
+    const [groupTurn, setGroupTurn] = useState<GroupTurnState | null>(null);
     const [serverReadOnly, setServerReadOnly] = useState(false);
     const [mentions, setMentions] = useState<string[]>([]);
     const [internalUnavailableAttachments, setInternalUnavailableAttachments] = useState<Set<string>>(() => new Set());
@@ -116,6 +207,7 @@ export default function SessionViewerDrawer({
     const socketRef = useRef<WebSocket | null>(null);
     const uploadAbortRef = useRef(new Map<string, () => void>());
     const requestSequenceRef = useRef(0);
+    const groupSendInFlightRef = useRef(false);
     const sessionId = target?.sessionId;
     const accessAgentId = target?.agentId || agentId;
     const canCompose = interactive && !serverReadOnly;
@@ -158,12 +250,19 @@ export default function SessionViewerDrawer({
                     } : null;
                 })
                 .filter((message): message is ConversationMessage => Boolean(message));
+            const nextGroupTurn = groupConfig ? deriveGroupTurnState(Array.isArray(rows) ? rows : []) : null;
             setSession(detail);
             setMessages(normalized);
+            if (groupConfig) {
+                setGroupTurn(nextGroupTurn);
+                if (!groupSendInFlightRef.current) setSending(nextGroupTurn?.phase === 'active');
+            }
             setError('');
+            return nextGroupTurn;
         } catch (loadError: any) {
             if (sequence !== requestSequenceRef.current) return;
             setError(loadError?.message || t('agent.sessionViewer.loadError'));
+            return undefined;
         } finally {
             if (sequence === requestSequenceRef.current && !background) setLoading(false);
         }
@@ -180,6 +279,8 @@ export default function SessionViewerDrawer({
         setUploads([]);
         setConnected(false);
         setSending(false);
+        setGroupTurn(null);
+        groupSendInFlightRef.current = false;
         setServerReadOnly(false);
         setMentions([]);
         setInternalUnavailableAttachments(new Set());
@@ -477,6 +578,7 @@ export default function SessionViewerDrawer({
             created_at: new Date().toISOString(),
         }]);
         if (groupConfig) {
+            groupSendInFlightRef.current = true;
             setSending(true);
             try {
                 const result = await groupConfig.sendMessage(sessionId, {
@@ -489,17 +591,34 @@ export default function SessionViewerDrawer({
                 if (committed) {
                     setMessages((previous) => previous.map((message) => message.id === clientMessageId ? committed : message));
                 }
+                const responseRuns = Array.isArray(result.subagent_runs) ? result.subagent_runs : [];
+                const activeResponseRuns = responseRuns.filter((run) => GROUP_RUN_ACTIVE_STATUSES.has(String(run.status || '').toLowerCase()));
+                const responseTurn: GroupTurnState | null = activeResponseRuns.length ? {
+                    phase: 'active',
+                    anchorMessageId: String(result.message?.id || clientMessageId),
+                    agentIds: Array.from(new Set(activeResponseRuns.map((run) => String(run.agent_id || '')).filter(Boolean))),
+                    runCount: activeResponseRuns.length,
+                } : null;
+                setGroupTurn(responseTurn);
                 setDraft('');
                 setAttachedFiles([]);
                 setMentions([]);
                 setComposerError('');
                 if (textareaRef.current) textareaRef.current.style.height = 'auto';
-                await loadSession(true);
+                const durableTurn = await loadSession(true);
+                const effectiveTurn = durableTurn === undefined ? responseTurn : durableTurn;
+                setGroupTurn(effectiveTurn);
+                setSending(effectiveTurn?.phase === 'active');
+                if (!effectiveTurn && responseRuns.length && responseRuns.every((run) => !GROUP_RUN_ACTIVE_STATUSES.has(String(run.status || '').toLowerCase()))) {
+                    setComposerError(t('agent.sessionViewer.groupTurnNoActiveRun', '本轮没有可继续处理的 Agent 运行，请在运行控制中查看失败原因。'));
+                }
             } catch (sendError: any) {
                 setMessages((previous) => previous.filter((message) => message.id !== clientMessageId));
                 setComposerError(sendError?.message || t('agent.sessionViewer.sendError', '消息发送失败。'));
-            } finally {
                 setSending(false);
+                setGroupTurn(null);
+            } finally {
+                groupSendInFlightRef.current = false;
             }
             return;
         }
@@ -555,6 +674,28 @@ export default function SessionViewerDrawer({
 
     const executionAgentId = String(runtime?.execution_agent_id || session?.agent_id || target.agentId || agentId);
     const executionAgentName = String(runtime?.execution_agent_name || agentName || 'Agent');
+    const groupLeader = groupConfig?.members.find((member) => member.isLeader && member.isEnabled !== false);
+    const activeGroupAgentIds = groupTurn?.phase === 'active' ? groupTurn.agentIds : [];
+    const activeGroupAgents = activeGroupAgentIds
+        .map((pendingAgentId) => groupConfig?.members.find((member) => member.agentId === pendingAgentId))
+        .filter((member): member is NonNullable<typeof member> => Boolean(member));
+    const primaryGroupAgent = activeGroupAgents.find((member) => member.isLeader) || activeGroupAgents[0] || groupLeader;
+    const queuedAgentCount = activeGroupAgents.filter((member) => member.agentId !== primaryGroupAgent?.agentId).length;
+    const groupProcessingAgentName = primaryGroupAgent?.name || 'Leader';
+    const groupProcessingLabel = groupConfig && sending
+        ? activeGroupAgents.length > 1
+            ? t('agent.sessionViewer.groupProcessingQueued', { name: groupProcessingAgentName, count: queuedAgentCount })
+            : t('agent.sessionViewer.groupProcessing', { name: groupProcessingAgentName })
+        : '';
+    const timelineMessages = groupConfig && sending ? [...messages, {
+        id: `group-pending-${groupTurn?.anchorMessageId || 'sending'}`,
+        role: 'assistant' as const,
+        content: '',
+        created_at: null,
+        sender_agent_id: activeGroupAgents[0]?.agentId || groupLeader?.agentId,
+        sender_name: activeGroupAgents[0]?.name || groupLeader?.name || 'Leader',
+        _streaming: true,
+    }] : messages;
     const routePrefix = routeMode === 'h5' ? '/h5/agents' : '/agents';
     const fullSessionHref = `${routePrefix}/${executionAgentId}/chat?session_id=${encodeURIComponent(sessionId)}`;
     const isSubagent = runtime?.kind === 'subagent' || session?.source_channel === 'subagent';
@@ -616,15 +757,16 @@ export default function SessionViewerDrawer({
                             <span>{error}</span>
                             <button type="button" onClick={() => void loadSession(false)}>{t('agent.sessionViewer.retry')}</button>
                         </div>
-                    ) : messages.length === 0 ? (
+                    ) : timelineMessages.length === 0 ? (
                         <div className="session-viewer-drawer__state">{t('agent.sessionViewer.empty')}</div>
                     ) : (
                         <ConversationTimeline
                             agentId={executionAgentId}
                             agentName={executionAgentName}
-                            messages={messages}
+                            messages={timelineMessages}
                             scrollerRef={scrollerRef}
                             isRunning={active}
+                            runningLabel={groupProcessingLabel || undefined}
                             mode={routeMode}
                             onPreviewImages={handlePreviewImages}
                             unavailableAttachmentKeys={effectiveUnavailableAttachments}
@@ -728,7 +870,15 @@ export default function SessionViewerDrawer({
                             )}
                         </div>
                         <small className="session-viewer-drawer__composer-status">
-                            {serverReadOnly ? t('agent.sessionViewer.readOnly', '只读') : connected ? (groupConfig ? '所有消息由 Leader 处理；@ 可额外唤醒指定 Agent · 已连接项目共享时间线' : t('agent.sessionViewer.connected', '已连接标准 Web Chat')) : t('agent.sessionViewer.connecting', '正在连接会话…')}
+                            {serverReadOnly
+                                ? t('agent.sessionViewer.readOnly', '只读')
+                                : connected
+                                    ? groupConfig
+                                        ? groupTurn?.phase === 'expired'
+                                            ? t('agent.sessionViewer.groupTurnExpired')
+                                            : groupProcessingLabel || t('agent.sessionViewer.groupConnected')
+                                        : t('agent.sessionViewer.connected', '已连接标准 Web Chat')
+                                    : t('agent.sessionViewer.connecting', '正在连接会话…')}
                         </small>
                     </footer>
                 )}

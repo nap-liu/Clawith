@@ -52,6 +52,13 @@ class SubagentError(ValueError):
     """A safe, user-facing Subagent contract error."""
 
 
+def _project_member_origin_tool_call_id(member) -> str:
+    membership = dict(dict(member.config_snapshot or {}).get("membership") or {})
+    generation = max(1, int(membership.get("generation") or 1))
+    base = f"project-member:{member.id}"
+    return base if generation == 1 else f"{base}:v{generation}"
+
+
 def _message_meta(row: ChatMessage) -> dict:
     return dict(row.message_meta) if isinstance(row.message_meta, dict) else {}
 
@@ -98,6 +105,18 @@ async def _validate_execution_identity(
     if agent is None:
         raise RuntimeError("Subagent execution Agent no longer exists")
     await resolve_execution_user_id(db, agent, run.execution_user_id)
+    if run.project_id is not None:
+        from app.models.project import ProjectMemberSnapshot
+
+        member = await db.get(ProjectMemberSnapshot, run.project_member_id) if run.project_member_id else None
+        if (
+            member is None
+            or member.project_id != run.project_id
+            or member.agent_id != child.agent_id
+            or not member.is_enabled
+            or bool(dict(child.im_config or {}).get("membership_revoked"))
+        ):
+            raise RuntimeError("Project member is no longer active")
     return agent
 
 
@@ -353,6 +372,20 @@ async def create_subagent(
                 "project_id": str(parent.project_id) if parent.project_id else None,
                 "project_group_session_id": str(parent.id) if parent.project_id else None,
                 "project_member_id": str(project_member.id) if project_member else None,
+                "project_membership_generation": (
+                    max(
+                        1,
+                        int(
+                            dict(dict(project_member.config_snapshot or {}).get("membership") or {}).get(
+                                "generation"
+                            )
+                            or 1
+                        ),
+                    )
+                    if project_member
+                    else None
+                ),
+                "membership_revoked": False,
                 "project_role_snapshot": "leader" if project_member and project_member.is_leader else "participant",
                 "project_tool_policy_snapshot": project_tool_policy_snapshot,
                 "member_config_snapshot": dict(project_member.config_snapshot or {}) if project_member else {},
@@ -456,6 +489,10 @@ async def append_subagent_message(
         child = await db.get(ChatSession, child_id)
         if child is None or child.agent_id != agent_id:
             raise SubagentError("当前 Agent 无权操作这个 Subagent。")
+        try:
+            await _validate_execution_identity(db, run, child)
+        except RuntimeError as exc:
+            raise SubagentError("项目成员已退出，不能继续这个工作会话。") from exc
         existing = (
             await db.execute(
                 select(ChatMessage.id).where(
@@ -524,6 +561,10 @@ async def send_subagent_message_to_parent(
             raise SubagentError("当前执行身份无权从这个 Subagent 发送消息。")
         if run.status == RUN_CANCELLED:
             raise SubagentError("Subagent 已停止。")
+        try:
+            await _validate_execution_identity(db, run, child)
+        except RuntimeError as exc:
+            raise SubagentError("项目成员已退出，不能继续发送项目消息。") from exc
         existing = (
             await db.execute(
                 select(ChatMessage.id).where(
@@ -606,6 +647,26 @@ async def stop_subagent(
         if task is not None and not task.done():
             task.cancel()
     return RUN_CANCELLED
+
+
+async def cancel_local_subagent_tasks(run_ids: list[uuid.UUID]) -> None:
+    """Interrupt local workers after their durable runs were revoked.
+
+    Cross-instance workers observe the cancelled status on their next lease,
+    round or tool boundary. This local fast path closes the same-instance gap.
+    """
+
+    if not run_ids:
+        return
+    async with _running_tasks_guard:
+        tasks = [
+            _running_tasks.get(run_id)
+            for run_id in run_ids
+            if _running_tasks.get(run_id) is not None
+        ]
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
 
 
 async def prepare_subagent_tools(
@@ -1750,6 +1811,7 @@ async def _dispatch_project_leader_batch(
                 .where(
                     SubagentRun.parent_session_id == group_session_id,
                     SubagentRun.project_member_id == leader.id,
+                    SubagentRun.origin_tool_call_id == _project_member_origin_tool_call_id(leader),
                 )
                 .order_by(SubagentRun.id)
                 .limit(1)
@@ -1766,7 +1828,7 @@ async def _dispatch_project_leader_batch(
             agent_id=leader.agent_id,
             execution_user_id=project.owner_user_id,
             parent_session_id=str(group_session_id),
-            origin_tool_call_id=f"project-member:{leader.id}",
+            origin_tool_call_id=_project_member_origin_tool_call_id(leader),
             task=task,
             mode="async",
             fork=True,
@@ -1862,7 +1924,15 @@ async def _dispatch_project_leader_batch(
 
 
 PROJECT_DISPATCH_TRIGGERS = frozenset(
-    {"leader_kickoff", "group_leader_message", "group_mention"}
+    {
+        "leader_kickoff",
+        "group_leader_message",
+        "group_mention",
+        "manual",
+        "leader",
+        "schedule",
+        "retry",
+    }
 )
 
 
@@ -1893,15 +1963,22 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
     commit and Subagent creation cannot strand kickoff or a group mention.
     """
     from app.models.project import Project, ProjectEvent, ProjectMemberSnapshot, ProjectRun
-    from app.services.project_service import add_event
+    from app.services.project_service import (
+        TERMINAL_PROJECT_RUN_STATUSES,
+        add_event,
+        reconcile_project_run_terminal_state,
+    )
 
     async with async_session() as db:
         project_run = await db.get(ProjectRun, project_run_id)
         if project_run is None or project_run.trigger_type not in PROJECT_DISPATCH_TRIGGERS:
             return {"status": "gone"}
+        repaired = reconcile_project_run_terminal_state(project_run)
         output = dict(project_run.output or {})
         if output.get("subagent_run_id"):
-            return {"status": project_run.status, **output}
+            if repaired:
+                await db.commit()
+            return {**output, "status": project_run.status}
         dispatch = dict((project_run.input or {}).get("dispatch") or {})
         try:
             group_session_id = uuid.UUID(str(dispatch["group_session_id"]))
@@ -1938,6 +2015,7 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 .where(
                     SubagentRun.parent_session_id == parent.id,
                     SubagentRun.project_member_id == member.id,
+                    SubagentRun.origin_tool_call_id == _project_member_origin_tool_call_id(member),
                 )
                 .order_by(SubagentRun.id)
                 .limit(1)
@@ -1951,7 +2029,7 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 agent_id=agent_id,
                 execution_user_id=execution_user_id,
                 parent_session_id=str(group_session_id),
-                origin_tool_call_id=f"project-member:{member_id}",
+                origin_tool_call_id=_project_member_origin_tool_call_id(member),
                 task=task,
                 mode="async",
                 fork=True,
@@ -1978,7 +2056,12 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
     except SubagentError as exc:
         async with async_session() as db:
             failed_run = await db.get(ProjectRun, project_run_id, with_for_update=True)
-            if failed_run is not None and not dict(failed_run.output or {}).get("subagent_run_id"):
+            if (
+                failed_run is not None
+                and failed_run.finished_at is None
+                and failed_run.status not in TERMINAL_PROJECT_RUN_STATUSES
+                and not dict(failed_run.output or {}).get("subagent_run_id")
+            ):
                 failed_run.status = "failed"
                 failed_run.finished_at = datetime.now(UTC)
                 failed_run.error = str(exc)
@@ -1990,14 +2073,20 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
         if project_run is None:
             return {"status": "gone"}
         dispatch = dict((project_run.input or {}).get("dispatch") or {})
-        project_run.status = "queued" if child_status == RUN_QUEUED else "running"
-        if project_run.status == "running" and project_run.started_at is None:
-            project_run.started_at = datetime.now(UTC)
+        # The child may finish between append_subagent_message() and this
+        # transaction. Its completion transaction writes finished_at first;
+        # dispatch must enrich output without regressing that terminal fact.
+        reconcile_project_run_terminal_state(project_run)
+        if project_run.status not in TERMINAL_PROJECT_RUN_STATUSES:
+            project_run.status = "queued" if child_status == RUN_QUEUED else "running"
+            if project_run.status == "running" and project_run.started_at is None:
+                project_run.started_at = datetime.now(UTC)
         project_run.output = {
             **dict(project_run.output or {}),
             "subagent_run_id": str(child_id),
             "subagent_session_id": str(child_id),
             "status": child_status,
+            "subagent_status": child_status,
         }
 
         project = await db.get(Project, project_run.project_id, with_for_update=True)
@@ -2103,11 +2192,12 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                     "subagent_runs": subagent_rows,
                 }
         await db.commit()
-        return {"status": project_run.status, **dict(project_run.output or {})}
+        return {**dict(project_run.output or {}), "status": project_run.status}
 
 
 async def _pending_project_dispatch_runs() -> list[uuid.UUID]:
     from app.models.project import ProjectRun
+    from app.services.project_service import reconcile_project_run_terminal_state
 
     async with async_session() as db:
         rows = (
@@ -2121,9 +2211,13 @@ async def _pending_project_dispatch_runs() -> list[uuid.UUID]:
                 .limit(50)
             )
         ).scalars().all()
+        repaired = sum(reconcile_project_run_terminal_state(row) for row in rows)
+        if repaired:
+            await db.commit()
         return [
             row.id
             for row in rows
+            if row.finished_at is None
             if dict((row.input or {}).get("dispatch") or {})
             and not dict(row.output or {}).get("subagent_run_id")
         ]
