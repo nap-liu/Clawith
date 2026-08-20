@@ -163,12 +163,11 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
     event: { content?: string; now?: string; messageId?: string },
     makeId: () => string = defaultMakeId,
 ): T[] {
-    const identifiedIdx = event.messageId
+    let identifiedIdx = event.messageId
         ? messages.findIndex((message) => String(message.id || '') === event.messageId)
         : -1;
     const content = event.content || '';
     const now = event.now || new Date().toISOString();
-    const identifiedMessage = identifiedIdx >= 0 ? messages[identifiedIdx] : undefined;
     let lastUserIdx = -1;
     for (let i = messages.length - 1; i >= 0; i -= 1) {
         if (messages[i].role === 'user') {
@@ -176,6 +175,7 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
             break;
         }
     }
+    const identifiedMessage = identifiedIdx >= 0 ? messages[identifiedIdx] : undefined;
     const isCurrentTurnStream = (message: T, index: number) => (
         index > lastUserIdx
         && message.role === 'assistant'
@@ -192,17 +192,33 @@ export function applyAssistantDoneMessage<T extends Record<string, any>>(
         .join('\n\n');
 
     // Explicit ids address one committed message (currently onboarding and
-    // server-committed rows). Preserve its full shape and position.
+    // server-committed rows). Preserve its full shape and position, but still
+    // collapse every transient assistant row from the same turn. A committed
+    // event can arrive before `done`; returning after updating only that row
+    // would strand earlier streamed fragments until a full history reload.
     if (
         event.messageId
         && identifiedMessage
         && !identifiedMessage.streaming
         && !identifiedMessage._streaming
     ) {
-        const next = [...messages];
-        next[identifiedIdx] = {
+        const next = messages.filter((message, index) => !isCurrentTurnStream(message, index));
+        const nextIdentifiedIdx = next.findIndex((message) => (
+            message === identifiedMessage
+            || (
+                identifiedMessage.id
+                && String(message.id || '') === String(identifiedMessage.id)
+            )
+        ));
+        if (nextIdentifiedIdx < 0) return next;
+        next[nextIdentifiedIdx] = {
             ...identifiedMessage,
             content: content || identifiedMessage.content || '',
+            ...(
+                identifiedMessage.thinking || streamedThinking
+                    ? { thinking: identifiedMessage.thinking || streamedThinking }
+                    : {}
+            ),
             streaming: false,
             _streaming: false,
             _canonicalDone: true,
@@ -384,9 +400,16 @@ export function mergeHistoryMessages(prev: ConversationMessage[], history: Conve
     const assistantContents = history
         .filter((item) => item.role === 'assistant' && !!item.content)
         .map((item) => item.content);
-    const localOnly: ConversationMessage[] = [];
+    const localOnly: Array<{
+        message: ConversationMessage;
+        localIndex: number;
+        previousHistoryIndex: number;
+    }> = [];
+    const matchedHistoryByLocalIndex = new Map<number, number>();
+    let previousHistoryIndex = -1;
 
-    for (const local of prev) {
+    for (let localIndex = 0; localIndex < prev.length; localIndex += 1) {
+        const local = prev[localIndex];
         let matchedHistoryIndex = -1;
         for (const key of mergeKeys(local)) {
             const bucket = historyBuckets.get(key);
@@ -401,6 +424,8 @@ export function mergeHistoryMessages(prev: ConversationMessage[], history: Conve
         }
         if (matchedHistoryIndex >= 0) {
             usedHistoryIndexes.add(matchedHistoryIndex);
+            matchedHistoryByLocalIndex.set(localIndex, matchedHistoryIndex);
+            previousHistoryIndex = matchedHistoryIndex;
             continue;
         }
 
@@ -410,10 +435,60 @@ export function mergeHistoryMessages(prev: ConversationMessage[], history: Conve
             continue;
         }
 
-        localOnly.push(local);
+        localOnly.push({ message: local, localIndex, previousHistoryIndex });
     }
 
-    return [...history, ...localOnly];
+    if (localOnly.length === 0) return history;
+
+    const messageTime = (message: ConversationMessage) => {
+        const value = message.created_at || message.timestamp;
+        const parsed = value ? Date.parse(value) : Number.NaN;
+        return Number.isFinite(parsed) ? parsed : null;
+    };
+    const buckets = new Map<number, ConversationMessage[]>();
+    for (const local of localOnly) {
+        let nextHistoryIndex = -1;
+        for (let index = local.localIndex + 1; index < prev.length; index += 1) {
+            const matched = matchedHistoryByLocalIndex.get(index);
+            if (matched != null) {
+                nextHistoryIndex = matched;
+                break;
+            }
+        }
+
+        const lowerBound = Math.max(0, local.previousHistoryIndex + 1);
+        const upperBound = nextHistoryIndex >= 0 ? nextHistoryIndex : history.length;
+        const localTime = messageTime(local.message);
+        // A transient without a server timestamp was already visible before
+        // this history request began. Durable rows that appear only in the new
+        // snapshot were committed during the disconnect/recovery window, so
+        // keep the transient immediately after its previous matched anchor.
+        // Non-transient local rows retain the conservative upper-bound policy.
+        let insertionIndex = localTime == null
+            && (local.message.streaming || local.message._streaming)
+            ? lowerBound
+            : upperBound;
+        if (localTime != null) {
+            for (let index = lowerBound; index < upperBound; index += 1) {
+                const historyTime = messageTime(history[index]);
+                if (historyTime != null && historyTime > localTime) {
+                    insertionIndex = index;
+                    break;
+                }
+            }
+        }
+        const bucket = buckets.get(insertionIndex);
+        if (bucket) bucket.push(local.message);
+        else buckets.set(insertionIndex, [local.message]);
+    }
+
+    const merged: ConversationMessage[] = [];
+    for (let index = 0; index <= history.length; index += 1) {
+        const localBucket = buckets.get(index);
+        if (localBucket) merged.push(...localBucket);
+        if (index < history.length) merged.push(history[index]);
+    }
+    return merged;
 }
 
 function stableMessageKeys(message: ConversationMessage): string[] {
