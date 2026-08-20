@@ -154,7 +154,7 @@ export default function TalentMarketModal({ open, onClose }: Props) {
                             onChange={(e) => setSearchQuery(e.target.value)}
                             placeholder={t(
                                 'talentMarket.searchPlaceholder',
-                                isChinese ? '搜索 Agent 名称或能力…' : 'Search agents by name or skill…',
+                                isChinese ? '搜索智能体名称或能力…' : 'Search agents by name or skill…',
                             )}
                             style={{
                                 flex: 1, minWidth: 0,
@@ -162,7 +162,7 @@ export default function TalentMarketModal({ open, onClose }: Props) {
                                 color: 'var(--text-primary)', fontSize: '13px',
                                 height: '100%',
                             }}
-                            aria-label={t('talentMarket.searchLabel', isChinese ? '搜索 Agent' : 'Search agents')}
+                            aria-label={t('talentMarket.searchLabel', isChinese ? '搜索智能体' : 'Search agents')}
                         />
                         {searchQuery && (
                             <button
@@ -256,7 +256,7 @@ export default function TalentMarketModal({ open, onClose }: Props) {
                     {!isLoading && visibleTemplates.length === 0 && (
                         <div style={{ gridColumn: '1 / -1', padding: '40px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '13px' }}>
                             {isSearching
-                                ? t('talentMarket.emptySearch', isChinese ? `没有匹配 "${trimmedQuery}" 的 Agent` : `No agents match "${trimmedQuery}"`)
+                                ? t('talentMarket.emptySearch', isChinese ? `没有匹配「${trimmedQuery}」的智能体` : `No agents match "${trimmedQuery}"`)
                                 : t('talentMarket.empty', isChinese ? '这个分类下还没有模板' : 'No templates in this category yet')}
                         </div>
                     )}
@@ -403,7 +403,7 @@ function CustomCard({ onClick }: { onClick: () => void }) {
                 <IconPlus size={20} stroke={1.5} />
             </div>
             <div style={{ fontSize: '15px', fontWeight: 600, marginBottom: '2px', position: 'relative', zIndex: 1 }}>
-                {t('talentMarket.customTitle', isChinese ? '自建 Agent' : 'Build custom')}
+                {t('talentMarket.customTitle', isChinese ? '自建智能体' : 'Build custom')}
             </div>
             <div style={{
                 fontSize: '10px', fontWeight: 500, letterSpacing: '0.06em',
@@ -419,7 +419,7 @@ function CustomCard({ onClick }: { onClick: () => void }) {
                 position: 'relative', zIndex: 1,
             }}>
                 {t('talentMarket.customDescription', isChinese
-                    ? '创建本地 Native Agent，按你的需求定义身份、权限和工具。'
+                    ? '创建本地 Native 智能体，按你的需求定义身份、权限和工具。'
                     : 'Create a native agent, then define its identity, permissions, and tools.')}
             </p>
             <div style={{
@@ -436,7 +436,7 @@ function CustomCard({ onClick }: { onClick: () => void }) {
                 <IconWorld size={13} stroke={1.5} style={{ flexShrink: 0 }} />
                 <span>
                     {t('talentMarket.externalAgentHint', isChinese
-                        ? '支持 Native、OpenClaw 等外部 Agent'
+                        ? '支持 Native、OpenClaw 等外部智能体'
                         : 'Supports native, OpenClaw, and external agents')}
                 </span>
             </div>

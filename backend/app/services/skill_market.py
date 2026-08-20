@@ -532,4 +532,35 @@ async def take_skill_offline(db: AsyncSession, *, skill_id: uuid.UUID, actor: Us
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the publisher or an admin can take this Skill offline")
     skill.status = "offline"
     await db.flush()
+    # PostgreSQL updates ``updated_at`` server-side. Refresh before returning
+    # so synchronous response serialization never attempts async lazy IO.
+    await db.refresh(skill)
+    return skill
+
+
+async def withdraw_agent_skill(
+    db: AsyncSession,
+    *,
+    skill_id: uuid.UUID,
+    agent: Agent,
+) -> Skill:
+    """Withdraw a market Skill only when it was published by this Agent."""
+    skill = await db.get(Skill, skill_id)
+    if not skill:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Skill not found")
+    await lock_skill_folder(db, skill.folder_name)
+    await db.refresh(
+        skill,
+        attribute_names=["status", "folder_name", "tenant_id", "publisher_agent_id"],
+    )
+    if skill.tenant_id != agent.tenant_id or skill.publisher_agent_id != agent.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "An Agent can only withdraw a Skill it published",
+        )
+    if skill.status != "published":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Skill is not currently published")
+    skill.status = "offline"
+    await db.flush()
+    await db.refresh(skill)
     return skill

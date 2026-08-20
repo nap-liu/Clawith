@@ -17,12 +17,16 @@ const promptSource = readSource('../src/components/PromptModal.tsx');
 assert.match(dialogSource, /export function Modal\(/);
 assert.match(dialogSource, /export function Drawer\(/);
 assert.match(dialogSource, /useOverlayPresence\(open, onAfterClose\)/);
+assert.match(dialogSource, /setMounted\(false\)/);
+assert.match(dialogSource, /OVERLAY_TRANSITION_MS/);
+assert.match(dialogSource, /mountFrame[\s\S]*openFrame/);
 assert.match(dialogSource, /closeOnBackdrop = true/);
 assert.match(dialogSource, /event\.target === event\.currentTarget/);
 
 assert.match(dialogStyles, /data-state="open"/);
 assert.match(dialogStyles, /transition:/);
 assert.match(dialogStyles, /prefers-reduced-motion: reduce/);
+assert.match(dialogStyles, /translateX\(100%\)/);
 
 assert.match(skillMarketSource, /<Modal[\s\S]*open=\{installModalOpen\}/);
 assert.match(skillMarketSource, /<Drawer[\s\S]*open=\{open\}/);

@@ -135,7 +135,7 @@ export default function OrgMemberAccessPicker({
         selectPage: '选择当前页成员',
         selected: '已选成员',
         systemManagers: '系统保留管理者',
-        creator: 'Agent 创建者',
+        creator: '智能体创建者',
         companyAdmins: '公司管理员',
         use: '使用',
         manage: '管理',

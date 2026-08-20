@@ -53,7 +53,10 @@ interface ModalProps {
     onAfterClose?: () => void;
 }
 
-const OVERLAY_TRANSITION_MS = 200;
+// Keep this in sync with --app-overlay-duration. The portal deliberately
+// remains mounted for the whole leave transition; consumers only own `open`
+// and never need to delay clearing their business state themselves.
+const OVERLAY_TRANSITION_MS = 260;
 
 function useOverlayPresence(open: boolean, onAfterClose?: () => void) {
     const [mounted, setMounted] = useState(open);
@@ -67,8 +70,18 @@ function useOverlayPresence(open: boolean, onAfterClose?: () => void) {
     useEffect(() => {
         if (open) {
             setMounted(true);
-            const frame = window.requestAnimationFrame(() => setVisible(true));
-            return () => window.cancelAnimationFrame(frame);
+            // Two frames are intentional: the first commits the mounted,
+            // closed pose; the second lets the browser transition to open.
+            // A single frame can be batched with the mount and skip enter
+            // motion entirely.
+            let openFrame = 0;
+            const mountFrame = window.requestAnimationFrame(() => {
+                openFrame = window.requestAnimationFrame(() => setVisible(true));
+            });
+            return () => {
+                window.cancelAnimationFrame(mountFrame);
+                if (openFrame) window.cancelAnimationFrame(openFrame);
+            };
         }
         if (!mounted) return;
         setVisible(false);

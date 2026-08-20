@@ -23,8 +23,10 @@ from app.services.skill_market import (
     list_market_skills,
     publish_agent_skill,
     serialize_market_skill,
+    take_skill_offline,
     uninstall_market_skill,
     validate_skill_files,
+    withdraw_agent_skill,
 )
 from app.services.storage import get_storage_backend, normalize_storage_key
 
@@ -65,6 +67,7 @@ async def _create_tenant_team(label: str) -> tuple[Tenant, User, User, Agent]:
             autonomy_policy={
                 "install_skill_from_market": "L3",
                 "publish_skill_to_market": "L3",
+                "withdraw_skill_from_market": "L3",
             },
         )
         db.add(agent)
@@ -399,12 +402,13 @@ async def test_agent_market_install_waits_for_l3_approval_then_executes_once():
         skill_id = skill.id
         await db.commit()
 
-    # Agent policy cannot downgrade these two mutations below L3.
+    # Agent policy cannot downgrade market mutations below L3.
     async with async_session() as db:
         target_agent = await db.get(Agent, agent_b.id)
         target_agent.autonomy_policy = {
             "install_skill_from_market": "L1",
             "publish_skill_to_market": "L1",
+            "withdraw_skill_from_market": "L1",
         }
         await db.commit()
 
@@ -610,6 +614,118 @@ async def test_agent_market_publish_approval_is_idempotent_and_rejection_is_fina
         assert not await db.scalar(
             select(Skill.id).where(Skill.tenant_id == tenant.id, Skill.folder_name == rejected_folder)
         )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_user_and_agent_can_withdraw_with_agent_l3_and_ownership_boundaries():
+    tenant, owner, guest, agent = await _create_tenant_team("withdraw")
+    folder = f"withdraw-skill-{uuid.uuid4().hex[:8]}"
+    await _write_skill(agent.id, folder, "Withdrawal behavior")
+
+    async with async_session() as db:
+        skill = await publish_agent_skill(
+            db,
+            agent=await db.get(Agent, agent.id),
+            actor=await db.get(User, owner.id),
+            path=f"skills/{folder}",
+            name="Withdrawal Skill",
+            description="Withdrawal behavior",
+            category="general",
+            visibility="tenant",
+        )
+        skill_id = skill.id
+        await db.commit()
+
+    async with async_session() as db:
+        with pytest.raises(HTTPException) as denied:
+            await take_skill_offline(
+                db,
+                skill_id=skill_id,
+                actor=await db.get(User, guest.id),
+            )
+        assert denied.value.status_code == 403
+        await db.rollback()
+
+    session_id = f"withdraw-session-{uuid.uuid4()}"
+    tool_call_id = f"withdraw-call-{uuid.uuid4()}"
+    pending = await execute_tool(
+        "withdraw_skill_from_market",
+        {"skill_id": str(skill_id)},
+        agent.id,
+        owner.id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+        skip_autonomy=True,
+    )
+    assert "requires approval" in pending
+    async with async_session() as db:
+        assert (await db.get(Skill, skill_id)).status == "published"
+        approval = await db.scalar(
+            select(ApprovalRequest).where(
+                ApprovalRequest.agent_id == agent.id,
+                ApprovalRequest.action_type == "withdraw_skill_from_market",
+                ApprovalRequest.status == "pending",
+            )
+        )
+        assert approval is not None
+        await autonomy_service.resolve_approval(
+            db,
+            approval.id,
+            await db.get(User, owner.id),
+            "approve",
+        )
+        await db.commit()
+
+    async with async_session() as db:
+        assert (await db.get(Skill, skill_id)).status == "offline"
+
+    replay = await execute_tool(
+        "withdraw_skill_from_market",
+        {"skill_id": str(skill_id)},
+        agent.id,
+        owner.id,
+        session_id=session_id,
+        tool_call_id=tool_call_id,
+    )
+    assert "already been executed" in replay
+
+    async with async_session() as db:
+        publisher = await db.get(Agent, agent.id)
+        actor = await db.get(User, owner.id)
+        republished = await publish_agent_skill(
+            db,
+            agent=publisher,
+            actor=actor,
+            path=f"skills/{folder}",
+            name="Withdrawal Skill",
+            description="Withdrawal behavior",
+            category="general",
+            visibility="tenant",
+        )
+        intruder = Agent(
+            tenant_id=tenant.id,
+            creator_id=owner.id,
+            name=f"Withdrawal Intruder {uuid.uuid4().hex[:8]}",
+            role_description="Cannot withdraw another Agent's publication",
+            status="idle",
+            access_mode="private",
+            company_access_level="use",
+        )
+        db.add(intruder)
+        await db.flush()
+        with pytest.raises(HTTPException) as wrong_agent:
+            await withdraw_agent_skill(db, skill_id=republished.id, agent=intruder)
+        assert wrong_agent.value.status_code == 403
+        await db.rollback()
+
+    async with async_session() as db:
+        withdrawn = await take_skill_offline(
+            db,
+            skill_id=skill_id,
+            actor=await db.get(User, owner.id),
+        )
+        assert withdrawn.status == "offline"
+        assert serialize_market_skill(withdrawn)["status"] == "offline"
 
 
 def test_skill_validation_rejects_missing_manifest_and_secret_content():

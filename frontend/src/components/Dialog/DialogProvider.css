@@ -1,5 +1,5 @@
 .app-modal-overlay {
-    --app-overlay-duration: 200ms;
+    --app-overlay-duration: 260ms;
     --app-overlay-ease: cubic-bezier(.2, .8, .2, 1);
     position: fixed;
     inset: 0;
@@ -26,7 +26,7 @@
     box-shadow: 0 20px 60px rgba(0, 0, 0, .32);
     outline: none;
     opacity: 0;
-    transform: translateY(10px) scale(.985);
+    transform: translateY(22px) scale(.96);
     transition:
         opacity var(--app-overlay-duration) var(--app-overlay-ease),
         transform var(--app-overlay-duration) var(--app-overlay-ease);
@@ -43,7 +43,7 @@
 }
 
 .app-drawer-overlay {
-    --app-overlay-duration: 200ms;
+    --app-overlay-duration: 260ms;
     --app-overlay-ease: cubic-bezier(.2, .8, .2, 1);
     position: fixed;
     inset: 0;
@@ -66,11 +66,17 @@
     background: var(--bg-primary);
     box-shadow: -22px 0 58px rgba(9, 14, 24, .2);
     outline: none;
-    transform: translateX(28px);
-    transition: transform var(--app-overlay-duration) var(--app-overlay-ease);
+    opacity: .94;
+    transform: translateX(100%);
+    transition:
+        opacity var(--app-overlay-duration) var(--app-overlay-ease),
+        transform var(--app-overlay-duration) var(--app-overlay-ease);
 }
 
-.app-drawer-overlay[data-state="open"] .app-drawer-surface { transform: translateX(0); }
+.app-drawer-overlay[data-state="open"] .app-drawer-surface {
+    opacity: 1;
+    transform: translateX(0);
+}
 
 @media (max-width: 680px) {
     .app-modal-overlay { padding: 12px; }

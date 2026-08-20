@@ -3716,6 +3716,26 @@ BUILTIN_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "withdraw_skill_from_market",
+        "display_name": "Withdraw Skill from Market",
+        "description": (
+            "Withdraw a Skill previously published by this Agent. Existing installs remain available. The platform "
+            "creates an L3 approval before withdrawal, and the approving user must have Agent manage access."
+        ),
+        "category": "discovery",
+        "icon": "📤",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "skill_id": {"type": "string", "description": "Skill UUID returned after publication or search."},
+            },
+            "required": ["skill_id"],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "sql_execute",
         "display_name": "SQL Execute",
         "description": (

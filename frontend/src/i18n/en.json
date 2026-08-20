@@ -69,6 +69,13 @@
     "platformSettings": "Platform Settings",
     "skillMarket": "Skill Market"
   },
+  "sidebar": {
+    "agents": "Agents",
+    "agentSearchPlaceholder": "Search name or creator",
+    "agentSearchLabel": "Search Agents by name or creator",
+    "clearAgentSearch": "Clear Agent search",
+    "noAgentMatches": "No matching Agents"
+  },
   "skillMarket": {
     "eyebrow": "SKILL MARKET",
     "title": "Skill Market",
@@ -95,7 +102,7 @@
     "installCount": "{{count}} Agent installs",
     "viewDetails": "View details",
     "working": "Working…",
-    "takeOffline": "Take offline",
+    "takeOffline": "Withdraw",
     "install": "Install",
     "installing": "Installing…",
     "confirmInstall": "Install",
@@ -118,8 +125,8 @@
     "installNote": "Writes to skills/{{folder}}. Reinstalling updates the current version; each Agent is counted once.",
     "publishNote": "Before publishing, the platform checks root SKILL.md, text format, size, and common secrets. Publishing the same folder again updates its version.",
     "publishing": "Publishing…",
-    "offlineTitle": "Take Skill offline",
-    "offlineConfirm": "Take “{{name}}” offline? Existing installs are unaffected.",
+    "offlineTitle": "Withdraw Skill",
+    "offlineConfirm": "Withdraw “{{name}}” from the market? Existing installs are unaffected.",
     "emptyMineTitle": "Nothing published yet",
     "emptyMineHint": "Publish one from an Agent’s skills folder.",
     "emptyMarketTitle": "No matching Skills",
@@ -129,8 +136,8 @@
       "installFailed": "Install failed",
       "published": "Published “{{name}}”",
       "publishFailed": "Publish failed",
-      "offlineSuccess": "Skill taken offline",
-      "offlineFailed": "Unable to take Skill offline"
+      "offlineSuccess": "Skill withdrawn",
+      "offlineFailed": "Unable to withdraw Skill"
     }
   },
   "talentMarket": {
@@ -1455,6 +1462,7 @@
         "search_skill_market": "Search Skill Market",
         "install_skill_from_market": "Install Market Skill",
         "publish_skill_to_market": "Publish Skill to Market",
+        "withdraw_skill_from_market": "Withdraw Skill from Market",
         "agentbay_browser_navigate": "AgentBay: Browser Navigate",
         "agentbay_browser_screenshot": "AgentBay: Browser Screenshot",
         "agentbay_browser_click": "AgentBay: Browser Click",
@@ -1527,6 +1535,7 @@
         "search_skill_market": "Search visible company and public Skills in the Skill market.",
         "install_skill_from_market": "Install a market Skill into this Agent after L3 approval.",
         "publish_skill_to_market": "Publish an Agent Skill folder to the company or public market after L3 approval.",
+        "withdraw_skill_from_market": "Withdraw a Skill published by this Agent after L3 approval. Existing installs remain available.",
         "agentbay_browser_navigate": "[ENV: Browser] Navigate to a URL in the AgentBay headless browser environment.",
         "agentbay_browser_screenshot": "[ENV: Browser] Take a screenshot of the current page in the headless browser.",
         "agentbay_browser_click": "[ENV: Browser] Click an element in the headless browser.",

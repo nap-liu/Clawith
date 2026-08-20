@@ -194,9 +194,17 @@ async def _build_unread_count_by_agent(
     return {str(row[0]): int(row[1] or 0) for row in result.all()}
 
 
-def _serialize_agent_out(agent: Agent, unread_count: int = 0) -> AgentOut:
+def _serialize_agent_out(
+    agent: Agent,
+    unread_count: int = 0,
+    *,
+    creator_username: str | None = None,
+    creator_display_name: str | None = None,
+) -> AgentOut:
     payload = AgentOut.model_validate(agent).model_dump()
     payload["unread_count"] = unread_count
+    payload["creator_username"] = creator_username
+    payload["creator_display_name"] = creator_display_name
     return AgentOut.model_validate(payload)
 
 
@@ -287,11 +295,28 @@ async def list_agents(
     if needs_flush:
         await db.commit()
     unread_by_agent = await _build_unread_count_by_agent(db, agents, current_user)
+    creator_ids = {a.creator_id for a in agents if a.creator_id}
+    creators_by_id: dict[uuid.UUID, User] = {}
+    if creator_ids:
+        from sqlalchemy.orm import selectinload
+
+        creator_rows = await db.execute(
+            select(User)
+            .where(User.id.in_(creator_ids))
+            .options(selectinload(User.identity))
+        )
+        creators_by_id = {creator.id: creator for creator in creator_rows.scalars().all()}
     from app.services.onboarding import onboarded_agent_ids
     onboarded = await onboarded_agent_ids(db, current_user.id, [a.id for a in agents])
     out: list[AgentOut] = []
     for a in agents:
-        model = _serialize_agent_out(a, unread_by_agent.get(str(a.id), 0))
+        creator = creators_by_id.get(a.creator_id)
+        model = _serialize_agent_out(
+            a,
+            unread_by_agent.get(str(a.id), 0),
+            creator_username=creator.username if creator else None,
+            creator_display_name=creator.display_name if creator else None,
+        )
         model.onboarded_for_me = a.id in onboarded
         out.append(model)
     return out
@@ -379,6 +404,7 @@ async def get_agent(
         )
         creator = creator_result.scalar_one_or_none()
         out["creator_username"] = creator.username if creator else None
+        out["creator_display_name"] = creator.display_name if creator else None
 
     # Resolve effective timezone (agent → tenant → UTC)
     effective_tz = agent.timezone

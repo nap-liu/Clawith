@@ -237,7 +237,7 @@ function SkillCard({
     const published = skill.status === 'published';
 
     return (
-        <article className={`skill-market-card${published ? '' : ' is-offline'}`}>
+        <article className={`skill-market-card${published ? '' : ' is-offline'}`} onClick={onDetail}>
             <div className="skill-market-folder-tab" aria-hidden />
             <div className="skill-market-card-head">
                 <span className="skill-market-glyph" aria-hidden>{skill.icon || '✦'}</span>
@@ -260,15 +260,15 @@ function SkillCard({
                 <span className="skill-market-category">{skill.category || t('skillMarket.generalCategory')}</span>
             </div>
             <footer>
-                <Button variant="ghost" type="button" className="skill-market-detail-button" onClick={onDetail}>
+                <Button variant="ghost" type="button" className="skill-market-detail-button" onClick={(event) => { event.stopPropagation(); onDetail(); }}>
                     {t('skillMarket.viewDetails')} <IconChevronRight size={14} />
                 </Button>
                 {mine ? (
-                    published && <Button variant="secondary" type="button" onClick={onOffline} disabled={busy}>
+                    published && <Button variant="secondary" type="button" onClick={(event) => { event.stopPropagation(); onOffline(); }} disabled={busy}>
                         <IconArchive size={14} />{busy ? t('skillMarket.working') : t('skillMarket.takeOffline')}
                     </Button>
                 ) : (
-                    <Button variant="primary" type="button" onClick={onInstall} disabled={busy}>
+                    <Button variant="primary" type="button" onClick={(event) => { event.stopPropagation(); onInstall(); }} disabled={busy}>
                         <IconDownload size={14} />{t('skillMarket.install')}
                     </Button>
                 )}

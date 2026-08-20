@@ -2264,6 +2264,23 @@ AGENT_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "withdraw_skill_from_market",
+            "description": (
+                "Withdraw one market Skill previously published by this Agent. Existing installs remain available. "
+                "The platform always requires L3 approval before withdrawal."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_id": {"type": "string", "description": "Skill UUID returned after publication or search."},
+                },
+                "required": ["skill_id"],
+            },
+        },
+    },
     # AgentBay tools
     {
         "type": "function",
@@ -3278,9 +3295,14 @@ _TOOL_AUTONOMY_MAP = {
     "execute_code_aio": "execute_code",
     "install_skill_from_market": "install_skill_from_market",
     "publish_skill_to_market": "publish_skill_to_market",
+    "withdraw_skill_from_market": "withdraw_skill_from_market",
 }
 
-_FORCED_L3_TOOLS = {"install_skill_from_market", "publish_skill_to_market"}
+_FORCED_L3_TOOLS = {
+    "install_skill_from_market",
+    "publish_skill_to_market",
+    "withdraw_skill_from_market",
+}
 
 
 def _is_enterprise_info_path(path: str | None) -> bool:
@@ -3570,6 +3592,8 @@ async def _execute_tool_direct(
             return await _install_skill_from_market(agent_id, user_id, arguments)
         elif tool_name == "publish_skill_to_market":
             return await _publish_skill_to_market(agent_id, user_id, arguments)
+        elif tool_name == "withdraw_skill_from_market":
+            return await _withdraw_skill_from_market(agent_id, user_id, arguments)
         elif tool_name == "web_search":
             return await _web_search(arguments, agent_id)
         elif tool_name == "jina_search":
@@ -4463,6 +4487,8 @@ async def execute_tool(
             result = await _install_skill_from_market(agent_id, user_id, arguments)
         elif tool_name == "publish_skill_to_market":
             result = await _publish_skill_to_market(agent_id, user_id, arguments)
+        elif tool_name == "withdraw_skill_from_market":
+            result = await _withdraw_skill_from_market(agent_id, user_id, arguments)
         # ── OKR Tools ──
         elif tool_name == "get_okr":
             result = await _get_okr(agent_id, arguments)
@@ -17448,6 +17474,32 @@ async def _publish_skill_to_market(
     except Exception as exc:
         detail = getattr(exc, "detail", str(exc))
         return f"❌ Skill publication failed: {str(detail)[:260]}"
+
+
+async def _withdraw_skill_from_market(
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    arguments: dict,
+) -> str:
+    raw_skill_id = str(arguments.get("skill_id") or "").strip()
+    try:
+        skill_id = uuid.UUID(raw_skill_id)
+    except ValueError:
+        return "❌ skill_id must be a valid UUID returned after publication or search"
+
+    from app.services.skill_market import withdraw_agent_skill
+
+    try:
+        async with async_session() as db:
+            _actor, agent, error = await _market_tool_actor(db, agent_id, user_id)
+            if error:
+                return error
+            skill = await withdraw_agent_skill(db, skill_id=skill_id, agent=agent)
+            await db.commit()
+        return f"✅ Withdrew '{skill.name}' from the Skill market. Existing installs are unaffected."
+    except Exception as exc:
+        detail = getattr(exc, "detail", str(exc))
+        return f"❌ Skill withdrawal failed: {str(detail)[:260]}"
 
 
 # ─── sql_execute memory-safe limits ─────────────────────────────────────

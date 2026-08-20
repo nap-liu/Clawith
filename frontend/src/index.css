@@ -543,7 +543,7 @@ select:focus {
 
 .sidebar-logo {
   padding: var(--space-3) var(--space-5);
-  margin-bottom: var(--space-3);
+  margin-bottom: var(--space-2);
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -551,6 +551,36 @@ select:focus {
   font-weight: 600;
   color: var(--text-primary);
   letter-spacing: -0.02em;
+}
+
+.sidebar-logo-switcher {
+  min-width: 0;
+  height: 36px;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.sidebar-logo-switcher:hover,
+.sidebar-logo-switcher.open {
+  background: var(--bg-hover);
+  border-color: var(--border-subtle);
+}
+
+.sidebar-logo-switcher:focus-visible {
+  outline: none;
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 0 2px var(--accent-subtle);
 }
 
 .sidebar-workspace-row {
@@ -591,6 +621,8 @@ select:focus {
 }
 
 .workspace-switcher-avatar {
+  position: relative;
+  overflow: hidden;
   width: 26px;
   height: 26px;
   flex: 0 0 26px;
@@ -608,6 +640,8 @@ select:focus {
 }
 
 .workspace-switcher-avatar img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   display: block;
@@ -1590,6 +1624,13 @@ select:focus {
   padding: var(--space-3) 0;
   flex-direction: column;
   gap: var(--space-2);
+}
+
+.sidebar.collapsed .sidebar-logo-switcher {
+  width: 36px;
+  flex: 0 0 36px;
+  justify-content: center;
+  padding: 5px;
 }
 
 .sidebar.collapsed .sidebar-workspace-row {

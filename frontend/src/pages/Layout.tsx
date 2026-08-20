@@ -465,7 +465,7 @@ export default function Layout() {
     const [tenantFormLoading, setTenantFormLoading] = useState(false);
     const [tenantFormError, setTenantFormError] = useState('');
     const [allowSelfCreate, setAllowSelfCreate] = useState(true);
-    const tenantSwitcherRef = useRef<HTMLDivElement>(null);
+    const tenantSwitcherRef = useRef<HTMLButtonElement>(null);
     const tenantMenuPortalRef = useRef<HTMLDivElement>(null);
     const [tenantMenuPos, setTenantMenuPos] = useState({ top: 0, left: 0, maxHeight: 520 });
 
@@ -901,7 +901,8 @@ export default function Layout() {
     const q = sidebarSearch.trim().toLowerCase();
     const sortedAgents = [...agents].filter((a: any) => {
         if (!q) return true;
-        return (a.name || '').toLowerCase().includes(q) || (a.role_description || '').toLowerCase().includes(q);
+        return [a.name, a.creator_display_name, a.creator_username]
+            .some(value => String(value || '').toLowerCase().includes(q));
     }).sort((a: any, b: any) => {
         const ap = pinnedAgents.has(a.id) ? 1 : 0;
         const bp = pinnedAgents.has(b.id) ? 1 : 0;
@@ -918,10 +919,11 @@ export default function Layout() {
                 type="text"
                 value={sidebarSearch}
                 onChange={e => setSidebarSearch(e.target.value)}
-                placeholder={isChinese ? '搜索...' : 'Search...'}
+                placeholder={t('sidebar.agentSearchPlaceholder')}
+                aria-label={t('sidebar.agentSearchLabel')}
             />
             {sidebarSearch && (
-                <button onClick={() => setSidebarSearch('')} aria-label={isChinese ? '清空搜索' : 'Clear search'}>
+                <button onClick={() => setSidebarSearch('')} aria-label={t('sidebar.clearAgentSearch')}>
                     <IconX size={14} stroke={2} />
                 </button>
             )}
@@ -936,13 +938,22 @@ export default function Layout() {
         return (
             <div key={agent.id} className={`sidebar-agent-item${agent.creator_id === user?.id ? ' owned' : ''}${options?.drawer ? ' drawer-agent' : ''}`}>
                 <NavLink
-                    to={`/agents/${agent.id}/chat`}
+                    to={options?.drawer ? `/agents/${agent.id}/chat` : `/agents/${agent.id}`}
                     className={({ isActive }) => `sidebar-item ${isActive || activeAgentId === agent.id ? 'active' : ''}`}
                     title={agent.name}
                     onClick={() => setAgentDrawerOpen(false)}
                 >
                     <span className="sidebar-item-icon" style={{ position: 'relative' }}>
-                        <span className={`agent-avatar${agent.agent_type === 'openclaw' ? ' openclaw' : ''}`}>{avatarChar}</span>
+                        {agent.avatar_url ? (
+                            <img
+                                src={agent.avatar_url.startsWith('/api') ? `${agent.avatar_url}${agent.avatar_url.includes('?') ? '&' : '?'}token=${token}` : agent.avatar_url}
+                                alt=""
+                                className={`agent-avatar${agent.agent_type === 'openclaw' ? ' openclaw' : ''}`}
+                                style={{ objectFit: 'cover' }}
+                            />
+                        ) : (
+                            <span className={`agent-avatar${agent.agent_type === 'openclaw' ? ' openclaw' : ''}`}>{avatarChar}</span>
+                        )}
                         {agent.agent_type === 'openclaw' && (
                             <span className="agent-avatar-link" style={{ display: 'flex' }}>
                                 <IconArrowUpRight size={10} stroke={2.5} />
@@ -987,7 +998,7 @@ export default function Layout() {
             )}
             {agents.length > 0 && sortedAgents.length === 0 && q && (
                 <div className="sidebar-agent-empty">
-                    {isChinese ? '无匹配结果' : 'No matches'}
+                    {t('sidebar.noAgentMatches')}
                 </div>
             )}
         </>
@@ -1025,22 +1036,11 @@ export default function Layout() {
             <nav className={`sidebar ${isSidebarCollapsed ? 'collapsed' : ''}`}>
                 <div className="sidebar-top">
                     <div className="sidebar-logo">
-                        <img src={theme === 'dark' ? '/logo-white.png' : '/logo-black.png'} alt="" style={{ width: 22, height: 22 }} />
-                        <span className="sidebar-logo-text">{t('app.name', '数字员工平台')}</span>
-                        <button className="btn btn-ghost sidebar-collapse-btn" onClick={toggleSidebar} style={{
-                            padding: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                            marginLeft: 'auto', color: 'var(--text-tertiary)',
-                        }} title={isSidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}>
-                            {isSidebarCollapsed ? SidebarIcons.expand : SidebarIcons.collapse}
-                        </button>
-                    </div>
-
-                    {/* Tenant switcher: avatar + current tenant name + chevron;
-                        click toggles the popover (which is positioned `fixed` via CSS). */}
-                    <div className="sidebar-workspace-row" ref={tenantSwitcherRef} data-tour-target="company-switcher">
                         <button
+                            ref={tenantSwitcherRef}
                             type="button"
-                            className={`workspace-switcher-trigger${showTenantMenu ? ' open' : ''}`}
+                            className={`sidebar-logo-switcher${showTenantMenu ? ' open' : ''}`}
+                            data-tour-target="company-switcher"
                             onClick={() => {
                                 if (showTenantMenu) {
                                     setShowTenantMenu(false);
@@ -1051,15 +1051,25 @@ export default function Layout() {
                             title={isChinese ? '切换企业' : 'Switch Organization'}
                         >
                             <span className={`workspace-switcher-avatar tone-${currentTenantAvatarTone}`}>
-                                {currentTenantLogoUrl ? <img src={currentTenantLogoUrl} alt="" /> : currentTenantInitial}
+                                {currentTenantInitial}
+                                {currentTenantLogoUrl && (
+                                    <img
+                                        src={currentTenantLogoUrl}
+                                        alt=""
+                                        onError={event => { event.currentTarget.style.display = 'none'; }}
+                                    />
+                                )}
                             </span>
                             <span className="workspace-switcher-name">{currentTenantName}</span>
                             <IconChevronDown className="workspace-switcher-chevron" size={15} stroke={1.7} />
                         </button>
-
+                        <button className="btn btn-ghost sidebar-collapse-btn" onClick={toggleSidebar} style={{
+                            padding: '4px', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            marginLeft: 'auto', color: 'var(--text-tertiary)',
+                        }} title={isSidebarCollapsed ? t('common.expandSidebar') : t('common.collapseSidebar')}>
+                            {isSidebarCollapsed ? SidebarIcons.expand : SidebarIcons.collapse}
+                        </button>
                     </div>
-
-
 
                     <div className="sidebar-section" data-tour-target="main-nav">
                         <NavLink to="/explore" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
@@ -1104,7 +1114,7 @@ export default function Layout() {
                 >
                     {!isSidebarCollapsed && (
                         <div className="sidebar-agent-header">
-                            <span>{isChinese ? '智能体' : 'Agents'}</span>
+                            <span>{t('sidebar.agents')}</span>
                             <button
                                 type="button"
                                 data-tour-target="hire-agent"
@@ -1115,83 +1125,8 @@ export default function Layout() {
                             </button>
                         </div>
                     )}
-                    {/* Agent list */}
-                    {(() => {
-                        const q = sidebarSearch.trim().toLowerCase();
-                        const filterAgent = (a: any) => !q || (a.name || '').toLowerCase().includes(q) || (a.role_description || '').toLowerCase().includes(q);
-                        const sortedAgents = [...agents].filter(filterAgent).sort((a: any, b: any) => {
-                            const ap = pinnedAgents.has(a.id) ? 1 : 0;
-                            const bp = pinnedAgents.has(b.id) ? 1 : 0;
-                            if (ap !== bp) return bp - ap;
-                            // Sort by created_at descending (newest first)
-                            const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
-                            const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
-                            return bTime - aTime;
-                        });
-                        const renderAgent = (agent: any) => {
-                            const badge = getAgentBadgeStatus(agent);
-                            const avatarChar = ((Array.from(agent.name || '?')[0] as string) || '?').toUpperCase();
-                            return (
-                            <div key={agent.id} style={{ position: 'relative' }} className={`sidebar-agent-item${agent.creator_id === user?.id ? ' owned' : ''}`}>
-                                <NavLink
-                                    to={`/agents/${agent.id}`}
-                                    className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}
-                                    title={agent.name}
-                                >
-                                    <span className="sidebar-item-icon" style={{ position: 'relative' }}>
-                                        {agent.avatar_url ? (
-                                            <img
-                                                src={agent.avatar_url.startsWith('/api') ? `${agent.avatar_url}${agent.avatar_url.includes('?') ? '&' : '?'}token=${token}` : agent.avatar_url}
-                                                alt=""
-                                                className={`agent-avatar${agent.agent_type === 'openclaw' ? ' openclaw' : ''}`}
-                                                style={{ objectFit: 'cover' }}
-                                            />
-                                        ) : (
-                                            <span className={`agent-avatar${agent.agent_type === 'openclaw' ? ' openclaw' : ''}`}>{avatarChar}</span>
-                                        )}
-                                        {agent.agent_type === 'openclaw' && (
-                                            <span className="agent-avatar-link" style={{ display: 'flex' }}>
-                                                <IconArrowUpRight size={10} stroke={2.5} />
-                                            </span>
-                                        )}
-                                        {badge && <span className={`agent-avatar-badge ${badge}`} />}
-                                    </span>
-                                    <span className="sidebar-item-text">{agent.name}</span>
-                                </NavLink>
-                                {!isSidebarCollapsed && (
-                                    <button
-                                        onClick={e => { e.preventDefault(); e.stopPropagation(); togglePin(agent.id); }}
-                                        className={`sidebar-pin-btn ${pinnedAgents.has(agent.id) ? 'pinned' : ''}`}
-                                        title={pinnedAgents.has(agent.id) ? (isChinese ? '取消置顶' : 'Unpin') : (isChinese ? '置顶' : 'Pin to top')}
-                                    >
-                                        {pinnedAgents.has(agent.id) ? (
-                                            <>
-                                                <IconPin size={14} stroke={1.5} className="pin-default" />
-                                                <IconPinnedOff size={14} stroke={1.5} className="pin-hover" />
-                                            </>
-                                        ) : (
-                                            <IconPin size={14} stroke={1.5} className="pin-on" />
-                                        )}
-                                    </button>
-                                )}
-                            </div>
-                        );};
-                        return (
-                            <>
-                                {sortedAgents.map(renderAgent)}
-                                {agents.length === 0 && (
-                                    <div className="sidebar-section">
-                                        <div className="sidebar-section-title">{t('nav.myAgents')}</div>
-                                    </div>
-                                )}
-                                {agents.length > 0 && sortedAgents.length === 0 && q && (
-                                    <div style={{ padding: '12px 16px', fontSize: '12px', color: 'var(--text-tertiary)', textAlign: 'center' }}>
-                                        {isChinese ? '无匹配结果' : 'No matches'}
-                                    </div>
-                                )}
-                            </>
-                        );
-                    })()}
+                    {!isSidebarCollapsed && agentSearchBox(true)}
+                    {agentListContent()}
                 </div>
 
                 <div className="sidebar-bottom">
