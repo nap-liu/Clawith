@@ -203,6 +203,26 @@ export const projectsApi = {
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(workItemId)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
     listRuns: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/runs`),
     listEvents: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/events`),
+    getGroupSession: (projectId: string) =>
+        fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/group-session`),
+    async listGroupMessages(projectId: string, sessionId: string): Promise<JsonRecord[]> {
+        const response = await fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages?limit=500`);
+        return array(response.items).map(item => {
+            const message = record(item);
+            const metadata = record(message.metadata || message.message_meta);
+            return {
+                ...message,
+                display_content: message.display_content ?? message.content ?? '',
+                attachments: array(message.attachments).length ? message.attachments : array(metadata.attachments),
+                sender_name: message.sender_name || metadata.sender_name,
+            };
+        });
+    },
+    sendGroupMessage: (projectId: string, sessionId: string, payload: { content: string; llm_content?: string; mentions: string[]; attachments: JsonRecord[]; sender_agent_id?: string }) =>
+        fetchJson<{ message?: JsonRecord; awakened_agent_ids?: string[]; subagent_runs?: Array<{ run_id: string; session_id: string; agent_id: string; status: string }> }>(`/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages`, {
+            method: 'POST',
+            body: JSON.stringify({ ...payload, client_message_id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}` }),
+        }),
     createEvent: (projectId: string, payload: { event_type: string; summary?: string; work_item_id?: string; run_id?: string; actor_agent_id?: string; metadata?: JsonRecord }) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/events`, { method: 'POST', body: JSON.stringify(payload) }),
     patchMember: (projectId: string, memberId: string, payload: { is_enabled?: boolean; is_leader?: boolean; config_snapshot?: JsonRecord }) =>

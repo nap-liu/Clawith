@@ -31,6 +31,15 @@ class SubagentRun(Base):
         nullable=False,
         index=True,
     )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    project_member_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("project_member_snapshots.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     execution_user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id"),
@@ -48,6 +57,11 @@ class SubagentRun(Base):
             "parent_session_id",
             "origin_tool_call_id",
             name="uq_subagent_runs_parent_tool_call",
+        ),
+        UniqueConstraint(
+            "parent_session_id",
+            "project_member_id",
+            name="uq_subagent_runs_project_group_member",
         ),
         Index("ix_subagent_runs_status_lease", "status", "lease_expires_at"),
     )

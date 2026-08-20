@@ -321,6 +321,24 @@ class A2AWakeRequest(BaseModel):
     new_conversation: bool = False
 
 
+class ProjectGroupMessageCreate(BaseModel):
+    content: str = Field(default="", max_length=100_000)
+    # Attachment extraction can be substantially larger than the compact
+    # timeline label. It is execution-only input and is not duplicated in
+    # ChatMessage.message_meta.
+    llm_content: str | None = Field(default=None, max_length=250_000)
+    mentions: list[uuid.UUID] = Field(default_factory=list)
+    attachments: list[dict] = Field(default_factory=list, max_length=10)
+    sender_agent_id: uuid.UUID | None = None
+    client_message_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def require_content_or_attachment(self):
+        if not self.content.strip() and not (self.llm_content or "").strip() and not self.attachments:
+            raise ValueError("content, llm_content, or attachments is required")
+        return self
+
+
 class GitRestoreRequest(BaseModel):
     commit: str = Field(pattern=r"^[0-9a-fA-F]{7,64}$")
     message: str | None = None

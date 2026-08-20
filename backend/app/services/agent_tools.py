@@ -11218,6 +11218,12 @@ async def _send_message_to_agent(
     msg_type = args.get("msg_type", "notify").strip().lower()
     force_async = bool(args.get("force_async"))
     new_conversation = bool(args.get("new_conversation"))
+    project_id = None
+    if args.get("_project_id"):
+        try:
+            project_id = uuid.UUID(str(args["_project_id"]))
+        except (TypeError, ValueError):
+            return "❌ _project_id must be a complete platform UUID"
 
     if not canonical_agent_id or not message_text:
         return "❌ Please provide canonical agent_id and message content"
@@ -11246,7 +11252,7 @@ async def _send_message_to_agent(
 
             try:
                 recipient = await resolve_agent_recipient(
-                    db, from_agent_id, canonical_agent_id
+                    db, from_agent_id, canonical_agent_id, project_id=project_id
                 )
             except RecipientResolutionError as exc:
                 return exc.as_json()
@@ -11306,7 +11312,7 @@ async def _send_message_to_agent(
                     if {
                         replay_session.agent_id,
                         replay_session.peer_agent_id,
-                    } != expected_pair or replay_session.source_channel != "agent":
+                    } != expected_pair or replay_session.source_channel != "agent" or replay_session.project_id != project_id:
                         return "❌ The recorded message's conversation route changed"
                     recorded_openclaw_outbound = candidate
 
@@ -11325,6 +11331,7 @@ async def _send_message_to_agent(
                         ChatSession.agent_id == session_agent_id,
                         ChatSession.peer_agent_id == session_peer_id,
                         ChatSession.source_channel == "agent",
+                        ChatSession.project_id == project_id if project_id else ChatSession.project_id.is_(None),
                     ).order_by(
                         ChatSession.last_message_at.desc().nulls_last(),
                         ChatSession.created_at.desc(),
@@ -11333,7 +11340,7 @@ async def _send_message_to_agent(
                 chat_session = sess_r.scalars().first()
 
             if not chat_session:
-                _ext = None
+                _ext = f"project-a2a:{project_id}:{session_peer_id}" if project_id else None
                 _suffix = ""
                 if new_conversation:
                     from sqlalchemy import func as _sa_func
@@ -11343,12 +11350,14 @@ async def _send_message_to_agent(
                             ChatSession.agent_id == session_agent_id,
                             ChatSession.peer_agent_id == session_peer_id,
                             ChatSession.source_channel == "agent",
+                            ChatSession.project_id == project_id if project_id else ChatSession.project_id.is_(None),
                         )
                     )
                     _suffix = f" #{(_cnt_r.scalar() or 0) + 1}"
                 src_part_id = src_participant.id if src_participant else None
                 chat_session = ChatSession(
                     agent_id=session_agent_id,
+                    project_id=project_id,
                     user_id=owner_id,
                     title=f"{source_name} ↔ {target.name}{_suffix}",
                     source_channel="agent",

@@ -149,7 +149,11 @@ def _parse_skill_frontmatter(content: str, filename: str) -> tuple[str, str]:
     return name, description
 
 
-async def _load_skills_index(agent_id: uuid.UUID) -> str:
+async def _load_skills_index(
+    agent_id: uuid.UUID,
+    *,
+    allowed_names: set[str] | None = None,
+) -> str:
     """Load skill index (name + description) from skills/ directory.
 
     Supports two formats:
@@ -194,7 +198,10 @@ async def _load_skills_index(agent_id: uuid.UUID) -> str:
     # Deduplicate by name
     seen: set[str] = set()
     unique: list[tuple[str, str, str]] = []
+    normalized_allowed = {name.casefold() for name in allowed_names} if allowed_names is not None else None
     for s in skills:
+        if normalized_allowed is not None and s[0].casefold() not in normalized_allowed:
+            continue
         if s[0] not in seen:
             seen.add(s[0])
             unique.append(s)
@@ -547,8 +554,30 @@ async def build_agent_context(
     if soul.startswith("# "):
         soul = "\n".join(soul.split("\n")[1:]).strip()
 
-    # --- Skills index (progressive disclosure) ---
-    skills_text = await _load_skills_index(agent_id)
+    # Project durable children execute against the project capability snapshot,
+    # not every Skill carried by the mutable source Agent. An empty snapshot is
+    # intentionally deny-all for Skills.
+    project_runtime: dict | None = None
+    allowed_skill_names: set[str] | None = None
+    runtime_session_id = str((channel_context or {}).get("session_id") or "").strip()
+    if runtime_session_id:
+        try:
+            from app.database import async_session as _context_session
+            from app.models.chat_session import ChatSession
+
+            async with _context_session() as _db:
+                runtime_session = await _db.get(ChatSession, uuid.UUID(runtime_session_id))
+                config = dict(runtime_session.im_config or {}) if runtime_session else {}
+                if config.get("project_id"):
+                    project_runtime = config
+                    allowed_skill_names = {
+                        str(capability.get("name") or "")
+                        for capability in config.get("capability_snapshot", [])
+                        if isinstance(capability, dict) and capability.get("type") == "skill"
+                    }
+        except (TypeError, ValueError):
+            project_runtime = None
+    skills_text = await _load_skills_index(agent_id, allowed_names=allowed_skill_names)
 
     # --- Relationships (read live from the database) ---
     # relationships.md is no longer generated (api/relationships.py:_regenerate_
@@ -892,6 +921,15 @@ Strict rules:
 
     if skills_text:
         static_parts.append(f"\n## Skills\n{skills_text}")
+
+    if project_runtime is not None:
+        dynamic_parts.append(
+            "\n## Project Runtime Boundary\n"
+            f"project_id: {project_runtime.get('project_id')}\n"
+            f"project_group_session_id: {project_runtime.get('project_group_session_id')}\n"
+            "Only the immutable project capability snapshot applies. Skills and MCPs absent "
+            "from that snapshot are unavailable even if the source Agent later enables them."
+        )
 
     if relationships and "暂无" not in relationships and "None yet" not in relationships:
         static_parts.append(f"\n## Relationships\n{relationships}")

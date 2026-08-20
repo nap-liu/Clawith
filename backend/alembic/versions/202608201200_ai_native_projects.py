@@ -27,6 +27,11 @@ def _timestamps() -> list[sa.Column]:
 
 
 def upgrade() -> None:
+    # The repository's baseline migration creates current Base.metadata for a
+    # fresh database. In that path these tables already exist; historical
+    # databases reaching this revision still need the explicit DDL below.
+    if sa.inspect(op.get_bind()).has_table("projects"):
+        return
     op.create_table(
         "project_templates",
         sa.Column("id", UUID, primary_key=True),

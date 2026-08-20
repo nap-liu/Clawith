@@ -21,15 +21,21 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import app.models.agent  # noqa: F401
+import app.models.audit  # noqa: F401
+import app.models.chat_compaction  # noqa: F401
+import app.models.chat_session  # noqa: F401
 import app.models.llm  # noqa: F401
 import app.models.org  # noqa: F401
+import app.models.participant  # noqa: F401
 import app.models.project  # noqa: F401
 import app.models.tenant  # noqa: F401
 import app.models.user  # noqa: F401
+import app.models.subagent_run  # noqa: F401
 from app.api import projects as projects_api
 from app.core.security import get_current_user
 from app.database import Base, get_db
 from app.models.agent import Agent
+from app.models.audit import ChatMessage
 from app.models.project import ProjectEvent
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
@@ -45,6 +51,7 @@ TABLES = [
     "agent_templates",
     "agents",
     "agent_agent_relationships",
+    "participants",
     "project_templates",
     "projects",
     "project_access_grants",
@@ -54,6 +61,10 @@ TABLES = [
     "project_runs",
     "project_run_member_snapshots",
     "project_events",
+    "chat_sessions",
+    "chat_messages",
+    "chat_compactions",
+    "subagent_runs",
 ]
 
 
@@ -61,6 +72,7 @@ TABLES = [
 class ProjectApiEnv:
     client: AsyncClient
     db: AsyncSession
+    session_factory: Any
     tenant_id: uuid.UUID
     owner_id: uuid.UUID
     viewer_id: uuid.UUID
@@ -128,6 +140,10 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
         )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     session = session_factory()
+    # Durable subagent helpers intentionally open their own transaction. Point
+    # that runtime at the same isolated test database instead of the process
+    # default database configured for production.
+    monkeypatch.setattr("app.services.subagent_runtime.async_session", session_factory)
 
     tenant = Tenant(name="Project API", slug=f"project-api-{uuid.uuid4().hex[:8]}")
     session.add(tenant)
@@ -182,6 +198,7 @@ async def project_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncI
         yield ProjectApiEnv(
             client=client,
             db=session,
+            session_factory=session_factory,
             tenant_id=tenant_id,
             owner_id=owner_id,
             viewer_id=viewer_id,
@@ -383,6 +400,241 @@ async def test_member_and_run_snapshots_are_isolated_and_a2a_bypasses_leader(pro
     assert {"run.queued", "capability.updated", "member.snapshot.updated"} <= {
         event["event_type"] for event in events
     }
+
+
+async def test_project_a2a_delivery_returns_scoped_session_identifiers(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.models.chat_session import ChatSession
+    from app.models.project import ProjectRun
+    from app.services import agent_tools, project_service
+
+    env = project_api
+    project = await _create_project(env, name="A2A session identity")
+    queued = await env.client.post(
+        f"/api/projects/{project['id']}/a2a",
+        json={
+            "from_agent_id": str(env.worker_id),
+            "to_agent_id": str(env.reviewer_id),
+            "message": "Return the exact project thread",
+            "mode": "notify",
+        },
+    )
+    assert queued.status_code == 202, queued.text
+    queued_body = queued.json()
+
+    async def scoped_sender(from_agent_id, args, **_kwargs):
+        project_id = uuid.UUID(args["_project_id"])
+        target_id = uuid.UUID(args["agent_id"])
+        access_id = min(from_agent_id, target_id, key=str)
+        peer_id = max(from_agent_id, target_id, key=str)
+        async with env.session_factory() as delivery_db:
+            delivery_db.add(
+                ChatSession(
+                    project_id=project_id,
+                    agent_id=access_id,
+                    peer_agent_id=peer_id,
+                    source_channel="agent",
+                    title="Worker ↔ Reviewer",
+                    external_conv_id=f"project-a2a:{project_id}:{peer_id}",
+                )
+            )
+            await delivery_db.commit()
+        return "✅ Notification sent"
+
+    monkeypatch.setattr(project_service, "async_session", env.session_factory)
+    monkeypatch.setattr(agent_tools, "_send_message_to_agent", scoped_sender)
+    await project_service.deliver_project_a2a(uuid.UUID(queued_body["run_id"]))
+
+    env.db.expire_all()
+    run = await env.db.get(ProjectRun, uuid.UUID(queued_body["run_id"]))
+    assert run is not None and run.status == "succeeded"
+    assert run.output["group_session_id"] == queued_body["group_session_id"]
+    assert run.output["session_id"]
+    assert run.output["session_agent_id"] == run.output["session_access_agent_id"]
+    assert run.output["session_title"] == "Worker ↔ Reviewer"
+    delivered = (
+        await env.db.execute(
+            select(ProjectEvent).where(
+                ProjectEvent.run_id == run.id,
+                ProjectEvent.event_type == "a2a.delivered",
+            )
+        )
+    ).scalar_one()
+    assert delivered.event_metadata["session_id"] == run.output["session_id"]
+    assert delivered.event_metadata["group_session_id"] == queued_body["group_session_id"]
+
+
+async def test_project_group_mentions_are_explicit_bounded_and_reuse_durable_child(project_api: ProjectApiEnv):
+    env = project_api
+    project = await _create_project(env, name="Project Agent Group")
+    project_id = project["id"]
+
+    group_response = await env.client.get(f"/api/projects/{project_id}/group-session")
+    assert group_response.status_code == 200, group_response.text
+    group = group_response.json()
+    assert group["source_channel"] == "project"
+
+    passive = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Visible update only", "mentions": [], "attachments": []},
+    )
+    assert passive.status_code == 201, passive.text
+    assert passive.json()["awakened_agent_ids"] == []
+    assert passive.json()["subagent_runs"] == []
+    assert passive.json()["message"]["message_meta"]["visible_to_group"] is True
+
+    mentioned = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={
+            "content": "Worker build and Reviewer check",
+            "llm_content": "[brief.md extracted]\nBuild the evidence and review every acceptance item.",
+            "mentions": [str(env.worker_id), str(env.reviewer_id), str(env.worker_id)],
+            "attachments": [{"name": "brief.md", "path": "brief.md"}],
+            "client_message_id": "mention-1",
+        },
+    )
+    assert mentioned.status_code == 201, mentioned.text
+    body = mentioned.json()
+    assert body["awakened_agent_ids"] == [str(env.worker_id), str(env.reviewer_id)]
+    assert len(body["subagent_runs"]) == 2
+    assert all(row["project_run_id"] for row in body["subagent_runs"])
+    assert body["message"]["display_content"] == "Worker build and Reviewer check"
+    worker_child = next(row for row in body["subagent_runs"] if row["agent_id"] == str(env.worker_id))
+    worker_input = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == worker_child["session_id"],
+                ChatMessage.message_meta["project_run_id"].as_string()
+                == worker_child["project_run_id"],
+            )
+        )
+    ).scalar_one()
+    assert worker_input.content.startswith("[brief.md extracted]")
+
+    replay = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={
+            "content": "Worker build and Reviewer check",
+            "mentions": [str(env.worker_id), str(env.reviewer_id)],
+            "client_message_id": "mention-1",
+        },
+    )
+    assert replay.status_code == 201
+    assert replay.json()["idempotent_replay"] is True
+    assert replay.json()["subagent_runs"] == body["subagent_runs"]
+
+    reused = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Worker follow-up", "mentions": [str(env.worker_id)]},
+    )
+    assert reused.status_code == 201, reused.text
+    assert reused.json()["subagent_runs"][0]["session_id"] == worker_child["session_id"]
+    assert reused.json()["subagent_runs"][0]["project_run_id"] != worker_child["project_run_id"]
+
+    self_mention = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={
+            "content": "No self wake",
+            "sender_agent_id": str(env.worker_id),
+            "mentions": [str(env.worker_id)],
+        },
+    )
+    assert self_mention.status_code == 422
+
+    history = await env.client.get(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages?limit=500"
+    )
+    assert history.status_code == 200
+    assert len(history.json()["items"]) == 3
+    attachment_message = next(
+        item for item in history.json()["items"] if item["attachments"]
+    )
+    assert attachment_message["attachments"][0]["name"] == "brief.md"
+
+
+async def test_project_subagent_reply_materializes_without_resuming_group_root(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from app.models.audit import ChatMessage
+    from app.models.chat_session import ChatSession
+    from app.models.project import ProjectRun
+    from app.models.subagent_run import SubagentRun
+    from app.services import subagent_runtime
+
+    env = project_api
+    project = await _create_project(env, name="Passive child reply")
+    group = (await env.client.get(f"/api/projects/{project['id']}/group-session")).json()
+    wake = await env.client.post(
+        f"/api/projects/{project['id']}/group-sessions/{group['id']}/messages",
+        json={"content": "Worker answer once", "mentions": [str(env.worker_id)]},
+    )
+    assert wake.status_code == 201, wake.text
+    child_id = uuid.UUID(wake.json()["subagent_runs"][0]["session_id"])
+    project_run_id = uuid.UUID(wake.json()["subagent_runs"][0]["project_run_id"])
+    child_input = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(child_id),
+                ChatMessage.message_meta["project_run_id"].as_string() == str(project_run_id),
+            )
+        )
+    ).scalar_one()
+    child_input.message_meta = {
+        **dict(child_input.message_meta or {}),
+        "subagent_input_state": "processing",
+        "subagent_turn_anchor_id": str(child_input.id),
+        "turn_status": "running",
+    }
+    durable_run = await env.db.get(SubagentRun, child_id)
+    assert durable_run is not None
+    durable_run.status = "running"
+    durable_run.lease_owner = subagent_runtime.settings.INSTANCE_ID
+    await env.db.commit()
+
+    terminal = await subagent_runtime._finish_subagent_turn(
+        run_id=child_id,
+        anchor_id=child_input.id,
+        reply="Worker result",
+        failed=False,
+    )
+    assert terminal is True
+    env.db.expire_all()
+    project_run = await env.db.get(ProjectRun, project_run_id)
+    assert project_run is not None and project_run.status == "succeeded"
+    assert project_run.finished_at is not None
+    assert project_run.output["subagent_session_id"] == str(child_id)
+    assert project_run.output["result"] == "Worker result"
+    completion = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(child_id),
+                ChatMessage.message_meta["kind"].as_string() == "subagent_completion",
+            )
+        )
+    ).scalar_one()
+
+    async def forbidden_resume(_anchor):
+        raise AssertionError("project group completion must not resume root LLM")
+
+    monkeypatch.setattr("app.services.turn_recovery.resume_turn", forbidden_resume)
+    assert await subagent_runtime._dispatch_parent_event(completion.id) is True
+    materialized = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.external_event_key == f"project-subagent:{completion.id}"
+            )
+        )
+    ).scalar_one()
+    assert materialized.conversation_id == group["id"]
+    assert materialized.sender_agent_id == env.worker_id
+    assert materialized.message_meta["visible_to_group"] is True
+    assert materialized.message_meta["mentions"] == []
+    assert materialized.message_meta["awakened_agent_ids"] == []
+    parent = await env.db.get(ChatSession, uuid.UUID(group["id"]))
+    assert parent is not None and parent.source_channel == "project"
 
 
 async def test_work_item_mutations_update_dashboard_and_audit(project_api: ProjectApiEnv):

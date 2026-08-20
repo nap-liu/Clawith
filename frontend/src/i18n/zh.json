@@ -3,6 +3,39 @@
     "name": "数字员工平台",
     "tagline": "企业数字员工平台"
   },
+  "projectAudit": {
+    "actorColumn": "执行主体",
+    "filterActor": "筛选执行主体",
+    "allActors": "全部执行主体",
+    "projectAgent": "项目 Agent",
+    "projectUser": "项目用户",
+    "projectSystem": "项目系统",
+    "events": {
+      "project": {
+        "created": "创建项目",
+        "initialized": "初始化项目",
+        "updated": "更新项目",
+        "archived": "归档项目",
+        "shared": "共享项目",
+        "unshared": "取消共享",
+        "settings": { "updated": "更新项目设置" },
+        "file": { "committed": "提交项目文件" }
+      },
+      "member": { "snapshot": { "created": "创建成员快照", "updated": "更新成员快照" } },
+      "leader": { "changed": "变更项目 Leader" },
+      "capability": { "bound": "绑定项目能力", "updated": "更新项目能力" },
+      "work_item": { "created": "创建工作项", "updated": "更新工作项" },
+      "run": { "queued": "运行进入队列" },
+      "a2a": { "queued": "A2A 请求进入队列", "delivered": "A2A 消息已送达", "delivery_failed": "A2A 消息送达失败" },
+      "group": { "message": { "created": "创建项目群消息" } },
+      "git": {
+        "commit": { "created": "创建 Git 提交" },
+        "milestone": { "created": "创建交付里程碑" },
+        "branch": { "created": "创建 Git 分支" },
+        "restore_commit": { "created": "创建恢复提交" }
+      }
+    }
+  },
   "login": {
     "hero": {
       "badge": "开源 · 多智能体协作",

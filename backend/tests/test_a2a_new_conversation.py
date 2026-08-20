@@ -64,10 +64,12 @@ class RecordingDB:
     def __init__(self, responses=None):
         self.responses = list(responses or [])
         self.added = []
+        self.statements = []
         self.committed = False
         self.flushed = False
 
     async def execute(self, _statement, _params=None):
+        self.statements.append(_statement)
         if not self.responses:
             raise AssertionError(
                 f"unexpected execute() call — no more responses queued. "
@@ -83,6 +85,23 @@ class RecordingDB:
 
     async def flush(self):
         self.flushed = True
+
+
+def _project_notify_db(*, source_agent, target_agent, existing_session=None):
+    """Recording DB for one native notify through an active relationship."""
+    responses = [
+        DummyResult(scalar_value=source_agent),
+        DummyResult(scalars_list=[target_agent]),
+        DummyResult(scalar_value=uuid.uuid4()),
+        DummyResult(scalar_value=_make_participant(ref_id=source_agent.id)),
+        DummyResult(scalar_value=_make_participant(ref_id=target_agent.id)),
+        DummyResult(values=[existing_session] if existing_session else []),
+    ]
+    if existing_session is None:
+        responses.append(DummyResult(scalar_value=_make_tenant()))
+    else:
+        responses.append(DummyResult(scalar_value=_make_tenant()))
+    return RecordingDB(responses=responses)
 
 
 def _make_agent(agent_id=None, name="TestAgent", tenant_id=None, agent_type="native",
@@ -290,3 +309,108 @@ async def test_default_reuses_existing_session_no_new_session_added():
         f"Expected 0 new ChatSessions (reuse path), got {len(chat_sessions)}: {db.added}"
     )
     assert "Notification sent" in result
+
+
+@pytest.mark.asyncio
+async def test_project_scope_creates_distinct_threads_for_same_agent_pair():
+    """The same pair in two projects must never share its ordinary/A2A thread."""
+    from app.models.chat_session import ChatSession
+    from app.services.agent_tools import _send_message_to_agent
+
+    source = _make_agent(name="Alice")
+    target = _make_agent(name="Bob", tenant_id=source.tenant_id)
+    projects = [uuid.uuid4(), uuid.uuid4()]
+    created = []
+
+    for project_id in projects:
+        db = _project_notify_db(source_agent=source, target_agent=target)
+        with patch("app.services.agent_tools.async_session") as session_ctx, patch(
+            "app.services.agent_tools._wake_agent_async", new_callable=AsyncMock
+        ):
+            session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
+            session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await _send_message_to_agent(
+                source.id,
+                {
+                    "agent_id": str(target.id),
+                    "message": "Project scoped update",
+                    "msg_type": "notify",
+                    "force_async": True,
+                    "_project_id": str(project_id),
+                },
+            )
+        assert "Notification sent" in result
+        session = next(row for row in db.added if isinstance(row, ChatSession))
+        created.append(session)
+        session_lookup = str(db.statements[5])
+        assert "chat_sessions.project_id =" in session_lookup
+
+    assert [row.project_id for row in created] == projects
+    assert created[0].external_conv_id != created[1].external_conv_id
+
+
+@pytest.mark.asyncio
+async def test_same_project_reuses_scoped_thread_and_new_conversation_stays_scoped():
+    from app.models.chat_session import ChatSession
+    from app.services.agent_tools import _send_message_to_agent
+
+    source = _make_agent(name="Alice")
+    target = _make_agent(name="Bob", tenant_id=source.tenant_id)
+    project_id = uuid.uuid4()
+    existing = MagicMock()
+    existing.id = uuid.uuid4()
+    existing.last_message_at = None
+    existing.project_id = project_id
+    db = _project_notify_db(
+        source_agent=source,
+        target_agent=target,
+        existing_session=existing,
+    )
+    with patch("app.services.agent_tools.async_session") as session_ctx, patch(
+        "app.services.agent_tools._wake_agent_async", new_callable=AsyncMock
+    ):
+        session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
+        session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+        result = await _send_message_to_agent(
+            source.id,
+            {
+                "agent_id": str(target.id),
+                "message": "Reuse this project thread",
+                "msg_type": "notify",
+                "force_async": True,
+                "_project_id": str(project_id),
+            },
+        )
+    assert "Notification sent" in result
+    assert not [row for row in db.added if isinstance(row, ChatSession)]
+
+    fresh_db = RecordingDB(
+        responses=[
+            DummyResult(scalar_value=source),
+            DummyResult(scalars_list=[target]),
+            DummyResult(scalar_value=uuid.uuid4()),
+            DummyResult(scalar_value=_make_participant(ref_id=source.id)),
+            DummyResult(scalar_value=_make_participant(ref_id=target.id)),
+            DummyResult(scalar_value=1),
+            DummyResult(scalar_value=_make_tenant()),
+        ]
+    )
+    with patch("app.services.agent_tools.async_session") as session_ctx, patch(
+        "app.services.agent_tools._wake_agent_async", new_callable=AsyncMock
+    ):
+        session_ctx.return_value.__aenter__ = AsyncMock(return_value=fresh_db)
+        session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+        await _send_message_to_agent(
+            source.id,
+            {
+                "agent_id": str(target.id),
+                "message": "Explicit fresh thread",
+                "msg_type": "notify",
+                "force_async": True,
+                "new_conversation": True,
+                "_project_id": str(project_id),
+            },
+        )
+    fresh = next(row for row in fresh_db.added if isinstance(row, ChatSession))
+    assert fresh.project_id == project_id
+    assert fresh.external_conv_id.startswith("a2a-")

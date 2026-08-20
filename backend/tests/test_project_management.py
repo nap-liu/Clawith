@@ -9,8 +9,10 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.models.agent  # noqa: F401
+import app.models.chat_session  # noqa: F401
 import app.models.llm  # noqa: F401
 import app.models.org  # noqa: F401
+import app.models.participant  # noqa: F401
 import app.models.project  # noqa: F401
 import app.models.tenant  # noqa: F401
 import app.models.user  # noqa: F401
@@ -39,6 +41,7 @@ TABLES = [
     "agent_templates",
     "agents",
     "agent_agent_relationships",
+    "participants",
     "project_templates",
     "projects",
     "project_access_grants",
@@ -48,6 +51,7 @@ TABLES = [
     "project_runs",
     "project_run_member_snapshots",
     "project_events",
+    "chat_sessions",
 ]
 
 

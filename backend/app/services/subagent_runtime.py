@@ -60,10 +60,25 @@ def _run_owned_by_parent(run: SubagentRun, parent_session_id: uuid.UUID) -> bool
     return run.parent_session_id == parent_session_id
 
 
-def _agent_participates(session: ChatSession, agent_id: uuid.UUID) -> bool:
-    return session.agent_id == agent_id or (
+async def _agent_participates(db, session: ChatSession, agent_id: uuid.UUID) -> bool:
+    if session.agent_id == agent_id or (
         session.source_channel == "agent" and session.peer_agent_id == agent_id
-    )
+    ):
+        return True
+    if session.source_channel != "project" or session.project_id is None:
+        return False
+    from app.models.project import ProjectMemberSnapshot
+
+    member_id = (
+        await db.execute(
+            select(ProjectMemberSnapshot.id).where(
+                ProjectMemberSnapshot.project_id == session.project_id,
+                ProjectMemberSnapshot.agent_id == agent_id,
+                ProjectMemberSnapshot.is_enabled.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    return member_id is not None
 
 
 def _task_title(task: str) -> str:
@@ -210,6 +225,7 @@ async def create_subagent(
     model: str | None = None,
     fork: bool = False,
     turn_anchor_id: uuid.UUID | None = None,
+    project_run_id: uuid.UUID | None = None,
 ) -> tuple[SubagentRun, bool]:
     """Create one child Session and lifecycle row, idempotent per parent tool call."""
     task_text = str(task or "").strip()
@@ -229,7 +245,7 @@ async def create_subagent(
     async with async_session() as db:
         agent = await db.get(Agent, agent_id)
         parent = await db.get(ChatSession, parent_id)
-        if agent is None or parent is None or not _agent_participates(parent, agent_id):
+        if agent is None or parent is None or not await _agent_participates(db, parent, agent_id):
             raise SubagentError("当前 Agent 无权从这个 Session 创建 Subagent。")
         if parent.source_channel == SUBAGENT_CHANNEL:
             raise SubagentError("Subagent 不能继续创建 Subagent。")
@@ -277,20 +293,71 @@ async def create_subagent(
             and parent.source_channel not in {"agent", "trigger", SUBAGENT_CHANNEL}
             else None
         )
+        project_member = None
+        project_capabilities: list[dict] = []
+        if parent.project_id is not None:
+            from app.models.project import ProjectCapabilityBinding, ProjectMemberSnapshot
+
+            project_member = (
+                await db.execute(
+                    select(ProjectMemberSnapshot).where(
+                        ProjectMemberSnapshot.project_id == parent.project_id,
+                        ProjectMemberSnapshot.agent_id == agent_id,
+                        ProjectMemberSnapshot.is_enabled.is_(True),
+                    )
+                )
+            ).scalar_one_or_none()
+            if project_member is None:
+                raise SubagentError("目标 Agent 不是当前项目的已启用成员。")
+            bindings = (
+                await db.execute(
+                    select(ProjectCapabilityBinding).where(
+                        ProjectCapabilityBinding.project_id == parent.project_id,
+                        ProjectCapabilityBinding.is_enabled.is_(True),
+                        or_(
+                            ProjectCapabilityBinding.source == "shared",
+                            ProjectCapabilityBinding.inherited_from_agent_id == agent_id,
+                        ),
+                    )
+                )
+            ).scalars().all()
+            project_capabilities = [
+                {
+                    "binding_id": str(binding.id),
+                    "capability_id": str(binding.capability_id) if binding.capability_id else None,
+                    "type": binding.capability_type,
+                    "name": binding.capability_name,
+                    "source": binding.source,
+                    "scope": binding.scope,
+                    "config": binding.config,
+                }
+                for binding in bindings
+            ]
+
         child = ChatSession(
             id=child_id,
             agent_id=agent_id,
+            project_id=parent.project_id,
             user_id=child_user_id,
             title=_task_title(task_text),
             source_channel=SUBAGENT_CHANNEL,
             is_primary=False,
             is_group=False,
+            im_config={
+                "project_id": str(parent.project_id) if parent.project_id else None,
+                "project_group_session_id": str(parent.id) if parent.project_id else None,
+                "project_member_id": str(project_member.id) if project_member else None,
+                "member_config_snapshot": dict(project_member.config_snapshot or {}) if project_member else {},
+                "capability_snapshot": project_capabilities,
+            },
             created_at=now,
             last_message_at=now,
         )
         run = SubagentRun(
             id=child_id,
             parent_session_id=parent.id,
+            project_id=parent.project_id,
+            project_member_id=project_member.id if project_member else None,
             execution_user_id=resolved_user_id,
             origin_tool_call_id=call_id,
             mode=normalized_mode,
@@ -326,6 +393,7 @@ async def create_subagent(
                 "kind": SUBAGENT_INPUT,
                 "subagent_input_state": INPUT_PENDING,
                 "attachments": [],
+                **({"project_run_id": str(project_run_id)} if project_run_id else {}),
             },
             created_at=message_time,
         )
@@ -351,6 +419,7 @@ async def append_subagent_message(
     message: str,
     execution_user_id: uuid.UUID,
     origin_tool_call_id: str,
+    project_run_id: uuid.UUID | None = None,
 ) -> str:
     content = str(message or "").strip()
     if not content:
@@ -400,6 +469,7 @@ async def append_subagent_message(
                     "kind": SUBAGENT_INPUT,
                     "subagent_input_state": INPUT_PENDING,
                     "attachments": [],
+                    **({"project_run_id": str(project_run_id)} if project_run_id else {}),
                 },
                 created_at=now,
             )
@@ -527,7 +597,10 @@ async def stop_subagent(
     return RUN_CANCELLED
 
 
-async def prepare_subagent_tools(agent_id: uuid.UUID) -> list[dict]:
+async def prepare_subagent_tools(
+    agent_id: uuid.UUID,
+    session_id: uuid.UUID | None = None,
+) -> list[dict]:
     """Return the Agent's normal tools with the child-only protocol surface."""
     from app.models.tool import AgentTool, Tool
     from app.services.agent_tools import get_agent_tools_for_llm
@@ -547,6 +620,44 @@ async def prepare_subagent_tools(agent_id: uuid.UUID) -> list[dict]:
         if tool.get("function", {}).get("name") not in hidden
     ]
     async with async_session() as db:
+        child = await db.get(ChatSession, session_id) if session_id else None
+        runtime_config = dict(child.im_config or {}) if child else {}
+        if runtime_config.get("project_id"):
+            # Builtins remain governed by the normal Agent tool policy. MCP is
+            # deny-by-default and re-enabled only by the immutable project
+            # snapshot captured when this child was created.
+            from app.models.tool import Tool
+
+            all_mcp_names = set(
+                (
+                    await db.execute(select(Tool.name).where(Tool.type == "mcp"))
+                ).scalars()
+            )
+            allowed_server_ids = {
+                uuid.UUID(str(entry["capability_id"]))
+                for entry in runtime_config.get("capability_snapshot", [])
+                if isinstance(entry, dict)
+                and entry.get("type") == "mcp"
+                and entry.get("capability_id")
+            }
+            allowed_mcp_names = set()
+            if allowed_server_ids:
+                allowed_mcp_names = set(
+                    (
+                        await db.execute(
+                            select(Tool.name).where(
+                                Tool.type == "mcp",
+                                Tool.mcp_server_id.in_(allowed_server_ids),
+                            )
+                        )
+                    ).scalars()
+                )
+            child_tools = [
+                item
+                for item in child_tools
+                if item.get("function", {}).get("name") not in all_mcp_names
+                or item.get("function", {}).get("name") in allowed_mcp_names
+            ]
         row = (
             await db.execute(
                 select(Tool, AgentTool)
@@ -796,6 +907,42 @@ async def _finish_subagent_turn(
         content = (reply or "").strip() or (
             "Subagent 执行失败，未返回错误详情。" if failed else "Subagent 已完成。"
         )
+        # One durable child Session may process many separately auditable
+        # project mentions. Complete every ProjectRun whose exact input was
+        # consumed by this turn; do not leave the Runs UI permanently queued.
+        from app.models.project import ProjectRun
+
+        now = datetime.now(UTC)
+        project_run_ids: set[uuid.UUID] = set()
+        for row in processed:
+            raw_project_run_id = _message_meta(row).get("project_run_id")
+            if raw_project_run_id:
+                try:
+                    project_run_ids.add(uuid.UUID(str(raw_project_run_id)))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[subagent] ignoring invalid project_run_id on input=%s",
+                        row.id,
+                    )
+        if project_run_ids:
+            project_runs = (
+                await db.execute(
+                    select(ProjectRun).where(
+                        ProjectRun.id.in_(project_run_ids),
+                        ProjectRun.project_id == run.project_id,
+                    )
+                )
+            ).scalars().all()
+            for project_run in project_runs:
+                project_run.status = "failed" if failed else "succeeded"
+                project_run.finished_at = now
+                project_run.output = {
+                    **dict(project_run.output or {}),
+                    "subagent_run_id": str(run.id),
+                    "subagent_session_id": str(run.id),
+                    "result": content,
+                }
+                project_run.error = content if failed else None
         await persist_assistant_reply_row(
             db,
             agent_id=child.agent_id,
@@ -809,7 +956,7 @@ async def _finish_subagent_turn(
             },
             turn_anchor_id=anchor_id,
         )
-        child.last_message_at = datetime.now(UTC)
+        child.last_message_at = now
         if terminal:
             run.status = RUN_FAILED if failed else RUN_COMPLETED
             run.lease_owner = None
@@ -910,7 +1057,7 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     )
                     if history is None:
                         raise RuntimeError("Subagent fresh turn prefix changed")
-                tools = await prepare_subagent_tools(child.agent_id)
+                tools = await prepare_subagent_tools(child.agent_id, child.id)
                 reply = await _call_agent_llm(
                     db,
                     child.agent_id,
@@ -1101,6 +1248,7 @@ async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
     async with async_session() as db:
         parent_anchor = aliased(ChatMessage)
         parent_final = aliased(ChatMessage)
+        project_materialized = aliased(ChatMessage)
         completed_exists = exists(
             select(parent_final.id)
             .select_from(parent_anchor)
@@ -1114,6 +1262,12 @@ async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
                 parent_final.role == "assistant",
                 parent_final.message_meta["turn_anchor_id"].as_string()
                 == cast(parent_anchor.id, String),
+            )
+        )
+        project_materialized_exists = exists(
+            select(project_materialized.id).where(
+                project_materialized.external_event_key
+                == ("project-subagent:" + cast(ChatMessage.id, String))
             )
         )
         rows = (
@@ -1134,6 +1288,7 @@ async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
                         ]
                     ),
                     ~completed_exists,
+                    ~project_materialized_exists,
                 )
                 .order_by(ChatMessage.created_at, ChatMessage.id)
                 .limit(limit)
@@ -1165,6 +1320,51 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
         if run is None or child is None or parent is None:
             return True
         lock_key = chat_session_lock_key(parent)
+
+    if parent.source_channel == "project" and parent.project_id is not None:
+        # Project Agent Group is an append-only coordination surface. Child
+        # output becomes a visible group reply but never resumes the root/Leader
+        # LLM, so completion cannot fan out into an implicit broadcast storm.
+        external_key = f"project-subagent:{child_message_id}"
+        async with async_session() as db:
+            existing = (
+                await db.execute(
+                    select(ChatMessage.id).where(
+                        ChatMessage.external_event_key == external_key
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return True
+            db.add(
+                ChatMessage(
+                    agent_id=parent.agent_id,
+                    sender_agent_id=child.agent_id,
+                    role="assistant",
+                    content=event.content,
+                    conversation_id=str(parent.id),
+                    external_event_key=external_key,
+                    message_meta={
+                        "kind": "project_subagent_reply",
+                        "project_id": str(parent.project_id),
+                        "visible_to_group": True,
+                        "mentions": [],
+                        "awakened_agent_ids": [],
+                        "subagent_id": str(child.id),
+                        "child_message_id": str(child_message_id),
+                        "attachments": _message_meta(event).get("attachments", []),
+                        "wake_policy": "append_only_no_reply_wake",
+                    },
+                )
+            )
+            stored_parent = await db.get(ChatSession, parent.id)
+            if stored_parent is not None:
+                stored_parent.last_message_at = datetime.now(UTC)
+            try:
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
+            return True
 
     external_key = f"subagent-parent:{child_message_id}"
 

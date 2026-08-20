@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
+from app.models.audit import ChatMessage
+from app.models.chat_session import ChatSession
 from app.models.mcp_server import MCPServer
 from app.models.project import (
     Project,
@@ -22,6 +24,7 @@ from app.models.project import (
     ProjectWorkItem,
 )
 from app.models.skill import Skill
+from app.models.subagent_run import SubagentRun
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.schemas.project import (
@@ -40,6 +43,7 @@ from app.schemas.project import (
     ProjectEventOut,
     ProjectFileWriteRequest,
     ProjectFromTemplateCreate,
+    ProjectGroupMessageCreate,
     ProjectMemberCreate,
     ProjectMemberOut,
     ProjectMemberUpdate,
@@ -70,6 +74,7 @@ from app.services.project_service import (
     apply_run_status,
     create_project,
     deliver_project_a2a,
+    ensure_project_group_session,
     freeze_run_members,
     project_summary,
     replace_access_grants,
@@ -1254,6 +1259,312 @@ async def create_project_event(
     return event
 
 
+def _group_session_payload(session: ChatSession) -> dict:
+    return {
+        "id": str(session.id),
+        "project_id": str(session.project_id) if session.project_id else None,
+        "title": session.title,
+        "group_name": session.group_name,
+        "source_channel": session.source_channel,
+        "access_agent_id": str(session.agent_id),
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "last_message_at": session.last_message_at.isoformat() if session.last_message_at else None,
+    }
+
+
+def _group_message_payload(message: ChatMessage) -> dict:
+    metadata = dict(message.message_meta or {})
+    return {
+        "id": str(message.id),
+        "session_id": message.conversation_id,
+        "content": message.content,
+        "display_content": message.content,
+        "role": message.role,
+        "sender_user_id": str(message.sender_user_id) if message.sender_user_id else None,
+        "sender_agent_id": str(message.sender_agent_id) if message.sender_agent_id else None,
+        "attachments": metadata.get("attachments", []),
+        "metadata": metadata,
+        "message_meta": metadata,
+        "created_at": message.created_at.isoformat() if message.created_at else None,
+    }
+
+
+@router.get("/{project_id}/group-session")
+async def get_project_group_session(
+    project_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_project(db, current_user, project_id)
+    session = await ensure_project_group_session(db, project)
+    await db.commit()
+    await db.refresh(session)
+    return _group_session_payload(session)
+
+
+@router.get("/{project_id}/group-sessions/{session_id}/messages")
+async def list_project_group_messages(
+    project_id: uuid.UUID,
+    session_id: uuid.UUID,
+    limit: int = Query(500, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_project(db, current_user, project_id)
+    session = (
+        await db.execute(
+            select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.project_id == project.id,
+                ChatSession.source_channel == "project",
+                ChatSession.is_group.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Project group session not found")
+    messages = (
+        await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.conversation_id == str(session.id))
+            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return {"session": _group_session_payload(session), "items": [_group_message_payload(row) for row in reversed(messages)]}
+
+
+@router.post("/{project_id}/group-sessions/{session_id}/messages", status_code=201)
+async def create_project_group_message(
+    project_id: uuid.UUID,
+    session_id: uuid.UUID,
+    data: ProjectGroupMessageCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Append one group-visible message and wake only structured mentions."""
+    from app.services.subagent_runtime import (
+        SubagentError,
+        append_subagent_message,
+        create_subagent,
+    )
+
+    project = await require_project(db, current_user, project_id, edit=True)
+    session = (
+        await db.execute(
+            select(ChatSession).where(
+                ChatSession.id == session_id,
+                ChatSession.project_id == project.id,
+                ChatSession.source_channel == "project",
+                ChatSession.is_group.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Project group session not found")
+
+    mention_ids = list(dict.fromkeys(data.mentions))
+    policies = dict((project.settings or {}).get("policies") or {})
+    mention_limit = min(8, max(1, int(policies.get("max_group_mentions_per_message", 4))))
+    wake_budget = min(mention_limit, max(0, int(policies.get("max_a2a_wakes", mention_limit))))
+    if len(mention_ids) > mention_limit or len(mention_ids) > wake_budget:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Structured mentions exceed this project's per-message wake budget ({wake_budget})",
+        )
+    if data.sender_agent_id and data.sender_agent_id in mention_ids:
+        raise HTTPException(status_code=422, detail="An Agent cannot mention itself")
+
+    required_agent_ids = set(mention_ids)
+    if data.sender_agent_id:
+        required_agent_ids.add(data.sender_agent_id)
+    members = (
+        await db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.agent_id.in_(required_agent_ids),
+            )
+        )
+    ).scalars().all() if required_agent_ids else []
+    member_by_agent = {member.agent_id: member for member in members}
+    if set(member_by_agent) != required_agent_ids:
+        raise HTTPException(status_code=422, detail="Every sender and mention must be a project member")
+    disabled = [agent_id for agent_id in mention_ids if not member_by_agent[agent_id].is_enabled]
+    if disabled:
+        raise HTTPException(status_code=422, detail="Disabled project members cannot be awakened")
+
+    event_key = f"project-group:{project.id}:{data.client_message_id}" if data.client_message_id else None
+    existing = None
+    if event_key:
+        existing = (
+            await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == event_key))
+        ).scalar_one_or_none()
+    if existing is not None:
+        meta = dict(existing.message_meta or {})
+        return {
+            "message": _group_message_payload(existing),
+            "awakened_agent_ids": meta.get("awakened_agent_ids", []),
+            "subagent_runs": meta.get("subagent_runs", []),
+            "idempotent_replay": True,
+        }
+
+    message = ChatMessage(
+        agent_id=session.agent_id,
+        user_id=current_user.id,
+        sender_user_id=None if data.sender_agent_id else current_user.id,
+        sender_agent_id=data.sender_agent_id,
+        role="user",
+        content=data.content.strip(),
+        conversation_id=str(session.id),
+        external_event_key=event_key,
+        message_meta={
+            "kind": "project_group_message",
+            "project_id": str(project.id),
+            "visible_to_group": True,
+            "mentions": [str(agent_id) for agent_id in mention_ids],
+            "attachments": data.attachments,
+            "awakened_agent_ids": [],
+            "subagent_runs": [],
+            "wake_policy": "structured_mentions_only",
+            "initiator_user_id": str(current_user.id),
+        },
+    )
+    db.add(message)
+    session.last_message_at = func.now()
+    await db.flush()
+    await db.commit()
+    await db.refresh(message)
+
+    awakened: list[str] = []
+    subagent_rows: list[dict] = []
+    execution_content = (data.llm_content or data.content).strip()
+    if not execution_content:
+        execution_content = (
+            "处理项目群聊中附带的文件，并把结论回复到项目群。附件："
+            + str(data.attachments)
+        )
+    for agent_id in mention_ids:
+        member = member_by_agent[agent_id]
+        existing_run = (
+            await db.execute(
+                select(SubagentRun).where(
+                    SubagentRun.parent_session_id == session.id,
+                    SubagentRun.project_member_id == member.id,
+                ).order_by(SubagentRun.id).limit(1)
+            )
+        ).scalar_one_or_none()
+        project_run = ProjectRun(
+            tenant_id=project.tenant_id,
+            project_id=project.id,
+            agent_id=agent_id,
+            initiated_by_user_id=current_user.id,
+            status="queued",
+            trigger_type="group_mention",
+            input={
+                "group_session_id": str(session.id),
+                "group_message_id": str(message.id),
+                "mentioned_agent_id": str(agent_id),
+                "initiator_user_id": str(current_user.id),
+            },
+            output={"group_session_id": str(session.id)},
+        )
+        db.add(project_run)
+        await db.flush()
+        await freeze_run_members(db, project, project_run)
+        # Commit the auditable wake before publishing the child input. A fast
+        # worker can then always resolve project_run_id when it finishes.
+        await db.commit()
+        try:
+            if existing_run is None:
+                durable_run, _created = await create_subagent(
+                    agent_id=agent_id,
+                    execution_user_id=project.owner_user_id,
+                    parent_session_id=str(session.id),
+                    origin_tool_call_id=f"project-member:{member.id}",
+                    task=execution_content,
+                    mode="async",
+                    fork=True,
+                    turn_anchor_id=message.id,
+                    project_run_id=project_run.id,
+                )
+                run_status = durable_run.status
+                run_id = durable_run.id
+            else:
+                run_id = existing_run.id
+                run_status = await append_subagent_message(
+                    agent_id=agent_id,
+                    parent_session_id=str(session.id),
+                    subagent_id=str(existing_run.id),
+                    message=execution_content,
+                    execution_user_id=existing_run.execution_user_id,
+                    origin_tool_call_id=f"group-message:{message.id}:{agent_id}",
+                    project_run_id=project_run.id,
+                )
+            awakened.append(str(agent_id))
+            project_run.status = "queued" if run_status == "queued" else "running"
+            project_run.output = {
+                **dict(project_run.output or {}),
+                "subagent_run_id": str(run_id),
+                "subagent_session_id": str(run_id),
+            }
+            subagent_rows.append({
+                "project_run_id": str(project_run.id),
+                "run_id": str(run_id),
+                "session_id": str(run_id),
+                "agent_id": str(agent_id),
+                "status": run_status,
+            })
+        except SubagentError as exc:
+            project_run.status = "failed"
+            project_run.finished_at = func.now()
+            project_run.error = str(exc)
+            subagent_rows.append({
+                "project_run_id": str(project_run.id),
+                "run_id": str(existing_run.id) if existing_run else None,
+                "session_id": str(existing_run.id) if existing_run else None,
+                "agent_id": str(agent_id),
+                "status": "rejected",
+                "error": str(exc),
+            })
+
+    message = await db.get(ChatMessage, message.id, with_for_update=True)
+    if message is None:
+        raise HTTPException(status_code=500, detail="Group message disappeared during wake dispatch")
+    message.message_meta = {
+        **dict(message.message_meta or {}),
+        "awakened_agent_ids": awakened,
+        "subagent_runs": subagent_rows,
+    }
+    event = add_event(
+        db,
+        project,
+        "group.message.created",
+        "Appended project group message and dispatched structured mentions",
+        actor_user_id=current_user.id,
+        actor_agent_id=data.sender_agent_id,
+        metadata={
+            "group_session_id": str(session.id),
+            "group_message_id": str(message.id),
+            "initiator_user_id": str(current_user.id),
+            "visible_to_group": True,
+            "mentioned_agent_ids": [str(agent_id) for agent_id in mention_ids],
+            "awakened_agent_ids": awakened,
+            "subagent_runs": subagent_rows,
+            "zero_wake_default": not mention_ids,
+        },
+    )
+    await db.flush()
+    await db.commit()
+    await db.refresh(message)
+    return {
+        "message": _group_message_payload(message),
+        "event_id": str(event.id),
+        "awakened_agent_ids": awakened,
+        "subagent_runs": subagent_rows,
+    }
+
+
 @router.post("/{project_id}/a2a", status_code=202)
 async def wake_project_agent(
     project_id: uuid.UUID,
@@ -1267,6 +1578,7 @@ async def wake_project_agent(
         raise HTTPException(status_code=422, detail="from_agent_id and to_agent_id must differ")
     await _require_member_agent(db, project, data.from_agent_id)
     await _require_member_agent(db, project, data.to_agent_id)
+    group_session = await ensure_project_group_session(db, project)
     run = ProjectRun(
         tenant_id=project.tenant_id,
         project_id=project.id,
@@ -1282,6 +1594,7 @@ async def wake_project_agent(
             "mode": data.mode,
             "new_conversation": data.new_conversation,
             "connector": "agent_tools.send_message_to_agent",
+            "group_session_id": str(group_session.id),
         },
     )
     db.add(run)
@@ -1303,6 +1616,7 @@ async def wake_project_agent(
             "message": data.message,
             "delivery": "queued",
             "connector": "agent_tools.send_message_to_agent",
+            "group_session_id": str(group_session.id),
         },
     )
     await db.flush()
@@ -1314,6 +1628,7 @@ async def wake_project_agent(
         "event_id": str(event.id),
         "from_agent_id": str(data.from_agent_id),
         "to_agent_id": str(data.to_agent_id),
+        "group_session_id": str(group_session.id),
         "delivery_contract": "The existing A2A sender can consume this queued run without leader relay.",
     }
 

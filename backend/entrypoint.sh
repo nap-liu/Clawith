@@ -123,11 +123,11 @@ async def main():
     import app.models.onboarding         # noqa
     import app.models.identity           # noqa
     import app.models.published_page     # noqa
-    # On an existing installation Alembic must create newly introduced
-    # project tables. Import them for create_all only on a genuinely fresh DB,
-    # where the migration history will be stamped rather than replayed.
-    if os.environ.get("SCHEMA_BOOTSTRAP_MODE") == "fresh":
-        import app.models.project        # noqa
+    # Register project metadata on every startup. SubagentRun and ChatSession
+    # have project-scoped foreign keys, so SQLAlchemy must be able to resolve
+    # their target tables even when Alembic (rather than create_all) owns the
+    # actual DDL for an existing installation.
+    import app.models.project            # noqa
 
     # Create all tables that don't exist yet (safe to run on every startup)
     async with engine.begin() as conn:

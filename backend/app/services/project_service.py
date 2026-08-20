@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
 from app.models.agent import Agent
+from app.models.chat_session import ChatSession
 from app.models.mcp_server import MCPServer
 from app.models.project import (
     Project,
@@ -65,6 +66,60 @@ async def require_owner(db: AsyncSession, user: User, project_id: uuid.UUID) -> 
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+async def ensure_project_group_session(db: AsyncSession, project: Project) -> ChatSession:
+    """Return the project's single durable group root.
+
+    The access Agent is fixed at first creation instead of following Leader
+    changes. Project REST endpoints enforce ACL; this session is only the
+    append-only conversation/root for durable child runs.
+    """
+    session = (
+        await db.execute(
+            select(ChatSession).where(
+                ChatSession.project_id == project.id,
+                ChatSession.source_channel == "project",
+                ChatSession.is_group.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if session is not None:
+        return session
+    anchor = (
+        await db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.is_enabled.is_(True),
+            ).order_by(
+                ProjectMemberSnapshot.is_leader.desc(),
+                ProjectMemberSnapshot.created_at,
+                ProjectMemberSnapshot.id,
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    if anchor is None:
+        raise HTTPException(status_code=422, detail="Project needs an enabled Agent before group chat can start")
+    session = ChatSession(
+        project_id=project.id,
+        agent_id=anchor.agent_id,
+        title=f"{project.name} · Agent Group",
+        source_channel="project",
+        external_conv_id=f"project:{project.id}",
+        is_group=True,
+        group_name=project.name,
+        is_primary=False,
+        im_config={
+            "project_id": str(project.id),
+            "access_agent_id": str(anchor.agent_id),
+            "append_only": True,
+            "wake_policy": "structured_mentions_only",
+        },
+    )
+    db.add(session)
+    await db.flush()
+    return session
 
 
 def add_event(
@@ -358,6 +413,10 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
     if data.visibility == "shared" and not data.shared_with_user_ids:
         raise HTTPException(status_code=422, detail="shared visibility requires shared_with_user_ids")
     await replace_access_grants(db, project, data.shared_with_user_ids, actor_user_id=user.id)
+    # A project with Agents owns its canonical group root from creation time;
+    # GET remains a safe fallback for projects created before this migration.
+    if members:
+        await ensure_project_group_session(db, project)
     from app.services.project_git_service import initialize_project_repo
 
     git_config = dict((project.settings or {}).get("git") or {})
@@ -557,6 +616,8 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
         if project is None:
             return
         payload = dict(run.input or {})
+        project_id = run.project_id
+        initiated_by_user_id = run.initiated_by_user_id
         from_agent_id = uuid.UUID(payload["from_agent_id"])
         mode_map = {"delegate": "task_delegate", "review": "consult"}
         msg_type = mode_map.get(payload.get("mode"), payload.get("mode", "notify"))
@@ -572,20 +633,53 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
                 "msg_type": msg_type,
                 "force_async": True,
                 "new_conversation": bool(payload.get("new_conversation")),
-                "_project_id": str(project.id),
+                "_project_id": str(project_id),
             },
-            user_id=run.initiated_by_user_id,
+            user_id=initiated_by_user_id,
         )
     except Exception as exc:  # delivery failures must become durable run state
         result = f"❌ Project A2A delivery raised {type(exc).__name__}: {exc!s}"
     failed = result.startswith("❌") or '"status": "error"' in result
+    session_info: dict = {}
+    async with async_session() as session_db:
+        from app.models.chat_session import ChatSession
+
+        source_id = uuid.UUID(payload["from_agent_id"])
+        target_id = uuid.UUID(payload["to_agent_id"])
+        session_agent_id = min(source_id, target_id, key=str)
+        session_peer_id = max(source_id, target_id, key=str)
+        session = (
+            await session_db.execute(
+                select(ChatSession).where(
+                    ChatSession.project_id == project_id,
+                    ChatSession.source_channel == "agent",
+                    ChatSession.agent_id == session_agent_id,
+                    ChatSession.peer_agent_id == session_peer_id,
+                ).order_by(
+                    ChatSession.last_message_at.desc().nulls_last(),
+                    ChatSession.created_at.desc(),
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if session is not None:
+            session_info = {
+                "session_id": str(session.id),
+                "session_agent_id": str(session.agent_id),
+                "session_access_agent_id": str(session.agent_id),
+                "session_title": session.title,
+            }
     async with async_session() as db:
         run = await db.get(ProjectRun, run_id)
         project = await db.get(Project, run.project_id) if run else None
         if run is None or project is None:
             return
         apply_run_status(run, "failed" if failed else "succeeded")
-        run.output = {"delivery_result": result}
+        delivery_metadata = {
+            "delivery_result": result,
+            "group_session_id": payload.get("group_session_id"),
+            **session_info,
+        }
+        run.output = delivery_metadata
         if failed:
             run.error = result
         add_event(
@@ -599,6 +693,6 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
             to_agent_id=uuid.UUID(payload["to_agent_id"]),
             work_item_id=run.work_item_id,
             run_id=run.id,
-            metadata={"delivery_result": result},
+            metadata=delivery_metadata,
         )
         await db.commit()
