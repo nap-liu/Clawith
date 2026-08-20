@@ -16,10 +16,13 @@ export type SubagentRunCardData = {
     sessionId?: string;
     executionAgentId?: string;
     status: string;
+    name?: string;
     mode?: string;
     task?: string;
     model?: string;
     fork?: boolean;
+    soul?: boolean;
+    memory?: boolean;
 };
 
 type Translate = (key: string, options?: any) => string;
@@ -51,10 +54,13 @@ export function parseSubagentRunCardData(message: any, payload: Record<string, a
         sessionId: result.session_id ? String(result.session_id) : (result.subagent_id ? String(result.subagent_id) : undefined),
         executionAgentId: result.execution_agent_id ? String(result.execution_agent_id) : undefined,
         status,
+        name: result.name || args.name ? String(result.name || args.name) : undefined,
         mode: result.mode || args.mode ? String(result.mode || args.mode) : undefined,
         task: args.task ? String(args.task) : undefined,
         model: args.model ? String(args.model) : undefined,
         fork: args.fork === true,
+        soul: (result.soul ?? args.soul) !== false,
+        memory: (result.memory ?? args.memory) !== false,
     };
 }
 
@@ -107,8 +113,11 @@ export default function SubagentRunCard({
                     ...data,
                     status: String(runtime?.status || data.status).toLowerCase(),
                     executionAgentId: String(runtime?.execution_agent_id || detail?.agent_id || data.executionAgentId || ''),
+                    name: String(detail?.title || data.name || ''),
                     mode: runtime?.mode || data.mode,
                     model: runtime?.model || data.model,
+                    soul: runtime?.soul ?? data.soul,
+                    memory: runtime?.memory ?? data.memory,
                 };
                 setLiveData(next);
                 if (['queued', 'pending', 'running', 'processing'].includes(next.status)) {
@@ -126,7 +135,7 @@ export default function SubagentRunCard({
             cancelled = true;
             if (timer !== undefined) window.clearTimeout(timer);
         };
-    }, [agentId, data.executionAgentId, data.mode, data.model, data.sessionId, data.status, data.task, data.fork]);
+    }, [agentId, data.executionAgentId, data.mode, data.model, data.name, data.sessionId, data.status, data.task, data.fork, data.soul, data.memory]);
 
     const status = statusMeta(liveData.status);
     const StatusIcon = status.icon;
@@ -147,7 +156,7 @@ export default function SubagentRunCard({
                 <span className="subagent-run-card__header">
                     <span className="subagent-run-card__identity">
                         <span className="subagent-run-card__icon"><IconBinaryTree size={18} stroke={1.8} /></span>
-                        <span>{t('agent.subagentRun.title')}</span>
+                        <span>{liveData.name || liveData.task || t('agent.subagentRun.title')}</span>
                     </span>
                     <span className={`subagent-run-card__status subagent-run-card__status--${status.className}`}>
                         <StatusIcon className={status.className === 'running' ? 'subagent-run-card__spin' : ''} size={14} stroke={2} />
@@ -159,6 +168,8 @@ export default function SubagentRunCard({
                     {liveData.mode && <span>{t(`agent.subagentRun.mode.${modeKey}`)}</span>}
                     {liveData.model && <span>{liveData.model}</span>}
                     {liveData.fork && <span>{t('agent.subagentRun.forked')}</span>}
+                    {liveData.soul === false && <span>{t('agent.subagentRun.soulOff')}</span>}
+                    {liveData.memory === false && <span>{t('agent.subagentRun.memoryOff')}</span>}
                     {shortId && <span className="subagent-run-card__session">#{shortId}</span>}
                 </span>
                 <span className="subagent-run-card__action">

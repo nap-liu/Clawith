@@ -563,6 +563,8 @@
         "async": "异步"
       },
       "forked": "已复制当前上下文",
+      "soulOff": "不加载 Soul",
+      "memoryOff": "不加载记忆",
       "model": "模型",
       "sessionId": "会话 ID",
       "status": {
@@ -944,7 +946,7 @@
     "toolTranslations": {
       "run_subagent": {
         "name": "运行子智能体",
-        "description": "把目标明确的任务委派给独立的子智能体会话；支持同步等待结果或异步后台执行，并可选择模型及复制当前上下文。"
+        "description": "为子智能体命名并把目标明确的任务委派给独立会话；支持同步或异步执行、模型选择、上下文复制，以及按需关闭 Soul 或记忆。"
       },
       "send_message_to_subagent": {
         "name": "向子智能体发送消息",

@@ -72,6 +72,8 @@ class SessionRuntimeOut(BaseModel):
     execution_agent_name: str
     mode: str
     model: Optional[str] = None
+    soul: bool = True
+    memory: bool = True
 
 
 class SessionDetailOut(SessionOut):
@@ -220,6 +222,8 @@ async def _build_session_detail_out(
                 execution_agent_name=execution_agent.name or "Agent",
                 mode=run.mode,
                 model=run.model,
+                soul=run.soul,
+                memory=run.memory,
             )
 
     return SessionDetailOut(

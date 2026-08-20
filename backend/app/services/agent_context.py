@@ -524,6 +524,8 @@ async def build_agent_context(
     current_user_id: uuid.UUID | str | None = None,
     is_group: bool = False,
     channel_context: dict | None = None,
+    include_soul: bool = True,
+    include_memory: bool = True,
 ) -> tuple[str, str]:
     """Build a rich system prompt incorporating agent's full context.
 
@@ -542,7 +544,11 @@ async def build_agent_context(
     # generous cap. Memory is injected in full (no truncation): truncating it
     # silently dropped curated notes past the cap. Memory growth is managed by
     # the agent curating memory.md, not by a hard context cap here.
-    soul = await _read_file_safe(normalize_storage_key(f"{agent_id}/soul.md"), 30000)
+    soul = (
+        await _read_file_safe(normalize_storage_key(f"{agent_id}/soul.md"), 30000)
+        if include_soul
+        else ""
+    )
     # Strip markdown heading if present
     if soul.startswith("# "):
         soul = "\n".join(soul.split("\n")[1:]).strip()
@@ -570,8 +576,13 @@ async def build_agent_context(
 
     agent_tz_name = await get_agent_timezone(agent_id)
     agent_local_now = now_in_timezone(agent_tz_name)
-    memory_snapshot = await load_agent_memory_snapshot(agent_id, today=agent_local_now.date())
-    memory_context = memory_snapshot.render()
+    memory_context = ""
+    if include_memory:
+        memory_snapshot = await load_agent_memory_snapshot(
+            agent_id,
+            today=agent_local_now.date(),
+        )
+        memory_context = memory_snapshot.render()
     # Date granularity only. A passively-injected clock is approximate by
     # nature; anything finer than a day changes within the 5-minute prefix-cache
     # TTL and busts the cached system prefix — most acutely on the heartbeat /
@@ -617,7 +628,8 @@ When installing or importing an MCP server via `discover_resources` / `import_mc
 - Do **NOT** ask the user for tool-specific tokens (GitHub PAT, Notion integration secret, etc.) when the Smithery flow supports OAuth.
 - Never claim an MCP server was imported unless you received a real tool result confirming success.
 """)
-    static_parts.append(MEMORY_SYSTEM_PROMPT)
+    if include_memory:
+        static_parts.append(MEMORY_SYSTEM_PROMPT)
 
     dynamic_parts = []
 
