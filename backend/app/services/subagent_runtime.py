@@ -226,6 +226,7 @@ async def create_subagent(
     fork: bool = False,
     turn_anchor_id: uuid.UUID | None = None,
     project_run_id: uuid.UUID | None = None,
+    input_metadata: dict | None = None,
 ) -> tuple[SubagentRun, bool]:
     """Create one child Session and lifecycle row, idempotent per parent tool call."""
     task_text = str(task or "").strip()
@@ -295,9 +296,11 @@ async def create_subagent(
         )
         project_member = None
         project_capabilities: list[dict] = []
+        project_tool_policy_snapshot: dict = {}
         if parent.project_id is not None:
-            from app.models.project import ProjectCapabilityBinding, ProjectMemberSnapshot
+            from app.models.project import Project, ProjectCapabilityBinding, ProjectMemberSnapshot
 
+            project = await db.get(Project, parent.project_id)
             project_member = (
                 await db.execute(
                     select(ProjectMemberSnapshot).where(
@@ -333,6 +336,9 @@ async def create_subagent(
                 }
                 for binding in bindings
             ]
+            project_tool_policy_snapshot = dict(
+                dict((project.settings or {}).get("policies") or {}).get("project_tools") or {}
+            ) if project is not None else {}
 
         child = ChatSession(
             id=child_id,
@@ -347,6 +353,8 @@ async def create_subagent(
                 "project_id": str(parent.project_id) if parent.project_id else None,
                 "project_group_session_id": str(parent.id) if parent.project_id else None,
                 "project_member_id": str(project_member.id) if project_member else None,
+                "project_role_snapshot": "leader" if project_member and project_member.is_leader else "participant",
+                "project_tool_policy_snapshot": project_tool_policy_snapshot,
                 "member_config_snapshot": dict(project_member.config_snapshot or {}) if project_member else {},
                 "capability_snapshot": project_capabilities,
             },
@@ -390,6 +398,7 @@ async def create_subagent(
             content=task_text,
             conversation_id=str(child_id),
             message_meta={
+                **dict(input_metadata or {}),
                 "kind": SUBAGENT_INPUT,
                 "subagent_input_state": INPUT_PENDING,
                 "attachments": [],
@@ -420,6 +429,7 @@ async def append_subagent_message(
     execution_user_id: uuid.UUID,
     origin_tool_call_id: str,
     project_run_id: uuid.UUID | None = None,
+    input_metadata: dict | None = None,
 ) -> str:
     content = str(message or "").strip()
     if not content:
@@ -466,6 +476,7 @@ async def append_subagent_message(
                 conversation_id=str(child_id),
                 external_event_key=event_key,
                 message_meta={
+                    **dict(input_metadata or {}),
                     "kind": SUBAGENT_INPUT,
                     "subagent_input_state": INPUT_PENDING,
                     "attachments": [],
@@ -600,6 +611,7 @@ async def stop_subagent(
 async def prepare_subagent_tools(
     agent_id: uuid.UUID,
     session_id: uuid.UUID | None = None,
+    execution_user_id: uuid.UUID | None = None,
 ) -> list[dict]:
     """Return the Agent's normal tools with the child-only protocol surface."""
     from app.models.tool import AgentTool, Tool
@@ -619,13 +631,27 @@ async def prepare_subagent_tools(
         for tool in tools
         if tool.get("function", {}).get("name") not in hidden
     ]
+    project_tools: list[dict] = []
     async with async_session() as db:
         child = await db.get(ChatSession, session_id) if session_id else None
-        runtime_config = dict(child.im_config or {}) if child else {}
-        if runtime_config.get("project_id"):
+        if child is not None and child.source_channel == SUBAGENT_CHANNEL and child.project_id is not None:
+            if execution_user_id is None:
+                raise ValueError("Project Subagent tool preparation requires its execution user identity")
+            from app.services.project_runtime_tools import (
+                load_project_runtime_scope,
+                project_runtime_tool_schemas,
+            )
+
+            project, member, scoped_child, _run = await load_project_runtime_scope(
+                db,
+                session_id=child.id,
+                agent_id=agent_id,
+                execution_user_id=execution_user_id,
+            )
+            runtime_config = dict(scoped_child.im_config or {})
             # Builtins remain governed by the normal Agent tool policy. MCP is
             # deny-by-default and re-enabled only by the immutable project
-            # snapshot captured when this child was created.
+            # snapshot captured when this validated child was created.
             from app.models.tool import Tool
 
             all_mcp_names = set(
@@ -658,6 +684,7 @@ async def prepare_subagent_tools(
                 if item.get("function", {}).get("name") not in all_mcp_names
                 or item.get("function", {}).get("name") in allowed_mcp_names
             ]
+            project_tools = project_runtime_tool_schemas(project, member)
         row = (
             await db.execute(
                 select(Tool, AgentTool)
@@ -668,6 +695,13 @@ async def prepare_subagent_tools(
                 .where(Tool.name == "send_message_to_parent")
             )
         ).one_or_none()
+    if project_tools:
+        projected_names = {item["function"]["name"] for item in project_tools}
+        child_tools = [
+            item
+            for item in child_tools
+            if item.get("function", {}).get("name") not in projected_names
+        ]
     parent_tool = row[0] if row else None
     if parent_tool is None:
         raise RuntimeError("send_message_to_parent builtin tool is not seeded")
@@ -676,7 +710,7 @@ async def prepare_subagent_tools(
         parent_tool.name,
         assignment,
     ):
-        return child_tools
+        return [*child_tools, *project_tools]
     child_tools.append(
         {
             "type": "function",
@@ -687,6 +721,7 @@ async def prepare_subagent_tools(
             },
         }
     )
+    child_tools.extend(project_tools)
     return child_tools
 
 
@@ -953,6 +988,7 @@ async def _finish_subagent_turn(
                 "kind": kind,
                 "subagent_wake": terminal and run.mode == "async",
                 "attachments": [],
+                "project_run_ids": [str(value) for value in sorted(project_run_ids, key=str)],
             },
             turn_anchor_id=anchor_id,
         )
@@ -1057,7 +1093,11 @@ async def execute_claimed_subagent(run_id: uuid.UUID) -> None:
                     )
                     if history is None:
                         raise RuntimeError("Subagent fresh turn prefix changed")
-                tools = await prepare_subagent_tools(child.agent_id, child.id)
+                tools = await prepare_subagent_tools(
+                    child.agent_id,
+                    child.id,
+                    execution_user_id=run.execution_user_id,
+                )
                 reply = await _call_agent_llm(
                     db,
                     child.agent_id,
@@ -1327,6 +1367,8 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
         # LLM, so completion cannot fan out into an implicit broadcast storm.
         external_key = f"project-subagent:{child_message_id}"
         async with async_session() as db:
+            from app.models.project import ProjectMemberSnapshot
+
             existing = (
                 await db.execute(
                     select(ChatMessage.id).where(
@@ -1336,8 +1378,18 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
             ).scalar_one_or_none()
             if existing is not None:
                 return True
-            db.add(
-                ChatMessage(
+            leader_agent_id = (
+                await db.execute(
+                    select(ProjectMemberSnapshot.agent_id).where(
+                        ProjectMemberSnapshot.project_id == parent.project_id,
+                        ProjectMemberSnapshot.is_leader.is_(True),
+                        ProjectMemberSnapshot.is_enabled.is_(True),
+                    )
+                )
+            ).scalar_one_or_none()
+            is_leader_reply = leader_agent_id == child.agent_id
+            event_meta = _message_meta(event)
+            materialized = ChatMessage(
                     agent_id=parent.agent_id,
                     sender_agent_id=child.agent_id,
                     role="assistant",
@@ -1352,11 +1404,14 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
                         "awakened_agent_ids": [],
                         "subagent_id": str(child.id),
                         "child_message_id": str(child_message_id),
-                        "attachments": _message_meta(event).get("attachments", []),
-                        "wake_policy": "append_only_no_reply_wake",
+                        "source_project_run_ids": event_meta.get("project_run_ids", []),
+                        "attachments": event_meta.get("attachments", []),
+                        "wake_policy": "leader_batch_pending" if not is_leader_reply else "leader_self_no_wake",
+                        "leader_batch_state": "ignored_leader_self" if is_leader_reply else "pending",
+                        "default_leader_agent_id": str(leader_agent_id) if leader_agent_id else None,
                     },
                 )
-            )
+            db.add(materialized)
             stored_parent = await db.get(ChatSession, parent.id)
             if stored_parent is not None:
                 stored_parent.last_message_at = datetime.now(UTC)
@@ -1536,6 +1591,544 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
     return result != "busy"
 
 
+async def _pending_project_leader_groups(
+    *,
+    debounce_seconds: float = 0.5,
+    limit: int = 20,
+) -> list[uuid.UUID]:
+    """Find durable project reply queues ready for one Leader batch turn."""
+    cutoff = datetime.now(UTC) - timedelta(seconds=max(0.0, debounce_seconds))
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(ChatMessage.conversation_id)
+                .where(
+                    ChatMessage.message_meta["kind"].as_string() == "project_subagent_reply",
+                    ChatMessage.message_meta["leader_batch_state"].as_string().in_(["pending", "claimed"]),
+                    ChatMessage.created_at <= cutoff,
+                )
+                .distinct()
+                .limit(limit)
+            )
+        ).scalars().all()
+    groups: list[uuid.UUID] = []
+    for value in rows:
+        try:
+            groups.append(uuid.UUID(str(value)))
+        except (TypeError, ValueError):
+            continue
+    return groups
+
+
+async def _dispatch_project_leader_batch(
+    group_session_id: uuid.UUID,
+    *,
+    debounce_seconds: float = 0.5,
+) -> bool:
+    """Atomically claim pending Agent replies and enqueue one Leader input.
+
+    Claimed rows and the batch ProjectRun are durable before child dispatch. A
+    crash retries the same batch id and append_subagent_message's external key
+    makes the Leader input idempotent.
+    """
+    from app.models.project import Project, ProjectMemberSnapshot, ProjectRun
+    from app.services.project_service import add_event, freeze_run_members
+
+    cutoff = datetime.now(UTC) - timedelta(seconds=max(0.0, debounce_seconds))
+    async with async_session() as db:
+        group = await db.get(ChatSession, group_session_id, with_for_update=True)
+        if group is None or group.source_channel != "project" or group.project_id is None:
+            return True
+        project = await db.get(Project, group.project_id)
+        leader = (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == group.project_id,
+                    ProjectMemberSnapshot.is_leader.is_(True),
+                    ProjectMemberSnapshot.is_enabled.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if project is None or leader is None:
+            return False
+
+        claimed = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id == str(group.id),
+                    ChatMessage.message_meta["kind"].as_string() == "project_subagent_reply",
+                    ChatMessage.message_meta["leader_batch_state"].as_string() == "claimed",
+                )
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+            )
+        ).scalars().all()
+        if claimed:
+            batch_id = str(_message_meta(claimed[0]).get("leader_batch_id") or "")
+            source_rows = [
+                row for row in claimed if str(_message_meta(row).get("leader_batch_id") or "") == batch_id
+            ]
+            raw_project_run_id = _message_meta(source_rows[0]).get("leader_batch_project_run_id")
+            try:
+                project_run_id = uuid.UUID(str(raw_project_run_id))
+            except (TypeError, ValueError):
+                return False
+            project_run = await db.get(ProjectRun, project_run_id)
+            if project_run is None:
+                return False
+        else:
+            source_rows = (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(
+                        ChatMessage.conversation_id == str(group.id),
+                        ChatMessage.message_meta["kind"].as_string() == "project_subagent_reply",
+                        ChatMessage.message_meta["leader_batch_state"].as_string() == "pending",
+                        ChatMessage.created_at <= cutoff,
+                        ChatMessage.sender_agent_id != leader.agent_id,
+                    )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
+                    .with_for_update()
+                )
+            ).scalars().all()
+            if not source_rows:
+                return False
+            batch_id = str(uuid.uuid4())
+            project_run = ProjectRun(
+                tenant_id=project.tenant_id,
+                project_id=project.id,
+                agent_id=leader.agent_id,
+                initiated_by_user_id=project.owner_user_id,
+                status="queued",
+                trigger_type="leader_reply_batch",
+                input={
+                    "group_session_id": str(group.id),
+                    "leader_agent_id": str(leader.agent_id),
+                    "leader_batch_id": batch_id,
+                    "source_group_message_ids": [str(row.id) for row in source_rows],
+                },
+                output={"group_session_id": str(group.id), "leader_batch_id": batch_id},
+            )
+            db.add(project_run)
+            await db.flush()
+            await freeze_run_members(db, project, project_run)
+            for row in source_rows:
+                row.message_meta = {
+                    **_message_meta(row),
+                    "leader_batch_state": "claimed",
+                    "leader_batch_id": batch_id,
+                    "leader_batch_project_run_id": str(project_run.id),
+                    "leader_batch_claimed_at": datetime.now(UTC).isoformat(),
+                }
+        await db.commit()
+
+    sources = [
+        {
+            "group_message_id": str(row.id),
+            "source_agent_id": str(row.sender_agent_id) if row.sender_agent_id else None,
+            "child_message_id": _message_meta(row).get("child_message_id"),
+            "subagent_session_id": _message_meta(row).get("subagent_id"),
+            "subagent_run_id": _message_meta(row).get("subagent_id"),
+            "project_run_ids": _message_meta(row).get("source_project_run_ids", []),
+            "content": row.content,
+            "attachments": _message_meta(row).get("attachments", []),
+        }
+        for row in source_rows
+    ]
+    task = (
+        "Process this coalesced batch of project Agent replies in one Leader turn. "
+        "Update project coordination as needed; do not broadcast or wake anyone unless you explicitly target them.\n"
+        + json.dumps(
+            {"leader_batch_id": batch_id, "group_session_id": str(group_session_id), "replies": sources},
+            ensure_ascii=False,
+        )
+    )
+    async with async_session() as db:
+        existing_child = (
+            await db.execute(
+                select(SubagentRun)
+                .where(
+                    SubagentRun.parent_session_id == group_session_id,
+                    SubagentRun.project_member_id == leader.id,
+                )
+                .order_by(SubagentRun.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    input_metadata = {
+        "project_leader_batch": True,
+        "leader_batch_id": batch_id,
+        "source_group_message_ids": [str(row.id) for row in source_rows],
+        "source_replies": sources,
+    }
+    if existing_child is None:
+        durable_run, created = await create_subagent(
+            agent_id=leader.agent_id,
+            execution_user_id=project.owner_user_id,
+            parent_session_id=str(group_session_id),
+            origin_tool_call_id=f"project-member:{leader.id}",
+            task=task,
+            mode="async",
+            fork=True,
+            turn_anchor_id=source_rows[-1].id,
+            project_run_id=project_run.id,
+            input_metadata=input_metadata,
+        )
+        child_id = durable_run.id
+        child_status = durable_run.status
+        if not created and not await _project_run_has_child_input(child_id, project_run.id):
+            child_status = await append_subagent_message(
+                agent_id=leader.agent_id,
+                parent_session_id=str(group_session_id),
+                subagent_id=str(durable_run.id),
+                message=task,
+                execution_user_id=durable_run.execution_user_id,
+                origin_tool_call_id=f"project-leader-batch:{batch_id}",
+                project_run_id=project_run.id,
+                input_metadata=input_metadata,
+            )
+    else:
+        child_id = existing_child.id
+        child_status = existing_child.status
+        if not await _project_run_has_child_input(child_id, project_run.id):
+            child_status = await append_subagent_message(
+                agent_id=leader.agent_id,
+                parent_session_id=str(group_session_id),
+                subagent_id=str(existing_child.id),
+                message=task,
+                execution_user_id=existing_child.execution_user_id,
+                origin_tool_call_id=f"project-leader-batch:{batch_id}",
+                project_run_id=project_run.id,
+                input_metadata=input_metadata,
+            )
+
+    async with async_session() as db:
+        project_run = await db.get(ProjectRun, project_run.id, with_for_update=True)
+        batch_input = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id == str(child_id),
+                    ChatMessage.message_meta["leader_batch_id"].as_string() == batch_id,
+                )
+                .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        delivered_rows = (
+            await db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(group_session_id),
+                    ChatMessage.message_meta["leader_batch_id"].as_string() == batch_id,
+                )
+            )
+        ).scalars().all()
+        for row in delivered_rows:
+            row.message_meta = {
+                **_message_meta(row),
+                "leader_batch_state": "delivered",
+                "leader_batch_input_id": str(batch_input.id) if batch_input else None,
+                "leader_subagent_session_id": str(child_id),
+            }
+        if project_run is not None:
+            project_run.status = "queued" if child_status == RUN_QUEUED else "running"
+            project_run.output = {
+                **dict(project_run.output or {}),
+                "subagent_run_id": str(child_id),
+                "subagent_session_id": str(child_id),
+                "leader_batch_input_id": str(batch_input.id) if batch_input else None,
+                "source_count": len(delivered_rows),
+            }
+        attached_project = await db.get(Project, project.id)
+        if attached_project is not None:
+            add_event(
+                db,
+                attached_project,
+                "project.agent_reply_batch.dispatched",
+                f"Coalesced {len(delivered_rows)} Agent replies into one Leader turn",
+                actor_agent_id=leader.agent_id,
+                run_id=project_run.id if project_run else None,
+                metadata={
+                    "leader_batch_id": batch_id,
+                    "leader_agent_id": str(leader.agent_id),
+                    "leader_subagent_session_id": str(child_id),
+                    "leader_batch_input_id": str(batch_input.id) if batch_input else None,
+                    "source_group_message_ids": [str(row.id) for row in delivered_rows],
+                    "source_count": len(delivered_rows),
+                },
+            )
+        await db.commit()
+    return True
+
+
+PROJECT_DISPATCH_TRIGGERS = frozenset(
+    {"leader_kickoff", "group_leader_message", "group_mention"}
+)
+
+
+async def _project_run_has_child_input(
+    child_id: uuid.UUID,
+    project_run_id: uuid.UUID,
+) -> bool:
+    async with async_session() as db:
+        existing = (
+            await db.execute(
+                select(ChatMessage.id)
+                .where(
+                    ChatMessage.conversation_id == str(child_id),
+                    ChatMessage.message_meta["project_run_id"].as_string()
+                    == str(project_run_id),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        return existing is not None
+
+
+async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
+    """Idempotently deliver one durable project dispatch outbox row.
+
+    Project endpoints commit the ProjectRun before calling this helper. The
+    daemon scans the same queued rows, so a process exit between the database
+    commit and Subagent creation cannot strand kickoff or a group mention.
+    """
+    from app.models.project import Project, ProjectEvent, ProjectMemberSnapshot, ProjectRun
+    from app.services.project_service import add_event
+
+    async with async_session() as db:
+        project_run = await db.get(ProjectRun, project_run_id)
+        if project_run is None or project_run.trigger_type not in PROJECT_DISPATCH_TRIGGERS:
+            return {"status": "gone"}
+        output = dict(project_run.output or {})
+        if output.get("subagent_run_id"):
+            return {"status": project_run.status, **output}
+        dispatch = dict((project_run.input or {}).get("dispatch") or {})
+        try:
+            group_session_id = uuid.UUID(str(dispatch["group_session_id"]))
+            member_id = uuid.UUID(str(dispatch["project_member_id"]))
+            anchor_id = uuid.UUID(str(dispatch["turn_anchor_id"]))
+        except (KeyError, TypeError, ValueError):
+            return {"status": "not_dispatchable"}
+        task = str(dispatch.get("task") or "").strip()
+        if not task:
+            return {"status": "not_dispatchable"}
+        project = await db.get(Project, project_run.project_id)
+        parent = await db.get(ChatSession, group_session_id)
+        member = await db.get(ProjectMemberSnapshot, member_id)
+        if (
+            project is None
+            or parent is None
+            or parent.project_id != project.id
+            or parent.source_channel != "project"
+            or member is None
+            or member.project_id != project.id
+            or member.agent_id != project_run.agent_id
+            or not member.is_enabled
+        ):
+            project_run.status = "failed"
+            project_run.error = "Project dispatch identity is no longer valid"
+            project_run.finished_at = datetime.now(UTC)
+            await db.commit()
+            return {"status": "failed", "error": project_run.error}
+        agent_id = member.agent_id
+        execution_user_id = project.owner_user_id
+        existing_child = (
+            await db.execute(
+                select(SubagentRun)
+                .where(
+                    SubagentRun.parent_session_id == parent.id,
+                    SubagentRun.project_member_id == member.id,
+                )
+                .order_by(SubagentRun.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    try:
+        created = False
+        if existing_child is None:
+            child, created = await create_subagent(
+                agent_id=agent_id,
+                execution_user_id=execution_user_id,
+                parent_session_id=str(group_session_id),
+                origin_tool_call_id=f"project-member:{member_id}",
+                task=task,
+                mode="async",
+                fork=True,
+                turn_anchor_id=anchor_id,
+                project_run_id=project_run_id,
+                input_metadata={"project_dispatch": True},
+            )
+            child_id = child.id
+            child_status = child.status
+        else:
+            child_id = existing_child.id
+            child_status = existing_child.status
+        if not created and not await _project_run_has_child_input(child_id, project_run_id):
+            child_status = await append_subagent_message(
+                agent_id=agent_id,
+                parent_session_id=str(group_session_id),
+                subagent_id=str(child_id),
+                message=task,
+                execution_user_id=execution_user_id,
+                origin_tool_call_id=f"project-dispatch:{project_run_id}",
+                project_run_id=project_run_id,
+                input_metadata={"project_dispatch": True},
+            )
+    except SubagentError as exc:
+        async with async_session() as db:
+            failed_run = await db.get(ProjectRun, project_run_id, with_for_update=True)
+            if failed_run is not None and not dict(failed_run.output or {}).get("subagent_run_id"):
+                failed_run.status = "failed"
+                failed_run.finished_at = datetime.now(UTC)
+                failed_run.error = str(exc)
+                await db.commit()
+        return {"status": "failed", "error": str(exc)}
+
+    async with async_session() as db:
+        project_run = await db.get(ProjectRun, project_run_id, with_for_update=True)
+        if project_run is None:
+            return {"status": "gone"}
+        dispatch = dict((project_run.input or {}).get("dispatch") or {})
+        project_run.status = "queued" if child_status == RUN_QUEUED else "running"
+        if project_run.status == "running" and project_run.started_at is None:
+            project_run.started_at = datetime.now(UTC)
+        project_run.output = {
+            **dict(project_run.output or {}),
+            "subagent_run_id": str(child_id),
+            "subagent_session_id": str(child_id),
+            "status": child_status,
+        }
+
+        project = await db.get(Project, project_run.project_id, with_for_update=True)
+        anchor = await db.get(ChatMessage, anchor_id, with_for_update=True)
+        if project_run.trigger_type == "leader_kickoff" and project is not None:
+            kickoff = dict(dispatch.get("kickoff") or {})
+            project.status = "running"
+            project.settings = {
+                **dict(project.settings or {}),
+                "kickoff": {
+                    **kickoff,
+                    "project_run_id": str(project_run.id),
+                    "subagent_session_id": str(child_id),
+                },
+            }
+            if anchor is not None:
+                anchor.message_meta = {
+                    **_message_meta(anchor),
+                    "awakened_agent_ids": [str(agent_id)],
+                    "project_run_id": str(project_run.id),
+                    "subagent_session_id": str(child_id),
+                }
+            existing_event = (
+                await db.execute(
+                    select(ProjectEvent.id).where(
+                        ProjectEvent.run_id == project_run.id,
+                        ProjectEvent.event_type == "project.kickoff.confirmed",
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing_event is None:
+                add_event(
+                    db,
+                    project,
+                    "project.kickoff.confirmed",
+                    "User confirmed the Leader plan and autonomous execution started",
+                    actor_user_id=project_run.initiated_by_user_id,
+                    actor_agent_id=agent_id,
+                    run_id=project_run.id,
+                    metadata={
+                        **kickoff,
+                        "leader_agent_id": str(agent_id),
+                        "awakened_agent_ids": [str(agent_id)],
+                        "project_run_id": str(project_run.id),
+                        "subagent_run_id": str(child_id),
+                        "subagent_session_id": str(child_id),
+                    },
+                )
+        elif anchor is not None:
+            meta = _message_meta(anchor)
+            awakened = list(dict.fromkeys([*meta.get("awakened_agent_ids", []), str(agent_id)]))
+            subagent_rows = list(meta.get("subagent_runs", []))
+            if not any(str(row.get("project_run_id")) == str(project_run.id) for row in subagent_rows):
+                subagent_rows.append(
+                    {
+                        "project_run_id": str(project_run.id),
+                        "run_id": str(child_id),
+                        "session_id": str(child_id),
+                        "agent_id": str(agent_id),
+                        "status": child_status,
+                    }
+                )
+            anchor.message_meta = {
+                **meta,
+                "awakened_agent_ids": awakened,
+                "subagent_runs": subagent_rows,
+            }
+            existing_event = (
+                await db.execute(
+                    select(ProjectEvent)
+                    .where(
+                        ProjectEvent.project_id == project_run.project_id,
+                        ProjectEvent.event_type == "group.message.created",
+                        ProjectEvent.event_metadata["group_message_id"].as_string()
+                        == str(anchor.id),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing_event is None and project is not None:
+                add_event(
+                    db,
+                    project,
+                    "group.message.created",
+                    "Appended project group message and dispatched Leader plus structured mentions",
+                    actor_user_id=project_run.initiated_by_user_id,
+                    metadata={
+                        "group_session_id": str(group_session_id),
+                        "group_message_id": str(anchor.id),
+                        "initiator_user_id": str(project_run.initiated_by_user_id),
+                        "visible_to_group": True,
+                        "mentioned_agent_ids": meta.get("mentions", []),
+                        "default_leader_agent_id": meta.get("default_leader_agent_id"),
+                        "awakened_agent_ids": awakened,
+                        "subagent_runs": subagent_rows,
+                        "zero_wake_default": False,
+                    },
+                )
+            elif existing_event is not None:
+                existing_event.event_metadata = {
+                    **dict(existing_event.event_metadata or {}),
+                    "awakened_agent_ids": awakened,
+                    "subagent_runs": subagent_rows,
+                }
+        await db.commit()
+        return {"status": project_run.status, **dict(project_run.output or {})}
+
+
+async def _pending_project_dispatch_runs() -> list[uuid.UUID]:
+    from app.models.project import ProjectRun
+
+    async with async_session() as db:
+        rows = (
+            await db.execute(
+                select(ProjectRun)
+                .where(
+                    ProjectRun.status.in_(["queued", "running"]),
+                    ProjectRun.trigger_type.in_(PROJECT_DISPATCH_TRIGGERS),
+                )
+                .order_by(ProjectRun.created_at, ProjectRun.id)
+                .limit(50)
+            )
+        ).scalars().all()
+        return [
+            row.id
+            for row in rows
+            if dict((row.input or {}).get("dispatch") or {})
+            and not dict(row.output or {}).get("subagent_run_id")
+        ]
+
+
 async def _subagent_parent_dispatch_loop() -> None:
     while True:
         try:
@@ -1545,9 +2138,6 @@ async def _subagent_parent_dispatch_loop() -> None:
         except Exception as exc:  # noqa: BLE001 - daemon must survive transient DB faults
             logger.exception(f"[subagent] parent event scan failed: {exc}")
             await asyncio.sleep(1)
-            continue
-        if not pending:
-            await asyncio.sleep(0.5)
             continue
         made_progress = False
         for message_id in pending:
@@ -1561,6 +2151,22 @@ async def _subagent_parent_dispatch_loop() -> None:
                 logger.exception(
                     f"[subagent] parent event dispatch failed message={message_id}: {exc}"
                 )
+        try:
+            leader_groups = await _pending_project_leader_groups()
+            for group_id in leader_groups:
+                made_progress = await _dispatch_project_leader_batch(group_id) or made_progress
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - durable claimed batches retry on the next scan
+            logger.exception(f"[subagent] project Leader batch dispatch failed: {exc}")
+        try:
+            for project_run_id in await _pending_project_dispatch_runs():
+                result = await dispatch_project_run(project_run_id)
+                made_progress = result.get("status") not in {"gone", "not_dispatchable"} or made_progress
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - queued outbox rows remain retryable
+            logger.exception(f"[subagent] project dispatch recovery failed: {exc}")
         if not made_progress:
             await asyncio.sleep(0.5)
 

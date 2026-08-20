@@ -183,6 +183,7 @@ type ProjectSegmentedControlProps<T extends string> = {
     onChange: (value: T) => void;
     ariaLabel: string;
     className?: string;
+    disabled?: boolean;
 };
 
 export function ProjectSegmentedControl<T extends string>({
@@ -191,6 +192,7 @@ export function ProjectSegmentedControl<T extends string>({
     onChange,
     ariaLabel,
     className = '',
+    disabled = false,
 }: ProjectSegmentedControlProps<T>) {
     return (
         <div className={['project-segmented-control', className].filter(Boolean).join(' ')} role="group" aria-label={ariaLabel}>
@@ -201,7 +203,7 @@ export function ProjectSegmentedControl<T extends string>({
                     variant="ghost"
                     className={value === option.value ? 'is-active' : ''}
                     aria-pressed={value === option.value}
-                    disabled={option.disabled}
+                    disabled={disabled || option.disabled}
                     onClick={() => onChange(option.value)}
                 >
                     {option.icon}

@@ -41,6 +41,7 @@ from app.models.project import (  # noqa: F401
     ProjectCapabilityBinding,
     ProjectEvent,
     ProjectMemberSnapshot,
+    ProjectRepositoryOperation,
     ProjectRun,
     ProjectRunMemberSnapshot,
     ProjectTemplate,

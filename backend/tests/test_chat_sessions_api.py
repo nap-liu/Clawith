@@ -292,6 +292,8 @@ async def test_org_admin_can_list_all_sessions(monkeypatch):
         db=db,
     )
 
+    rendered = str(db.statements[1])
+    assert "chat_sessions.project_id IS NULL" in rendered
     assert len(sessions) == 1
     assert sessions[0].id == str(session.id)
     assert sessions[0].user_id == str(owner_id)
@@ -394,6 +396,7 @@ async def test_mine_session_list_applies_channel_filter_and_pagination(monkeypat
 
     rendered = str(db.statements[1])
     assert "chat_sessions.source_channel =" in rendered
+    assert "chat_sessions.project_id IS NULL" in rendered
     assert "LIMIT" in rendered.upper()
     assert "OFFSET" in rendered.upper()
     assert len(sessions) == 1

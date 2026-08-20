@@ -88,6 +88,7 @@ const {
     buildConversationEntries: buildH5ConversationEntries,
     getConversationScrollAnchor: getH5ScrollAnchor,
     hasPendingConfirmation,
+    isA2AMessageLeft,
     isConfirmationToolCall,
     latestHistoryWindowOverlaps,
     mapHistoryMessage,
@@ -105,6 +106,30 @@ const {
     prepareMessagesForActiveTurnResume,
     shouldScheduleResumeReconnect,
 } = resumeRecoveryModule.exports;
+
+{
+    const currentAgentId = 'agent-engineer';
+    assert.equal(
+        isA2AMessageLeft({ sender_agent_id: 'agent-architect' }),
+        true,
+        'the peer Agent must render on the left regardless of its stored LLM role',
+    );
+    assert.equal(
+        isA2AMessageLeft({ sender_agent_id: currentAgentId }),
+        true,
+        'the Agent whose page is open must also render on the left',
+    );
+    assert.equal(
+        isA2AMessageLeft({ sender_user_id: 'human-owner' }),
+        false,
+        'a human-authored A2A timeline message must render on the right',
+    );
+    assert.equal(
+        isA2AMessageLeft({}),
+        true,
+        'legacy actorless A2A rows must not guess ownership from role',
+    );
+}
 
 {
     const messages = [

@@ -31,6 +31,7 @@ from typing import Optional, Any
 from urllib.parse import unquote, urlsplit
 import re
 
+from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy import func, select, or_
 from sqlalchemy.orm import selectinload
@@ -3655,6 +3656,29 @@ async def execute_tool(
             return json.dumps({"status": "sent"}, ensure_ascii=False)
         except SubagentError as exc:
             return f"❌ {exc}"
+
+    from app.services.project_runtime_tools import (
+        PROJECT_RUNTIME_TOOL_NAMES,
+        execute_project_runtime_tool,
+    )
+
+    if tool_name in PROJECT_RUNTIME_TOOL_NAMES:
+        try:
+            return await execute_project_runtime_tool(
+                tool_name,
+                arguments,
+                agent_id=agent_id,
+                execution_user_id=user_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_anchor_id=turn_anchor_id,
+            )
+        except (ValueError, HTTPException) as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            return f"❌ {detail}"
+        except Exception as exc:
+            logger.exception("[ProjectTool] {} failed", tool_name)
+            return f"❌ Project tool failed: {type(exc).__name__}"
 
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
 

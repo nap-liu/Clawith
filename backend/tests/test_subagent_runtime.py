@@ -422,7 +422,8 @@ async def test_unexpected_failure_requeues_pending_input_without_lease_delay(
         origin_tool_call_id="append-after-exception",
     )
 
-    async def fake_tools(_agent_id, _session_id=None):
+    async def fake_tools(_agent_id, _session_id=None, execution_user_id=None):
+        del execution_user_id
         return []
 
     async def failing_llm(*_args, **_kwargs):
@@ -550,7 +551,8 @@ async def test_processing_reclaim_continues_durable_done_tool_tail(monkeypatch):
 
     captured = {}
 
-    async def fake_tools(_agent_id, _session_id=None):
+    async def fake_tools(_agent_id, _session_id=None, execution_user_id=None):
+        del execution_user_id
         return []
 
     async def fake_llm(_db, _agent_id, user_text, **kwargs):
@@ -666,7 +668,8 @@ async def test_sync_execution_reuses_unified_llm_and_persists_terminal_result(mo
     )
     captured = {}
 
-    async def fake_tools(_agent_id, _session_id=None):
+    async def fake_tools(_agent_id, _session_id=None, execution_user_id=None):
+        del execution_user_id
         return [{"type": "function", "function": {"name": "safe", "parameters": {}}}]
 
     async def fake_llm(_db, _agent_id, user_text, **kwargs):

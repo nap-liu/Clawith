@@ -32,7 +32,7 @@ import {
     shouldScheduleResumeReconnect,
     type ResumeEventGate,
 } from '../../features/conversation/core/resumeRecovery';
-import { buildConversationEntries, getConversationScrollAnchor } from '../../features/conversation/core/chatTimeline';
+import { buildConversationEntries, getConversationScrollAnchor, isA2AMessageLeft } from '../../features/conversation/core/chatTimeline';
 import { useConversationAutoFollow } from '../../features/conversation/useConversationAutoFollow';
 import {
     createConversationHistoryPageParams,
@@ -6477,13 +6477,15 @@ export default function AgentDetailPage() {
                                                     onOpenSubagentSession={openSubagentSession}
                                                     onToolResolved={(message, result) => upsertToolCallMessage({ ...message, toolStatus: 'done', toolResult: result } as any)}
                                                     viewOf={(m: any) => {
-                                                    // Determine if this message is from "this agent" (left) or peer (right).
+                                                    // Canonical actor IDs, not LLM roles, determine A2A ownership.
+                                                    // All Agent actors are left and human actors are right.
+                                                    // Actorless legacy rows fail closed to the left.
                                                     // Group chat: assistant always left; user msgs are RIGHT only when sent
                                                     // by the logged-in viewer themself, otherwise LEFT (so each distinct
                                                     // human speaker gets their own avatar/name label).
                                                     let isLeft: boolean;
-                                                    if (isA2A && thisAgentId && m.sender_agent_id) {
-                                                        isLeft = String(m.sender_agent_id) !== thisAgentId;
+                                                    if (isA2A) {
+                                                        isLeft = isA2AMessageLeft(m);
                                                     } else if (isGroupChat) {
                                                         if (m.role === 'assistant') {
                                                             isLeft = true;

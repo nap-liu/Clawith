@@ -277,6 +277,10 @@ async def list_sessions(
                 | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
             )
             & (ChatSession.source_channel != "subagent")
+            # Project conversations have their own project-scoped navigation
+            # and APIs.  Never leak planning, group, or direct project A2A
+            # threads into the ordinary Web Agent session picker.
+            & ChatSession.project_id.is_(None)
         )
         query = select(ChatSession).where(all_where)
         if source_channel:
@@ -316,7 +320,7 @@ async def list_sessions(
                     ChatSession.id.in_(session_uuid_ids),
                     ChatSession.user_id == current_user.id,
                     ChatSession.source_channel.notin_(["agent", "trigger"]),
-                    ChatSession.is_group == False,
+                    ChatSession.is_group.is_(False),
                     ChatMessage.role.in_(["assistant", "system", "tool_call"]),
                     ChatMessage.created_at > func.coalesce(
                         ChatSession.last_read_at_by_user,
@@ -421,14 +425,15 @@ async def list_sessions(
             select(ChatSession)
             .where(
                 ChatSession.agent_id == agent_id,
+                ChatSession.project_id.is_(None),
                 ChatSession.source_channel.notin_(["agent", "trigger", "subagent"]),
                 or_(
                     and_(
-                        ChatSession.is_group == False,
+                        ChatSession.is_group.is_(False),
                         ChatSession.user_id == current_user.id,
                     ),
                     and_(
-                        ChatSession.is_group == True,
+                        ChatSession.is_group.is_(True),
                         group_membership,
                     ),
                 ),
@@ -478,7 +483,7 @@ async def list_sessions(
                 .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
                 .where(
                     ChatSession.id.in_(session_uuid_ids),
-                    ChatSession.is_group == False,  # group last_read_at is shared; per-user unread undefined
+                    ChatSession.is_group.is_(False),  # group last_read_at is shared; per-user unread undefined
                     ChatMessage.role.in_(["assistant", "system", "tool_call"]),
                     ChatMessage.created_at > func.coalesce(
                         ChatSession.last_read_at_by_user,

@@ -19,20 +19,31 @@
         "shared": "共享项目",
         "unshared": "取消共享",
         "settings": { "updated": "更新项目设置" },
-        "file": { "committed": "提交项目文件" }
+        "file": { "committed": "提交项目文件" },
+        "kickoff": { "confirmed": "确认项目方案并启动", "failed": "项目启动失败" },
+        "agent_reply_batch": { "dispatched": "派发 Agent 批量回复" }
       },
       "member": { "snapshot": { "created": "创建成员快照", "updated": "更新成员快照" } },
       "leader": { "changed": "变更项目 Leader" },
       "capability": { "bound": "绑定项目能力", "updated": "更新项目能力" },
       "work_item": { "created": "创建工作项", "updated": "更新工作项" },
-      "run": { "queued": "运行进入队列" },
+      "run": {
+        "queued": "运行进入队列",
+        "running": "运行已开始",
+        "waiting": "运行进入等待",
+        "succeeded": "运行已成功完成",
+        "failed": "运行执行失败",
+        "cancelled": "运行已取消"
+      },
       "a2a": { "queued": "A2A 请求进入队列", "delivered": "A2A 消息已送达", "delivery_failed": "A2A 消息送达失败" },
       "group": { "message": { "created": "创建项目群消息" } },
       "git": {
         "commit": { "created": "创建 Git 提交" },
         "milestone": { "created": "创建交付里程碑" },
         "branch": { "created": "创建 Git 分支" },
-        "restore_commit": { "created": "创建恢复提交" }
+        "restore_commit": { "created": "创建恢复提交" },
+        "remote": { "configured": "配置 Git 远端", "deleted": "删除 Git 远端" },
+        "repository": { "cloned": "从远程克隆项目仓库" }
       }
     }
   },

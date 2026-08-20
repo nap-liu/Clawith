@@ -1,9 +1,13 @@
 """REST API for closed-loop AI-native project management."""
 
+import hashlib
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from loguru import logger
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user
@@ -18,13 +22,13 @@ from app.models.project import (
     ProjectCapabilityBinding,
     ProjectEvent,
     ProjectMemberSnapshot,
+    ProjectRepositoryOperation,
     ProjectRun,
     ProjectRunMemberSnapshot,
     ProjectTemplate,
     ProjectWorkItem,
 )
 from app.models.skill import Skill
-from app.models.subagent_run import SubagentRun
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
 from app.schemas.project import (
@@ -32,7 +36,9 @@ from app.schemas.project import (
     CapabilityOut,
     CapabilityUpdate,
     GitBranchRequest,
+    GitCloneRequest,
     GitCommitRequest,
+    GitRemoteRequest,
     GitRestoreRequest,
     LeaderUpdate,
     ProjectAccessGrantCreate,
@@ -44,6 +50,7 @@ from app.schemas.project import (
     ProjectFileWriteRequest,
     ProjectFromTemplateCreate,
     ProjectGroupMessageCreate,
+    ProjectKickoffConfirm,
     ProjectMemberCreate,
     ProjectMemberOut,
     ProjectMemberUpdate,
@@ -59,11 +66,20 @@ from app.schemas.project import (
     WorkItemUpdate,
 )
 from app.services.project_git_service import (
+    apply_project_repository_clone,
+    begin_project_repository_clone,
     commit_project_changes,
     create_branch,
+    delete_git_remote,
+    finalize_project_repository_clone,
+    list_git_remotes,
     list_project_files,
+    put_git_remote,
+    reconcile_project_repository_operations,
+    release_project_repository_clone_lock,
     repository_state,
     restore_as_new_commit,
+    rollback_project_repository_clone,
     write_project_file,
 )
 from app.services.project_service import (
@@ -75,6 +91,7 @@ from app.services.project_service import (
     create_project,
     deliver_project_a2a,
     ensure_project_group_session,
+    ensure_project_leader_session,
     freeze_run_members,
     project_summary,
     replace_access_grants,
@@ -107,6 +124,52 @@ def _record_git_head(project: Project, commit: str) -> None:
     settings = dict(project.settings or {})
     settings["git"] = {**dict(settings.get("git") or {}), "head": commit}
     project.settings = settings
+
+
+def _record_git_repository_settings(
+    project: Project,
+    *,
+    remotes: list[dict],
+    source: str | None = None,
+    head: str | None = None,
+    default_branch: str | None = None,
+) -> None:
+    settings = dict(project.settings or {})
+    safe_remotes = [
+        {
+            "name": str(remote.get("name") or ""),
+            "url_sha256": hashlib.sha256(str(remote.get("url") or "").encode("utf-8")).hexdigest(),
+        }
+        for remote in remotes
+    ]
+    git_settings = {
+        **dict(settings.get("git") or {}),
+        "mode": "managed",
+        "repository_mode": "managed",
+        # Full remote URLs are owner-only and live in Git config. Project
+        # settings are included in viewer dashboards, so keep only safe refs.
+        "remotes": safe_remotes,
+        "remote_count": len(safe_remotes),
+    }
+    if source is not None:
+        git_settings["source"] = source
+    if head is not None:
+        git_settings["head"] = head
+    if default_branch is not None:
+        git_settings["default_branch"] = default_branch
+    settings["git"] = git_settings
+    project.settings = settings
+
+
+def _git_remote_audit_metadata(remote: dict, *, history_changed: bool) -> dict:
+    """Return viewer-safe remote evidence without persisting repository URLs."""
+
+    url = str(remote.get("url") or "")
+    return {
+        "remote_name": str(remote.get("name") or ""),
+        "remote_url_sha256": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+        "history_changed": history_changed,
+    }
 
 
 async def _template_payload(db: AsyncSession, template: ProjectTemplate) -> dict:
@@ -566,6 +629,7 @@ async def get_project_dashboard(
         .scalars()
         .all()
     )
+    await reconcile_project_repository_operations(project.id, db=db)
     git_state = await repository_state(project, 20)
     files = await list_project_files(project)
     return {
@@ -594,10 +658,21 @@ async def patch_project(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    project = await require_project(db, current_user, project_id, edit=True)
     updates = data.model_dump(exclude_unset=True)
+    acl_change = bool({"visibility", "shared_with_user_ids"} & data.model_fields_set)
+    project = (
+        await require_owner(db, current_user, project_id)
+        if acl_change
+        else await require_project(db, current_user, project_id, edit=True)
+    )
+    if project.status == "planning" and updates.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Confirm the Leader kickoff before starting a planning project")
     shared_ids = updates.pop("shared_with_user_ids", None)
     requested_visibility = updates.pop("visibility", None)
+    if requested_visibility == "shared" and shared_ids is not None and not shared_ids:
+        raise HTTPException(status_code=422, detail="A shared project requires at least one shared user")
+    if requested_visibility == "private" and shared_ids:
+        raise HTTPException(status_code=422, detail="A private project cannot include shared users")
     for key, value in updates.items():
         setattr(project, key, value)
     if shared_ids is not None:
@@ -1259,7 +1334,14 @@ async def create_project_event(
     return event
 
 
-def _group_session_payload(session: ChatSession) -> dict:
+def _group_session_payload(session: ChatSession, project: Project) -> dict:
+    policies = dict((project.settings or {}).get("policies") or {})
+    mention_limit = min(8, max(1, int(policies.get("max_group_mentions_per_message", 4))))
+    configured_wake_budget = max(0, int(policies.get("max_a2a_wakes", mention_limit)))
+    # A Human message always gets one Leader turn, even when an old project
+    # policy configured a zero A2A wake budget. The remainder is available to
+    # explicit, non-Leader mentions.
+    max_mentions = min(mention_limit, max(0, max(1, configured_wake_budget) - 1))
     return {
         "id": str(session.id),
         "project_id": str(session.project_id) if session.project_id else None,
@@ -1267,6 +1349,7 @@ def _group_session_payload(session: ChatSession) -> dict:
         "group_name": session.group_name,
         "source_channel": session.source_channel,
         "access_agent_id": str(session.agent_id),
+        "max_mentions": max_mentions,
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "last_message_at": session.last_message_at.isoformat() if session.last_message_at else None,
     }
@@ -1289,6 +1372,293 @@ def _group_message_payload(message: ChatMessage) -> dict:
     }
 
 
+def _leader_session_payload(session: ChatSession, discussion_count: int) -> dict:
+    return {
+        "id": str(session.id),
+        "project_id": str(session.project_id) if session.project_id else None,
+        "agent_id": str(session.agent_id),
+        "user_id": str(session.user_id) if session.user_id else None,
+        "title": session.title,
+        "source_channel": session.source_channel,
+        "is_group": False,
+        "discussion_count": discussion_count,
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "last_message_at": session.last_message_at.isoformat() if session.last_message_at else None,
+    }
+
+
+def _kickoff_transcript(
+    project: Project,
+    messages: list[ChatMessage],
+    confirmation: str,
+    confirmed_at: datetime,
+) -> str:
+    lines = [
+        f"# {project.name} · Kickoff transcript",
+        "",
+        f"Project ID: `{project.id}`",
+        "",
+        f"Goal: {project.goal}",
+        "",
+        "## Planning discussion",
+        "",
+    ]
+    role_labels = {"user": "User", "assistant": "Leader", "system": "System", "tool_call": "Tool"}
+    for message in messages:
+        actor = role_labels.get(message.role, message.role.title())
+        timestamp = message.created_at.isoformat() if message.created_at else "unknown time"
+        lines.extend([f"### {actor} · {timestamp}", ""])
+        content = message.content.strip() or "_(empty message)_"
+        lines.extend([f"> {line}" if line else ">" for line in content.splitlines()])
+        lines.append("")
+    lines.extend(["## User confirmation", "", f"Confirmed at: {confirmed_at.isoformat()}", "", confirmation, ""])
+    return "\n".join(lines)
+
+
+@router.get("/{project_id}/leader-session")
+async def get_project_leader_session(
+    project_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_project(db, current_user, project_id)
+    session = await ensure_project_leader_session(db, project)
+    discussion_count = int(
+        (
+            await db.execute(
+                select(func.count(ChatMessage.id)).where(ChatMessage.conversation_id == str(session.id))
+            )
+        ).scalar_one()
+    )
+    await db.commit()
+    await db.refresh(session)
+    return _leader_session_payload(session, discussion_count)
+
+
+@router.post("/{project_id}/kickoff/confirm", status_code=202)
+async def confirm_project_kickoff(
+    project_id: uuid.UUID,
+    data: ProjectKickoffConfirm,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Freeze Leader planning evidence and start one durable Leader child.
+
+    Confirmation is the only implicit wake in this flow and targets only the
+    enabled Leader. Group messages remain append-only and structured mentions
+    keep their zero-broadcast default.
+    """
+    from app.services.subagent_runtime import dispatch_project_run
+
+    authorized_project = await require_project(db, current_user, project_id, edit=True)
+    project = (
+        await db.execute(select(Project).where(Project.id == authorized_project.id).with_for_update())
+    ).scalar_one()
+    if project.status == "initializing":
+        pending_run = (
+            await db.execute(
+                select(ProjectRun)
+                .where(
+                    ProjectRun.project_id == project.id,
+                    ProjectRun.trigger_type == "leader_kickoff",
+                    ProjectRun.status.in_(["queued", "running"]),
+                )
+                .order_by(ProjectRun.created_at.desc(), ProjectRun.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if pending_run is not None and dict((pending_run.input or {}).get("dispatch") or {}):
+            await db.commit()
+            dispatch_result = await dispatch_project_run(pending_run.id)
+            refreshed = await db.get(ProjectRun, pending_run.id)
+            event_id = (
+                await db.execute(
+                    select(ProjectEvent.id)
+                    .where(
+                        ProjectEvent.run_id == pending_run.id,
+                        ProjectEvent.event_type == "project.kickoff.confirmed",
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            payload = {
+                **dict(pending_run.input or {}),
+                **(dict(refreshed.output or {}) if refreshed else {}),
+            }
+            return {
+                "status": "running" if dispatch_result.get("subagent_run_id") else "initializing",
+                "project_id": str(project.id),
+                "run_id": str(pending_run.id),
+                "event_id": str(event_id) if event_id else None,
+                "leader_session_id": payload.get("leader_session_id"),
+                "group_session_id": payload.get("group_session_id"),
+                "leader_agent_id": payload.get("leader_agent_id"),
+                "awakened_agent_ids": [payload.get("leader_agent_id")] if dispatch_result.get("subagent_run_id") else [],
+                "subagent_run_id": dispatch_result.get("subagent_run_id"),
+                "subagent_session_id": dispatch_result.get("subagent_session_id"),
+                "git_start_commit": payload.get("git_start_commit"),
+                "transcript_path": payload.get("transcript_path"),
+                "transcript_commit": payload.get("transcript_commit"),
+                "recovered": True,
+            }
+    if project.status != "planning":
+        raise HTTPException(status_code=409, detail="Only a planning project can be confirmed")
+
+    leader = (
+        await db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.is_leader.is_(True),
+                ProjectMemberSnapshot.is_enabled.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if leader is None:
+        raise HTTPException(status_code=422, detail="Project needs an enabled Leader before kickoff")
+    leader_session = await ensure_project_leader_session(db, project)
+    discussion = (
+        await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.conversation_id == str(leader_session.id))
+            .order_by(ChatMessage.created_at, ChatMessage.id)
+        )
+    ).scalars().all()
+    roles = {message.role for message in discussion}
+    if "user" not in roles or "assistant" not in roles:
+        raise HTTPException(
+            status_code=422,
+            detail="Kickoff requires at least one User message and one Leader response",
+        )
+
+    confirmation = (data.confirmation or "I confirm this plan and authorize the Leader to begin execution.").strip()
+    confirmed_at = datetime.now(timezone.utc)
+    transcript = _kickoff_transcript(project, discussion, confirmation, confirmed_at)
+    transcript_sha256 = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+    await reconcile_project_repository_operations(project.id, db=db)
+    git_start = await repository_state(project, limit=1)
+    transcript_commit = await write_project_file(project, "docs/kickoff-transcript.md", transcript)
+    group_session = await ensure_project_group_session(db, project)
+    now = confirmed_at
+    kickoff_message = ChatMessage(
+        id=uuid.uuid4(),
+        agent_id=group_session.agent_id,
+        user_id=current_user.id,
+        sender_user_id=current_user.id,
+        role="user",
+        content=(
+            f"Kickoff confirmed. Leader @{leader.name_snapshot} may begin driving the project. "
+            "The frozen planning record is in docs/kickoff-transcript.md."
+        ),
+        conversation_id=str(group_session.id),
+        external_event_key=f"project-kickoff:{project.id}:{transcript_sha256}",
+        message_meta={
+            "kind": "project_kickoff_confirmation",
+            "project_id": str(project.id),
+            "visible_to_group": True,
+            "mentions": [],
+            "awakened_agent_ids": [],
+            "wake_policy": "kickoff_leader_only",
+            "initiator_user_id": str(current_user.id),
+            "leader_agent_id": str(leader.agent_id),
+            "transcript_path": "docs/kickoff-transcript.md",
+            "transcript_commit": transcript_commit["commit"],
+        },
+        created_at=now,
+    )
+    task = (
+        "The User confirmed project kickoff. Act as Project Leader: drive the agreed goal autonomously, "
+        "coordinate only explicit recipients, preserve all output in project Git, and report progress to the group.\n\n"
+        + transcript
+    )
+    kickoff_snapshot = {
+        "confirmed_at": confirmed_at.isoformat(),
+        "confirmed_by_user_id": str(current_user.id),
+        "leader_session_id": str(leader_session.id),
+        "group_session_id": str(group_session.id),
+        "leader_agent_id": str(leader.agent_id),
+        "git_start_commit": git_start["head"],
+        "transcript_path": "docs/kickoff-transcript.md",
+        "transcript_commit": transcript_commit["commit"],
+        "transcript_sha256": transcript_sha256,
+    }
+    run = ProjectRun(
+        tenant_id=project.tenant_id,
+        project_id=project.id,
+        agent_id=leader.agent_id,
+        initiated_by_user_id=current_user.id,
+        status="queued",
+        trigger_type="leader_kickoff",
+        input={
+            "leader_session_id": str(leader_session.id),
+            "group_session_id": str(group_session.id),
+            "leader_agent_id": str(leader.agent_id),
+            "confirmation": confirmation,
+            "conversation_snapshot": {
+                "message_count": len(discussion),
+                "message_ids": [str(message.id) for message in discussion],
+                "last_message_at": discussion[-1].created_at.isoformat() if discussion[-1].created_at else None,
+                "transcript_path": "docs/kickoff-transcript.md",
+                "transcript_sha256": transcript_sha256,
+            },
+            "git_start_commit": git_start["head"],
+            "transcript_path": "docs/kickoff-transcript.md",
+            "transcript_commit": transcript_commit["commit"],
+            "dispatch": {
+                "group_session_id": str(group_session.id),
+                "project_member_id": str(leader.id),
+                "turn_anchor_id": str(kickoff_message.id),
+                "task": task,
+                "kickoff": kickoff_snapshot,
+            },
+        },
+        output={
+            "group_session_id": str(group_session.id),
+            "leader_session_id": str(leader_session.id),
+            "transcript_path": "docs/kickoff-transcript.md",
+            "transcript_commit": transcript_commit["commit"],
+        },
+    )
+    db.add_all([kickoff_message, run])
+    group_session.last_message_at = now
+    project.status = "initializing"
+    await db.flush()
+    await freeze_run_members(db, project, run)
+    await db.commit()
+    try:
+        dispatch_result = await dispatch_project_run(run.id)
+    except Exception as exc:
+        # The committed ProjectRun is the durable outbox. A daemon retry owns
+        # recovery, so this response never rolls the project back to planning.
+        dispatch_result = {"status": "initializing", "error": str(exc)}
+    event_id = (
+        await db.execute(
+            select(ProjectEvent.id)
+            .where(
+                ProjectEvent.run_id == run.id,
+                ProjectEvent.event_type == "project.kickoff.confirmed",
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    child_id = dispatch_result.get("subagent_run_id")
+    return {
+        "status": "running" if child_id else "initializing",
+        "project_id": str(project.id),
+        "run_id": str(run.id),
+        "event_id": str(event_id) if event_id else None,
+        "leader_session_id": str(leader_session.id),
+        "group_session_id": str(group_session.id),
+        "leader_agent_id": str(leader.agent_id),
+        "awakened_agent_ids": [str(leader.agent_id)] if child_id else [],
+        "subagent_run_id": str(child_id) if child_id else None,
+        "subagent_session_id": str(child_id) if child_id else None,
+        "git_start_commit": git_start["head"],
+        "transcript_path": "docs/kickoff-transcript.md",
+        "transcript_commit": transcript_commit["commit"],
+    }
+
+
 @router.get("/{project_id}/group-session")
 async def get_project_group_session(
     project_id: uuid.UUID,
@@ -1299,7 +1669,7 @@ async def get_project_group_session(
     session = await ensure_project_group_session(db, project)
     await db.commit()
     await db.refresh(session)
-    return _group_session_payload(session)
+    return _group_session_payload(session, project)
 
 
 @router.get("/{project_id}/group-sessions/{session_id}/messages")
@@ -1331,7 +1701,10 @@ async def list_project_group_messages(
             .limit(limit)
         )
     ).scalars().all()
-    return {"session": _group_session_payload(session), "items": [_group_message_payload(row) for row in reversed(messages)]}
+    return {
+        "session": _group_session_payload(session, project),
+        "items": [_group_message_payload(row) for row in reversed(messages)],
+    }
 
 
 @router.post("/{project_id}/group-sessions/{session_id}/messages", status_code=201)
@@ -1342,14 +1715,15 @@ async def create_project_group_message(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Append one group-visible message and wake only structured mentions."""
-    from app.services.subagent_runtime import (
-        SubagentError,
-        append_subagent_message,
-        create_subagent,
-    )
+    """Append a group message, route Human input to Leader, and wake mentions."""
+    from app.services.subagent_runtime import dispatch_project_run
 
     project = await require_project(db, current_user, project_id, edit=True)
+    if data.sender_agent_id is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="Human project REST callers cannot impersonate an Agent sender",
+        )
     session = (
         await db.execute(
             select(ChatSession).where(
@@ -1364,20 +1738,35 @@ async def create_project_group_message(
         raise HTTPException(status_code=404, detail="Project group session not found")
 
     mention_ids = list(dict.fromkeys(data.mentions))
+    leader = (
+        await db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.is_leader.is_(True),
+                ProjectMemberSnapshot.is_enabled.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if leader is None:
+        raise HTTPException(status_code=422, detail="Project needs an enabled Leader for Human group messages")
+    default_leader_agent_id = leader.agent_id
     policies = dict((project.settings or {}).get("policies") or {})
     mention_limit = min(8, max(1, int(policies.get("max_group_mentions_per_message", 4))))
-    wake_budget = min(mention_limit, max(0, int(policies.get("max_a2a_wakes", mention_limit))))
-    if len(mention_ids) > mention_limit or len(mention_ids) > wake_budget:
+    configured_wake_budget = max(0, int(policies.get("max_a2a_wakes", mention_limit)))
+    wake_budget = max(1, configured_wake_budget)
+    if len(mention_ids) > mention_limit:
         raise HTTPException(
             status_code=422,
-            detail=f"Structured mentions exceed this project's per-message wake budget ({wake_budget})",
+            detail=f"Structured mentions exceed this project's per-message limit ({mention_limit})",
         )
-    if data.sender_agent_id and data.sender_agent_id in mention_ids:
-        raise HTTPException(status_code=422, detail="An Agent cannot mention itself")
-
-    required_agent_ids = set(mention_ids)
-    if data.sender_agent_id:
-        required_agent_ids.add(data.sender_agent_id)
+    wake_agent_ids = list(dict.fromkeys([default_leader_agent_id, *mention_ids]))
+    if len(wake_agent_ids) > wake_budget:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Leader and mentions exceed this project's per-message wake budget ({wake_budget})",
+        )
+    required_agent_ids = set(wake_agent_ids)
     members = (
         await db.execute(
             select(ProjectMemberSnapshot).where(
@@ -1386,7 +1775,7 @@ async def create_project_group_message(
                 ProjectMemberSnapshot.agent_id.in_(required_agent_ids),
             )
         )
-    ).scalars().all() if required_agent_ids else []
+    ).scalars().all()
     member_by_agent = {member.agent_id: member for member in members}
     if set(member_by_agent) != required_agent_ids:
         raise HTTPException(status_code=422, detail="Every sender and mention must be a project member")
@@ -1401,10 +1790,25 @@ async def create_project_group_message(
             await db.execute(select(ChatMessage).where(ChatMessage.external_event_key == event_key))
         ).scalar_one_or_none()
     if existing is not None:
+        pending_runs = (
+            await db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project.id,
+                    ProjectRun.input["group_message_id"].as_string() == str(existing.id),
+                    ProjectRun.trigger_type.in_(["group_leader_message", "group_mention"]),
+                )
+            )
+        ).scalars().all()
+        await db.commit()
+        for pending_run in pending_runs:
+            if not dict(pending_run.output or {}).get("subagent_run_id"):
+                await dispatch_project_run(pending_run.id)
+        await db.refresh(existing)
         meta = dict(existing.message_meta or {})
         return {
             "message": _group_message_payload(existing),
             "awakened_agent_ids": meta.get("awakened_agent_ids", []),
+            "default_leader_agent_id": meta.get("default_leader_agent_id"),
             "subagent_runs": meta.get("subagent_runs", []),
             "idempotent_replay": True,
         }
@@ -1412,8 +1816,8 @@ async def create_project_group_message(
     message = ChatMessage(
         agent_id=session.agent_id,
         user_id=current_user.id,
-        sender_user_id=None if data.sender_agent_id else current_user.id,
-        sender_agent_id=data.sender_agent_id,
+        sender_user_id=current_user.id,
+        sender_agent_id=None,
         role="user",
         content=data.content.strip(),
         conversation_id=str(session.id),
@@ -1423,137 +1827,129 @@ async def create_project_group_message(
             "project_id": str(project.id),
             "visible_to_group": True,
             "mentions": [str(agent_id) for agent_id in mention_ids],
+            "default_leader_agent_id": str(default_leader_agent_id),
             "attachments": data.attachments,
             "awakened_agent_ids": [],
             "subagent_runs": [],
-            "wake_policy": "structured_mentions_only",
+            "wake_policy": "default_leader_plus_structured_mentions",
             "initiator_user_id": str(current_user.id),
         },
     )
     db.add(message)
     session.last_message_at = func.now()
     await db.flush()
-    await db.commit()
-    await db.refresh(message)
-
-    awakened: list[str] = []
-    subagent_rows: list[dict] = []
     execution_content = (data.llm_content or data.content).strip()
     if not execution_content:
         execution_content = (
             "处理项目群聊中附带的文件，并把结论回复到项目群。附件："
             + str(data.attachments)
         )
-    for agent_id in mention_ids:
+    project_runs: list[ProjectRun] = []
+    for agent_id in wake_agent_ids:
         member = member_by_agent[agent_id]
-        existing_run = (
-            await db.execute(
-                select(SubagentRun).where(
-                    SubagentRun.parent_session_id == session.id,
-                    SubagentRun.project_member_id == member.id,
-                ).order_by(SubagentRun.id).limit(1)
-            )
-        ).scalar_one_or_none()
         project_run = ProjectRun(
             tenant_id=project.tenant_id,
             project_id=project.id,
             agent_id=agent_id,
             initiated_by_user_id=current_user.id,
             status="queued",
-            trigger_type="group_mention",
+            trigger_type="group_leader_message" if agent_id == default_leader_agent_id else "group_mention",
             input={
                 "group_session_id": str(session.id),
                 "group_message_id": str(message.id),
                 "mentioned_agent_id": str(agent_id),
+                "wake_reason": "default_leader" if agent_id == default_leader_agent_id else "structured_mention",
                 "initiator_user_id": str(current_user.id),
+                "dispatch": {
+                    "group_session_id": str(session.id),
+                    "project_member_id": str(member.id),
+                    "turn_anchor_id": str(message.id),
+                    "task": execution_content,
+                },
             },
             output={"group_session_id": str(session.id)},
         )
         db.add(project_run)
         await db.flush()
         await freeze_run_members(db, project, project_run)
-        # Commit the auditable wake before publishing the child input. A fast
-        # worker can then always resolve project_run_id when it finishes.
-        await db.commit()
+        project_runs.append(project_run)
+    # Message and every target run form one durable outbox transaction. The
+    # Subagent daemon can recover all rows after a process exit.
+    await db.commit()
+
+    awakened: list[str] = []
+    subagent_rows: list[dict] = []
+    for project_run in project_runs:
+        agent_id = project_run.agent_id
         try:
-            if existing_run is None:
-                durable_run, _created = await create_subagent(
-                    agent_id=agent_id,
-                    execution_user_id=project.owner_user_id,
-                    parent_session_id=str(session.id),
-                    origin_tool_call_id=f"project-member:{member.id}",
-                    task=execution_content,
-                    mode="async",
-                    fork=True,
-                    turn_anchor_id=message.id,
-                    project_run_id=project_run.id,
-                )
-                run_status = durable_run.status
-                run_id = durable_run.id
-            else:
-                run_id = existing_run.id
-                run_status = await append_subagent_message(
-                    agent_id=agent_id,
-                    parent_session_id=str(session.id),
-                    subagent_id=str(existing_run.id),
-                    message=execution_content,
-                    execution_user_id=existing_run.execution_user_id,
-                    origin_tool_call_id=f"group-message:{message.id}:{agent_id}",
-                    project_run_id=project_run.id,
-                )
-            awakened.append(str(agent_id))
-            project_run.status = "queued" if run_status == "queued" else "running"
-            project_run.output = {
-                **dict(project_run.output or {}),
-                "subagent_run_id": str(run_id),
-                "subagent_session_id": str(run_id),
-            }
+            result = await dispatch_project_run(project_run.id)
+            run_id = result.get("subagent_run_id")
+            run_status = result.get("status", "queued")
+            if run_id:
+                awakened.append(str(agent_id))
             subagent_rows.append({
                 "project_run_id": str(project_run.id),
-                "run_id": str(run_id),
-                "session_id": str(run_id),
+                "run_id": str(run_id) if run_id else None,
+                "session_id": str(run_id) if run_id else None,
                 "agent_id": str(agent_id),
                 "status": run_status,
             })
-        except SubagentError as exc:
-            project_run.status = "failed"
-            project_run.finished_at = func.now()
-            project_run.error = str(exc)
+        except Exception as exc:
+            # Keep the durable queued run retryable; the daemon owns recovery.
             subagent_rows.append({
                 "project_run_id": str(project_run.id),
-                "run_id": str(existing_run.id) if existing_run else None,
-                "session_id": str(existing_run.id) if existing_run else None,
+                "run_id": None,
+                "session_id": None,
                 "agent_id": str(agent_id),
-                "status": "rejected",
+                "status": "queued",
                 "error": str(exc),
             })
 
     message = await db.get(ChatMessage, message.id, with_for_update=True)
     if message is None:
         raise HTTPException(status_code=500, detail="Group message disappeared during wake dispatch")
-    message.message_meta = {
-        **dict(message.message_meta or {}),
+    recovered_meta = dict(message.message_meta or {})
+    awakened = list(dict.fromkeys([*recovered_meta.get("awakened_agent_ids", []), *awakened]))
+    recovered_rows = list(recovered_meta.get("subagent_runs", []))
+    for row in subagent_rows:
+        if not any(str(existing_row.get("project_run_id")) == row["project_run_id"] for existing_row in recovered_rows):
+            recovered_rows.append(row)
+    message.message_meta = {**recovered_meta, "awakened_agent_ids": awakened, "subagent_runs": recovered_rows}
+    subagent_rows = recovered_rows
+    event = (
+        await db.execute(
+            select(ProjectEvent)
+            .where(
+                ProjectEvent.project_id == project.id,
+                ProjectEvent.event_type == "group.message.created",
+                ProjectEvent.event_metadata["group_message_id"].as_string() == str(message.id),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    event_metadata = {
+        "group_session_id": str(session.id),
+        "group_message_id": str(message.id),
+        "initiator_user_id": str(current_user.id),
+        "visible_to_group": True,
+        "mentioned_agent_ids": [str(agent_id) for agent_id in mention_ids],
+        "default_leader_agent_id": str(default_leader_agent_id),
         "awakened_agent_ids": awakened,
         "subagent_runs": subagent_rows,
+        "zero_wake_default": False,
     }
-    event = add_event(
-        db,
-        project,
-        "group.message.created",
-        "Appended project group message and dispatched structured mentions",
-        actor_user_id=current_user.id,
-        actor_agent_id=data.sender_agent_id,
-        metadata={
-            "group_session_id": str(session.id),
-            "group_message_id": str(message.id),
-            "initiator_user_id": str(current_user.id),
-            "visible_to_group": True,
-            "mentioned_agent_ids": [str(agent_id) for agent_id in mention_ids],
-            "awakened_agent_ids": awakened,
-            "subagent_runs": subagent_rows,
-            "zero_wake_default": not mention_ids,
-        },
-    )
+    if event is None:
+        event = add_event(
+            db,
+            project,
+            "group.message.created",
+            "Appended project group message and dispatched Leader plus structured mentions",
+            actor_user_id=current_user.id,
+            actor_agent_id=None,
+            metadata=event_metadata,
+        )
+    else:
+        event.event_metadata = event_metadata
     await db.flush()
     await db.commit()
     await db.refresh(message)
@@ -1561,6 +1957,7 @@ async def create_project_group_message(
         "message": _group_message_payload(message),
         "event_id": str(event.id),
         "awakened_agent_ids": awakened,
+        "default_leader_agent_id": str(default_leader_agent_id),
         "subagent_runs": subagent_rows,
     }
 
@@ -1633,6 +2030,178 @@ async def wake_project_agent(
     }
 
 
+@router.get("/{project_id}/git/remotes")
+async def get_git_remotes(
+    project_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    return {"items": await list_git_remotes(project)}
+
+
+@router.put("/{project_id}/git/remotes/{name}")
+async def put_project_git_remote(
+    project_id: uuid.UUID,
+    name: str,
+    data: GitRemoteRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    result = await put_git_remote(project, name, data.url)
+    remotes = await list_git_remotes(project)
+    _record_git_repository_settings(project, remotes=remotes)
+    event = add_event(
+        db,
+        project,
+        "git.remote.configured",
+        f"Configured Git remote: {result['name']}",
+        actor_user_id=current_user.id,
+        metadata=_git_remote_audit_metadata(result, history_changed=False),
+    )
+    await db.flush()
+    return {**result, "event_id": str(event.id)}
+
+
+@router.delete("/{project_id}/git/remotes/{name}")
+async def delete_project_git_remote(
+    project_id: uuid.UUID,
+    name: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    result = await delete_git_remote(project, name)
+    remotes = await list_git_remotes(project)
+    _record_git_repository_settings(project, remotes=remotes)
+    event = add_event(
+        db,
+        project,
+        "git.remote.deleted",
+        f"Deleted Git remote: {result['name']}",
+        actor_user_id=current_user.id,
+        metadata=_git_remote_audit_metadata(result, history_changed=False),
+    )
+    await db.flush()
+    return {**result, "event_id": str(event.id)}
+
+
+@router.post("/{project_id}/git/clone")
+async def clone_project_git_repository(
+    project_id: uuid.UUID,
+    data: GitCloneRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await require_owner(db, current_user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
+    operation = await begin_project_repository_clone(project, data.url, data.branch)
+    result = operation.result
+    journal = ProjectRepositoryOperation(
+        id=operation.id,
+        tenant_id=project.tenant_id,
+        project_id=project.id,
+        operation_type="clone",
+        state="prepared",
+        old_head=operation.old_head,
+        new_head=operation.new_head,
+        backup_name=operation.backup.name,
+        staging_name=operation.staging_root.name,
+    )
+    db.add(journal)
+    try:
+        # The journal must win its own transaction before the filesystem can
+        # move. A process exit after this point is repaired on next Git access.
+        await db.commit()
+        await apply_project_repository_clone(operation)
+        _record_git_repository_settings(
+            project,
+            source="cloned",
+            head=str(result["head"]),
+            default_branch=str(result["default_branch"]),
+            remotes=list(result["remotes"]),
+        )
+        event = add_event(
+            db,
+            project,
+            "git.repository.cloned",
+            f"Cloned project repository at {str(result['head'])[:12]}",
+            actor_user_id=current_user.id,
+            metadata={
+                **_git_remote_audit_metadata(
+                    {"name": "origin", "url": result["url"]},
+                    history_changed=True,
+                ),
+                "operation": "clone",
+                "head": result["head"],
+                "default_branch": result["default_branch"],
+            },
+        )
+        journal.state = "committed"
+        await db.flush()
+        # The filesystem backup cannot be finalized by the dependency's
+        # post-response commit: a commit failure there would be too late to
+        # compensate. Commit the settings and audit event inside this unit.
+        await db.commit()
+    except BaseException as exc:  # noqa: BLE001 - cancellation must preserve the durable state machine
+        persisted: ProjectRepositoryOperation | None = None
+        state_known = False
+        try:
+            await db.rollback()
+            persisted = await db.get(ProjectRepositoryOperation, operation.id)
+            state_known = True
+        except BaseException as state_exc:  # noqa: BLE001 - do not guess an ambiguous commit result
+            logger.warning("Could not read project clone journal operation={}: {}", operation.id, state_exc)
+        if persisted is not None and persisted.state == "committed":
+            # The metadata transaction won even though the client observed an
+            # exception (for example a disconnect after server-side COMMIT).
+            # Keep the new repository and let this or the next access finish
+            # cleanup; rolling it back would contradict durable project state.
+            try:
+                await finalize_project_repository_clone(operation)
+            except BaseException as cleanup_exc:  # noqa: BLE001 - committed journal owns deferred cleanup
+                logger.warning("Deferred ambiguous project clone cleanup operation={}: {}", operation.id, cleanup_exc)
+        elif state_known:
+            try:
+                await rollback_project_repository_clone(operation)
+            finally:
+                try:
+                    if persisted is not None:
+                        await db.delete(persisted)
+                        await db.commit()
+                except BaseException:  # noqa: BLE001 - preserve the original operation failure
+                    await db.rollback()
+        else:
+            # A DB outage leaves the commit result genuinely unknown. Release
+            # only the lock: the durable journal decides recovery on access.
+            await release_project_repository_clone_lock(operation)
+        if isinstance(exc, IntegrityError):
+            raise HTTPException(status_code=409, detail="A repository operation is already in progress") from exc
+        raise
+    finalized = False
+    try:
+        await finalize_project_repository_clone(operation)
+        finalized = True
+    except Exception as exc:  # noqa: BLE001 - committed journal owns deferred cleanup
+        # DB state is authoritative after ``committed``. Keep the journal so a
+        # later repository access can retry backup cleanup.
+        logger.warning("Deferred committed project clone cleanup operation={}: {}", operation.id, exc)
+    if finalized:
+        try:
+            persisted = await db.get(ProjectRepositoryOperation, operation.id)
+            if persisted is not None:
+                await db.delete(persisted)
+                await db.commit()
+        except Exception as exc:  # noqa: BLE001 - committed journal remains recoverable
+            await db.rollback()
+            logger.warning("Deferred project clone journal deletion operation={}: {}", operation.id, exc)
+    return {**result, "event_id": str(event.id)}
+
+
 @router.post("/{project_id}/git/restore")
 async def create_git_restore(
     project_id: uuid.UUID,
@@ -1641,6 +2210,7 @@ async def create_git_restore(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id, edit=True)
+    await reconcile_project_repository_operations(project.id, db=db)
     result = await restore_as_new_commit(project, data.commit, data.message)
     _record_git_head(project, result["commit"])
     event = add_event(
@@ -1662,6 +2232,7 @@ async def get_project_files(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
     return await list_project_files(project)
 
 
@@ -1675,6 +2246,7 @@ async def put_project_file(
     """Atomically write one project file and immediately create its Git commit."""
 
     project = await require_project(db, current_user, project_id, edit=True)
+    await reconcile_project_repository_operations(project.id, db=db)
     result = await write_project_file(project, data.path, data.content)
     _record_git_head(project, result["commit"])
     event = add_event(
@@ -1701,6 +2273,7 @@ async def create_git_commit(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id, edit=True)
+    await reconcile_project_repository_operations(project.id, db=db)
     result = await commit_project_changes(
         project,
         data.message,
@@ -1742,6 +2315,7 @@ async def create_git_branch(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id, edit=True)
+    await reconcile_project_repository_operations(project.id, db=db)
     result = await create_branch(project, data.name, data.from_commit)
     event = add_event(
         db,
@@ -1763,4 +2337,5 @@ async def get_git_state(
     db: AsyncSession = Depends(get_db),
 ):
     project = await require_project(db, current_user, project_id)
+    await reconcile_project_repository_operations(project.id, db=db)
     return await repository_state(project, limit)

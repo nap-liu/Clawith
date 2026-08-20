@@ -81,6 +81,9 @@ async def list_conversations(
                     (ChatSession.agent_id == agent_id)
                     | (ChatSession.peer_agent_id == agent_id)
                 ),
+                # Project-scoped conversations are discoverable only from the
+                # project surface, never from ordinary Agent chat history.
+                ChatSession.project_id.is_(None),
                 ChatSession.source_channel != "subagent",
             )
         )

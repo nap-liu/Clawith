@@ -30,19 +30,21 @@ import {
     IconFlag,
     IconRefresh,
     IconRestore,
-    IconSend,
     IconSettings,
     IconShieldCheck,
     IconSparkles,
     IconTargetArrow,
     IconTool,
+    IconTrash,
     IconUsers,
     IconX,
 } from '@tabler/icons-react';
 
 import { useToast } from '../../components/Toast/ToastProvider';
-import SessionViewerDrawer, { type SessionViewerTarget } from '../../components/SessionViewerDrawer';
+import MultiSelectDropdown from '../../components/ui/MultiSelectDropdown';
+import SessionViewerDrawer, { type SessionViewerGroupConfig, type SessionViewerTarget } from '../../components/SessionViewerDrawer';
 import { projectsApi } from '../../services/projects';
+import { useAuthStore } from '../../stores';
 import {
     Button,
     ProjectCountBadge,
@@ -80,6 +82,7 @@ type OpenSession = (source: RecordValue, title?: string) => void;
 type WorkspaceTab =
     | 'cockpit'
     | 'work'
+    | 'group'
     | 'mesh'
     | 'detail'
     | 'files'
@@ -99,6 +102,7 @@ type WorkspaceData = {
     runs: RecordValue[];
     events: RecordValue[];
     commits: RecordValue[];
+    gitRepository: RecordValue;
     files: RecordValue[];
     policies: RecordValue | null;
     groupSession: RecordValue | null;
@@ -110,6 +114,7 @@ const NAV_GROUPS: Array<{ label: string; items: Array<{ id: WorkspaceTab; label:
         items: [
             { id: 'cockpit', label: '项目驾驶舱', icon: IconActivityHeartbeat },
             { id: 'work', label: '目标与任务', icon: IconTargetArrow },
+            { id: 'group', label: '项目群聊', icon: IconMessageCircle },
             { id: 'mesh', label: 'A2A Mesh', icon: IconBroadcast },
             { id: 'detail', label: '工作项详情', icon: IconChecklist },
             { id: 'files', label: '文件与交付', icon: IconFileText },
@@ -155,8 +160,65 @@ const dateLabel = (value: unknown): string => {
     return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date);
 };
 const statusLabel = (status: string): string => ({
-    running: '运行中', queued: '排队中', waiting: '等待中', paused: '已暂停', completed: '已完成', success: '已完成', succeeded: '已完成', cancelled: '已取消', failed: '失败', blocked: '阻塞', review: '待评审', backlog: '待规划', todo: '待处理', doing: '进行中', in_progress: '进行中', done: '已完成',
+    planning: '规划中', initializing: '初始化中', running: '运行中', queued: '排队中', waiting: '等待中', paused: '已暂停', completed: '已完成', success: '已完成', succeeded: '已完成', cancelled: '已取消', failed: '失败', blocked: '阻塞', review: '待评审', backlog: '待规划', todo: '待处理', doing: '进行中', in_progress: '进行中', done: '已完成',
 }[status] || status || '未知');
+
+type ProjectToolDefinition = {
+    name: string;
+    label: string;
+    description: string;
+    participant: boolean;
+};
+
+const PROJECT_TOOL_REGISTRY: readonly ProjectToolDefinition[] = [
+    { name: 'project_get_context', label: '读取项目上下文', description: '读取项目目标、规划信号、状态与 Git HEAD。', participant: true },
+    { name: 'project_list_work_items', label: '查看工作项', description: '列出项目工作项，可限定为本人负责的工作。', participant: true },
+    { name: 'project_list_files', label: '查看文件列表', description: '查看项目 Git 仓库中的产物路径与提交标识。', participant: true },
+    { name: 'project_read_file', label: '读取项目文件', description: '读取一个已提交的项目文本产物。', participant: true },
+    { name: 'project_update_work_item', label: '更新工作项', description: '参与者仅更新本人工作项；Leader 可编辑和指派。', participant: true },
+    { name: 'project_write_file', label: '写入项目文件', description: '写入项目相对路径，并原子创建 Git 提交。', participant: true },
+    { name: 'project_message_agent', label: '定向联系 Agent', description: '只向一个项目 Agent 发送消息，不做广播。', participant: true },
+    { name: 'project_update_plan', label: '更新项目计划', description: '更新目标、成功标准和当前推进信号。', participant: false },
+    { name: 'project_create_work_item', label: '创建工作项', description: '创建可追溯工作项，但不会自动唤醒负责人。', participant: false },
+    { name: 'project_set_member_enabled', label: '启停项目成员', description: '启用或停用非 Leader 项目成员。', participant: false },
+    { name: 'project_set_capability_enabled', label: '启停项目能力', description: '启用或停用现有项目能力绑定。', participant: false },
+    { name: 'project_create_milestone', label: '创建 Git 里程碑', description: '创建命名里程碑提交，不改写历史。', participant: false },
+    { name: 'project_restore_commit', label: '恢复为新提交', description: '把旧版本恢复成新提交，不执行 reset。', participant: false },
+] as const;
+
+const HUMAN_ONLY_PROJECT_OPERATIONS = [
+    '分享或撤销项目访问',
+    '指定或更换项目 Leader',
+    '绑定、查看或轮换 MCP 凭证',
+    '批准高风险或外部写操作',
+    '归档、删除项目或改写 Git 历史',
+] as const;
+
+const stringList = (value: unknown): string[] => Array.isArray(value) ? value.map(entry => String(entry)).filter(Boolean) : [];
+
+function projectToolResolution(tool: ProjectToolDefinition, member: RecordValue, policies: RecordValue | null) {
+    const role = bool(member, 'is_leader') ? 'leader' : 'participant';
+    const roleCeiling = role === 'leader' || tool.participant;
+    const projectPolicy = obj(obj(policies?.policies).project_tools || obj(policies).project_tools);
+    const policyDisabled = new Set([
+        ...stringList(projectPolicy.disabled),
+        ...stringList(projectPolicy[`${role}_disabled`]),
+    ]);
+    const roleAllowed = Array.isArray(projectPolicy[`${role}_allowed`]) ? new Set(stringList(projectPolicy[`${role}_allowed`])) : null;
+    const config = obj(member.config_snapshot);
+    const memberDisabled = new Set(stringList(config.disabled_project_tools));
+    const memberAllowed = Array.isArray(config.enabled_project_tools) ? new Set(stringList(config.enabled_project_tools)) : null;
+    const policyBlocked = policyDisabled.has(tool.name) || Boolean(roleAllowed && !roleAllowed.has(tool.name));
+    const snapshotBlocked = Boolean(memberAllowed && !memberAllowed.has(tool.name));
+    return {
+        role,
+        roleCeiling,
+        policyBlocked,
+        snapshotBlocked,
+        memberDisabled: memberDisabled.has(tool.name),
+        effective: roleCeiling && !policyBlocked && !snapshotBlocked && !memberDisabled.has(tool.name),
+    };
+}
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : '请求失败，请稍后重试';
 
 function parseRecord(value: unknown): RecordValue | null {
@@ -310,6 +372,7 @@ export default function ProjectWorkspacePage() {
                 runs: pickCollection(payload, 'runs'),
                 events: pickCollection(payload, 'events', 'audit_events'),
                 commits: pickCollection(gitPayload, 'commits'),
+                gitRepository: { ...obj(obj(settings || {}).git), ...gitPayload },
                 files: arr(serverFiles).length ? arr(serverFiles) : rawFiles.map((entry) => typeof entry === 'string' ? { id: entry, path: entry, name: entry.split('/').pop() || entry } : obj(entry)),
                 policies: settings ? obj(settings) : payload.policies ? obj(payload.policies) : Object.keys(projectSettings).length ? projectSettings : null,
                 groupSession: groupSessionResult.status === 'fulfilled' ? obj(groupSessionResult.value) : null,
@@ -317,7 +380,7 @@ export default function ProjectWorkspacePage() {
             setData(next);
             setSelectedWorkItemId((current) => current || text(next.workItems[0] || {}, 'id', 'work_item_id'));
             setSelectedMemberId((current) => current || text(next.members[0] || {}, 'id', 'member_id', 'agent_id'));
-            setSelectedCommit((current) => current || next.commits[0] || null);
+            setSelectedCommit((current) => current && next.commits.some(commit => text(commit, 'commit', 'hash', 'commit_hash', 'id') === text(current, 'commit', 'hash', 'commit_hash', 'id')) ? current : next.commits[0] || null);
         } catch (loadError) {
             setError(errorMessage(loadError));
             setData(null);
@@ -382,29 +445,34 @@ export default function ProjectWorkspacePage() {
             kind,
         });
     }, [data, toast]);
-    const openGroupSession = useCallback(() => {
-        if (!data?.groupSession) {
-            toast.warning('项目群聊暂不可用');
-            return;
-        }
-        const group = data.groupSession;
-        const sessionId = text(group, 'id', 'group_session_id', 'session_id');
-        const agentId = text(group, 'access_agent_id', 'session_agent_id', 'agent_id');
-        if (!sessionId || !agentId) {
-            toast.warning('项目群聊缺少会话路由');
-            return;
-        }
-        setSessionTarget({ sessionId, agentId, agentName: '项目群聊', title: text(group, 'title', 'group_name') || `${data.project.name} · 项目群聊`, mode: 'group', kind: 'group' });
-    }, [data, toast]);
-    const groupConfig = useMemo(() => ({
-        members: (data?.members || []).map((member) => ({
-            agentId: text(member, 'agent_id'),
-            name: text(member, 'name_snapshot', 'agent_name', 'name') || 'Agent',
-        })).filter((member) => member.agentId),
-        maxMentions: 4,
-        loadMessages: (sessionId: string) => projectsApi.listGroupMessages(projectId, sessionId),
-        sendMessage: (sessionId: string, payload: { content: string; llm_content?: string; mentions: string[]; attachments: Array<Record<string, unknown>> }) => projectsApi.sendGroupMessage(projectId, sessionId, payload),
-    }), [data?.members, projectId]);
+    const groupMembers = useMemo(() => {
+        const sources = [...(data?.members || []), ...arr(data?.groupSession ? obj(data.groupSession).members : [])];
+        const normalized = sources.map((member) => {
+            const snapshot = obj(member.snapshot || member.member_snapshot || member.member);
+            const agent = obj(member.agent || snapshot.agent);
+            return {
+                agentId: text(member, 'agent_id') || text(snapshot, 'agent_id') || text(agent, 'id', 'agent_id'),
+                name: text(member, 'name_snapshot', 'agent_name', 'name')
+                    || text(snapshot, 'name_snapshot', 'agent_name', 'name')
+                    || text(agent, 'name', 'agent_name')
+                    || 'Agent',
+                isLeader: member.is_leader === true || snapshot.is_leader === true,
+                isEnabled: member.is_enabled !== false && snapshot.is_enabled !== false,
+            };
+        }).filter((member) => member.agentId);
+        return Array.from(new Map(normalized.map((member) => [member.agentId, member])).values());
+    }, [data?.groupSession, data?.members]);
+    const groupConfig = useMemo(() => {
+        const group = obj(data?.groupSession);
+        const configuredLimit = Number(group.max_mentions || group.mention_limit || obj(data?.policies).group_max_mentions || 4);
+        const nonLeaderCount = groupMembers.filter((member) => member.isEnabled !== false && !member.isLeader).length;
+        return {
+            members: groupMembers,
+            maxMentions: Math.min(Number.isFinite(configuredLimit) ? Math.max(0, configuredLimit) : 4, nonLeaderCount),
+            loadMessages: (sessionId: string) => projectsApi.listGroupMessages(projectId, sessionId),
+            sendMessage: (sessionId: string, payload: { content: string; llm_content?: string; mentions: string[]; attachments: Array<Record<string, unknown>> }) => projectsApi.sendGroupMessage(projectId, sessionId, payload),
+        };
+    }, [data?.groupSession, data?.policies, groupMembers, projectId]);
 
     if (loading) {
         return <main className="project-workspace project-workspace__state" aria-live="polite"><IconLoader2 className="project-workspace__spinner" size={28} /><strong>正在建立项目运行视图</strong><p>读取成员、能力、运行与追溯信息…</p></main>;
@@ -417,15 +485,16 @@ export default function ProjectWorkspacePage() {
         switch (tab) {
             case 'cockpit': return <Cockpit data={data} onNavigate={setTab} runAction={runAction} busyAction={busyAction} />;
             case 'work': return <WorkBoard projectId={projectId} items={data.workItems} members={data.members} onSelect={(id) => { setSelectedWorkItemId(id); setTab('detail'); }} runAction={runAction} busyAction={busyAction} />;
-            case 'mesh': return <MeshPanel projectId={projectId} members={data.members} events={data.events} groupSession={data.groupSession} onOpenGroup={openGroupSession} onOpenSession={openSession} runAction={runAction} busyAction={busyAction} />;
+            case 'group': return <GroupChatPanel projectId={projectId} project={data.project} members={data.members} groupSession={data.groupSession} groupConfig={groupConfig} />;
+            case 'mesh': return <MeshPanel members={data.members} events={data.events} onOpenSession={openSession} />;
             case 'detail': return <WorkItemDetail projectId={projectId} items={data.workItems} members={data.members} selectedId={selectedWorkItemId} onSelect={setSelectedWorkItemId} onOpenSession={openSession} runAction={runAction} busyAction={busyAction} />;
             case 'files': return <FilesPanel projectId={projectId} files={data.files} commits={data.commits} runAction={runAction} busyAction={busyAction} />;
             case 'runs': return <RunsPanel projectId={projectId} runs={data.runs} onOpenSession={openSession} runAction={runAction} busyAction={busyAction} />;
             case 'members': return <MembersPanel projectId={projectId} members={data.members} runs={data.runs} selectedId={selectedMemberId} onSelect={setSelectedMemberId} runAction={runAction} busyAction={busyAction} />;
-            case 'capabilities': return <CapabilitiesPanel projectId={projectId} capabilities={data.capabilities} runAction={runAction} busyAction={busyAction} />;
-            case 'matrix': return <CapabilityMatrix members={data.members} capabilities={data.capabilities} />;
-            case 'policies': return <PoliciesPanel projectId={projectId} policies={data.policies} runAction={runAction} busyAction={busyAction} />;
-            case 'git': return <GitPanel commits={data.commits} events={data.events} selected={selectedCommit} onSelect={setSelectedCommit} onDialog={setGitDialog} onOpenSession={openSession} />;
+            case 'capabilities': return <CapabilitiesPanel projectId={projectId} members={data.members} capabilities={data.capabilities} policies={data.policies} runAction={runAction} busyAction={busyAction} />;
+            case 'matrix': return <CapabilityMatrix members={data.members} capabilities={data.capabilities} policies={data.policies} />;
+            case 'policies': return <PoliciesPanel projectId={projectId} project={data.project} policies={data.policies} onReload={load} runAction={runAction} busyAction={busyAction} />;
+            case 'git': return <GitPanel projectId={projectId} project={data.project} repository={data.gitRepository} commits={data.commits} events={data.events} selected={selectedCommit} onSelect={setSelectedCommit} onDialog={setGitDialog} onOpenSession={openSession} onReload={load} />;
             case 'audit': return <AuditPanel events={data.events} members={data.members} onRefresh={load} onOpenSession={openSession} />;
         }
     };
@@ -449,7 +518,7 @@ export default function ProjectWorkspacePage() {
                     })}</section>)}
                     <div className="project-workspace__snapshot-note"><IconBox size={16} /><span><strong>项目隔离已开启</strong><small>成员与能力改动只在本项目生效</small></span></div>
                 </aside>
-                <div className="project-workspace__content" key={tab}>{resourceWarnings.length > 0 && <div className="project-workspace__resource-warning" role="status"><IconAlertTriangle size={17} /><div><strong>部分项目资源暂不可用</strong><p>{resourceWarnings.join('；')}</p></div><Button variant="ghost" onClick={() => void load()}><IconRefresh size={15} />重试</Button></div>}{renderContent()}</div>
+                <div className={`project-workspace__content${tab === 'group' ? ' project-workspace__content--chat' : ''}`} key={tab}>{resourceWarnings.length > 0 && <div className="project-workspace__resource-warning" role="status"><IconAlertTriangle size={17} /><div><strong>部分项目资源暂不可用</strong><p>{resourceWarnings.join('；')}</p></div><Button variant="ghost" onClick={() => void load()}><IconRefresh size={15} />重试</Button></div>}{renderContent()}</div>
             </div>
 
             {gitDialog && selectedCommit && <GitActionDialog projectId={projectId} mode={gitDialog} commit={selectedCommit} busy={busyAction} onClose={() => setGitDialog(null)} runAction={runAction} />}
@@ -524,29 +593,31 @@ function WorkBoard({ projectId, items, members, onSelect, runAction, busyAction 
         {items.length ? view === 'graph' ? <div className="project-workspace__graph-panel"><WorkDependencyGraph items={graphItems} selectedWorkItemId={undefined} onWorkItemSelect={(id) => onSelect(id)} /><ProjectGraphLegend /></div> : <div className="project-workspace__kanban">{columns.map((column) => { const list = items.filter((item) => groupFor(item) === column.key); return <section key={column.key}><header><span><i />{column.label}</span><ProjectCountBadge>{list.length}</ProjectCountBadge></header><div>{list.map((item) => { const id = text(item, 'id', 'work_item_id'); return <Button variant="ghost" key={id} onClick={() => onSelect(id)}><div><code>{id}</code>{text(item, 'priority') && <em>{text(item, 'priority')}</em>}</div><h3>{text(item, 'title', 'name') || '未命名工作项'}</h3><p>{listText(item, 'acceptance_criteria') || text(item, 'description') || '尚未设置验收条件'}</p><footer><span>{itemAssignee(item)}</span><time>{dateLabel(item.updated_at)}</time></footer></Button>; })}{!list.length && <div className="project-workspace__column-empty">暂无工作项</div>}</div></section>; })}</div> : <EmptyState icon={<IconChecklist size={22} />} title="目标还没有拆成工作项" description="创建后会进入项目 API，并出现在 Agent 的执行队列。" action={<Button variant="primary" onClick={() => setShowCreate(true)}>创建第一个工作项</Button>} />}</>;
 }
 
-function MeshPanel({ projectId, members, events, groupSession, onOpenGroup, onOpenSession, runAction, busyAction }: { projectId: string; members: RecordValue[]; events: RecordValue[]; groupSession: RecordValue | null; onOpenGroup: () => void; onOpenSession: OpenSession; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
-    const [source, setSource] = useState('');
-    const [target, setTarget] = useState('');
-    const [kind, setKind] = useState('wake');
-    const [message, setMessage] = useState('');
-    const submit = (event: FormEvent) => {
-        event.preventDefault();
-        if (!source || !target || source === target || !message.trim()) return;
-        void runAction('a2a', () => projectsApi.sendA2A(projectId, { from_agent_id: source, to_agent_id: target, mode: kind, message: message.trim() }), 'A2A 消息已进入目标 Agent 的唤醒队列').then((succeeded) => { if (succeeded) setMessage(''); });
-    };
-    const memberOptions = members.map((member) => ({
-        value: text(member, 'agent_id', 'id', 'member_id'),
-        label: text(member, 'agent_name', 'name_snapshot', 'name'),
-    }));
-    const actionOptions = [
-        { value: 'wake', label: '唤醒' },
-        { value: 'consult', label: '咨询' },
-        { value: 'delegate', label: '委派' },
-        { value: 'review', label: '请求评审' },
-    ];
-    return <><SectionHeading eyebrow="A2A DIRECT MESH" title="Agent 协作网络" description="成员可直接唤醒、咨询、委派或请求评审；Leader 不再是消息中转站。" actions={<Button variant="secondary" onClick={onOpenGroup} disabled={!groupSession}><IconMessageCircle size={16} />进入项目群聊</Button>} />
-        <div className="project-workspace__mesh-layout"><section className="project-workspace__mesh-graph">{members.length ? <><A2AMeshGraph members={members} events={events} selectedAgentId={target} onAgentSelect={(id) => setTarget(id)} /><ProjectGraphLegend /></> : <EmptyState icon={<IconUsers size={22} />} title="项目还没有 Agent 成员" description="添加成员后，A2A 直连拓扑会显示在这里。" />}</section>
-            <section className="project-workspace__mesh-composer"><header><IconBolt size={18} /><div><strong>直接发起 A2A</strong><small>发送成功仅代表事件已排队，实际执行结果会写入事件流。</small></div></header><form onSubmit={submit}><div className="project-workspace__field-row"><ProjectField label="发起方"><ProjectSelect value={source} options={memberOptions} onChange={setSource} ariaLabel="A2A 发起方" placeholder="选择 Agent" /></ProjectField><ProjectField label="接收方"><ProjectSelect value={target} options={memberOptions.filter((option) => option.value !== source)} onChange={setTarget} ariaLabel="A2A 接收方" placeholder="选择 Agent" /></ProjectField></div><ProjectField label="动作"><ProjectSelect value={kind} options={actionOptions} onChange={setKind} ariaLabel="A2A 动作" /></ProjectField><ProjectField label="消息与期望产出" labelFor="project-a2a-message" required><ProjectTextarea id="project-a2a-message" value={message} onChange={(e) => setMessage(e.target.value)} placeholder="说明上下文、希望对方完成什么，以及返回哪些证据…" rows={5} required /></ProjectField><Button variant="primary" type="submit" disabled={!source || !target || source === target || !message.trim() || busyAction === 'a2a'}>{busyAction === 'a2a' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconSend size={16} />}发送并唤醒</Button></form></section></div>
+function GroupChatPanel({ project, groupSession, groupConfig }: { projectId: string; project: ProjectSummary; members: RecordValue[]; groupSession: RecordValue | null; groupConfig: SessionViewerGroupConfig }) {
+    const sessionId = text(groupSession || {}, 'id', 'group_session_id', 'session_id');
+    const agentId = text(groupSession || {}, 'access_agent_id', 'session_agent_id', 'agent_id');
+    const target: SessionViewerTarget | null = sessionId && agentId ? {
+        sessionId,
+        agentId,
+        title: text(groupSession || {}, 'title', 'group_name') || `${project.name} · 项目群聊`,
+        mode: 'group',
+    } : null;
+    return target ? (
+            <SessionViewerDrawer
+                embedded
+                agentId={agentId}
+                agentName="项目群聊"
+                target={target}
+                interactive
+                groupConfig={groupConfig}
+                onClose={() => undefined}
+            />
+        ) : <EmptyState icon={<IconMessageCircle size={22} />} title="项目群聊暂不可用" description="项目群会话初始化完成后，会在这里显示共享时间线与输入区。" />;
+}
+
+function MeshPanel({ members, events, onOpenSession }: { members: RecordValue[]; events: RecordValue[]; onOpenSession: OpenSession }) {
+    return <><SectionHeading eyebrow="A2A DIRECT MESH" title="Agent 协作网络" description="成员可直接唤醒、咨询、委派或请求评审；Leader 不再是消息中转站。" />
+        <section className="project-workspace__mesh-graph">{members.length ? <><A2AMeshGraph members={members} events={events} /><ProjectGraphLegend /></> : <EmptyState icon={<IconUsers size={22} />} title="项目还没有 Agent 成员" description="添加成员后，A2A 直连拓扑会显示在这里。" />}</section>
         <section className="project-workspace__card project-workspace__timeline"><header><div><span>实时事件</span><h3>A2A 协作流</h3></div></header>{events.length ? events.slice(0, 30).map((event) => <article key={text(event, 'id', 'event_id') || `${text(event, 'created_at')}-${text(event, 'type')}`}><i /><span>{(text(event, 'actor_name', 'from_agent_name') || '系统').slice(0, 1)}</span><div><strong>{text(event, 'actor_name', 'from_agent_name') || '系统'} <em>{text(event, 'type', 'event_type')}</em> {text(event, 'target_name', 'to_agent_name')}</strong><p>{text(event, 'message', 'summary', 'detail') || '事件没有附加说明'}</p><small>{dateLabel(event.created_at)}</small><SessionButton source={event} onOpen={onOpenSession} /></div></article>) : <EmptyState title="还没有协作事件" description="成员直接唤醒或委派后，事件会按因果顺序出现在这里。" />}</section>
     </>;
 }
@@ -603,7 +674,51 @@ function MembersPanel({ projectId, members, runs, selectedId, onSelect, runActio
     return <><SectionHeading eyebrow="MEMBERS / SNAPSHOTS" title="成员与三层快照" description="源 Agent 保持稳定；项目快照承接项目内配置，每个 Run 再冻结一次执行视图。" />{members.length ? <><div className="project-workspace__member-layout"><div className="project-workspace__member-list">{members.map((entry) => { const id = text(entry, 'id', 'member_id', 'agent_id'); return <Button variant="ghost" key={id} className={text(member || {}, 'id', 'member_id', 'agent_id') === id ? 'is-active' : ''} onClick={() => onSelect(id)}><span>{(text(entry, 'agent_name', 'name_snapshot', 'name') || 'A').slice(0, 1)}</span><div><strong>{text(entry, 'agent_name', 'name_snapshot', 'name')}</strong><small>{bool(entry, 'is_leader') ? 'Leader · ' : ''}{text(entry, 'role_snapshot', 'role') || '项目成员'}</small></div><IconChevronRight size={15} /></Button>; })}</div><div className="project-workspace__snapshot-graph"><SnapshotLineageGraph member={member || null} runs={runs} /><ProjectGraphLegend /></div></div><section className="project-workspace__action-panel project-workspace__member-editor"><header><div><span>PROJECT SNAPSHOT EDITOR</span><h3>编辑 {text(member || {}, 'name_snapshot')} 的项目快照</h3></div>{!bool(member || {}, 'is_leader') && <Button variant="secondary" disabled={busyAction === 'leader'} onClick={() => void runAction('leader', () => projectsApi.setLeader(projectId, agentId), '项目 Leader 已切换')}><IconFlag size={15} />设为 Leader</Button>}</header><ProjectField label="项目内配置 JSON" labelFor="project-member-config" error={configError || undefined}><ProjectTextarea id="project-member-config" value={config} onChange={(event) => setConfig(event.target.value)} rows={7} spellCheck={false} /></ProjectField><footer><ToggleSwitch checked={member?.is_enabled !== false} ariaLabel="启用或停用项目成员" disabled={busyAction === 'toggle-member'} onChange={(checked) => void runAction('toggle-member', () => projectsApi.patchMember(projectId, memberId, { is_enabled: checked }), checked ? '成员已在项目内启用' : '成员已在项目内停用')} /><span className="project-workspace__switch-copy">仅影响当前项目</span><Button variant="primary" onClick={saveSnapshot} disabled={busyAction === 'save-member'}>{busyAction === 'save-member' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存快照</Button></footer></section></> : <EmptyState icon={<IconUsers size={22} />} title="项目还没有成员" description="添加 Agent 并指定 Leader 后，系统会创建项目隔离快照。" />}</>;
 }
 
-function CapabilitiesPanel({ projectId, capabilities, runAction, busyAction }: { projectId: string; capabilities: RecordValue[]; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
+function ProjectToolsControl({ projectId, members, policies, runAction, busyAction }: { projectId: string; members: RecordValue[]; policies: RecordValue | null; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
+    const [selectedMemberId, setSelectedMemberId] = useState(() => text(members[0] || {}, 'id', 'member_id'));
+    useEffect(() => {
+        if (!members.some(member => text(member, 'id', 'member_id') === selectedMemberId)) {
+            setSelectedMemberId(text(members[0] || {}, 'id', 'member_id'));
+        }
+    }, [members, selectedMemberId]);
+    const member = members.find(entry => text(entry, 'id', 'member_id') === selectedMemberId) || members[0];
+    const memberId = text(member || {}, 'id', 'member_id');
+    const memberName = text(member || {}, 'name_snapshot', 'agent_name', 'name') || '项目成员';
+    const effectiveCount = member ? PROJECT_TOOL_REGISTRY.filter(tool => projectToolResolution(tool, member, policies).effective).length : 0;
+    const toggleTool = (tool: ProjectToolDefinition, checked: boolean) => {
+        if (!member || !memberId) return;
+        const resolution = projectToolResolution(tool, member, policies);
+        if (!resolution.roleCeiling || resolution.policyBlocked || resolution.snapshotBlocked) return;
+        const config = obj(member.config_snapshot);
+        const existingDisabled = stringList(config.disabled_project_tools);
+        const disabled = new Set(existingDisabled);
+        if (checked) disabled.delete(tool.name); else disabled.add(tool.name);
+        const knownNames = new Set(PROJECT_TOOL_REGISTRY.map(entry => entry.name));
+        const disabledProjectTools = [
+            ...existingDisabled.filter(name => !knownNames.has(name)),
+            ...PROJECT_TOOL_REGISTRY.map(entry => entry.name).filter(name => disabled.has(name)),
+        ];
+        void runAction(
+            `project-tool-${memberId}-${tool.name}`,
+            () => projectsApi.patchMember(projectId, memberId, { config_snapshot: { ...config, disabled_project_tools: disabledProjectTools } }),
+            `${memberName} 的项目管理工具已更新`,
+        );
+    };
+    return <section className="project-workspace__project-tools">
+        <header className="project-workspace__subsection-heading"><div><span>PROJECT MANAGEMENT TOOLS</span><h3>项目管理工具</h3><p>运行时工具来自同一原子 registry，并按角色基线、项目策略和成员快照求交集。</p></div>{member && <div className="project-workspace__project-tool-member"><ProjectSelect value={memberId} options={members.map(entry => ({ value: text(entry, 'id', 'member_id'), label: `${text(entry, 'name_snapshot', 'agent_name', 'name')}${bool(entry, 'is_leader') ? ' · Leader' : ''}` }))} onChange={setSelectedMemberId} ariaLabel="选择项目成员" /><ProjectCountBadge>{effectiveCount} / {PROJECT_TOOL_REGISTRY.length}</ProjectCountBadge></div>}</header>
+        <div className="project-workspace__tool-baselines"><article><strong>Leader 基线</strong><span>{PROJECT_TOOL_REGISTRY.length} 个 Agent-safe 工具</span><small>包含计划、成员、能力和安全 Git 操作。</small></article><article><strong>参与者基线</strong><span>{PROJECT_TOOL_REGISTRY.filter(tool => tool.participant).length} 个执行工具</span><small>读上下文、工作项、文件，更新本人工作，写文件和定向消息。</small></article></div>
+        {member ? <div className="project-workspace__project-tool-grid">{PROJECT_TOOL_REGISTRY.map(tool => {
+            const resolution = projectToolResolution(tool, member, policies);
+            const blockedLabel = !resolution.roleCeiling ? 'Leader 专用' : resolution.policyBlocked ? '项目策略禁用' : resolution.snapshotBlocked ? '快照白名单限制' : resolution.memberDisabled ? '成员已关闭' : '当前有效';
+            const tone = resolution.effective ? 'success' : resolution.memberDisabled ? 'neutral' : 'warning';
+            const actionKey = `project-tool-${memberId}-${tool.name}`;
+            return <article key={tool.name} className={resolution.effective ? 'is-effective' : ''}><header><span><IconTool size={16} /></span><div><strong>{tool.label}</strong><code>{tool.name}</code></div><ToggleSwitch checked={resolution.effective} onChange={checked => toggleTool(tool, checked)} ariaLabel={`${resolution.effective ? '关闭' : '启用'} ${tool.label}`} disabled={!resolution.roleCeiling || resolution.policyBlocked || resolution.snapshotBlocked || busyAction === actionKey} /></header><p>{tool.description}</p><footer><ProjectStatusBadge tone={tone}>{blockedLabel}</ProjectStatusBadge><small>{tool.participant ? '参与者基线' : 'Leader 基线'}</small></footer></article>;
+        })}</div> : <ProjectEmptyState icon={<IconUsers size={22} />} title="没有项目成员" description="添加成员后才能配置其项目管理工具。" />}
+        <aside className="project-workspace__human-only"><IconLock size={18} /><div><strong>Human-only 操作不进入 Agent 工具集</strong><p>{HUMAN_ONLY_PROJECT_OPERATIONS.join(' · ')}</p></div></aside>
+    </section>;
+}
+
+function CapabilitiesPanel({ projectId, members, capabilities, policies, runAction, busyAction }: { projectId: string; members: RecordValue[]; capabilities: RecordValue[]; policies: RecordValue | null; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
     const [filter, setFilter] = useState('all');
     const visible = capabilities.filter((cap) => {
         if (filter === 'all') return true;
@@ -613,14 +728,103 @@ function CapabilitiesPanel({ projectId, capabilities, runAction, busyAction }: {
     });
     return <><SectionHeading eyebrow="CAPABILITY CONTROL" title="项目能力中心" description="项目共享 Skill/MCP 对成员可见；Agent 带入能力可逐项关闭，均不影响源 Agent。" />
         <ProjectSegmentedControl className="project-workspace__filters" value={filter} options={[{ value: 'all', label: '全部' }, { value: 'skill', label: 'Skill' }, { value: 'mcp', label: 'MCP' }, { value: 'project', label: '项目共享' }, { value: 'agent', label: 'Agent 带入' }]} onChange={setFilter} ariaLabel="能力筛选" />
-        {visible.length ? <div className="project-workspace__cap-grid">{visible.map((cap) => { const id = text(cap, 'id', 'binding_id', 'capability_id'); const capabilityType = text(cap, 'capability_type', 'kind', 'type'); const enabled = cap.is_enabled !== false; return <article key={id}><header><span className={`is-${capabilityType || 'skill'}`}>{capabilityType === 'mcp' ? <IconCodeDots size={17} /> : <IconTool size={17} />}</span><div><strong>{text(cap, 'name', 'capability_name')}</strong><small>{text(cap, 'version') || capabilityType.toUpperCase() || '能力'} · {text(cap, 'source') === 'agent' ? `由 ${text(cap, 'inherited_from_agent_id') || 'Agent'} 带入` : '项目共享'}</small></div><ToggleSwitch checked={enabled} ariaLabel={`${enabled ? '关闭' : '启用'} ${text(cap, 'name', 'capability_name')}`} disabled={busyAction === `cap-${id}`} onChange={(checked) => void runAction(`cap-${id}`, () => projectsApi.patchCapability(projectId, id, { is_enabled: checked }), checked ? '能力已在项目内启用' : '能力已在项目内关闭；源 Agent 不受影响')} /></header><p>{text(cap, 'description') || '没有能力说明。'}</p><footer><span>{Object.keys(obj(cap.scope)).length ? JSON.stringify(cap.scope) : '未配置权限范围'}</span>{text(cap, 'risk_level') && <em>{text(cap, 'risk_level')} risk</em>}</footer></article>; })}</div> : <EmptyState icon={<IconTool size={22} />} title="没有符合条件的能力" description="添加项目共享 Skill/MCP，或启用成员带入的能力后会出现在这里。" />}</>;
+        {visible.length ? <div className="project-workspace__cap-grid">{visible.map((cap) => { const id = text(cap, 'id', 'binding_id', 'capability_id'); const capabilityType = text(cap, 'capability_type', 'kind', 'type'); const enabled = cap.is_enabled !== false; const scopeCount = Object.keys(obj(cap.scope)).length; return <article key={id}><header><span className={`is-${capabilityType || 'skill'}`}>{capabilityType === 'mcp' ? <IconCodeDots size={17} /> : <IconTool size={17} />}</span><div><strong>{text(cap, 'name', 'capability_name')}</strong><small>{text(cap, 'version') || capabilityType.toUpperCase() || '能力'} · {text(cap, 'source') === 'agent' ? `由 ${text(cap, 'inherited_from_agent_id') || 'Agent'} 带入` : '项目共享'}</small></div><ToggleSwitch checked={enabled} ariaLabel={`${enabled ? '关闭' : '启用'} ${text(cap, 'name', 'capability_name')}`} disabled={busyAction === `cap-${id}`} onChange={(checked) => void runAction(`cap-${id}`, () => projectsApi.patchCapability(projectId, id, { is_enabled: checked }), checked ? '能力已在项目内启用' : '能力已在项目内关闭；源 Agent 不受影响')} /></header><p>{text(cap, 'description') || '没有能力说明。'}</p><footer><span>{scopeCount ? `${scopeCount} 项权限范围` : '未配置权限范围'}</span>{text(cap, 'risk_level') && <em>{text(cap, 'risk_level')} risk</em>}</footer></article>; })}</div> : <EmptyState icon={<IconTool size={22} />} title="没有符合条件的能力" description="添加项目共享 Skill/MCP，或启用成员带入的能力后会出现在这里。" />}
+        <ProjectToolsControl projectId={projectId} members={members} policies={policies} runAction={runAction} busyAction={busyAction} /></>;
 }
 
-function CapabilityMatrix({ members, capabilities }: { members: RecordValue[]; capabilities: RecordValue[] }) {
+function CapabilityBindingsMatrix({ members, capabilities }: { members: RecordValue[]; capabilities: RecordValue[] }) {
     return <><SectionHeading eyebrow="EFFECTIVE CAPABILITIES" title="能力矩阵" description="最终能力 = 项目分配 ∩ 成员启用 ∩ 角色策略 ∩ 安全边界；每次解析均写入审计。" />{members.length && capabilities.length ? <div className="project-workspace__matrix-wrap"><ProjectDataTable><ProjectDataTableHead><ProjectDataTableRow><ProjectDataTableHeader>能力</ProjectDataTableHeader><ProjectDataTableHeader>来源</ProjectDataTableHeader>{members.map((member) => <ProjectDataTableHeader key={text(member, 'agent_id', 'id', 'member_id')}>{text(member, 'agent_name', 'name_snapshot', 'name')}</ProjectDataTableHeader>)}</ProjectDataTableRow></ProjectDataTableHead><ProjectDataTableBody>{capabilities.map((cap) => { const assignments = obj(cap.assignments); const inheritedAgentId = text(cap, 'inherited_from_agent_id'); const inherited = Boolean(inheritedAgentId) || ['agent', 'inherited'].includes(text(cap, 'source')); return <ProjectDataTableRow key={text(cap, 'id', 'binding_id', 'capability_id')}><ProjectDataTableCell><strong>{text(cap, 'name', 'capability_name')}</strong><small>{text(cap, 'capability_type', 'kind', 'type')}</small></ProjectDataTableCell><ProjectDataTableCell>{inherited ? 'Agent 带入' : '项目共享'}</ProjectDataTableCell>{members.map((member) => { const id = text(member, 'agent_id', 'id', 'member_id'); const explicitlyAssigned = Object.prototype.hasOwnProperty.call(assignments, id); const enabled = cap.is_enabled !== false; const resolved: 'yes' | 'no' | 'unknown' = !enabled ? 'no' : inheritedAgentId ? (inheritedAgentId === id ? 'yes' : 'no') : explicitlyAssigned ? (assignments[id] === false ? 'no' : 'yes') : 'unknown'; return <ProjectDataTableCell key={id}><span className={`project-workspace__matrix-${resolved}`}>{resolved === 'yes' ? <IconCircleCheck size={17} /> : resolved === 'no' ? <IconX size={16} /> : <IconClock size={16} />}<small>{resolved === 'yes' ? '可用' : resolved === 'no' ? '不可用' : '按策略解析'}</small></span></ProjectDataTableCell>; })}</ProjectDataTableRow>; })}</ProjectDataTableBody></ProjectDataTable></div> : <EmptyState icon={<IconCodeDots size={22} />} title="能力矩阵尚不可计算" description="至少需要一个项目成员和一个能力绑定。" />}</>;
 }
 
-function PoliciesPanel({ projectId, policies, runAction, busyAction }: { projectId: string; policies: RecordValue | null; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
+function ProjectToolsMatrix({ members, policies }: { members: RecordValue[]; policies: RecordValue | null }) {
+    return <section className="project-workspace__project-tool-matrix"><header className="project-workspace__subsection-heading"><div><span>PROJECT TOOL EFFECTIVE MATRIX</span><h3>项目管理工具有效矩阵</h3><p>同一 registry 依次应用角色 ceiling、项目策略和成员关闭项；Human-only 操作不出现在矩阵中。</p></div><ProjectCountBadge>{PROJECT_TOOL_REGISTRY.length} 个原子工具</ProjectCountBadge></header>{members.length ? <div className="project-workspace__matrix-wrap"><ProjectDataTable><ProjectDataTableHead><ProjectDataTableRow><ProjectDataTableHeader>原子工具</ProjectDataTableHeader><ProjectDataTableHeader>角色基线</ProjectDataTableHeader>{members.map(member => <ProjectDataTableHeader key={text(member, 'id', 'member_id', 'agent_id')}>{text(member, 'name_snapshot', 'agent_name', 'name')}<small>{bool(member, 'is_leader') ? 'Leader' : '参与者'}</small></ProjectDataTableHeader>)}</ProjectDataTableRow></ProjectDataTableHead><ProjectDataTableBody>{PROJECT_TOOL_REGISTRY.map(tool => <ProjectDataTableRow key={tool.name}><ProjectDataTableCell><strong>{tool.label}</strong><small>{tool.name}</small></ProjectDataTableCell><ProjectDataTableCell>{tool.participant ? 'Leader / 参与者' : '仅 Leader'}</ProjectDataTableCell>{members.map(member => { const resolution = projectToolResolution(tool, member, policies); const label = resolution.effective ? '有效' : !resolution.roleCeiling ? '超出角色' : resolution.memberDisabled ? '成员关闭' : resolution.policyBlocked ? '策略禁用' : '快照限制'; return <ProjectDataTableCell key={text(member, 'id', 'member_id', 'agent_id')}><span className={resolution.effective ? 'project-workspace__matrix-yes' : resolution.roleCeiling ? 'project-workspace__matrix-unknown' : 'project-workspace__matrix-no'}>{resolution.effective ? <IconCircleCheck size={17} /> : resolution.roleCeiling ? <IconClock size={16} /> : <IconX size={16} />}<small>{label}</small></span></ProjectDataTableCell>; })}</ProjectDataTableRow>)}</ProjectDataTableBody></ProjectDataTable></div> : <ProjectEmptyState icon={<IconUsers size={22} />} title="项目管理工具矩阵尚不可计算" description="至少需要一个项目成员。" />}</section>;
+}
+
+function CapabilityMatrix({ members, capabilities, policies }: { members: RecordValue[]; capabilities: RecordValue[]; policies: RecordValue | null }) {
+    return <><CapabilityBindingsMatrix members={members} capabilities={capabilities} /><ProjectToolsMatrix members={members} policies={policies} /></>;
+}
+
+function ProjectVisibilitySettings({ projectId, project, onReload }: { projectId: string; project: ProjectSummary; onReload: () => Promise<void> }) {
+    const currentUser = useAuthStore(state => state.user);
+    const toast = useToast();
+    const [visibility, setVisibility] = useState<'private' | 'shared'>(project.visibility);
+    const [sharedUserIds, setSharedUserIds] = useState<string[]>(project.shared_with_user_ids || []);
+    const [shareTargets, setShareTargets] = useState<Array<{ id: string; name: string; email?: string | null }>>([]);
+    const [targetsLoading, setTargetsLoading] = useState(true);
+    const [targetsError, setTargetsError] = useState('');
+    const [saveError, setSaveError] = useState('');
+    const [saving, setSaving] = useState(false);
+    const [permissionDenied, setPermissionDenied] = useState(project.editable === false);
+
+    useEffect(() => {
+        setVisibility(project.visibility);
+        setSharedUserIds(project.shared_with_user_ids || []);
+        setPermissionDenied(project.editable === false);
+        setSaveError('');
+    }, [project.editable, project.shared_with_user_ids, project.updated_at, project.visibility]);
+
+    useEffect(() => {
+        let active = true;
+        setTargetsLoading(true);
+        setTargetsError('');
+        void projectsApi.bootstrapOptions().then(options => {
+            if (active) setShareTargets(options.users);
+        }).catch(error => {
+            if (active) setTargetsError(errorMessage(error));
+        }).finally(() => {
+            if (active) setTargetsLoading(false);
+        });
+        return () => { active = false; };
+    }, []);
+
+    const isOwner = Boolean(currentUser?.id && project.owner_id === currentUser.id);
+    const knownNonOwner = Boolean(currentUser?.id && project.owner_id && !isOwner);
+    const permissionUnknown = project.editable == null && (!currentUser?.id || !project.owner_id);
+    const readOnly = permissionDenied || project.editable === false || knownNonOwner;
+    const sharedWithoutMembers = visibility === 'shared' && sharedUserIds.length === 0;
+    const save = async () => {
+        if (readOnly) return;
+        if (sharedWithoutMembers) {
+            setSaveError('共享项目至少需要选择一名组织成员。');
+            return;
+        }
+        setSaving(true);
+        setSaveError('');
+        try {
+            await projectsApi.update(projectId, {
+                visibility,
+                shared_with_user_ids: visibility === 'shared' ? sharedUserIds : [],
+            });
+            toast.success(visibility === 'shared' ? '项目共享范围已保存' : '项目已设为仅自己可见');
+            await onReload();
+        } catch (error) {
+            const status = Number(obj(error).status);
+            const message = errorMessage(error);
+            if (status === 403 || status === 404) setPermissionDenied(true);
+            setSaveError(status === 403 || status === 404 ? '你没有管理此项目可见范围的权限，草稿已保留。' : message);
+            toast.error(message);
+        } finally {
+            setSaving(false);
+        }
+    };
+    const shareOptions = shareTargets.filter(user => user.id !== project.owner_id).map(user => ({
+        value: user.id,
+        label: user.email ? `${user.name} · ${user.email}` : user.name,
+    }));
+
+    return <section className="project-workspace__visibility-settings">
+        <header><div><span>PROJECT ACCESS</span><h3>可见范围</h3><p>私有项目仅自己可见；共享项目只对选中的同组织成员开放。</p></div><ProjectStatusBadge tone={visibility === 'shared' ? 'info' : 'neutral'}>{visibility === 'shared' ? '已共享' : '仅自己可见'}</ProjectStatusBadge></header>
+        <div className="project-workspace__visibility-body">
+            <ProjectField label="访问模式" hint="切换为私有后，现有共享授权会全部撤销。"><ProjectSegmentedControl value={visibility} options={[{ value: 'private', label: '仅自己可见' }, { value: 'shared', label: '指定成员共享' }]} onChange={setVisibility} ariaLabel="项目可见范围" disabled={readOnly} /></ProjectField>
+            <ProjectField label="共享成员" hint={visibility === 'shared' ? '成员必须来自当前组织；项目所有者无需重复选择。' : '切换到指定成员共享后可选择组织成员。'} error={sharedWithoutMembers ? '至少选择一名成员' : undefined}>
+                <MultiSelectDropdown options={shareOptions} values={sharedUserIds} onChange={setSharedUserIds} emptyLabel={targetsLoading ? '正在读取组织成员…' : '选择共享成员'} selectedLabel={count => `已选择 ${count} 名成员`} searchPlaceholder="搜索组织成员" noOptionsLabel={targetsError ? '组织成员暂不可用' : '暂无可共享成员'} noMatchesLabel="没有匹配的组织成员" ariaLabel="选择项目共享成员" disabled={readOnly || visibility !== 'shared' || targetsLoading} />
+            </ProjectField>
+        </div>
+        <footer><div>{targetsError && <small className="is-warning">组织成员读取失败：{targetsError}</small>}{permissionUnknown && !permissionDenied && <small>项目未返回可编辑标识，保存时将由服务端校验管理权限。</small>}{readOnly && <small className="is-warning">当前账号不能管理此项目的可见范围。</small>}{saveError && <small className="is-error" role="alert">{saveError}</small>}</div><Button variant="secondary" onClick={() => void save()} disabled={readOnly || saving || sharedWithoutMembers}>{saving ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconLock size={16} />}保存可见范围</Button></footer>
+    </section>;
+}
+
+function PoliciesPanel({ projectId, project, policies, onReload, runAction, busyAction }: { projectId: string; project: ProjectSummary; policies: RecordValue | null; onReload: () => Promise<void>; runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>; busyAction: string }) {
     const runtime = obj(policies?.runtime);
     const governance = obj(policies?.policies);
     const [model, setModel] = useState('default');
@@ -632,7 +836,7 @@ function PoliciesPanel({ projectId, policies, runAction, busyAction }: { project
     useEffect(() => { const nextRuntime = obj(policies?.runtime); const nextGovernance = obj(policies?.policies); setModel(text(nextRuntime, 'model', 'default_model') || 'default'); setBudget(text(nextRuntime, 'monthly_budget', 'budget_limit') || '0'); setApproval(text(nextGovernance, 'approval_policy') || 'risk'); setParallel(text(nextRuntime, 'max_parallel_runs') || '4'); setA2aLimit(text(nextGovernance, 'max_a2a_wakes') || '12'); setLoopGuard(nextGovernance.loop_guard !== false); }, [policies]);
     const save = () => void runAction('save-policies', () => projectsApi.updateSettings(projectId, { runtime: { ...runtime, model, monthly_budget: Number(budget), max_parallel_runs: Number(parallel) }, policies: { ...governance, approval_policy: approval, max_a2a_wakes: Number(a2aLimit), loop_guard: loopGuard } }), '项目策略已保存，新运行将使用最新版本');
     const approvalOptions = [{ value: 'risk', label: '仅高风险操作' }, { value: 'all_writes', label: '所有写操作' }, { value: 'manual', label: '手动审批' }];
-    return <><SectionHeading eyebrow="POLICIES / SAFETY" title="运行与安全策略" description="模型、预算、凭证和审批规则在项目范围生效；保存后由服务端持久化。" actions={<Button variant="primary" onClick={save} disabled={busyAction === 'save-policies'}>{busyAction === 'save-policies' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存策略</Button>} /><div className="project-workspace__settings-grid"><ProjectField label="默认模型" labelFor="project-policy-model"><TextInput id="project-policy-model" value={model} onChange={(event) => setModel(event.target.value)} placeholder="default" /></ProjectField><ProjectField label="月度预算" labelFor="project-policy-budget"><TextInput id="project-policy-budget" type="number" min="0" step="1" value={budget} onChange={(event) => setBudget(event.target.value)} /></ProjectField><ProjectField label="审批策略"><ProjectSelect value={approval} options={approvalOptions} onChange={setApproval} ariaLabel="审批策略" /></ProjectField><ProjectField label="最大并行 Run" labelFor="project-policy-parallel"><TextInput id="project-policy-parallel" type="number" min="1" max="32" value={parallel} onChange={(event) => setParallel(event.target.value)} /></ProjectField><ProjectField label="单次 Run 最大 A2A 唤醒" labelFor="project-policy-a2a-limit"><TextInput id="project-policy-a2a-limit" type="number" min="1" max="100" value={a2aLimit} onChange={(event) => setA2aLimit(event.target.value)} /></ProjectField><div className="project-workspace__switch-setting"><span><strong>循环保护</strong><small>阻止重复唤醒与无界委派</small></span><ToggleSwitch checked={loopGuard} onChange={setLoopGuard} ariaLabel="循环保护" /></div></div><div className="project-workspace__policy-grid">{[
+    return <><SectionHeading eyebrow="POLICIES / SAFETY" title="运行与安全策略" description="模型、预算、凭证和审批规则在项目范围生效；保存后由服务端持久化。" actions={<Button variant="primary" onClick={save} disabled={busyAction === 'save-policies'}>{busyAction === 'save-policies' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存策略</Button>} /><ProjectVisibilitySettings projectId={projectId} project={project} onReload={onReload} /><div className="project-workspace__settings-grid"><ProjectField label="默认模型" labelFor="project-policy-model"><TextInput id="project-policy-model" value={model} onChange={(event) => setModel(event.target.value)} placeholder="default" /></ProjectField><ProjectField label="月度预算" labelFor="project-policy-budget"><TextInput id="project-policy-budget" type="number" min="0" step="1" value={budget} onChange={(event) => setBudget(event.target.value)} /></ProjectField><ProjectField label="审批策略"><ProjectSelect value={approval} options={approvalOptions} onChange={setApproval} ariaLabel="审批策略" /></ProjectField><ProjectField label="最大并行 Run" labelFor="project-policy-parallel"><TextInput id="project-policy-parallel" type="number" min="1" max="32" value={parallel} onChange={(event) => setParallel(event.target.value)} /></ProjectField><ProjectField label="单次 Run 最大 A2A 唤醒" labelFor="project-policy-a2a-limit"><TextInput id="project-policy-a2a-limit" type="number" min="1" max="100" value={a2aLimit} onChange={(event) => setA2aLimit(event.target.value)} /></ProjectField><div className="project-workspace__switch-setting"><span><strong>循环保护</strong><small>阻止重复唤醒与无界委派</small></span><ToggleSwitch checked={loopGuard} onChange={setLoopGuard} ariaLabel="循环保护" /></div></div><div className="project-workspace__policy-grid">{[
         ['模型策略', model, '成员新运行默认使用的模型策略。', <IconSparkles size={18} />],
         ['预算边界', budget ? `每月 ${budget}` : '未设置', '到达阈值时阻止创建新 Run。', <IconActivityHeartbeat size={18} />],
         ['审批规则', approval, '高风险写入和外部动作按此审批。', <IconShieldCheck size={18} />],
@@ -640,7 +844,132 @@ function PoliciesPanel({ projectId, policies, runAction, busyAction }: { project
     ].map(([title, value, desc, icon]) => <article key={String(title)}><span>{icon}</span><div><strong>{title}</strong><p>{desc}</p><code>{String(value)}</code></div></article>)}</div></>;
 }
 
-function GitPanel({ commits, events, selected, onSelect, onDialog, onOpenSession }: { commits: RecordValue[]; events: RecordValue[]; selected: RecordValue | null; onSelect: (commit: RecordValue) => void; onDialog: (mode: 'restore' | 'branch') => void; onOpenSession: OpenSession }) {
+function GitRepositoryControls({ projectId, project, repository, commits, onReload }: { projectId: string; project: ProjectSummary; repository: RecordValue; commits: RecordValue[]; onReload: () => Promise<void> }) {
+    const currentUser = useAuthStore(state => state.user);
+    const toast = useToast();
+    const isOwner = Boolean(currentUser?.id && project.owner_id === currentUser.id);
+    const [remotes, setRemotes] = useState<Array<{ name: string; url: string }>>([]);
+    const [remotesLoading, setRemotesLoading] = useState(false);
+    const [remoteError, setRemoteError] = useState('');
+    const [remoteName, setRemoteName] = useState('');
+    const [remoteUrl, setRemoteUrl] = useState('');
+    const [editingRemote, setEditingRemote] = useState('');
+    const [cloneUrl, setCloneUrl] = useState('');
+    const [cloneBranch, setCloneBranch] = useState('');
+    const [cloneConfirmOpen, setCloneConfirmOpen] = useState(false);
+    const [busy, setBusy] = useState('');
+
+    const loadRemotes = useCallback(async () => {
+        if (!isOwner) {
+            setRemotes([]);
+            setRemoteError('');
+            return;
+        }
+        setRemotesLoading(true);
+        setRemoteError('');
+        try {
+            setRemotes(await projectsApi.listGitRemotes(projectId));
+        } catch (error) {
+            setRemoteError(errorMessage(error));
+        } finally {
+            setRemotesLoading(false);
+        }
+    }, [isOwner, projectId]);
+    useEffect(() => { void loadRemotes(); }, [loadRemotes]);
+
+    const repositoryFiles = Array.isArray(repository.files) ? repository.files.map(String).sort() : [];
+    const source = text(repository, 'source') === 'cloned' ? 'cloned' : 'managed';
+    const initializationOnly = source !== 'cloned'
+        && commits.length === 1
+        && text(commits[0], 'message', 'subject', 'title') === 'Initialize AI-native project'
+        && repositoryFiles.length === 2
+        && repositoryFiles[0] === 'PROJECT.json'
+        && repositoryFiles[1] === 'README.md';
+    const canClone = isOwner && project.status === 'planning' && initializationOnly;
+    const cloneUnavailableReason = !isOwner
+        ? '只有项目所有者可以替换仓库来源。'
+        : project.status !== 'planning'
+            ? '项目已离开规划阶段，不能再替换仓库。'
+            : !initializationOnly
+                ? '仓库已包含项目产出，不能再执行初始化克隆。'
+                : '';
+
+    const resetRemoteDraft = () => {
+        setEditingRemote('');
+        setRemoteName('');
+        setRemoteUrl('');
+    };
+    const saveRemote = async (event: FormEvent) => {
+        event.preventDefault();
+        if (!isOwner || !remoteName.trim() || !remoteUrl.trim()) return;
+        setBusy('remote-save');
+        setRemoteError('');
+        try {
+            await projectsApi.putGitRemote(projectId, remoteName.trim(), remoteUrl.trim());
+            toast.success(editingRemote ? `远端 ${remoteName.trim()} 已更新` : `远端 ${remoteName.trim()} 已添加`);
+            resetRemoteDraft();
+            await loadRemotes();
+            await onReload();
+        } catch (error) {
+            const message = errorMessage(error);
+            setRemoteError(message);
+            toast.error(message);
+        } finally {
+            setBusy('');
+        }
+    };
+    const deleteRemote = async (name: string) => {
+        if (!isOwner) return;
+        setBusy(`remote-delete-${name}`);
+        setRemoteError('');
+        try {
+            await projectsApi.deleteGitRemote(projectId, name);
+            toast.success(`远端 ${name} 已删除`);
+            if (editingRemote === name) resetRemoteDraft();
+            await loadRemotes();
+            await onReload();
+        } catch (error) {
+            const message = errorMessage(error);
+            setRemoteError(message);
+            toast.error(message);
+        } finally {
+            setBusy('');
+        }
+    };
+    const cloneRepository = async (event: FormEvent) => {
+        event.preventDefault();
+        if (!canClone || !cloneUrl.trim()) return;
+        setBusy('clone');
+        try {
+            await projectsApi.cloneGitRepository(projectId, { url: cloneUrl.trim(), branch: cloneBranch.trim() || undefined });
+            toast.success('远程仓库已原子克隆，项目 Git 基线已更新');
+            setCloneConfirmOpen(false);
+            setCloneUrl('');
+            setCloneBranch('');
+            await loadRemotes();
+            await onReload();
+        } catch (error) {
+            toast.error(errorMessage(error));
+        } finally {
+            setBusy('');
+        }
+    };
+
+    return <section className="project-workspace__repository-control">
+        <header><div><span>HUMAN-ONLY REPOSITORY</span><h3>仓库来源与远端</h3><p>Git 仓库来源和远端只由人类所有者管理，不进入 Agent 工具集。</p></div><ProjectStatusBadge tone="warning">Human-only</ProjectStatusBadge></header>
+        <div className="project-workspace__repository-summary"><article><span>仓库来源</span><strong>{source === 'cloned' ? '远程仓库克隆' : '平台初始化仓库'}</strong><small>{source === 'cloned' ? '当前内容来自一次原子 clone' : '当前为平台创建的 managed Git 基线'}</small></article><article><span>默认分支</span><strong>{text(repository, 'default_branch') || text(repository, 'branch') || '未记录'}</strong><small>HEAD <code>{text(repository, 'head').slice(0, 12) || '—'}</code></small></article><article><span>远端数量</span><strong>{isOwner ? remotes.length : '仅所有者可见'}</strong><small>支持任意标准 Git 服务商</small></article></div>
+        <div className="project-workspace__repository-grid">
+            <section><header><div><span>REMOTES</span><h4>远端列表</h4></div><ProjectCountBadge>{isOwner ? remotes.length : 0}</ProjectCountBadge></header>{isOwner ? remotes.length ? <ProjectDataTable className="project-workspace__remote-table"><ProjectDataTableHead><ProjectDataTableRow><ProjectDataTableHeader>名称</ProjectDataTableHeader><ProjectDataTableHeader>地址</ProjectDataTableHeader><ProjectDataTableHeader>操作</ProjectDataTableHeader></ProjectDataTableRow></ProjectDataTableHead><ProjectDataTableBody>{remotes.map(remote => <ProjectDataTableRow key={remote.name}><ProjectDataTableCell><code>{remote.name}</code></ProjectDataTableCell><ProjectDataTableCell><code title={remote.url}>{remote.url}</code></ProjectDataTableCell><ProjectDataTableCell><div className="project-workspace__remote-actions"><Button variant="ghost" disabled={Boolean(busy)} onClick={() => { setEditingRemote(remote.name); setRemoteName(remote.name); setRemoteUrl(remote.url); }}>修改</Button><ProjectIconButton aria-label={`删除远端 ${remote.name}`} disabled={Boolean(busy)} onClick={() => void deleteRemote(remote.name)}>{busy === `remote-delete-${remote.name}` ? <IconLoader2 className="project-workspace__spinner" size={15} /> : <IconTrash size={15} />}</ProjectIconButton></div></ProjectDataTableCell></ProjectDataTableRow>)}</ProjectDataTableBody></ProjectDataTable> : <ProjectEmptyState title={remotesLoading ? '正在读取远端' : '还没有配置远端'} description="添加后可记录上游地址；配置远端不会改变当前提交历史。" /> : <ProjectEmptyState icon={<IconLock size={20} />} title="远端仅所有者可管理" description="共享成员仍可查看项目提交历史，但不能读取或修改仓库远端。" />}
+                {isOwner && <form className="project-workspace__remote-form" onSubmit={saveRemote}><ProjectField label="远端名称" labelFor="project-remote-name" required><TextInput id="project-remote-name" value={remoteName} onChange={event => setRemoteName(event.target.value)} placeholder="origin" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}" disabled={Boolean(editingRemote)} required /></ProjectField><ProjectField label="远端 URL" labelFor="project-remote-url" required><TextInput id="project-remote-url" value={remoteUrl} onChange={event => setRemoteUrl(event.target.value)} placeholder="https://git.example.com/team/project.git" required /></ProjectField><footer>{editingRemote && <Button type="button" variant="ghost" onClick={resetRemoteDraft}>取消修改</Button>}<Button type="submit" variant="secondary" disabled={!remoteName.trim() || !remoteUrl.trim() || Boolean(busy)}>{busy === 'remote-save' ? <IconLoader2 className="project-workspace__spinner" size={15} /> : editingRemote ? <IconDeviceFloppy size={15} /> : <IconPlus size={15} />}{editingRemote ? '保存远端' : '添加远端'}</Button></footer></form>}
+            </section>
+            <section><header><div><span>INITIAL SOURCE</span><h4>从远程初始化</h4></div><ProjectStatusBadge tone={canClone ? 'success' : 'neutral'}>{canClone ? '可克隆' : '不可克隆'}</ProjectStatusBadge></header><div className="project-workspace__clone-form"><ProjectField label="仓库 URL" labelFor="project-clone-url" required><TextInput id="project-clone-url" value={cloneUrl} onChange={event => setCloneUrl(event.target.value)} placeholder="https://… 或 ssh://…" disabled={!canClone || Boolean(busy)} /></ProjectField><ProjectField label="分支（可选）" labelFor="project-clone-branch"><TextInput id="project-clone-branch" value={cloneBranch} onChange={event => setCloneBranch(event.target.value)} placeholder="留空使用远端默认分支" disabled={!canClone || Boolean(busy)} /></ProjectField><div className="project-workspace__clone-note"><IconShieldCheck size={17} /><p>支持 HTTPS 与 SSH。凭证不得写入 URL；私有 SSH 仓库使用服务端已配置的密钥，并以非交互模式连接。</p></div>{cloneUnavailableReason && <small>{cloneUnavailableReason}</small>}<Button variant="danger" disabled={!canClone || !cloneUrl.trim() || Boolean(busy)} onClick={() => setCloneConfirmOpen(true)}><IconBrandGit size={16} />确认远程来源</Button></div></section>
+        </div>
+        {remoteError && <div className="project-workspace__repository-error" role="alert"><IconAlertTriangle size={16} /><span>{remoteError}</span></div>}
+        <ProjectDialog open={cloneConfirmOpen} onClose={() => { if (busy !== 'clone') setCloneConfirmOpen(false); }} ariaLabel="确认从远程仓库初始化" className="project-workspace__git-dialog"><form className="project-workspace__modal" onSubmit={cloneRepository}><header><div><span>ATOMIC REPOSITORY REPLACEMENT</span><h2>确认替换初始化仓库</h2></div><ProjectIconButton aria-label="关闭" disabled={busy === 'clone'} onClick={() => setCloneConfirmOpen(false)}><IconX size={18} /></ProjectIconButton></header><p>系统将先在隔离目录完成 clone 与 Git 校验，再原子替换当前仅含初始化文件的仓库。该操作只允许执行一次；已有项目产出时服务端会拒绝。</p><dl className="project-workspace__definition-list"><div><dt>远端</dt><dd><code>{cloneUrl}</code></dd></div><div><dt>分支</dt><dd><code>{cloneBranch || '远端默认分支'}</code></dd></div></dl><div className="project-workspace__safe-note"><IconLock size={16} /><span>不要在 URL 中携带用户名、密码、Token 或私钥。</span></div><footer><Button type="button" variant="secondary" disabled={busy === 'clone'} onClick={() => setCloneConfirmOpen(false)}>取消</Button><Button type="submit" variant="danger" disabled={busy === 'clone'}>{busy === 'clone' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconBrandGit size={16} />}原子克隆并替换</Button></footer></form></ProjectDialog>
+    </section>;
+}
+
+function GitPanel({ projectId, project, repository, commits, events, selected, onSelect, onDialog, onOpenSession, onReload }: { projectId: string; project: ProjectSummary; repository: RecordValue; commits: RecordValue[]; events: RecordValue[]; selected: RecordValue | null; onSelect: (commit: RecordValue) => void; onDialog: (mode: 'restore' | 'branch') => void; onOpenSession: OpenSession; onReload: () => Promise<void> }) {
     const selectedId = text(selected || {}, 'commit', 'hash', 'commit_hash', 'id');
     const eventsForCommit = (commit: RecordValue) => {
         const commitId = text(commit, 'commit', 'hash', 'commit_hash', 'id');
@@ -666,7 +995,7 @@ function GitPanel({ commits, events, selected, onSelect, onDialog, onOpenSession
     const selectedEvents = selected ? eventsForCommit(selected) : [];
     const linkedEvent = selectedEvents.find((event) => sessionIdOf(event)) || selectedEvents[0];
     const sessionSource = sessionIdOf(selected || {}) ? selected || {} : linkedEvent || selected || {};
-    return <><SectionHeading eyebrow="GIT / TRACEABILITY" title="Git 历史与恢复" description="使用标准 Git 日志追溯项目产物；恢复会创建新提交，禁止 reset --hard 与 force push。" />{commits.length ? <div className="project-workspace__git-layout"><section className="project-workspace__card project-workspace__git-log" aria-label="Git 提交历史"><header><div><span>COMMIT LOG</span><h3>提交历史</h3></div><ProjectCountBadge>{commits.length}</ProjectCountBadge></header><div className="project-workspace__git-log-head" aria-hidden="true"><span>Commit</span><span>说明</span><span>作者</span><span>时间</span><span>引用</span></div><ol>{commits.map((commit, index) => { const hash = text(commit, 'commit', 'hash', 'commit_hash', 'id'); const refs = refsForCommit(commit, index); const milestone = isMilestone(commit); return <li key={hash}><Button type="button" variant="ghost" className={hash === selectedId ? 'is-active' : ''} aria-pressed={hash === selectedId} onClick={() => onSelect(commit)}><code title={hash}>{text(commit, 'short_commit') || hash.slice(0, 12)}</code><span className="project-workspace__git-log-message"><strong>{text(commit, 'message', 'subject', 'title') || '未命名提交'}</strong><small>{hash}</small></span><span>{text(commit, 'author', 'author_name', 'actor_name') || 'Clawith'}</span><time dateTime={text(commit, 'created_at', 'timestamp')}>{dateLabel(commit.created_at || commit.timestamp)}</time><span className="project-workspace__git-refs">{refs.map((ref) => <ProjectStatusBadge key={ref} tone={ref === 'HEAD' ? 'success' : 'info'}>{ref}</ProjectStatusBadge>)}{milestone && <ProjectStatusBadge tone="warning">里程碑</ProjectStatusBadge>}{!refs.length && !milestone && <small>—</small>}</span></Button></li>; })}</ol></section><aside className="project-workspace__card project-workspace__commit-detail"><header><div><span>提交详情</span><h3>{text(selected || {}, 'message', 'subject', 'title') || '未命名提交'}</h3></div></header><div className="project-workspace__repro"><IconCircleCheck size={18} /><span><strong>历史保留</strong><small>恢复操作不会删除现有提交</small></span></div><dl className="project-workspace__definition-list"><div><dt>Commit</dt><dd><code>{selectedId || '—'}</code></dd></div><div><dt>作者</dt><dd>{text(selected || {}, 'author', 'author_name', 'actor_name') || 'Clawith'}</dd></div><div><dt>时间</dt><dd>{dateLabel(selected?.created_at || selected?.timestamp)}</dd></div><div><dt>引用</dt><dd className="project-workspace__git-detail-refs">{selectedRefs.map((ref) => <ProjectStatusBadge key={ref} tone={ref === 'HEAD' ? 'success' : 'info'}>{ref}</ProjectStatusBadge>)}{selected && isMilestone(selected) && <ProjectStatusBadge tone="warning">里程碑</ProjectStatusBadge>}{!selectedRefs.length && !(selected && isMilestone(selected)) && '—'}</dd></div><div><dt>关联 Run</dt><dd>{traceValue(traceRecords(linkedEvent || selected || {}), 'run_id') || '—'}</dd></div><div><dt>工作项</dt><dd>{traceValue(traceRecords(linkedEvent || selected || {}), 'work_item_id') || '—'}</dd></div><div><dt>会话</dt><dd>{sessionIdOf(sessionSource) || '—'}<SessionButton source={sessionSource} onOpen={onOpenSession} /></dd></div><div><dt>变更文件</dt><dd>{text(selected || {}, 'file_count', 'files_changed') || '—'}</dd></div></dl><div className="project-workspace__git-actions"><Button variant="secondary" onClick={() => onDialog('branch')}><IconGitBranch size={16} />从此创建分支</Button><Button variant="danger" onClick={() => onDialog('restore')}><IconRestore size={16} />还原为新提交</Button></div><p><IconLock size={14} /> 保护规则：禁止 force push 与 reset --hard</p></aside></div> : <EmptyState icon={<IconBrandGit size={22} />} title="还没有提交历史" description="项目产物提交后，可在这里查看 Commit、作者、时间、分支、里程碑与关联会话。" />}</>;
+    return <><SectionHeading eyebrow="GIT / TRACEABILITY" title="Git 历史与恢复" description="使用标准 Git 日志追溯项目产物；恢复会创建新提交，禁止 reset --hard 与 force push。" /><GitRepositoryControls projectId={projectId} project={project} repository={repository} commits={commits} onReload={onReload} />{commits.length ? <div className="project-workspace__git-layout"><section className="project-workspace__card project-workspace__git-log" aria-label="Git 提交历史"><header><div><span>COMMIT LOG</span><h3>提交历史</h3></div><ProjectCountBadge>{commits.length}</ProjectCountBadge></header><div className="project-workspace__git-log-head" aria-hidden="true"><span>Commit</span><span>说明</span><span>作者</span><span>时间</span><span>引用</span></div><ol>{commits.map((commit, index) => { const hash = text(commit, 'commit', 'hash', 'commit_hash', 'id'); const refs = refsForCommit(commit, index); const milestone = isMilestone(commit); return <li key={hash}><Button type="button" variant="ghost" className={hash === selectedId ? 'is-active' : ''} aria-pressed={hash === selectedId} onClick={() => onSelect(commit)}><code title={hash}>{text(commit, 'short_commit') || hash.slice(0, 12)}</code><span className="project-workspace__git-log-message"><strong>{text(commit, 'message', 'subject', 'title') || '未命名提交'}</strong><small>{hash}</small></span><span>{text(commit, 'author', 'author_name', 'actor_name') || 'Clawith'}</span><time dateTime={text(commit, 'created_at', 'timestamp')}>{dateLabel(commit.created_at || commit.timestamp)}</time><span className="project-workspace__git-refs">{refs.map((ref) => <ProjectStatusBadge key={ref} tone={ref === 'HEAD' ? 'success' : 'info'}>{ref}</ProjectStatusBadge>)}{milestone && <ProjectStatusBadge tone="warning">里程碑</ProjectStatusBadge>}{!refs.length && !milestone && <small>—</small>}</span></Button></li>; })}</ol></section><aside className="project-workspace__card project-workspace__commit-detail"><header><div><span>提交详情</span><h3>{text(selected || {}, 'message', 'subject', 'title') || '未命名提交'}</h3></div></header><div className="project-workspace__repro"><IconCircleCheck size={18} /><span><strong>历史保留</strong><small>恢复操作不会删除现有提交</small></span></div><dl className="project-workspace__definition-list"><div><dt>Commit</dt><dd><code>{selectedId || '—'}</code></dd></div><div><dt>作者</dt><dd>{text(selected || {}, 'author', 'author_name', 'actor_name') || 'Clawith'}</dd></div><div><dt>时间</dt><dd>{dateLabel(selected?.created_at || selected?.timestamp)}</dd></div><div><dt>引用</dt><dd className="project-workspace__git-detail-refs">{selectedRefs.map((ref) => <ProjectStatusBadge key={ref} tone={ref === 'HEAD' ? 'success' : 'info'}>{ref}</ProjectStatusBadge>)}{selected && isMilestone(selected) && <ProjectStatusBadge tone="warning">里程碑</ProjectStatusBadge>}{!selectedRefs.length && !(selected && isMilestone(selected)) && '—'}</dd></div><div><dt>关联 Run</dt><dd>{traceValue(traceRecords(linkedEvent || selected || {}), 'run_id') || '—'}</dd></div><div><dt>工作项</dt><dd>{traceValue(traceRecords(linkedEvent || selected || {}), 'work_item_id') || '—'}</dd></div><div><dt>会话</dt><dd>{sessionIdOf(sessionSource) || '—'}<SessionButton source={sessionSource} onOpen={onOpenSession} /></dd></div><div><dt>变更文件</dt><dd>{text(selected || {}, 'file_count', 'files_changed') || '—'}</dd></div></dl><div className="project-workspace__git-actions"><Button variant="secondary" onClick={() => onDialog('branch')}><IconGitBranch size={16} />从此创建分支</Button><Button variant="danger" onClick={() => onDialog('restore')}><IconRestore size={16} />还原为新提交</Button></div><p><IconLock size={14} /> 保护规则：禁止 force push 与 reset --hard</p></aside></div> : <EmptyState icon={<IconBrandGit size={22} />} title="还没有提交历史" description="项目产物提交后，可在这里查看 Commit、作者、时间、分支、里程碑与关联会话。" />}</>;
 }
 
 function AuditPanel({ events, members, onRefresh, onOpenSession }: { events: RecordValue[]; members: RecordValue[]; onRefresh: () => Promise<void>; onOpenSession: OpenSession }) {

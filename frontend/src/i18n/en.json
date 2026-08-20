@@ -19,20 +19,31 @@
         "shared": "Project shared",
         "unshared": "Project unshared",
         "settings": { "updated": "Project settings updated" },
-        "file": { "committed": "Project file committed" }
+        "file": { "committed": "Project file committed" },
+        "kickoff": { "confirmed": "Project plan confirmed and started", "failed": "Project kickoff failed" },
+        "agent_reply_batch": { "dispatched": "Agent reply batch dispatched" }
       },
       "member": { "snapshot": { "created": "Member snapshot created", "updated": "Member snapshot updated" } },
       "leader": { "changed": "Project Leader changed" },
       "capability": { "bound": "Project capability bound", "updated": "Project capability updated" },
       "work_item": { "created": "Work item created", "updated": "Work item updated" },
-      "run": { "queued": "Run queued" },
+      "run": {
+        "queued": "Run queued",
+        "running": "Run started",
+        "waiting": "Run waiting",
+        "succeeded": "Run succeeded",
+        "failed": "Run failed",
+        "cancelled": "Run cancelled"
+      },
       "a2a": { "queued": "A2A request queued", "delivered": "A2A message delivered", "delivery_failed": "A2A delivery failed" },
       "group": { "message": { "created": "Project group message created" } },
       "git": {
         "commit": { "created": "Git commit created" },
         "milestone": { "created": "Delivery milestone created" },
         "branch": { "created": "Git branch created" },
-        "restore_commit": { "created": "Restore commit created" }
+        "restore_commit": { "created": "Restore commit created" },
+        "remote": { "configured": "Git remote configured", "deleted": "Git remote deleted" },
+        "repository": { "cloned": "Project repository cloned from remote" }
       }
     }
   },

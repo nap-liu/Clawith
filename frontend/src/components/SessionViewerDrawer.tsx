@@ -14,7 +14,7 @@ import {
 
 import ConversationTimeline, { type ConversationTimelineProps } from '../features/conversation/web/ConversationTimeline';
 import ChatImageLightbox from './ChatImageLightbox';
-import MultiSelectDropdown from './ui/MultiSelectDropdown';
+import RichMentionComposer, { type RichMentionComposerHandle } from './ui/RichMentionComposer';
 import {
     applyAssistantDoneMessage,
     applyAssistantStreamMessage,
@@ -43,7 +43,7 @@ export type SessionViewerTarget = {
 };
 
 export type SessionViewerGroupConfig = {
-    members: Array<{ agentId: string; name: string }>;
+    members: Array<{ agentId: string; name: string; isLeader?: boolean; isEnabled?: boolean }>;
     currentAgentId?: string;
     maxMentions?: number;
     loadMessages: (sessionId: string) => Promise<unknown[]>;
@@ -66,6 +66,8 @@ type SessionViewerDrawerProps = {
     routeMode?: 'pc' | 'h5';
     portalContainer?: HTMLElement | null;
     interactive?: boolean;
+    /** Render the same timeline/composer inside the current page instead of an overlay drawer. */
+    embedded?: boolean;
     groupConfig?: SessionViewerGroupConfig;
     onClose: () => void;
     onPreviewImages?: (images: ChatPreviewImage[], index: number) => void;
@@ -75,7 +77,6 @@ type SessionViewerDrawerProps = {
 };
 
 const ACTIVE_STATUSES = new Set(['queued', 'pending', 'running', 'processing']);
-
 export default function SessionViewerDrawer({
     agentId,
     agentName,
@@ -83,6 +84,7 @@ export default function SessionViewerDrawer({
     routeMode = 'pc',
     portalContainer,
     interactive = false,
+    embedded = false,
     groupConfig,
     onClose,
     onPreviewImages,
@@ -110,15 +112,16 @@ export default function SessionViewerDrawer({
     const closeButtonRef = useRef<HTMLButtonElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const richMentionComposerRef = useRef<RichMentionComposerHandle>(null);
     const socketRef = useRef<WebSocket | null>(null);
     const uploadAbortRef = useRef(new Map<string, () => void>());
     const requestSequenceRef = useRef(0);
     const sessionId = target?.sessionId;
     const accessAgentId = target?.agentId || agentId;
     const canCompose = interactive && !serverReadOnly;
-    const mentionLimit = Math.max(1, groupConfig?.maxMentions || 8);
+    const mentionLimit = Math.max(0, groupConfig?.maxMentions ?? 8);
     const mentionOptions = useMemo(() => groupConfig?.members
-        .filter((member) => member.agentId !== groupConfig.currentAgentId)
+        .filter((member) => member.isEnabled !== false && !member.isLeader && member.agentId !== groupConfig.currentAgentId)
         .map((member) => ({ value: member.agentId, label: member.name })) || [], [groupConfig]);
 
     const loadSession = useCallback(async (background = false) => {
@@ -347,7 +350,7 @@ export default function SessionViewerDrawer({
     }, [active, loadSession, sessionId]);
 
     useEffect(() => {
-        if (!target) return;
+        if (!target || embedded) return;
         const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
         const previousOverflow = document.body.style.overflow;
         document.body.style.overflow = 'hidden';
@@ -380,7 +383,7 @@ export default function SessionViewerDrawer({
             window.removeEventListener('keydown', onKeyDown);
             previousFocus?.focus();
         };
-    }, [onClose, target?.sessionId]);
+    }, [embedded, onClose, target?.sessionId]);
 
     useEffect(() => {
         if (!messages.length) return;
@@ -439,7 +442,7 @@ export default function SessionViewerDrawer({
         void uploadFiles(files);
     };
 
-    const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const handlePaste = (event: ClipboardEvent<HTMLElement>) => {
         const images = Array.from(event.clipboardData?.items || [])
             .filter((item) => item.type.startsWith('image/'))
             .map((item, index) => {
@@ -454,11 +457,13 @@ export default function SessionViewerDrawer({
         void uploadFiles(images);
     };
 
-    const sendMessage = async () => {
+    const sendMessage = async (draftOverride?: string, mentionsOverride?: string[]) => {
         const socket = socketRef.current;
         if (!canCompose || !connected || sending) return;
-        if (!draft.trim() && attachedFiles.length === 0) return;
-        const attachmentPayload = buildChatAttachmentPayload({ input: draft.trim(), attachments: attachedFiles });
+        const effectiveDraft = draftOverride ?? draft;
+        const effectiveMentions = mentionsOverride ?? mentions;
+        if (!effectiveDraft.trim() && attachedFiles.length === 0) return;
+        const attachmentPayload = buildChatAttachmentPayload({ input: effectiveDraft.trim(), attachments: attachedFiles });
         const clientMessageId = createClientId();
         setMessages((previous) => [...previous, {
             id: clientMessageId,
@@ -477,7 +482,7 @@ export default function SessionViewerDrawer({
                 const result = await groupConfig.sendMessage(sessionId, {
                     content: attachmentPayload.displayContent || t('agent.sessionViewer.attachmentOnlyMessage', '请查看附件'),
                     llm_content: attachmentPayload.contentForLLM,
-                    mentions,
+                    mentions: effectiveMentions,
                     attachments: attachmentPayload.attachments,
                 });
                 const committed = result.message ? mapHistoryMessage(result.message) : null;
@@ -555,19 +560,19 @@ export default function SessionViewerDrawer({
     const isSubagent = runtime?.kind === 'subagent' || session?.source_channel === 'subagent';
     const participantName = String(session?.username || t('agent.sessionViewer.participant'));
 
-    return createPortal(
-        <div className={`session-viewer-drawer-layer session-viewer-drawer-layer--${routeMode}`} role="presentation">
-            <button
+    const viewer = (
+        <div className={`session-viewer-drawer-layer session-viewer-drawer-layer--${routeMode}${embedded ? ' session-viewer-drawer-layer--embedded' : ''}`} role="presentation">
+            {!embedded && <button
                 type="button"
                 className="session-viewer-drawer-backdrop"
                 aria-label={t('agent.sessionViewer.close')}
                 onClick={onClose}
-            />
+            />}
             <aside
                 ref={drawerRef}
-                className={`session-viewer-drawer session-viewer-drawer--${routeMode}`}
-                role="dialog"
-                aria-modal="true"
+                className={`session-viewer-drawer session-viewer-drawer--${routeMode}${embedded ? ' session-viewer-drawer--embedded' : ''}`}
+                role={embedded ? 'region' : 'dialog'}
+                aria-modal={embedded ? undefined : true}
                 aria-labelledby="session-viewer-drawer-title"
             >
                 <header className="session-viewer-drawer__header">
@@ -588,9 +593,9 @@ export default function SessionViewerDrawer({
                                 <IconArrowUpRight size={17} stroke={1.8} />
                             </a>
                         )}
-                        <button ref={closeButtonRef} type="button" onClick={onClose} title={t('agent.sessionViewer.close')}>
+                        {!embedded && <button ref={closeButtonRef} type="button" onClick={onClose} title={t('agent.sessionViewer.close')}>
                             <IconX size={18} stroke={1.8} />
-                        </button>
+                        </button>}
                     </span>
                 </header>
                 <div className="session-viewer-drawer__context">
@@ -671,39 +676,32 @@ export default function SessionViewerDrawer({
                             </div>
                         )}
                         {composerError && <div className="session-viewer-drawer__composer-error" role="status">{composerError}</div>}
-                        {groupConfig && (
-                            <div className="session-viewer-drawer__mentions">
-                                <div className="session-viewer-drawer__mention-control">
-                                    <MultiSelectDropdown
-                                        options={mentionOptions}
-                                        values={mentions}
-                                        onChange={(values) => {
-                                            if (values.length > mentionLimit) {
-                                                setComposerError(`每条消息最多 @ ${mentionLimit} 个 Agent。`);
-                                                return;
-                                            }
-                                            setMentions(Array.from(new Set(values)));
-                                            setComposerError('');
-                                        }}
-                                        emptyLabel="@ 项目成员"
-                                        selectedLabel={(count) => `已 @ ${count} 个 Agent`}
-                                        searchPlaceholder="搜索项目成员"
-                                        noOptionsLabel="没有可提及的 Agent"
-                                        noMatchesLabel="没有匹配的 Agent"
-                                        ariaLabel="选择要唤醒的项目 Agent"
-                                    />
-                                    <small>仅 @ 的 Agent 会被唤醒；普通发送只写入共享时间线。</small>
-                                </div>
-                                {mentions.length > 0 && <div className="session-viewer-drawer__mention-chips">{mentions.map((mentionedAgentId) => {
-                                    const member = groupConfig.members.find((entry) => entry.agentId === mentionedAgentId);
-                                    return <button key={mentionedAgentId} type="button" onClick={() => setMentions((previous) => previous.filter((id) => id !== mentionedAgentId))}><span>@{member?.name || mentionedAgentId}</span><IconX size={12} /></button>;
-                                })}</div>}
-                            </div>
-                        )}
                         <div className="session-viewer-drawer__composer-row">
                             <input ref={fileInputRef} type="file" multiple hidden onChange={handleFileChange} />
                             <button type="button" className="session-viewer-drawer__composer-icon" onClick={() => fileInputRef.current?.click()} disabled={!canCompose || !connected || sending || uploads.length > 0 || attachedFiles.length >= 10} title={t('agent.workspace.uploadFile', '添加附件')}><IconPaperclip size={17} /></button>
-                            <textarea
+                            {groupConfig ? (
+                                <RichMentionComposer
+                                    ref={richMentionComposerRef}
+                                    value={draft}
+                                    options={mentionOptions}
+                                    maxMentions={mentionLimit}
+                                    disabled={!canCompose || sending}
+                                    placeholder={serverReadOnly
+                                        ? t('agent.sessionViewer.readOnlySession', '该会话仅允许查看，不能继续发送消息。')
+                                        : connected
+                                            ? t('chat.placeholder', '输入消息…')
+                                            : t('agent.sessionViewer.connecting', '正在连接会话…')}
+                                    onChange={(displayContent, mentionIds) => {
+                                        setDraft(displayContent);
+                                        setMentions(mentionIds);
+                                        setComposerError('');
+                                    }}
+                                    onSubmit={(displayContent, mentionIds) => void sendMessage(displayContent, mentionIds)}
+                                    onPaste={handlePaste}
+                                    onLimitExceeded={() => setComposerError(`每条消息最多 @ ${mentionLimit} 个 Agent。`)}
+                                    onUnresolvedSubmit={() => setComposerError('存在未匹配或重名的 @成员，请删除红色提及或从候选列表中选择后再发送。')}
+                                />
+                            ) : <textarea
                                 ref={textareaRef}
                                 value={draft}
                                 onChange={(event) => {
@@ -720,23 +718,23 @@ export default function SessionViewerDrawer({
                                     : connected
                                         ? t('chat.placeholder', '输入消息…')
                                         : t('agent.sessionViewer.connecting', '正在连接会话…')}
-                            />
+                            />}
                             {sending && !groupConfig ? (
                                 <button type="button" className="session-viewer-drawer__composer-send session-viewer-drawer__composer-send--stop" onClick={abortTurn} title={t('chat.stop', '停止')}><IconPlayerStopFilled size={16} /></button>
                             ) : sending ? (
                                 <button type="button" className="session-viewer-drawer__composer-send" disabled title="正在写入项目共享时间线"><IconRefresh className="subagent-run-card__spin" size={16} /></button>
                             ) : (
-                                <button type="button" className="session-viewer-drawer__composer-send" onClick={() => void sendMessage()} disabled={!canCompose || !connected || uploads.length > 0 || (!draft.trim() && attachedFiles.length === 0)} title={t('chat.send', '发送')}><IconSend size={16} /></button>
+                                <button type="button" className="session-viewer-drawer__composer-send" onClick={() => groupConfig ? richMentionComposerRef.current?.submit() : void sendMessage()} disabled={!canCompose || !connected || uploads.length > 0 || (!draft.trim() && attachedFiles.length === 0)} title={t('chat.send', '发送')}><IconSend size={16} /></button>
                             )}
                         </div>
                         <small className="session-viewer-drawer__composer-status">
-                            {serverReadOnly ? t('agent.sessionViewer.readOnly', '只读') : connected ? (groupConfig ? '已连接项目共享时间线' : t('agent.sessionViewer.connected', '已连接标准 Web Chat')) : t('agent.sessionViewer.connecting', '正在连接会话…')}
+                            {serverReadOnly ? t('agent.sessionViewer.readOnly', '只读') : connected ? (groupConfig ? '所有消息由 Leader 处理；@ 可额外唤醒指定 Agent · 已连接项目共享时间线' : t('agent.sessionViewer.connected', '已连接标准 Web Chat')) : t('agent.sessionViewer.connecting', '正在连接会话…')}
                         </small>
                     </footer>
                 )}
             </aside>
             {!onPreviewImages && <ChatImageLightbox open={Boolean(internalPreview)} images={internalPreview?.images || []} index={internalPreview?.index || 0} mode={routeMode === 'h5' ? 'mobile' : 'desktop'} onClose={() => setInternalPreview(null)} onIndexChange={(index) => setInternalPreview((previous) => previous ? { ...previous, index } : previous)} />}
-        </div>,
-        portalContainer || document.body,
+        </div>
     );
+    return embedded ? viewer : createPortal(viewer, portalContainer || document.body);
 }

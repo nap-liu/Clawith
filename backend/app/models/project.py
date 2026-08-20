@@ -36,9 +36,43 @@ class Project(Base):
     success_criteria: Mapped[list] = mapped_column(JSON, nullable=False, default=list, server_default=text("'[]'"))
     visibility: Mapped[str] = mapped_column(String(20), nullable=False, default="private", server_default="private")
     status: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="initializing", server_default="initializing"
+        String(20), nullable=False, default="planning", server_default="planning"
     )
     settings: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict, server_default=text("'{}'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ProjectRepositoryOperation(Base):
+    """Durable journal for a filesystem repository swap.
+
+    Clone uses one row per project while its old repository remains recoverable.
+    ``prepared`` means project settings still describe the old repository and a
+    reconciler must roll the filesystem back. ``committed`` means the settings
+    transaction won and a reconciler may discard the old backup.
+    """
+
+    __tablename__ = "project_repository_operations"
+    __table_args__ = (
+        UniqueConstraint("project_id", name="uq_project_repository_operation_project"),
+        Index("ix_project_repository_operations_state", "state", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    operation_type: Mapped[str] = mapped_column(String(30), nullable=False, default="clone", server_default="clone")
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="prepared", server_default="prepared")
+    old_head: Mapped[str] = mapped_column(String(64), nullable=False)
+    new_head: Mapped[str] = mapped_column(String(64), nullable=False)
+    backup_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    staging_name: Mapped[str] = mapped_column(String(120), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

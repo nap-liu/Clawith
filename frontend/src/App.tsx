@@ -34,6 +34,7 @@ const PublishedPageUnavailable = lazy(() => import('./pages/PublishedPageUnavail
 const ProjectPortfolioPage = lazy(() => import('./features/projects/ProjectPortfolioPage'));
 const ProjectTemplatesPage = lazy(() => import('./features/projects/ProjectTemplatesPage'));
 const ProjectCreatePage = lazy(() => import('./features/projects/ProjectCreatePage'));
+const ProjectPlanningPage = lazy(() => import('./features/projects/ProjectPlanningPage'));
 const ProjectWorkspacePage = lazy(() => import('./features/projects/ProjectWorkspacePage'));
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -323,6 +324,7 @@ export default function App() {
                     <Route path="projects" element={<ProjectPortfolioPage />} />
                     <Route path="projects/templates" element={<ProjectTemplatesPage />} />
                     <Route path="projects/new" element={<ProjectCreatePage />} />
+                    <Route path="projects/:projectId/planning" element={<ProjectPlanningPage />} />
                     <Route path="projects/:projectId/*" element={<ProjectWorkspacePage />} />
                     <Route path="enterprise" element={<CompanyAdminRoute><EnterpriseSettings /></CompanyAdminRoute>} />
                     <Route path="okr" element={<OKR />} />

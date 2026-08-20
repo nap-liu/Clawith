@@ -27,6 +27,8 @@
 
 .ui-multi-select__menu {
     position: absolute;
+    display: flex;
+    flex-direction: column;
     top: calc(100% + 6px);
     left: 0;
     z-index: 30;
@@ -41,11 +43,18 @@
     box-shadow: var(--shadow-lg);
 }
 
+.ui-multi-select__menu--portal {
+    position: fixed;
+    z-index: 10000;
+}
+
 .ui-multi-select__search {
     margin-bottom: 5px;
 }
 
 .ui-multi-select__options {
+    min-height: 0;
+    flex: 1;
     max-height: 268px;
     overflow-y: auto;
 }

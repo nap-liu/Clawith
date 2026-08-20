@@ -34,7 +34,7 @@ class ProjectCreate(BaseModel):
     visibility: Literal["private", "shared"] = "private"
     shared_with_user_ids: list[uuid.UUID] = Field(default_factory=list)
     shared_user_ids: list[uuid.UUID] = Field(default_factory=list)
-    status: Literal["initializing", "running", "waiting", "paused", "completed", "archived", "failed"] = "initializing"
+    status: Literal["planning", "initializing"] = "planning"
     template_id: uuid.UUID | None = None
     members: list[ProjectMemberCreate] = Field(default_factory=list)
     capabilities: list[ProjectCapabilityCreate] = Field(default_factory=list)
@@ -60,7 +60,10 @@ class ProjectUpdate(BaseModel):
     goal: str | None = None
     success_criteria: list[str] | None = None
     visibility: Literal["private", "shared"] | None = None
-    status: Literal["initializing", "running", "waiting", "paused", "completed", "archived", "failed"] | None = None
+    status: (
+        Literal["planning", "initializing", "running", "waiting", "paused", "completed", "archived", "failed"]
+        | None
+    ) = None
     settings: dict | None = None
     shared_with_user_ids: list[uuid.UUID] | None = None
 
@@ -339,6 +342,10 @@ class ProjectGroupMessageCreate(BaseModel):
         return self
 
 
+class ProjectKickoffConfirm(BaseModel):
+    confirmation: str | None = Field(default=None, max_length=10_000)
+
+
 class GitRestoreRequest(BaseModel):
     commit: str = Field(pattern=r"^[0-9a-fA-F]{7,64}$")
     message: str | None = None
@@ -347,6 +354,15 @@ class GitRestoreRequest(BaseModel):
 class GitBranchRequest(BaseModel):
     name: str = Field(pattern=r"^[A-Za-z0-9._/-]+$")
     from_commit: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{7,64}$")
+
+
+class GitRemoteRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=4096)
+
+
+class GitCloneRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=4096)
+    branch: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class ProjectFileWriteRequest(BaseModel):

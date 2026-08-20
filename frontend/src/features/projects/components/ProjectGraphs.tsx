@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import {
     Background,
     BackgroundVariant,
@@ -10,6 +10,7 @@ import {
     ReactFlow,
     ReactFlowProvider,
     useEdgesState,
+    useNodesInitialized,
     useNodesState,
     useReactFlow,
     type Edge,
@@ -206,6 +207,8 @@ function ProjectGraphViewport({
     const [nodes, setNodes, onNodesChange] = useNodesState<ProjectGraphNode>(sourceNodes);
     const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(sourceEdges);
     const { fitView } = useReactFlow<ProjectGraphNode, Edge>();
+    const nodesInitialized = useNodesInitialized();
+    const viewportRef = useRef<HTMLDivElement>(null);
     const signature = useMemo(
         () => `${sourceNodes.map((node) => node.id).join('|')}::${sourceEdges.map((edge) => edge.id).join('|')}`,
         [sourceEdges, sourceNodes],
@@ -214,12 +217,35 @@ function ProjectGraphViewport({
     useEffect(() => {
         setNodes(sourceNodes);
         setEdges(sourceEdges);
-        const frame = window.requestAnimationFrame(() => void fitView({ padding: 0.18, duration: 260 }));
-        return () => window.cancelAnimationFrame(frame);
-    }, [fitView, setEdges, setNodes, signature, sourceEdges, sourceNodes]);
+    }, [setEdges, setNodes, sourceEdges, sourceNodes]);
+
+    useEffect(() => {
+        const viewport = viewportRef.current;
+        if (!viewport || !nodesInitialized) return;
+        let frame = 0;
+        let previousWidth = -1;
+        let previousHeight = -1;
+        const refit = (width: number, height: number, duration = 0) => {
+            if (width <= 0 || height <= 0 || (width === previousWidth && height === previousHeight)) return;
+            previousWidth = width;
+            previousHeight = height;
+            window.cancelAnimationFrame(frame);
+            frame = window.requestAnimationFrame(() => void fitView({ padding: 0.18, duration }));
+        };
+        const initialRect = viewport.getBoundingClientRect();
+        refit(initialRect.width, initialRect.height, 260);
+        const resizeObserver = new ResizeObserver(([entry]) => {
+            if (entry) refit(entry.contentRect.width, entry.contentRect.height);
+        });
+        resizeObserver.observe(viewport);
+        return () => {
+            resizeObserver.disconnect();
+            window.cancelAnimationFrame(frame);
+        };
+    }, [fitView, nodesInitialized, signature]);
 
     return (
-        <div className={`project-graph project-graph--${direction}`} role="img" aria-label={ariaLabel}>
+        <div ref={viewportRef} className={`project-graph project-graph--${direction}`} role="img" aria-label={ariaLabel}>
             <ReactFlow<ProjectGraphNode, Edge>
                 nodes={nodes}
                 edges={edges}
@@ -231,8 +257,6 @@ function ProjectGraphViewport({
                     id: node.id,
                     record: records.get(node.id) || {},
                 })}
-                fitView
-                fitViewOptions={{ padding: 0.18 }}
                 minZoom={0.35}
                 maxZoom={1.8}
                 nodesConnectable={false}
@@ -327,6 +351,7 @@ export function A2AMeshGraph({ members, events = [], selectedAgentId, onAgentSel
         ...ordered.filter((member) => member.is_enabled !== false).map((member) => {
             const agentId = valueText(member, 'agent_id', 'id', 'member_id');
             return makeEdge(`mesh-${agentId}`, 'project-a2a-mesh', agentId, {
+                type: 'bezier',
                 label: '可直连',
                 markerStart: { type: MarkerType.ArrowClosed, color: 'var(--text-tertiary)', width: 15, height: 15 },
                 style: { ...edgeStyle, strokeDasharray: '4 5' },
@@ -337,6 +362,7 @@ export function A2AMeshGraph({ members, events = [], selectedAgentId, onAgentSel
             relation.source,
             relation.target,
             {
+                type: 'bezier',
                 animated: relation.latestType.includes('queued') || relation.latestType.includes('wake'),
                 label: relation.count > 1 ? `${relation.count} 次` : relation.latestType.replace('a2a.', ''),
                 style: { stroke: 'var(--info)', strokeWidth: 2 },

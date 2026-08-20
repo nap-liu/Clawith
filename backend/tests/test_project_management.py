@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import subprocess
 import uuid
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from app.services.project_git_service import (
     initialize_project_repo,
     list_project_files,
     restore_as_new_commit,
+    validate_project_remote_url,
     write_project_file,
 )
 from app.services.project_service import create_project, freeze_run_members, require_project
@@ -88,6 +90,43 @@ async def _user(db, tenant: Tenant, name: str) -> User:
     return user
 
 
+async def test_git_remote_validation_blocks_non_public_dns(monkeypatch: pytest.MonkeyPatch):
+    addresses = {
+        "loopback.example": "127.0.0.1",
+        "linklocal.example": "169.254.7.8",
+        "metadata.example": "169.254.169.254",
+        "private.example": "10.23.4.5",
+        "public.example": "93.184.216.34",
+    }
+
+    def fake_getaddrinfo(host: str, port: int, *_args):
+        address = addresses[host]
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    for remote in (
+        "http://loopback.example/org/repo.git",
+        "http://linklocal.example/org/repo.git",
+        "http://metadata.example/latest/meta-data",
+        "https://private.example/org/repo.git",
+        "ssh://git@private.example/org/repo.git",
+        "git://private.example/org/repo.git",
+        "git@private.example:org/repo.git",
+    ):
+        with pytest.raises(HTTPException) as denied:
+            await validate_project_remote_url(remote)
+        assert denied.value.status_code == 422
+
+    for public_remote in (
+        "http://public.example/org/repo.git",
+        "https://public.example/org/repo.git",
+        "ssh://git@public.example/org/repo.git",
+        "git://public.example/org/repo.git",
+        "git@public.example:org/repo.git",
+    ):
+        assert await validate_project_remote_url(public_remote) == public_remote
+
+
 async def test_private_project_and_explicit_share_are_tenant_safe(db, monkeypatch):
     async def fake_git(_project):
         return {"mode": "managed", "head": "a" * 40, "default_branch": "main"}
@@ -104,7 +143,7 @@ async def test_private_project_and_explicit_share_are_tenant_safe(db, monkeypatc
         owner,
         ProjectCreate(name="Private", objective="Ship safely", shared_user_ids=[viewer.id], visibility="shared"),
     )
-    assert project.status == "running"
+    assert project.status == "planning"
     assert project.goal == "Ship safely"
     assert (await require_project(db, owner, project.id)).id == project.id
     assert (await require_project(db, viewer, project.id)).id == project.id

@@ -35,6 +35,7 @@ const scopeTabs: Array<{ value: ProjectScope; label: string }> = [
 ];
 
 const statusLabels: Record<ProjectStatus, string> = {
+    planning: '规划中',
     initializing: '初始化中',
     running: '进行中',
     waiting: '等待确认',
@@ -45,6 +46,7 @@ const statusLabels: Record<ProjectStatus, string> = {
 };
 
 const statusTones: Record<ProjectStatus, 'neutral' | 'success' | 'warning' | 'error'> = {
+    planning: 'warning',
     initializing: 'neutral',
     running: 'success',
     waiting: 'warning',

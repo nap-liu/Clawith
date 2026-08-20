@@ -26,7 +26,7 @@ function normalizeStatus(value: unknown): ProjectStatus {
     if (raw === 'active') return 'running';
     if (raw === 'draft') return 'initializing';
     if (raw === 'success' || raw === 'succeeded') return 'completed';
-    return ['initializing', 'running', 'waiting', 'paused', 'completed', 'archived', 'failed'].includes(raw)
+    return ['planning', 'initializing', 'running', 'waiting', 'paused', 'completed', 'archived', 'failed'].includes(raw)
         ? raw as ProjectStatus
         : 'initializing';
 }
@@ -34,6 +34,12 @@ function normalizeStatus(value: unknown): ProjectStatus {
 function normalizeProject(value: unknown): ProjectSummary {
     const source = record(value);
     const settings = record(source.settings);
+    const sharedWith = array(source.shared_with).map(record);
+    const editable = typeof source.editable === 'boolean'
+        ? source.editable
+        : typeof source.can_edit === 'boolean'
+            ? source.can_edit
+            : null;
     return {
         id: string(source.id),
         name: string(source.name, '未命名项目'),
@@ -59,6 +65,10 @@ function normalizeProject(value: unknown): ProjectSummary {
         next_action: string(source.next_action || settings.next_action) || null,
         owner_id: string(source.owner_id || source.owner_user_id) || null,
         owner_name: string(source.owner_name) || null,
+        editable,
+        shared_with_user_ids: (array(source.shared_with_user_ids).length
+            ? array(source.shared_with_user_ids)
+            : sharedWith.map(item => item.user_id || item.id)).map(item => string(item)).filter(Boolean),
         shared_with_names: array(source.shared_with_names).map(item => string(item)).filter(Boolean),
         created_at: string(source.created_at, new Date(0).toISOString()),
         updated_at: string(source.updated_at || source.created_at, new Date(0).toISOString()),
@@ -160,6 +170,7 @@ export const projectsApi = {
             const risk = string(capability.risk_level);
             return {
                 id: string(capability.id),
+                capability_id: string(capability.capability_id) || null,
                 name: string(capability.name || capability.display_name, '未命名能力'),
                 description: string(capability.description) || null,
                 kind: capability.kind === 'mcp' || capability.type === 'mcp' ? 'mcp' as const : 'skill' as const,
@@ -187,10 +198,30 @@ export const projectsApi = {
     async create(payload: ProjectCreatePayload): Promise<ProjectCreateResponse> {
         const response = await fetchJson<JsonRecord>('/projects', {
             method: 'POST',
-            body: JSON.stringify({ ...payload, goal: payload.objective, status: 'initializing', settings: { git: payload.git, runtime: payload.runtime } }),
+            body: JSON.stringify({
+                ...payload,
+                goal: payload.objective,
+                status: 'planning',
+                settings: {
+                    git: payload.git,
+                    runtime: payload.runtime,
+                    planning: {
+                        state: 'draft',
+                        intent: 'discuss_with_leader_before_launch',
+                        launch_confirmed: false,
+                    },
+                },
+            }),
         });
         const project = normalizeProject(response);
         return { id: project.id, name: project.name, status: project.status };
+    },
+
+    async update(projectId: string, payload: { visibility?: 'private' | 'shared'; shared_with_user_ids?: string[] }): Promise<ProjectSummary> {
+        return normalizeProject(await fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}`, {
+            method: 'PATCH',
+            body: JSON.stringify(payload),
+        }));
     },
 
     dashboard: (projectId: string) => fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/dashboard`),
@@ -205,6 +236,13 @@ export const projectsApi = {
     listEvents: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/events`),
     getGroupSession: (projectId: string) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/group-session`),
+    getLeaderSession: (projectId: string) =>
+        fetchJson<{ id: string; project_id: string; agent_id: string; title?: string; source_channel?: string; discussion_count?: number }>(`/projects/${encodeURIComponent(projectId)}/leader-session`),
+    confirmKickoff: (projectId: string, confirmation?: string) =>
+        fetchJson<{ status: string; project_id: string; run_id: string; leader_session_id: string; group_session_id: string; leader_agent_id: string; awakened_agent_ids: string[]; subagent_run_id: string; subagent_session_id: string; transcript_path: string; transcript_commit: string }>(`/projects/${encodeURIComponent(projectId)}/kickoff/confirm`, {
+            method: 'POST',
+            body: JSON.stringify({ confirmation: confirmation || undefined }),
+        }),
     async listGroupMessages(projectId: string, sessionId: string): Promise<JsonRecord[]> {
         const response = await fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/group-sessions/${encodeURIComponent(sessionId)}/messages?limit=500`);
         return array(response.items).map(item => {
@@ -231,6 +269,19 @@ export const projectsApi = {
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/leader`, { method: 'PUT', body: JSON.stringify({ agent_id: agentId }) }),
     getGit: (projectId: string, limit = 100) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/git?limit=${encodeURIComponent(String(limit))}`),
+    async listGitRemotes(projectId: string): Promise<Array<{ name: string; url: string }>> {
+        const response = record(await fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/git/remotes`));
+        return array(response.items).map(item => {
+            const remote = record(item);
+            return { name: string(remote.name), url: string(remote.url) };
+        }).filter(remote => remote.name && remote.url);
+    },
+    putGitRemote: (projectId: string, name: string, url: string) =>
+        fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/git/remotes/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ url }) }),
+    deleteGitRemote: (projectId: string, name: string) =>
+        fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/git/remotes/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+    cloneGitRepository: (projectId: string, payload: { url: string; branch?: string }) =>
+        fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/git/clone`, { method: 'POST', body: JSON.stringify({ url: payload.url, branch: payload.branch || undefined }) }),
     patchCapability: (projectId: string, bindingId: string, payload: { enabled?: boolean; is_enabled?: boolean }) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/capabilities/${encodeURIComponent(bindingId)}`, { method: 'PATCH', body: JSON.stringify({ is_enabled: payload.is_enabled ?? payload.enabled }) }),
     patchRun: (projectId: string, runId: string, payload: { status?: string; output?: JsonRecord; error?: string }) =>

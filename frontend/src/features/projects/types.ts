@@ -1,6 +1,7 @@
 export type ProjectScope = 'mine' | 'shared' | 'running' | 'archived';
 
 export type ProjectStatus =
+    | 'planning'
     | 'initializing'
     | 'running'
     | 'waiting'
@@ -35,6 +36,8 @@ export interface ProjectSummary {
     next_action?: string | null;
     owner_id?: string | null;
     owner_name?: string | null;
+    editable?: boolean | null;
+    shared_with_user_ids?: string[];
     shared_with_names?: string[];
     updated_at: string;
     created_at: string;
@@ -92,6 +95,7 @@ export type CapabilityKind = 'skill' | 'mcp';
 
 export interface ProjectCapabilityOption {
     id: string;
+    capability_id?: string | null;
     name: string;
     description?: string | null;
     kind: CapabilityKind;

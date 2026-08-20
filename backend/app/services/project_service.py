@@ -122,6 +122,73 @@ async def ensure_project_group_session(db: AsyncSession, project: Project) -> Ch
     return session
 
 
+async def ensure_project_leader_session(db: AsyncSession, project: Project) -> ChatSession:
+    """Return the durable project-scoped planning conversation with its Leader.
+
+    This is deliberately a normal, non-primary Web session so the existing Web
+    Chat transport/history can be reused. The project owner is the canonical
+    human participant; project REST remains the discovery and ACL boundary.
+    """
+    external_conv_id = f"project-leader:{project.id}"
+    session = (
+        await db.execute(
+            select(ChatSession)
+            .where(
+                ChatSession.project_id == project.id,
+                ChatSession.source_channel == "web",
+                ChatSession.external_conv_id == external_conv_id,
+                ChatSession.is_group.is_(False),
+            )
+            .order_by(ChatSession.created_at, ChatSession.id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    leader = (
+        await db.execute(
+            select(ProjectMemberSnapshot)
+            .where(
+                ProjectMemberSnapshot.project_id == project.id,
+                ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                ProjectMemberSnapshot.is_leader.is_(True),
+                ProjectMemberSnapshot.is_enabled.is_(True),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if leader is None:
+        raise HTTPException(status_code=422, detail="Project needs an enabled Leader before planning can start")
+    if session is not None:
+        # Leader replacement before confirmation should continue the same
+        # auditable project discussion rather than orphaning a second thread.
+        if session.agent_id != leader.agent_id:
+            session.agent_id = leader.agent_id
+            session.title = f"{project.name} · Leader Planning"
+            session.im_config = {
+                **dict(session.im_config or {}),
+                "leader_agent_id": str(leader.agent_id),
+            }
+        return session
+    session = ChatSession(
+        project_id=project.id,
+        agent_id=leader.agent_id,
+        user_id=project.owner_user_id,
+        title=f"{project.name} · Leader Planning",
+        source_channel="web",
+        external_conv_id=external_conv_id,
+        is_group=False,
+        is_primary=False,
+        im_config={
+            "project_id": str(project.id),
+            "project_member_id": str(leader.id),
+            "leader_agent_id": str(leader.agent_id),
+            "purpose": "project_kickoff_planning",
+        },
+    )
+    db.add(session)
+    await db.flush()
+    return session
+
+
 def add_event(
     db: AsyncSession,
     project: Project,
@@ -417,6 +484,7 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
     # GET remains a safe fallback for projects created before this migration.
     if members:
         await ensure_project_group_session(db, project)
+        await ensure_project_leader_session(db, project)
     from app.services.project_git_service import initialize_project_repo
 
     git_config = dict((project.settings or {}).get("git") or {})
@@ -430,12 +498,13 @@ async def create_project(db: AsyncSession, user: User, data: ProjectCreate) -> P
     }
     add_event(db, project, "project.created", f"Created project {project.name}", actor_user_id=user.id)
     if project.status == "initializing":
-        project.status = "running"
+        project.status = "planning"
+    if project.status == "planning":
         add_event(
             db,
             project,
             "project.initialized",
-            "Project snapshots and capability bindings are ready",
+            "Project snapshots and capability bindings are ready for Leader planning",
             actor_user_id=user.id,
         )
     await db.flush()
