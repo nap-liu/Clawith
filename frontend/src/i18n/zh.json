@@ -543,6 +543,60 @@
       "confirmResolved": "已确认",
       "confirmCancelled": "已取消"
     },
+    "subagentRun": {
+      "title": "子 Agent",
+      "taskFallback": "委派任务",
+      "viewSession": "查看会话",
+      "sessionPending": "子会话创建后即可查看。",
+      "mode": {
+        "sync": "同步",
+        "async": "异步"
+      },
+      "forked": "已复制当前上下文",
+      "model": "模型",
+      "sessionId": "会话 ID",
+      "status": {
+        "queued": "排队中",
+        "running": "执行中",
+        "completed": "已完成",
+        "failed": "执行失败",
+        "cancelled": "已取消",
+        "stopped": "已停止",
+        "unknown": "未知状态"
+      },
+      "drawerTitle": "子 Agent 会话",
+      "readOnly": "只读执行记录",
+      "loading": "正在加载子 Agent 会话...",
+      "loadError": "无法加载此子 Agent 会话。",
+      "retry": "重试",
+      "empty": "暂无执行消息。",
+      "close": "关闭",
+      "liveRefresh": "子 Agent 执行期间自动更新",
+      "openFullSession": "打开完整会话"
+    },
+    "sessionViewer": {
+      "title": "会话记录",
+      "readOnly": "只读会话视图",
+      "loading": "正在加载会话记录...",
+      "loadError": "无法加载此会话记录。",
+      "retry": "重试",
+      "empty": "暂无会话消息。",
+      "close": "关闭",
+      "openFullSession": "打开完整会话",
+      "participant": "会话参与者",
+      "caller": "发起方",
+      "callerAvatar": "发",
+      "status": {
+        "queued": "排队中",
+        "pending": "等待中",
+        "running": "执行中",
+        "processing": "处理中",
+        "completed": "已完成",
+        "failed": "执行失败",
+        "cancelled": "已取消",
+        "canceled": "已取消"
+      }
+    },
     "activityLog": {
       "title": "工作日志",
       "noRecords": "暂无工作日志",
@@ -802,6 +856,11 @@
       "setupGuide": "设置指南",
       "configureCategory": "配置 {{category}}",
       "enableDisableAll": "启用/禁用所有 {{category}} 工具",
+      "builtin": "内置",
+      "categoryFallbackDescription": "该分类下的工具",
+      "groupSummary": "共 {{total}} 个工具 · 已启用 {{enabled}} 个",
+      "groupShown": "显示 {{count}} 个",
+      "groupConfigured": "已配置 {{count}} 个",
       "configurePerAgent": "配置员工级设置",
       "removeTool": "从员工移除",
       "confirmDelete": "确定从该员工移除 \"{{name}}\" 吗？",
@@ -858,6 +917,7 @@
       "search": "搜索",
       "custom": "自定义",
       "general": "通用",
+      "subagent": "子 Agent",
       "email": "邮件",
       "aware": "感知与触发器",
       "social": "社交",
@@ -867,6 +927,27 @@
       "agentbay": "AgentBay",
       "browser": "浏览器",
       "okr": "OKR"
+    },
+    "toolCategoryDescriptions": {
+      "subagent": "将任务委派给子 Agent，并支持父子会话之间的多轮双向协作"
+    },
+    "toolTranslations": {
+      "run_subagent": {
+        "name": "运行子 Agent",
+        "description": "把目标明确的任务委派给独立的子 Agent 会话；支持同步等待结果或异步后台执行，并可选择模型及复制当前上下文。"
+      },
+      "send_message_to_subagent": {
+        "name": "向子 Agent 发送消息",
+        "description": "向已创建的子 Agent 追加消息。执行中的消息会在下一轮模型循环插入；已结束的子 Agent 会沿用原会话异步恢复。"
+      },
+      "stop_subagent": {
+        "name": "停止子 Agent",
+        "description": "停止正在排队或执行的子 Agent；已经开始的外部工具调用及其副作用不会被回滚。"
+      },
+      "send_message_to_parent": {
+        "name": "向父 Agent 发送消息",
+        "description": "从子 Agent 向创建它的父会话发送一次或多次阶段性消息；异步执行时会唤醒父 Agent，同步执行时会随最终结果一并返回；仅在子 Agent 会话中可用。"
+      }
     },
     "upload": {
       "success": "上传成功",

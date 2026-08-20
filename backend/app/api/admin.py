@@ -25,6 +25,26 @@ from app.models.user import User, Identity
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+async def _delete_company_subagent_runs(
+    db: AsyncSession,
+    agent_ids: list[uuid.UUID],
+) -> None:
+    """Remove tenant-owned lifecycle rows before deleting their sessions."""
+    if not agent_ids:
+        return
+    from sqlalchemy import delete as sa_delete
+
+    from app.models.chat_session import ChatSession
+    from app.models.subagent_run import SubagentRun
+
+    tenant_session_ids = select(ChatSession.id).where(
+        ChatSession.agent_id.in_(agent_ids)
+    )
+    await db.execute(
+        sa_delete(SubagentRun).where(SubagentRun.id.in_(tenant_session_ids))
+    )
+
+
 # ─── Schemas ────────────────────────────────────────────
 
 class CompanyStats(BaseModel):
@@ -760,6 +780,10 @@ async def delete_company(
         await db.execute(sa_delete(Task).where(Task.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(AuditLog).where(AuditLog.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(ApprovalRequest).where(ApprovalRequest.agent_id.in_(agent_ids)))
+        # Company deletion is an explicit full-data purge. Remove lifecycle
+        # rows before their parent/child sessions so the normal RESTRICT guard
+        # used by individual session deletion cannot leave a half-deleted tree.
+        await _delete_company_subagent_runs(db, agent_ids)
         await db.execute(sa_delete(ChatMessage).where(ChatMessage.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(ChatSession).where(ChatSession.agent_id.in_(agent_ids)))
         await db.execute(sa_delete(GatewayMessage).where(GatewayMessage.agent_id.in_(agent_ids)))

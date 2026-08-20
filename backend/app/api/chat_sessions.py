@@ -1,13 +1,16 @@
 """Chat session management API endpoints."""
 
+import re
 import uuid
-from datetime import datetime, timezone as tz
+from datetime import datetime
+from datetime import timezone as tz
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import and_, cast, func, or_, select, String
+from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.core.permissions import (
     can_view_all_agent_chat_sessions,
@@ -18,9 +21,10 @@ from app.core.permissions import (
 )
 from app.core.security import get_current_user
 from app.database import get_db
+from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
-from app.models.agent import Agent
+from app.models.subagent_run import SubagentRun
 from app.models.user import Identity, User
 from app.services.auth_code_exchange import validate_platform_login_channel
 from app.services.chat_message_serializer import serialize_chat_message_for_client
@@ -61,8 +65,18 @@ class SessionOut(BaseModel):
         from_attributes = True
 
 
+class SessionRuntimeOut(BaseModel):
+    kind: Literal["subagent"]
+    status: str
+    execution_agent_id: str
+    execution_agent_name: str
+    mode: str
+    model: Optional[str] = None
+
+
 class SessionDetailOut(SessionOut):
     view_scope: Literal["mine", "all"]
+    runtime: Optional[SessionRuntimeOut] = None
 
 
 class CreateSessionIn(BaseModel):
@@ -83,10 +97,27 @@ async def _load_accessible_session(
     """Resolve one session and the web picker scope that can display it."""
     agent, agent_access = await check_agent_access(db, current_user, agent_id)
     require_current_agent_tenant(current_user, agent)
+    parent_session = aliased(ChatSession)
     result = await db.execute(
-        select(ChatSession).where(
+        select(ChatSession)
+        .outerjoin(SubagentRun, SubagentRun.id == ChatSession.id)
+        .outerjoin(parent_session, parent_session.id == SubagentRun.parent_session_id)
+        .where(
             ChatSession.id == session_id,
-            (ChatSession.agent_id == agent_id) | (ChatSession.peer_agent_id == agent_id),
+            or_(
+                ChatSession.agent_id == agent_id,
+                ChatSession.peer_agent_id == agent_id,
+                and_(
+                    ChatSession.source_channel == "subagent",
+                    or_(
+                        parent_session.agent_id == agent_id,
+                        and_(
+                            parent_session.source_channel == "agent",
+                            parent_session.peer_agent_id == agent_id,
+                        ),
+                    ),
+                ),
+            ),
         )
     )
     session = result.scalar_one_or_none()
@@ -97,7 +128,17 @@ async def _load_accessible_session(
     if hasattr(agent, "tenant_id"):
         await require_tenant_safe_chat_session(db, session, agent.tenant_id)
 
-    is_owner = str(session.user_id) == str(current_user.id)
+    source_channel = str(session.source_channel or "web").lower()
+    is_subagent_owner = False
+    if source_channel == "subagent":
+        run = await db.get(SubagentRun, session.id)
+        is_subagent_owner = bool(
+            run is not None and run.execution_user_id == current_user.id
+        )
+
+    is_owner = (
+        str(session.user_id) == str(current_user.id) or is_subagent_owner
+    )
     is_privileged = _can_view_all_agent_chat_sessions(current_user, agent)
     is_group_member = False
     if bool(getattr(session, "is_group", False)) and not is_owner and not is_privileged:
@@ -118,7 +159,6 @@ async def _load_accessible_session(
         )
         is_group_member = member_result.scalar_one_or_none() is not None
 
-    source_channel = str(session.source_channel or "web").lower()
     is_trigger_manager = agent_access == "manage" and source_channel == "trigger"
     if not (is_owner or is_privileged or is_group_member or is_trigger_manager):
         raise HTTPException(status_code=403, detail="Not authorized to view this session")
@@ -145,6 +185,7 @@ async def _build_session_detail_out(
     peer_agent_id: Optional[str] = None
     peer_agent_name: Optional[str] = None
     participant_type = "user"
+    runtime: SessionRuntimeOut | None = None
 
     if session.source_channel == "agent" and session.peer_agent_id:
         participant_type = "agent"
@@ -168,6 +209,19 @@ async def _build_session_detail_out(
         )
         username = user_result.scalar_one_or_none() or "Unknown"
 
+    if session.source_channel == "subagent":
+        run = await db.get(SubagentRun, session.id)
+        execution_agent = await db.get(Agent, session.agent_id)
+        if run is not None and execution_agent is not None:
+            runtime = SessionRuntimeOut(
+                kind="subagent",
+                status=run.status,
+                execution_agent_id=str(execution_agent.id),
+                execution_agent_name=execution_agent.name or "Agent",
+                mode=run.mode,
+                model=run.model,
+            )
+
     return SessionDetailOut(
         id=str(session.id),
         agent_id=str(session.agent_id),
@@ -186,6 +240,7 @@ async def _build_session_detail_out(
         is_group=bool(session.is_group),
         group_name=session.group_name,
         view_scope=view_scope,
+        runtime=runtime,
     )
 
 
@@ -217,8 +272,11 @@ async def list_sessions(
 
         # Fetch all sessions (including agent-to-agent where this agent is peer)
         all_where = (
-            (ChatSession.agent_id == agent_id)
-            | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
+            (
+                (ChatSession.agent_id == agent_id)
+                | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
+            )
+            & (ChatSession.source_channel != "subagent")
         )
         query = select(ChatSession).where(all_where)
         if source_channel:
@@ -363,7 +421,7 @@ async def list_sessions(
             select(ChatSession)
             .where(
                 ChatSession.agent_id == agent_id,
-                ChatSession.source_channel.notin_(["agent", "trigger"]),  # Exclude agent-to-agent and reflection sessions
+                ChatSession.source_channel.notin_(["agent", "trigger", "subagent"]),
                 or_(
                     and_(
                         ChatSession.is_group == False,
@@ -567,6 +625,13 @@ async def rename_session(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    if session.source_channel == "subagent":
+        await _load_accessible_session(db, current_user, agent_id, session_id)
+        raise HTTPException(
+            status_code=409,
+            detail="Subagent sessions are runtime-owned and read-only; use stop_subagent.",
+        )
+
     if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -592,8 +657,28 @@ async def delete_session(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    if session.source_channel == "subagent":
+        await _load_accessible_session(db, current_user, agent_id, session_id)
+        raise HTTPException(
+            status_code=409,
+            detail="Subagent sessions are runtime-owned and cannot be deleted.",
+        )
+
     if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
         raise HTTPException(status_code=403, detail="Not authorized")
+
+    child_run = (
+        await db.execute(
+            select(SubagentRun.id)
+            .where(SubagentRun.parent_session_id == session_id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if child_run is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Sessions with Subagent audit records cannot be deleted.",
+        )
 
     was_primary = bool(session.is_primary)
     owner_user_id = session.user_id
@@ -637,6 +722,9 @@ async def _get_session_messages_page(
         select(ChatMessage)
         .where(
             ChatMessage.conversation_id == str(session_id),
+            ChatMessage.message_meta["kind"].as_string().is_distinct_from(
+                "subagent_event"
+            ),
             or_(
                 ChatMessage.role != "assistant",
                 ChatMessage.message_meta["media_kind"].as_string().is_(None),
@@ -928,9 +1016,6 @@ async def get_session_message_turns(
         db=db,
         response=response,
     )
-
-
-import re
 
 def _split_inline_tools(content: str) -> list[dict]:
     """Parse assistant content containing inline ```tool_code blocks.

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
@@ -17,6 +17,7 @@ import {
 import ChatAttachmentIcon from '../../../components/ChatAttachmentIcon';
 import ChatMediaCard from '../../../components/ChatMediaCard';
 import ChatToolCallRenderer from '../../../components/ChatToolCallRenderer';
+import type { SubagentRunCardData } from '../../../components/SubagentRunCard';
 import MarkdownRenderer from '../../../components/MarkdownRenderer';
 import { copyToClipboard } from '../../../utils/clipboard';
 import {
@@ -45,6 +46,7 @@ export type ConversationTimelineProps = {
     agentId: string;
     agentName: string;
     messages: ConversationMessage[];
+    mode?: 'h5' | 'pc';
     viewOf: (message: ConversationMessage) => ConversationMessageView;
     isRunning?: boolean;
     unavailableAttachmentKeys?: ReadonlySet<string>;
@@ -52,7 +54,9 @@ export type ConversationTimelineProps = {
     onAttachmentUnavailable?: (key: string) => void;
     onPreviewImages?: (images: ChatPreviewImage[], index: number) => void;
     onToolResolved?: (message: ConversationMessage, result: string) => void;
+    onOpenSubagentSession?: (data: SubagentRunCardData) => void;
     scrollerRef?: React.RefObject<HTMLElement | null>;
+    resumeMeasurementKey?: string | number | null;
     provenance?: {
         source?: string;
         status?: string;
@@ -253,6 +257,7 @@ export default function ConversationTimeline({
     agentId,
     agentName,
     messages,
+    mode = 'pc',
     viewOf,
     isRunning = false,
     unavailableAttachmentKeys = new Set<string>(),
@@ -260,7 +265,9 @@ export default function ConversationTimeline({
     onAttachmentUnavailable,
     onPreviewImages,
     onToolResolved,
+    onOpenSubagentSession,
     scrollerRef,
+    resumeMeasurementKey,
     provenance,
 }: ConversationTimelineProps) {
     const { t, i18n } = useTranslation();
@@ -299,6 +306,26 @@ export default function ConversationTimeline({
         overscan: 8,
         enabled: virtualizeEntries,
     });
+    useEffect(() => {
+        if (!virtualizeEntries || resumeMeasurementKey == null || document.hidden) return;
+        const measureMountedRows = () => {
+            scrollerRef?.current
+                ?.querySelectorAll<HTMLElement>('.conversation-timeline__virtual-row')
+                .forEach((element) => rowVirtualizer.measureElement(element));
+        };
+        let secondFrame: number | null = null;
+        const firstFrame = window.requestAnimationFrame(() => {
+            measureMountedRows();
+            // The history reconciliation and Markdown layout can commit in the
+            // same foreground transition. A second frame catches that layout
+            // without clearing offscreen measurements or measuring every chunk.
+            secondFrame = window.requestAnimationFrame(measureMountedRows);
+        });
+        return () => {
+            window.cancelAnimationFrame(firstFrame);
+            if (secondFrame != null) window.cancelAnimationFrame(secondFrame);
+        };
+    }, [resumeMeasurementKey, rowVirtualizer, scrollerRef, virtualizeEntries]);
     const renderEntry = (entry: (typeof entries)[number], index: number) => {
         if (entry.type === 'analysis_group') {
             const owner = analysisOwners.get(entry.key);
@@ -307,7 +334,7 @@ export default function ConversationTimeline({
             return <div className={`chat-msg-row chat-msg-row--analysis${ownerView.isLeft ? '' : ' chat-msg-row--user'}`}><div className="chat-msg-avatar">{ownerView.avatarText || agentName[0] || 'A'}</div><AnalysisCard items={entry.items} running={running} expanded={!!expandedAnalysis[entry.key]} onToggle={() => setExpandedAnalysis((current) => ({ ...current, [entry.key]: !current[entry.key] }))} /></div>;
         }
         if (entry.type === 'special_render') {
-            return <div className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}><div className="chat-msg-avatar">{agentName[0] || 'A'}</div><ChatToolCallRenderer agentId={agentId} message={entry.msg} t={t} mode="pc" onPreviewImages={onPreviewImages} onResolved={(result) => onToolResolved?.(entry.msg, result)} /></div>;
+            return <div className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}><div className="chat-msg-avatar">{agentName[0] || 'A'}</div><ChatToolCallRenderer agentId={agentId} message={entry.msg} t={t} mode={mode} onPreviewImages={onPreviewImages} onOpenSubagentSession={onOpenSubagentSession} onResolved={(result) => onToolResolved?.(entry.msg, result)} /></div>;
         }
         const previous = entries[index - 1];
         const view = viewOf(entry.msg);

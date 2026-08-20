@@ -1180,6 +1180,8 @@ async def call_llm(
     prepared_turn_context: tuple[str, str] | None = None,
     prepared_tools: list[dict] | None = None,
     context_recovery=None,
+    before_round=None,
+    before_tool_execution=None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     supports_vision = bool(getattr(model, "supports_vision", False))
@@ -1327,8 +1329,33 @@ async def call_llm(
     # Non-empty model content is user-visible even when the same response also
     # carries tool calls. Keep it until this logical turn finishes or suspends.
     visible_response_segments: list[str] = []
-    # Tool-calling loop
+    # Tool-calling loop. A subagent may receive parent messages while a model
+    # request is in flight. ``skip_before_round_once`` avoids draining the same
+    # round twice when the final-reply gate below has already prefetched those
+    # messages for the next round.
+    skip_before_round_once = False
     for round_i in range(_max_tool_rounds):
+        if skip_before_round_once:
+            skip_before_round_once = False
+        elif before_round is not None:
+            injected = await before_round(round_i)
+            if injected:
+                from app.services.image_context import prepare_messages_for_model
+
+                prepared_injected = await prepare_messages_for_model(
+                    injected,
+                    agent_id=agent_id,
+                    supports_vision=supports_vision,
+                )
+                api_messages.extend(
+                    LLMMessage(
+                        role=msg.get("role", "user"),
+                        content=msg.get("content"),
+                        tool_calls=msg.get("tool_calls"),
+                        tool_call_id=msg.get("tool_call_id"),
+                    )
+                    for msg in prepared_injected
+                )
         # Dynamic tool-call limit warning.
         # NB (context-v2): these warnings stay as plain appended user messages.
         # That keeps api_messages append-only — once appended at round N, the
@@ -1541,8 +1568,49 @@ async def call_llm(
         if complete_response_content and complete_response_content.strip():
             visible_response_segments.append(complete_response_content)
 
-        # Plain assistant text (no tool calls) ends the turn — it IS the reply.
+        # Plain assistant text normally ends the turn. Before returning, drain
+        # the external round inbox once more: a parent message may have arrived
+        # while this provider request was in flight. In that case the reply is
+        # retained as an assistant prefix and the new message interrupts the
+        # same logical turn at the next round instead of being deferred to a
+        # separate turn.
         if not response.tool_calls:
+            # Claim late inbox messages only when another provider dispatch is
+            # guaranteed to happen inside this logical turn.  On the final
+            # allowed round, claiming here would mark the message processing and
+            # then fall out of the loop without ever showing it to the model.
+            has_next_round = round_i + 1 < _max_tool_rounds
+            late_injected = (
+                await before_round(round_i + 1)
+                if before_round is not None and has_next_round
+                else []
+            )
+            if late_injected:
+                from app.services.image_context import prepare_messages_for_model
+
+                api_messages.append(
+                    LLMMessage(
+                        role="assistant",
+                        content=response.content or None,
+                        reasoning_content=response.reasoning_content,
+                    )
+                )
+                prepared_injected = await prepare_messages_for_model(
+                    late_injected,
+                    agent_id=agent_id,
+                    supports_vision=supports_vision,
+                )
+                api_messages.extend(
+                    LLMMessage(
+                        role=msg.get("role", "user"),
+                        content=msg.get("content"),
+                        tool_calls=msg.get("tool_calls"),
+                        tool_call_id=msg.get("tool_call_id"),
+                    )
+                    for msg in prepared_injected
+                )
+                skip_before_round_once = True
+                continue
             if agent_id and _unsaved_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _unsaved_usage)
             await client.close()
@@ -1634,6 +1702,12 @@ async def call_llm(
                 or REPEAT_TOOL_CALL_BREAK_MESSAGE
             )
 
+        # A durable background owner may have been cancelled while the provider
+        # request was in flight.  Revalidate immediately before persisting tool
+        # markers or starting any external side effect.
+        if before_tool_execution is not None:
+            await before_tool_execution()
+
         # Remember where this round's appended entries begin. The message-level
         # budget enforcer operates only on items at or beyond this index —
         # historical messages (already sent as prefix bytes in prior rounds) must
@@ -1701,6 +1775,8 @@ async def call_llm(
                     pass
 
         for tc in sanitized_tool_calls or []:
+            if before_tool_execution is not None:
+                await before_tool_execution()
             try:
                 tool_error = await _process_tool_call(
                     tc=tc,
@@ -1781,6 +1857,9 @@ async def call_llm_with_failover(
     channel_context: dict | None = None,
     turn_anchor_id: uuid.UUID | None = None,
     context_recovery=None,
+    prepared_tools: list[dict] | None = None,
+    before_round=None,
+    before_tool_execution=None,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -1799,6 +1878,7 @@ async def call_llm_with_failover(
         fallback_model = None
 
     turn_messages = list(messages)
+    injected_turn_messages: list[dict] = []
     recovery_used = False
 
     async def _recover_once(model, budget):
@@ -1815,7 +1895,7 @@ async def call_llm_with_failover(
             )
             return None
         if recovered is not None:
-            turn_messages = list(recovered)
+            turn_messages = list(recovered) + list(injected_turn_messages)
             return turn_messages
         return None
 
@@ -1832,8 +1912,13 @@ async def call_llm_with_failover(
         session_id=session_id,
         channel_context=channel_context,
     )
-    if skip_tools:
-        prepared_tools: list[dict] = []
+    if prepared_tools is not None:
+        prepared_tools = sorted(
+            prepared_tools,
+            key=lambda tool: tool.get("function", {}).get("name", ""),
+        )
+    elif skip_tools:
+        prepared_tools = []
     else:
         from app.services.agent_tools import AGENT_TOOLS
 
@@ -1842,6 +1927,16 @@ async def call_llm_with_failover(
             prepared_tools or [],
             key=lambda tool: tool.get("function", {}).get("name", ""),
         )
+
+    async def _wrapped_before_round(round_i: int):
+        if before_round is None:
+            return []
+        injected = await before_round(round_i)
+        if injected:
+            normalized = [dict(message) for message in injected]
+            injected_turn_messages.extend(normalized)
+            turn_messages.extend(normalized)
+        return injected
 
     # Wrapper callbacks to track state for guard checks
     async def _wrapped_on_chunk(text: str):
@@ -1888,6 +1983,8 @@ async def call_llm_with_failover(
         prepared_turn_context=prepared_turn_context,
         prepared_tools=prepared_tools,
         context_recovery=_recover_once,
+        before_round=_wrapped_before_round,
+        before_tool_execution=before_tool_execution,
     )
 
     # Check if we need to failover
@@ -1975,6 +2072,8 @@ async def call_llm_with_failover(
         # failed before yielding output, fallback is a retry and may not mutate
         # persisted history or trigger compaction after that first dispatch.
         context_recovery=None,
+        before_round=_wrapped_before_round,
+        before_tool_execution=before_tool_execution,
     )
 
     if (

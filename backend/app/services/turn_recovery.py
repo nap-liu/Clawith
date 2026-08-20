@@ -45,6 +45,72 @@ class _RecoveryOrigin:
     external_conv_id: str | None
 
 
+def _metadata_execution_agent_id(anchor: ChatMessage) -> uuid.UUID:
+    meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
+    try:
+        return uuid.UUID(str(meta.get("execution_agent_id")))
+    except (TypeError, ValueError):
+        return anchor.agent_id
+
+
+async def _validated_execution_agent_id(
+    db,
+    anchor: ChatMessage,
+) -> uuid.UUID | None:
+    """Resolve an execution Agent only from a validated Subagent edge."""
+    candidate = _metadata_execution_agent_id(anchor)
+    if candidate == anchor.agent_id:
+        return candidate
+    meta = anchor.message_meta if isinstance(anchor.message_meta, dict) else {}
+    if meta.get("kind") != "subagent_event":
+        logger.warning(
+            f"[turn_recovery] ignored execution_agent_id on non-subagent "
+            f"anchor={anchor.id}"
+        )
+        return anchor.agent_id
+
+    try:
+        parent_id = uuid.UUID(str(anchor.conversation_id))
+        child_id = uuid.UUID(str(meta.get("subagent_id")))
+    except (TypeError, ValueError):
+        return None
+
+    from app.models.subagent_run import SubagentRun
+
+    parent = await db.get(ChatSession, parent_id)
+    child = await db.get(ChatSession, child_id)
+    run = await db.get(SubagentRun, child_id)
+    storage_agent = await db.get(Agent, anchor.agent_id)
+    execution_agent = await db.get(Agent, candidate)
+    if (
+        parent is None
+        or child is None
+        or run is None
+        or storage_agent is None
+        or execution_agent is None
+        or parent.agent_id != anchor.agent_id
+        or run.parent_session_id != parent.id
+        or child.source_channel != "subagent"
+        or child.agent_id != candidate
+        or anchor.sender_agent_id != candidate
+        or run.execution_user_id != anchor.user_id
+        or storage_agent.tenant_id != execution_agent.tenant_id
+        or not (
+            parent.agent_id == candidate
+            or (
+                parent.source_channel == "agent"
+                and parent.peer_agent_id == candidate
+            )
+        )
+    ):
+        logger.error(
+            f"[turn_recovery] rejected invalid subagent execution edge "
+            f"anchor={anchor.id} candidate={candidate}"
+        )
+        return None
+    return candidate
+
+
 def _recovery_max_age_hours() -> float:
     raw = os.environ.get("TURN_RECOVERY_MAX_AGE_HOURS")
     if raw is None or raw.strip() == "":
@@ -118,7 +184,9 @@ async def _complete_unfinished_tool_calls(
     *,
     ctx_size: int,
     expected_origin: _RecoveryOrigin,
+    execution_agent_id: uuid.UUID | None = None,
 ) -> int:
+    execution_agent_id = execution_agent_id or anchor.agent_id
     rows = await load_recoverable_messages_for_turn(
         db,
         agent_id=anchor.agent_id,
@@ -146,7 +214,7 @@ async def _complete_unfinished_tool_calls(
         raw_result = await execute_tool(
             name,
             args,
-            agent_id=anchor.agent_id,
+            agent_id=execution_agent_id,
             user_id=anchor.user_id,
             session_id=anchor.conversation_id,
             tool_call_id=key,
@@ -157,7 +225,7 @@ async def _complete_unfinished_tool_calls(
         llm_view = finalize_tool_output(
             result_text,
             tool_name=name,
-            agent_id=anchor.agent_id,
+            agent_id=execution_agent_id,
             session_id=anchor.conversation_id,
             tool_call_id=key,
         )
@@ -234,11 +302,45 @@ async def _recovery_origin_matches(
     return await _load_fresh_recovery_origin(anchor) == expected
 
 
+async def prepare_recoverable_turn_history(
+    db,
+    anchor: ChatMessage,
+    *,
+    execution_agent_id: uuid.UUID,
+    ctx_size: int,
+) -> list[dict]:
+    """Finish an interrupted durable tool tail and rebuild its exact history.
+
+    Subagent workers share the normal startup recovery semantics but retain
+    ownership of their own lifecycle transition and parent notification.
+    """
+    expected_origin = await _load_recovery_origin(db, anchor)
+    if expected_origin is None:
+        return []
+    await _complete_unfinished_tool_calls(
+        db,
+        anchor,
+        ctx_size=ctx_size,
+        expected_origin=expected_origin,
+        execution_agent_id=execution_agent_id,
+    )
+    if not await _recovery_origin_matches(anchor, expected_origin):
+        return []
+    return await load_recoverable_history_for_turn(
+        db,
+        agent_id=anchor.agent_id,
+        conversation_id=anchor.conversation_id,
+        turn_anchor_id=anchor.id,
+        ctx_size=ctx_size,
+    )
+
+
 async def _deliver_recovered_reply(
     anchor: ChatMessage,
     *,
     expected_origin: _RecoveryOrigin,
     reply: str,
+    execution_agent_id: uuid.UUID,
 ) -> bool:
     """Validate the turn generation and deliver while its rows stay locked."""
     async with async_session() as db:
@@ -251,7 +353,7 @@ async def _deliver_recovered_reply(
             return False
 
         delivery_kwargs = {
-            "agent_id": anchor.agent_id,
+            "agent_id": execution_agent_id,
             "conversation_id": anchor.conversation_id,
             "reply": reply,
         }
@@ -307,6 +409,12 @@ async def _load_recoverable_anchors(db, *, limit: int) -> list[ChatMessage]:
 
 
 async def _latest_row_needs_recovery(db, row: ChatMessage) -> bool:
+    try:
+        session = await db.get(ChatSession, uuid.UUID(str(row.conversation_id)))
+    except (TypeError, ValueError):
+        session = None
+    if session is not None and session.source_channel == "subagent":
+        return False
     meta = row.message_meta if isinstance(getattr(row, "message_meta", None), dict) else {}
     if meta.get("consumed_by_onmessage") or meta.get("kind") == "on_message_event":
         # TriggerExecution owns these durable event turns and has its own lease
@@ -407,7 +515,12 @@ async def resume_turn(anchor: ChatMessage) -> bool:
         return False
 
     async with async_session() as db:
-        agent = (await db.execute(select(Agent).where(Agent.id == anchor.agent_id))).scalar_one_or_none()
+        execution_agent_id = await _validated_execution_agent_id(db, anchor)
+        if execution_agent_id is None:
+            return False
+        agent = (
+            await db.execute(select(Agent).where(Agent.id == execution_agent_id))
+        ).scalar_one_or_none()
         if agent is None or getattr(agent, "agent_type", None) == "openclaw":
             return False
         ctx_size = (agent.context_window_size if agent else None) or DEFAULT_CONTEXT_WINDOW_SIZE
@@ -418,6 +531,7 @@ async def resume_turn(anchor: ChatMessage) -> bool:
             anchor,
             ctx_size=ctx_size,
             expected_origin=expected_origin,
+            execution_agent_id=execution_agent_id,
         )
         if not await _recovery_origin_matches(anchor, expected_origin):
             return False
@@ -438,7 +552,7 @@ async def resume_turn(anchor: ChatMessage) -> bool:
 
         reply = await _call_agent_llm(
             db,
-            anchor.agent_id,
+            execution_agent_id,
             "",
             session_id=anchor.conversation_id,
             user_id=anchor.user_id,
@@ -447,6 +561,7 @@ async def resume_turn(anchor: ChatMessage) -> bool:
             continue_turn=True,
             recovery_mode=True,
             turn_anchor_id=anchor.id,
+            storage_agent_id=anchor.agent_id,
         )
 
     if reply and reply.strip():
@@ -460,12 +575,14 @@ async def resume_turn(anchor: ChatMessage) -> bool:
                 conversation_id=anchor.conversation_id,
                 content=reply,
                 turn_anchor_id=anchor.id,
+                sender_agent_id=execution_agent_id,
             )
             await db.commit()
         delivered = await _deliver_recovered_reply(
             anchor,
             expected_origin=expected_origin,
             reply=reply,
+            execution_agent_id=execution_agent_id,
         )
         if not delivered:
             logger.warning(f"[turn_recovery] final reply delivery pending anchor={anchor.id}")

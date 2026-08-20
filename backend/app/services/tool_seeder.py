@@ -16,6 +16,10 @@ from app.services.tool_enablement import tool_is_required
 _settings = get_settings()
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
+    "run_subagent",
+    "send_message_to_subagent",
+    "stop_subagent",
+    "send_message_to_parent",
     "execute_code",
     "execute_code_aio",
     "read_image",
@@ -101,6 +105,103 @@ def _global_builtin_config(tool_data: dict) -> dict:
 # Builtin tool definitions — these map to the hardcoded AGENT_TOOLS
 BUILTIN_TOOLS = [
     REQUEST_CONFIRMATION_TOOL_SEED,
+    {
+        "name": "run_subagent",
+        "display_name": "Run Subagent",
+        "description": (
+            "Delegate a focused task to a child Agent session. sync waits for the final "
+            "result and reports any child messages with it; async returns the subagent_id "
+            "immediately and supports live multi-round messages in both directions. In "
+            "async mode, child messages and completion durably wake this exact session. "
+            "The subagent_id is also the standard child session id."
+        ),
+        "category": "subagent",
+        "icon": "🧩",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "task": {"type": "string", "minLength": 1, "maxLength": 12000},
+                "mode": {"type": "string", "enum": ["sync", "async"], "default": "sync"},
+                "model": {
+                    "type": "string",
+                    "description": "Optional readable model id from the tenant model catalog.",
+                },
+                "fork": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Copy the current compacted, LLM-visible context into the child once.",
+                },
+            },
+            "required": ["task"],
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
+        "name": "send_message_to_subagent",
+        "display_name": "Message Subagent",
+        "description": (
+            "Send one of any number of messages to a child you created. While it is "
+            "running, messages interrupt its current turn at the next LLM round; a "
+            "finished child resumes asynchronously with the same id and history."
+        ),
+        "category": "subagent",
+        "icon": "➡️",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "subagent_id": {"type": "string", "format": "uuid"},
+                "message": {"type": "string", "minLength": 1, "maxLength": 12000},
+            },
+            "required": ["subagent_id", "message"],
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
+        "name": "stop_subagent",
+        "display_name": "Stop Subagent",
+        "description": "Stop a queued or running child you created. Already-started external tool side effects are not rolled back.",
+        "category": "subagent",
+        "icon": "⏹️",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"subagent_id": {"type": "string", "format": "uuid"}},
+            "required": ["subagent_id"],
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
+        "name": "send_message_to_parent",
+        "display_name": "Message Parent Agent",
+        "description": (
+            "Send one of any number of interim messages to the exact parent session. "
+            "In async mode each message durably wakes the parent and can receive a reply "
+            "in a later round; in sync mode messages are collected into the final tool "
+            "result because the parent turn is blocked. Available only inside a "
+            "Subagent session."
+        ),
+        "category": "subagent",
+        "icon": "⬅️",
+        # This protocol tool is only surfaced inside Subagent sessions, but its
+        # per-Agent assignment is still managed by the standard tool panel.
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"message": {"type": "string", "minLength": 1, "maxLength": 12000}},
+            "required": ["message"],
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
     {
         "name": "set_execution_user",
         "display_name": "调整后台任务执行人",
@@ -2205,14 +2306,14 @@ BUILTIN_TOOLS = [
     {
         "name": "list_sessions",
         "display_name": "List Sessions",
-        "description": "List the conversation sessions you (this agent) take part in — your chats with people, group chats, agent-to-agent (A2A) threads, and your own trigger reflections. Read-only. Supports exact or fuzzy counterpart/group filtering. Results are automatically scoped by who is talking to you: an admin partner can list every user's sessions with you; a regular user only sees their own; in unattended (A2A/trigger) turns only your autonomous-side sessions are visible. You can never see another agent's sessions.",
+        "description": "List the conversation sessions you (this agent) take part in — your chats with people, group chats, agent-to-agent (A2A) threads, your own trigger reflections, and permitted Subagent execution sessions. Read-only. Supports exact or fuzzy counterpart/group filtering. Results are automatically scoped by who is talking to you: an admin partner can list every user's sessions with you; a regular user only sees their own; in unattended (A2A/trigger/Subagent) turns only your autonomous-side sessions are visible. You can never see another agent's sessions.",
         "category": "discovery",
         "icon": "🗂️",
         "is_default": True,
         "parameters_schema": {
             "type": "object",
             "properties": {
-                "channel": {"type": "string", "description": "Optional channel filter, e.g. 'web', 'feishu', 'agent' (A2A), 'trigger'. Omit or 'all' for every permitted channel."},
+                "channel": {"type": "string", "description": "Optional channel filter, e.g. 'web', 'feishu', 'agent' (A2A), 'trigger', or 'subagent'. Omit or 'all' for every permitted channel."},
                 "query": {"type": "string", "description": "Optional case-insensitive substring to match against session title / group name."},
                 "counterpart": {"type": "string", "description": "Optional conversation-person filter. Matches a P2P person's display name/login/exact user_id, an A2A peer Agent, or a real human sender in a group."},
                 "counterpart_match": {"type": "string", "enum": ["exact", "fuzzy"], "description": "How counterpart is matched. Default fuzzy; exact is case-insensitive and also accepts canonical IDs."},
@@ -2255,7 +2356,7 @@ BUILTIN_TOOLS = [
     {
         "name": "search_sessions",
         "display_name": "Search Sessions",
-        "description": "Full-text search across the messages of the sessions you are allowed to see, returning each exact session_id, source channel, and matching snippet. Read-only and permission-scoped exactly like list_sessions (admin partner → all users' sessions; regular user → own; A2A/trigger → autonomous-side only; never another agent's). Narrow the keyword if there are too many hits.",
+        "description": "Full-text search across the messages of the sessions you are allowed to see, including permitted Subagent execution sessions, returning each exact session_id, source channel, and matching snippet. Read-only and permission-scoped exactly like list_sessions (admin partner → all users' sessions; regular user → own; A2A/trigger/Subagent → autonomous-side only; never another agent's). Narrow the keyword if there are too many hits.",
         "category": "discovery",
         "icon": "🔍",
         "is_default": True,
@@ -4803,9 +4904,8 @@ BUILTIN_TOOLS = [
 
 async def seed_builtin_tools():
     """Insert or update builtin tools in the database."""
-    from app.models.tool import AgentTool
     from app.models.agent import Agent
-
+    from app.models.tool import AgentTool
 
     async with async_session() as db:
         # Rename or merge persisted builtin tools in place so existing Agent
@@ -4891,6 +4991,11 @@ async def seed_builtin_tools():
                 if should_sync_builtin_default(t) and existing.is_default != t["is_default"]:
                     existing.is_default = t["is_default"]
                     updated_fields.append("is_default")
+                    # A builtin that becomes default-on must receive explicit
+                    # assignments for existing Agents too. Existing rows,
+                    # including manual opt-outs, are preserved below.
+                    if t["is_default"]:
+                        new_tool_ids.append(existing.id)
                 if (
                     t["category"] in FORCE_DISABLED_BUILTIN_CATEGORIES
                     and existing.enabled != seed_enabled
@@ -5017,14 +5122,15 @@ async def seed_builtin_tools():
 
 async def clean_orphaned_mcp_tools():
     """Clean up orphan MCP tools that lost all their AgentTool assignments.
-    
+
     This happens when an Agent is deleted (cascade deletes AgentTool) but the
     shared Tool record remains. We run this periodically/on-startup to prevent
     the database from filling up with abandoned tool records.
     """
-    from app.models.tool import AgentTool
     from sqlalchemy import and_, delete
-    
+
+    from app.models.tool import AgentTool
+
     async with async_session() as db:
         # 1. Get all currently assigned tool IDs
         all_assigned_r = await db.execute(select(AgentTool.tool_id).distinct())

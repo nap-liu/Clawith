@@ -2818,6 +2818,10 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             # be re-added by the _always_tools fallback below.
             explicitly_disabled_names = set()
             for t in all_tools:
+                # Child-only protocol surface. Subagent execution appends this
+                # definition explicitly after filtering the ordinary tool set.
+                if t.name == "send_message_to_parent":
+                    continue
                 tid = str(t.id)
                 at = assignments.get(tid)
                 enabled = resolved_agent_tool_enabled(t.name, at)
@@ -3642,6 +3646,89 @@ async def execute_tool(
     # clear signal instead of falling through to unknown-tool handling.
     if tool_name == REQUEST_CONFIRMATION_TOOL_NAME:
         return "⚠️ request_confirmation 由确认流程处理,不应到达工具执行层"
+
+    if tool_name in {
+        "run_subagent",
+        "send_message_to_subagent",
+        "stop_subagent",
+        "send_message_to_parent",
+    }:
+        from app.services.subagent_runtime import (
+            SubagentError,
+            append_subagent_message,
+            create_subagent,
+            run_subagent_sync,
+            send_subagent_message_to_parent,
+            stop_subagent,
+        )
+
+        try:
+            if tool_name == "run_subagent":
+                run, _created = await create_subagent(
+                    agent_id=agent_id,
+                    execution_user_id=user_id,
+                    parent_session_id=session_id,
+                    origin_tool_call_id=tool_call_id,
+                    task=arguments.get("task"),
+                    mode=arguments.get("mode", "sync"),
+                    model=arguments.get("model"),
+                    fork=bool(arguments.get("fork", False)),
+                    turn_anchor_id=turn_anchor_id,
+                )
+                if run.mode == "async":
+                    return json.dumps(
+                        {
+                            "subagent_id": str(run.id),
+                            "session_id": str(run.id),
+                            "execution_agent_id": str(agent_id),
+                            "status": run.status,
+                            "mode": run.mode,
+                            "model": run.model,
+                        },
+                        ensure_ascii=False,
+                    )
+                status, reply, parent_messages = await run_subagent_sync(run.id)
+                return json.dumps(
+                    {
+                        "subagent_id": str(run.id),
+                        "session_id": str(run.id),
+                        "execution_agent_id": str(agent_id),
+                        "status": status,
+                        "mode": run.mode,
+                        "model": run.model,
+                        "result": reply,
+                        "messages_to_parent": parent_messages,
+                    },
+                    ensure_ascii=False,
+                )
+            if tool_name == "send_message_to_subagent":
+                status = await append_subagent_message(
+                    agent_id=agent_id,
+                    parent_session_id=session_id,
+                    subagent_id=arguments.get("subagent_id"),
+                    message=arguments.get("message"),
+                    execution_user_id=user_id,
+                    origin_tool_call_id=tool_call_id,
+                )
+                return json.dumps({"status": status}, ensure_ascii=False)
+            if tool_name == "stop_subagent":
+                status = await stop_subagent(
+                    agent_id=agent_id,
+                    parent_session_id=session_id,
+                    subagent_id=arguments.get("subagent_id"),
+                    execution_user_id=user_id,
+                )
+                return json.dumps({"status": status}, ensure_ascii=False)
+            await send_subagent_message_to_parent(
+                agent_id=agent_id,
+                execution_user_id=user_id,
+                origin_tool_call_id=tool_call_id,
+                subagent_session_id=session_id,
+                message=arguments.get("message"),
+            )
+            return json.dumps({"status": "sent"}, ensure_ascii=False)
+        except SubagentError as exc:
+            return f"❌ {exc}"
 
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
 

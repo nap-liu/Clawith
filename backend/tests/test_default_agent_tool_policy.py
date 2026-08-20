@@ -25,6 +25,10 @@ def test_requested_builtin_default_flags_are_canonical():
     assert _seed("execute_code_aio")["is_default"] is True
     assert _seed("read_image")["is_default"] is True
     assert REQUEST_CONFIRMATION_TOOL_SEED["is_default"] is True
+    assert _seed("run_subagent")["is_default"] is True
+    assert _seed("send_message_to_subagent")["is_default"] is True
+    assert _seed("stop_subagent")["is_default"] is True
+    assert _seed("send_message_to_parent")["is_default"] is True
 
 
 def test_toolscall_is_agent_scoped_and_defaults_on():
