@@ -125,15 +125,15 @@
 .skill-market-publish-form > .skill-market-form-actions { grid-column: 1 / -1; }
 .skill-market-field-status { min-height: 34px; display: flex; align-items: center; padding: 0 10px; border: 1px dashed var(--border-subtle); border-radius: 7px; color: var(--text-tertiary); font-size: 11px; }
 
-.skill-preview-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 10000;
-    display: flex;
-    justify-content: flex-end;
-    background: rgba(9, 14, 24, .52);
-    animation: skill-preview-fade-in 160ms ease-out;
-}
+.skill-market-install-modal { width: min(520px, calc(100vw - 40px)); }
+.skill-market-install-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 20px 22px 16px; border-bottom: 1px solid var(--border-subtle); }
+.skill-market-install-head span { color: var(--text-tertiary); font-size: 9px; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; }
+.skill-market-install-head h2 { margin: 4px 0 0; font-size: 18px; line-height: 1.35; }
+.skill-market-install-head > .btn { min-width: 34px; padding: 7px; }
+.skill-market-install-body { display: grid; gap: 13px; padding: 22px; }
+.skill-market-install-body label { display: grid; gap: 7px; color: var(--text-secondary); font-size: 11px; font-weight: 650; }
+.skill-market-install-body .select-dropdown { width: 100%; box-sizing: border-box; }
+.skill-market-install-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px 18px; border-top: 1px solid var(--border-subtle); }
 
 .skill-preview-drawer {
     width: min(960px, calc(100vw - 44px));
@@ -144,7 +144,6 @@
     border-left: 1px solid var(--border-subtle);
     background: var(--bg-primary);
     box-shadow: -22px 0 58px rgba(9, 14, 24, .2);
-    animation: skill-preview-slide-in 190ms cubic-bezier(.2, .8, .2, 1);
 }
 
 .skill-preview-header {
@@ -231,9 +230,6 @@
 .skill-preview-source { min-height: 100%; margin: 0; padding: 24px 28px 70px; color: var(--text-secondary); font-family: var(--font-mono); font-size: 11px; line-height: 1.7; tab-size: 4; white-space: pre-wrap; word-break: break-word; }
 .skill-preview-placeholder { min-height: 160px; display: grid; place-items: center; padding: 22px; color: var(--text-tertiary); font-size: 11px; text-align: center; }
 
-@keyframes skill-preview-fade-in { from { opacity: 0; } }
-@keyframes skill-preview-slide-in { from { transform: translateX(32px); opacity: .65; } }
-
 @media (max-width: 980px) { .skill-market-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 680px) {
     .skill-market-page { padding: 28px 16px 48px; }
@@ -244,15 +240,13 @@
     .skill-market-publish-form { grid-template-columns: 1fr; }
     .skill-market-publish-form > label:nth-of-type(4), .skill-market-publish-form > .skill-market-form-note, .skill-market-publish-form > .skill-market-form-row, .skill-market-publish-form > .skill-market-form-actions { grid-column: auto; }
     .skill-market-form-row { grid-template-columns: 1fr; }
+    .skill-market-install-modal { width: calc(100vw - 24px); }
+    .skill-market-install-head, .skill-market-install-body { padding-right: 16px; padding-left: 16px; }
+    .skill-market-install-actions { padding-right: 16px; padding-left: 16px; }
     .skill-preview-drawer { width: 100vw; }
     .skill-preview-header { min-height: 82px; padding: 16px; }
     .skill-preview-body { grid-template-columns: 1fr; grid-template-rows: minmax(150px, 32vh) minmax(0, 1fr); }
     .skill-preview-tree { border-right: 0; border-bottom: 1px solid var(--border-subtle); }
     .skill-preview-markdown { padding: 20px 18px 54px; }
     .skill-preview-source { padding: 18px 16px 54px; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-    .skill-preview-overlay,
-    .skill-preview-drawer { animation: none; }
 }

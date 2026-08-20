@@ -180,7 +180,7 @@ export function CliToolsSection({ tenantId: _tenantId }: CliToolsSectionProps) {
       )}
 
       {/* Create / edit wizard */}
-      {showWizard && <CliToolWizard tool={editingTool} onClose={closeWizard} />}
+      <CliToolWizard open={showWizard} tool={editingTool} onClose={closeWizard} />
     </div>
   );
 }

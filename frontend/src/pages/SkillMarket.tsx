@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { createPortal } from 'react-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
@@ -17,7 +16,7 @@ import {
     IconX,
 } from '@tabler/icons-react';
 
-import { useDialog } from '../components/Dialog/DialogProvider';
+import { Drawer, Modal, useDialog } from '../components/Dialog/DialogProvider';
 import MarkdownRenderer from '../components/MarkdownRenderer';
 import { useToast } from '../components/Toast/ToastProvider';
 import SelectDropdown from '../components/SelectDropdown';
@@ -78,43 +77,38 @@ function collectDirectoryPaths(nodes: SkillTreeNode[]): string[] {
 }
 
 function SkillPreviewDrawer({
+    open,
     detail,
     loading,
     onClose,
 }: {
+    open: boolean;
     detail?: MarketSkill;
     loading: boolean;
     onClose: () => void;
 }) {
     const { t } = useTranslation();
+    const [lastDetail, setLastDetail] = useState<MarketSkill>();
+    const displayedDetail = detail ?? lastDetail;
     const files = useMemo<MarketSkillFile[]>(() => {
-        if (detail?.files?.length) return detail.files;
-        if (detail?.skill_md !== undefined) return [{ path: 'SKILL.md', content: detail.skill_md }];
+        if (displayedDetail?.files?.length) return displayedDetail.files;
+        if (displayedDetail?.skill_md !== undefined) return [{ path: 'SKILL.md', content: displayedDetail.skill_md }];
         return [];
-    }, [detail?.files, detail?.skill_md]);
+    }, [displayedDetail?.files, displayedDetail?.skill_md]);
     const tree = useMemo(() => buildSkillTree(files), [files]);
     const [selectedPath, setSelectedPath] = useState('');
     const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
     const selectedFile = files.find((file) => file.path === selectedPath);
 
     useEffect(() => {
-        if (!detail?.id) return;
-        setSelectedPath(files.find((file) => file.path === 'SKILL.md')?.path || files[0]?.path || '');
-        setExpandedDirs(new Set(collectDirectoryPaths(tree)));
-    }, [detail?.id, files, tree]);
+        if (detail) setLastDetail(detail);
+    }, [detail]);
 
     useEffect(() => {
-        const previousOverflow = document.body.style.overflow;
-        const onKeyDown = (event: KeyboardEvent) => {
-            if (event.key === 'Escape') onClose();
-        };
-        document.body.style.overflow = 'hidden';
-        window.addEventListener('keydown', onKeyDown);
-        return () => {
-            document.body.style.overflow = previousOverflow;
-            window.removeEventListener('keydown', onKeyDown);
-        };
-    }, [onClose]);
+        if (!displayedDetail?.id) return;
+        setSelectedPath(files.find((file) => file.path === 'SKILL.md')?.path || files[0]?.path || '');
+        setExpandedDirs(new Set(collectDirectoryPaths(tree)));
+    }, [displayedDetail?.id, files, tree]);
 
     const toggleDirectory = (path: string) => {
         setExpandedDirs((current) => {
@@ -165,26 +159,21 @@ function SkillPreviewDrawer({
         );
     });
 
-    if (typeof document === 'undefined') return null;
-
-    return createPortal(
-        <div className="skill-preview-overlay" onMouseDown={(event) => {
-            if (event.target === event.currentTarget) onClose();
-        }}>
-            <aside
-                className="skill-preview-drawer"
-                role="dialog"
-                aria-modal="true"
-                aria-labelledby="skill-preview-title"
-            >
+    return (
+        <Drawer
+            open={open}
+            onClose={onClose}
+            className="skill-preview-drawer"
+            ariaLabelledBy="skill-preview-title"
+        >
                 <header className="skill-preview-header">
                     <div className="skill-preview-heading">
                         <span className="skill-preview-kicker">{t('skillMarket.preview.package')}</span>
-                        <h2 id="skill-preview-title">{detail?.name || t('common.loading')}</h2>
+                        <h2 id="skill-preview-title">{displayedDetail?.name || t('common.loading')}</h2>
                         <div className="skill-preview-meta">
-                            <span>{detail?.is_builtin ? t('skillMarket.platformPublisher') : detail?.publisher_name || '—'}</span>
-                            <span>{detail?.version ? t('skillMarket.version', { version: detail.version }) : '—'}</span>
-                            <span>{t('skillMarket.installCount', { count: detail?.downloads || 0 })}</span>
+                            <span>{displayedDetail?.is_builtin ? t('skillMarket.platformPublisher') : displayedDetail?.publisher_name || '—'}</span>
+                            <span>{displayedDetail?.version ? t('skillMarket.version', { version: displayedDetail.version }) : '—'}</span>
+                            <span>{t('skillMarket.installCount', { count: displayedDetail?.downloads || 0 })}</span>
                         </div>
                     </div>
                     <Button type="button" variant="ghost" onClick={onClose} aria-label={t('common.close')}>
@@ -195,7 +184,7 @@ function SkillPreviewDrawer({
                 <div className="skill-preview-body">
                     <nav className="skill-preview-tree" aria-label={t('skillMarket.preview.fileTree')}>
                         <div className="skill-preview-pane-title">
-                            <span>{detail?.folder_name || t('skillMarket.preview.files')}</span>
+                            <span>{displayedDetail?.folder_name || t('skillMarket.preview.files')}</span>
                             <span>{files.length}</span>
                         </div>
                         <div className="skill-preview-tree-scroll">
@@ -225,9 +214,7 @@ function SkillPreviewDrawer({
                         </div>
                     </section>
                 </div>
-            </aside>
-        </div>,
-        document.body,
+        </Drawer>
     );
 }
 
@@ -301,6 +288,7 @@ export default function SkillMarket() {
     const [search, setSearch] = useState('');
     const [detailId, setDetailId] = useState<string | null>(null);
     const [installSkill, setInstallSkill] = useState<MarketSkill | null>(null);
+    const [installModalOpen, setInstallModalOpen] = useState(false);
     const [installAgentId, setInstallAgentId] = useState('');
     const [showPublish, setShowPublish] = useState(false);
     const [publishAgentId, setPublishAgentId] = useState('');
@@ -313,8 +301,12 @@ export default function SkillMarket() {
 
     const closeWorkbench = () => {
         setDetailId(null);
-        setInstallSkill(null);
+        setInstallModalOpen(false);
         setShowPublish(false);
+    };
+
+    const closeInstallModal = () => {
+        if (!busyKey.startsWith('install:')) setInstallModalOpen(false);
     };
 
     const { data: agents = [] } = useQuery({
@@ -395,10 +387,11 @@ export default function SkillMarket() {
         setDetailId(null);
         setShowPublish(false);
         setInstallSkill(skill);
+        setInstallModalOpen(true);
     };
 
     const openDetail = (skillId: string) => {
-        setInstallSkill(null);
+        setInstallModalOpen(false);
         setShowPublish(false);
         setDetailId(skillId);
     };
@@ -409,7 +402,7 @@ export default function SkillMarket() {
         try {
             await skillApi.market.install(installAgentId, installSkill.id);
             toast.success(t('skillMarket.toast.installed', { name: installSkill.name }));
-            setInstallSkill(null);
+            setInstallModalOpen(false);
             await refresh();
         } catch (error: any) {
             toast.error(t('skillMarket.toast.installFailed'), { details: error?.message || String(error) });
@@ -476,7 +469,7 @@ export default function SkillMarket() {
                 <Button
                     variant="primary"
                     type="button"
-                    onClick={() => { setDetailId(null); setInstallSkill(null); setShowPublish(true); }}
+                    onClick={() => { setDetailId(null); setInstallModalOpen(false); setShowPublish(true); }}
                     disabled={!manageableAgents.length}
                 >
                     <IconUpload size={15} />{t('skillMarket.publishSkill')}
@@ -501,33 +494,17 @@ export default function SkillMarket() {
                 )}
             </div>
 
-            {(installSkill || showPublish) && (
+            {showPublish && (
                 <section className="skill-market-workbench" aria-live="polite">
                     <div className="skill-market-workbench-head">
                         <div>
-                            <span>{showPublish ? t('skillMarket.publish') : t('skillMarket.install')}</span>
-                            <h2>{showPublish ? t('skillMarket.publishFromAgent') : installSkill?.name}</h2>
+                            <span>{t('skillMarket.publish')}</span>
+                            <h2>{t('skillMarket.publishFromAgent')}</h2>
                         </div>
                         <Button type="button" variant="ghost" onClick={closeWorkbench} aria-label={t('common.close')}><IconX size={17} /></Button>
                     </div>
 
-                    {installSkill && (
-                        <div className="skill-market-form-body">
-                            <label>{t('skillMarket.targetAgent')}
-                                {installAgentId && <SelectDropdown value={installAgentId} options={agentOptions} onChange={setInstallAgentId} ariaLabel={t('skillMarket.targetAgent')} />}
-                            </label>
-                            <p className="skill-market-form-note">{t('skillMarket.installNote', { folder: installSkill.folder_name })}</p>
-                            <div className="skill-market-form-actions">
-                                <Button variant="secondary" type="button" onClick={closeWorkbench}>{t('common.cancel')}</Button>
-                                <Button variant="primary" type="button" onClick={install} disabled={!installAgentId || busyKey.startsWith('install:')}>
-                                    <IconDownload size={14} />{busyKey ? t('skillMarket.installing') : t('skillMarket.confirmInstall')}
-                                </Button>
-                            </div>
-                        </div>
-                    )}
-
-                    {showPublish && (
-                        <form className="skill-market-form-body skill-market-publish-form" onSubmit={publish}>
+                    <form className="skill-market-form-body skill-market-publish-form" onSubmit={publish}>
                             <label>{t('skillMarket.sourceAgent')}
                                 {publishAgentId && <SelectDropdown value={publishAgentId} options={agentOptions} onChange={setPublishAgentId} ariaLabel={t('skillMarket.sourceAgent')} />}
                             </label>
@@ -565,8 +542,7 @@ export default function SkillMarket() {
                                     <IconUpload size={14} />{busyKey === 'publish' ? t('skillMarket.publishing') : t('skillMarket.publish')}
                                 </Button>
                             </div>
-                        </form>
-                    )}
+                    </form>
                 </section>
             )}
 
@@ -594,13 +570,72 @@ export default function SkillMarket() {
                 </div>
             )}
         </main>
-        {detailId && (
-            <SkillPreviewDrawer
-                detail={detail}
-                loading={detailLoading}
-                onClose={() => setDetailId(null)}
-            />
+        {installSkill && (
+            <Modal
+                open={installModalOpen}
+                onClose={closeInstallModal}
+                onAfterClose={() => setInstallSkill(null)}
+                closeOnEscape={!busyKey.startsWith('install:')}
+                ariaLabelledBy="skill-market-install-title"
+                className="skill-market-install-modal"
+            >
+                <header className="skill-market-install-head">
+                    <div>
+                        <span>{t('skillMarket.install')}</span>
+                        <h2 id="skill-market-install-title">{installSkill.name}</h2>
+                    </div>
+                    <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={closeInstallModal}
+                        disabled={busyKey.startsWith('install:')}
+                        aria-label={t('common.close')}
+                    >
+                        <IconX size={18} />
+                    </Button>
+                </header>
+                <div className="skill-market-install-body">
+                    <label>{t('skillMarket.targetAgent')}
+                        {installAgentId && (
+                            <SelectDropdown
+                                value={installAgentId}
+                                options={agentOptions}
+                                onChange={setInstallAgentId}
+                                ariaLabel={t('skillMarket.targetAgent')}
+                            />
+                        )}
+                    </label>
+                    <p className="skill-market-form-note">
+                        {t('skillMarket.installNote', { folder: installSkill.folder_name })}
+                    </p>
+                </div>
+                <footer className="skill-market-install-actions">
+                    <Button
+                        variant="secondary"
+                        type="button"
+                        onClick={closeInstallModal}
+                        disabled={busyKey.startsWith('install:')}
+                    >
+                        {t('common.cancel')}
+                    </Button>
+                    <Button
+                        variant="primary"
+                        type="button"
+                        onClick={install}
+                        disabled={!installAgentId || busyKey.startsWith('install:')}
+                    >
+                        <IconDownload size={14} />
+                        {busyKey.startsWith('install:') ? t('skillMarket.installing') : t('skillMarket.confirmInstall')}
+                    </Button>
+                </footer>
+            </Modal>
         )}
+        <SkillPreviewDrawer
+            open={Boolean(detailId)}
+            detail={detail}
+            loading={detailLoading}
+            onClose={() => setDetailId(null)}
+        />
         </>
     );
 }

@@ -1,6 +1,9 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { IconAlertTriangle, IconCheck, IconInfoCircle, IconX } from '@tabler/icons-react';
+import Button from '../ui/Button';
+import './DialogProvider.css';
 
 type DialogType = 'info' | 'success' | 'warning' | 'error';
 
@@ -36,6 +39,167 @@ const TYPE_META: Record<DialogType, { color: string; icon: ReactNode }> = {
     warning: { color: 'var(--warning)', icon: <IconAlertTriangle size={14} stroke={2} /> },
     error: { color: 'var(--error)', icon: <IconX size={14} stroke={2.4} /> },
 };
+
+interface ModalProps {
+    open: boolean;
+    children: ReactNode;
+    onClose: () => void;
+    ariaLabelledBy?: string;
+    ariaLabel?: string;
+    className?: string;
+    style?: CSSProperties;
+    closeOnEscape?: boolean;
+    onAfterClose?: () => void;
+}
+
+const OVERLAY_TRANSITION_MS = 200;
+
+function useOverlayPresence(open: boolean, onAfterClose?: () => void) {
+    const [mounted, setMounted] = useState(open);
+    const [visible, setVisible] = useState(false);
+    const afterCloseRef = useRef(onAfterClose);
+
+    useEffect(() => {
+        afterCloseRef.current = onAfterClose;
+    }, [onAfterClose]);
+
+    useEffect(() => {
+        if (open) {
+            setMounted(true);
+            const frame = window.requestAnimationFrame(() => setVisible(true));
+            return () => window.cancelAnimationFrame(frame);
+        }
+        if (!mounted) return;
+        setVisible(false);
+        const timer = window.setTimeout(() => {
+            setMounted(false);
+            afterCloseRef.current?.();
+        }, OVERLAY_TRANSITION_MS);
+        return () => window.clearTimeout(timer);
+    }, [mounted, open]);
+
+    return { mounted, visible };
+}
+
+/**
+ * Shared modal frame for application dialogs.
+ * Backdrop clicks are intentionally inert so unfinished form state is never
+ * discarded by an accidental click outside the dialog.
+ */
+export function Modal({
+    open,
+    children,
+    onClose,
+    ariaLabelledBy,
+    ariaLabel,
+    className = '',
+    style,
+    closeOnEscape = true,
+    onAfterClose,
+}: ModalProps) {
+    const dialogRef = useRef<HTMLElement>(null);
+    const onCloseRef = useRef(onClose);
+    const { mounted, visible } = useOverlayPresence(open, onAfterClose);
+
+    useEffect(() => {
+        onCloseRef.current = onClose;
+    }, [onClose]);
+
+    useEffect(() => {
+        if (!mounted) return;
+        const previousOverflow = document.body.style.overflow;
+        const focusTimer = window.setTimeout(() => dialogRef.current?.focus(), 0);
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape' && open && closeOnEscape) onCloseRef.current();
+        };
+        document.body.style.overflow = 'hidden';
+        window.addEventListener('keydown', onKeyDown);
+        return () => {
+            window.clearTimeout(focusTimer);
+            document.body.style.overflow = previousOverflow;
+            window.removeEventListener('keydown', onKeyDown);
+        };
+    }, [closeOnEscape, mounted, open]);
+
+    if (!mounted || typeof document === 'undefined') return null;
+
+    return createPortal(
+        <div className="app-modal-overlay" data-state={visible ? 'open' : 'closed'}>
+            <section
+                ref={dialogRef}
+                className={`app-modal-surface${className ? ` ${className}` : ''}`}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby={ariaLabelledBy}
+                aria-label={ariaLabel}
+                tabIndex={-1}
+                style={style}
+            >
+                {children}
+            </section>
+        </div>,
+        document.body,
+    );
+}
+
+type DrawerProps = Omit<ModalProps, 'style'> & { style?: CSSProperties };
+
+/** Shared right-side drawer with the same overlay and motion contract as Modal. */
+export function Drawer({
+    open,
+    children,
+    onClose,
+    ariaLabelledBy,
+    ariaLabel,
+    className = '',
+    style,
+    closeOnEscape = true,
+    onAfterClose,
+}: DrawerProps) {
+    const drawerRef = useRef<HTMLElement>(null);
+    const onCloseRef = useRef(onClose);
+    const { mounted, visible } = useOverlayPresence(open, onAfterClose);
+
+    useEffect(() => {
+        onCloseRef.current = onClose;
+    }, [onClose]);
+
+    useEffect(() => {
+        if (!mounted) return;
+        const previousOverflow = document.body.style.overflow;
+        const focusTimer = window.setTimeout(() => drawerRef.current?.focus(), 0);
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape' && open && closeOnEscape) onCloseRef.current();
+        };
+        document.body.style.overflow = 'hidden';
+        window.addEventListener('keydown', onKeyDown);
+        return () => {
+            window.clearTimeout(focusTimer);
+            document.body.style.overflow = previousOverflow;
+            window.removeEventListener('keydown', onKeyDown);
+        };
+    }, [closeOnEscape, mounted, open]);
+
+    if (!mounted || typeof document === 'undefined') return null;
+
+    return createPortal(
+        <div className="app-drawer-overlay" data-state={visible ? 'open' : 'closed'}>
+            <aside
+                ref={drawerRef}
+                className={`app-drawer-surface${className ? ` ${className}` : ''}`}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby={ariaLabelledBy}
+                aria-label={ariaLabel}
+                tabIndex={-1}
+                style={style}
+            >
+                {children}
+            </aside>
+        </div>,
+        document.body,
+    );
+}
 
 export function DialogProvider({ children }: { children: ReactNode }) {
     const [state, setState] = useState<ModalState>(null);
@@ -73,16 +237,22 @@ function DialogModal({ state, onClose }: { state: NonNullable<ModalState>; onClo
     const { t } = useTranslation();
     const btnRef = useRef<HTMLButtonElement>(null);
     const [showDetails, setShowDetails] = useState(false);
+    const [open, setOpen] = useState(true);
+    const closeResult = useRef(false);
+
+    const requestClose = useCallback((result = false) => {
+        closeResult.current = result;
+        setOpen(false);
+    }, []);
 
     useEffect(() => {
         const timer = setTimeout(() => btnRef.current?.focus(), 50);
         const onKey = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') onClose(false);
-            if (e.key === 'Enter' && state.kind === 'alert') onClose();
+            if (e.key === 'Enter' && state.kind === 'alert') requestClose(true);
         };
         window.addEventListener('keydown', onKey);
         return () => { clearTimeout(timer); window.removeEventListener('keydown', onKey); };
-    }, [state, onClose]);
+    }, [requestClose, state]);
 
     const isConfirm = state.kind === 'confirm';
     const type: DialogType = isConfirm
@@ -102,30 +272,13 @@ function DialogModal({ state, onClose }: { state: NonNullable<ModalState>; onClo
     const details = !isConfirm ? state.options.details : undefined;
 
     return (
-        <div
-            style={{
-                position: 'fixed', inset: 0,
-                background: 'rgba(0,0,0,0.5)',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-                zIndex: 10000,
-            }}
-            onClick={(e) => { if (e.target === e.currentTarget) onClose(false); }}
+        <Modal
+            open={open}
+            onClose={() => requestClose(false)}
+            onAfterClose={() => onClose(closeResult.current)}
+            ariaLabel={title}
+            className="app-modal-surface--compact"
         >
-            <div
-                role="dialog"
-                aria-modal="true"
-                style={{
-                    background: 'var(--bg-primary)',
-                    borderRadius: '12px',
-                    padding: '24px',
-                    width: '420px',
-                    maxWidth: '90vw',
-                    maxHeight: '80vh',
-                    overflow: 'auto',
-                    border: '1px solid var(--border-subtle)',
-                    boxShadow: '0 20px 60px rgba(0,0,0,0.4)',
-                }}
-            >
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px' }}>
                     <span
                         aria-hidden
@@ -174,22 +327,22 @@ function DialogModal({ state, onClose }: { state: NonNullable<ModalState>; onClo
                 )}
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
                     {isConfirm && (
-                        <button className="btn btn-secondary" onClick={() => onClose(false)}>
+                        <Button type="button" variant="secondary" onClick={() => requestClose(false)}>
                             {state.options.cancelLabel ?? t('common.cancel', 'Cancel')}
-                        </button>
+                        </Button>
                     )}
-                    <button
+                    <Button
                         ref={btnRef}
-                        className={isConfirm && state.options.danger ? 'btn btn-danger' : 'btn btn-primary'}
-                        onClick={() => onClose(true)}
+                        type="button"
+                        variant={isConfirm && state.options.danger ? 'danger' : 'primary'}
+                        onClick={() => requestClose(true)}
                     >
                         {isConfirm
                             ? (state.options.confirmLabel ?? t('common.confirm', 'Confirm'))
                             : (state.options.confirmLabel ?? t('common.confirm', 'Confirm'))}
-                    </button>
+                    </Button>
                 </div>
-            </div>
-        </div>
+        </Modal>
     );
 }
 
