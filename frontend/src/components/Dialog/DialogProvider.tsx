@@ -49,6 +49,7 @@ interface ModalProps {
     className?: string;
     style?: CSSProperties;
     closeOnEscape?: boolean;
+    closeOnBackdrop?: boolean;
     onAfterClose?: () => void;
 }
 
@@ -83,8 +84,8 @@ function useOverlayPresence(open: boolean, onAfterClose?: () => void) {
 
 /**
  * Shared modal frame for application dialogs.
- * Backdrop clicks are intentionally inert so unfinished form state is never
- * discarded by an accidental click outside the dialog.
+ * Backdrop clicks close ordinary dialogs by default. Strong configuration
+ * flows can opt out with closeOnBackdrop={false}.
  */
 export function Modal({
     open,
@@ -95,6 +96,7 @@ export function Modal({
     className = '',
     style,
     closeOnEscape = true,
+    closeOnBackdrop = true,
     onAfterClose,
 }: ModalProps) {
     const dialogRef = useRef<HTMLElement>(null);
@@ -124,7 +126,13 @@ export function Modal({
     if (!mounted || typeof document === 'undefined') return null;
 
     return createPortal(
-        <div className="app-modal-overlay" data-state={visible ? 'open' : 'closed'}>
+        <div
+            className="app-modal-overlay"
+            data-state={visible ? 'open' : 'closed'}
+            onMouseDown={(event) => {
+                if (open && closeOnBackdrop && event.target === event.currentTarget) onCloseRef.current();
+            }}
+        >
             <section
                 ref={dialogRef}
                 className={`app-modal-surface${className ? ` ${className}` : ''}`}
@@ -154,6 +162,7 @@ export function Drawer({
     className = '',
     style,
     closeOnEscape = true,
+    closeOnBackdrop = true,
     onAfterClose,
 }: DrawerProps) {
     const drawerRef = useRef<HTMLElement>(null);
@@ -183,7 +192,13 @@ export function Drawer({
     if (!mounted || typeof document === 'undefined') return null;
 
     return createPortal(
-        <div className="app-drawer-overlay" data-state={visible ? 'open' : 'closed'}>
+        <div
+            className="app-drawer-overlay"
+            data-state={visible ? 'open' : 'closed'}
+            onMouseDown={(event) => {
+                if (open && closeOnBackdrop && event.target === event.currentTarget) onCloseRef.current();
+            }}
+        >
             <aside
                 ref={drawerRef}
                 className={`app-drawer-surface${className ? ` ${className}` : ''}`}

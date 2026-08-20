@@ -66,6 +66,7 @@ export function CliToolWizard({
     <Modal
       open={open}
       onClose={onClose}
+      closeOnBackdrop={false}
       ariaLabelledBy="cli-tool-wizard-title"
       className="cli-tool-wizard-modal"
       style={{ width: 'min(480px, calc(100vw - 40px))' }}

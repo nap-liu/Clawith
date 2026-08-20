@@ -17,8 +17,8 @@ const promptSource = readSource('../src/components/PromptModal.tsx');
 assert.match(dialogSource, /export function Modal\(/);
 assert.match(dialogSource, /export function Drawer\(/);
 assert.match(dialogSource, /useOverlayPresence\(open, onAfterClose\)/);
-assert.doesNotMatch(dialogSource, /app-modal-overlay[^>]*onClick=/);
-assert.doesNotMatch(dialogSource, /app-drawer-overlay[^>]*on(?:Click|MouseDown)=/);
+assert.match(dialogSource, /closeOnBackdrop = true/);
+assert.match(dialogSource, /event\.target === event\.currentTarget/);
 
 assert.match(dialogStyles, /data-state="open"/);
 assert.match(dialogStyles, /transition:/);
@@ -28,6 +28,7 @@ assert.match(skillMarketSource, /<Modal[\s\S]*open=\{installModalOpen\}/);
 assert.match(skillMarketSource, /<Drawer[\s\S]*open=\{open\}/);
 assert.doesNotMatch(skillMarketSource, /skill-preview-overlay/);
 assert.match(cliWizardSource, /<Modal[\s\S]*open=\{open\}/);
+assert.match(cliWizardSource, /closeOnBackdrop=\{false\}/);
 assert.match(cliSectionSource, /<CliToolWizard open=\{showWizard\}/);
 assert.match(confirmSource, /<Modal/);
 assert.match(promptSource, /<Modal/);
