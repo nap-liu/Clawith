@@ -70,7 +70,7 @@
     "skillMarket": "Skill Market"
   },
   "skillMarket": {
-    "eyebrow": "CLAWITH SKILLS",
+    "eyebrow": "SKILL MARKET",
     "title": "Skill Market",
     "subtitle": "Discover capabilities, install them to an Agent, or publish proven ways of working.",
     "publishSkill": "Publish Skill",
@@ -84,6 +84,7 @@
     "searchPlaceholder": "Search name, description, or category",
     "searchAria": "Search Skills",
     "by": "By",
+    "platformPublisher": "Platform",
     "version": "v{{version}}",
     "generalCategory": "General",
     "noDescription": "No description yet.",
@@ -115,7 +116,7 @@
       "selectFile": "Select a file to preview"
     },
     "installNote": "Writes to skills/{{folder}}. Reinstalling updates the current version; each Agent is counted once.",
-    "publishNote": "Before publishing, Clawith checks root SKILL.md, text format, size, and common secrets. Publishing the same folder again updates its version.",
+    "publishNote": "Before publishing, the platform checks root SKILL.md, text format, size, and common secrets. Publishing the same folder again updates its version.",
     "publishing": "Publishing…",
     "offlineTitle": "Take Skill offline",
     "offlineConfirm": "Take “{{name}}” offline? Existing installs are unaffected.",
@@ -1523,7 +1524,7 @@
         "list_published_pages": "List all pages published by this agent.",
         "search_clawhub": "Search the ClawHub skill registry for skills matching a query.",
         "install_skill": "Install a skill into this agent's workspace.",
-        "search_skill_market": "Search visible company and public Skills in the Clawith market.",
+        "search_skill_market": "Search visible company and public Skills in the Skill market.",
         "install_skill_from_market": "Install a market Skill into this Agent after L3 approval.",
         "publish_skill_to_market": "Publish an Agent Skill folder to the company or public market after L3 approval.",
         "agentbay_browser_navigate": "[ENV: Browser] Navigate to a URL in the AgentBay headless browser environment.",

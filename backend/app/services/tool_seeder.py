@@ -3654,7 +3654,7 @@ BUILTIN_TOOLS = [
         "name": "search_skill_market",
         "display_name": "Search Skill Market",
         "description": (
-            "Search Clawith's first-party Skill market. Use automatically when installed Skills do not clearly cover "
+            "Search the first-party Skill market. Use automatically when installed Skills do not clearly cover "
             "a specialized request. Returns visible company and public Skills with IDs, versions, publishers, and "
             "unique Agent install counts."
         ),
@@ -3675,7 +3675,7 @@ BUILTIN_TOOLS = [
         "name": "install_skill_from_market",
         "display_name": "Install Market Skill",
         "description": (
-            "Install a Clawith market Skill into this Agent by Skill ID. The platform creates an L3 approval before "
+            "Install a market Skill into this Agent by Skill ID. The platform creates an L3 approval before "
             "changing files, and the approving user must have Agent manage access."
         ),
         "category": "discovery",
@@ -3695,7 +3695,7 @@ BUILTIN_TOOLS = [
         "name": "publish_skill_to_market",
         "display_name": "Publish Skill to Market",
         "description": (
-            "Publish skills/<folder> from this Agent to the company or public Clawith market. The platform creates an "
+            "Publish skills/<folder> from this Agent to the company or public Skill market. The platform creates an "
             "L3 approval before publication, and the approving user must have Agent manage access."
         ),
         "category": "discovery",

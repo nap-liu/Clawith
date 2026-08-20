@@ -739,6 +739,7 @@ export type MarketSkill = {
     status: 'draft' | 'published' | 'offline';
     version: number;
     downloads: number;
+    is_builtin: boolean;
     publisher_name: string;
     publisher_user_id?: string | null;
     publisher_agent_id?: string | null;

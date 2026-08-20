@@ -2205,7 +2205,7 @@ AGENT_TOOLS = [
         "function": {
             "name": "search_skill_market",
             "description": (
-                "Search Clawith's first-party Skill market. When installed Skills do not clearly cover a specialized "
+                "Search the first-party Skill market. When installed Skills do not clearly cover a specialized "
                 "request, use this tool automatically before improvising. Returns visible company and public Skills "
                 "with IDs, versions, publishers, and unique Agent install counts."
             ),
@@ -2226,7 +2226,7 @@ AGENT_TOOLS = [
         "function": {
             "name": "install_skill_from_market",
             "description": (
-                "Install one Clawith market Skill into this Agent by Skill ID. This changes the shared Agent workspace. "
+                "Install one market Skill into this Agent by Skill ID. This changes the shared Agent workspace. "
                 "The platform always requires L3 approval before any files are changed."
             ),
             "parameters": {
@@ -2243,7 +2243,7 @@ AGENT_TOOLS = [
         "function": {
             "name": "publish_skill_to_market",
             "description": (
-                "Publish a Skill folder from this Agent to the Clawith market. The path must be skills/<folder>. "
+                "Publish a Skill folder from this Agent to the Skill market. The path must be skills/<folder>. "
                 "The platform always requires L3 approval before publication."
             ),
             "parameters": {

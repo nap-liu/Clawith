@@ -182,7 +182,7 @@ function SkillPreviewDrawer({
                         <span className="skill-preview-kicker">{t('skillMarket.preview.package')}</span>
                         <h2 id="skill-preview-title">{detail?.name || t('common.loading')}</h2>
                         <div className="skill-preview-meta">
-                            <span>{detail?.publisher_name || '—'}</span>
+                            <span>{detail?.is_builtin ? t('skillMarket.platformPublisher') : detail?.publisher_name || '—'}</span>
                             <span>{detail?.version ? t('skillMarket.version', { version: detail.version }) : '—'}</span>
                             <span>{t('skillMarket.installCount', { count: detail?.downloads || 0 })}</span>
                         </div>
@@ -259,7 +259,9 @@ function SkillCard({
                         <h3>{skill.name}</h3>
                         <span className="skill-market-version">{t('skillMarket.version', { version: skill.version })}</span>
                     </div>
-                    <div className="skill-market-publisher">{t('skillMarket.by')} · {skill.publisher_name}</div>
+                    <div className="skill-market-publisher">
+                        {t('skillMarket.by')} · {skill.is_builtin ? t('skillMarket.platformPublisher') : skill.publisher_name}
+                    </div>
                 </div>
             </div>
             <p>{skill.description || t('skillMarket.noDescription')}</p>

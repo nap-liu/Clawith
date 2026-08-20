@@ -45,7 +45,7 @@
     "skillMarket": "Skill 市场"
   },
   "skillMarket": {
-    "eyebrow": "CLAWITH SKILLS",
+    "eyebrow": "SKILL MARKET",
     "title": "Skill 市场",
     "subtitle": "发现能力，安装到 Agent；也可以把成熟的工作方法发布给团队。",
     "publishSkill": "发布 Skill",
@@ -59,6 +59,7 @@
     "searchPlaceholder": "搜索名称、说明或分类",
     "searchAria": "搜索 Skill",
     "by": "发布者",
+    "platformPublisher": "平台",
     "version": "v{{version}}",
     "generalCategory": "通用",
     "noDescription": "暂无说明",
@@ -1615,7 +1616,7 @@
         "list_published_pages": "列出此数字员工发布的所有页面。",
         "search_clawhub": "在 ClawHub 技能注册表中搜索匹配查询的技能。",
         "install_skill": "将技能安装到此数字员工的工作区。",
-        "search_skill_market": "搜索当前可见的企业内和公开 Clawith Skill。",
+        "search_skill_market": "搜索当前可见的企业内和公开 Skill。",
         "install_skill_from_market": "通过 L3 审批后，将市场 Skill 安装到此 Agent。",
         "publish_skill_to_market": "通过 L3 审批后，将 Agent Skill 文件夹发布到企业或公开市场。",
         "agentbay_browser_navigate": "[ENV: Browser] 在 AgentBay 无头浏览器环境中访问指定网址。",

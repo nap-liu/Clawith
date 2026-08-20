@@ -22,6 +22,7 @@ from app.services.skill_market import (
     install_market_skill,
     list_market_skills,
     publish_agent_skill,
+    serialize_market_skill,
     uninstall_market_skill,
     validate_skill_files,
 )
@@ -626,6 +627,21 @@ def test_skill_validation_rejects_missing_manifest_and_secret_content():
             ]
         )
     assert secret.value.status_code == 400
+
+
+def test_builtin_market_publisher_uses_platform_label():
+    skill = Skill(
+        name="Builtin Market Skill",
+        folder_name="builtin-market-skill",
+        status="published",
+        visibility="public",
+        is_builtin=True,
+    )
+
+    result = serialize_market_skill(skill)
+
+    assert result["is_builtin"] is True
+    assert result["publisher_name"] == "Platform"
 
 
 @pytest.mark.asyncio(loop_scope="session")
