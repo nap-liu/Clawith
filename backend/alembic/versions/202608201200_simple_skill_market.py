@@ -1,7 +1,7 @@
 """Add the minimal first-party Skill market.
 
 Revision ID: simple_skill_market
-Revises: published_page_actor
+Revises: subagent_runs
 """
 
 from collections.abc import Sequence
@@ -12,7 +12,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision: str = "simple_skill_market"
-down_revision: str | Sequence[str] | None = "published_page_actor"
+down_revision: str | Sequence[str] | None = "subagent_runs"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
