@@ -1567,6 +1567,158 @@ async def test_project_subagent_reply_materializes_without_resuming_group_root(
     assert parent is not None and parent.source_channel == "project"
 
 
+async def test_project_group_timeline_reuses_standard_child_message_contract(
+    project_api: ProjectApiEnv,
+):
+    from datetime import timedelta
+
+    from app.models.audit import ChatMessage
+
+    env = project_api
+    project = await _create_project(env, name="Standard group timeline")
+    project_id = project["id"]
+    group = (await env.client.get(f"/api/projects/{project_id}/group-session")).json()
+    wake = await env.client.post(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
+        json={"content": "Show the full execution turn", "mentions": [str(env.worker_id)]},
+    )
+    assert wake.status_code == 201, wake.text
+    worker_wake = next(
+        row for row in wake.json()["subagent_runs"] if row["agent_id"] == str(env.worker_id)
+    )
+    child_id = uuid.UUID(worker_wake["session_id"])
+    project_run_id = uuid.UUID(worker_wake["project_run_id"])
+    child_input = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(child_id),
+                ChatMessage.message_meta["project_run_id"].as_string() == str(project_run_id),
+            )
+        )
+    ).scalar_one()
+    child_input.message_meta = {
+        **dict(child_input.message_meta or {}),
+        "subagent_input_state": "processing",
+        "subagent_turn_anchor_id": str(child_input.id),
+        "turn_status": "running",
+    }
+    base_time = child_input.created_at + timedelta(seconds=1)
+    running_tool = ChatMessage(
+        agent_id=env.worker_id,
+        role="tool_call",
+        content=json.dumps({
+            "name": "read_file",
+            "call_id": "worker-read-1",
+            "args": {"path": "README.md"},
+            "status": "running",
+            "result": "",
+            "reasoning_content": "Inspecting the project evidence",
+        }),
+        conversation_id=str(child_id),
+        message_meta={"turn_anchor_id": str(child_input.id)},
+        created_at=base_time,
+    )
+    done_tool = ChatMessage(
+        agent_id=env.worker_id,
+        role="tool_call",
+        content=json.dumps({
+            "name": "read_file",
+            "call_id": "worker-read-1",
+            "args": {"path": "README.md"},
+            "status": "done",
+            "result": "# Project evidence",
+            "reasoning_content": "Inspecting the project evidence",
+        }),
+        conversation_id=str(child_id),
+        message_meta={"turn_anchor_id": str(child_input.id)},
+        created_at=base_time + timedelta(seconds=1),
+    )
+    confirmation = ChatMessage(
+        agent_id=env.worker_id,
+        role="tool_call",
+        content=json.dumps({
+            "name": "request_confirmation",
+            "args": {"title": "Approve delivery", "summary": "Publish the evidence"},
+            "status": "pending",
+            "result": "",
+        }),
+        conversation_id=str(child_id),
+        message_meta={"turn_anchor_id": str(child_input.id), "turn_status": "suspended"},
+        created_at=base_time + timedelta(seconds=2),
+    )
+    fork_context = ChatMessage(
+        agent_id=env.worker_id,
+        role="assistant",
+        content="Fork context must stay in the child session",
+        conversation_id=str(child_id),
+        message_meta={"kind": "subagent_fork_context"},
+        created_at=base_time + timedelta(seconds=3),
+    )
+    child_final = ChatMessage(
+        agent_id=env.worker_id,
+        sender_agent_id=env.worker_id,
+        role="assistant",
+        content="Worker final answer",
+        thinking="Checked the evidence before answering",
+        conversation_id=str(child_id),
+        message_meta={
+            "kind": "subagent_completion",
+            "turn_anchor_id": str(child_input.id),
+            "project_run_ids": [str(project_run_id)],
+            "attachments": [],
+        },
+        created_at=base_time + timedelta(seconds=4),
+    )
+    env.db.add_all([running_tool, done_tool, confirmation, fork_context, child_final])
+    await env.db.flush()
+    materialized = ChatMessage(
+        agent_id=env.leader_id,
+        sender_agent_id=env.worker_id,
+        role="assistant",
+        content=child_final.content,
+        conversation_id=group["id"],
+        external_event_key=f"project-subagent:{child_final.id}",
+        message_meta={
+            "kind": "project_subagent_reply",
+            "visible_to_group": True,
+            "child_message_id": str(child_final.id),
+            "subagent_id": str(child_id),
+            "source_project_run_ids": [str(project_run_id)],
+            "attachments": [],
+        },
+        created_at=base_time + timedelta(seconds=5),
+    )
+    env.db.add(materialized)
+    await env.db.commit()
+
+    response = await env.client.get(
+        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages"
+    )
+    assert response.status_code == 200, response.text
+    items = response.json()["items"]
+    assert len([item for item in items if item["role"] == "user"]) == 1
+    assert all(item["content"] != fork_context.content for item in items)
+
+    tools = [item for item in items if item["role"] == "tool_call"]
+    read_tools = [item for item in tools if item.get("toolName") == "read_file"]
+    assert len(read_tools) == 1
+    assert read_tools[0]["toolCallId"] == "worker-read-1"
+    assert read_tools[0]["toolStatus"] == "done"
+    assert read_tools[0]["toolResult"] == "# Project evidence"
+    assert read_tools[0]["sender_agent_id"] == str(env.worker_id)
+
+    confirmation_item = next(item for item in tools if item.get("toolName") == "request_confirmation")
+    assert confirmation_item["toolCallId"] == str(confirmation.id)
+    assert confirmation_item["toolStatus"] == "pending"
+    assert confirmation_item["sender_agent_id"] == str(env.worker_id)
+
+    final_items = [item for item in items if item["content"] == child_final.content]
+    assert len(final_items) == 1
+    assert final_items[0]["id"] == str(materialized.id)
+    assert final_items[0]["thinking"] == child_final.thinking
+    assert final_items[0]["sender_agent_id"] == str(env.worker_id)
+
+
 async def test_project_participant_replies_coalesce_into_one_durable_leader_turn(
     project_api: ProjectApiEnv,
     monkeypatch: pytest.MonkeyPatch,

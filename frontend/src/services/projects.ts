@@ -208,7 +208,12 @@ export const projectsApi = {
             capabilities: normalizedCapabilities.length ? normalizedCapabilities : [...skills, ...mcpServers],
             users: array(source.users).map(item => {
                 const user = record(item);
-                return { id: string(user.id), name: string(user.name || user.display_name, '未命名成员'), email: string(user.email) || null };
+                return {
+                    id: string(user.id),
+                    name: string(user.name || user.display_name, '未命名成员'),
+                    email: string(user.email) || null,
+                    avatar_url: string(user.avatar_url) || null,
+                };
             }),
         };
     },

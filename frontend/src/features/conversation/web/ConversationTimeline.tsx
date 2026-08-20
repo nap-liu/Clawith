@@ -338,11 +338,13 @@ export default function ConversationTimeline({
             return <div className={`chat-msg-row chat-msg-row--analysis${ownerView.isLeft ? '' : ' chat-msg-row--user'}`}><div className="chat-msg-avatar">{ownerView.avatarText || agentName[0] || 'A'}</div><AnalysisCard items={entry.items} running={running} expanded={!!expandedAnalysis[entry.key]} onToggle={() => setExpandedAnalysis((current) => ({ ...current, [entry.key]: !current[entry.key] }))} /></div>;
         }
         if (entry.type === 'special_render') {
-            return <div className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}><div className="chat-msg-avatar">{agentName[0] || 'A'}</div><ChatToolCallRenderer agentId={agentId} message={entry.msg} t={t} mode={mode} onPreviewImages={onPreviewImages} onOpenSubagentSession={onOpenSubagentSession} onResolved={(result) => onToolResolved?.(entry.msg, result)} /></div>;
+            const view = viewOf(entry.msg);
+            const messageAgentId = entry.msg.sender_agent_id || agentId;
+            return <div className={`chat-msg-row chat-msg-row--special-render chat-msg-row--${entry.renderType}`}><div className="chat-msg-avatar">{view.avatarText || agentName[0] || 'A'}</div><ChatToolCallRenderer agentId={messageAgentId} message={entry.msg} t={t} mode={mode} onPreviewImages={onPreviewImages} onOpenSubagentSession={onOpenSubagentSession} onResolved={(result) => onToolResolved?.(entry.msg, result)} /></div>;
         }
         const previous = entries[index - 1];
         const view = viewOf(entry.msg);
-        return <MessageItem agentId={agentId} msg={entry.msg} view={{ ...view, hideAvatar: view.hideAvatar || (entry.msg.role === 'assistant' && previous?.type === 'analysis_group') }} unavailable={unavailableAttachmentKeys} onDownload={onAttachmentDownload} onUnavailable={onAttachmentUnavailable} onPreview={onPreviewImages} runningLabel={runningLabel} />;
+        return <MessageItem agentId={entry.msg.sender_agent_id || agentId} msg={entry.msg} view={{ ...view, hideAvatar: view.hideAvatar || (entry.msg.role === 'assistant' && previous?.type === 'analysis_group') }} unavailable={unavailableAttachmentKeys} onDownload={onAttachmentDownload} onUnavailable={onAttachmentUnavailable} onPreview={onPreviewImages} runningLabel={runningLabel} />;
     };
     return <div className="conversation-timeline">
         {provenance && (

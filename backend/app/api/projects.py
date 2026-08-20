@@ -90,6 +90,10 @@ from app.services.project_git_service import (
     rollback_project_repository_clone,
     write_project_file,
 )
+from app.services.project_group_timeline import (
+    build_project_group_timeline,
+    serialize_project_group_message,
+)
 from app.services.project_service import (
     accessible_projects_clause,
     add_capability,
@@ -547,6 +551,7 @@ async def get_project_bootstrap_options(
                 "id": str(user.id),
                 "name": user.display_name,
                 "email": getattr(user, "email", None),
+                "avatar_url": user.avatar_url,
             }
             for user in users
             if user.id != current_user.id
@@ -1641,20 +1646,7 @@ def _group_session_payload(session: ChatSession, project: Project) -> dict:
 
 
 def _group_message_payload(message: ChatMessage) -> dict:
-    metadata = dict(message.message_meta or {})
-    return {
-        "id": str(message.id),
-        "session_id": message.conversation_id,
-        "content": message.content,
-        "display_content": message.content,
-        "role": message.role,
-        "sender_user_id": str(message.sender_user_id) if message.sender_user_id else None,
-        "sender_agent_id": str(message.sender_agent_id) if message.sender_agent_id else None,
-        "attachments": metadata.get("attachments", []),
-        "metadata": metadata,
-        "message_meta": metadata,
-        "created_at": message.created_at.isoformat() if message.created_at else None,
-    }
+    return serialize_project_group_message(message)
 
 
 def _leader_session_payload(session: ChatSession, discussion_count: int) -> dict:
@@ -2029,7 +2021,11 @@ async def list_project_group_messages(
     ).scalars().all()
     return {
         "session": _group_session_payload(session, project),
-        "items": [_group_message_payload(row) for row in reversed(messages)],
+        "items": await build_project_group_timeline(
+            db,
+            project_id=project.id,
+            group_messages=list(reversed(messages)),
+        ),
     }
 
 

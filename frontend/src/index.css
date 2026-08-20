@@ -8713,6 +8713,16 @@ select:focus {
   padding-inline: clamp(18px, 3vw, 44px);
 }
 
+.session-viewer-drawer-layer--embedded .session-viewer-drawer__composer-row {
+  align-items: center;
+}
+
+.session-viewer-drawer-layer--embedded .session-viewer-drawer__composer-row > .ui-rich-mention-composer {
+  min-height: 34px;
+  padding: 6px 2px;
+  box-sizing: border-box;
+}
+
 .session-viewer-drawer-backdrop {
   position: absolute;
   inset: 0;

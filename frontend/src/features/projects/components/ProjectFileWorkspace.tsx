@@ -8,7 +8,6 @@ import {
     IconFile,
     IconFileCode,
     IconFileUnknown,
-    IconFlag,
     IconFolder,
     IconFolderOpen,
     IconLoader2,
@@ -18,11 +17,11 @@ import {
     IconPlus,
     IconRefresh,
 } from '@tabler/icons-react';
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 
 import { projectsApi, type ProjectFileContent, type ProjectFileKind } from '../../../services/projects';
 import { formatFileSize } from '../../../utils/formatFileSize';
-import { Button, ProjectField, TextInput } from './ProjectUI';
+import { Button, TextInput } from './ProjectUI';
 import './ProjectFileWorkspace.css';
 
 const ProjectCodeEditor = lazy(() => import('./ProjectCodeEditor'));
@@ -32,7 +31,6 @@ type RecordValue = Record<string, unknown>;
 type Props = {
     projectId: string;
     files: RecordValue[];
-    commits: RecordValue[];
     runAction: (key: string, action: () => Promise<unknown>, success: string) => Promise<boolean>;
     busyAction: string;
 };
@@ -110,19 +108,6 @@ function FileKindIcon({ kind, size = 16 }: { kind: ProjectFileKind; size?: numbe
     return <IconFile size={size} />;
 }
 
-function SectionHeading({ actions }: { actions: ReactNode }) {
-    return (
-        <header className="project-workspace__section-heading">
-            <div>
-                <span>FILES / DELIVERABLES</span>
-                <h2>项目文件与交付</h2>
-                <p>浏览 Git HEAD 中的真实项目文件；文本修改会原子创建 Commit，二进制与媒体保持只读。</p>
-            </div>
-            <div className="project-workspace__heading-actions">{actions}</div>
-        </header>
-    );
-}
-
 function TreeRows({
     nodes,
     depth,
@@ -189,7 +174,7 @@ function MediaPreview({ content, onUnavailable }: { content: ProjectFileContent;
     );
 }
 
-export default function ProjectFileWorkspace({ projectId, files, commits, runAction, busyAction }: Props) {
+export default function ProjectFileWorkspace({ projectId, files, runAction, busyAction }: Props) {
     const firstPath = filePath(files[0] || {});
     const [selectedPath, setSelectedPath] = useState(firstPath);
     const [creating, setCreating] = useState(!firstPath);
@@ -199,7 +184,6 @@ export default function ProjectFileWorkspace({ projectId, files, commits, runAct
     const [loading, setLoading] = useState(Boolean(firstPath));
     const [loadError, setLoadError] = useState('');
     const [reloadKey, setReloadKey] = useState(0);
-    const [milestoneMessage, setMilestoneMessage] = useState('');
     const tree = useMemo(() => treeFromFiles(files), [files]);
     const allFolders = useMemo(() => folderPaths(tree), [tree]);
     const knownFoldersRef = useRef(new Set(allFolders));
@@ -276,16 +260,9 @@ export default function ProjectFileWorkspace({ projectId, files, commits, runAct
         }
     };
 
-    const milestone = async (event: FormEvent) => {
-        event.preventDefault();
-        const ok = await runAction('milestone', () => projectsApi.commitFiles(projectId, { message: milestoneMessage.trim(), milestone: true }), '项目里程碑已创建并写入审计');
-        if (ok) setMilestoneMessage('');
-    };
-
     const textReadOnly = Boolean(content && (!content.is_editable || content.truncated));
     const canEditText = creating || Boolean(content?.is_text);
     const activeEntry = files.find((entry) => filePath(entry) === selectedPath);
-    const branch = text(commits[0] || {}, 'branch') || '项目工作树';
     const refreshMediaTicket = () => {
         if (!selectedPath || mediaRecoveryPathRef.current === selectedPath) return;
         mediaRecoveryPathRef.current = selectedPath;
@@ -293,11 +270,9 @@ export default function ProjectFileWorkspace({ projectId, files, commits, runAct
     };
 
     return (
-        <>
-            <SectionHeading actions={<Button variant="secondary" onClick={startNewFile}><IconPlus size={16} />新建文件</Button>} />
-            <div className="project-file-workspace">
+        <div className="project-file-workspace">
                 <aside className="project-file-workspace__sidebar" aria-label="项目目录">
-                    <header><IconBrandGit size={16} /><span title={branch}>{branch}</span><em>{files.length}</em></header>
+                    <header><IconBrandGit size={16} /><span title="项目工作树">项目工作树</span><em>{files.length}</em><Button type="button" variant="ghost" onClick={startNewFile} title="新建文件" aria-label="新建文件"><IconPlus size={15} /></Button></header>
                     <div className="project-file-workspace__tree" role="tree" aria-label="项目文件树">
                         {tree.length ? <TreeRows nodes={tree} depth={0} expanded={expanded} selectedPath={selectedPath} onToggle={(path) => setExpanded((current) => { const next = new Set(current); if (next.has(path)) next.delete(path); else next.add(path); return next; })} onSelect={selectFile} /> : <div className="project-file-workspace__tree-empty"><IconFolder size={22} /><span>暂无项目文件</span></div>}
                     </div>
@@ -305,37 +280,26 @@ export default function ProjectFileWorkspace({ projectId, files, commits, runAct
 
                 <section className="project-file-workspace__viewer">
                     <header className="project-file-workspace__viewer-header">
-                        <div><span>{creating ? 'NEW FILE' : content?.is_text ? 'EDIT FILE' : 'FILE PREVIEW'}</span><h3 title={draftPath || selectedPath}>{draftPath || selectedPath || '创建项目文件'}</h3></div>
+                        <div><span>{creating ? 'NEW FILE' : content?.is_text ? 'EDIT FILE' : 'FILE PREVIEW'}</span>{creating ? <TextInput form="project-file-editor-form" value={draftPath} onChange={(event) => setDraftPath(event.target.value)} placeholder="docs/deliverable.md" aria-label="项目内路径" required /> : <h3 title={draftPath || selectedPath}>{draftPath || selectedPath || '创建项目文件'}</h3>}</div>
                         <div className="project-file-workspace__viewer-actions">
                             {content ? <MetaLine content={content} /> : activeEntry ? <span>{formatFileSize(number(activeEntry, 'size'))}</span> : null}
                             {content?.download_url ? <a className="btn btn-ghost" href={content.download_url} download={content.name} title="下载文件" aria-label={`下载 ${content.name}`}><IconDownload size={17} /></a> : null}
+                            {canEditText && !textReadOnly ? <Button type="submit" form="project-file-editor-form" variant="primary" disabled={!draftPath.trim() || busyAction === 'save-file'}>{busyAction === 'save-file' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存并提交</Button> : null}
                         </div>
                     </header>
 
                     {loading ? <div className="project-file-workspace__state"><IconLoader2 className="project-workspace__spinner" size={24} /><span>正在读取 Git HEAD 文件…</span></div> : loadError ? <div className="project-file-workspace__state is-error"><IconAlertTriangle size={24} /><strong>文件加载失败</strong><span>{loadError}</span><Button variant="secondary" onClick={() => setReloadKey((value) => value + 1)}><IconRefresh size={15} />重试</Button></div> : canEditText ? (
-                        <form className="project-file-workspace__editor" onSubmit={(event) => void save(event)}>
-                            <ProjectField label="项目内路径" labelFor="project-file-path" required>
-                                <TextInput id="project-file-path" value={draftPath} onChange={(event) => setDraftPath(event.target.value)} placeholder="docs/deliverable.md" readOnly={!creating} required />
-                            </ProjectField>
+                        <form id="project-file-editor-form" className="project-file-workspace__editor" onSubmit={(event) => void save(event)}>
                             {textReadOnly ? <div className="project-file-workspace__readonly-note" role="status"><IconAlertTriangle size={16} /><div><strong>{content?.truncated ? '当前仅显示文件前部内容' : '此文件只允许在线查看'}</strong><p>为避免使用截断内容覆盖原文件，请在 Agent 工作区修改后提交。</p></div></div> : null}
                             <Suspense fallback={<div className="project-file-workspace__editor-loading"><IconLoader2 className="project-workspace__spinner" size={20} /><span>正在载入代码编辑器…</span></div>}>
                                 <ProjectCodeEditor path={draftPath} value={draftContent} readOnly={textReadOnly} onChange={setDraftContent} />
                             </Suspense>
                             <footer>
                                 <span>{creating ? '保存后会创建普通 Git Commit' : textReadOnly ? '只读预览不会修改项目文件' : '改动仅作用于当前项目仓库'}</span>
-                                {!textReadOnly ? <Button type="submit" variant="primary" disabled={!draftPath.trim() || busyAction === 'save-file'}>{busyAction === 'save-file' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存并提交</Button> : null}
                             </footer>
                         </form>
                     ) : content ? <div className="project-file-workspace__preview"><MediaPreview content={content} onUnavailable={refreshMediaTicket} /></div> : <div className="project-file-workspace__state"><IconCode size={24} /><span>选择一个文件查看内容</span></div>}
                 </section>
-            </div>
-
-            <form className="project-workspace__inline-create project-workspace__milestone" onSubmit={(event) => void milestone(event)}>
-                <ProjectField label="里程碑说明" labelFor="project-milestone-message" required>
-                    <TextInput id="project-milestone-message" value={milestoneMessage} onChange={(event) => setMilestoneMessage(event.target.value)} placeholder="例如：M1 · 需求与技术方案冻结" required />
-                </ProjectField>
-                <Button variant="secondary" type="submit" disabled={!milestoneMessage.trim() || busyAction === 'milestone'}>{busyAction === 'milestone' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconFlag size={16} />}创建里程碑</Button>
-            </form>
-        </>
+        </div>
     );
 }

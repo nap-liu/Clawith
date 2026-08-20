@@ -312,31 +312,23 @@ export function A2AMeshGraph({ members, events = [], selectedAgentId, onAgentSel
         }
         return [...counts.values()].sort((left, right) => `${left.source}${left.target}`.localeCompare(`${right.source}${right.target}`));
     }, [events, memberIds]);
-    // Leave enough room around the project mesh node for readable hit targets.
-    // React Flow owns edge routing, zooming and panning.
-    const radius = Math.max(320, 110 * ordered.length);
-    const nodes = useMemo<ProjectGraphNode[]>(() => [{
-        id: 'project-a2a-mesh',
-        type: 'projectGraph',
-        draggable: false,
-        selectable: false,
-        position: { x: 0, y: 0 },
-        data: {
-            kind: 'mesh',
-            label: '项目 A2A Mesh',
-            caption: '成员可直接互相唤醒',
-            badge: '事件总线',
-            tone: 'info',
-        },
-    } satisfies ProjectGraphNode, ...ordered.map<ProjectGraphNode>((member, index) => {
+    const leaderId = valueText(ordered.find((member) => member.is_leader === true) || ordered[0] || {}, 'agent_id', 'id', 'member_id');
+    const participants = ordered.filter((member) => valueText(member, 'agent_id', 'id', 'member_id') !== leaderId);
+    const nodes = useMemo<ProjectGraphNode[]>(() => ordered.map<ProjectGraphNode>((member) => {
         const id = valueText(member, 'agent_id', 'id', 'member_id');
-        const angle = ((index / Math.max(1, ordered.length)) * Math.PI * 2) - (Math.PI / 2);
         const isLeader = member.is_leader === true;
         const enabled = member.is_enabled !== false;
+        const participantIndex = participants.findIndex((entry) => valueText(entry, 'agent_id', 'id', 'member_id') === id);
+        const columns = Math.min(4, Math.max(1, participants.length));
+        const row = Math.floor(Math.max(0, participantIndex) / columns);
+        const column = Math.max(0, participantIndex) % columns;
+        const rowCount = Math.min(columns, Math.max(1, participants.length - (row * columns)));
         return {
             id,
             type: 'projectGraph',
-            position: { x: Math.cos(angle) * radius, y: Math.sin(angle) * Math.max(150, radius * 0.65) },
+            position: isLeader || id === leaderId
+                ? { x: 0, y: 0 }
+                : { x: (column - ((rowCount - 1) / 2)) * 330, y: 230 + (row * 150) },
             data: {
                 kind: 'agent',
                 label: valueText(member, 'name_snapshot', 'agent_name', 'name') || '未命名 Agent',
@@ -346,14 +338,14 @@ export function A2AMeshGraph({ members, events = [], selectedAgentId, onAgentSel
                 tone: !enabled ? 'neutral' : isLeader ? 'info' : 'success',
             },
         };
-    })], [ordered, radius, selectedAgentId]);
+    }), [leaderId, ordered, participants, selectedAgentId]);
     const edges = useMemo<Edge[]>(() => [
-        ...ordered.filter((member) => member.is_enabled !== false).map((member) => {
+        ...ordered.filter((member) => member.is_enabled !== false && valueText(member, 'agent_id', 'id', 'member_id') !== leaderId).map((member) => {
             const agentId = valueText(member, 'agent_id', 'id', 'member_id');
-            return makeEdge(`mesh-${agentId}`, 'project-a2a-mesh', agentId, {
+            return makeEdge(`leader-entry-${agentId}`, leaderId, agentId, {
                 type: 'bezier',
-                label: '可直连',
-                markerStart: { type: MarkerType.ArrowClosed, color: 'var(--text-tertiary)', width: 15, height: 15 },
+                label: '协作入口',
+                markerEnd: { type: MarkerType.ArrowClosed, color: 'var(--text-tertiary)', width: 15, height: 15 },
                 style: { ...edgeStyle, strokeDasharray: '4 5' },
             });
         }),
@@ -369,11 +361,8 @@ export function A2AMeshGraph({ members, events = [], selectedAgentId, onAgentSel
                 markerEnd: { type: MarkerType.ArrowClosed, color: 'var(--info)', width: 15, height: 15 },
             },
         )),
-    ], [ordered, relationshipCounts]);
-    const records = useMemo(() => new Map<string, ProjectGraphRecord>([
-        ['project-a2a-mesh', {}],
-        ...ordered.map((member) => [valueText(member, 'agent_id', 'id', 'member_id'), member] as [string, ProjectGraphRecord]),
-    ]), [ordered]);
+    ], [leaderId, ordered, relationshipCounts]);
+    const records = useMemo(() => new Map<string, ProjectGraphRecord>(ordered.map((member) => [valueText(member, 'agent_id', 'id', 'member_id'), member] as [string, ProjectGraphRecord])), [ordered]);
 
     return (
         <ProjectGraphCanvas
@@ -382,7 +371,7 @@ export function A2AMeshGraph({ members, events = [], selectedAgentId, onAgentSel
             edges={edges}
             records={records}
             miniMap={ordered.length > 7}
-            onSelect={({ id, record }) => { if (id !== 'project-a2a-mesh') onAgentSelect?.(id, record); }}
+            onSelect={({ id, record }) => onAgentSelect?.(id, record)}
         />
     );
 }
@@ -462,7 +451,7 @@ export function SnapshotLineageGraph({ member, runs = [], runSnapshots = [], onN
                     tone: statusTone(status),
                 },
             });
-            records.set(nodeId, entry);
+            records.set(nodeId, runRecord);
             edges.push(makeEdge(`project-to-${nodeId}`, projectId, nodeId, { label: '运行时冻结' }));
         });
         return { nodes, edges, records };
@@ -489,20 +478,27 @@ function dependencyRanks(items: ProjectGraphRecord[]): Map<string, number> {
     const ids = new Set(items.map((item) => valueText(item, 'id', 'work_item_id')).filter(Boolean));
     const dependencies = new Map(items.map((item) => {
         const id = valueText(item, 'id', 'work_item_id');
-        const refs = [...valueList(item, 'dependency_ids'), valueText(item, 'parent_id')].filter((ref) => ref && ids.has(ref));
+        const refs = [...new Set(valueList(item, 'dependency_ids'))].filter((ref) => ref && ref !== id && ids.has(ref));
         return [id, refs] as const;
     }));
-    const memo = new Map<string, number>();
-    const visit = (id: string, visiting: Set<string>): number => {
-        if (memo.has(id)) return memo.get(id) || 0;
-        if (visiting.has(id)) return 0;
-        const nextVisiting = new Set(visiting).add(id);
-        const rank = Math.max(0, ...(dependencies.get(id) || []).map((dependency) => visit(dependency, nextVisiting) + 1));
-        memo.set(id, rank);
-        return rank;
-    };
-    for (const id of ids) visit(id, new Set());
-    return memo;
+    const ranks = new Map<string, number>();
+    const unresolved = new Set(ids);
+    let changed = true;
+    while (unresolved.size && changed) {
+        changed = false;
+        for (const id of [...unresolved]) {
+            const refs = dependencies.get(id) || [];
+            if (refs.some((dependency) => !ranks.has(dependency))) continue;
+            ranks.set(id, refs.length ? Math.max(...refs.map((dependency) => ranks.get(dependency) || 0)) + 1 : 0);
+            unresolved.delete(id);
+            changed = true;
+        }
+    }
+    // Cycles are invalid project data, but the graph must remain inspectable.
+    // Keep every unresolved node together after the valid DAG instead of recursing forever.
+    const cycleRank = Math.max(-1, ...ranks.values()) + 1;
+    [...unresolved].sort().forEach((id) => ranks.set(id, cycleRank));
+    return ranks;
 }
 
 export function WorkDependencyGraph({ items, selectedWorkItemId, onWorkItemSelect }: WorkDependencyGraphProps) {
@@ -544,11 +540,9 @@ export function WorkDependencyGraph({ items, selectedWorkItemId, onWorkItemSelec
         const knownIds = new Set(nodes.map((node) => node.id));
         for (const item of items) {
             const target = valueText(item, 'id', 'work_item_id');
-            const parent = valueText(item, 'parent_id');
-            const dependencyIds = valueList(item, 'dependency_ids');
-            if (parent && knownIds.has(parent)) edges.push(makeEdge(`parent-${parent}-${target}`, parent, target, { label: '父任务' }));
+            const dependencyIds = [...new Set(valueList(item, 'dependency_ids'))];
             for (const dependency of dependencyIds) {
-                if (dependency !== parent && knownIds.has(dependency)) {
+                if (dependency !== target && knownIds.has(dependency)) {
                     edges.push(makeEdge(`dependency-${dependency}-${target}`, dependency, target, { label: '依赖' }));
                 }
             }

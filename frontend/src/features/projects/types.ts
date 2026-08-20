@@ -117,6 +117,7 @@ export interface ProjectShareTarget {
     id: string;
     name: string;
     email?: string | null;
+    avatar_url?: string | null;
 }
 
 export interface ProjectCreatePayload {

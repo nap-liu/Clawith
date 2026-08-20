@@ -11,6 +11,9 @@ import './MultiSelectDropdown.css';
 export type MultiSelectOption = {
     value: string;
     label: string;
+    description?: string;
+    avatarUrl?: string | null;
+    avatarFallback?: string;
 };
 
 type MultiSelectDropdownProps = {
@@ -128,7 +131,17 @@ export default function MultiSelectDropdown({
                                 onChange={() => toggle(option.value)}
                                 aria-label={option.label}
                             />
-                            <span>{option.label}</span>
+                            {option.avatarUrl ? (
+                                <img className="ui-multi-select__avatar" src={option.avatarUrl} alt="" />
+                            ) : option.avatarFallback ? (
+                                <span className="ui-multi-select__avatar ui-multi-select__avatar--fallback" aria-hidden="true">
+                                    {option.avatarFallback}
+                                </span>
+                            ) : null}
+                            <span className="ui-multi-select__option-copy">
+                                <strong>{option.label}</strong>
+                                {option.description && <small>{option.description}</small>}
+                            </span>
                         </label>
                     );
                 })}

@@ -876,7 +876,7 @@ export default function SessionViewerDrawer({
                                     ? groupConfig
                                         ? groupTurn?.phase === 'expired'
                                             ? t('agent.sessionViewer.groupTurnExpired')
-                                            : groupProcessingLabel || t('agent.sessionViewer.groupConnected')
+                                            : t('agent.sessionViewer.groupConnected')
                                         : t('agent.sessionViewer.connected', '已连接标准 Web Chat')
                                     : t('agent.sessionViewer.connecting', '正在连接会话…')}
                         </small>
