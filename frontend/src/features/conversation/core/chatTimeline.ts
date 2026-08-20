@@ -789,6 +789,7 @@ export function buildConversationEntries(messages: ConversationMessage[]): Conve
         if (msg.role === 'assistant') {
             const contentText = msg.content?.trim() || '';
             const hasAttachments = Array.isArray(msg.attachments) && msg.attachments.length > 0;
+            const isStreamingPlaceholder = Boolean(msg.streaming || msg._streaming);
             if (msg.thinking) {
                 if (!currentGroup) {
                     currentGroup = [];
@@ -797,7 +798,11 @@ export function buildConversationEntries(messages: ConversationMessage[]): Conve
                 }
                 pushThinking(currentGroup, msg.thinking);
             }
-            if (!contentText && !hasAttachments) continue;
+            // Keep the canonical empty streaming row. ConversationTimeline
+            // renders it with the same thinking/loading bubble used by normal
+            // Web Chat. Dropping it here made project group turns appear to be
+            // idle while the composer button alone kept spinning.
+            if (!contentText && !hasAttachments && !isStreamingPlaceholder) continue;
             flushGroup();
             grouped.push({
                 type: 'message',

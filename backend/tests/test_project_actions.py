@@ -386,12 +386,10 @@ async def test_private_share_settings_and_audit_are_a_real_api_round_trip(projec
     assert private.json()["visibility"] == "private"
     assert private.json()["shared_with"] == []
     remaining_grants = (
-        await env.db.execute(
-            select(ProjectAccessGrant).where(
-                ProjectAccessGrant.project_id == uuid.UUID(project_id)
-            )
-        )
-    ).scalars().all()
+        (await env.db.execute(select(ProjectAccessGrant).where(ProjectAccessGrant.project_id == uuid.UUID(project_id))))
+        .scalars()
+        .all()
+    )
     assert remaining_grants == []
 
     events_response = await env.client.get(f"/api/projects/{project_id}/events")
@@ -496,9 +494,7 @@ async def test_member_and_run_snapshots_are_isolated_and_a2a_bypasses_leader(pro
     a2a_event = next(event for event in events if event["event_type"] == "a2a.queued")
     assert a2a_event["from_agent_id"] == str(worker_id)
     assert a2a_event["to_agent_id"] == str(reviewer_id)
-    assert {"run.queued", "capability.updated", "member.snapshot.updated"} <= {
-        event["event_type"] for event in events
-    }
+    assert {"run.queued", "capability.updated", "member.snapshot.updated"} <= {event["event_type"] for event in events}
 
 
 async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh_child(
@@ -639,11 +635,7 @@ async def test_member_departure_is_audited_revocation_and_restore_starts_a_fresh
     assert owner_user is not None
     assert await project_session_access_mode(env.db, owner_user, second_child_session) == "edit"
 
-    events = (
-        await env.db.execute(
-            select(ProjectEvent).where(ProjectEvent.project_id == project_id)
-        )
-    ).scalars().all()
+    events = (await env.db.execute(select(ProjectEvent).where(ProjectEvent.project_id == project_id))).scalars().all()
     lifecycle_events = [row for row in events if row.event_type in {"member.departed", "member.restored"}]
     assert [row.event_type for row in lifecycle_events] == ["member.departed", "member.restored"]
     assert lifecycle_events[0].event_metadata["snapshot_retained"] is True
@@ -928,6 +920,316 @@ async def test_project_a2a_delivery_returns_scoped_session_identifiers(
     assert delivered.event_metadata["group_session_id"] == queued_body["group_session_id"]
 
 
+async def test_project_a2a_uses_durable_project_child_and_exact_standard_timeline(
+    project_api: ProjectApiEnv,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A→B stays single-target while B retains project tools and exact trace."""
+    from datetime import timedelta
+
+    from app.models.chat_session import ChatSession
+    from app.models.project import ProjectMemberSnapshot, ProjectRun, ProjectWorkItem
+    from app.models.subagent_run import SubagentRun
+    from app.services import agent_tools, project_runtime_tools, project_service, subagent_runtime
+
+    env = project_api
+    monkeypatch.setattr(agent_tools, "async_session", env.session_factory)
+    monkeypatch.setattr(project_service, "async_session", env.session_factory)
+    project = await _create_project(env, name="Durable exact project A2A")
+    project_id = uuid.UUID(project["id"])
+
+    work_item = ProjectWorkItem(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        assignee_agent_id=env.worker_id,
+        created_by_agent_id=env.leader_id,
+        title="Write A2A evidence",
+        description="B must update this item inside its project runtime",
+        status="todo",
+        priority="medium",
+        acceptance_criteria=["Committed evidence exists"],
+        dependency_ids=[],
+    )
+    env.db.add(work_item)
+    await env.db.commit()
+    work_item_id = work_item.id
+
+    raw_result = await agent_tools._send_message_to_agent(
+        env.leader_id,
+        {
+            "agent_id": str(env.worker_id),
+            "message": "Write docs/a2a-evidence.md and mark the assigned item done.",
+            "msg_type": "task_delegate",
+            "force_async": True,
+            "_project_id": str(project_id),
+        },
+        user_id=env.owner_id,
+        origin_session_id=None,
+        tool_call_id="leader-a2a-worker-1",
+    )
+    result = json.loads(raw_result)
+    assert result["status"] == "queued"
+    assert result["awakened_agent_ids"] == [str(env.worker_id)]
+    a2a_session_id = uuid.UUID(result["a2a_session_id"])
+    child_id = uuid.UUID(result["subagent_session_id"])
+    project_run_id = uuid.UUID(result["project_run_id"])
+
+    a2a_session = await env.db.get(ChatSession, a2a_session_id)
+    child = await env.db.get(ChatSession, child_id)
+    durable = await env.db.get(SubagentRun, child_id)
+    run = await env.db.get(ProjectRun, project_run_id)
+    assert a2a_session is not None and a2a_session.source_channel == "agent"
+    assert a2a_session.project_id == project_id
+    assert child is not None and child.source_channel == "subagent"
+    assert child.project_id == project_id and child.agent_id == env.worker_id
+    assert durable is not None and durable.parent_session_id == a2a_session_id
+    assert durable.project_member_id is not None
+    assert run is not None and run.status in {"queued", "running"}
+    assert run.output["session_id"] == str(a2a_session_id)
+    assert run.output["subagent_session_id"] == str(child_id)
+
+    tool_names = {
+        item["function"]["name"]
+        for item in await subagent_runtime.prepare_subagent_tools(
+            env.worker_id,
+            child_id,
+            execution_user_id=env.owner_id,
+        )
+    }
+    assert {"project_write_file", "project_update_work_item", "project_message_agent"} <= tool_names
+
+    write_result = json.loads(
+        await project_runtime_tools.execute_project_runtime_tool(
+            "project_write_file",
+            {"path": "docs/a2a-evidence.md", "content": "# Exact A2A evidence\n"},
+            agent_id=env.worker_id,
+            execution_user_id=env.owner_id,
+            session_id=str(child_id),
+            tool_call_id="worker-write-a2a-evidence",
+            turn_anchor_id=None,
+        )
+    )
+    assert write_result["commit"]
+    await project_runtime_tools.execute_project_runtime_tool(
+        "project_update_work_item",
+        {
+            "work_item_id": str(work_item_id),
+            "status": "done",
+            "progress_note": "Evidence committed through project A2A child",
+            "evidence": ["docs/a2a-evidence.md", write_result["commit"]],
+        },
+        agent_id=env.worker_id,
+        execution_user_id=env.owner_id,
+        session_id=str(child_id),
+        tool_call_id="worker-finish-a2a-item",
+        turn_anchor_id=None,
+    )
+
+    child_input = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(child_id),
+                ChatMessage.message_meta["project_run_id"].as_string() == str(project_run_id),
+            )
+        )
+    ).scalar_one()
+    child_input.message_meta = {
+        **dict(child_input.message_meta or {}),
+        "subagent_input_state": "processing",
+        "subagent_turn_anchor_id": str(child_input.id),
+        "turn_status": "running",
+    }
+    durable.status = "running"
+    durable.lease_owner = subagent_runtime.settings.INSTANCE_ID
+    base_time = child_input.created_at + timedelta(seconds=1)
+    env.db.add_all(
+        [
+            ChatMessage(
+                agent_id=env.worker_id,
+                sender_agent_id=env.worker_id,
+                role="assistant",
+                content="",
+                thinking="I should write the evidence before completing the item.",
+                conversation_id=str(child_id),
+                message_meta={"turn_anchor_id": str(child_input.id)},
+                created_at=base_time,
+            ),
+            ChatMessage(
+                agent_id=env.worker_id,
+                sender_agent_id=env.worker_id,
+                role="tool_call",
+                content=json.dumps(
+                    {
+                        "name": "project_write_file",
+                        "call_id": "worker-write-a2a-evidence",
+                        "args": {"path": "docs/a2a-evidence.md"},
+                        "status": "done",
+                        "result": write_result,
+                    }
+                ),
+                conversation_id=str(child_id),
+                message_meta={"turn_anchor_id": str(child_input.id)},
+                created_at=base_time + timedelta(seconds=1),
+            ),
+        ]
+    )
+    await env.db.commit()
+
+    assert (
+        await subagent_runtime._finish_subagent_turn(
+            run_id=child_id,
+            anchor_id=child_input.id,
+            reply="Evidence committed and assigned work item completed.",
+            failed=False,
+        )
+        is True
+    )
+    completion = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(child_id),
+                ChatMessage.message_meta["kind"].as_string() == "subagent_completion",
+            )
+        )
+    ).scalar_one()
+    assert await subagent_runtime._dispatch_parent_event(completion.id) is True
+
+    visible_rows = (
+        (
+            await env.db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == str(a2a_session_id))
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert visible_rows[0].sender_agent_id == env.leader_id
+    assert visible_rows[0].message_meta["target_agent_id"] == str(env.worker_id)
+    assert any(row.thinking for row in visible_rows)
+    assert any(row.role == "tool_call" for row in visible_rows)
+    final_reply = next(row for row in visible_rows if row.content.startswith("Evidence committed"))
+    assert final_reply.role == "assistant"
+    assert final_reply.sender_agent_id == env.worker_id
+    assert final_reply.message_meta["a2a_session_id"] == str(a2a_session_id)
+    assert final_reply.message_meta["subagent_session_id"] == str(child_id)
+
+    env.db.expire_all()
+    completed_run = await env.db.get(ProjectRun, project_run_id)
+    completed_item = await env.db.get(ProjectWorkItem, work_item_id)
+    assert completed_run is not None and completed_run.status == "succeeded"
+    assert completed_run.output["session_id"] == str(a2a_session_id)
+    assert completed_run.output["subagent_session_id"] == str(child_id)
+    assert completed_item is not None and completed_item.status == "done"
+    terminal_event = (
+        await env.db.execute(
+            select(ProjectEvent).where(
+                ProjectEvent.run_id == project_run_id,
+                ProjectEvent.event_type == "run.succeeded",
+            )
+        )
+    ).scalar_one()
+    assert terminal_event.event_metadata["session_id"] == str(a2a_session_id)
+    assert terminal_event.event_metadata["subagent_session_id"] == str(child_id)
+
+    failure_run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=project_id,
+        agent_id=env.worker_id,
+        initiated_by_user_id=env.owner_id,
+        status="queued",
+        trigger_type="a2a",
+        input={"message": "Exercise the failed terminal audit contract"},
+        output={"session_id": str(a2a_session_id)},
+    )
+    env.db.add(failure_run)
+    await env.db.commit()
+    failure_run_id = failure_run.id
+    await subagent_runtime.append_subagent_message(
+        agent_id=env.worker_id,
+        parent_session_id=str(a2a_session_id),
+        subagent_id=str(child_id),
+        message="This test turn intentionally fails.",
+        execution_user_id=env.owner_id,
+        origin_tool_call_id="worker-a2a-failure-audit",
+        project_run_id=failure_run_id,
+        input_metadata={"project_a2a": True, "a2a_session_id": str(a2a_session_id)},
+    )
+    failed_input = (
+        await env.db.execute(
+            select(ChatMessage).where(
+                ChatMessage.conversation_id == str(child_id),
+                ChatMessage.message_meta["project_run_id"].as_string() == str(failure_run_id),
+            )
+        )
+    ).scalar_one()
+    failed_input.message_meta = {
+        **dict(failed_input.message_meta or {}),
+        "subagent_input_state": "processing",
+        "subagent_turn_anchor_id": str(failed_input.id),
+        "turn_status": "running",
+    }
+    durable = await env.db.get(SubagentRun, child_id)
+    assert durable is not None
+    durable.status = "running"
+    durable.lease_owner = subagent_runtime.settings.INSTANCE_ID
+    await env.db.commit()
+    assert (
+        await subagent_runtime._finish_subagent_turn(
+            run_id=child_id,
+            anchor_id=failed_input.id,
+            reply="Intentional project A2A failure",
+            failed=True,
+        )
+        is True
+    )
+    failed_terminal_event = (
+        await env.db.execute(
+            select(ProjectEvent).where(
+                ProjectEvent.run_id == failure_run_id,
+                ProjectEvent.event_type == "run.failed",
+            )
+        )
+    ).scalar_one()
+    assert failed_terminal_event.event_metadata["session_id"] == str(a2a_session_id)
+    assert failed_terminal_event.event_metadata["subagent_session_id"] == str(child_id)
+
+    worker_member = (
+        await env.db.execute(
+            select(ProjectMemberSnapshot).where(
+                ProjectMemberSnapshot.project_id == project_id,
+                ProjectMemberSnapshot.agent_id == env.worker_id,
+            )
+        )
+    ).scalar_one()
+    stored_project = await env.db.get(Project, project_id)
+    assert stored_project is not None
+    await project_service.deactivate_project_member(
+        env.db,
+        stored_project,
+        worker_member,
+        actor_user_id=env.owner_id,
+        reason="A2A membership regression",
+    )
+    await env.db.commit()
+    rejected = await agent_tools._send_message_to_agent(
+        env.leader_id,
+        {
+            "agent_id": str(env.worker_id),
+            "message": "This departed member must not wake.",
+            "msg_type": "notify",
+            "force_async": True,
+            "_project_id": str(project_id),
+        },
+        user_id=env.owner_id,
+        tool_call_id="leader-a2a-departed-worker",
+    )
+    rejection_payload = json.loads(rejected)
+    assert rejection_payload["status"] == "error"
+    assert rejection_payload["code"] == "project_member_inactive"
+
+
 async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
     project_api: ProjectApiEnv,
 ):
@@ -952,10 +1254,7 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
     assert len(passive_body["subagent_runs"]) == 1
     assert passive_body["subagent_runs"][0]["agent_id"] == str(env.leader_id)
     assert passive_body["message"]["message_meta"]["visible_to_group"] is True
-    assert (
-        passive_body["message"]["message_meta"]["wake_policy"]
-        == "default_leader_plus_structured_mentions"
-    )
+    assert passive_body["message"]["message_meta"]["wake_policy"] == "default_leader_plus_structured_mentions"
 
     mentioned = await env.client.post(
         f"/api/projects/{project_id}/group-sessions/{group['id']}/messages",
@@ -982,8 +1281,7 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
         await env.db.execute(
             select(ChatMessage).where(
                 ChatMessage.conversation_id == worker_child["session_id"],
-                ChatMessage.message_meta["project_run_id"].as_string()
-                == worker_child["project_run_id"],
+                ChatMessage.message_meta["project_run_id"].as_string() == worker_child["project_run_id"],
             )
         )
     ).scalar_one()
@@ -1006,11 +1304,7 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
         json={"content": "Worker follow-up", "mentions": [str(env.worker_id)]},
     )
     assert reused.status_code == 201, reused.text
-    reused_worker = next(
-        row
-        for row in reused.json()["subagent_runs"]
-        if row["agent_id"] == str(env.worker_id)
-    )
+    reused_worker = next(row for row in reused.json()["subagent_runs"] if row["agent_id"] == str(env.worker_id))
     assert reused_worker["session_id"] == worker_child["session_id"]
     assert reused_worker["project_run_id"] != worker_child["project_run_id"]
 
@@ -1078,14 +1372,10 @@ async def test_project_group_routes_human_to_leader_and_reuses_durable_children(
     )
     assert self_mention.status_code == 422
 
-    history = await env.client.get(
-        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages?limit=500"
-    )
+    history = await env.client.get(f"/api/projects/{project_id}/group-sessions/{group['id']}/messages?limit=500")
     assert history.status_code == 200
     assert len(history.json()["items"]) == 4
-    attachment_message = next(
-        item for item in history.json()["items"] if item["attachments"]
-    )
+    attachment_message = next(item for item in history.json()["items"] if item["attachments"])
     assert attachment_message["attachments"][0]["name"] == "brief.md"
 
 
@@ -1117,13 +1407,17 @@ async def test_project_group_dispatch_outbox_recovers_on_idempotent_replay(
     assert first.status_code == 201, first.text
     assert first.json()["awakened_agent_ids"] == []
     pending = (
-        await env.db.execute(
-            select(ProjectRun).where(
-                ProjectRun.project_id == uuid.UUID(project_id),
-                ProjectRun.trigger_type.in_(["group_leader_message", "group_mention"]),
+        (
+            await env.db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == uuid.UUID(project_id),
+                    ProjectRun.trigger_type.in_(["group_leader_message", "group_mention"]),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(pending) == 2
     assert all(row.status == "queued" and row.input["dispatch"]["task"] for row in pending)
     pending_ids = [row.id for row in pending]
@@ -1143,11 +1437,7 @@ async def test_project_group_dispatch_outbox_recovers_on_idempotent_replay(
     assert replay_body["awakened_agent_ids"] == [str(env.leader_id), str(env.worker_id)]
     assert len(replay_body["subagent_runs"]) == 2
     env.db.expire_all()
-    recovered = (
-        await env.db.execute(
-            select(ProjectRun).where(ProjectRun.id.in_(pending_ids))
-        )
-    ).scalars().all()
+    recovered = (await env.db.execute(select(ProjectRun).where(ProjectRun.id.in_(pending_ids)))).scalars().all()
     assert all(row.output["subagent_run_id"] for row in recovered)
 
 
@@ -1263,16 +1553,18 @@ async def test_kickoff_requires_leader_discussion_then_freezes_and_starts(projec
     run = await env.db.get(ProjectRun, uuid.UUID(body["run_id"]))
     child = await env.db.get(SubagentRun, uuid.UUID(body["subagent_run_id"]))
     assert stored_project is not None and stored_project.status == "running"
+    assert stored_project.settings["planning"]["state"] == "confirmed"
+    assert stored_project.settings["planning"]["launch_confirmed"] is True
     assert stored_project.settings["kickoff"]["project_run_id"] == body["run_id"]
     assert run is not None and run.trigger_type == "leader_kickoff"
     assert run.input["conversation_snapshot"]["message_count"] == 2
     assert run.input["conversation_snapshot"]["transcript_sha256"]
     assert run.output["transcript_commit"] == body["transcript_commit"]
     snapshots = (
-        await env.db.execute(
-            select(ProjectRunMemberSnapshot).where(ProjectRunMemberSnapshot.run_id == run.id)
-        )
-    ).scalars().all()
+        (await env.db.execute(select(ProjectRunMemberSnapshot).where(ProjectRunMemberSnapshot.run_id == run.id)))
+        .scalars()
+        .all()
+    )
     assert len(snapshots) == 3
     assert child is not None and child.project_id == uuid.UUID(project_id)
     assert child.project_member_id == next(item.project_member_id for item in snapshots if item.is_leader)
@@ -1315,9 +1607,7 @@ async def test_kickoff_requires_leader_discussion_then_freezes_and_starts(projec
     assert event.event_metadata["transcript_commit"] == body["transcript_commit"]
     kickoff_group_message = (
         await env.db.execute(
-            select(ChatMessage).where(
-                ChatMessage.external_event_key.like(f"project-kickoff:{project_id}:%")
-            )
+            select(ChatMessage).where(ChatMessage.external_event_key.like(f"project-kickoff:{project_id}:%"))
         )
     ).scalar_one()
     assert kickoff_group_message.message_meta["mentions"] == []
@@ -1466,13 +1756,17 @@ async def test_kickoff_outbox_recovers_initializing_project(
     env.db.expire_all()
     stored = await env.db.get(Project, uuid.UUID(project_id))
     events = (
-        await env.db.execute(
-            select(ProjectEvent).where(
-                ProjectEvent.project_id == uuid.UUID(project_id),
-                ProjectEvent.event_type == "project.kickoff.confirmed",
+        (
+            await env.db.execute(
+                select(ProjectEvent).where(
+                    ProjectEvent.project_id == uuid.UUID(project_id),
+                    ProjectEvent.event_type == "project.kickoff.confirmed",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert stored is not None and stored.status == "running"
     assert len(events) == 1
 
@@ -1495,11 +1789,7 @@ async def test_project_subagent_reply_materializes_without_resuming_group_root(
         json={"content": "Worker answer once", "mentions": [str(env.worker_id)]},
     )
     assert wake.status_code == 201, wake.text
-    worker_wake = next(
-        row
-        for row in wake.json()["subagent_runs"]
-        if row["agent_id"] == str(env.worker_id)
-    )
+    worker_wake = next(row for row in wake.json()["subagent_runs"] if row["agent_id"] == str(env.worker_id))
     child_id = uuid.UUID(worker_wake["session_id"])
     project_run_id = uuid.UUID(worker_wake["project_run_id"])
     child_input = (
@@ -1551,9 +1841,7 @@ async def test_project_subagent_reply_materializes_without_resuming_group_root(
     assert await subagent_runtime._dispatch_parent_event(completion.id) is True
     materialized = (
         await env.db.execute(
-            select(ChatMessage).where(
-                ChatMessage.external_event_key == f"project-subagent:{completion.id}"
-            )
+            select(ChatMessage).where(ChatMessage.external_event_key == f"project-subagent:{completion.id}")
         )
     ).scalar_one()
     assert materialized.conversation_id == group["id"]
@@ -1583,9 +1871,7 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
         json={"content": "Show the full execution turn", "mentions": [str(env.worker_id)]},
     )
     assert wake.status_code == 201, wake.text
-    worker_wake = next(
-        row for row in wake.json()["subagent_runs"] if row["agent_id"] == str(env.worker_id)
-    )
+    worker_wake = next(row for row in wake.json()["subagent_runs"] if row["agent_id"] == str(env.worker_id))
     child_id = uuid.UUID(worker_wake["session_id"])
     project_run_id = uuid.UUID(worker_wake["project_run_id"])
     child_input = (
@@ -1606,14 +1892,16 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
     running_tool = ChatMessage(
         agent_id=env.worker_id,
         role="tool_call",
-        content=json.dumps({
-            "name": "read_file",
-            "call_id": "worker-read-1",
-            "args": {"path": "README.md"},
-            "status": "running",
-            "result": "",
-            "reasoning_content": "Inspecting the project evidence",
-        }),
+        content=json.dumps(
+            {
+                "name": "read_file",
+                "call_id": "worker-read-1",
+                "args": {"path": "README.md"},
+                "status": "running",
+                "result": "",
+                "reasoning_content": "Inspecting the project evidence",
+            }
+        ),
         conversation_id=str(child_id),
         message_meta={"turn_anchor_id": str(child_input.id)},
         created_at=base_time,
@@ -1621,14 +1909,16 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
     done_tool = ChatMessage(
         agent_id=env.worker_id,
         role="tool_call",
-        content=json.dumps({
-            "name": "read_file",
-            "call_id": "worker-read-1",
-            "args": {"path": "README.md"},
-            "status": "done",
-            "result": "# Project evidence",
-            "reasoning_content": "Inspecting the project evidence",
-        }),
+        content=json.dumps(
+            {
+                "name": "read_file",
+                "call_id": "worker-read-1",
+                "args": {"path": "README.md"},
+                "status": "done",
+                "result": "# Project evidence",
+                "reasoning_content": "Inspecting the project evidence",
+            }
+        ),
         conversation_id=str(child_id),
         message_meta={"turn_anchor_id": str(child_input.id)},
         created_at=base_time + timedelta(seconds=1),
@@ -1636,12 +1926,14 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
     confirmation = ChatMessage(
         agent_id=env.worker_id,
         role="tool_call",
-        content=json.dumps({
-            "name": "request_confirmation",
-            "args": {"title": "Approve delivery", "summary": "Publish the evidence"},
-            "status": "pending",
-            "result": "",
-        }),
+        content=json.dumps(
+            {
+                "name": "request_confirmation",
+                "args": {"title": "Approve delivery", "summary": "Publish the evidence"},
+                "status": "pending",
+                "result": "",
+            }
+        ),
         conversation_id=str(child_id),
         message_meta={"turn_anchor_id": str(child_input.id), "turn_status": "suspended"},
         created_at=base_time + timedelta(seconds=2),
@@ -1691,9 +1983,7 @@ async def test_project_group_timeline_reuses_standard_child_message_contract(
     env.db.add(materialized)
     await env.db.commit()
 
-    response = await env.client.get(
-        f"/api/projects/{project_id}/group-sessions/{group['id']}/messages"
-    )
+    response = await env.client.get(f"/api/projects/{project_id}/group-sessions/{group['id']}/messages")
     assert response.status_code == 200, response.text
     items = response.json()["items"]
     assert len([item for item in items if item["role"] == "user"]) == 1
@@ -1793,69 +2083,89 @@ async def test_project_participant_replies_coalesce_into_one_durable_leader_turn
     for completion in completion_rows:
         assert await subagent_runtime._dispatch_parent_event(completion.id) is True
 
-    assert await subagent_runtime._dispatch_project_leader_batch(
-        uuid.UUID(group["id"]),
-        debounce_seconds=0,
-    ) is True
+    assert (
+        await subagent_runtime._dispatch_project_leader_batch(
+            uuid.UUID(group["id"]),
+            debounce_seconds=0,
+        )
+        is True
+    )
     env.db.expire_all()
     leader_inputs = (
-        await env.db.execute(
-            select(ChatMessage).where(
-                ChatMessage.conversation_id == str(leader_child_id),
-                ChatMessage.message_meta["project_leader_batch"].as_boolean().is_(True),
+        (
+            await env.db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(leader_child_id),
+                    ChatMessage.message_meta["project_leader_batch"].as_boolean().is_(True),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(leader_inputs) == 1
     batch_input = leader_inputs[0]
     assert len(batch_input.message_meta["source_group_message_ids"]) == 3
     assert len(batch_input.message_meta["source_replies"]) == 3
     batch_attachments = [
-        attachment
-        for reply in batch_input.message_meta["source_replies"]
-        for attachment in reply["attachments"]
+        attachment for reply in batch_input.message_meta["source_replies"] for attachment in reply["attachments"]
     ]
     assert batch_attachments[0]["name"] == "evidence-a.md"
 
     materialized = (
-        await env.db.execute(
-            select(ChatMessage).where(
-                ChatMessage.conversation_id == group["id"],
-                ChatMessage.message_meta["kind"].as_string() == "project_subagent_reply",
+        (
+            await env.db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == group["id"],
+                    ChatMessage.message_meta["kind"].as_string() == "project_subagent_reply",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(materialized) == 3
     assert {row.message_meta["leader_batch_state"] for row in materialized} == {"delivered"}
     assert len({row.message_meta["leader_batch_id"] for row in materialized}) == 1
 
     batch_runs = (
-        await env.db.execute(
-            select(ProjectRun).where(
-                ProjectRun.project_id == project_id,
-                ProjectRun.trigger_type == "leader_reply_batch",
+        (
+            await env.db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project_id,
+                    ProjectRun.trigger_type == "leader_reply_batch",
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(batch_runs) == 1
     assert batch_runs[0].output["subagent_session_id"] == str(leader_child_id)
     assert batch_runs[0].output["source_count"] == 3
     leader_run = await env.db.get(SubagentRun, leader_child_id)
     assert leader_run is not None and leader_run.parent_session_id == uuid.UUID(group["id"])
 
-    assert await subagent_runtime._dispatch_project_leader_batch(
-        uuid.UUID(group["id"]),
-        debounce_seconds=0,
-    ) is False
+    assert (
+        await subagent_runtime._dispatch_project_leader_batch(
+            uuid.UUID(group["id"]),
+            debounce_seconds=0,
+        )
+        is False
+    )
     env.db.expire_all()
     replay_inputs = (
-        await env.db.execute(
-            select(ChatMessage).where(
-                ChatMessage.conversation_id == str(leader_child_id),
-                ChatMessage.message_meta["project_leader_batch"].as_boolean().is_(True),
+        (
+            await env.db.execute(
+                select(ChatMessage).where(
+                    ChatMessage.conversation_id == str(leader_child_id),
+                    ChatMessage.message_meta["project_leader_batch"].as_boolean().is_(True),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert len(replay_inputs) == 1
 
 
@@ -1908,18 +2218,10 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
     )
     assert worker_wake.status_code == leader_wake.status_code == 201
     worker_child_id = uuid.UUID(
-        next(
-            row
-            for row in worker_wake.json()["subagent_runs"]
-            if row["agent_id"] == str(env.worker_id)
-        )["session_id"]
+        next(row for row in worker_wake.json()["subagent_runs"] if row["agent_id"] == str(env.worker_id))["session_id"]
     )
     leader_child_id = uuid.UUID(
-        next(
-            row
-            for row in leader_wake.json()["subagent_runs"]
-            if row["agent_id"] == str(env.leader_id)
-        )["session_id"]
+        next(row for row in leader_wake.json()["subagent_runs"] if row["agent_id"] == str(env.leader_id))["session_id"]
     )
 
     worker_names = {
@@ -1942,7 +2244,13 @@ async def test_project_runtime_tools_are_role_projected_and_double_enforced(
     assert {"project_update_work_item", "project_write_file", "project_message_agent"} <= worker_names
     assert "project_create_work_item" not in worker_names
     assert "project_update_plan" not in worker_names
-    assert {"project_create_work_item", "project_update_plan", "project_restore_commit"} <= leader_names
+    assert "project_set_status" not in worker_names
+    assert {
+        "project_create_work_item",
+        "project_update_plan",
+        "project_restore_commit",
+        "project_set_status",
+    } <= leader_names
 
     with pytest.raises(ValueError, match="authorized project Subagent runtime"):
         await prepare_subagent_tools(
@@ -2104,6 +2412,209 @@ async def test_work_item_mutations_update_dashboard_and_audit(project_api: Proje
     assert {"status", "priority"} <= set(updated["event_metadata"]["changed_fields"])
 
 
+async def test_run_work_item_and_milestone_contracts_are_explicit(project_api: ProjectApiEnv):
+    from app.models.project import ProjectRun
+    from app.services.project_runtime_tools import execute_project_runtime_tool
+
+    env = project_api
+    project = await _create_project(env, name="Explicit trace contract")
+    project_id = project["id"]
+    stored_project = await env.db.get(Project, uuid.UUID(project_id))
+    assert stored_project is not None
+    stored_project.status = "running"
+    await env.db.commit()
+
+    item_response = await env.client.post(
+        f"/api/projects/{project_id}/work-items",
+        json={
+            "title": "Ship traced artifact",
+            "assignee_agent_id": str(env.leader_id),
+            "acceptance_criteria": ["Artifact and milestone are linked"],
+        },
+    )
+    assert item_response.status_code == 201, item_response.text
+    item_id = item_response.json()["id"]
+    run_response = await env.client.post(
+        f"/api/projects/{project_id}/runs",
+        json={"work_item_id": item_id, "agent_id": str(env.leader_id)},
+    )
+    assert run_response.status_code == 201, run_response.text
+    run = run_response.json()
+    assert run["work_item_id"] == item_id
+    assert run["agent_name"] == "Leader"
+    assert run["project_member_id"]
+    assert run["member_snapshot"]["name_snapshot"] == "Leader"
+    assert run["session_id"] == run["subagent_session_id"]
+    child_id = uuid.UUID(run["subagent_session_id"])
+    child_input = (
+        await env.db.execute(
+            select(ChatMessage)
+            .where(
+                ChatMessage.conversation_id == str(child_id),
+                ChatMessage.role == "user",
+            )
+            .order_by(ChatMessage.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one()
+    assert child_input.message_meta["project_run_id"] == run["id"]
+    anchor_id = child_input.id
+
+    await execute_project_runtime_tool(
+        "project_update_work_item",
+        {
+            "work_item_id": item_id,
+            "status": "in_progress",
+            "progress_note": "Implementation is traceable",
+            "evidence": ["deliverables/traced.md"],
+        },
+        agent_id=env.leader_id,
+        execution_user_id=env.owner_id,
+        session_id=str(child_id),
+        tool_call_id="trace-update",
+        turn_anchor_id=anchor_id,
+    )
+    write_result = json.loads(
+        await execute_project_runtime_tool(
+            "project_write_file",
+            {"path": "deliverables/traced.md", "content": "# Durable evidence\n"},
+            agent_id=env.leader_id,
+            execution_user_id=env.owner_id,
+            session_id=str(child_id),
+            tool_call_id="trace-file",
+            turn_anchor_id=anchor_id,
+        )
+    )
+    milestone_result = json.loads(
+        await execute_project_runtime_tool(
+            "project_create_milestone",
+            {
+                "message": "Trace contract milestone",
+                "related_work_item_ids": [item_id],
+                "related_run_ids": [run["id"]],
+            },
+            agent_id=env.leader_id,
+            execution_user_id=env.owner_id,
+            session_id=str(child_id),
+            tool_call_id="trace-milestone",
+            turn_anchor_id=anchor_id,
+        )
+    )
+
+    detail_response = await env.client.get(f"/api/projects/{project_id}/work-items/{item_id}")
+    assert detail_response.status_code == 200, detail_response.text
+    detail = detail_response.json()
+    assert detail["work_item"]["id"] == item_id
+    assert [row["id"] for row in detail["runs"]] == [run["id"]]
+    assert detail["sessions"][0] == {
+        "run_id": run["id"],
+        "work_item_id": item_id,
+        "agent_id": str(env.leader_id),
+        "agent_name": "Leader",
+        "status": detail["runs"][0]["status"],
+        "source_channel": "subagent",
+        "session_intent": "execution",
+        "session_id": str(child_id),
+        "subagent_session_id": str(child_id),
+    }
+    assert any(row["path"] == "deliverables/traced.md" for row in detail["files"])
+    assert {row["commit"] for row in detail["commits"]} >= {
+        write_result["commit"],
+        milestone_result["commit"],
+    }
+    assert any(row["kind"] == "progress_note" for row in detail["evidence"])
+    assert any(row["kind"] == "evidence" for row in detail["evidence"])
+    traced_events = [
+        row
+        for row in detail["events"]
+        if row["event_type"] in {"work_item.updated", "project.file.committed", "git.milestone.created"}
+    ]
+    assert all(row["run_id"] == run["id"] for row in traced_events)
+    assert all(row["work_item_id"] == item_id for row in traced_events)
+
+    # A durable Leader child is reused across work items. Session equality is
+    # only a conversation entry point and must never pull another work item's
+    # Run, events, commits, files, or evidence into this detail contract.
+    other_item_response = await env.client.post(
+        f"/api/projects/{project_id}/work-items",
+        json={"title": "Unrelated work", "assignee_agent_id": str(env.leader_id)},
+    )
+    assert other_item_response.status_code == 201
+    other_item_id = other_item_response.json()["id"]
+    unrelated_run = ProjectRun(
+        tenant_id=env.tenant_id,
+        project_id=uuid.UUID(project_id),
+        work_item_id=uuid.UUID(other_item_id),
+        agent_id=env.leader_id,
+        initiated_by_user_id=env.owner_id,
+        status="succeeded",
+        trigger_type="manual",
+        output={"subagent_session_id": str(child_id)},
+    )
+    env.db.add(unrelated_run)
+    await env.db.flush()
+    foreign_commit = "f" * 40
+    env.db.add(
+        ProjectEvent(
+            tenant_id=env.tenant_id,
+            project_id=uuid.UUID(project_id),
+            work_item_id=uuid.UUID(other_item_id),
+            run_id=unrelated_run.id,
+            actor_agent_id=env.leader_id,
+            event_type="foreign.work.evidence",
+            summary="Must stay with the other work item",
+            event_metadata={
+                "project_run_id": str(unrelated_run.id),
+                "session_id": str(child_id),
+                "subagent_session_id": str(child_id),
+                "commit": foreign_commit,
+                "path": "foreign/only.md",
+                "evidence": ["foreign-evidence"],
+            },
+        )
+    )
+    await env.db.commit()
+    detail_again = (await env.client.get(f"/api/projects/{project_id}/work-items/{item_id}")).json()
+    assert [row["id"] for row in detail_again["runs"]] == [run["id"]]
+    assert all(row["event_type"] != "foreign.work.evidence" for row in detail_again["events"])
+    assert all(row["commit"] != foreign_commit for row in detail_again["commits"])
+    assert all(row["path"] != "foreign/only.md" for row in detail_again["files"])
+    assert all(row["value"] != "foreign-evidence" for row in detail_again["evidence"])
+    assert len(detail_again["sessions"]) == 1
+
+    milestones_response = await env.client.get(f"/api/projects/{project_id}/milestones")
+    assert milestones_response.status_code == 200, milestones_response.text
+    milestone = milestones_response.json()[0]
+    assert milestone["commit"] == milestone_result["commit"]
+    assert milestone["run_id"] == run["id"]
+    assert milestone["work_item_id"] == item_id
+    assert milestone["session_id"] == str(child_id)
+    assert milestone["subagent_session_id"] == str(child_id)
+    assert milestone["agent_name"] == "Leader"
+    assert milestone["related_run_ids"] == [run["id"]]
+    assert milestone["related_work_item_ids"] == [item_id]
+
+    completed = json.loads(
+        await execute_project_runtime_tool(
+            "project_set_status",
+            {"status": "completed", "reason": "Acceptance evidence is committed"},
+            agent_id=env.leader_id,
+            execution_user_id=env.owner_id,
+            session_id=str(child_id),
+            tool_call_id="trace-complete",
+            turn_anchor_id=anchor_id,
+        )
+    )
+    assert completed["status"] == "completed"
+    env.db.expire(stored_project)
+    refreshed_project = (await env.client.get(f"/api/projects/{project_id}")).json()
+    assert refreshed_project["status"] == "completed"
+    project_events = (await env.client.get(f"/api/projects/{project_id}/events?limit=200")).json()
+    status_event = next(row for row in project_events if row["event_type"] == "project.status.updated")
+    assert status_event["run_id"] == run["id"]
+    assert status_event["event_metadata"]["after"] == "completed"
+
+
 async def test_file_commits_restore_branch_and_milestone_preserve_history(project_api: ProjectApiEnv):
     env = project_api
     project = await _create_project(env, name="Git evidence")
@@ -2140,8 +2651,7 @@ async def test_file_commits_restore_branch_and_milestone_preserve_history(projec
     files_payload = files_response.json()
     files = files_payload["files"] if isinstance(files_payload, dict) else files_payload
     assert any(
-        (item == "deliverables/report.md")
-        or (isinstance(item, dict) and item.get("path") == "deliverables/report.md")
+        (item == "deliverables/report.md") or (isinstance(item, dict) and item.get("path") == "deliverables/report.md")
         for item in files
     )
 
@@ -2193,8 +2703,10 @@ async def test_file_commits_restore_branch_and_milestone_preserve_history(projec
     } <= event_types
 
     db_events = (
-        await env.db.execute(select(ProjectEvent).where(ProjectEvent.project_id == uuid.UUID(project_id)))
-    ).scalars().all()
+        (await env.db.execute(select(ProjectEvent).where(ProjectEvent.project_id == uuid.UUID(project_id))))
+        .scalars()
+        .all()
+    )
     assert len(db_events) == len(events)
     assert any(event.event_metadata.get("commit") == restore_commit for event in db_events)
 
@@ -2442,10 +2954,13 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
         assert staged_only.lock_handle is not None
         staged_only.lock_handle.close()  # Simulate exit before the filesystem swap.
         staged_only.lock_handle = None
-        assert await project_git_service.reconcile_project_repository_operations(
-            model.id,
-            db=env.db,
-        ) == 1
+        assert (
+            await project_git_service.reconcile_project_repository_operations(
+                model.id,
+                db=env.db,
+            )
+            == 1
+        )
         await env.db.commit()
         assert not staged_only.staging_root.exists()
         assert not (staged_only.repo / "SOURCE.md").exists()
@@ -2470,10 +2985,13 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
         assert abandoned.lock_handle is not None
         abandoned.lock_handle.close()  # Simulate OS releasing flock on process death.
         abandoned.lock_handle = None
-        assert await project_git_service.reconcile_project_repository_operations(
-            model.id,
-            db=env.db,
-        ) == 1
+        assert (
+            await project_git_service.reconcile_project_repository_operations(
+                model.id,
+                db=env.db,
+            )
+            == 1
+        )
         await env.db.commit()
         assert not (abandoned.repo / "SOURCE.md").exists()
         assert list(abandoned.repo.parent.glob(".repo-backup-*")) == []
@@ -2509,12 +3027,15 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
         ).stdout.splitlines()
         assert set(restored_files) == {"PROJECT.json", "README.md"}
         assert not (restored_repo / "SOURCE.md").exists()
-        assert subprocess.run(
-            ["git", "-C", str(restored_repo), "log", "-1", "--format=%s"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip() == "Initialize AI-native project"
+        assert (
+            subprocess.run(
+                ["git", "-C", str(restored_repo), "log", "-1", "--format=%s"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            == "Initialize AI-native project"
+        )
         assert list(restored_repo.parent.glob(".repo-backup-*")) == []
         failed_settings = (await env.client.get(f"/api/projects/{project_id}/settings")).json()
         assert failed_settings["git"].get("source") != "cloned"
@@ -2554,9 +3075,7 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
         assert (ambiguous_repo / "SOURCE.md").exists()
         ambiguous_settings = (await env.client.get(f"/api/projects/{ambiguous_project_id}/settings")).json()
         assert ambiguous_settings["git"]["source"] == "cloned"
-        ambiguous_events = (
-            await env.client.get(f"/api/projects/{ambiguous_project_id}/events?limit=200")
-        ).json()
+        ambiguous_events = (await env.client.get(f"/api/projects/{ambiguous_project_id}/events?limit=200")).json()
         assert "git.repository.cloned" in {event["event_type"] for event in ambiguous_events}
         ambiguous_journal = (
             await env.db.execute(
@@ -2644,18 +3163,16 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
     configured_event = next(
         event
         for event in events
-        if event["event_type"] == "git.remote.configured"
-        and event["event_metadata"]["remote_name"] == "upstream"
+        if event["event_type"] == "git.remote.configured" and event["event_metadata"]["remote_name"] == "upstream"
     )
     assert configured_event["event_metadata"]["remote_name"] == "upstream"
-    assert configured_event["event_metadata"]["remote_url_sha256"] == hashlib.sha256(
-        b"https://example.com/vendor/project.git"
-    ).hexdigest()
+    assert (
+        configured_event["event_metadata"]["remote_url_sha256"]
+        == hashlib.sha256(b"https://example.com/vendor/project.git").hexdigest()
+    )
     cloned_event = next(event for event in events if event["event_type"] == "git.repository.cloned")
     assert cloned_event["event_metadata"]["remote_name"] == "origin"
-    assert cloned_event["event_metadata"]["remote_url_sha256"] == hashlib.sha256(
-        clone_url.encode("utf-8")
-    ).hexdigest()
+    assert cloned_event["event_metadata"]["remote_url_sha256"] == hashlib.sha256(clone_url.encode("utf-8")).hexdigest()
 
     # Audit events are visible to explicitly shared viewers, so no Git event
     # may disclose a provider URL or the remote response object.
@@ -2667,9 +3184,7 @@ async def test_owner_manages_provider_neutral_remotes_and_atomically_clones(
     env.authenticate_as(env.viewer_id)
     viewer_events_response = await env.client.get(f"/api/projects/{project_id}/events?limit=200")
     assert viewer_events_response.status_code == 200, viewer_events_response.text
-    viewer_git_events = [
-        event for event in viewer_events_response.json() if event["event_type"].startswith("git.")
-    ]
+    viewer_git_events = [event for event in viewer_events_response.json() if event["event_type"].startswith("git.")]
     serialized_events = json.dumps(viewer_git_events, sort_keys=True)
     for private_url in (
         "https://example.com/vendor/project.git",

@@ -271,12 +271,15 @@ export const projectsApi = {
         }),
     listCapabilities: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/capabilities`),
     listWorkItems: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/work-items`),
+    getWorkItemDetail: (projectId: string, workItemId: string) =>
+        fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(workItemId)}`),
     createWorkItem: (projectId: string, payload: { title: string; description?: string; assignee_agent_id?: string | null; status?: string; priority?: string; acceptance_criteria?: string[]; dependency_ids?: string[] }) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/work-items`, { method: 'POST', body: JSON.stringify(payload) }),
     patchWorkItem: (projectId: string, workItemId: string, payload: { title?: string; description?: string; assignee_agent_id?: string | null; status?: string; priority?: string; acceptance_criteria?: string[]; dependency_ids?: string[] }) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(workItemId)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
     listRuns: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/runs`),
-    listEvents: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/events`),
+    listEvents: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/events?limit=500`),
+    listMilestones: (projectId: string) => fetchJson<JsonRecord[]>(`/projects/${encodeURIComponent(projectId)}/milestones`),
     getGroupSession: (projectId: string) =>
         fetchJson<JsonRecord>(`/projects/${encodeURIComponent(projectId)}/group-session`),
     getLeaderSession: (projectId: string) =>

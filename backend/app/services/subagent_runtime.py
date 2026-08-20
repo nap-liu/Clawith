@@ -1006,7 +1006,8 @@ async def _finish_subagent_turn(
         # One durable child Session may process many separately auditable
         # project mentions. Complete every ProjectRun whose exact input was
         # consumed by this turn; do not leave the Runs UI permanently queued.
-        from app.models.project import ProjectRun
+        from app.models.project import Project, ProjectEvent, ProjectRun
+        from app.services.project_service import add_event
 
         now = datetime.now(UTC)
         project_run_ids: set[uuid.UUID] = set()
@@ -1039,6 +1040,36 @@ async def _finish_subagent_turn(
                     "result": content,
                 }
                 project_run.error = content if failed else None
+                terminal_event_type = "run.failed" if failed else "run.succeeded"
+                terminal_event_exists = (
+                    await db.execute(
+                        select(ProjectEvent.id).where(
+                            ProjectEvent.run_id == project_run.id,
+                            ProjectEvent.event_type == terminal_event_type,
+                        )
+                    )
+                ).scalar_one_or_none()
+                project = await db.get(Project, project_run.project_id)
+                if project is not None and terminal_event_exists is None:
+                    add_event(
+                        db,
+                        project,
+                        terminal_event_type,
+                        "Project run failed" if failed else "Project run succeeded",
+                        actor_user_id=project_run.initiated_by_user_id,
+                        actor_agent_id=child.agent_id,
+                        work_item_id=project_run.work_item_id,
+                        run_id=project_run.id,
+                        metadata={
+                            "project_run_id": str(project_run.id),
+                            "subagent_run_id": str(run.id),
+                            "subagent_session_id": str(run.id),
+                            "session_id": str(
+                                dict(project_run.output or {}).get("session_id") or run.id
+                            ),
+                            "status": project_run.status,
+                        },
+                    )
         await persist_assistant_reply_row(
             db,
             agent_id=child.agent_id,
@@ -1398,6 +1429,165 @@ async def _pending_parent_events(limit: int = 50) -> list[uuid.UUID]:
         return list(rows)
 
 
+async def _materialize_project_a2a_turn(
+    *,
+    event: ChatMessage,
+    child: ChatSession,
+    run: SubagentRun,
+    parent: ChatSession,
+) -> bool:
+    """Project one child turn onto its exact visible A2A Session.
+
+    The execution child remains the source of truth.  Timeline rows are copied
+    with stable external keys so the ordinary Web Chat renderer can display the
+    same thinking/tool/final-reply contract without inventing an A2A renderer.
+    """
+    from app.models.project import Project, ProjectEvent, ProjectRun
+    from app.services.project_service import add_event
+
+    event_meta = _message_meta(event)
+    raw_project_run_ids = list(event_meta.get("project_run_ids") or [])
+    project_run_ids: list[uuid.UUID] = []
+    for value in raw_project_run_ids:
+        try:
+            project_run_ids.append(uuid.UUID(str(value)))
+        except (TypeError, ValueError):
+            continue
+    if not project_run_ids:
+        return True
+
+    async with async_session() as db:
+        project_runs = (
+            await db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.id.in_(project_run_ids),
+                    ProjectRun.project_id == parent.project_id,
+                    ProjectRun.trigger_type == "a2a",
+                )
+            )
+        ).scalars().all()
+        if not project_runs:
+            return True
+        project_run = project_runs[0]
+        anchor = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id == str(child.id),
+                    ChatMessage.message_meta["project_run_id"].as_string()
+                    == str(project_run.id),
+                )
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if anchor is None:
+            return True
+
+        trace_rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(
+                    ChatMessage.conversation_id == str(child.id),
+                    or_(
+                        ChatMessage.id == event.id,
+                        ChatMessage.message_meta["turn_anchor_id"].as_string()
+                        == str(anchor.id),
+                    ),
+                    ChatMessage.role.in_(["assistant", "tool_call"]),
+                )
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+            )
+        ).scalars().all()
+        if not any(row.id == event.id for row in trace_rows):
+            trace_rows.append(event)
+            trace_rows.sort(key=lambda row: (row.created_at, row.id))
+
+        for row in trace_rows:
+            external_key = (
+                f"project-subagent:{row.id}"
+                if row.id == event.id
+                else f"project-a2a-trace:{row.id}"
+            )
+            exists_row = (
+                await db.execute(
+                    select(ChatMessage.id).where(ChatMessage.external_event_key == external_key)
+                )
+            ).scalar_one_or_none()
+            if exists_row is not None:
+                continue
+            metadata = copy.deepcopy(_message_meta(row))
+            metadata.pop("subagent_wake", None)
+            metadata.update(
+                {
+                    "kind": "project_a2a_trace",
+                    "project_id": str(parent.project_id),
+                    "project_run_id": str(project_run.id),
+                    "a2a_session_id": str(parent.id),
+                    "subagent_run_id": str(child.id),
+                    "subagent_session_id": str(child.id),
+                    "source_child_message_id": str(row.id),
+                    "execution_agent_id": str(child.agent_id),
+                    "visible_to_group": False,
+                }
+            )
+            db.add(
+                ChatMessage(
+                    agent_id=parent.agent_id,
+                    user_id=run.execution_user_id,
+                    sender_agent_id=child.agent_id,
+                    role=row.role,
+                    content=row.content,
+                    conversation_id=str(parent.id),
+                    external_event_key=external_key,
+                    message_meta=metadata,
+                    thinking=row.thinking,
+                    created_at=row.created_at,
+                )
+            )
+        stored_parent = await db.get(ChatSession, parent.id, with_for_update=True)
+        if stored_parent is not None:
+            stored_parent.last_message_at = event.created_at or datetime.now(UTC)
+        project = await db.get(Project, parent.project_id)
+        existing_event = (
+            await db.execute(
+                select(ProjectEvent.id).where(
+                    ProjectEvent.run_id == project_run.id,
+                    ProjectEvent.event_type == "a2a.completed",
+                )
+            )
+        ).scalar_one_or_none()
+        dispatch_a2a = dict(dict((project_run.input or {}).get("dispatch") or {}).get("a2a") or {})
+        if project is not None and existing_event is None:
+            add_event(
+                db,
+                project,
+                "a2a.completed",
+                "Project Agent completed one exact A2A turn",
+                actor_agent_id=child.agent_id,
+                from_agent_id=(
+                    uuid.UUID(str(dispatch_a2a["from_agent_id"]))
+                    if dispatch_a2a.get("from_agent_id")
+                    else None
+                ),
+                to_agent_id=child.agent_id,
+                run_id=project_run.id,
+                metadata={
+                    "session_id": str(parent.id),
+                    "a2a_session_id": str(parent.id),
+                    "subagent_run_id": str(child.id),
+                    "subagent_session_id": str(child.id),
+                    "result_message_id": str(event.id),
+                    "trace_message_ids": [str(row.id) for row in trace_rows],
+                },
+            )
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+        return True
+
+
 async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
     from app.services.channel_dispatch import (
         ChannelReactions,
@@ -1421,6 +1611,18 @@ async def _dispatch_parent_event(child_message_id: uuid.UUID) -> bool:
         if run is None or child is None or parent is None:
             return True
         lock_key = chat_session_lock_key(parent)
+
+    if (
+        parent.source_channel == "agent"
+        and parent.project_id is not None
+        and child.project_id == parent.project_id
+    ):
+        return await _materialize_project_a2a_turn(
+            event=event,
+            child=child,
+            run=run,
+            parent=parent,
+        )
 
     if parent.source_channel == "project" and parent.project_id is not None:
         # Project Agent Group is an append-only coordination surface. Child
@@ -1925,6 +2127,7 @@ async def _dispatch_project_leader_batch(
 
 PROJECT_DISPATCH_TRIGGERS = frozenset(
     {
+        "a2a",
         "leader_kickoff",
         "group_leader_message",
         "group_mention",
@@ -1934,6 +2137,154 @@ PROJECT_DISPATCH_TRIGGERS = frozenset(
         "retry",
     }
 )
+
+
+async def enqueue_project_a2a_run(
+    *,
+    project_id: uuid.UUID,
+    a2a_session_id: uuid.UUID,
+    outbound_message_id: uuid.UUID,
+    from_agent_id: uuid.UUID,
+    to_agent_id: uuid.UUID,
+    execution_user_id: uuid.UUID,
+    message: str,
+    mode: str,
+    project_run_id: uuid.UUID | None = None,
+) -> dict:
+    """Queue one exact, project-scoped Agent-to-Agent wake.
+
+    The visible A2A ``ChatSession`` is only the collaboration timeline.  The
+    target executes in its reusable project ``SubagentRun`` child so project
+    tools, frozen capability policy, membership revocation and durable recovery
+    are identical to project-group execution.  No other member is awakened.
+    """
+    from app.models.project import Project, ProjectEvent, ProjectMemberSnapshot, ProjectRun
+    from app.services.project_service import add_event, freeze_run_members
+
+    task_text = str(message or "").strip()
+    if not task_text:
+        raise SubagentError("项目 A2A 消息不能为空。")
+    if from_agent_id == to_agent_id:
+        raise SubagentError("项目 A2A 发送方和接收方不能相同。")
+
+    async with async_session() as db:
+        project = await db.get(Project, project_id)
+        parent = await db.get(ChatSession, a2a_session_id)
+        members = (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project_id,
+                    ProjectMemberSnapshot.agent_id.in_([from_agent_id, to_agent_id]),
+                    ProjectMemberSnapshot.is_enabled.is_(True),
+                )
+            )
+        ).scalars().all()
+        member_by_agent = {member.agent_id: member for member in members}
+        target_member = member_by_agent.get(to_agent_id)
+        if (
+            project is None
+            or parent is None
+            or parent.project_id != project_id
+            or parent.source_channel != "agent"
+            or {parent.agent_id, parent.peer_agent_id} != {from_agent_id, to_agent_id}
+            or set(member_by_agent) != {from_agent_id, to_agent_id}
+            or target_member is None
+        ):
+            raise SubagentError("项目 A2A 会话或成员作用域已经失效。")
+
+        run = await db.get(ProjectRun, project_run_id, with_for_update=True) if project_run_id else None
+        if project_run_id is not None and (
+            run is None
+            or run.project_id != project_id
+            or run.agent_id != to_agent_id
+            or run.trigger_type != "a2a"
+        ):
+            raise SubagentError("项目 A2A Run 与当前消息不匹配。")
+        dispatch = {
+            "group_session_id": str(parent.id),
+            "project_member_id": str(target_member.id),
+            "turn_anchor_id": str(outbound_message_id),
+            "task": (
+                "You received one explicit project A2A message from another enabled member. "
+                "Handle only this target request. Use project tools for project-scoped changes, "
+                "and never broadcast or wake unrelated Agents.\n\n"
+                f"Message:\n{task_text}"
+            ),
+            "a2a": {
+                "session_id": str(parent.id),
+                "message_id": str(outbound_message_id),
+                "from_agent_id": str(from_agent_id),
+                "to_agent_id": str(to_agent_id),
+                "mode": str(mode or "notify"),
+            },
+        }
+        if run is None:
+            run = ProjectRun(
+                tenant_id=project.tenant_id,
+                project_id=project.id,
+                agent_id=to_agent_id,
+                initiated_by_user_id=execution_user_id,
+                status="queued",
+                trigger_type="a2a",
+                input={
+                    "from_agent_id": str(from_agent_id),
+                    "to_agent_id": str(to_agent_id),
+                    "message": task_text,
+                    "mode": str(mode or "notify"),
+                    "session_id": str(parent.id),
+                    "dispatch": dispatch,
+                },
+                output={
+                    "session_id": str(parent.id),
+                    "session_agent_id": str(parent.agent_id),
+                    "session_access_agent_id": str(parent.agent_id),
+                    "session_title": parent.title,
+                },
+            )
+            db.add(run)
+            await db.flush()
+            await freeze_run_members(db, project, run)
+        else:
+            run.input = {**dict(run.input or {}), "session_id": str(parent.id), "dispatch": dispatch}
+            run.output = {
+                **dict(run.output or {}),
+                "session_id": str(parent.id),
+                "session_agent_id": str(parent.agent_id),
+                "session_access_agent_id": str(parent.agent_id),
+                "session_title": parent.title,
+            }
+        existing_event = (
+            await db.execute(
+                select(ProjectEvent.id).where(
+                    ProjectEvent.run_id == run.id,
+                    ProjectEvent.event_type == "a2a.queued",
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_event is None:
+            add_event(
+                db,
+                project,
+                "a2a.queued",
+                "Queued one explicit project A2A wake",
+                actor_user_id=execution_user_id,
+                actor_agent_id=from_agent_id,
+                from_agent_id=from_agent_id,
+                to_agent_id=to_agent_id,
+                run_id=run.id,
+                metadata={
+                    "mode": str(mode or "notify"),
+                    "session_id": str(parent.id),
+                    "message_id": str(outbound_message_id),
+                    "awakened_agent_ids": [str(to_agent_id)],
+                    "broadcast": False,
+                },
+            )
+        await db.commit()
+        run_id = run.id
+
+    result = await dispatch_project_run(run_id)
+    return {**result, "project_run_id": str(run_id)}
 
 
 async def _project_run_has_child_input(
@@ -1996,7 +2347,9 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
             project is None
             or parent is None
             or parent.project_id != project.id
-            or parent.source_channel != "project"
+            or parent.source_channel not in {"project", "agent"}
+            or (project_run.trigger_type != "a2a" and parent.source_channel != "project")
+            or (project_run.trigger_type == "a2a" and parent.source_channel != "agent")
             or member is None
             or member.project_id != project.id
             or member.agent_id != project_run.agent_id
@@ -2035,7 +2388,11 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 fork=True,
                 turn_anchor_id=anchor_id,
                 project_run_id=project_run_id,
-                input_metadata={"project_dispatch": True},
+                input_metadata={
+                    "project_dispatch": True,
+                    "project_a2a": project_run.trigger_type == "a2a",
+                    "a2a_session_id": str(parent.id) if project_run.trigger_type == "a2a" else None,
+                },
             )
             child_id = child.id
             child_status = child.status
@@ -2051,7 +2408,11 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                 execution_user_id=execution_user_id,
                 origin_tool_call_id=f"project-dispatch:{project_run_id}",
                 project_run_id=project_run_id,
-                input_metadata={"project_dispatch": True},
+                input_metadata={
+                    "project_dispatch": True,
+                    "project_a2a": project_run.trigger_type == "a2a",
+                    "a2a_session_id": str(parent.id) if project_run.trigger_type == "a2a" else None,
+                },
             )
     except SubagentError as exc:
         async with async_session() as db:
@@ -2085,6 +2446,14 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
             **dict(project_run.output or {}),
             "subagent_run_id": str(child_id),
             "subagent_session_id": str(child_id),
+            **(
+                {
+                    "session_id": str(parent.id),
+                    "a2a_session_id": str(parent.id),
+                }
+                if project_run.trigger_type == "a2a"
+                else {}
+            ),
             "status": child_status,
             "subagent_status": child_status,
         }
@@ -2135,6 +2504,60 @@ async def dispatch_project_run(project_run_id: uuid.UUID) -> dict:
                         "subagent_session_id": str(child_id),
                     },
                 )
+        elif project_run.trigger_type == "a2a" and anchor is not None:
+            a2a = dict(dispatch.get("a2a") or {})
+            anchor.message_meta = {
+                **_message_meta(anchor),
+                "project_run_id": str(project_run.id),
+                "a2a_session_id": str(parent.id),
+                "subagent_run_id": str(child_id),
+                "subagent_session_id": str(child_id),
+                "awakened_agent_ids": [str(agent_id)],
+                "wake_policy": "single_explicit_project_target",
+            }
+            existing_event = (
+                await db.execute(
+                    select(ProjectEvent)
+                    .where(
+                        ProjectEvent.run_id == project_run.id,
+                        ProjectEvent.event_type == "a2a.delivered",
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            event_metadata = {
+                "session_id": str(parent.id),
+                "a2a_session_id": str(parent.id),
+                "message_id": str(anchor.id),
+                "subagent_run_id": str(child_id),
+                "subagent_session_id": str(child_id),
+                "from_agent_id": a2a.get("from_agent_id"),
+                "to_agent_id": a2a.get("to_agent_id") or str(agent_id),
+                "awakened_agent_ids": [str(agent_id)],
+                "broadcast": False,
+            }
+            if existing_event is None and project is not None:
+                add_event(
+                    db,
+                    project,
+                    "a2a.delivered",
+                    "Project A2A message delivered to one durable project Agent runtime",
+                    actor_user_id=project_run.initiated_by_user_id,
+                    actor_agent_id=(
+                        uuid.UUID(str(a2a["from_agent_id"])) if a2a.get("from_agent_id") else None
+                    ),
+                    from_agent_id=(
+                        uuid.UUID(str(a2a["from_agent_id"])) if a2a.get("from_agent_id") else None
+                    ),
+                    to_agent_id=agent_id,
+                    run_id=project_run.id,
+                    metadata=event_metadata,
+                )
+            elif existing_event is not None:
+                existing_event.event_metadata = {
+                    **dict(existing_event.event_metadata or {}),
+                    **event_metadata,
+                }
         elif anchor is not None:
             meta = _message_meta(anchor)
             awakened = list(dict.fromkeys([*meta.get("awakened_agent_ids", []), str(agent_id)]))

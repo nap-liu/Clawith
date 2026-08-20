@@ -11296,6 +11296,7 @@ async def _send_message_to_agent(
                 origin_turn_anchor_id=origin_turn_anchor_id,
             )
             recorded_openclaw_outbound = None
+            recorded_project_outbound = None
             if getattr(target, "agent_type", "native") == "openclaw" and outbound_operation_key:
                 # A row lock cannot protect the first insert because the row does
                 # not exist yet. The transaction-scoped operation lock closes
@@ -11339,6 +11340,40 @@ async def _send_message_to_agent(
                     } != expected_pair or replay_session.source_channel != "agent" or replay_session.project_id != project_id:
                         return "❌ The recorded message's conversation route changed"
                     recorded_openclaw_outbound = candidate
+            elif project_id is not None and outbound_operation_key:
+                await _lock_outbound_operation(db, outbound_operation_key)
+                candidate = (
+                    await db.execute(
+                        select(ChatMessage).where(
+                            ChatMessage.external_event_key == outbound_operation_key
+                        ).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if candidate is not None:
+                    candidate_meta = (
+                        candidate.message_meta
+                        if isinstance(candidate.message_meta, dict)
+                        else {}
+                    )
+                    if str(candidate_meta.get("target_agent_id") or "") != str(target.id):
+                        return "❌ The replayed project message does not match the requested target"
+                    try:
+                        replay_session = await db.get(
+                            ChatSession,
+                            uuid.UUID(str(candidate.conversation_id)),
+                        )
+                    except (TypeError, ValueError):
+                        replay_session = None
+                    expected_pair = {from_agent_id, target.id}
+                    if (
+                        replay_session is None
+                        or replay_session.source_channel != "agent"
+                        or replay_session.project_id != project_id
+                        or {replay_session.agent_id, replay_session.peer_agent_id}
+                        != expected_pair
+                    ):
+                        return "❌ The replayed project message's conversation route changed"
+                    recorded_project_outbound = candidate
 
             # Find or create ChatSession for this agent pair (ordered consistently)
             session_agent_id = min(from_agent_id, target.id, key=str)
@@ -11348,7 +11383,12 @@ async def _send_message_to_agent(
             owner_id = user_id or (source_agent.creator_id if source_agent else from_agent_id)
 
             # Only reuse an existing thread when not explicitly starting a fresh one
-            chat_session = replay_session if recorded_openclaw_outbound is not None else None
+            chat_session = (
+                replay_session
+                if recorded_openclaw_outbound is not None
+                or recorded_project_outbound is not None
+                else None
+            )
             if chat_session is None and not new_conversation:
                 sess_r = await db.execute(
                     select(ChatSession).where(
@@ -11511,31 +11551,83 @@ async def _send_message_to_agent(
             # ── Native target: branch by msg_type ──
 
             # Save source message (common to all paths)
-            outbound_a2a_message = ChatMessage(
-                id=uuid.uuid4(),
-                agent_id=session_agent_id,
-                user_id=owner_id,
-                sender_agent_id=from_agent_id,
-                role="user",
-                content=message_text,
-                conversation_id=session_id,
-                participant_id=src_participant.id if src_participant else None,
-                external_event_key=outbound_operation_key,
-                message_meta={
-                    "direction": "outbound",
-                    "source_channel": "agent",
-                    "origin_session_id": str(origin_session_id or ""),
-                    "origin_source_channel": origin_source_channel,
-                    "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
-                    "tool_call_id": str(tool_call_id or ""),
-                    "actor_ref": str(tgt_participant.id if tgt_participant else target.id),
-                    "target_agent_id": str(target.id),
-                    "target_name": target.name,
-                },
-            )
-            db.add(outbound_a2a_message)
-            chat_session.last_message_at = datetime.now(timezone.utc)
+            outbound_a2a_message = recorded_project_outbound
+            if outbound_a2a_message is None:
+                outbound_a2a_message = ChatMessage(
+                    id=uuid.uuid4(),
+                    agent_id=session_agent_id,
+                    user_id=owner_id,
+                    sender_agent_id=from_agent_id,
+                    role="user",
+                    content=message_text,
+                    conversation_id=session_id,
+                    participant_id=src_participant.id if src_participant else None,
+                    external_event_key=outbound_operation_key,
+                    message_meta={
+                        "direction": "outbound",
+                        "source_channel": "agent",
+                        "origin_session_id": str(origin_session_id or ""),
+                        "origin_source_channel": origin_source_channel,
+                        "origin_turn_anchor_id": str(origin_turn_anchor_id or ""),
+                        "tool_call_id": str(tool_call_id or ""),
+                        "actor_ref": str(tgt_participant.id if tgt_participant else target.id),
+                        "target_agent_id": str(target.id),
+                        "target_name": target.name,
+                    },
+                )
+                db.add(outbound_a2a_message)
+                chat_session.last_message_at = datetime.now(timezone.utc)
             await db.commit()
+
+            # Project A2A must execute in the same durable, project-scoped child
+            # runtime as group mentions.  A generic trigger Session has no
+            # ProjectMemberSnapshot authority and therefore cannot use project
+            # tools.  Keep the exact A2A Session as the visible timeline while
+            # waking only the explicitly addressed member child.
+            if project_id is not None:
+                from app.services.subagent_runtime import enqueue_project_a2a_run
+
+                raw_project_run_id = args.get("_project_run_id") or dict(
+                    outbound_a2a_message.message_meta or {}
+                ).get("project_run_id")
+                try:
+                    scoped_project_run_id = (
+                        uuid.UUID(str(raw_project_run_id)) if raw_project_run_id else None
+                    )
+                except (TypeError, ValueError):
+                    return "❌ _project_run_id must be a complete platform UUID"
+                try:
+                    dispatch_result = await enqueue_project_a2a_run(
+                        project_id=project_id,
+                        a2a_session_id=chat_session.id,
+                        outbound_message_id=outbound_a2a_message.id,
+                        from_agent_id=from_agent_id,
+                        to_agent_id=target.id,
+                        execution_user_id=owner_id,
+                        message=message_text,
+                        mode=msg_type,
+                        project_run_id=scoped_project_run_id,
+                    )
+                except Exception as exc:
+                    logger.exception("[project-a2a] durable target dispatch failed: {}", exc)
+                    return f"❌ Project A2A dispatch failed: {type(exc).__name__}: {exc!s}"
+                return json.dumps(
+                    {
+                        "status": "queued",
+                        "message": f"Message queued for {target.name}",
+                        "session_id": session_id,
+                        "a2a_session_id": session_id,
+                        "project_run_id": str(
+                            scoped_project_run_id
+                            or dispatch_result.get("project_run_id")
+                            or ""
+                        ),
+                        "subagent_run_id": dispatch_result.get("subagent_run_id"),
+                        "subagent_session_id": dispatch_result.get("subagent_session_id"),
+                        "awakened_agent_ids": [str(target.id)],
+                    },
+                    ensure_ascii=False,
+                )
 
             # ── Feature flag: async A2A (tenant-level) ──
             _a2a_async = False

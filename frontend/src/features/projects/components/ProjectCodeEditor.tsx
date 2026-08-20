@@ -123,6 +123,8 @@ export default function ProjectCodeEditor({
     return (
         <div className="project-file-workspace__monaco" aria-label={ariaLabel}>
             <Editor
+                width="100%"
+                height="100%"
                 path={path || 'untitled.txt'}
                 language={languageForPath(path)}
                 value={value}

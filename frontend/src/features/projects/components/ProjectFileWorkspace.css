@@ -1,6 +1,6 @@
 .project-file-workspace {
-    height: min(680px, calc(100vh - 260px));
-    min-height: 520px;
+    min-height: 0;
+    flex: 1 1 auto;
     display: grid;
     grid-template-columns: minmax(230px, 280px) minmax(0, 1fr);
     overflow: hidden;

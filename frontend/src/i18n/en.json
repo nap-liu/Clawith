@@ -20,6 +20,10 @@
         "unshared": "Project unshared",
         "settings": { "updated": "Project settings updated" },
         "file": { "committed": "Project file committed" },
+        "plan": { "updated": "Project plan updated" },
+        "status": { "updated": "Project status updated" },
+        "trace": { "repaired": "Project trace links repaired" },
+        "agent": { "message": { "sent": "Project Agent message sent" } },
         "kickoff": { "confirmed": "Project plan confirmed and started", "failed": "Project kickoff failed" },
         "agent_reply_batch": { "dispatched": "Agent reply batch dispatched" }
       },
@@ -39,7 +43,7 @@
         "failed": "Run failed",
         "cancelled": "Run cancelled"
       },
-      "a2a": { "queued": "A2A request queued", "delivered": "A2A message delivered", "delivery_failed": "A2A delivery failed" },
+      "a2a": { "queued": "A2A request queued", "delivered": "A2A message delivered", "completed": "A2A collaboration completed", "delivery_failed": "A2A delivery failed" },
       "group": { "message": { "created": "Project group message created" } },
       "git": {
         "commit": { "created": "Git commit created" },

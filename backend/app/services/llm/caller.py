@@ -178,6 +178,7 @@ async def _sleep_before_throttle_retry(delay_seconds: float) -> None:
 
 async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_kwargs):
     attempts = 1 + len(PROVIDER_THROTTLE_RETRY_DELAYS)
+    request_timeout = _get_model_timeout(model)
 
     # Per-round latency observability: wall time + time-to-first-token (first
     # content/thinking/tool-args delta from the provider). Callbacks are wrapped
@@ -202,7 +203,16 @@ async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_k
         _first_token_at.clear()
         _t0 = perf_counter()
         try:
-            response = await client.stream(**stream_kwargs)
+            # httpx's read timeout is an inactivity timeout. Some compatible
+            # providers keep an otherwise-stalled SSE request alive with empty
+            # heartbeat lines, so it never fires and the whole Agent turn can
+            # remain in "thinking" forever. The model-level request timeout is
+            # the wall-clock budget for one provider round; tool rounds still
+            # receive their own independent budget.
+            response = await asyncio.wait_for(
+                client.stream(**stream_kwargs),
+                timeout=request_timeout,
+            )
             _elapsed = perf_counter() - _t0
             _ttft = f"{_first_token_at[0] - _t0:.2f}s" if _first_token_at else "n/a"
             _usage = getattr(response, "usage", None)
@@ -213,6 +223,10 @@ async def _stream_with_throttle_retry(client, *, model, round_i: int, **stream_k
                 f"llm_call={_elapsed:.2f}s ttft={_ttft} output_tokens={_out_tokens}{_rate}"
             )
             return response
+        except TimeoutError as e:
+            raise LLMError(
+                f"Request timed out after {request_timeout:g}s"
+            ) from e
         except LLMError as e:
             if not _is_provider_throttle_error(e):
                 raise

@@ -20,6 +20,10 @@
         "unshared": "取消共享",
         "settings": { "updated": "更新项目设置" },
         "file": { "committed": "提交项目文件" },
+        "plan": { "updated": "更新项目计划" },
+        "status": { "updated": "更新项目状态" },
+        "trace": { "repaired": "修复项目追溯关联" },
+        "agent": { "message": { "sent": "发送项目 Agent 消息" } },
         "kickoff": { "confirmed": "确认项目方案并启动", "failed": "项目启动失败" },
         "agent_reply_batch": { "dispatched": "派发 Agent 批量回复" }
       },
@@ -39,7 +43,7 @@
         "failed": "运行执行失败",
         "cancelled": "运行已取消"
       },
-      "a2a": { "queued": "A2A 请求进入队列", "delivered": "A2A 消息已送达", "delivery_failed": "A2A 消息送达失败" },
+      "a2a": { "queued": "A2A 请求进入队列", "delivered": "A2A 消息已送达", "completed": "A2A 协作已完成", "delivery_failed": "A2A 消息送达失败" },
       "group": { "message": { "created": "创建项目群消息" } },
       "git": {
         "commit": { "created": "创建 Git 提交" },

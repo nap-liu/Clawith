@@ -108,6 +108,18 @@ const {
 } = resumeRecoveryModule.exports;
 
 {
+    const entries = buildH5ConversationEntries([{
+        id: 'streaming-placeholder',
+        role: 'assistant',
+        content: '',
+        _streaming: true,
+    }]);
+    assert.equal(entries.length, 1, 'an empty streaming assistant row must remain visible');
+    assert.equal(entries[0].type, 'message');
+    assert.equal(entries[0].msg._streaming, true);
+}
+
+{
     const currentAgentId = 'agent-engineer';
     assert.equal(
         isA2AMessageLeft({ sender_agent_id: 'agent-architect' }),

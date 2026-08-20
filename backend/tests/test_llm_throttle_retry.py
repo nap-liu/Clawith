@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -97,6 +98,35 @@ async def test_provider_throttle_is_retried_before_returning_success(monkeypatch
 
     assert result == "重试后成功"
     assert len(client.stream_calls) == 3
+    assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_provider_round_has_wall_clock_timeout(monkeypatch):
+    class _HeartbeatForeverClient:
+        closed = False
+
+        async def stream(self, **_kwargs):
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.closed = True
+
+    client = _HeartbeatForeverClient()
+    _patch_call_llm_collaborators(monkeypatch, client)
+    model = _FakeModel(request_timeout=0.01)
+
+    result = await call_llm(
+        model=model,
+        messages=[{"role": "user", "content": "hello"}],
+        agent_name="测试助手",
+        role_description="",
+        agent_id="agent-x",
+        user_id="user-x",
+        session_id="",
+    )
+
+    assert result == "[LLM Error] Request timed out after 0.01s"
     assert client.closed is True
 
 

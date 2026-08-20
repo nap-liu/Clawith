@@ -61,8 +61,7 @@ class ProjectUpdate(BaseModel):
     success_criteria: list[str] | None = None
     visibility: Literal["private", "shared"] | None = None
     status: (
-        Literal["planning", "initializing", "running", "waiting", "paused", "completed", "archived", "failed"]
-        | None
+        Literal["planning", "initializing", "running", "waiting", "paused", "completed", "archived", "failed"] | None
     ) = None
     settings: dict | None = None
     shared_with_user_ids: list[uuid.UUID] | None = None
@@ -277,6 +276,37 @@ class ProjectRunOut(BaseModel):
     finished_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    # Stable execution identity. ``session_id`` is the exact conversation a
+    # viewer should open (the A2A timeline for A2A runs, otherwise the durable
+    # child session); ``subagent_session_id`` is always the worker child.
+    project_member_id: uuid.UUID | None = None
+    agent_name: str | None = None
+    member_snapshot: dict | None = None
+    session_id: uuid.UUID | None = None
+    subagent_session_id: uuid.UUID | None = None
+    group_session_id: uuid.UUID | None = None
+
+
+class ProjectMilestoneOut(BaseModel):
+    id: uuid.UUID
+    event_id: uuid.UUID
+    project_id: uuid.UUID
+    commit: str
+    short_commit: str
+    message: str
+    author: str | None = None
+    created_at: datetime
+    commit_created_at: datetime | str | None = None
+    run_id: uuid.UUID | None = None
+    work_item_id: uuid.UUID | None = None
+    session_id: uuid.UUID | None = None
+    subagent_session_id: uuid.UUID | None = None
+    agent_id: uuid.UUID | None = None
+    agent_name: str | None = None
+    paths: list[str] = Field(default_factory=list)
+    changed: bool | None = None
+    related_run_ids: list[uuid.UUID] = Field(default_factory=list)
+    related_work_item_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 class ProjectRunMemberSnapshotOut(BaseModel):
@@ -317,6 +347,16 @@ class ProjectEventOut(BaseModel):
     summary: str
     event_metadata: dict
     created_at: datetime
+
+
+class WorkItemDetailOut(BaseModel):
+    work_item: WorkItemOut
+    runs: list[ProjectRunOut] = Field(default_factory=list)
+    sessions: list[dict] = Field(default_factory=list)
+    events: list[ProjectEventOut] = Field(default_factory=list)
+    commits: list[dict] = Field(default_factory=list)
+    files: list[dict] = Field(default_factory=list)
+    evidence: list[dict] = Field(default_factory=list)
 
 
 class A2AWakeRequest(BaseModel):

@@ -40,6 +40,8 @@ export type SessionViewerTarget = {
     status?: string;
     mode?: string;
     model?: string;
+    /** Force a historical or frozen session into view-only mode. */
+    readOnly?: boolean;
 };
 
 export type SessionViewerGroupConfig = {
@@ -210,7 +212,8 @@ export default function SessionViewerDrawer({
     const groupSendInFlightRef = useRef(false);
     const sessionId = target?.sessionId;
     const accessAgentId = target?.agentId || agentId;
-    const canCompose = interactive && !serverReadOnly;
+    const targetReadOnly = target?.readOnly === true;
+    const canCompose = interactive && !targetReadOnly && !serverReadOnly;
     const mentionLimit = Math.max(0, groupConfig?.maxMentions ?? 8);
     const mentionOptions = useMemo(() => groupConfig?.members
         .filter((member) => member.isEnabled !== false && !member.isLeader && member.agentId !== groupConfig.currentAgentId)
@@ -298,7 +301,7 @@ export default function SessionViewerDrawer({
     }, [loadSession, sessionId]);
 
     useEffect(() => {
-        if (!interactive || groupConfig || !sessionId || !accessAgentId) return;
+        if (!interactive || targetReadOnly || groupConfig || !sessionId || !accessAgentId) return;
         const token = localStorage.getItem('token');
         if (!token) {
             setComposerError(t('agent.sessionViewer.authenticationRequired', '登录已失效，无法继续对话。'));
@@ -423,17 +426,17 @@ export default function SessionViewerDrawer({
             socketRef.current = null;
             if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, 'session drawer closed');
         };
-    }, [accessAgentId, groupConfig, interactive, loadSession, sessionId, t]);
+    }, [accessAgentId, groupConfig, interactive, loadSession, sessionId, t, targetReadOnly]);
 
     useEffect(() => {
-        if (!interactive || !groupConfig || !sessionId) return;
+        if (!interactive || targetReadOnly || !groupConfig || !sessionId) return;
         setConnected(true);
         const timer = window.setInterval(() => void loadSession(true), 3000);
         return () => {
             setConnected(false);
             window.clearInterval(timer);
         };
-    }, [groupConfig, interactive, loadSession, sessionId]);
+    }, [groupConfig, interactive, loadSession, sessionId, targetReadOnly]);
 
     useEffect(() => () => {
         uploadAbortRef.current.forEach((abort) => abort());
@@ -729,7 +732,7 @@ export default function SessionViewerDrawer({
                                 {t(`agent.sessionViewer.status.${currentStatus}`, { defaultValue: currentStatus })}
                             </span>
                         )}
-                        {routeMode === 'pc' && !groupConfig && (
+                        {routeMode === 'pc' && !groupConfig && !targetReadOnly && (
                             <a href={fullSessionHref} title={t('agent.sessionViewer.openFullSession')} onClick={onClose}>
                                 <IconArrowUpRight size={17} stroke={1.8} />
                             </a>
@@ -828,7 +831,7 @@ export default function SessionViewerDrawer({
                                     options={mentionOptions}
                                     maxMentions={mentionLimit}
                                     disabled={!canCompose || sending}
-                                    placeholder={serverReadOnly
+                                    placeholder={targetReadOnly || serverReadOnly
                                         ? t('agent.sessionViewer.readOnlySession', '该会话仅允许查看，不能继续发送消息。')
                                         : connected
                                             ? t('chat.placeholder', '输入消息…')
@@ -855,7 +858,7 @@ export default function SessionViewerDrawer({
                                 onPaste={handlePaste}
                                 rows={1}
                                 disabled={!canCompose || sending}
-                                placeholder={serverReadOnly
+                                placeholder={targetReadOnly || serverReadOnly
                                     ? t('agent.sessionViewer.readOnlySession', '该会话仅允许查看，不能继续发送消息。')
                                     : connected
                                         ? t('chat.placeholder', '输入消息…')
@@ -870,7 +873,7 @@ export default function SessionViewerDrawer({
                             )}
                         </div>
                         <small className="session-viewer-drawer__composer-status">
-                            {serverReadOnly
+                            {targetReadOnly || serverReadOnly
                                 ? t('agent.sessionViewer.readOnly', '只读')
                                 : connected
                                     ? groupConfig

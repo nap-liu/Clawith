@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import and_, delete, exists, func, or_, select
@@ -90,15 +91,18 @@ async def ensure_project_group_session(db: AsyncSession, project: Project) -> Ch
         return session
     anchor = (
         await db.execute(
-            select(ProjectMemberSnapshot).where(
+            select(ProjectMemberSnapshot)
+            .where(
                 ProjectMemberSnapshot.project_id == project.id,
                 ProjectMemberSnapshot.tenant_id == project.tenant_id,
                 ProjectMemberSnapshot.is_enabled.is_(True),
-            ).order_by(
+            )
+            .order_by(
                 ProjectMemberSnapshot.is_leader.desc(),
                 ProjectMemberSnapshot.created_at,
                 ProjectMemberSnapshot.id,
-            ).limit(1)
+            )
+            .limit(1)
         )
     ).scalar_one_or_none()
     if anchor is None:
@@ -262,7 +266,9 @@ async def add_member(
         )
         raise HTTPException(status_code=409, detail=detail)
     if not data.is_enabled:
-        raise HTTPException(status_code=422, detail="New project members must start active; remove them explicitly later")
+        raise HTTPException(
+            status_code=422, detail="New project members must start active; remove them explicitly later"
+        )
     if data.is_leader:
         await db.execute(
             ProjectMemberSnapshot.__table__.update()
@@ -375,13 +381,17 @@ async def deactivate_project_member(
         return []
 
     all_children = (
-        await db.execute(
-            select(SubagentRun).where(
-                SubagentRun.project_id == project.id,
-                SubagentRun.project_member_id == member.id,
+        (
+            await db.execute(
+                select(SubagentRun).where(
+                    SubagentRun.project_id == project.id,
+                    SubagentRun.project_member_id == member.id,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     live_children = [row for row in all_children if row.status in {"queued", "running"}]
     child_ids = [row.id for row in all_children]
     cancelled_child_ids = [row.id for row in live_children]
@@ -392,9 +402,7 @@ async def deactivate_project_member(
         child.lease_expires_at = None
 
     if child_ids:
-        sessions = (
-            await db.execute(select(ChatSession).where(ChatSession.id.in_(child_ids)))
-        ).scalars().all()
+        sessions = (await db.execute(select(ChatSession).where(ChatSession.id.in_(child_ids)))).scalars().all()
         for session in sessions:
             session.im_config = {
                 **dict(session.im_config or {}),
@@ -403,14 +411,18 @@ async def deactivate_project_member(
                 "membership_revoked_reason": "project_member_departed",
             }
         inputs = (
-            await db.execute(
-                select(ChatMessage).where(
-                    ChatMessage.conversation_id.in_([str(value) for value in child_ids]),
-                    ChatMessage.message_meta["kind"].as_string() == "subagent_input",
-                    ChatMessage.message_meta["subagent_input_state"].as_string().in_(["pending", "processing"]),
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.conversation_id.in_([str(value) for value in child_ids]),
+                        ChatMessage.message_meta["kind"].as_string() == "subagent_input",
+                        ChatMessage.message_meta["subagent_input_state"].as_string().in_(["pending", "processing"]),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for row in inputs:
             metadata = dict(row.message_meta or {})
             metadata["subagent_input_state"] = "cancelled"
@@ -419,15 +431,19 @@ async def deactivate_project_member(
             row.message_meta = metadata
 
     project_runs = (
-        await db.execute(
-            select(ProjectRun).where(
-                ProjectRun.project_id == project.id,
-                ProjectRun.tenant_id == project.tenant_id,
-                ProjectRun.agent_id == member.agent_id,
-                ProjectRun.status.not_in(TERMINAL_PROJECT_RUN_STATUSES),
+        (
+            await db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project.id,
+                    ProjectRun.tenant_id == project.tenant_id,
+                    ProjectRun.agent_id == member.agent_id,
+                    ProjectRun.status.not_in(TERMINAL_PROJECT_RUN_STATUSES),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     for run in project_runs:
         run.status = "cancelled"
         run.finished_at = now
@@ -547,9 +563,7 @@ async def project_session_access_mode(
         or member.agent_id != session.agent_id
     ):
         return None
-    member_is_writable = member.is_enabled and not bool(
-        dict(session.im_config or {}).get("membership_revoked")
-    )
+    member_is_writable = member.is_enabled and not bool(dict(session.im_config or {}).get("membership_revoked"))
     if project.owner_user_id == user.id:
         human_role = "edit"
     else:
@@ -849,6 +863,129 @@ async def freeze_run_members(db: AsyncSession, project: Project, run: ProjectRun
     return frozen
 
 
+def _trace_uuid(*values: Any) -> uuid.UUID | None:
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            return uuid.UUID(str(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+async def serialize_project_runs(
+    db: AsyncSession,
+    project: Project,
+    runs: list[ProjectRun],
+) -> list[dict[str, Any]]:
+    """Return ProjectRuns with immutable member and exact session identity.
+
+    Consumers must never infer a conversation from a group root or from the
+    currently active member list.  The execution-time snapshot survives member
+    removal, while the explicit session fields distinguish the visible A2A
+    conversation from the durable worker child.
+    """
+    if not runs:
+        return []
+    run_ids = [run.id for run in runs]
+    snapshots = (
+        (
+            await db.execute(
+                select(ProjectRunMemberSnapshot).where(
+                    ProjectRunMemberSnapshot.project_id == project.id,
+                    ProjectRunMemberSnapshot.tenant_id == project.tenant_id,
+                    ProjectRunMemberSnapshot.run_id.in_(run_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    member_ids = {snapshot.project_member_id for snapshot in snapshots}
+    members = (
+        (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                    ProjectMemberSnapshot.id.in_(member_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if member_ids
+        else []
+    )
+    member_by_id = {member.id: member for member in members}
+    snapshots_by_run: dict[uuid.UUID, list[ProjectRunMemberSnapshot]] = {}
+    for snapshot in snapshots:
+        snapshots_by_run.setdefault(snapshot.run_id, []).append(snapshot)
+
+    payloads: list[dict[str, Any]] = []
+    for run in runs:
+        output = dict(run.output or {})
+        input_data = dict(run.input or {})
+        dispatch = dict(input_data.get("dispatch") or {})
+        responsible = next(
+            (snapshot for snapshot in snapshots_by_run.get(run.id, []) if snapshot.agent_id == run.agent_id),
+            None,
+        )
+        member = member_by_id.get(responsible.project_member_id) if responsible else None
+        subagent_session_id = _trace_uuid(
+            output.get("subagent_session_id"),
+            output.get("subagent_run_id"),
+        )
+        visible_session_id = _trace_uuid(
+            output.get("session_id"),
+            output.get("a2a_session_id"),
+            subagent_session_id,
+        )
+        group_session_id = _trace_uuid(
+            output.get("group_session_id"),
+            input_data.get("group_session_id"),
+            dispatch.get("group_session_id"),
+        )
+        member_snapshot = None
+        if responsible is not None:
+            member_snapshot = {
+                "project_member_id": str(responsible.project_member_id),
+                "agent_id": str(responsible.agent_id),
+                "name_snapshot": member.name_snapshot if member else None,
+                "role_snapshot": member.role_snapshot if member else "",
+                "is_leader": responsible.is_leader,
+                "member_config_snapshot": dict(responsible.member_config_snapshot or {}),
+                "capability_snapshot": list(responsible.capability_snapshot or []),
+                "created_at": responsible.created_at,
+            }
+        payloads.append(
+            {
+                "id": run.id,
+                "project_id": run.project_id,
+                "work_item_id": run.work_item_id,
+                "agent_id": run.agent_id,
+                "initiated_by_user_id": run.initiated_by_user_id,
+                "status": run.status,
+                "trigger_type": run.trigger_type,
+                "input": input_data,
+                "output": output,
+                "error": run.error,
+                "started_at": run.started_at,
+                "finished_at": run.finished_at,
+                "created_at": run.created_at,
+                "updated_at": run.updated_at,
+                "project_member_id": responsible.project_member_id if responsible else None,
+                "agent_name": member.name_snapshot if member else None,
+                "member_snapshot": member_snapshot,
+                "session_id": visible_session_id,
+                "subagent_session_id": subagent_session_id,
+                "group_session_id": group_session_id,
+            }
+        )
+    return payloads
+
+
 async def project_summary(db: AsyncSession, project: Project) -> dict:
     members = (
         (
@@ -1053,6 +1190,7 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
                 "force_async": True,
                 "new_conversation": bool(payload.get("new_conversation")),
                 "_project_id": str(project_id),
+                "_project_run_id": str(run_id),
             },
             user_id=initiated_by_user_id,
         )
@@ -1069,15 +1207,18 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
         session_peer_id = max(source_id, target_id, key=str)
         session = (
             await session_db.execute(
-                select(ChatSession).where(
+                select(ChatSession)
+                .where(
                     ChatSession.project_id == project_id,
                     ChatSession.source_channel == "agent",
                     ChatSession.agent_id == session_agent_id,
                     ChatSession.peer_agent_id == session_peer_id,
-                ).order_by(
+                )
+                .order_by(
                     ChatSession.last_message_at.desc().nulls_last(),
                     ChatSession.created_at.desc(),
-                ).limit(1)
+                )
+                .limit(1)
             )
         ).scalar_one_or_none()
         if session is not None:
@@ -1092,26 +1233,41 @@ async def deliver_project_a2a(run_id: uuid.UUID) -> None:
         project = await db.get(Project, run.project_id) if run else None
         if run is None or project is None:
             return
-        apply_run_status(run, "failed" if failed else "succeeded")
+        if failed:
+            apply_run_status(run, "failed")
+        elif not dict(run.output or {}).get("subagent_run_id"):
+            # Compatibility for non-native/legacy transports that confirm
+            # delivery but do not create a project execution child. Native
+            # project A2A remains live until the durable child turn finishes.
+            apply_run_status(run, "succeeded")
         delivery_metadata = {
             "delivery_result": result,
             "group_session_id": payload.get("group_session_id"),
             **session_info,
         }
-        run.output = delivery_metadata
+        run.output = {**dict(run.output or {}), **delivery_metadata}
         if failed:
             run.error = result
-        add_event(
-            db,
-            project,
-            "a2a.delivery_failed" if failed else "a2a.delivered",
-            "Project A2A delivery failed" if failed else "Project A2A message delivered and target wake requested",
-            actor_user_id=run.initiated_by_user_id,
-            actor_agent_id=uuid.UUID(payload["from_agent_id"]),
-            from_agent_id=uuid.UUID(payload["from_agent_id"]),
-            to_agent_id=uuid.UUID(payload["to_agent_id"]),
-            work_item_id=run.work_item_id,
-            run_id=run.id,
-            metadata=delivery_metadata,
-        )
+        existing_delivery_event = (
+            await db.execute(
+                select(ProjectEvent.id).where(
+                    ProjectEvent.run_id == run.id,
+                    ProjectEvent.event_type == ("a2a.delivery_failed" if failed else "a2a.delivered"),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_delivery_event is None:
+            add_event(
+                db,
+                project,
+                "a2a.delivery_failed" if failed else "a2a.delivered",
+                "Project A2A delivery failed" if failed else "Project A2A message delivered and target wake requested",
+                actor_user_id=run.initiated_by_user_id,
+                actor_agent_id=uuid.UUID(payload["from_agent_id"]),
+                from_agent_id=uuid.UUID(payload["from_agent_id"]),
+                to_agent_id=uuid.UUID(payload["to_agent_id"]),
+                work_item_id=run.work_item_id,
+                run_id=run.id,
+                metadata=delivery_metadata,
+            )
         await db.commit()

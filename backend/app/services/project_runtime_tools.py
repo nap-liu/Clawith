@@ -9,11 +9,13 @@ from typing import Any
 from sqlalchemy import select
 
 from app.database import async_session
+from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.project import (
     Project,
     ProjectCapabilityBinding,
     ProjectMemberSnapshot,
+    ProjectRun,
     ProjectWorkItem,
 )
 from app.models.subagent_run import SubagentRun
@@ -49,6 +51,7 @@ LEADER_ONLY_PROJECT_TOOLS = frozenset(
         "project_set_member_enabled",
         "project_set_capability_enabled",
         "project_create_milestone",
+        "project_set_status",
         "project_restore_commit",
     }
 )
@@ -172,8 +175,22 @@ PROJECT_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     "project_create_milestone": _schema(
         "project_create_milestone",
         "Create one named Git milestone commit without rewriting history.",
-        {"message": {"type": "string"}},
+        {
+            "message": {"type": "string"},
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "related_work_item_ids": {"type": "array", "items": {"type": "string"}},
+            "related_run_ids": {"type": "array", "items": {"type": "string"}},
+        },
         ["message"],
+    ),
+    "project_set_status": _schema(
+        "project_set_status",
+        "Explicitly pause, wait, complete, or fail the project and audit the transition.",
+        {
+            "status": {"type": "string", "enum": ["waiting", "paused", "completed", "failed"]},
+            "reason": {"type": "string"},
+        },
+        ["status"],
     ),
     "project_restore_commit": _schema(
         "project_restore_commit",
@@ -286,7 +303,8 @@ async def _runtime_scope(
     session_id: str,
     agent_id: uuid.UUID,
     execution_user_id: uuid.UUID,
-) -> tuple[Project, ProjectMemberSnapshot]:
+    turn_anchor_id: uuid.UUID | None,
+) -> tuple[Project, ProjectMemberSnapshot, ProjectRun | None]:
     async with async_session() as db:
         project, member, _child, _run = await load_project_runtime_scope(
             db,
@@ -294,9 +312,23 @@ async def _runtime_scope(
             agent_id=agent_id,
             execution_user_id=execution_user_id,
         )
+        project_run = None
+        if turn_anchor_id is not None:
+            anchor = await db.get(ChatMessage, turn_anchor_id)
+            raw_run_id = dict(anchor.message_meta or {}).get("project_run_id") if anchor else None
+            try:
+                project_run_id = uuid.UUID(str(raw_run_id)) if raw_run_id else None
+            except (TypeError, ValueError):
+                project_run_id = None
+            if project_run_id is not None:
+                candidate = await db.get(ProjectRun, project_run_id)
+                if candidate is not None and candidate.project_id == project.id:
+                    project_run = candidate
         db.expunge(project)
         db.expunge(member)
-        return project, member
+        if project_run is not None:
+            db.expunge(project_run)
+        return project, member, project_run
 
 
 async def _enabled_member(db, project: Project, agent_id: uuid.UUID | None) -> ProjectMemberSnapshot | None:
@@ -341,6 +373,21 @@ async def _dependency_ids(db, project: Project, raw_ids: list[Any], *, item_id: 
 async def _project_context(project: Project) -> str:
     git = await repository_state(project, limit=1)
     settings = dict(project.settings or {})
+    async with async_session() as db:
+        members = (
+            (
+                await db.execute(
+                    select(ProjectMemberSnapshot)
+                    .where(ProjectMemberSnapshot.project_id == project.id)
+                    .order_by(
+                        ProjectMemberSnapshot.is_leader.desc(),
+                        ProjectMemberSnapshot.created_at,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
     payload = {
         "id": str(project.id),
         "name": project.name,
@@ -351,6 +398,16 @@ async def _project_context(project: Project) -> str:
         "current_signal": settings.get("current_signal"),
         "next_action": settings.get("next_action"),
         "git_head": git["head"],
+        "members": [
+            {
+                "member_id": str(member.id),
+                "agent_id": str(member.agent_id),
+                "name": member.name_snapshot,
+                "role": "leader" if member.is_leader else "participant",
+                "enabled": member.is_enabled,
+            }
+            for member in members
+        ],
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -391,7 +448,18 @@ async def execute_project_runtime_tool(
 
     if tool_name not in PROJECT_RUNTIME_TOOL_NAMES:
         raise ValueError(f"Unknown project runtime tool: {tool_name}")
-    project, member = await _runtime_scope(session_id, agent_id, execution_user_id)
+    project, member, project_run = await _runtime_scope(
+        session_id,
+        agent_id,
+        execution_user_id,
+        turn_anchor_id,
+    )
+    trace_metadata = {
+        "session_id": session_id,
+        "subagent_session_id": session_id,
+        "project_run_id": str(project_run.id) if project_run else None,
+        "a2a_session_id": (dict(project_run.output or {}).get("a2a_session_id") if project_run else None),
+    }
     if tool_name not in effective_project_tool_names(project, member):
         raise ValueError(
             "This project tool is not allowed by the current role, project policy, and member configuration"
@@ -436,6 +504,11 @@ async def execute_project_runtime_tool(
             tool_call_id=tool_call_id,
             origin_turn_anchor_id=turn_anchor_id,
         )
+        try:
+            delivery = json.loads(result)
+        except (TypeError, ValueError):
+            delivery = {}
+        delivered_session_id = str(delivery.get("a2a_session_id") or delivery.get("session_id") or "") or None
         async with async_session() as db:
             attached = await db.get(Project, project.id)
             add_event(
@@ -449,13 +522,53 @@ async def execute_project_runtime_tool(
                 metadata={
                     "mode": str(arguments.get("mode") or "task_delegate"),
                     "new_conversation": bool(arguments.get("new_conversation", False)),
-                    "session_id": session_id,
+                    "session_id": delivered_session_id,
+                    "a2a_session_id": delivered_session_id,
+                    "origin_session_id": session_id,
+                    "project_run_id": delivery.get("project_run_id"),
+                    "subagent_run_id": delivery.get("subagent_run_id"),
+                    "subagent_session_id": delivery.get("subagent_session_id"),
                     "delivery_result": result,
                     "visible_to_group": False,
                 },
             )
             await db.commit()
         return result
+
+    if tool_name == "project_set_status":
+        requested_status = str(arguments.get("status") or "").strip()
+        if requested_status not in {"waiting", "paused", "completed", "failed"}:
+            raise ValueError("status must be waiting, paused, completed, or failed")
+        async with async_session() as db:
+            attached = (
+                await db.execute(select(Project).where(Project.id == project.id).with_for_update())
+            ).scalar_one()
+            if attached.status in {"planning", "initializing"}:
+                raise ValueError("Confirm project kickoff before changing execution status")
+            if attached.status in {"completed", "failed", "archived"} and attached.status != requested_status:
+                raise ValueError("A terminal project cannot be reopened by an Agent tool")
+            previous_status = attached.status
+            attached.status = requested_status
+            add_event(
+                db,
+                attached,
+                "project.status.updated",
+                f"{member.name_snapshot} changed project status to {requested_status}",
+                actor_agent_id=agent_id,
+                work_item_id=project_run.work_item_id if project_run else None,
+                run_id=project_run.id if project_run else None,
+                metadata={
+                    "before": previous_status,
+                    "after": requested_status,
+                    "reason": str(arguments.get("reason") or "").strip() or None,
+                    **trace_metadata,
+                },
+            )
+            await db.commit()
+        return json.dumps(
+            {"project_id": str(project.id), "before": previous_status, "status": requested_status},
+            ensure_ascii=False,
+        )
 
     if tool_name == "project_restore_commit":
         policies = dict((project.settings or {}).get("policies") or {})
@@ -498,7 +611,9 @@ async def execute_project_runtime_tool(
                 "project.file.committed",
                 f"{member.name_snapshot} wrote and committed {result['path']}",
                 actor_agent_id=agent_id,
-                metadata={"path": result["path"], "commit": result["commit"], "session_id": session_id},
+                work_item_id=project_run.work_item_id if project_run else None,
+                run_id=project_run.id if project_run else None,
+                metadata={"path": result["path"], "commit": result["commit"], **trace_metadata},
             )
             await db.commit()
         return json.dumps(result, ensure_ascii=False)
@@ -507,7 +622,39 @@ async def execute_project_runtime_tool(
         message = str(arguments.get("message") or "").strip()
         if not message:
             raise ValueError("message is required")
-        result = await commit_project_changes(project, message, milestone=True)
+        paths = [str(value) for value in arguments.get("paths", []) if str(value).strip()] or None
+        related_work_item_ids = {
+            _uuid(value, "related_work_item_id") for value in arguments.get("related_work_item_ids", [])
+        }
+        related_run_ids = {_uuid(value, "related_run_id") for value in arguments.get("related_run_ids", [])}
+        async with async_session() as db:
+            if related_work_item_ids:
+                found_work_items = set(
+                    (
+                        await db.execute(
+                            select(ProjectWorkItem.id).where(
+                                ProjectWorkItem.project_id == project.id,
+                                ProjectWorkItem.id.in_(related_work_item_ids),
+                            )
+                        )
+                    ).scalars()
+                )
+                if found_work_items != related_work_item_ids:
+                    raise ValueError("Every related work item must belong to the current project")
+            if related_run_ids:
+                found_runs = set(
+                    (
+                        await db.execute(
+                            select(ProjectRun.id).where(
+                                ProjectRun.project_id == project.id,
+                                ProjectRun.id.in_(related_run_ids),
+                            )
+                        )
+                    ).scalars()
+                )
+                if found_runs != related_run_ids:
+                    raise ValueError("Every related run must belong to the current project")
+        result = await commit_project_changes(project, message, paths, milestone=True)
         async with async_session() as db:
             attached = await db.get(Project, project.id)
             settings = dict(attached.settings or {})
@@ -519,7 +666,14 @@ async def execute_project_runtime_tool(
                 "git.milestone.created",
                 f"{member.name_snapshot} created milestone: {message}",
                 actor_agent_id=agent_id,
-                metadata={**result, "session_id": session_id},
+                work_item_id=project_run.work_item_id if project_run else None,
+                run_id=project_run.id if project_run else None,
+                metadata={
+                    **result,
+                    **trace_metadata,
+                    "related_work_item_ids": [str(value) for value in sorted(related_work_item_ids, key=str)],
+                    "related_run_ids": [str(value) for value in sorted(related_run_ids, key=str)],
+                },
             )
             await db.commit()
         return json.dumps(result, ensure_ascii=False)
@@ -743,12 +897,13 @@ async def execute_project_runtime_tool(
             f"{member.name_snapshot} updated work item {item.title}",
             actor_agent_id=agent_id,
             work_item_id=item.id,
+            run_id=project_run.id if project_run else None,
             metadata={
                 "before": before,
                 "after": after,
                 "progress_note": str(arguments.get("progress_note") or "").strip() or None,
                 "evidence": [str(value) for value in arguments.get("evidence", [])],
-                "session_id": session_id,
+                **trace_metadata,
             },
         )
         await db.commit()

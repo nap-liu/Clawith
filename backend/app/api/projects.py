@@ -59,6 +59,7 @@ from app.schemas.project import (
     ProjectMemberLifecycleRequest,
     ProjectMemberOut,
     ProjectMemberUpdate,
+    ProjectMilestoneOut,
     ProjectRunCreate,
     ProjectRunMemberSnapshotOut,
     ProjectRunOut,
@@ -67,6 +68,7 @@ from app.schemas.project import (
     ProjectTemplateCreate,
     ProjectUpdate,
     WorkItemCreate,
+    WorkItemDetailOut,
     WorkItemOut,
     WorkItemUpdate,
 )
@@ -112,6 +114,7 @@ from app.services.project_service import (
     require_owner,
     require_project,
     restore_project_member,
+    serialize_project_runs,
 )
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -731,7 +734,7 @@ async def get_project_dashboard(
         "members": members,
         "capabilities": capabilities,
         "work_items": work_items,
-        "runs": runs,
+        "runs": await serialize_project_runs(db, project, list(runs)),
         "events": events,
         "git": git_state,
         "commits": git_state["commits"],
@@ -1253,6 +1256,222 @@ async def list_work_items(
     )
 
 
+@router.get("/{project_id}/work-items/{work_item_id}", response_model=WorkItemDetailOut)
+async def get_work_item_detail(
+    project_id: uuid.UUID,
+    work_item_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return one trace object; clients do not reconstruct links heuristically."""
+    project = await require_project(db, current_user, project_id)
+    item = (
+        await db.execute(
+            select(ProjectWorkItem).where(
+                ProjectWorkItem.id == work_item_id,
+                ProjectWorkItem.project_id == project.id,
+                ProjectWorkItem.tenant_id == project.tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if item is None:
+        raise HTTPException(status_code=404, detail="Work item not found")
+    project_runs = (
+        (
+            await db.execute(
+                select(ProjectRun)
+                .where(
+                    ProjectRun.project_id == project.id,
+                    ProjectRun.tenant_id == project.tenant_id,
+                )
+                .order_by(ProjectRun.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    all_run_payloads = await serialize_project_runs(db, project, list(project_runs))
+    project_events = (
+        (
+            await db.execute(
+                select(ProjectEvent)
+                .where(
+                    ProjectEvent.project_id == project.id,
+                    ProjectEvent.tenant_id == project.tenant_id,
+                )
+                .order_by(ProjectEvent.created_at.desc(), ProjectEvent.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    item_events = [event for event in project_events if event.work_item_id == item.id]
+    explicit_run_ids = {
+        str(value)
+        for event in item_events
+        for value in (
+            event.run_id,
+            dict(event.event_metadata or {}).get("project_run_id"),
+            *(dict(event.event_metadata or {}).get("related_run_ids") or []),
+        )
+        if value
+    }
+    run_payloads = [
+        run for run in all_run_payloads if run.get("work_item_id") == item.id or str(run["id"]) in explicit_run_ids
+    ]
+    run_ids = {str(run["id"]) for run in run_payloads}
+    events = []
+    for event in project_events:
+        metadata = dict(event.event_metadata or {})
+        event_run_ids = {
+            str(value)
+            for value in (
+                event.run_id,
+                metadata.get("project_run_id"),
+                *(metadata.get("related_run_ids") or []),
+            )
+            if value
+        }
+        if event.work_item_id == item.id or bool(run_ids & event_run_ids):
+            events.append(event)
+    run_by_id = {str(run["id"]): run for run in run_payloads}
+    sessions = [
+        {
+            "run_id": str(run["id"]),
+            "work_item_id": str(item.id),
+            "agent_id": str(run["agent_id"]) if run.get("agent_id") else None,
+            "agent_name": run.get("agent_name"),
+            "status": run["status"],
+            "source_channel": "agent" if run["trigger_type"] == "a2a" else "subagent",
+            "session_intent": "a2a" if run["trigger_type"] == "a2a" else "execution",
+            "session_id": str(run["session_id"]) if run.get("session_id") else None,
+            "subagent_session_id": (str(run["subagent_session_id"]) if run.get("subagent_session_id") else None),
+        }
+        for run in run_payloads
+        if run.get("session_id") or run.get("subagent_session_id")
+    ]
+    known_session_ids = {row["session_id"] for row in sessions if row.get("session_id")}
+    session_actor_ids = {event.actor_agent_id for event in item_events if event.actor_agent_id is not None}
+    session_members = (
+        (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                    ProjectMemberSnapshot.agent_id.in_(session_actor_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if session_actor_ids
+        else []
+    )
+    session_member_names = {str(member.agent_id): member.name_snapshot for member in session_members}
+    for event in item_events:
+        metadata = dict(event.event_metadata or {})
+        event_session_id = str(metadata.get("session_id") or "").strip()
+        if not event_session_id or event_session_id in known_session_ids:
+            continue
+        sessions.append(
+            {
+                "run_id": str(event.run_id) if event.run_id else metadata.get("project_run_id"),
+                "work_item_id": str(item.id),
+                "agent_id": str(event.actor_agent_id) if event.actor_agent_id else None,
+                "agent_name": session_member_names.get(str(event.actor_agent_id)),
+                "status": None,
+                "source_channel": "subagent",
+                "session_intent": "evidence",
+                "session_id": event_session_id,
+                "subagent_session_id": metadata.get("subagent_session_id") or event_session_id,
+            }
+        )
+        known_session_ids.add(event_session_id)
+    commits_by_hash: dict[str, dict] = {}
+    files_by_path: dict[str, dict] = {}
+    evidence: list[dict] = []
+    for event in events:
+        metadata = dict(event.event_metadata or {})
+        linked_run = run_by_id.get(str(event.run_id)) if event.run_id else None
+        trace = {
+            "event_id": str(event.id),
+            "run_id": str(event.run_id) if event.run_id else None,
+            "work_item_id": str(event.work_item_id or item.id),
+            "session_id": metadata.get("session_id")
+            or (str(linked_run["session_id"]) if linked_run and linked_run.get("session_id") else None),
+            "subagent_session_id": metadata.get("subagent_session_id")
+            or (
+                str(linked_run["subagent_session_id"]) if linked_run and linked_run.get("subagent_session_id") else None
+            ),
+        }
+        commit = str(metadata.get("commit") or "").strip()
+        if commit:
+            commits_by_hash.setdefault(
+                commit,
+                {
+                    **trace,
+                    "commit": commit,
+                    "short_commit": commit[:12],
+                    "message": metadata.get("message") or event.summary,
+                    "event_type": event.event_type,
+                    "created_at": event.created_at,
+                    "paths": list(metadata.get("paths") or []),
+                },
+            )
+        raw_paths: list[str] = []
+        if metadata.get("path"):
+            raw_paths.append(str(metadata["path"]))
+        raw_paths.extend(str(path) for path in (metadata.get("paths") or []) if path)
+        file_meta = metadata.get("file")
+        if isinstance(file_meta, dict) and file_meta.get("path"):
+            raw_paths.append(str(file_meta["path"]))
+        for path in raw_paths:
+            files_by_path[path] = {
+                **trace,
+                "path": path,
+                "commit": commit or None,
+                "event_type": event.event_type,
+                "created_at": event.created_at,
+            }
+        for value in metadata.get("evidence") or []:
+            evidence.append({**trace, "kind": "evidence", "value": str(value), "created_at": event.created_at})
+        if metadata.get("progress_note"):
+            evidence.append(
+                {
+                    **trace,
+                    "kind": "progress_note",
+                    "value": str(metadata["progress_note"]),
+                    "created_at": event.created_at,
+                }
+            )
+    for run in run_payloads:
+        output = dict(run.get("output") or {})
+        value = output.get("result") or run.get("error")
+        if value:
+            evidence.append(
+                {
+                    "kind": "run_result" if output.get("result") else "run_error",
+                    "value": str(value),
+                    "run_id": str(run["id"]),
+                    "work_item_id": str(item.id),
+                    "session_id": str(run["session_id"]) if run.get("session_id") else None,
+                    "subagent_session_id": (
+                        str(run["subagent_session_id"]) if run.get("subagent_session_id") else None
+                    ),
+                    "created_at": run.get("finished_at") or run["updated_at"],
+                }
+            )
+    return {
+        "work_item": item,
+        "runs": run_payloads,
+        "sessions": sessions,
+        "events": events,
+        "commits": list(commits_by_hash.values()),
+        "files": list(files_by_path.values()),
+        "evidence": evidence,
+    }
+
+
 @router.post("/{project_id}/work-items", response_model=WorkItemOut, status_code=201)
 async def create_work_item(
     project_id: uuid.UUID,
@@ -1355,7 +1574,7 @@ async def list_project_runs(
     project = await require_project(db, current_user, project_id)
     if await reconcile_project_runs(db, project.id, tenant_id=project.tenant_id):
         await db.commit()
-    return (
+    runs = (
         (
             await db.execute(
                 select(ProjectRun)
@@ -1366,6 +1585,7 @@ async def list_project_runs(
         .scalars()
         .all()
     )
+    return await serialize_project_runs(db, project, list(runs))
 
 
 @router.post("/{project_id}/runs", response_model=ProjectRunOut, status_code=201)
@@ -1430,10 +1650,7 @@ async def create_project_run(
 
     supplied_input = dict(data.input or {})
     task = str(
-        supplied_input.get("task")
-        or supplied_input.get("objective")
-        or supplied_input.get("message")
-        or ""
+        supplied_input.get("task") or supplied_input.get("objective") or supplied_input.get("message") or ""
     ).strip()
     if work_item is not None:
         criteria = "\n".join(f"- {item}" for item in (work_item.acceptance_criteria or [])) or "- None recorded"
@@ -1514,7 +1731,7 @@ async def create_project_run(
     except Exception as exc:  # noqa: BLE001 - queued outbox remains retryable
         logger.warning("Project run dispatch deferred run=%s error=%s", run.id, exc)
     await db.refresh(run)
-    return run
+    return (await serialize_project_runs(db, project, [run]))[0]
 
 
 @router.patch("/{project_id}/runs/{run_id}", response_model=ProjectRunOut)
@@ -1552,7 +1769,7 @@ async def patch_project_run(
     )
     await db.flush()
     await db.refresh(run)
-    return run
+    return (await serialize_project_runs(db, project, [run]))[0]
 
 
 @router.get("/{project_id}/runs/{run_id}/member-snapshots", response_model=list[ProjectRunMemberSnapshotOut])
@@ -1702,9 +1919,7 @@ async def get_project_leader_session(
     session = await ensure_project_leader_session(db, project)
     discussion_count = int(
         (
-            await db.execute(
-                select(func.count(ChatMessage.id)).where(ChatMessage.conversation_id == str(session.id))
-            )
+            await db.execute(select(func.count(ChatMessage.id)).where(ChatMessage.conversation_id == str(session.id)))
         ).scalar_one()
     )
     await db.commit()
@@ -1771,10 +1986,10 @@ async def confirm_project_kickoff(
                 "group_session_id": payload.get("group_session_id"),
                 "leader_agent_id": payload.get("leader_agent_id"),
                 "discussion_source": payload.get("discussion_source", "leader_session"),
-                "discussion_session_id": payload.get(
-                    "discussion_session_id", payload.get("leader_session_id")
-                ),
-                "awakened_agent_ids": [payload.get("leader_agent_id")] if dispatch_result.get("subagent_run_id") else [],
+                "discussion_session_id": payload.get("discussion_session_id", payload.get("leader_session_id")),
+                "awakened_agent_ids": [payload.get("leader_agent_id")]
+                if dispatch_result.get("subagent_run_id")
+                else [],
                 "subagent_run_id": dispatch_result.get("subagent_run_id"),
                 "subagent_session_id": dispatch_result.get("subagent_session_id"),
                 "git_start_commit": payload.get("git_start_commit"),
@@ -1799,12 +2014,16 @@ async def confirm_project_kickoff(
         raise HTTPException(status_code=422, detail="Project needs an enabled Leader before kickoff")
     leader_session = await ensure_project_leader_session(db, project)
     discussion = (
-        await db.execute(
-            select(ChatMessage)
-            .where(ChatMessage.conversation_id == str(leader_session.id))
-            .order_by(ChatMessage.created_at, ChatMessage.id)
+        (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == str(leader_session.id))
+                .order_by(ChatMessage.created_at, ChatMessage.id)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     roles = {message.role for message in discussion}
     if "user" not in roles or "assistant" not in roles:
         # New projects discuss the plan in the canonical project group. Keep
@@ -1814,21 +2033,25 @@ async def confirm_project_kickoff(
         # from the frozen agreement.
         group_session = await ensure_project_group_session(db, project)
         discussion = (
-            await db.execute(
-                select(ChatMessage)
-                .where(
-                    ChatMessage.conversation_id == str(group_session.id),
-                    or_(
-                        and_(ChatMessage.role == "user", ChatMessage.sender_user_id.is_not(None)),
-                        and_(
-                            ChatMessage.role == "assistant",
-                            ChatMessage.sender_agent_id == leader.agent_id,
+            (
+                await db.execute(
+                    select(ChatMessage)
+                    .where(
+                        ChatMessage.conversation_id == str(group_session.id),
+                        or_(
+                            and_(ChatMessage.role == "user", ChatMessage.sender_user_id.is_not(None)),
+                            and_(
+                                ChatMessage.role == "assistant",
+                                ChatMessage.sender_agent_id == leader.agent_id,
+                            ),
                         ),
-                    ),
+                    )
+                    .order_by(ChatMessage.created_at, ChatMessage.id)
                 )
-                .order_by(ChatMessage.created_at, ChatMessage.id)
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         roles = {message.role for message in discussion}
         discussion_source = "project_group"
         discussion_session_id = group_session.id
@@ -1938,6 +2161,16 @@ async def confirm_project_kickoff(
     db.add_all([kickoff_message, run])
     group_session.last_message_at = now
     project.status = "initializing"
+    project.settings = {
+        **dict(project.settings or {}),
+        "planning": {
+            **dict(dict(project.settings or {}).get("planning") or {}),
+            "state": "confirmed",
+            "launch_confirmed": True,
+            "confirmed_at": confirmed_at.isoformat(),
+            "confirmed_by_user_id": str(current_user.id),
+        },
+    }
     await db.flush()
     await freeze_run_members(db, project, run)
     await db.commit()
@@ -2012,13 +2245,17 @@ async def list_project_group_messages(
     if session is None:
         raise HTTPException(status_code=404, detail="Project group session not found")
     messages = (
-        await db.execute(
-            select(ChatMessage)
-            .where(ChatMessage.conversation_id == str(session.id))
-            .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-            .limit(limit)
+        (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == str(session.id))
+                .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+                .limit(limit)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return {
         "session": _group_session_payload(session, project),
         "items": await build_project_group_timeline(
@@ -2090,14 +2327,18 @@ async def create_project_group_message(
         )
     required_agent_ids = set(wake_agent_ids)
     members = (
-        await db.execute(
-            select(ProjectMemberSnapshot).where(
-                ProjectMemberSnapshot.project_id == project.id,
-                ProjectMemberSnapshot.tenant_id == project.tenant_id,
-                ProjectMemberSnapshot.agent_id.in_(required_agent_ids),
+        (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                    ProjectMemberSnapshot.agent_id.in_(required_agent_ids),
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     member_by_agent = {member.agent_id: member for member in members}
     if set(member_by_agent) != required_agent_ids:
         raise HTTPException(status_code=422, detail="Every sender and mention must be a project member")
@@ -2113,14 +2354,18 @@ async def create_project_group_message(
         ).scalar_one_or_none()
     if existing is not None:
         pending_runs = (
-            await db.execute(
-                select(ProjectRun).where(
-                    ProjectRun.project_id == project.id,
-                    ProjectRun.input["group_message_id"].as_string() == str(existing.id),
-                    ProjectRun.trigger_type.in_(["group_leader_message", "group_mention"]),
+            (
+                await db.execute(
+                    select(ProjectRun).where(
+                        ProjectRun.project_id == project.id,
+                        ProjectRun.input["group_message_id"].as_string() == str(existing.id),
+                        ProjectRun.trigger_type.in_(["group_leader_message", "group_mention"]),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         await db.commit()
         for pending_run in pending_runs:
             if not dict(pending_run.output or {}).get("subagent_run_id"):
@@ -2162,10 +2407,7 @@ async def create_project_group_message(
     await db.flush()
     execution_content = (data.llm_content or data.content).strip()
     if not execution_content:
-        execution_content = (
-            "处理项目群聊中附带的文件，并把结论回复到项目群。附件："
-            + str(data.attachments)
-        )
+        execution_content = "处理项目群聊中附带的文件，并把结论回复到项目群。附件：" + str(data.attachments)
     project_runs: list[ProjectRun] = []
     for agent_id in wake_agent_ids:
         member = member_by_agent[agent_id]
@@ -2209,23 +2451,27 @@ async def create_project_group_message(
             run_status = result.get("status", "queued")
             if run_id:
                 awakened.append(str(agent_id))
-            subagent_rows.append({
-                "project_run_id": str(project_run.id),
-                "run_id": str(run_id) if run_id else None,
-                "session_id": str(run_id) if run_id else None,
-                "agent_id": str(agent_id),
-                "status": run_status,
-            })
+            subagent_rows.append(
+                {
+                    "project_run_id": str(project_run.id),
+                    "run_id": str(run_id) if run_id else None,
+                    "session_id": str(run_id) if run_id else None,
+                    "agent_id": str(agent_id),
+                    "status": run_status,
+                }
+            )
         except Exception as exc:
             # Keep the durable queued run retryable; the daemon owns recovery.
-            subagent_rows.append({
-                "project_run_id": str(project_run.id),
-                "run_id": None,
-                "session_id": None,
-                "agent_id": str(agent_id),
-                "status": "queued",
-                "error": str(exc),
-            })
+            subagent_rows.append(
+                {
+                    "project_run_id": str(project_run.id),
+                    "run_id": None,
+                    "session_id": None,
+                    "agent_id": str(agent_id),
+                    "status": "queued",
+                    "error": str(exc),
+                }
+            )
 
     message = await db.get(ChatMessage, message.id, with_for_update=True)
     if message is None:
@@ -2734,6 +2980,103 @@ async def create_git_branch(
     )
     await db.flush()
     return {**result, "event_id": str(event.id)}
+
+
+@router.get("/{project_id}/milestones", response_model=list[ProjectMilestoneOut])
+async def list_project_milestones(
+    project_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Aggregate durable milestone audit rows with verified Git commits."""
+    project = await require_project(db, current_user, project_id)
+    milestone_events = (
+        (
+            await db.execute(
+                select(ProjectEvent)
+                .where(
+                    ProjectEvent.project_id == project.id,
+                    ProjectEvent.tenant_id == project.tenant_id,
+                    ProjectEvent.event_type == "git.milestone.created",
+                )
+                .order_by(ProjectEvent.created_at.desc(), ProjectEvent.id.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    git_state = await repository_state(project, max(500, len(milestone_events) * 20))
+    commit_by_hash = {str(commit["commit"]): commit for commit in git_state.get("commits", [])}
+    run_ids = {event.run_id for event in milestone_events if event.run_id is not None}
+    runs = (
+        (
+            await db.execute(
+                select(ProjectRun).where(
+                    ProjectRun.project_id == project.id,
+                    ProjectRun.tenant_id == project.tenant_id,
+                    ProjectRun.id.in_(run_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if run_ids
+        else []
+    )
+    run_by_id = {str(payload["id"]): payload for payload in await serialize_project_runs(db, project, list(runs))}
+    actor_agent_ids = {event.actor_agent_id for event in milestone_events if event.actor_agent_id is not None}
+    actor_members = (
+        (
+            await db.execute(
+                select(ProjectMemberSnapshot).where(
+                    ProjectMemberSnapshot.project_id == project.id,
+                    ProjectMemberSnapshot.tenant_id == project.tenant_id,
+                    ProjectMemberSnapshot.agent_id.in_(actor_agent_ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if actor_agent_ids
+        else []
+    )
+    member_name_by_agent = {str(member.agent_id): member.name_snapshot for member in actor_members}
+    records = []
+    for event in milestone_events:
+        metadata = dict(event.event_metadata or {})
+        commit_hash = str(metadata.get("commit") or "").strip()
+        commit = commit_by_hash.get(commit_hash)
+        # An audit event alone is not a milestone: expose only records whose
+        # immutable Git commit still exists in the repository history.
+        if commit is None:
+            continue
+        run = run_by_id.get(str(event.run_id)) if event.run_id else None
+        records.append(
+            {
+                "id": event.id,
+                "event_id": event.id,
+                "project_id": project.id,
+                "commit": commit_hash,
+                "short_commit": commit.get("short_commit") or commit_hash[:12],
+                "message": commit.get("message") or metadata.get("message") or event.summary,
+                "author": commit.get("author"),
+                "created_at": event.created_at,
+                "commit_created_at": commit.get("created_at"),
+                "run_id": event.run_id,
+                "work_item_id": event.work_item_id or (run.get("work_item_id") if run else None),
+                "session_id": metadata.get("session_id") or (run.get("session_id") if run else None),
+                "subagent_session_id": metadata.get("subagent_session_id")
+                or (run.get("subagent_session_id") if run else None),
+                "agent_id": event.actor_agent_id or (run.get("agent_id") if run else None),
+                "agent_name": (run.get("agent_name") if run else None)
+                or member_name_by_agent.get(str(event.actor_agent_id)),
+                "paths": list(metadata.get("paths") or []),
+                "changed": metadata.get("changed"),
+                "related_run_ids": list(metadata.get("related_run_ids") or []),
+                "related_work_item_ids": list(metadata.get("related_work_item_ids") or []),
+            }
+        )
+    return records
 
 
 @router.get("/{project_id}/git")

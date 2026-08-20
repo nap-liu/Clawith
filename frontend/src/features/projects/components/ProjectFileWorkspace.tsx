@@ -271,35 +271,43 @@ export default function ProjectFileWorkspace({ projectId, files, runAction, busy
 
     return (
         <div className="project-file-workspace">
-                <aside className="project-file-workspace__sidebar" aria-label="项目目录">
-                    <header><IconBrandGit size={16} /><span title="项目工作树">项目工作树</span><em>{files.length}</em><Button type="button" variant="ghost" onClick={startNewFile} title="新建文件" aria-label="新建文件"><IconPlus size={15} /></Button></header>
-                    <div className="project-file-workspace__tree" role="tree" aria-label="项目文件树">
-                        {tree.length ? <TreeRows nodes={tree} depth={0} expanded={expanded} selectedPath={selectedPath} onToggle={(path) => setExpanded((current) => { const next = new Set(current); if (next.has(path)) next.delete(path); else next.add(path); return next; })} onSelect={selectFile} /> : <div className="project-file-workspace__tree-empty"><IconFolder size={22} /><span>暂无项目文件</span></div>}
+            <aside className="project-file-workspace__sidebar" aria-label="项目目录">
+                <header>
+                    <IconBrandGit size={16} />
+                    <span title="项目工作树">项目工作树</span>
+                    <em>{files.length}</em>
+                    <Button type="button" variant="ghost" onClick={startNewFile} title="新建文件" aria-label="新建文件"><IconPlus size={15} /></Button>
+                </header>
+                <div className="project-file-workspace__tree" role="tree" aria-label="项目文件树">
+                    {tree.length ? <TreeRows nodes={tree} depth={0} expanded={expanded} selectedPath={selectedPath} onToggle={(path) => setExpanded((current) => { const next = new Set(current); if (next.has(path)) next.delete(path); else next.add(path); return next; })} onSelect={selectFile} /> : <div className="project-file-workspace__tree-empty"><IconFolder size={22} /><span>暂无项目文件</span></div>}
+                </div>
+            </aside>
+
+            <section className="project-file-workspace__viewer">
+                <header className="project-file-workspace__viewer-header">
+                    <div>
+                        <span>{creating ? 'NEW FILE' : content?.is_text ? 'EDIT FILE' : 'FILE PREVIEW'}</span>
+                        {creating ? <TextInput form="project-file-editor-form" value={draftPath} onChange={(event) => setDraftPath(event.target.value)} placeholder="docs/deliverable.md" aria-label="项目内路径" required autoFocus /> : <h3 title={draftPath || selectedPath}>{draftPath || selectedPath || '创建项目文件'}</h3>}
                     </div>
-                </aside>
+                    <div className="project-file-workspace__viewer-actions">
+                        {content ? <MetaLine content={content} /> : activeEntry ? <span>{formatFileSize(number(activeEntry, 'size'))}</span> : null}
+                        {content?.download_url ? <a className="btn btn-ghost" href={content.download_url} download={content.name} title="下载文件" aria-label={`下载 ${content.name}`}><IconDownload size={17} /></a> : null}
+                        {canEditText && !textReadOnly ? <Button type="submit" form="project-file-editor-form" variant="primary" disabled={!draftPath.trim() || busyAction === 'save-file'}>{busyAction === 'save-file' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存并提交</Button> : null}
+                    </div>
+                </header>
 
-                <section className="project-file-workspace__viewer">
-                    <header className="project-file-workspace__viewer-header">
-                        <div><span>{creating ? 'NEW FILE' : content?.is_text ? 'EDIT FILE' : 'FILE PREVIEW'}</span>{creating ? <TextInput form="project-file-editor-form" value={draftPath} onChange={(event) => setDraftPath(event.target.value)} placeholder="docs/deliverable.md" aria-label="项目内路径" required /> : <h3 title={draftPath || selectedPath}>{draftPath || selectedPath || '创建项目文件'}</h3>}</div>
-                        <div className="project-file-workspace__viewer-actions">
-                            {content ? <MetaLine content={content} /> : activeEntry ? <span>{formatFileSize(number(activeEntry, 'size'))}</span> : null}
-                            {content?.download_url ? <a className="btn btn-ghost" href={content.download_url} download={content.name} title="下载文件" aria-label={`下载 ${content.name}`}><IconDownload size={17} /></a> : null}
-                            {canEditText && !textReadOnly ? <Button type="submit" form="project-file-editor-form" variant="primary" disabled={!draftPath.trim() || busyAction === 'save-file'}>{busyAction === 'save-file' ? <IconLoader2 className="project-workspace__spinner" size={16} /> : <IconDeviceFloppy size={16} />}保存并提交</Button> : null}
-                        </div>
-                    </header>
-
-                    {loading ? <div className="project-file-workspace__state"><IconLoader2 className="project-workspace__spinner" size={24} /><span>正在读取 Git HEAD 文件…</span></div> : loadError ? <div className="project-file-workspace__state is-error"><IconAlertTriangle size={24} /><strong>文件加载失败</strong><span>{loadError}</span><Button variant="secondary" onClick={() => setReloadKey((value) => value + 1)}><IconRefresh size={15} />重试</Button></div> : canEditText ? (
-                        <form id="project-file-editor-form" className="project-file-workspace__editor" onSubmit={(event) => void save(event)}>
-                            {textReadOnly ? <div className="project-file-workspace__readonly-note" role="status"><IconAlertTriangle size={16} /><div><strong>{content?.truncated ? '当前仅显示文件前部内容' : '此文件只允许在线查看'}</strong><p>为避免使用截断内容覆盖原文件，请在 Agent 工作区修改后提交。</p></div></div> : null}
-                            <Suspense fallback={<div className="project-file-workspace__editor-loading"><IconLoader2 className="project-workspace__spinner" size={20} /><span>正在载入代码编辑器…</span></div>}>
-                                <ProjectCodeEditor path={draftPath} value={draftContent} readOnly={textReadOnly} onChange={setDraftContent} />
-                            </Suspense>
-                            <footer>
-                                <span>{creating ? '保存后会创建普通 Git Commit' : textReadOnly ? '只读预览不会修改项目文件' : '改动仅作用于当前项目仓库'}</span>
-                            </footer>
-                        </form>
-                    ) : content ? <div className="project-file-workspace__preview"><MediaPreview content={content} onUnavailable={refreshMediaTicket} /></div> : <div className="project-file-workspace__state"><IconCode size={24} /><span>选择一个文件查看内容</span></div>}
-                </section>
+                {loading ? <div className="project-file-workspace__state"><IconLoader2 className="project-workspace__spinner" size={24} /><span>正在读取 Git HEAD 文件…</span></div> : loadError ? <div className="project-file-workspace__state is-error"><IconAlertTriangle size={24} /><strong>文件加载失败</strong><span>{loadError}</span><Button variant="secondary" onClick={() => setReloadKey((value) => value + 1)}><IconRefresh size={15} />重试</Button></div> : canEditText ? (
+                    <form id="project-file-editor-form" className="project-file-workspace__editor" onSubmit={(event) => void save(event)}>
+                        {textReadOnly ? <div className="project-file-workspace__readonly-note" role="status"><IconAlertTriangle size={16} /><div><strong>{content?.truncated ? '当前仅显示文件前部内容' : '此文件只允许在线查看'}</strong><p>为避免使用截断内容覆盖原文件，请在 Agent 工作区修改后提交。</p></div></div> : null}
+                        <Suspense fallback={<div className="project-file-workspace__editor-loading"><IconLoader2 className="project-workspace__spinner" size={20} /><span>正在载入代码编辑器…</span></div>}>
+                            <ProjectCodeEditor path={draftPath} value={draftContent} readOnly={textReadOnly} onChange={setDraftContent} />
+                        </Suspense>
+                        <footer>
+                            <span>{creating ? '保存后会创建普通 Git Commit' : textReadOnly ? '只读预览不会修改项目文件' : '改动仅作用于当前项目仓库'}</span>
+                        </footer>
+                    </form>
+                ) : content ? <div className="project-file-workspace__preview"><MediaPreview content={content} onUnavailable={refreshMediaTicket} /></div> : <div className="project-file-workspace__state"><IconCode size={24} /><span>选择一个文件查看内容</span></div>}
+            </section>
         </div>
     );
 }
